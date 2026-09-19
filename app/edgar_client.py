@@ -221,7 +221,8 @@ def _derive_q4_from_facts(full_facts: pd.DataFrame, concept: str, fy_end: pd.Tim
     fy = facts[(facts["duration_days"].between(*_FY_DAYS)) & (pd.to_datetime(facts["period_end"]) == fy_end)]
     if fy.empty:
         return None
-    fy_total = float(fy["value"].iloc[0])
+    fy_winner = _dedup_latest(fy).iloc[-1]
+    fy_total = float(fy_winner["value"])
     ytd = facts[
         (facts["duration_days"].between(*_YTD_DAYS))
         & (pd.to_datetime(facts["period_end"]) >= fy_end - pd.Timedelta(days=_MISSING_QUARTER_GAP_DAYS))
@@ -229,9 +230,9 @@ def _derive_q4_from_facts(full_facts: pd.DataFrame, concept: str, fy_end: pd.Tim
     ]
     if ytd.empty:
         return None
-    ytd_q3 = float(ytd.sort_values("period_end")["value"].iloc[-1])
+    ytd_q3 = float(_dedup_latest(ytd).sort_values("period_end").iloc[-1]["value"])
     q4 = fy_total - ytd_q3
-    row = fy.iloc[0].copy()
+    row = fy_winner.copy()
     row["value"] = q4
     row["fiscal_period"] = "Q4"
     return pd.DataFrame([row])
@@ -462,13 +463,21 @@ def _fact_field(row: pd.Series[float], name: str, *alts: str) -> str | None:
 def _copy_fact_meta(r: pd.Series[float]) -> dict[str, object]:
     """accession/form/filed meta off a fact row (first alias wins)."""
     meta: dict[str, object] = {}
-    for _k in ("accession", "accn", "form", "filed", "filed_at", "filing_date"):
+    for _k in ("accession", "accn", "form", "form_type", "filed", "filed_at", "filing_date"):
         try:
             _v = r.get(_k)
         except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
             _v = None
         if _v is not None and str(_v) not in ("", "nan", "NaT"):
-            _out = "accession" if _k in ("accession", "accn") else ("filed" if _k in ("filed", "filed_at", "filing_date") else _k)
+            _out = (
+                "accession"
+                if _k in ("accession", "accn")
+                else (
+                    "form"
+                    if _k in ("form", "form_type")
+                    else ("filed" if _k in ("filed", "filed_at", "filing_date") else _k)
+                )
+            )
             meta.setdefault(_out, str(_v))
     return meta
 
@@ -503,7 +512,7 @@ def _fundamentals_shares(ticker: str, company: Company, cik: object, facts_url: 
     ]
     if shares.empty:
         return _no_data(ticker, "shares outstanding not found in company facts")
-    latest = shares.sort_values("period_end").iloc[-1]
+    latest = _dedup_latest(shares).sort_values("period_end").iloc[-1]
     out: dict[str, object] = {
         "ticker": ticker,
         "shares_outstanding": float(latest["value"]),
@@ -517,7 +526,7 @@ def _fundamentals_shares(ticker: str, company: Company, cik: object, facts_url: 
         out["source_url"] = facts_url
     for k, v in (
         ("accession", _fact_field(latest, "accession", "accn")),
-        ("form", _fact_field(latest, "form")),
+        ("form", _fact_field(latest, "form", "form_type")),
         ("filed", _fact_field(latest, "filed", "filed_at", "filing_date")),
     ):
         if v:
