@@ -138,6 +138,14 @@ _MISSING_QUARTER_GAP_DAYS = 130
 _DERIVED_Q4_OFFSET_DAYS = 91
 
 
+def _facts_dataframe(facts) -> pd.DataFrame:
+    """EntityFacts frame with filing metadata when the SDK offers it."""
+    try:
+        return facts.to_dataframe(include_metadata=True)
+    except TypeError:
+        return facts.to_dataframe()
+
+
 def _fact_duration_days(frame: pd.DataFrame) -> pd.Series[int]:
     """Duration in days between period_start and period_end (XBRL facts)."""
     import pandas as pd
@@ -150,12 +158,29 @@ def _fact_duration_days(frame: pd.DataFrame) -> pd.Series[int]:
 def _dedup_latest(frame: pd.DataFrame) -> pd.DataFrame:
     """Drop duplicate period_end facts, keeping the most recently filed one.
 
-    XBRL company facts can carry restated values for the same period. The
-    dataframe has no filing-date column, so the latest-filed fact is
-    approximated by the largest fiscal_year (restatements are tagged with
-    the year they were reported in).
+    XBRL company facts can carry restated values for the same period. Prefer
+    the true filed order (filing_date, then largest accession as tiebreak);
+    when the SDK frame carries no date columns, fall back to the largest
+    fiscal_year proxy (restatements are tagged with the year reported in).
     """
-    return frame.sort_values(["period_end", "fiscal_year"]).drop_duplicates(subset=["period_end"], keep="last")
+    # ponytail: fiscal_year proxy ceiling — per-filing version chains if the
+    # SDK ever stops tagging restatements with their report year.
+    import pandas as pd
+
+    date_col = next((c for c in ("filing_date", "filed", "filed_at") if c in frame.columns), None)
+    if date_col is None:
+        keys = ["period_end", "fiscal_year"] if "fiscal_year" in frame.columns else ["period_end"]
+        return frame.sort_values(keys).drop_duplicates(subset=["period_end"], keep="last")
+    work = frame.copy()
+    work["_filed"] = pd.to_datetime(work[date_col], errors="coerce")
+    keys = ["period_end", "_filed"]
+    acc_col = next((c for c in ("accession", "accn") if c in work.columns), None)
+    if acc_col is not None:
+        keys.append(acc_col)
+    if "fiscal_year" in work.columns:
+        keys.append("fiscal_year")
+    out = work.sort_values(keys, na_position="first").drop_duplicates(subset=["period_end"], keep="last")
+    return out.drop(columns=["_filed"])
 
 
 def _quarters_with_derived_q4(quarterly: pd.DataFrame, full_facts: pd.DataFrame, concept: str) -> pd.DataFrame:
@@ -437,13 +462,13 @@ def _fact_field(row: pd.Series[float], name: str, *alts: str) -> str | None:
 def _copy_fact_meta(r: pd.Series[float]) -> dict[str, object]:
     """accession/form/filed meta off a fact row (first alias wins)."""
     meta: dict[str, object] = {}
-    for _k in ("accession", "accn", "form", "filed", "filed_at"):
+    for _k in ("accession", "accn", "form", "filed", "filed_at", "filing_date"):
         try:
             _v = r.get(_k)
         except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
             _v = None
         if _v is not None and str(_v) not in ("", "nan", "NaT"):
-            _out = "accession" if _k in ("accession", "accn") else ("filed" if _k in ("filed", "filed_at") else _k)
+            _out = "accession" if _k in ("accession", "accn") else ("filed" if _k in ("filed", "filed_at", "filing_date") else _k)
             meta.setdefault(_out, str(_v))
     return meta
 
@@ -466,7 +491,7 @@ def _fundamentals_shares(ticker: str, company: Company, cik: object, facts_url: 
     facts = company.get_facts()
     if facts is None:
         return _no_data(ticker, "company facts not available")
-    df = facts.to_dataframe()
+    df = _facts_dataframe(facts)
     shares = df[
         df["concept"].isin(
             [
@@ -493,7 +518,7 @@ def _fundamentals_shares(ticker: str, company: Company, cik: object, facts_url: 
     for k, v in (
         ("accession", _fact_field(latest, "accession", "accn")),
         ("form", _fact_field(latest, "form")),
-        ("filed", _fact_field(latest, "filed", "filed_at")),
+        ("filed", _fact_field(latest, "filed", "filed_at", "filing_date")),
     ):
         if v:
             out[k] = v
@@ -551,6 +576,7 @@ def _eps_result(
         result["cik"] = cik
     if facts_url:
         result["source_url"] = facts_url
+    # SDK get_ttm stays display-only (split-adjusted, not PIT); TTM here sums filed quarterly facts.
     if len(recent_diluted) == 4:
         result["ttm_eps_diluted"] = round(sum(float(r["value"]) for _, r in recent_diluted.iterrows()), 2)
     if recent_basic is not None and len(recent_basic) == 4:
@@ -563,7 +589,7 @@ def _fundamentals_eps(ticker: str, company: Company, cik: object, facts_url: str
     facts = company.get_facts()
     if facts is None:
         return _no_data(ticker, "company facts not available")
-    df = facts.to_dataframe()
+    df = _facts_dataframe(facts)
     recent_diluted = _recent_quarterly_facts(df, "us-gaap:EarningsPerShareDiluted")
     if recent_diluted is None:
         return _no_data(ticker, "diluted EPS not found in company facts")
@@ -599,7 +625,7 @@ def _fundamentals_dividends(ticker: str, company: Company) -> dict[str, object]:
     facts = company.get_facts()
     if facts is None:
         return _no_data(ticker, "company facts not available")
-    df = facts.to_dataframe()
+    df = _facts_dataframe(facts)
     div = df[df["concept"].isin(["us-gaap:" + _DIVIDEND_CONCEPT, _DIVIDEND_CONCEPT])].copy()
     if div.empty:
         return _null_dividend_payload(ticker)
@@ -1178,7 +1204,7 @@ def _fetch_xbrl_facts(ticker: str, concept: str) -> dict[str, object]:
         facts = company.get_facts()
         if facts is None:
             return _no_data(ticker, "company facts not available")
-        df = facts.to_dataframe()
+        df = _facts_dataframe(facts)
         matching = _xbrl_candidates(df, concept)
         if matching.empty:
             return _no_data(ticker, f"no XBRL facts found for concept '{concept}'")
