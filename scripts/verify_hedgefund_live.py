@@ -161,7 +161,7 @@ def golden_structure(session_id: str, db_path: Path | None = None) -> tuple[bool
         if job_counts[dom] < 1:
             failures.append(f"source domain {dom} has no jobs")
     frozen_counts: dict[str, int] = {d: 0 for d in GOLDEN_DOMAINS}
-    allowed_kinds = {"sec_source", "finra_record", "web_source"}
+    allowed_kinds = {"sec_source", "sec_record", "finra_record", "web_source"}
     ev_seq = evidence if isinstance(evidence, (list, tuple)) else []
     for row in ev_seq:
         get = row.get if isinstance(row, dict) else getattr(row, "get", None)

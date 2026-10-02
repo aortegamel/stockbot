@@ -923,8 +923,8 @@ class ResearchRepository:
     def save_tool_result(self, record: Mapping[str, object]) -> str:
         """Insert one immutable staged tool result; duplicate ids raise ValueError.
 
-        A tool result is the kernel-persisted FINRA/WEB payload a finra_record or
-        web_source ref replays against. Resume never rewrites one (same id =
+        A tool result is the kernel-persisted payload a finra_record, web_source,
+        or sec_record ref replays against. Resume never rewrites one (same id =
         same bytes), so evidence admission can prove the row a citation names.
         """
         if not isinstance(record, Mapping):

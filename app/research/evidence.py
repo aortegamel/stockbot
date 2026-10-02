@@ -34,8 +34,8 @@ __all__ = [
     "ingest_evidence",
     "normalize_accession",
     "search_run_ref",
+    "sec_record_ref",
     "sec_source_ref",
-    "substantive_records",
     "validate_provenance",
     "web_source_ref",
 ]
@@ -52,12 +52,14 @@ ledger row: evidence is what a human/source document states, coverage is what a
 search did or did not reach.
 """
 
-PROVENANCE_KINDS = ("sec_source", "finra_record", "web_source", "search_run", "none")
-"""Closed provenance vocabulary: a reloaded SEC passage, a persisted FINRA tool
-result, a persisted web-search result, the executed search, or nothing recorded."""
+PROVENANCE_KINDS = ("sec_source", "sec_record", "finra_record", "web_source", "search_run", "none")
+"""Closed provenance vocabulary: a reloaded SEC passage, a persisted SEC tool
+result, a persisted FINRA tool result, a persisted web-search result, the
+executed search, or nothing recorded."""
 
 PROVENANCE_DOMAINS: dict[str, str] = {
     "sec_source": "SEC",
+    "sec_record": "SEC",
     "finra_record": "FINRA",
     "web_source": "WEB",
     "search_run": "WEB",
@@ -67,6 +69,7 @@ PROVENANCE_DOMAINS: dict[str, str] = {
 
 PROVENANCE_INTEGRITY: dict[str, str] = {
     "sec_source": "PRIMARY_DOCUMENT",
+    "sec_record": "CANONICAL_STRUCTURED",
     "finra_record": "CANONICAL_STRUCTURED",
     "web_source": "EXTERNAL_SOURCE",
     "search_run": "EXTERNAL_SOURCE",
@@ -180,6 +183,33 @@ def sec_source_ref(
     }
 
 
+def sec_record_ref(
+    *,
+    tool_name: object,
+    record_identity: object,
+    dataset: object = None,
+    source_uri: object = None,
+    known_at: object = None,
+    tool_result_id: object = None,
+) -> dict[str, JSONValue]:
+    """SecRecordRef: one persisted SEC structured-tool result an observed fact is read off."""
+    tool = tool_name.strip() if isinstance(tool_name, str) else ""
+    identity = record_identity.strip() if isinstance(record_identity, str) else ""
+    if not tool or not identity:
+        raise ValueError("sec_record_ref: tool_name and record_identity must be non-empty strings")
+    ref: dict[str, JSONValue] = {"kind": "sec_record", "tool_name": tool, "record_identity": identity}
+    for key, value in (
+        ("dataset", dataset),
+        ("source_uri", source_uri),
+        ("known_at", known_at),
+        ("tool_result_id", tool_result_id),
+    ):
+        text = _provenance_opt({key: value}, key)
+        if text is not None:
+            ref[key] = text
+    return ref
+
+
 def _ref_texts(document_name: object, passage: object) -> tuple[str, str]:
     """(document, quoted passage) of one source ref; both must be non-empty strings."""
     document = document_name.strip() if isinstance(document_name, str) else ""
@@ -196,6 +226,7 @@ def _ref_window(offset: object, end: object) -> tuple[int, int]:
     if stop <= start:
         raise ValueError(f"sec_source_ref: end ({stop}) must be greater than offset ({start})")
     return start, stop
+
 
 def search_run_ref(*, search_id: object, query: object) -> dict[str, JSONValue]:
     """SearchRunRef: the executed search a navigation (discovery) row records; never evidence of a claim."""
@@ -233,7 +264,12 @@ def finra_record_ref(
     if not tool or not identity:
         raise ValueError("finra_record_ref: tool_name and record_identity must be non-empty strings")
     ref: dict[str, JSONValue] = {"kind": "finra_record", "tool_name": tool, "record_identity": identity}
-    for key, value in (("dataset", dataset), ("source_uri", source_uri), ("known_at", known_at), ("tool_result_id", tool_result_id)):
+    for key, value in (
+        ("dataset", dataset),
+        ("source_uri", source_uri),
+        ("known_at", known_at),
+        ("tool_result_id", tool_result_id),
+    ):
         text = _provenance_opt({key: value}, key)
         if text is not None:
             ref[key] = text
@@ -262,7 +298,13 @@ def web_source_ref(
     if not link or not quote:
         raise ValueError("web_source_ref: url and excerpt must be non-empty strings")
     ref: dict[str, JSONValue] = {"kind": "web_source", "url": link, "excerpt": quote}
-    for key, value in (("title", title), ("domain", domain), ("published_at", published_at), ("retrieved_at", retrieved_at), ("tool_result_id", tool_result_id)):
+    for key, value in (
+        ("title", title),
+        ("domain", domain),
+        ("published_at", published_at),
+        ("retrieved_at", retrieved_at),
+        ("tool_result_id", tool_result_id),
+    ):
         text = _provenance_opt({key: value}, key)
         if text is not None:
             ref[key] = text
@@ -316,6 +358,15 @@ def validate_provenance(value: object, where: str = "<evidence>: 'provenance'") 
             known_at=value.get("known_at"),
             tool_result_id=value.get("tool_result_id"),
         )
+    if kind == "sec_record":
+        return sec_record_ref(
+            tool_name=_provenance_str(value, "tool_name", where),
+            record_identity=_provenance_str(value, "record_identity", where),
+            dataset=value.get("dataset"),
+            source_uri=value.get("source_uri"),
+            known_at=value.get("known_at"),
+            tool_result_id=value.get("tool_result_id"),
+        )
     if kind == "web_source":
         return web_source_ref(
             url=_provenance_str(value, "url", where),
@@ -327,6 +378,7 @@ def validate_provenance(value: object, where: str = "<evidence>: 'provenance'") 
             tool_result_id=value.get("tool_result_id"),
         )
     return _sec_source_provenance(value, where)
+
 
 def _sec_source_provenance(value: Mapping[str, object], where: str) -> dict[str, JSONValue]:
     """Canonical SEC ref when the row holds kernel coordinates, else the legacy un-canonical ref."""
@@ -751,7 +803,10 @@ def evidence_from_dict(data: Mapping[str, object]) -> Evidence:
     """Rebuild validated Evidence (constructor re-checks hash/confidence)."""
     d = dict(data)
     provenance = validate_provenance(d.get("provenance", {}), "<evidence>: 'provenance'")
-    for key, expected in (("source_domain", evidence_domain(provenance)), ("integrity_class", evidence_integrity(provenance))):
+    for key, expected in (
+        ("source_domain", evidence_domain(provenance)),
+        ("integrity_class", evidence_integrity(provenance)),
+    ):
         raw = d.get(key)
         if raw is not None and raw != expected:
             raise EvidenceIntegrityError(f"evidence: '{key}' must match provenance-derived {expected!r}, got {raw!r}")
@@ -813,6 +868,7 @@ def _bundle_source_url(evidence: Evidence) -> str:
         return f"https://www.sec.gov/Archives/edgar/data/{bare}"
     return ""
 
+
 def _bundle_locator(evidence: Evidence) -> dict[str, JSONValue]:
     """Source locator: document + kernel-materialized window coordinates (the reload recipe)."""
     prov = evidence.provenance if isinstance(evidence.provenance, Mapping) else {}
@@ -826,6 +882,7 @@ def _bundle_locator(evidence: Evidence) -> dict[str, JSONValue]:
     locator["start"] = offset if isinstance(offset, int) and not isinstance(offset, bool) else None
     locator["end"] = end if isinstance(end, int) and not isinstance(end, bool) else None
     return locator
+
 
 def evidence_bundle_entry(evidence: Evidence, *, accepted_at: str | None = None) -> dict[str, JSONValue]:
     """Per-session bundle evidence entry: the 12-file Contract fields with exact model-visible text."""

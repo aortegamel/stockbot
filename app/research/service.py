@@ -29,6 +29,7 @@ from .evidence import (
     ingest_evidence,
     normalize_accession,
     search_run_ref,
+    sec_record_ref,
     sec_source_ref,
     web_source_ref,
 )
@@ -713,18 +714,21 @@ def _observed_provenance(
 ) -> MaterializedEvidenceSource | dict[str, JSONValue]:
     """Kernel-materialized provenance for an observed fact, routed by the owning job's domain.
 
-    SEC jobs reload a get_sec_document handle from the archive. FINRA/WEB jobs
-    replay a persisted staged tool result the kernel stored at dispatch time; a
-    citation naming no persisted result fails ERR_RAW_SOURCE_REQUIRED, and one
-    naming bytes the persisted result does not reproduce fails
-    ERR_PASSAGE_NOT_IN_SOURCE. A bare row/URL with no persisted result is
-    navigation at best, never evidence.
+    SEC jobs reload a get_sec_document handle from the archive, else replay a
+    persisted SEC structured tool result. FINRA/WEB jobs replay a persisted
+    staged tool result the kernel stored at dispatch time; a citation naming
+    no persisted result fails ERR_RAW_SOURCE_REQUIRED, and one naming bytes
+    the persisted result does not reproduce fails ERR_PASSAGE_NOT_IN_SOURCE.
+    A bare row/URL with no persisted result is navigation at best, never
+    evidence.
     """
     domain = (job.source_domain or "SEC").upper() if job is not None else "SEC"
     if domain == "FINRA":
         return _finra_provenance(data, job, store=store, session_id=session_id)
     if domain == "WEB":
         return _web_provenance(data, job, store=store, session_id=session_id)
+    if isinstance(data.get("tool_result_id"), str) and data.get("tool_result_id"):
+        return _sec_record_provenance(data, job, store=store, session_id=session_id)
     return _sec_provenance(data, as_of=as_of)
 
 
@@ -761,6 +765,30 @@ _FINRA_EVIDENCE_TOOLS: frozenset[str] = frozenset(
     }
 )
 """FINRA tools whose persisted results can ground a finra_record (catalog reads excluded)."""
+
+_SEC_REPLAY_TOOLS: frozenset[str] = frozenset(
+    {
+        "list_sec_filings",
+        "get_sec_filing",
+        "get_insider_activity",
+        "get_planned_insider_sales",
+        "get_fundamentals",
+        "get_beneficial_ownership",
+        "get_ownership_changes",
+        "get_offering_history",
+        "get_dilution_profile",
+        "get_governance_events",
+        "get_transaction_status",
+        "get_financial_statements",
+        "get_xbrl_facts",
+        "get_obligations",
+        "get_valuation_metrics",
+        "get_recent_ownership_filings",
+        "get_material_events",
+        "search_sec_filings",
+    }
+)
+"""SEC structured tools whose persisted results can ground a sec_record (document reads excluded)."""
 
 
 def _tool_result_ref(data: Mapping[str, object], domain: str) -> str:
@@ -865,6 +893,100 @@ def _finra_provenance(
         dataset=dataset if isinstance(dataset, str) else None,
         source_uri=_svc_opt_str(data, "source_uri"),
         known_at=_finra_known_at(result),
+        tool_result_id=ref_id,
+    )
+
+
+def _sec_record_texts(result: Mapping[str, object]) -> list[str]:
+    """Citable texts of one persisted SEC structured result: each row JSON + envelope JSON."""
+    texts: list[str] = []
+    payload = result.get("result")
+    payload = payload if isinstance(payload, Mapping) else result
+    for key in ("filings", "transactions", "quarterly_eps", "facts", "rows", "records", "documents", "events"):
+        rows = payload.get(key)
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, Mapping):
+                    texts.append(_normalize_record_text(json.dumps(dict(row), sort_keys=True, default=str)))
+                elif isinstance(row, (str, int, float)):
+                    texts.append(_normalize_record_text(str(row)))
+    texts.append(_normalize_record_text(json.dumps(dict(payload), sort_keys=True, default=str)))
+    return [text for text in texts if text]
+
+
+def _sec_record_known_at(data: Mapping[str, object], payload: Mapping[str, object]) -> str | None:
+    """Caller-known_at wins (structured tools report their own filing dates); else payload scan."""
+    for key in ("known_at", "filed_at", "accepted_at", "published_at", "as_of_date"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for key in ("known_at", "filed_at", "accepted_at", "published_at", "as_of_date"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _sec_record_provenance(
+    data: Mapping[str, object],
+    job: Job | None = None,
+    *,
+    store: ResearchRepository | None = None,
+    session_id: str | None = None,
+) -> dict[str, JSONValue]:
+    """SecRecordRef replayed against the persisted SEC structured tool result."""
+    from .repository import ResearchRepository as _RR
+
+    ref_id = _tool_result_ref(data, "SEC")
+    locator = _normalize_record_text(_first_text(data, (*_PASSAGE_KEYS, "record_identity")))
+    if not locator:
+        raise ValueError(
+            "record_evidence: ERR_RAW_SOURCE_REQUIRED (an SEC citation names the persisted "
+            "tool result id plus the record values you are citing.)"
+        )
+    try:
+        repo = store if store is not None else _RR()
+        result = repo.get_tool_result(ref_id)
+    except KeyError:
+        raise ValueError(
+            "record_evidence: ERR_RAW_SOURCE_REQUIRED (unknown persisted SEC tool result; "
+            "cite the tool_result_id the kernel returned for the response you read.)"
+        ) from None
+    other = result.get("session_id")
+    if isinstance(session_id, str) and session_id and isinstance(other, str) and other and other != session_id:
+        raise ValueError(
+            f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} belongs to session {other!r}, not {session_id!r})"
+        )
+    tool_name = str(result.get("tool_name") or "")
+    if tool_name not in _SEC_REPLAY_TOOLS:
+        raise ValueError(
+            f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} is {tool_name!r}, not SEC records)"
+        )
+    if job is not None:
+        allowed = _submit_subtree_job_ids(repo, job)
+        if str(result.get("job_id")) not in allowed:
+            raise ValueError(
+                f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} not in wave {job.wave_id} {(job.source_domain or 'SEC').upper()} lane)"
+            )
+    texts = _sec_record_texts(result)
+    if not any(locator in text for text in texts):
+        raise ValueError(
+            "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE (the cited record values do not appear "
+            "in the persisted SEC tool result)"
+        )
+    payload = result.get("result")
+    payload = payload if isinstance(payload, Mapping) else result
+    source_uri = _svc_opt_str(data, "source_uri")
+    if source_uri is None and isinstance(payload, Mapping):
+        raw_uri = payload.get("source") or payload.get("source_url")
+        if isinstance(raw_uri, str) and raw_uri.strip():
+            source_uri = raw_uri.strip()
+    return sec_record_ref(
+        tool_name=tool_name,
+        record_identity=locator[:2000],
+        dataset=str(payload.get("subject") or payload.get("ticker") or "") or None,
+        source_uri=source_uri,
+        known_at=_sec_record_known_at(data, payload if isinstance(payload, Mapping) else {}),
         tool_result_id=ref_id,
     )
 
@@ -1601,15 +1723,15 @@ def persist_tool_result(
     *,
     repo: ResearchRepository | Path | str | None = None,
 ) -> dict[str, JSONValue]:
-    """Persist one staged tool result for FINRA/WEB evidence replay; returns its id.
+    """Persist one staged tool result for FINRA/WEB/SEC-replay evidence; returns its id.
 
     Only staged source/scout jobs persist results, and only the tool the job's
-    domain owns (FINRA tools on FINRA jobs, search_web on WEB jobs). SEC jobs
-    never persist tool results: their evidence replays the archive instead.
-    Resume is idempotent: a repeated persist of the same id keeps the first
-    bytes and returns the same id.
+    domain owns (FINRA tools on FINRA jobs, search_web on WEB jobs, SEC replay
+    tools on SEC jobs). Document reads never persist: their evidence replays
+    the archive instead. Resume is idempotent: a repeated persist of the same
+    id keeps the first bytes and returns the same id.
     """
-    from .agents.source_agent import is_finra_tool, is_web_tool
+    from .agents.source_agent import is_finra_tool, is_sec_tool, is_web_tool
 
     store = _repo(repo)
     _found, job = _live_evidence_job(store, session_id, job_id)
@@ -1620,6 +1742,9 @@ def persist_tool_result(
     elif domain == "WEB":
         if not is_web_tool(tool_name):
             raise ValueError(f"persist_tool_result: tool {tool_name!r} cannot ground WEB evidence for job {job_id!r}")
+    elif domain == "SEC":
+        if not is_sec_tool(tool_name) or tool_name not in _SEC_REPLAY_TOOLS:
+            raise ValueError(f"persist_tool_result: tool {tool_name!r} cannot ground SEC replay for job {job_id!r}")
     else:
         raise ValueError(f"persist_tool_result: job {job_id!r} domain {job.source_domain!r} persists no tool results")
     rid = (
