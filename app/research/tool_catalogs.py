@@ -2,9 +2,9 @@
 
 Groups the JEV registry by tool-discovery domain so one small JEV choice
 picks a catalog first; the normal select round then runs over the winning
-subset only. The kernel worker routes the default flow through
-catalog_select_round; STOCKBOT_TOOLFLOW=full/whole/direct keeps the old
-whole-registry select as an escape hatch (programmatic keeps its own router).
+subset only. Opt-in via STOCKBOT_TOOLFLOW=catalog (default is the programmatic
+router: code first, JEV only on ambiguity); STOCKBOT_TOOLFLOW=full/whole/direct
+keeps the whole-registry select as an escape hatch.
 """
 
 import logging

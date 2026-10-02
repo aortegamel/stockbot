@@ -439,15 +439,20 @@ def _create_nodes_topological(sid: str, objective: str, admitted: list[dict[str,
             id_to_node[pid] = node_id
 
 
+def _toolflow() -> str:
+    """Normalized STOCKBOT_TOOLFLOW ("" = programmatic default)."""
+    return (os.environ.get("STOCKBOT_TOOLFLOW") or "").strip().lower()
+
+
 def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
-    """JEV-first entry route: winner over reasoning_required + every canonical tool + research_required. Fail-open to research; zero session/DB."""
+    """Programmatic-fast entry route: code signals -> research_required, else JEV decides. Fail-open to research; zero session/DB."""
     raw_id = req.get("id")
     rid = raw_id if isinstance(raw_id, str) else "?"
     prompt = req.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         logger.info("toolflow route rid=%s route=research_required reason=blank-prompt", rid)
         return {"id": rid, "route": "research_required"}
-    if (os.environ.get("STOCKBOT_TOOLFLOW") or "").strip().lower() == "programmatic":
+    if _toolflow() not in ("catalog", "full", "whole", "direct"):
         from app.research.programmatic_router import programmatic_route
 
         fast = programmatic_route(prompt.strip())
@@ -669,13 +674,14 @@ def _run(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str
     from app.research import scheduler
     from app.research.repository import ResearchRepository
 
+    # Programmatic default (code first, JEV only on ambiguity); "catalog" restores
+    # two-step JEV; "full"/"whole"/"direct" keep the whole-registry JEV escape hatch.
+    _flow = _toolflow()
     select_round = None
-    _flow = (os.environ.get("STOCKBOT_TOOLFLOW") or "").strip().lower()
-    if _flow == "programmatic":
-        from app.research.programmatic_router import programmatic_select_round as select_round
-    elif _flow in ("", "catalog"):
+    if _flow in ("catalog",):
         from app.research.tool_catalogs import catalog_select_round as select_round
-    # _flow in ("full", "whole", "direct") -> None (whole-registry select escape hatch)
+    elif _flow not in ("full", "whole", "direct"):
+        from app.research.programmatic_router import programmatic_select_round as select_round
 
     raw_id = req.get("id")
     rid = raw_id if isinstance(raw_id, str) else "?"

@@ -1,10 +1,10 @@
-"""Programmatic first-hop router: deterministic select_round variant.
+"""Programmatic first-hop router: deterministic select_round variant (default flow).
 
 Order: state gates -> explicit phrase rules -> lexical scorer margin ->
 JEV over top-5 only (reasoner/LLM only on genuine ambiguity, via the normal
 JEV path). Plugs into the scheduler's select_round hook, same as
-tool_catalogs.catalog_select_round; the kernel uses it only when
-STOCKBOT_TOOLFLOW=programmatic. Default flow untouched.
+tool_catalogs.catalog_select_round; the kernel uses it unless
+STOCKBOT_TOOLFLOW=catalog (two-step JEV) or full/whole/direct (whole registry).
 
 Reuses: app.tools normalizer/scorer/ambiguity helpers, scheduler ticker,
 company, accession, and record helpers, models.ToolDecision contract.
