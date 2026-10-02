@@ -142,6 +142,19 @@ def test_arguments_uses_shared_needle_and_schema_fallback(monkeypatch: pytest.Mo
     }
     seen = gen.seen[0]
     assert isinstance(seen, dict) and seen["schema"] == {"type": "object"}
+    assert isinstance(seen.get("objective"), str) and seen["objective"] == "short interest?"
+
+
+def test_kernel_worker_stamps_route_assess_and_node() -> None:
+    jev = _JevRoute("get_current_time")
+    out = kw._route({"id": "r1", "op": "route", "prompt": "what time is it?"}, jev=jev)  # type: ignore[arg-type]
+    assert out == {"id": "r1", "route": "get_current_time"}
+    assert isinstance(jev.seen[0][0], str) and jev.seen[0][0].startswith("[Today UTC ")
+    assess = _JevAssess("node_resolved")
+    kw._assess_entry({"id": "s1", "prompt": "risk?", "tool": "t", "result": {}}, jev=assess)  # type: ignore[arg-type]
+    assert isinstance(assess.seen[0][0], str) and assess.seen[0][0].startswith("[Today UTC ")
+    prompt = kw._decompose_prompt("rs:test", "objective?", None)
+    assert "[Today UTC " in prompt.split("CONTEXT: ", 1)[1]
 
 
 def test_arguments_mismatch_is_error_never_raise(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -149,6 +162,67 @@ def test_arguments_mismatch_is_error_never_raise(monkeypatch: pytest.MonkeyPatch
     out = kw._arguments({"id": "a2", "op": "arguments", "tool": "query_finra"})
     assert out["id"] == "a2" and "error" in out
     assert "error" in kw._arguments({"id": "a3"})
+
+
+def test_arguments_withhold_seeds_sec_and_sho(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Needle withhold seeds SEC identifier / SHO ticker+company; unseedable stays error."""
+
+    def _boom(**kwargs: object) -> object:
+        raise RuntimeError("needle tool mismatch: jev selected 'x', needle emitted None")
+
+    monkeypatch.setattr(kw, "_shared_needle_generate", lambda: _boom)
+    sho = kw._arguments(
+        {
+            "id": "s1",
+            "tool": "get_reg_sho_volume",
+            "objective": "What does FINRA Reg SHO daily short volume show for Apple this week?",
+        }
+    )
+    assert sho["arguments"] == {"ticker": "AAPL", "company_name": "Apple"}
+    sec = kw._arguments({"id": "s2", "tool": "list_sec_filings", "objective": "What drove NVDA revenue last quarter?"})
+    assert sec["arguments"] == {"identifier": "NVDA", "forms": ["10-Q", "10-K", "8-K"]}
+    none = kw._arguments({"id": "s3", "tool": "get_reg_sho_volume", "objective": "Which filings mention Elon Musk?"})
+    assert none["id"] == "s3" and "error" in none
+
+
+def test_arguments_repairs_needle_placeholders(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Needle placeholder forms / org ticker repair through the shared scheduler path."""
+
+    def _gen(**kwargs: object) -> object:
+        tool = kwargs.get("tool")
+        if tool == "list_sec_filings":
+            return {
+                "tool": tool,
+                "arguments": {"identifier": "NVDA", "forms": ["YYYY-MM-DD"]},
+                "confidence": 0.8,
+                "reasoning": "r",
+            }
+        return {
+            "tool": tool,
+            "arguments": {"ticker": "FINRA", "company_name": "Apple"},
+            "confidence": 0.8,
+            "reasoning": "r",
+        }
+
+    monkeypatch.setattr(kw, "_shared_needle_generate", lambda: _gen)
+    sec = kw._arguments(
+        {
+            "id": "r1",
+            "tool": "list_sec_filings",
+            "objective": "What drove NVDA revenue last quarter?",
+            "schema": {"type": "object"},
+        }
+    )
+    assert sec["arguments"] == {"identifier": "NVDA", "forms": ["10-Q", "10-K", "8-K"]}
+    sho = kw._arguments(
+        {
+            "id": "r2",
+            "tool": "get_reg_sho_volume",
+            "objective": "What does FINRA Reg SHO daily short volume show for Apple this week?",
+            "schema": {"type": "object"},
+        }
+    )
+    assert sho["arguments"] == {"ticker": "AAPL", "company_name": "Apple"}
 
 
 class _JevAssess:
@@ -180,3 +254,45 @@ def test_assess_entry_outage_and_blank_fail_open_to_research() -> None:
     assert out == {"id": "s2", "verdict": "research_required"}
     out = kw._assess_entry({"id": "s3", "prompt": "  ", "tool": "t"}, jev=_JevAssess("node_resolved"))  # type: ignore[arg-type]
     assert out == {"id": "s3", "verdict": "research_required"}
+
+
+def test_entry_prompts_carry_temporal_decoding() -> None:
+    import asyncio
+
+    from app.decision_client import JevClient
+
+    seen: dict[str, object] = {}
+
+    async def _stub(state: object, questions: object) -> object:
+        seen["questions"] = questions
+        assert isinstance(questions, dict)
+        qid = next(iter(questions))
+        opts = questions[qid]["criteria"] if isinstance(questions[qid], dict) else {}
+        assert isinstance(opts, dict)
+        winner = "reasoning_required" if "reasoning_required" in opts else next(iter(opts))
+        return {
+            "answers": {
+                qid: {
+                    "type": "choice",
+                    "choice": winner,
+                    "probabilities": dict.fromkeys(opts, 0.0) | {winner: 1.0},
+                    "confidence": 1.0,
+                }
+            }
+        }
+
+    client = JevClient(transport=_stub, data_root=__import__("pathlib").Path("/tmp"))
+    client._persist = lambda **kwargs: None  # type: ignore[method-assign]
+    out = asyncio.run(client.route_entry("hello"))
+    assert out == "reasoning_required"
+    entry_q = seen["questions"]
+    assert isinstance(entry_q, dict)
+    entry_text = str(next(iter(entry_q.values()))["instructions"])
+    assert "Today UTC is" in entry_text and "decode relative dates before choosing" in entry_text
+    seen.clear()
+    verdict = asyncio.run(client.assess_entry_tool("risk?", "search_sec_filings", {}, {"ok": True}))
+    assert verdict in ("reasoning_required", "research_required", "node_resolved") or isinstance(verdict, str)
+    assess_q = seen["questions"]
+    assert isinstance(assess_q, dict)
+    assess_text = str(next(iter(assess_q.values()))["instructions"])
+    assert "Today UTC is" in assess_text and "decode relative dates before choosing" in assess_text

@@ -2878,7 +2878,7 @@ def test_reg_negatives_coverage_present() -> None:
 
     # Evidence is kernel-replayed claims only: a search-derived absence is coverage state.
     assert CLAIM_KINDS == ("observed_fact",)
-    assert PROVENANCE_KINDS == ("sec_source", "finra_record", "web_source", "search_run", "none")
+    assert PROVENANCE_KINDS == ("sec_source", "sec_record", "finra_record", "web_source", "search_run", "none")
     cov = default_coverage()
     for key in ("forms", "sources_examined", "complete", "exclusions"):
         assert key in cov, sorted(cov.keys())
@@ -3354,6 +3354,12 @@ def test_crap_temporal_patterns() -> None:
     assert last2["mode"] == "range" and str(last2["start"])[:4] == "2023"
     lastyr = resolve_temporal_scope(temporal="last year", now=now)
     assert (lastyr["start"], lastyr["end"]) == ("2024-01-01", "2024-12-31")
+    lastq = resolve_temporal_scope(query="What drove NVDA revenue last quarter?", now=now)
+    assert lastq["mode"] == "range" and (lastq["start"], lastq["end"]) == ("2025-01-01", "2025-03-31")
+    thisw = resolve_temporal_scope(query="Apple news this week", now=now)
+    assert thisw["mode"] == "range" and thisw["start"] == "2025-06-23" and str(thisw["end"])[:10] == "2025-06-30"
+    lastw = resolve_temporal_scope(temporal="last week", now=now)
+    assert lastw["mode"] == "range" and (lastw["start"], lastw["end"]) == ("2025-06-16", "2025-06-22")
     assert resolve_temporal_scope(temporal="before earnings", now=now)["mode"] == "as_of"
     assert resolve_temporal_scope(temporal="latest available data", now=now)["mode"] == "latest-available"
     assert resolve_temporal_scope(temporal="most recent filing", now=now)["mode"] == "as_of"
@@ -4915,11 +4921,9 @@ def test_counterparty_queries_are_assigned_unscoped() -> None:
 # Hedgefund MVP slice: SEC+FINRA+WEB domains under the kernel's source policy.
 # All offline (fake archive seam, no network). Live golden coverage stays with
 # the opt-in verify:hedgefund-live script, never pytest.
-# Contract pins (peer-owned, tests only assert behavior + existing codes):
-# - domains SEC|FINRA|WEB; provenance sec_source|finra_record|web_source|search_run|none (closed;
-#   FINRA/WEB only via persisted-result replay, bare rows fail closed with ERR_RAW_SOURCE_REQUIRED);
-# - integrity SEC=PRIMARY_DOCUMENT FINRA=CANONICAL_STRUCTURED WEB=EXTERNAL_SOURCE
-#   (kernel-assigned; committee md files name them, kernel stores the raw ref);
+# - domains SEC|FINRA|WEB; provenance sec_source|sec_record|finra_record|web_source|search_run|none (closed;
+#   FINRA/WEB/SEC-replay only via persisted-result replay, bare rows fail closed with ERR_RAW_SOURCE_REQUIRED);
+# - integrity SEC=PRIMARY_DOCUMENT/CANONICAL_STRUCTURED FINRA=CANONICAL_STRUCTURED WEB=EXTERNAL_SOURCE
 # - session source policy {mode:allowlist,allowed:[]} default SEC-only;
 # - agents sec-agent/finra-agent/exa-agent + scouts; stockbot.yml async off, depth 3;
 # - Wave1 one OMP task batch with 3 desks; targeted waves only requested desks;
@@ -5655,7 +5659,7 @@ def test_hf_resume_after_one_committee_no_dup(tmp_path: Path, monkeypatch: pytes
 
 
 def test_hf_provenance_vocab_closed() -> None:
-    """Provenance kinds are closed at five: sec_source|finra_record|web_source|search_run|none all validate.
+    """Provenance kinds are closed at six: sec_source|sec_record|finra_record|web_source|search_run|none all validate.
 
     Bare FINRA rows / bare URLs still fail closed at admission (ERR_RAW_SOURCE_REQUIRED):
     only tool_result_id refs replayed against persisted tool results ground finra/web evidence.
@@ -5664,12 +5668,13 @@ def test_hf_provenance_vocab_closed() -> None:
         PROVENANCE_KINDS,
         finra_record_ref,
         search_run_ref,
+        sec_record_ref,
         sec_source_ref,
         validate_provenance,
         web_source_ref,
     )
 
-    assert set(PROVENANCE_KINDS) == {"sec_source", "finra_record", "web_source", "search_run", "none"}
+    assert set(PROVENANCE_KINDS) == {"sec_source", "sec_record", "finra_record", "web_source", "search_run", "none"}
     assert validate_provenance({"kind": "none"}) == {"kind": "none"}
     assert validate_provenance(search_run_ref(search_id="s1", query="q"))["kind"] == "search_run"
     sec = sec_source_ref(
@@ -5682,6 +5687,8 @@ def test_hf_provenance_vocab_closed() -> None:
         text_hash="ab" * 32,
     )
     assert validate_provenance(dict(sec))["kind"] == "sec_source"
+    rec = sec_record_ref(tool_name="get_sec_filing", record_identity="row-1")
+    assert validate_provenance(dict(rec))["kind"] == "sec_record"
     fin = finra_record_ref(tool_name="query_finra", record_identity="row-1")
     assert validate_provenance(dict(fin))["kind"] == "finra_record"
     web = web_source_ref(url="https://example.com/a", excerpt="highlight text")

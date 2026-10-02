@@ -844,12 +844,16 @@ def test_materialize_sec_passage_fails_closed_per_handle_defect() -> None:
             call_untyped(defect, passage)
     # Legacy/extra content_hash is ignored, never invalid: old handles still materialize.
     assert materialize_sec_passage(legacy_content, passage).provenance["passage"] == passage
-    assert materialize_sec_passage({k: v for k, v in handle.items() if k != "content_hash"}, passage).provenance["passage"] == passage
+    assert (
+        materialize_sec_passage({k: v for k, v in handle.items() if k != "content_hash"}, passage).provenance["passage"]
+        == passage
+    )
     # A locator the reloaded window does not contain is never admitted, blank included.
     with pytest.raises(ValueError, match="ERR_PASSAGE_NOT_IN_SOURCE"):
         materialize_sec_passage(handle, "this sentence is not in the window")
     with pytest.raises(ValueError, match="ERR_PASSAGE_NOT_IN_SOURCE"):
         materialize_sec_passage(handle, "   ")
+
 
 def test_live_handle_survives_archival_when_text_hash_differs_from_source_bytes(tmp_path: Path) -> None:
     """Live binary/PDF handles stay valid after archival: text_hash names the window, source bytes name the revision."""
@@ -969,24 +973,28 @@ def test_acceptance_archives_verified_window_bytes_not_rendered_text(
     h1 = seam.handle_for_registered(first, accession=acc, document=doc)
     h2 = seam.handle_for_registered(second, accession=acc, document=doc)
     out1 = svc.record_evidence(
-        sid, src, _item(f"{sid}:ev:1", matching_passage=first, source_handle=h1,
-                        source_record_id=acc, document_name=doc), repo=repo
+        sid,
+        src,
+        _item(f"{sid}:ev:1", matching_passage=first, source_handle=h1, source_record_id=acc, document_name=doc),
+        repo=repo,
     )
     out2 = svc.record_evidence(
-        sid, src, _item(f"{sid}:ev:2", matching_passage=second, source_handle=h2,
-                        source_record_id=acc, document_name=doc), repo=repo
+        sid,
+        src,
+        _item(f"{sid}:ev:2", matching_passage=second, source_handle=h2, source_record_id=acc, document_name=doc),
+        repo=repo,
     )
     for out in (out1, out2):
         stored = repo.get_evidence(str(out["evidence_id"]))
         provenance = stored["provenance"]
         assert isinstance(provenance, dict)
-        found = find_archived_document(str(provenance["accession_no"]), str(provenance["document_name"]), root=tmp_path / "raw")
+        found = find_archived_document(
+            str(provenance["accession_no"]), str(provenance["document_name"]), root=tmp_path / "raw"
+        )
         assert found is not None
         assert found.payload_path.read_bytes() == full.encode("utf-8")
         assert len(full) > len(first) and len(full) > len(second)
     assert documents.get_sec_document(acc, doc, as_of="2025-06-30", data_root=tmp_path)["text"] == full
-
-
 
 
 def test_acceptance_archive_failure_raises_without_row_event_or_link(
@@ -1011,9 +1019,7 @@ def test_acceptance_archive_failure_raises_without_row_event_or_link(
     assert [e for e in repo.list_events(sid) if e.event_type == "evidence.accepted"] == []
 
 
-def test_source_bytes_unavailable_emits_no_source_artifact(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_source_bytes_unavailable_emits_no_source_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Missing exact bytes fail closed: no row, no event, no session link."""
     monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
     repo = _repo(tmp_path, monkeypatch)
@@ -1027,7 +1033,6 @@ def test_source_bytes_unavailable_emits_no_source_artifact(
     assert repo.list_evidence(sid) == []
     assert repo.list_evidence_ids(sid) == []
     assert [e for e in repo.list_events(sid) if e.event_type == "evidence.accepted"] == []
-
 
 
 def test_revision_switch_rejects_stale_handle_without_row_event_link_or_archive(
@@ -1048,8 +1053,10 @@ def test_revision_switch_rejects_stale_handle_without_row_event_link_or_archive(
     seam.register_document(acc, doc, rev_b)  # same cited span, changed bytes elsewhere
     with pytest.raises(ValueError, match="ERR_SEC_HANDLE_STALE"):
         svc.record_evidence(
-            sid, src, _item(f"{sid}:ev:1", matching_passage=window, source_handle=stale,
-                            source_record_id=acc, document_name=doc), repo=repo
+            sid,
+            src,
+            _item(f"{sid}:ev:1", matching_passage=window, source_handle=stale, source_record_id=acc, document_name=doc),
+            repo=repo,
         )
     assert repo.list_evidence(sid) == []
     assert repo.list_evidence_ids(sid) == []
@@ -1096,19 +1103,24 @@ def test_offline_archive_serves_acceptance_when_live_filing_unavailable(
     passage = "offline archived passage"
     full = f"offline header\n{passage}\noffline trailer"
     canonical_url = f"https://www.sec.gov/Archives/edgar/data/{acc.replace('-', '')}/{doc}"
-    _archive.archive_sec_document(acc, doc, full.encode("utf-8"), url=canonical_url,
-                                  retrieved_at="2025-05-01T00:00:00Z",
-                                  metadata={"known_at": "2025-05-01T00:00:00Z",
-                                            "filed_at": "2025-04-30",
-                                            "representation": "source_bytes"},
-                                  root=tmp_path / "raw")
+    _archive.archive_sec_document(
+        acc,
+        doc,
+        full.encode("utf-8"),
+        url=canonical_url,
+        retrieved_at="2025-05-01T00:00:00Z",
+        metadata={"known_at": "2025-05-01T00:00:00Z", "filed_at": "2025-04-30", "representation": "source_bytes"},
+        root=tmp_path / "raw",
+    )
     live = real_get_sec_document(acc, doc, as_of="2025-06-30", data_root=tmp_path)
     assert isinstance(live["text"], str) and passage in str(live["text"])
     handle = live["source_handle"]
     assert isinstance(handle, dict)
     out = svc.record_evidence(
-        sid, src, _item(f"{sid}:ev:1", matching_passage=passage, source_handle=handle,
-                        source_record_id=acc, document_name=doc), repo=repo
+        sid,
+        src,
+        _item(f"{sid}:ev:1", matching_passage=passage, source_handle=handle, source_record_id=acc, document_name=doc),
+        repo=repo,
     )
     stored = repo.get_evidence(str(out["evidence_id"]))
     provenance = stored["provenance"]
@@ -1117,9 +1129,7 @@ def test_offline_archive_serves_acceptance_when_live_filing_unavailable(
     assert found is not None and found.payload_path.read_bytes() == full.encode("utf-8")
 
 
-def test_canonical_url_wins_over_item_source_uri(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_canonical_url_wins_over_item_source_uri(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The stored source_uri and archive URL are the kernel's canonical URL, never the model string."""
     from app.sec.archive import find_archived_document
 
@@ -1132,14 +1142,23 @@ def test_canonical_url_wins_over_item_source_uri(
     handle = seam.handle_for_registered(passage, accession=acc, document=doc)
     canonical = f"https://www.sec.gov/Archives/edgar/data/{acc.replace('-', '')}/{doc}"
     out = svc.record_evidence(
-        sid, src, _item(f"{sid}:ev:1", matching_passage=passage, source_handle=handle,
-                        source_record_id=acc, document_name=doc,
-                        source_uri="https://evil.example/x"), repo=repo
+        sid,
+        src,
+        _item(
+            f"{sid}:ev:1",
+            matching_passage=passage,
+            source_handle=handle,
+            source_record_id=acc,
+            document_name=doc,
+            source_uri="https://evil.example/x",
+        ),
+        repo=repo,
     )
     stored = repo.get_evidence(str(out["evidence_id"]))
     assert stored["source_uri"] == canonical
     found = find_archived_document(acc, doc, root=tmp_path / "raw")
     assert found is not None and found.url == canonical
+
 
 def test_evidence_no_per_job_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo = _repo(tmp_path, monkeypatch)
@@ -2089,11 +2108,15 @@ def test_list_sessions_limit_clamp(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 # ---- pending_next_action arms ----
 def test_pna_execute_queued() -> None:
+    from app.research.models import SOURCE_RUNTIME_BUDGET_S
+
     s = _sess()
     j = _mkjob(s, "job:1", status="queued", jtype="source_agent")
     out = pending_next_action(s, [j])
     assert isinstance(out, dict)
     assert out["verb"] == "EXECUTE_JOB" and out["job_id"] == "job:1"
+    assert SOURCE_RUNTIME_BUDGET_S == 1800
+    assert out["budget_s"] == 1800
 
 
 def test_pna_targeted_research_verb() -> None:
@@ -2926,12 +2949,22 @@ def test_resolve_subject_ticker_name_unresolved() -> None:
 
 def test_resolve_subject_unresolved_guards() -> None:
     asof = datetime(2026, 6, 1, tzinfo=_dt.UTC)
-    assert resolve_subject(
-        ticker=None, name="", aliases_by_ticker=_aliases_empty, name_to_ticker=_name_none, as_of=asof
-    ).resolved is False
-    assert resolve_subject(
-        ticker=None, name="No Such Company XYZ 123", aliases_by_ticker=_aliases_empty, name_to_ticker=_name_none, as_of=asof
-    ).resolved is False
+    assert (
+        resolve_subject(
+            ticker=None, name="", aliases_by_ticker=_aliases_empty, name_to_ticker=_name_none, as_of=asof
+        ).resolved
+        is False
+    )
+    assert (
+        resolve_subject(
+            ticker=None,
+            name="No Such Company XYZ 123",
+            aliases_by_ticker=_aliases_empty,
+            name_to_ticker=_name_none,
+            as_of=asof,
+        ).resolved
+        is False
+    )
 
 
 # --- dividend_analysis: cadence + lifecycle arms ---
@@ -4205,7 +4238,7 @@ def test_execute_pit_flag_set(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
         return {"ok": True}
 
     monkeypatch.setitem(tools_mod._MODEL_HANDLERS, "get_fundamentals", _ok_model)
-    out = execute_tool("get_fundamentals", {"ticker": "NVDA", "metric": "revenue"}, "m", context=ctx)
+    out = execute_tool("get_fundamentals", {"ticker": "NVDA", "metric": "eps"}, "m", context=ctx)
     assert out.get("ok") is True
     out2 = tools_mod._with_pit_flag("search_web", {"ok": True}, ctx)
     assert out2.get("pit_safe") is False
@@ -4617,14 +4650,19 @@ def test_sec_document_offsets(monkeypatch: pytest.MonkeyPatch) -> None:
     assert tools_mod._doc_max_chars(3.9) == 3
     assert tools_mod._doc_max_chars(" 9 ") == 9
     assert tools_mod._doc_max_chars("") == 12000
-    out = execute_tool("get_sec_document", {"accession_no": "a", "offset": "3", "max_chars": "9"}, "m", context=RCTX)
+    out = execute_tool(
+        "get_sec_document",
+        {"accession_no": "0000320193-25-000079", "offset": "3", "max_chars": "9"},
+        "m",
+        context=RCTX,
+    )
     assert out == {"ok": True} and seen == {"offset": 3, "max_chars": 9}
 
     def _doc_boom(*a: object, **k: object) -> dict[str, object]:
         raise ValueError("bad acc")
 
     monkeypatch.setattr(tools_mod.sec, "get_sec_document", _doc_boom)
-    err = execute_tool("get_sec_document", {"accession_no": "a"}, "m", context=RCTX)
+    err = execute_tool("get_sec_document", {"accession_no": "0000320193-25-000079"}, "m", context=RCTX)
     assert err["error_type"] == "invalid_tool_arguments"
 
 
@@ -4959,7 +4997,7 @@ def test_research_read_arms(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert isinstance(sid_raw, str)
     sid = sid_raw
     bad_kind = execute_tool("research_read", {"session_id": sid, "kind": "nope", "resource_id": "r"}, "m", context=ctx)
-    assert bad_kind["error_type"] == "unknown_resource"
+    assert bad_kind["error_type"] == "invalid_tool_arguments"
     assert tools_mod._checked_resource_kind({"kind": "job"}) == "job"
     missing_session = execute_tool(
         "research_read", {"session_id": "nope", "kind": "job", "resource_id": "r"}, "m", context=ctx

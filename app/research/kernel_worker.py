@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from app.research.models import JSONValue
+from app.research.models import JSONValue, query_with_today_utc, utcnow
 
 if TYPE_CHECKING:
     from app.decision_client import JevClient
@@ -151,7 +151,7 @@ def _evidence_id(rec: Mapping[str, JSONValue], fallback: str) -> str:
 def _decompose_prompt(objective_id: str, objective: str, as_of: str | None) -> str:
     """Caller-built decompose prompt (mirrors decision/prompts.ts shape, no fictional)."""
     ctx: dict[str, object] = {
-        "objective": {"id": objective_id, "prompt": objective, "asOf": as_of},
+        "objective": {"id": objective_id, "prompt": query_with_today_utc(objective), "asOf": as_of},
         "evidence": [],
     }
     return (
@@ -169,6 +169,7 @@ def _decompose_prompt(objective_id: str, objective: str, as_of: str | None) -> s
         "Authority: propose questions, interpretations, and evidence requests ONLY. NEVER emit "
         "approved/selected/finalDecision/shouldContinue/verdict/decision/buy/sell/hold/order/portfolio/committee "
         "fields under any name. Research never decides; the user decides.\n"
+        f"Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values.\n"
         "Output exactly one JSON object and nothing else: no prose, no markdown fences.\n"
         f"\nCONTEXT: {json.dumps(ctx)}"
     )
@@ -200,7 +201,7 @@ def _propose_questions(objective: str, as_of: str | None, objective_id: str) -> 
     try:
         client = ReasonerClient(
             api_key=os.environ.get("OPENCODE_API_KEY", ""),
-            url=os.environ.get("OPENCODE_URL", "https://opencode.ai/zen/v1/responses"),
+            url=os.environ.get("OPENCODE_URL", "https://opencode.ai/zen/go/v1/responses"),
             model=os.environ.get("OPENCODE_MODEL", "muse-spark-1.3-contributor"),
         )
         out = client.decompose(_decompose_prompt(objective_id, objective, as_of), objective_id)
@@ -402,8 +403,13 @@ def run_graph_prompt(prompt: str, as_of: str | None = None, jev: JevClient | Non
     if hit:
         raise RuntimeError(f"registry guard forbids portfolio tools: {hit}")
     objective = prompt.strip()
-    sid = service.create_research(objective, objective, as_of=as_of)
-    service.create_node(sid, objective, "Route question.")
+    stamped = query_with_today_utc(objective)
+    # ponytail: multi-source graph path (JEV selects over the whole registry);
+    # SEC-only stays the default for narrow sessions created elsewhere.
+    sid = service.create_research(
+        objective, objective, as_of=as_of, policy={"research_sources": {"mode": "all", "sources": []}}
+    )
+    service.create_node(sid, stamped, "Route question.")
     return sid
 
 
@@ -441,10 +447,17 @@ def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[s
     if not isinstance(prompt, str) or not prompt.strip():
         logger.info("toolflow route rid=%s route=research_required reason=blank-prompt", rid)
         return {"id": rid, "route": "research_required"}
+    if (os.environ.get("STOCKBOT_TOOLFLOW") or "").strip().lower() == "programmatic":
+        from app.research.programmatic_router import programmatic_route
+
+        fast = programmatic_route(prompt.strip())
+        if fast is not None:
+            logger.info("toolflow route rid=%s route=%s via=programmatic", rid, fast)
+            return {"id": rid, "route": fast}
     logger.debug("toolflow route_entry rid=%s prompt=%.200s", rid, prompt.strip())
     try:
         client = jev if jev is not None else _shared_jev()
-        winner = asyncio.run(client.route_entry(prompt.strip()))
+        winner = asyncio.run(client.route_entry(query_with_today_utc(prompt.strip())))
         logger.info("toolflow route rid=%s route=%s", rid, winner)
         return {"id": rid, "route": winner}
     except Exception as exc:
@@ -530,7 +543,7 @@ def _arguments(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         objective = req.get("objective")
         if objective is None:
             objective = req.get("prompt")
-        prompt = objective if isinstance(objective, str) and objective.strip() else ""
+        prompt = objective if isinstance(objective, str) else ""
         schema_raw = req.get("schema")
         schema: JSONValue = validate_json_value(schema_raw if schema_raw is not None else {}, "<arguments>: 'schema'")
         if not isinstance(schema, dict) or not schema:
@@ -547,15 +560,45 @@ def _arguments(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         context: JSONValue = (
             validate_json_value(context_raw, "<arguments>: 'context'") if context_raw is not None else None
         )
-        generated = _shared_needle_generate()(tool=tool, schema=schema, objective=prompt, node=node, context=context)
+        generated: object = None
+        try:
+            generated = _shared_needle_generate()(
+                tool=tool, schema=schema, objective=prompt, node=node, context=context
+            )
+        except Exception:
+            generated = None
+        if generated is None:
+            # Scheduler-seeded fallback (explicit objective ticker/company,
+            # latest = no filing-date window); fail-open error when unseedable.
+            try:
+                from app.research import scheduler as _sched
+
+                seeded = _sched._fallback_sec_args(tool, prompt)
+            except Exception:
+                seeded = None
+            if isinstance(seeded, dict):
+                logger.info("toolflow arguments rid=%s tool=%s conf=no fallback=seeded", rid, tool)
+                return {
+                    "id": rid,
+                    "tool": tool,
+                    "arguments": seeded,
+                    "confidence": None,
+                    "reasoning": "seeded after Needle withhold",
+                }
+            logger.warning("toolflow arguments_fail_open rid=%s tool=%s err_type=NeedleWithhold", rid, tool)
+            return {"id": rid, "error": "needle arguments failed"}
         needle_tool: object = generated.get("tool", tool) if isinstance(generated, dict) else tool
         from app.needle_client import validate_needle_tool
 
         validate_needle_tool(tool, needle_tool)
         raw_args: object = generated.get("arguments", {}) if isinstance(generated, dict) else {}
-        arguments = validate_json_mapping(
-            dict(raw_args) if isinstance(raw_args, dict) else {}, "<arguments>: 'arguments'"
-        )
+        from app.research.scheduler import _repair_tool_arguments as _kw_repair
+
+        try:
+            repaired = _kw_repair(tool, dict(raw_args) if isinstance(raw_args, dict) else {}, prompt, "-", "-")
+        except Exception:
+            repaired: dict[str, JSONValue] = dict(raw_args) if isinstance(raw_args, dict) else {}
+        arguments = validate_json_mapping(repaired, "<arguments>: 'arguments'")
         out: dict[str, JSONValue] = {"id": rid, "tool": tool, "arguments": arguments}
         if isinstance(generated, dict):
             confidence = generated.get("confidence")
@@ -602,7 +645,9 @@ def _assess_entry(req: Mapping[str, JSONValue], jev: JevClient | None = None) ->
         raw_result = req.get("result")
         result_map: Mapping[str, JSONValue] = raw_result if isinstance(raw_result, dict) else {}
         client = jev if jev is not None else _shared_jev()
-        verdict = asyncio.run(client.assess_entry_tool(prompt.strip(), tool, args_map, result_map))
+        verdict = asyncio.run(
+            client.assess_entry_tool(query_with_today_utc(prompt.strip()), tool, args_map, result_map)
+        )
         if not isinstance(verdict, str) or not verdict:
             logger.warning(
                 "toolflow assess_fail_open rid=%s tool=%s verdict=research_required reason=blank-verdict", rid, tool
@@ -624,6 +669,14 @@ def _run(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str
     from app.research import scheduler
     from app.research.repository import ResearchRepository
 
+    select_round = None
+    _flow = (os.environ.get("STOCKBOT_TOOLFLOW") or "").strip().lower()
+    if _flow == "programmatic":
+        from app.research.programmatic_router import programmatic_select_round as select_round
+    elif _flow in ("", "catalog"):
+        from app.research.tool_catalogs import catalog_select_round as select_round
+    # _flow in ("full", "whole", "direct") -> None (whole-registry select escape hatch)
+
     raw_id = req.get("id")
     rid = raw_id if isinstance(raw_id, str) else "?"
     prompt = req.get("prompt")
@@ -642,9 +695,12 @@ def _run(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str
     except Exception as exc:
         return _terminal(rid, "provider_error", f"session setup failed: {exc}")
     try:
-        run_result: dict[str, JSONValue] = asyncio.run(
-            scheduler.run(sid, jev=client, needle_generate=_shared_needle_generate())
-        )
+        if select_round is not None:
+            run_result: dict[str, JSONValue] = asyncio.run(
+                scheduler.run(sid, jev=client, needle_generate=_shared_needle_generate(), select_round=select_round)
+            )
+        else:
+            run_result = asyncio.run(scheduler.run(sid, jev=client, needle_generate=_shared_needle_generate()))
     except Exception as exc:
         return _terminal(rid, "provider_error", f"kernel run failed: {exc}")
     if not isinstance(run_result, dict):

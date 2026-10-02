@@ -13,8 +13,9 @@ import re
 import uuid
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
+from zoneinfo import ZoneInfo
 
 JSONScalar = str | int | float | bool | None
 type JSONValue = JSONScalar | list[JSONValue] | dict[str, JSONValue]
@@ -60,6 +61,23 @@ def validate_json_mapping(value: object, where: str = "<dict>") -> dict[str, JSO
 def utcnow() -> datetime:
     """Current UTC timestamp."""
     return datetime.now(UTC)
+
+
+def query_with_today_utc(text: str, today: date | datetime | str | None = None) -> str:
+    """Prefix a query/objective with `[Today UTC YYYY-MM-DD]` (idempotent)."""
+    if not isinstance(text, str) or not text.strip():
+        return text
+    if "[Today UTC " in text:
+        return text
+    if today is None:
+        day = utcnow().date().isoformat()
+    elif isinstance(today, datetime):
+        day = today.date().isoformat()
+    elif isinstance(today, date):
+        day = today.isoformat()
+    else:
+        day = today.strip() or utcnow().date().isoformat()
+    return f"[Today UTC {day}] {text}"
 
 
 def normalize_time(value: datetime) -> datetime:
@@ -153,7 +171,8 @@ class FailureCategory(StrEnum):
 
 # Control-plane bounds: single authority for source runtime and heartbeat staleness.
 # Budgets are session/tool/token/cost totals only; no per-source numeric gate.
-SOURCE_RUNTIME_BUDGET_S = 600
+# 1800s headroom: the 61s evidence-denial dispatch (rs:7506fb7f) must never hit a job wall clock.
+SOURCE_RUNTIME_BUDGET_S = 1800
 HEARTBEAT_STALE_S = 120
 # ponytail: single nested defaults dict; per-job overrides only via explicit
 # create_job kwargs. Add sections when a new job type needs children/tools.
@@ -306,7 +325,10 @@ _TEMPORAL_BETWEEN_RE = re.compile(r"\bbetween\s+(\d{4}-\d{2}-\d{2})\s+and\s+(\d{
 _TEMPORAL_AS_OF_RE = re.compile(r"\bas\s+of\s+(\d{4}-\d{2}-\d{2})\b", re.IGNORECASE)
 _TEMPORAL_LAST_N_RE = re.compile(r"\blast\s+(\d+)\s+years?\b", re.IGNORECASE)
 _TEMPORAL_LAST_YEAR_RE = re.compile(r"\blast\s+year\b", re.IGNORECASE)
+_TEMPORAL_LAST_QUARTER_RE = re.compile(r"\blast\s+quarter\b", re.IGNORECASE)
 _TEMPORAL_QUARTER_RE = re.compile(r"\bthis\s+quarter\b", re.IGNORECASE)
+_TEMPORAL_THIS_WEEK_RE = re.compile(r"\bthis\s+week\b", re.IGNORECASE)
+_TEMPORAL_LAST_WEEK_RE = re.compile(r"\blast\s+week\b", re.IGNORECASE)
 _TEMPORAL_LATEST_RE = re.compile(r"\blatest[\s-]*available\b", re.IGNORECASE)
 _TEMPORAL_NOW_RE = re.compile(r"\b(today|right\s+now|as\s+of\s+now|most\s+recent|current|latest)\b", re.IGNORECASE)
 
@@ -346,6 +368,50 @@ def _temporal_quarter_range(moment: datetime, raw: str | None) -> dict[str, JSON
     return {"as_of": moment.isoformat(), "start": q0, "end": moment.isoformat(), "mode": "range", "raw": raw}
 
 
+def _temporal_last_quarter_range(moment: datetime, raw: str | None) -> dict[str, JSONValue]:
+    """Range over the prior calendar quarter (UTC dates)."""
+    q_start = date(moment.year, 3 * ((moment.month - 1) // 3) + 1, 1)
+    prev_end = q_start - timedelta(days=1)
+    prev_start = date(prev_end.year, 3 * ((prev_end.month - 1) // 3) + 1, 1)
+    return {
+        "as_of": prev_end.isoformat(),
+        "start": prev_start.isoformat(),
+        "end": prev_end.isoformat(),
+        "mode": "range",
+        "raw": raw,
+    }
+
+
+_NYC = ZoneInfo("America/New_York")
+
+
+def _nyc_monday(moment: datetime) -> date:
+    """Monday of the NYC calendar week containing moment (exchanges run on NYC dates)."""
+    aware = moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+    nyc_day = aware.astimezone(_NYC).date()
+    return nyc_day - timedelta(days=nyc_day.weekday())
+
+
+def _temporal_this_week_range(moment: datetime, raw: str | None) -> dict[str, JSONValue]:
+    """Range from Monday 00:00 NYC through now."""
+    monday = _nyc_monday(moment)
+    return {
+        "as_of": moment.isoformat(),
+        "start": monday.isoformat(),
+        "end": moment.isoformat(),
+        "mode": "range",
+        "raw": raw,
+    }
+
+
+def _temporal_last_week_range(moment: datetime, raw: str | None) -> dict[str, JSONValue]:
+    """Range over the prior calendar week (Mon-Sun, NYC dates)."""
+    monday_this = _nyc_monday(moment)
+    start = monday_this - timedelta(days=7)
+    end = monday_this - timedelta(days=1)
+    return {"as_of": end.isoformat(), "start": start.isoformat(), "end": end.isoformat(), "mode": "range", "raw": raw}
+
+
 def _temporal_moment_asof(moment: datetime, raw: str | None, mode: str) -> dict[str, JSONValue]:
     """Cutoff pinned at now for pre-earnings/today/latest wording (no range)."""
     return {"as_of": moment.isoformat(), "start": None, "end": None, "mode": mode, "raw": raw}
@@ -354,7 +420,10 @@ def _temporal_moment_asof(moment: datetime, raw: str | None, mode: str) -> dict[
 _TEMPORAL_SIMPLE_TABLE = (
     ("last_n", _TEMPORAL_LAST_N_RE),
     ("last_year", _TEMPORAL_LAST_YEAR_RE),
+    ("last_quarter", _TEMPORAL_LAST_QUARTER_RE),
     ("quarter", _TEMPORAL_QUARTER_RE),
+    ("this_week", _TEMPORAL_THIS_WEEK_RE),
+    ("last_week", _TEMPORAL_LAST_WEEK_RE),
     ("earnings", _TEMPORAL_EARNINGS_RE),
     ("latest", _TEMPORAL_LATEST_RE),
     ("now", _TEMPORAL_NOW_RE),
@@ -374,8 +443,14 @@ def _temporal_simple_hit(name: str, hit: re.Match[str], moment: datetime, raw: s
         }
     if name == "last_year":
         return _temporal_last_year_range(moment, raw)
+    if name == "last_quarter":
+        return _temporal_last_quarter_range(moment, raw)
     if name == "quarter":
         return _temporal_quarter_range(moment, raw)
+    if name == "this_week":
+        return _temporal_this_week_range(moment, raw)
+    if name == "last_week":
+        return _temporal_last_week_range(moment, raw)
     if name == "latest":
         return _temporal_moment_asof(moment, raw, "latest-available")
     return _temporal_moment_asof(moment, raw, "as_of")

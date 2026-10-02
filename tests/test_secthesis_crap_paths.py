@@ -1571,7 +1571,8 @@ def test_attr_text_callable_raises() -> None:
 def test_source_bytes_branches() -> None:
     assert documents._source_bytes_of(SimpleNamespace(download=lambda: b"raw")) == (b"raw", "source_bytes")
     assert documents._source_bytes_of(SimpleNamespace(content=b"c")) == (b"c", "source_bytes")
-    assert documents._source_bytes_of(SimpleNamespace(text="s")) == (None, None)
+    assert documents._source_bytes_of(SimpleNamespace(text="s")) == (b"s", "source_bytes")
+    assert documents._source_bytes_of(SimpleNamespace(text=lambda: "cb")) == (b"cb", "source_bytes")
     assert documents._download_bytes_of(SimpleNamespace()) is None
     assert documents._attr_bytes_of(SimpleNamespace(), "content") is None
 
@@ -3398,6 +3399,7 @@ def test_context_history_and_pointer_branches(
 
 
 def test_short_pressure_branches(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.analyst_client as analyst
     import app.finra_client as finra
     from app.services import sec_facts
 
@@ -3410,9 +3412,22 @@ def test_short_pressure_branches(monkeypatch: pytest.MonkeyPatch) -> None:
         return {"shares_outstanding": 1000}
 
     monkeypatch.setattr(sec_facts, "get_fundamentals", _fake_8)
+
+    def _fake_float(ticker: object) -> object:
+        return {"float_shares": 500, "market_cap": 10000}
+
+    monkeypatch.setattr(analyst, "get_analyst_estimates", _fake_float)
     out = context.get_short_pressure_context("acme")
     assert out["short_position"] == 100
-    assert out["short_pct_of_outstanding"] == 10.0
+    assert out["float_shares"] == 500
+    assert out["short_pct_of_float"] == 20.0
+    briefing: dict[str, object] = {
+        "metrics": {
+            "latest_vs_prior": [{"field": "currentShortPositionQuantity", "latest": 139_749_097, "prior": 1}],
+            "fields": {"currentShortPositionQuantity": {"sum": 999_999_999}},
+        }
+    }
+    assert context._briefing_short_position(briefing) == 139_749_097  # latest wins, no sum inflation
 
     def _fake_7(ticker: object) -> object:
         raise RuntimeError("down")
