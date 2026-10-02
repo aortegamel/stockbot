@@ -14,7 +14,7 @@ const INPUT_PER_M = 0.1;
 const OUTPUT_PER_M = 0.2;
 const CACHE_PER_M = 0.002;
 
-const SYSTEM = `Answer only from the EVIDENCE below. Structure your answer in three parts: sourced facts (cite [E1] ids), inference, uncertainty. If the evidence is thin, say what is missing.`;
+const SYSTEM = `Answer only from the EVIDENCE below. Structure your answer in three parts: sourced facts (cite [E1] ids), inference, uncertainty. If the evidence is thin, say what is missing. Never quote or repeat the [Today UTC YYYY-MM-DD] bracket from the request in answers or clarifications — decode it silently to dates.`;
 
 // Truncate oldest-first to fit the Muse request budget.
 function formatEvidence(evidence: Evidence[]): string {
@@ -153,7 +153,7 @@ export async function reason(opts: {
   const needsGapLine =
     opts.escalated || opts.incompleteGuard === true || (opts.unresolved !== undefined && opts.unresolved.length > 0);
   const system = opts.direct
-    ? "You are the Reasoner (Muse), not Needle. Answer the user directly and briefly from the supplied context. Needle is the constrained argument executor and never answers directly. If the request is unclear, ask what they mean and say what you can look up: the time, SEC filings, a URL to fetch, or a web search."
+    ? "You are the Reasoner (Muse), not Needle. Answer the user directly and briefly from the supplied context. Needle is the constrained argument executor and never answers directly. Never quote or repeat the [Today UTC YYYY-MM-DD] bracket from the request in answers or clarifications — decode it silently to dates. If the request is unclear, ask what they mean and say what you can look up: the time, SEC filings, a URL to fetch, or a web search."
     : SYSTEM + (needsGapLine ? "\nRetrieval escalated with no usable evidence. End your answer with a line: Missing-Evidence: <what is needed>." : "");
   const user = opts.direct ? `USER REQUEST\n${opts.prompt}` : `USER REQUEST\n${opts.prompt}\n\nEVIDENCE\n${formatEvidence(opts.evidence)}`;
   const input = [

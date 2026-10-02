@@ -33,6 +33,7 @@ from app.research.models import (
     JSONValue,
     ToolDecision,
     new_decision_id,
+    query_with_today_utc,
     utcnow,
     validate_json_mapping,
     validate_json_value,
@@ -275,15 +276,21 @@ def _node_dict(node: object) -> dict[str, JSONValue]:
     return out
 
 
+_MAX_PRIOR_FAILURES = 3
+_MAX_OUTCOME_CONTENT = 2000
+
+
 def _outcome_dict(outcome: object) -> dict[str, JSONValue]:
     def text(value: object) -> str | None:
         return value if isinstance(value, str) else (None if value is None else str(value))
 
+    content = text(_field(outcome, "content"))
     return {
         "tool": _field(outcome, "tool_name", "tool"),
-        "content": text(_field(outcome, "content")),
+        "content": content[:_MAX_OUTCOME_CONTENT] if isinstance(content, str) else content,
         "error": text(_field(outcome, "error")),
         "error_type": text(_field(outcome, "error_type")),
+        "tool_result_id": text(_field(outcome, "tool_result_id", "tool_result_ref")),
     }
 
 
@@ -404,7 +411,8 @@ def _tool_options_prompt(
         if key in options:
             raise ValueError(f"tool_selection: registry collides with sentinel {key}")
         options[key] = desc
-    prompt = f"Which single tool runs next for research node {node_id}? Question: {question} JEV owns this selection and every transition over the whole canonical registry; Needle runs args only and never selects, chains, or judges. Choose exactly one winner."
+    stamped = query_with_today_utc(question) if isinstance(question, str) else question
+    prompt = f"Which single tool runs next for research node {node_id}? Question: {stamped} JEV owns this selection and every transition over the whole canonical registry; Needle runs args only and never selects, chains, or judges. Choose exactly one winner."
     why = node.get("why_it_matters")
     if isinstance(why, str) and why:
         prompt += f" Why it matters: {why}"
@@ -414,13 +422,21 @@ def _tool_options_prompt(
     for line in _observation_lines(evidence):
         prompt += f" Observed {line}."
     if isinstance(attempts, list):
+        recent: list[tuple[str, str]] = []
         for attempt in attempts:
             if not isinstance(attempt, dict):
                 continue
             tool = attempt.get("tool")
             error = attempt.get("error")
             if isinstance(tool, str) and isinstance(error, str) and tool and error:
-                prompt += f" Prior attempt {tool} failed: {error[:200]}."
+                recent.append((tool, error))
+        for tool, error in recent[-_MAX_PRIOR_FAILURES:]:
+            prompt += f" Prior attempt {tool} failed: {error[:200]}."
+    prompt += f" Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values."
+    prompt += " Search packets list candidates only — page with research_read_search beyond display_limit and open each accession via get_sec_filing/get_sec_document until answered or guard trips."
+    _qtext = stamped if isinstance(stamped, str) else (question if isinstance(question, str) else "")
+    if "revenue" in _qtext.lower() and "quarter" in _qtext.lower():
+        prompt += " Revenue-quarter answers come from the 10-Q (MD&A/segment revenue), not the 8-K: after the filing list, open the 10-Q accession via get_sec_document with a revenue query before re-reading any 8-K."
     return options, prompt
 
 
@@ -546,6 +562,25 @@ def _args_summary(args: Mapping[str, JSONValue]) -> str:
         return f"argkeys=[{','.join(sorted(str(k) for k in args))}] argbytes={size}"
     except Exception:  # noqa: BLE001 - logging-only helper, never raises
         return "argkeys=[] argbytes=?"
+
+
+def _jev_usage(raw: object) -> tuple[int | None, int | None, str | None]:
+    """Extract (input_tokens, output_tokens, model) from a raw SystemOne result; never raises."""
+    try:
+        if not isinstance(raw, dict):
+            return None, None, None
+        model_raw = raw.get("model")
+        model = model_raw if isinstance(model_raw, str) and model_raw else None
+        usage = raw.get("usage")
+        if not isinstance(usage, dict):
+            return None, None, model
+        in_raw = usage.get("input_tokens")
+        out_raw = usage.get("output_tokens")
+        jev_in = in_raw if isinstance(in_raw, int) and not isinstance(in_raw, bool) else None
+        jev_out = out_raw if isinstance(out_raw, int) and not isinstance(out_raw, bool) else None
+        return jev_in, jev_out, model
+    except Exception:  # noqa: BLE001 - logging/persistence helper, never raises
+        return None, None, None
 
 
 class JevClient:
@@ -774,6 +809,7 @@ class JevClient:
             raise
         completed_at = _now()
         latency_ms = (time.perf_counter() - start) * 1000.0
+        jev_in, jev_out, jev_model = _jev_usage(raw)
         self._persist(
             decision_type=decision_type,
             session_id=session_id,
@@ -786,15 +822,20 @@ class JevClient:
             latency_ms=latency_ms,
             started_at=started_at,
             completed_at=completed_at,
+            jev_in=jev_in,
+            jev_out=jev_out,
+            jev_model=jev_model,
         )
         logger.info(
-            "toolflow decide_exit sid=%s nid=%s type=%s qids=[%s] via=%s latency_ms=%.1f",
+            "toolflow decide_exit sid=%s nid=%s type=%s qids=[%s] via=%s latency_ms=%.1f in=%s out=%s",
             session_id,
             node_id if isinstance(node_id, str) and node_id else "-",
             decision_type,
             ",".join(sorted(str(k) for k in decisions)),
             via,
             latency_ms,
+            jev_in,
+            jev_out,
         )
         logger.debug(
             "toolflow decide_detail sid=%s nid=%s type=%s options=%s",
@@ -819,6 +860,7 @@ class JevClient:
         job_id: str | None = None,
     ) -> ToolDecision:
         """JEV owns ALL tool selection/transitions over the whole canonical registry every round; Needle is args-only (never selects/chains/judges). Caller assembles the whole registry; single-winner choice + 2 sentinels."""
+        objective = query_with_today_utc(objective) if isinstance(objective, str) else objective
         reg = list(registry) if registry else _auto_registry()
         node_d = _node_dict(node)
         nid = node_d.get("node_id") or node_d.get("id")
@@ -883,7 +925,7 @@ class JevClient:
         registry: Sequence[Mapping[str, JSONValue]] | None = None,
     ) -> str:
         """JEV-first entry route: one choice over reasoning_required + whole canonical registry + research_required. Uses _invoke directly so nothing persists (never decide); raises on blank prompt, empty registry, or any JEV outage — the caller fail-opens to research_required."""
-        text = prompt.strip() if isinstance(prompt, str) else ""
+        text = query_with_today_utc(prompt.strip()) if isinstance(prompt, str) else ""
         if not text:
             logger.warning("toolflow route_defect sid=- nid=- err=blank_prompt")
             raise ValueError("route_entry: blank prompt")
@@ -916,13 +958,13 @@ class JevClient:
         questions: dict[str, JSONValue] = {
             "entry": {
                 "type": "choice",
-                "instructions": f"Route this entry prompt with exactly one winner: {text} reasoning_required answers from user-supplied context with no new external evidence and no tool; a registry tool runs single-shot first when it fits; otherwise research_required.",
+                "instructions": f"Route this entry prompt with exactly one winner: {text} reasoning_required answers from user-supplied context with no new external evidence and no tool; a registry tool runs single-shot first when it fits; otherwise research_required. Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values.",
                 "criteria": validate_json_mapping(options, "<decision_client>: 'criteria'"),
             }
         }
         start = time.perf_counter()
         try:
-            decisions, _raw, _via = await self._invoke({"prompt": text}, questions, {"entry": options})
+            decisions, raw, _via = await self._invoke({"prompt": text}, questions, {"entry": options})
         except Exception as exc:
             logger.warning("toolflow route_defect sid=- nid=- err=%s: %s", type(exc).__name__, str(exc)[:200])
             raise
@@ -936,11 +978,14 @@ class JevClient:
                 _choice_summary(d),
             )
             raise ValueError(f"route_entry: winner {winner!r} not in options")
+        jev_in, jev_out, _ = _jev_usage(raw)
         logger.info(
-            "toolflow route_exit sid=- nid=- %s via=%s latency_ms=%.1f",
+            "toolflow route_exit sid=- nid=- %s via=%s latency_ms=%.1f in=%s out=%s",
             _choice_summary(d),
             _via,
             latency_ms,
+            jev_in,
+            jev_out,
         )
         return winner
 
@@ -959,7 +1004,7 @@ class JevClient:
         directly (never decide: nothing persists); raises on bad input or a
         winner outside the options — the worker fail-opens to research_required.
         """
-        text = prompt.strip() if isinstance(prompt, str) else ""
+        text = query_with_today_utc(prompt.strip()) if isinstance(prompt, str) else ""
         if not text:
             logger.warning(
                 "toolflow assess_defect sid=- nid=- tool=%s err=blank_prompt",
@@ -1016,17 +1061,17 @@ class JevClient:
                 "type": "choice",
                 "instructions": (
                     f"Assess this single-shot tool result for the entry prompt: {text} "
-                    f"Arguments: {json.dumps(args, default=str)[:2000]} Outcome: {outcome} "
-                    "node_resolved when the result answers the prompt; reasoning_required when no "
-                    "further tool helps; research_required when a full session is needed; otherwise "
-                    "the one registry tool to run next."
+                    + f"Arguments: {json.dumps(args, default=str)[:2000]} Outcome: {outcome} "
+                    + "node_resolved when the result answers the prompt; reasoning_required when no "
+                    + "further tool helps; research_required when a full session is needed; otherwise "
+                    + f"the one registry tool to run next. Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values.",
                 ),
                 "criteria": validate_json_mapping(options, "<decision_client>: 'criteria'"),
             }
         }
         start = time.perf_counter()
         try:
-            decisions, _raw, _via = await self._invoke(
+            decisions, raw, _via = await self._invoke(
                 {"prompt": text, "tool": tool, "arguments": args, "outcome": outcome},
                 questions,
                 {"assess": options},
@@ -1050,12 +1095,15 @@ class JevClient:
                 _choice_summary(d),
             )
             raise ValueError(f"assess_entry_tool: winner {winner!r} not in options")
+        jev_in, jev_out, _ = _jev_usage(raw)
         logger.info(
-            "toolflow assess_exit sid=- nid=- tool=%s %s via=%s latency_ms=%.1f",
+            "toolflow assess_exit sid=- nid=- tool=%s %s via=%s latency_ms=%.1f in=%s out=%s",
             tool,
             _choice_summary(d),
             _via,
             latency_ms,
+            jev_in,
+            jev_out,
         )
         return winner
 
@@ -1289,6 +1337,9 @@ class JevClient:
         latency_ms: float,
         started_at: str,
         completed_at: str,
+        jev_in: int | None = None,
+        jev_out: int | None = None,
+        jev_model: str | None = None,
     ) -> None:
         try:
             probabilities: dict[str, JSONValue] = {}
@@ -1350,6 +1401,9 @@ class JevClient:
                 started_at=started_at,
                 completed_at=completed_at,
                 decisions=decisions,
+                jev_in=jev_in,
+                jev_out=jev_out,
+                jev_model=jev_model,
             )
         except Exception as exc:  # noqa: BLE001 - persistence never breaks a decision
             logger.debug("jev persist: runs skipped (%s: %s)", type(exc).__name__, exc)
@@ -1422,29 +1476,53 @@ class JevClient:
         started_at: str,
         completed_at: str,
         decisions: dict[str, dict[str, JSONValue]],
+        jev_in: int | None = None,
+        jev_out: int | None = None,
+        jev_model: str | None = None,
     ) -> None:
         recorder = get_current_recorder()
         if recorder is None or not getattr(recorder, "enabled", True):
             return
         doc = record.to_dict()
+        metadata: dict[str, object] = {
+            "decision_id": doc["decision_id"],
+            "decision_type": doc["decision_type"],
+            "session_id": doc["session_id"],
+            "node_id": doc["node_id"],
+            "job_id": doc["job_id"],
+            "provider": self._provider,
+            "via": via,
+            "latency_ms": latency_ms,
+            "request": request,
+            "response": response,
+            "usage": {"input_tokens": jev_in, "output_tokens": jev_out},
+            "model": jev_model,
+        }
         recorder.record_event(
             "jev_decision",
             model=self._model,
             result_summary=json.dumps(decisions, sort_keys=True),
             success=True,
-            metadata={
-                "decision_id": doc["decision_id"],
-                "decision_type": doc["decision_type"],
-                "session_id": doc["session_id"],
-                "node_id": doc["node_id"],
-                "job_id": doc["job_id"],
-                "provider": self._provider,
-                "via": via,
-                "latency_ms": latency_ms,
-                "request": request,
-                "response": response,
-            },
+            metadata=metadata,
             started_at=started_at,
             completed_at=completed_at,
             duration_ms=latency_ms,
         )
+        try:
+            in_tokens = jev_in if isinstance(jev_in, int) else 0
+            out_tokens = jev_out if isinstance(jev_out, int) else 0
+            recorder.record_model_call(
+                round=0,
+                provider=self._provider,
+                model=jev_model or self._model,
+                started_at=started_at,
+                completed_at=completed_at,
+                usage={
+                    "prompt_tokens": in_tokens,
+                    "completion_tokens": out_tokens,
+                    "total_tokens": in_tokens + out_tokens,
+                },
+                tool_call_count=0,
+            )
+        except Exception as exc:  # noqa: BLE001 - model-call row is best-effort, never breaks a decision
+            logger.debug("jev persist: model call skipped (%s: %s)", type(exc).__name__, exc)

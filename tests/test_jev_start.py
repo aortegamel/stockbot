@@ -125,3 +125,46 @@ def test_runtime_ping_over_bun() -> None:
         assert proc.poll() is None
     finally:
         proc.terminate()
+
+
+def test_tool_options_prompt_keeps_last_three_failures() -> None:
+    from app.decision_client import _tool_options_prompt
+    from app.research.models import JSONValue
+
+    reg: list[dict[str, JSONValue]] = [{"name": "a", "description": "A tool"}]
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
+    attempts: list[JSONValue] = [{"tool": f"t{i}", "error": f"err{i}"} for i in range(10)]
+    _, prompt = _tool_options_prompt(reg, node, [], attempts)
+    assert prompt.count("Prior attempt") == 3
+    assert "t7" in prompt and "t8" in prompt and "t9" in prompt
+    assert "t0" not in prompt and "t6" not in prompt
+    assert "Today UTC is" in prompt and "decode relative dates before choosing" in prompt
+    assert "page with research_read_search beyond display_limit" in prompt
+    assert "[Today UTC " in prompt and "q?" in prompt
+
+
+def test_tool_options_prompt_stamp_idempotent() -> None:
+    from app.decision_client import _tool_options_prompt
+    from app.research.models import JSONValue, query_with_today_utc
+
+    reg: list[dict[str, JSONValue]] = [{"name": "a", "description": "A tool"}]
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
+    _, prompt = _tool_options_prompt(reg, node, [], [])
+    assert "[Today UTC " in prompt
+    stamped = query_with_today_utc("q?")
+    node2: dict[str, JSONValue] = {"node_id": "n1", "question": stamped}
+    _, prompt2 = _tool_options_prompt(reg, node2, [], [])
+    assert prompt2.count("[Today UTC ") == 1
+    assert query_with_today_utc("") == "" and query_with_today_utc("   ") == "   "
+    assert query_with_today_utc(stamped) == stamped
+
+
+def test_outcome_dict_truncates_64k_content_keeps_error() -> None:
+    from app.decision_client import _outcome_dict
+
+    big = "x" * 65536
+    err = "e" * 5000
+    out = _outcome_dict({"tool": "t", "content": big, "error": err, "error_type": "boom"})
+    assert isinstance(out["content"], str) and len(out["content"]) <= 2000
+    assert out["error"] == err
+    assert out["error_type"] == "boom"

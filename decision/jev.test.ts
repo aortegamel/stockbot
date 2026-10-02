@@ -23,6 +23,7 @@ import {
   scopeNodeState,
   TOOL_SELECTION_SENTINELS,
 } from "./jev.ts";
+import { analyzePrompt, decomposePrompt, expandPrompt } from "./prompts.ts";
 
 test("noul preserves probability exactly; policy stays in classifyProbability", () => {
   for (const p of [0, 0.5, 0.6999, 0.7, 0.85, 1]) {
@@ -279,8 +280,29 @@ test("tool selection covers the whole registry plus sentinels; enriched manifest
   for (const bit of ["[sec]", "Intent:", "Inputs:", "Output:", "Evidence:", "Needs:", "PIT:", "Use:", "Avoid:", "Conflicts:", "Next:"]) expect(doc).toContain(bit);
   expect(q.prompt).toContain("n1");
   expect(q.prompt).toContain("search_sec_filings");
+  expect(q.prompt).toContain("[Today UTC ");
+  expect(q.prompt).toContain("Today UTC is");
+  expect(q.prompt).toContain("decode relative dates before choosing");
+  expect(q.prompt).toContain("Monday-now NYC range");
+  expect(q.prompt).toContain("never pass phrases like 'this week' or 'today' or 'last quarter' as arg values");
+  expect(q.prompt).toContain("page with research_read_search beyond display_limit");
+  const rev = buildToolSelectionQuestion(registry, { nodeId: "n1", question: "What drove NVDA revenue last quarter?" }).prompt;
+  expect(rev).toContain("open the 10-Q accession via get_sec_document with a revenue query");
+  const plain = buildToolSelectionQuestion(registry, { nodeId: "n1", question: "q?" }).prompt;
+  expect(plain).not.toContain("open the 10-Q accession");
   expect(TOOL_SELECTION_SENTINELS.reasoning_required.length).toBeGreaterThan(0);
   expect(TOOL_SELECTION_SENTINELS.node_resolved.length).toBeGreaterThan(0);
+  for (const p of [decomposePrompt({}), analyzePrompt({}), expandPrompt({})]) {
+    expect(p).toContain("[Today UTC ");
+    expect(p).toContain("Today UTC is");
+    expect(p).toContain("decode relative dates before choosing");
+  }
+  const stamped = decomposePrompt({ objective: { id: "o", prompt: "What changed last quarter?" } });
+  expect(stamped).toContain("[Today UTC ");
+  const pre = decomposePrompt({ objective: { id: "o", prompt: "[Today UTC 2026-01-01] What changed?" } });
+  expect(pre.split("[Today UTC ").length).toBe(2);
+  const once = buildToolSelectionQuestion(registry, { nodeId: "n1", question: "q?" }).prompt;
+  expect(once.slice(once.indexOf("[Today UTC "), once.indexOf("]") + 1)).toContain(new Date().toISOString().slice(0, 10));
   expect(() => buildToolSelectionQuestion([], { nodeId: "n", question: "q" })).toThrow("empty registry");
   expect(() => buildToolSelectionQuestion(
     [{ name: "reasoning_required", description: "collision" }],

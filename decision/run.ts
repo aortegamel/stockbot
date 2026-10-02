@@ -36,7 +36,7 @@ import type {
 export { classifyProbability };
 export type { ChoiceDecision, Decision, DecisionResult, NoulDecision, ScoreDecision, SystemOneFn };
 
-const OPENCODE_URL = "https://opencode.ai/zen/v1/responses";
+const OPENCODE_URL = "https://opencode.ai/zen/go/v1/responses";
 const DEFAULT_MODEL = "muse-spark-1.3-contributor";
 const RESULTS_ROOT = "decision/results";
 
@@ -104,7 +104,12 @@ function checkAnalyses(
   const seen = new Set<string>();
   for (const item of value) {
     if (!isObj(item)) throw new Error(`${stage}: analysis must be an object`);
-    exactKeys(stage, item, ["evidenceRefs", "interpretation", "nodeId", "objectiveId"]);
+    const names = Object.keys(item).sort();
+    for (const k of ["evidenceRefs", "interpretation", "nodeId", "objectiveId"])
+      if (!names.includes(k)) throw new Error(`${stage}: unexpected fields [${names.join(",")}]`);
+    for (const k of names)
+      if (!["assumptions", "evidenceRefs", "interpretation", "nodeId", "numbers", "objectiveId"].includes(k))
+        throw new Error(`${stage}: unexpected fields [${names.join(",")}]`);
     const nodeId = nonEmpty(stage, item.nodeId, "analysis.nodeId");
     if (!proposalIds.has(nodeId)) throw new Error(`${stage}: analysis references unknown proposal ${nodeId}`);
     if (item.objectiveId !== objectiveId) throw new Error(`${stage}: analysis ${nodeId} references wrong objective`);
@@ -113,6 +118,30 @@ function checkAnalyses(
       throw new Error(`${stage}: analysis ${nodeId} evidenceRefs must be string[]`);
     for (const e of item.evidenceRefs as string[])
       if (!evidenceIds.has(e)) throw new Error(`${stage}: analysis ${nodeId} references unknown evidence ${e}`);
+    const refSet = new Set(item.evidenceRefs as string[]);
+    if (item.numbers !== undefined) {
+      if (!Array.isArray(item.numbers)) throw new Error(`${stage}: analysis ${nodeId} numbers must be an array`);
+      for (const n of item.numbers) {
+        if (!isObj(n)) throw new Error(`${stage}: analysis ${nodeId} number must be an object`);
+        exactKeys(stage, n, ["evidenceId", "quote", "value"]);
+        nonEmpty(stage, n.value, "analysis.number.value");
+        const eid = nonEmpty(stage, n.evidenceId, "analysis.number.evidenceId");
+        nonEmpty(stage, n.quote, "analysis.number.quote");
+        if (!refSet.has(eid)) throw new Error(`${stage}: analysis ${nodeId} number references unknown evidence ${eid}`);
+      }
+    }
+    if (item.assumptions !== undefined) {
+      if (!Array.isArray(item.assumptions)) throw new Error(`${stage}: analysis ${nodeId} assumptions must be an array`);
+      const seenAssumption = new Set<string>();
+      for (const a of item.assumptions) {
+        if (!isObj(a)) throw new Error(`${stage}: analysis ${nodeId} assumption must be an object`);
+        exactKeys(stage, a, ["assumptionId", "text"]);
+        const aid = nonEmpty(stage, a.assumptionId, "analysis.assumption.assumptionId");
+        nonEmpty(stage, a.text, "analysis.assumption.text");
+        if (seenAssumption.has(aid)) throw new Error(`${stage}: analysis ${nodeId} duplicate assumptionId ${aid}`);
+        seenAssumption.add(aid);
+      }
+    }
     if (seen.has(nodeId)) throw new Error(`${stage}: duplicate analysis for ${nodeId}`);
     seen.add(nodeId);
   }
@@ -178,14 +207,15 @@ async function postOpenCode(
   try {
     res = await fetchFn(OPENCODE_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, "x-opencode-session": crypto.randomUUID() },
       body: JSON.stringify(body),
     });
   } catch (e) {
     throw new Error(`${name}: opencode_request_failed: ${e instanceof Error ? e.message : String(e)}`);
   }
-  if (!res.ok) throw new Error(`${name}: opencode_request_failed: ${res.status}`);
-  const raw: unknown = await res.json();
+  const text = await res.text();
+  if (!res.ok) throw new Error(`${name}: opencode_request_failed: ${res.status} ${text.slice(0, 300)}`);
+  const raw: unknown = JSON.parse(text);
   await writeFile(join(dir, `raw-${name}.json`), JSON.stringify(raw, null, 2) + "\n");
   return raw;
 }

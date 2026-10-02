@@ -19,13 +19,17 @@ def _strip_descriptions(node):
     return node
 
 
-def load_catalog():
+def _catalog_path():
+    """Catalog file: NEEDLE_CATALOG override, else the harness-generated file."""
     env = os.environ.get("NEEDLE_CATALOG")
     if env:
-        path = env
-    else:
-        here = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.normpath(os.path.join(here, "..", "..", ".needle-catalog.json"))
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.normpath(os.path.join(here, "..", "..", ".needle-catalog.json"))
+
+
+def load_catalog():
+    path = _catalog_path()
     try:
         with open(path) as f:
             tools = json.load(f)
@@ -38,20 +42,15 @@ def load_catalog():
     # ponytail: full describe text (~58KB catalog) exceeds the Needle init
     # budget (needle_init code -1); truncated top-level descriptions ground
     # routing (name-only misroutes, e.g. clock->insider), stripped params fit.
+    # Init budget is tight (~29KB slim fails, ~28KB passes): drop parameter
+    # properties at init — the bound per-tool call carries full params.
     slim = []
     for tool in tools:
         if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
             continue
-        params = tool.get("parameters")
         raw_desc = tool.get("description")
         desc = raw_desc if isinstance(raw_desc, str) and raw_desc.strip() else tool["name"]
-        slim.append(
-            {
-                "name": tool["name"],
-                "description": desc[:150],
-                "parameters": _strip_descriptions(params) if isinstance(params, dict) else {"type": "object"},
-            }
-        )
+        slim.append({"name": tool["name"], "description": desc[:150], "parameters": {"type": "object"}})
     if not slim:
         sys.stderr.write(f"needle server: tool catalog at {path} is empty or invalid\n")
         sys.exit(1)
@@ -62,11 +61,16 @@ TOOLS = load_catalog()
 
 
 def resolve_weights():
+    # Mirror of needle-harness/scripts/needle.ts:44-48: relative pins resolve
+    # against HARNESS_DIR, absolute pins pass through.
+    here = os.path.dirname(os.path.abspath(__file__))
+    harness = os.path.normpath(os.path.join(here, "..", ".."))
     env = os.environ.get("NEEDLE_WEIGHTS")
     if env:
-        return env
-    here = os.path.dirname(os.path.abspath(__file__))
-    root_blob = os.path.normpath(os.path.join(here, "..", "..", "..", "needle3.cact"))
+        if os.path.isabs(env):
+            return env
+        return os.path.normpath(os.path.join(harness, env))
+    root_blob = os.path.normpath(os.path.join(harness, "..", "needle3.cact"))
     if os.path.exists(root_blob):
         return root_blob
     return None
@@ -87,7 +91,8 @@ def _legacy_system():
 
 
 def _bound_system():
-    return f"date: {_today()} UTC; locale: en-US;"
+    today = datetime.now(timezone.utc).date().isoformat()
+    return f"date: {_today()} UTC; locale: en-US; Today UTC is {today}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week' or 'today' or 'last quarter' as arg values."
 
 
 weights = resolve_weights()
@@ -121,11 +126,27 @@ def _tool_triggers(tool):
 def _tool_entry(tool, schema):
     """Single-tool binding for one arguments.generate call: grammar admits exactly this tool."""
     params = schema if isinstance(schema, dict) else {}
-    desc = next((t.get("description") for t in TOOLS if isinstance(t, dict) and t.get("name") == tool), tool)
+    full = None
+    try:
+        with open(_catalog_path()) as f:
+            for t in json.load(f):
+                if isinstance(t, dict) and t.get("name") == tool:
+                    full = t
+                    break
+    except Exception:
+        full = None
+    full = full if isinstance(full, dict) else {}
+    raw_desc = full.get("description")
+    desc = raw_desc if isinstance(raw_desc, str) and raw_desc.strip() else tool
+    full_params = full.get("parameters")
+    # ponytail: bound call is small (one tool); keep full params the kernel
+    # passes in, else fall back to the catalog entry. Legacy TOOLS slim stays
+    # stripped for the shared start/step agent init budget.
+    bound_params = params or (full_params if isinstance(full_params, dict) else {})
     entry = {
         "name": tool,
-        "description": desc if isinstance(desc, str) and desc.strip() else tool,
-        "parameters": _strip_descriptions(params) if params else {"type": "object"},
+        "description": desc,
+        "parameters": bound_params if bound_params else {"type": "object"},
     }
     triggers = _tool_triggers(tool)
     if triggers:
@@ -183,8 +204,14 @@ def _arguments_prompt(tool, schema, objective, node, context):
             "instruction": (
                 f"You must call exactly the tool {tool!r} once with valid grounded arguments, "
                 "or return an error (must-call-or-error). Never call another tool, never chain "
-                "tools, never judge sufficiency or completion. On insufficient grounding "
-                "raise/return an error, never stay silent."
+                "tools, never judge sufficiency or completion. Ground every argument: "
+                "accession_no only from a prior search_sec_filings packet, never invented from "
+                "tickers or names; ticker is a stock symbol like AAPL, never FINRA/SEC/org or "
+                "query words — when the symbol is unstated pass company_name instead and omit ticker; "
+                "dataset must be canonical group/name. as_of only from an explicit YYYY-MM-DD date or relative wording "
+                "in the query/objective, never memory or priors: no date wording means omit as_of entirely (latest-available). Today UTC is "
+                f"{datetime.now(timezone.utc).date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week' or 'today' or 'last quarter' as arg values. On insufficient grounding raise/return an error, never fabricate, never stay silent. "
+                "For get_sec_document on a revenue-quarter question always include query 'revenue increased'; "
             ),
             "tool": tool,
             "schema": schema,
@@ -231,12 +258,17 @@ def handle(line):
                 raise ValueError("bad tool")
             bound = _bound_agent(tool, req.get("schema"))
             try:
-                r = bound.complete(
-                    req.get("objective")
-                    if isinstance(req.get("objective"), str) and req.get("objective").strip()
+                objective = req.get("objective")
+                prompt = _arguments_prompt(
+                    tool,
+                    req.get("schema"),
+                    objective
+                    if isinstance(objective, str) and objective.strip()
                     else json.dumps({"tool": tool, "schema": req.get("schema")}),
-                    max_new_tokens=512,
+                    req.get("node"),
+                    req.get("context"),
                 )
+                r = bound.complete(prompt, max_new_tokens=512)
             finally:
                 try:
                     bound.close()

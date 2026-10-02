@@ -15,12 +15,14 @@ parts -> exact-keys JSON object). No new protocol, no new auth flow.
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, TypedDict
+from urllib import error as _urlerror
 from urllib import request as _urlrequest
 
-OPENCODE_URL = "https://opencode.ai/zen/v1/responses"
+OPENCODE_URL = "https://opencode.ai/zen/go/v1/responses"
 DEFAULT_MODEL = "muse-spark-1.3-contributor"
 
 
@@ -32,11 +34,24 @@ class Proposal(TypedDict):
     whyItMatters: str
 
 
+class AnalysisNumber(TypedDict):
+    value: str
+    evidenceId: str
+    quote: str
+
+
+class AnalysisAssumption(TypedDict):
+    assumptionId: str
+    text: str
+
+
 class Analysis(TypedDict):
     nodeId: str
     objectiveId: str
     interpretation: str
     evidenceRefs: list[str]
+    numbers: NotRequired[list[AnalysisNumber]]
+    assumptions: NotRequired[list[AnalysisAssumption]]
 
 
 class EvidenceRequest(TypedDict):
@@ -128,16 +143,54 @@ def check_analyses(
     for item in value:
         if not _is_obj(item) or not isinstance(item, Mapping):
             raise ValueError(f"{stage}: analysis must be an object")
-        _exact_keys(stage, item, ["evidenceRefs", "interpretation", "nodeId", "objectiveId"])
+        actual = set(item.keys())
+        if not {"evidenceRefs", "interpretation", "nodeId", "objectiveId"} <= actual or not actual <= {
+            "assumptions",
+            "evidenceRefs",
+            "interpretation",
+            "nodeId",
+            "numbers",
+            "objectiveId",
+        }:
+            raise ValueError(f"{stage}: unexpected fields [{','.join(sorted(item))}]")
         node_id = _nonempty(stage, item.get("nodeId"), "analysis.nodeId")
         if node_id not in proposal_ids:
             raise ValueError(f"{stage}: analysis references unknown proposal {node_id}")
         if item.get("objectiveId") != objective_id:
             raise ValueError(f"{stage}: analysis {node_id} references wrong objective")
         _nonempty(stage, item.get("interpretation"), "analysis.interpretation")
-        for ref in _str_list(stage, item.get("evidenceRefs"), f"analysis {node_id} evidenceRefs"):
+        refs = _str_list(stage, item.get("evidenceRefs"), f"analysis {node_id} evidenceRefs")
+        for ref in refs:
             if ref not in evidence_ids:
                 raise ValueError(f"{stage}: analysis {node_id} references unknown evidence {ref}")
+        ref_set = set(refs)
+        if "numbers" in item:
+            raw_numbers = item.get("numbers")
+            if not isinstance(raw_numbers, list):
+                raise ValueError(f"{stage}: analysis {node_id} numbers must be an array")
+            for n in raw_numbers:
+                if not _is_obj(n) or not isinstance(n, Mapping):
+                    raise ValueError(f"{stage}: analysis {node_id} number must be an object")
+                _exact_keys(stage, n, ["evidenceId", "quote", "value"])
+                _nonempty(stage, n.get("value"), "analysis.number.value")
+                eid = _nonempty(stage, n.get("evidenceId"), "analysis.number.evidenceId")
+                _nonempty(stage, n.get("quote"), "analysis.number.quote")
+                if eid not in ref_set:
+                    raise ValueError(f"{stage}: analysis {node_id} number references unknown evidence {eid}")
+        if "assumptions" in item:
+            raw_assumptions = item.get("assumptions")
+            if not isinstance(raw_assumptions, list):
+                raise ValueError(f"{stage}: analysis {node_id} assumptions must be an array")
+            seen_assumption: set[str] = set()
+            for a in raw_assumptions:
+                if not _is_obj(a) or not isinstance(a, Mapping):
+                    raise ValueError(f"{stage}: analysis {node_id} assumption must be an object")
+                _exact_keys(stage, a, ["assumptionId", "text"])
+                aid = _nonempty(stage, a.get("assumptionId"), "analysis.assumption.assumptionId")
+                _nonempty(stage, a.get("text"), "analysis.assumption.text")
+                if aid in seen_assumption:
+                    raise ValueError(f"{stage}: analysis {node_id} duplicate assumptionId {aid}")
+                seen_assumption.add(aid)
         if node_id in seen:
             raise ValueError(f"{stage}: duplicate analysis for {node_id}")
         seen.add(node_id)
@@ -147,14 +200,27 @@ def check_analyses(
             continue
         raw_refs = item.get("evidenceRefs")
         refs = [str(r) for r in raw_refs] if isinstance(raw_refs, list) else []
-        out.append(
-            Analysis(
-                nodeId=str(item.get("nodeId")),
-                objectiveId=str(item.get("objectiveId")),
-                interpretation=str(item.get("interpretation")),
-                evidenceRefs=refs,
-            )
+        entry = Analysis(
+            nodeId=str(item.get("nodeId")),
+            objectiveId=str(item.get("objectiveId")),
+            interpretation=str(item.get("interpretation")),
+            evidenceRefs=refs,
         )
+        if isinstance(item.get("numbers"), list):
+            entry["numbers"] = [
+                AnalysisNumber(
+                    value=str(n.get("value")), evidenceId=str(n.get("evidenceId")), quote=str(n.get("quote"))
+                )
+                for n in item["numbers"]
+                if isinstance(n, Mapping)
+            ]
+        if isinstance(item.get("assumptions"), list):
+            entry["assumptions"] = [
+                AnalysisAssumption(assumptionId=str(a.get("assumptionId")), text=str(a.get("text")))
+                for a in item["assumptions"]
+                if isinstance(a, Mapping)
+            ]
+        out.append(entry)
     return out
 
 
@@ -222,11 +288,26 @@ PostFn = Callable[[str, str], dict[str, object]]
 def _default_post(url: str, api_key: str, model: str, prompt: str) -> dict[str, object]:
     body = json.dumps({"model": model, "input": prompt}).encode()
     req = _urlrequest.Request(
-        url, data=body, headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "stockbot-reasoner/0.1",
+            "x-opencode-session": str(uuid.uuid4()),
+        },
     )
     try:
         with _urlrequest.urlopen(req, timeout=120) as res:
             loaded = json.load(res)
+    except _urlerror.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "ignore")
+        except Exception:
+            detail = ""
+        if detail:
+            raise RuntimeError(f"opencode_request_failed: {e.code} {detail[:300]}") from None
+        raise RuntimeError(f"opencode_request_failed: {e.code}") from None
     except Exception as e:
         raise RuntimeError(f"opencode_request_failed: {e}") from None
     if not isinstance(loaded, dict):

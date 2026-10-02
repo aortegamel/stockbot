@@ -306,6 +306,10 @@ function evidenceIds(evidence: unknown): string[] {
   return out;
 }
 
+function withTodayUtc(text: string): string {
+  return text.includes("[Today UTC ") ? text : `[Today UTC ${new Date().toISOString().slice(0, 10)}] ${text}`;
+}
+
 export function buildToolSelectionQuestion(
   registry: ToolManifestEntry[],
   node: ToolSelectionNode,
@@ -336,5 +340,8 @@ export function buildToolSelectionQuestion(
     if (!a || typeof a.tool !== "string" || typeof a.error !== "string") continue;
     prompt += ` Prior attempt ${a.tool} failed: ${a.error.slice(0, 200)}.`;
   }
-  return { id: "tool_selection", prompt, options };
+  prompt += ` Today UTC is ${new Date().toISOString().slice(0, 10)}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week' or 'today' or 'last quarter' as arg values.`;
+  prompt += ` Search packets list candidates only — page with research_read_search beyond display_limit and open each accession via get_sec_filing/get_sec_document until answered or guard trips.`;
+  if (/revenue/i.test(node.question) && /quarter/i.test(node.question)) prompt += ` Revenue-quarter answers come from the 10-Q (MD&A/segment revenue), not the 8-K: after the filing list, open the 10-Q accession via get_sec_document with a revenue query before re-reading any 8-K.`;
+  return { id: "tool_selection", prompt: withTodayUtc(prompt), options };
 }
