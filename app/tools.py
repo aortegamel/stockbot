@@ -8,12 +8,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
+from zoneinfo import ZoneInfo
 
 from . import (
     analyst_client,
@@ -131,6 +133,7 @@ TOOLS: list[dict[str, object]] = [
                     },
                     "as_of": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Point-in-time query date YYYY-MM-DD; store-backed for eps/shares_outstanding/dividends; live results are labeled data_source=live.",
                     },
                 },
@@ -149,6 +152,7 @@ TOOLS: list[dict[str, object]] = [
                     "query": {"type": "string"},
                     "as_of": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Point-in-time date YYYY-MM-DD; former names apply only within their known/valid interval.",
                     },
                     "exhaustive": {
@@ -182,12 +186,25 @@ TOOLS: list[dict[str, object]] = [
                         "type": "string",
                         "description": "Ticker, CUSIP, ISIN, or class title; never treated as issuer identity.",
                     },
-                    "accession_no": {"type": "string"},
+                    "accession_no": {
+                        "type": "string",
+                        "pattern": "^\\d{10}-?\\d{2}-?\\d{6}$",
+                        "description": "SEC accession number, e.g. 0000320193-25-000079. Named accession_no, not accession_number.",
+                    },
                     "forms": {"type": "array", "items": {"type": "string"}},
-                    "start_date": {"type": "string"},
-                    "end_date": {"type": "string"},
+                    "start_date": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "YYYY-MM-DD. Combined with end_date as a range.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "YYYY-MM-DD.",
+                    },
                     "as_of": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Point-in-time date YYYY-MM-DD; records known after it are excluded.",
                     },
                     "exhaustive": {
@@ -216,10 +233,19 @@ TOOLS: list[dict[str, object]] = [
                         "description": "Ticker or CIK, e.g. AAPL.",
                     },
                     "forms": {"type": "array", "items": {"type": "string"}},
-                    "start_date": {"type": "string"},
-                    "end_date": {"type": "string"},
+                    "start_date": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "YYYY-MM-DD. Combined with end_date as a range.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "YYYY-MM-DD.",
+                    },
                     "as_of": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Point-in-time date YYYY-MM-DD; filings known after it are excluded.",
                     },
                     "limit": {"type": "integer"},
@@ -251,6 +277,7 @@ TOOLS: list[dict[str, object]] = [
                     },
                     "as_of": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Point-in-time date YYYY-MM-DD.",
                     },
                     "limit": {"type": "integer"},
@@ -294,10 +321,12 @@ TOOLS: list[dict[str, object]] = [
                 "properties": {
                     "accession_no": {
                         "type": "string",
+                        "pattern": "^\\d{10}-?\\d{2}-?\\d{6}$",
                         "description": "SEC accession number, e.g. 0000320193-25-000079. Named accession_no, not accession_number.",
                     },
                     "as_of": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Point-in-time date YYYY-MM-DD; filings known after it are excluded.",
                     },
                 },
@@ -315,10 +344,12 @@ TOOLS: list[dict[str, object]] = [
                 "properties": {
                     "accession_no": {
                         "type": "string",
+                        "pattern": "^\\d{10}-?\\d{2}-?\\d{6}$",
                         "description": "SEC accession number, e.g. 0000320193-25-000079. Named accession_no, not accession_number.",
                     },
                     "as_of": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Point-in-time date YYYY-MM-DD; filings known after it are excluded.",
                     },
                 },
@@ -336,6 +367,7 @@ TOOLS: list[dict[str, object]] = [
                 "properties": {
                     "accession_no": {
                         "type": "string",
+                        "pattern": "^\\d{10}-?\\d{2}-?\\d{6}$",
                         "description": "SEC accession number, e.g. 0000320193-25-000079. Named accession_no, not accession_number.",
                     },
                     "document_name": {
@@ -352,6 +384,7 @@ TOOLS: list[dict[str, object]] = [
                     },
                     "as_of": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Point-in-time date YYYY-MM-DD; filings known after it are excluded.",
                     },
                     "offset": {
@@ -389,11 +422,20 @@ TOOLS: list[dict[str, object]] = [
                 "properties": {
                     "ticker": {"type": "string"},
                     "forms": {"type": "array", "items": {"type": "string"}},
-                    "current_accession": {"type": "string"},
-                    "previous_accession": {"type": "string"},
+                    "current_accession": {
+                        "type": "string",
+                        "pattern": "^\\d{10}-?\\d{2}-?\\d{6}$",
+                        "description": "SEC accession number, e.g. 0000320193-25-000079. Named current_accession/previous_accession for diffs.",
+                    },
+                    "previous_accession": {
+                        "type": "string",
+                        "pattern": "^\\d{10}-?\\d{2}-?\\d{6}$",
+                        "description": "SEC accession number, e.g. 0000320193-25-000079. Named current_accession/previous_accession for diffs.",
+                    },
                     "section": {"type": "string"},
                     "as_of": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Point-in-time date YYYY-MM-DD; filings known after it are excluded.",
                     },
                 },
@@ -410,9 +452,16 @@ TOOLS: list[dict[str, object]] = [
                 "type": "object",
                 "properties": {
                     "ticker": {"type": "string"},
-                    "since": {"type": "string"},
-                    "as_of": {"type": "string"},
-                    "limit": {"type": "integer"},
+                    "since": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "YYYY-MM-DD; events known on or after this date.",
+                    },
+                    "as_of": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "Point-in-time date YYYY-MM-DD.",
+                    },
                 },
                 "required": ["ticker", "since"],
             },
@@ -434,7 +483,11 @@ TOOLS: list[dict[str, object]] = [
                         "type": "string",
                         "description": "Company name (e.g. Apple) when the ticker is unknown; the server maps it to a ticker.",
                     },
-                    "as_of": {"type": "string"},
+                    "as_of": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "Point-in-time date YYYY-MM-DD.",
+                    },
                     "limit": {"type": "integer"},
                 },
                 "required": ["ticker"],
@@ -450,7 +503,11 @@ TOOLS: list[dict[str, object]] = [
                 "type": "object",
                 "properties": {
                     "ticker": {"type": "string"},
-                    "as_of": {"type": "string"},
+                    "as_of": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "Point-in-time date YYYY-MM-DD.",
+                    },
                     "limit": {"type": "integer"},
                 },
                 "required": ["ticker"],
@@ -473,7 +530,11 @@ TOOLS: list[dict[str, object]] = [
                         "type": "string",
                         "description": "Company name (e.g. Apple) when the ticker is unknown; the server maps it to a ticker.",
                     },
-                    "as_of": {"type": "string"},
+                    "as_of": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "Point-in-time date YYYY-MM-DD.",
+                    },
                     "limit": {"type": "integer"},
                 },
                 "required": ["ticker"],
@@ -489,7 +550,11 @@ TOOLS: list[dict[str, object]] = [
                 "type": "object",
                 "properties": {
                     "ticker": {"type": "string"},
-                    "as_of": {"type": "string"},
+                    "as_of": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "Point-in-time date YYYY-MM-DD.",
+                    },
                     "limit": {"type": "integer"},
                 },
                 "required": ["ticker"],
@@ -505,7 +570,11 @@ TOOLS: list[dict[str, object]] = [
                 "type": "object",
                 "properties": {
                     "ticker": {"type": "string"},
-                    "as_of": {"type": "string"},
+                    "as_of": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "Point-in-time date YYYY-MM-DD.",
+                    },
                     "limit": {"type": "integer"},
                 },
                 "required": ["ticker"],
@@ -521,7 +590,11 @@ TOOLS: list[dict[str, object]] = [
                 "type": "object",
                 "properties": {
                     "ticker": {"type": "string"},
-                    "as_of": {"type": "string"},
+                    "as_of": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "Point-in-time date YYYY-MM-DD.",
+                    },
                 },
                 "required": ["ticker"],
             },
@@ -536,9 +609,16 @@ TOOLS: list[dict[str, object]] = [
                 "type": "object",
                 "properties": {
                     "ticker": {"type": "string"},
-                    "since": {"type": "string"},
-                    "as_of": {"type": "string"},
-                    "limit": {"type": "integer"},
+                    "since": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "YYYY-MM-DD; events known on or after this date.",
+                    },
+                    "as_of": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "Point-in-time date YYYY-MM-DD.",
+                    },
                 },
                 "required": ["ticker"],
             },
@@ -553,7 +633,11 @@ TOOLS: list[dict[str, object]] = [
                 "type": "object",
                 "properties": {
                     "ticker": {"type": "string"},
-                    "as_of": {"type": "string"},
+                    "as_of": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "Point-in-time date YYYY-MM-DD.",
+                    },
                     "limit": {"type": "integer"},
                 },
                 "required": ["ticker"],
@@ -737,6 +821,7 @@ TOOLS: list[dict[str, object]] = [
                     "ticker": {"type": "string"},
                     "settlementDate": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Optional settlement date YYYY-MM-DD. Omit to return recent cycles.",
                     },
                 },
@@ -758,10 +843,12 @@ TOOLS: list[dict[str, object]] = [
                     },
                     "settlement_date": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Optional FINRA settlement date (YYYY-MM-DD). Omit for the latest published FINRA cycle.",
                     },
                     "as_of": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Optional knowledge horizon (YYYY-MM-DD). Only data knowable on or before this date is used. Defaults to today; pass an explicit date for a historical screen.",
                     },
                 },
@@ -775,17 +862,25 @@ TOOLS: list[dict[str, object]] = [
             "name": "get_reg_sho_volume",
             "description": "Self-contained daily short-sale volume by venue for one ticker: FINRA daily Reg SHO short-sale volume "
             "ticker (short, short-exempt, and total share quantity by "
-            "reporting facility). Rolling 12 months. Takes a ticker alone; dataset and fields resolve internally so do NOT call describe_finra_dataset or get_finra_datapoints. Do NOT use for biweekly short interest positions (get_short_interest). Takes a ticker.",
+            "reporting facility). Omit tradeDate for the Monday-now NYC week-to-date range plus short-volume ratio; pass one tradeDate for that single day only. Rolling 12 months. Pass a ticker (e.g. AAPL) or a company_name (e.g. Apple); dataset and fields resolve internally so do NOT call describe_finra_dataset or get_finra_datapoints. Do NOT use for biweekly short interest positions (get_short_interest).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "ticker": {"type": "string"},
+                    "ticker": {
+                        "type": "string",
+                        "description": "Ticker (e.g. AAPL). If unknown, pass company_name instead; never call with neither.",
+                    },
+                    "company_name": {
+                        "type": "string",
+                        "description": "Company name (e.g. Apple) when the ticker is unknown; the server maps it to a ticker.",
+                    },
                     "tradeDate": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Optional trade date YYYY-MM-DD.",
                     },
                 },
-                "required": ["ticker"],
+                "required": [],
             },
         },
     },
@@ -801,6 +896,7 @@ TOOLS: list[dict[str, object]] = [
                     "ticker": {"type": "string"},
                     "tradeDate": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Optional trade date YYYY-MM-DD.",
                     },
                 },
@@ -939,8 +1035,7 @@ TOOLS: list[dict[str, object]] = [
                     "dataset_id": {
                         "type": "string",
                         "description": "Canonical group/name "
-                        "(e.g. otcMarket/consolidatedShortInterest). "
-                        "Legacy bare names are accepted when unambiguous.",
+                        "(e.g. otcMarket/regShoDaily); unambiguous bare names resolve, unknown/ambiguous ones are rejected.",
                     }
                 },
                 "required": ["dataset_id"],
@@ -983,8 +1078,7 @@ TOOLS: list[dict[str, object]] = [
                     "dataset": {
                         "type": "string",
                         "description": "Canonical id group/name "
-                        "(e.g. otcMarket/consolidatedShortInterest). "
-                        "Legacy bare names accepted when unambiguous.",
+                        "(e.g. otcMarket/regShoDaily); unambiguous bare names resolve, unknown/ambiguous ones are rejected.",
                     },
                     "fields": {
                         "type": "array",
@@ -998,9 +1092,14 @@ TOOLS: list[dict[str, object]] = [
                     },
                     "start_date": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "YYYY-MM-DD. Combined with end_date as a range.",
                     },
-                    "end_date": {"type": "string", "description": "YYYY-MM-DD."},
+                    "end_date": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "YYYY-MM-DD.",
+                    },
                     "filters": {
                         "type": "array",
                         "description": "Extra compare filters (field names must exist on the dataset — when unknown, call describe_finra_dataset first).",
@@ -1071,8 +1170,7 @@ TOOLS: list[dict[str, object]] = [
                     "dataset": {
                         "type": "string",
                         "description": "Canonical id group/name "
-                        "(e.g. fixedIncomeMarket/treasuryDailyAggregates). "
-                        "Legacy bare names accepted when unambiguous.",
+                        "(e.g. otcMarket/regShoDaily); unambiguous bare names resolve, unknown/ambiguous ones are rejected.",
                     },
                     "ticker": {
                         "type": "string",
@@ -1080,9 +1178,14 @@ TOOLS: list[dict[str, object]] = [
                     },
                     "start_date": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "YYYY-MM-DD. Combined with end_date as a range.",
                     },
-                    "end_date": {"type": "string", "description": "YYYY-MM-DD."},
+                    "end_date": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "YYYY-MM-DD.",
+                    },
                     "limit": {
                         "type": "integer",
                         "description": "Max records to return (clamped to 1..1000).",
@@ -1304,10 +1407,12 @@ TOOLS: list[dict[str, object]] = [
                     },
                     "start_published_date": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Optional start publication date YYYY-MM-DD, inclusive.",
                     },
                     "end_published_date": {
                         "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Optional end publication date YYYY-MM-DD, inclusive.",
                     },
                     "search_type": {
@@ -1616,7 +1721,7 @@ TOOLS: list[dict[str, object]] = [
                     },
                     "item": {
                         "type": "object",
-                        "description": "Finding whose provenance must match its claim_kind and the owning job's domain: SEC jobs cite the get_sec_document source_handle + cited passage for observed_fact; FINRA/WEB jobs cite the persisted tool_result_id of the FINRA/search_web response they read plus the cited record values/highlight (the kernel replays the persisted result itself); search scope for absence_observation.",
+                        "description": "Finding whose provenance must match its claim_kind and the owning job's domain: SEC jobs cite the get_sec_document source_handle + cited passage, or the persisted tool_result_id of an SEC structured response they read plus the cited record values, for observed_fact; FINRA/WEB jobs cite the persisted tool_result_id of the FINRA/search_web response they read plus the cited record values/highlight (the kernel replays the persisted result itself); search scope for absence_observation.",
                         "properties": {
                             "claim_kind": {
                                 "type": "string",
@@ -2815,13 +2920,19 @@ def _search_web(args: dict[str, object], model: str) -> dict[str, object]:
         exclude_domains: list[str] | None = [str(x) for x in raw_exc]
     else:
         exclude_domains = None
+    start, err = _finra_date(args.get("start_published_date"), "search_web", "start_published_date")
+    if err is not None:
+        return err
+    end, err = _finra_date(args.get("end_published_date"), "search_web", "end_published_date")
+    if err is not None:
+        return err
     result = exa_client.search(
         str(args["query"]),
         category=_str_or_none(args.get("category")),
         include_domains=include_domains,
         exclude_domains=exclude_domains,
-        start_published_date=_str_or_none(args.get("start_published_date")),
-        end_published_date=_str_or_none(args.get("end_published_date")),
+        start_published_date=start,
+        end_published_date=end,
         search_type=str(args.get("search_type") or "auto"),
         limit=args.get("limit") or exa_client.EXA_DEFAULT_LIMIT,
     )
@@ -5365,11 +5476,14 @@ def _discovery_bounds(args: dict[str, object], context: RequestContext) -> tuple
 
 def _find_sec_entities(args: dict[str, object], context: RequestContext) -> dict[str, object]:
     """Entity discovery -> envelope with candidate verification statuses."""
+    as_of, as_of_err = _sec_date_arg(args, "find_sec_entities", "as_of")
+    if as_of_err is not None:
+        return as_of_err
     exhaustive, max_results, packet = _discovery_bounds(args, context)
     return _search_envelope(
         sec.find_sec_entities(
             str(args["query"]),
-            as_of=_str_or_none(args.get("as_of")),
+            as_of=as_of,
             exhaustive=exhaustive,
             max_results=max_results,
             data_root=get_data_root(),
@@ -5399,6 +5513,15 @@ def _sec_search_result(args: dict[str, object], context: RequestContext) -> dict
             "security_identifier"
         )
     exhaustive, max_results, packet = _discovery_bounds(args, context)
+    start, start_err = _sec_date_arg(args, "search_sec_filings", "start_date")
+    if start_err is not None:
+        return start_err
+    end, end_err = _sec_date_arg(args, "search_sec_filings", "end_date")
+    if end_err is not None:
+        return end_err
+    as_of, as_of_err = _sec_date_arg(args, "search_sec_filings", "as_of")
+    if as_of_err is not None:
+        return as_of_err
     raw_forms = args.get("forms")
     if isinstance(raw_forms, str):
         forms: tuple[str, ...] | None = (raw_forms,)
@@ -5416,9 +5539,9 @@ def _sec_search_result(args: dict[str, object], context: RequestContext) -> dict
         accession_no=_str_or_none(args.get("accession_no")),
         security_identifier=_str_or_none(args.get("security_identifier")),
         forms=forms,
-        start_date=_str_or_none(args.get("start_date")),
-        end_date=_str_or_none(args.get("end_date")),
-        as_of=_str_or_none(args.get("as_of")),
+        start_date=start,
+        end_date=end,
+        as_of=as_of,
         exhaustive=exhaustive,
         max_results=max_results,
     )
@@ -5473,20 +5596,106 @@ def _doc_view_kwargs(args: dict[str, object]) -> _DocView:
     return extra
 
 
+_SEC_ACCESSION_HINT = (
+    "pass accession_no like 0001628280-26-044069 from the search_sec_filings packet; "
+    "accession_number is not a valid key"
+)
+
+
+def _sec_accession_value(args: dict[str, object], tool: str) -> tuple[str | None, dict[str, object] | None]:
+    """Validated accession_no or a self-correcting invalid_tool_arguments error."""
+    raw = args.get("accession_no")
+    if not isinstance(raw, str) or not raw.strip():
+        return None, {
+            "error": f"tool '{tool}': missing accession_no {raw!r}; {_SEC_ACCESSION_HINT}",
+            "error_type": "invalid_tool_arguments",
+        }
+    try:
+        sec.normalize_accession_no(raw)
+    except Exception:  # noqa: BLE001 - any normalize failure is a bad accession, guidance owns it
+        return None, {
+            "error": f"tool '{tool}': invalid accession_no {raw!r}; {_SEC_ACCESSION_HINT}",
+            "error_type": "invalid_tool_arguments",
+        }
+    return raw.strip(), None
+
+
+def _diff_accession_value(args: dict[str, object], tool: str, key: str) -> tuple[str | None, dict[str, object] | None]:
+    """Validated diff accession (current/previous) or a self-correcting error."""
+    raw = args.get(key)
+    if raw is None:
+        return None, None
+    if not isinstance(raw, str) or not raw.strip():
+        return None, {
+            "error": f"tool '{tool}': invalid {key} {raw!r}; {_SEC_ACCESSION_HINT}",
+            "error_type": "invalid_tool_arguments",
+        }
+    try:
+        sec.normalize_accession_no(raw)
+    except Exception:  # noqa: BLE001 - any normalize failure is a bad accession, guidance owns it
+        return None, {
+            "error": f"tool '{tool}': invalid {key} {raw!r}; {_SEC_ACCESSION_HINT}",
+            "error_type": "invalid_tool_arguments",
+        }
+    return raw.strip(), None
+
+
+def _get_sec_filing(args: dict[str, object], model: str) -> dict[str, object]:
+    """One filing's record by accession; bad accessions get self-correcting guidance."""
+    val, err = _sec_accession_value(args, "get_sec_filing")
+    if err is not None or val is None:
+        assert err is not None
+        return err
+    as_of, err = _sec_date_arg(args, "get_sec_filing", "as_of")
+    if err is not None:
+        return err
+    try:
+        return sec.get_sec_filing(val, as_of=as_of).to_dict()
+    except (KeyError, ValueError) as exc:
+        return {"error": str(exc), "error_type": "invalid_tool_arguments"}
+
+
 def _get_sec_document(args: dict[str, object], model: str) -> dict[str, object]:
     """Archive-first document read; model callers always get a bounded window."""
     del model
+    val, err = _sec_accession_value(args, "get_sec_document")
+    if err is not None or val is None:
+        assert err is not None
+        return err
+    as_of, err = _sec_date_arg(args, "get_sec_document", "as_of")
+    if err is not None:
+        return err
     try:
         cursor = args.get("cursor")
         limit = args.get("limit")
         return sec.get_sec_document(
-            str(args["accession_no"]),
+            val,
             _str_or_none(args.get("document_name")),
-            as_of=_str_or_none(args.get("as_of")),
+            as_of=as_of,
             offset=_doc_offset(cursor if cursor is not None else args.get("offset", 0)),
             max_chars=_doc_max_chars(limit if limit is not None else args.get("max_chars", 12_000)),
             data_root=get_data_root(),
             **_doc_view_kwargs(args),
+        )
+    except (KeyError, ValueError) as exc:
+        return {"error": str(exc), "error_type": "invalid_tool_arguments"}
+
+
+def _list_sec_documents(args: dict[str, object], model: str) -> dict[str, object]:
+    """Documents for one filing; bad accessions get self-correcting guidance."""
+    del model
+    val, err = _sec_accession_value(args, "list_sec_documents")
+    if err is not None or val is None:
+        assert err is not None
+        return err
+    as_of, err = _sec_date_arg(args, "list_sec_documents", "as_of")
+    if err is not None:
+        return err
+    try:
+        return _wrap_list(
+            val,
+            sec.list_sec_documents(val, as_of=as_of),
+            "documents",
         )
     except (KeyError, ValueError) as exc:
         return {"error": str(exc), "error_type": "invalid_tool_arguments"}
@@ -5557,10 +5766,13 @@ def _rel_request(args: dict[str, object]) -> dict[str, object]:
 
 
 def _sec_relationships_result(args: dict[str, object]) -> dict[str, object]:
+    as_of, as_of_err = _sec_date_arg(args, "search_sec_relationships", "as_of")
+    if as_of_err is not None:
+        return as_of_err
     result = sec.search_sec_relationships(
         str(args["entity"]),
         relationship_types=_rel_types(args.get("relationship_types")),
-        as_of=_str_or_none(args.get("as_of")),
+        as_of=as_of,
         limit=int(str(args.get("limit", 50) or 50)),
         exhaustive=bool(args.get("exhaustive", True)),
     )
@@ -5593,23 +5805,27 @@ def _sec_relationships_result(args: dict[str, object]) -> dict[str, object]:
 def _list_sec_filings(args: dict[str, object], model: str) -> dict[str, object]:
     """List filings with lenient tool-JSON coercions (forms union narrowed here)."""
     del model
-    raw_forms = args.get("forms")
-    if raw_forms is None:
-        forms: str | list[str] | tuple[str, ...] | None = None
-    elif isinstance(raw_forms, str):
-        forms = raw_forms
-    elif isinstance(raw_forms, (list, tuple)):
-        forms = tuple(str(x) for x in raw_forms)
-    else:
-        forms = None
+    start, err = _sec_date_arg(args, "list_sec_filings", "start_date")
+    if err is not None:
+        return err
+    end, err = _sec_date_arg(args, "list_sec_filings", "end_date")
+    if err is not None:
+        return err
+    as_of, err = _sec_date_arg(args, "list_sec_filings", "as_of")
+    if err is not None:
+        return err
+    forms, err = _filing_forms_arg(args.get("forms"), "list_sec_filings")
+    if err is not None:
+        return err
+    identifier = _remap_mixed_case(args, "identifier", str(args["identifier"]).strip().upper())
     return _wrap_list(
-        args.get("identifier"),
+        identifier,
         sec.list_sec_filings(
-            str(args["identifier"]),
+            identifier,
             forms=forms,
-            start_date=_str_or_none(args.get("start_date")),
-            end_date=_str_or_none(args.get("end_date")),
-            as_of=_str_or_none(args.get("as_of")),
+            start_date=start,
+            end_date=end,
+            as_of=as_of,
             limit=_optional_int(args.get("limit", 50)),
         ),
         "filings",
@@ -5627,12 +5843,42 @@ def _filing_forms(raw: object) -> str | list[str] | tuple[str, ...] | None:
     return None
 
 
+_FILING_FORMS_HINT = "pass forms as SEC form types (e.g. 10-K, 10-Q, 8-K, 4); dates belong in start_date/end_date"
+
+
+def _date_like_form(value: object) -> bool:
+    """Date-shaped form values are misrouted date args, never valid SEC forms."""
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if "YYYY" in text.upper():
+        return True
+    if _FINRA_DATE_RE.match(text):
+        return True
+    return "/" in text and re.search(r"\d{4}", text) is not None
+
+
+def _filing_forms_arg(
+    raw: object, tool: str
+) -> tuple[str | list[str] | tuple[str, ...] | None, dict[str, object] | None]:
+    """Coerced forms or an invalid_tool_arguments error naming the date-like value."""
+    forms = _filing_forms(raw)
+    if forms is None:
+        return None, None
+    values = [forms] if isinstance(forms, str) else list(forms)
+    if any(_date_like_form(v) for v in values):
+        return None, _invalid_args_error(tool, f"tool '{tool}': invalid forms {raw!r}; {_FILING_FORMS_HINT}")
+    return forms, None
+
+
 def _recent_filings(ticker: str, args: dict[str, object]) -> object:
     """Up to 10 recent filings for ticker self-resolution; errors stay a dict."""
+    forms, err = _filing_forms_arg(args.get("forms"), "diff_sec_filings")
+    if err is not None:
+        return err
     try:
-        return sec.list_sec_filings(
-            ticker, forms=_filing_forms(args.get("forms")), as_of=_str_or_none(args.get("as_of")), limit=10
-        )
+        as_of, _ = _sec_date_arg(args, "diff_sec_filings", "as_of")
+        return sec.list_sec_filings(ticker, forms=forms, as_of=as_of, limit=10)
     except Exception as exc:  # noqa: BLE001 - intentional best-effort boundary, never aborts
         return {"error": str(exc)}
 
@@ -5664,8 +5910,12 @@ def _diff_resolved_pair(ticker: str, filings: list[Filing], section: str | None)
 def _diff_sec_filings(args: dict[str, object], model: str) -> dict[str, object]:
     """Accession pair direct, or ticker self-resolution via sec.list_sec_filings."""
     del model
-    cur = _str_or_none(args.get("current_accession"))
-    prev = _str_or_none(args.get("previous_accession"))
+    cur, err = _diff_accession_value(args, "diff_sec_filings", "current_accession")
+    if err is not None:
+        return err
+    prev, err = _diff_accession_value(args, "diff_sec_filings", "previous_accession")
+    if err is not None:
+        return err
     section = _str_or_none(args.get("section"))
     if cur and prev:
         return sec.diff_filings(cur, prev, section=section)
@@ -5700,6 +5950,9 @@ def _edgar_ticker(name: str) -> str | None:
 def _resolve_company_to_ticker(name: str) -> str | None:
     """Company name to ticker via the EDGAR company index top hit."""
     return _edgar_ticker(name)
+
+
+_FINRA_ORG_WORDS = frozenset({"FINRA", "SEC", "NYSE", "NASDAQ", "OTC", "EDGAR"})
 
 
 def _upper_arg(args: dict[str, object], key: str) -> str | None:
@@ -5749,7 +6002,7 @@ def _ticker_or_company_name(
 ) -> tuple[str | None, dict[str, object] | None]:
     """Ticker/entity value or company_name; maps names to tickers for single dispatch."""
     value = _upper_arg(args, key)
-    if value is not None:
+    if value is not None and value not in _FINRA_ORG_WORDS:
         return _remap_mixed_case(args, key, value), None
     name = _company_arg(args)
     if name is None:
@@ -5770,11 +6023,14 @@ def _get_beneficial_ownership(args: dict[str, object], model: str) -> dict[str, 
     if err is not None:
         return err
     assert ticker is not None
+    as_of, as_of_err = _sec_date_arg(args, "get_beneficial_ownership", "as_of")
+    if as_of_err is not None:
+        return as_of_err
     return _wrap_list(
         ticker,
         sec.get_beneficial_ownership(
             ticker,
-            as_of=_str_or_none(args.get("as_of")),
+            as_of=as_of,
             limit=_optional_int(args.get("limit", 20)),
         ),
         "records",
@@ -5784,17 +6040,28 @@ def _get_beneficial_ownership(args: dict[str, object], model: str) -> dict[str, 
 def _get_insider_activity(args: dict[str, object], model: str) -> dict[str, object]:
     """Ticker or company name."""
     del model
-    ticker, err = _ticker_or_company_name(args, "get_insider_activity")
-    if err is not None:
-        return err
-    assert ticker is not None
+    ticker = _upper_arg(args, "ticker")
+    if ticker is not None and ticker not in _FINRA_ORG_WORDS:
+        ticker = _remap_mixed_case(args, "ticker", ticker)
+    if ticker is None or ticker in _FINRA_ORG_WORDS:
+        name = _company_arg(args)
+        if name is None:
+            return _invalid_args_error(
+                "get_insider_activity",
+                "Provide a ticker (e.g. AAPL) or company_name (e.g. Apple) for tool 'get_insider_activity'",
+            )
+        resolved = _resolve_company_to_ticker(name)
+        if resolved is None:
+            return _invalid_args_error(
+                "get_insider_activity", f"Unknown company name '{name}'; pass a ticker like AAPL"
+            )
+        ticker = resolved
+    as_of, as_of_err = _sec_date_arg(args, "get_insider_activity", "as_of")
+    if as_of_err is not None:
+        return as_of_err
     return _wrap_list(
         ticker,
-        sec.get_insider_activity(
-            ticker,
-            as_of=_str_or_none(args.get("as_of")),
-            limit=_optional_int(args.get("limit", 50)),
-        ),
+        sec.get_insider_activity(ticker, as_of=as_of, limit=_optional_int(args.get("limit", 50))),
         "transactions",
     )
 
@@ -5809,8 +6076,139 @@ def _search_sec_relationships(args: dict[str, object], model: str) -> dict[str, 
     return _sec_relationships_result({**args, "entity": entity})
 
 
+def _sec_date_arg(args: dict[str, object], tool: str, key: str) -> tuple[str | None, dict[str, object] | None]:
+    """Validated YYYY-MM-DD SEC date (None when blank); one line per Q-path call site."""
+    return _finra_date(args.get(key), tool, key)
+
+
+def _get_material_events(args: dict[str, object], model: str) -> dict[str, object]:
+    """8-K events; bad since/as_of get self-correcting guidance."""
+    del model
+    since, err = _sec_date_arg(args, "get_material_events", "since")
+    if err is not None:
+        return err
+    if since is None:
+        return _invalid_args_error(
+            "get_material_events", "Provide a since date YYYY-MM-DD for tool 'get_material_events'"
+        )
+    as_of, err = _sec_date_arg(args, "get_material_events", "as_of")
+    if err is not None:
+        return err
+    return _wrap_list(
+        args.get("ticker"),
+        sec.get_material_events(str(args["ticker"]), since, as_of=as_of, limit=_optional_int(args.get("limit", 50))),
+        "events",
+    )
+
+
+def _get_governance_events(args: dict[str, object], model: str) -> dict[str, object]:
+    """Governance events; bad since/as_of get self-correcting guidance."""
+    del model
+    since, err = _sec_date_arg(args, "get_governance_events", "since")
+    if err is not None:
+        return err
+    as_of, err = _sec_date_arg(args, "get_governance_events", "as_of")
+    if err is not None:
+        return err
+    return _wrap_list(
+        args.get("ticker"),
+        sec.get_governance_events(
+            str(args["ticker"]), since=since, as_of=as_of, limit=_optional_int(args.get("limit", 10))
+        ),
+        "events",
+    )
+
+
+def _get_short_pressure_profile(args: dict[str, object], model: str) -> dict[str, object]:
+    """Short-vs-outstanding context; ticker routes through the FINRA normalizer."""
+    del model
+    ticker = _finra_ticker(args)
+    if ticker is None:
+        return _invalid_args_error(
+            "get_short_pressure_profile", "Provide a ticker (e.g. AAPL) for tool 'get_short_pressure_profile'"
+        )
+    return sec.get_short_pressure_context(ticker)
+
+
 # Direct-dispatch tools (EDGAR/analyst/obligations/valuation) — same
 # registry pattern as the FINRA/Robinhood handler maps below.
+def _get_ownership_changes(args: dict[str, object], model: str) -> dict[str, object]:
+    """Deterministic 13D/G diffs; bad as_of gets self-correcting guidance."""
+    del model
+    as_of, as_of_err = _sec_date_arg(args, "get_ownership_changes", "as_of")
+    if as_of_err is not None:
+        return as_of_err
+    return _wrap_list(
+        args.get("ticker"),
+        sec.get_ownership_changes(
+            str(args["ticker"]),
+            as_of=as_of,
+            limit=_optional_int(args.get("limit", 20)),
+        ),
+        "changes",
+    )
+
+
+def _get_planned_insider_sales(args: dict[str, object], model: str) -> dict[str, object]:
+    """Planned Form 144 notices; bad as_of gets self-correcting guidance."""
+    del model
+    as_of, as_of_err = _sec_date_arg(args, "get_planned_insider_sales", "as_of")
+    if as_of_err is not None:
+        return as_of_err
+    return _wrap_list(
+        args.get("ticker"),
+        sec.get_planned_insider_sales(
+            str(args["ticker"]),
+            as_of=as_of,
+            limit=_optional_int(args.get("limit", 20)),
+        ),
+        "proposed_sales",
+    )
+
+
+def _get_offering_history(args: dict[str, object], model: str) -> dict[str, object]:
+    """Financing history; bad as_of gets self-correcting guidance."""
+    del model
+    as_of, as_of_err = _sec_date_arg(args, "get_offering_history", "as_of")
+    if as_of_err is not None:
+        return as_of_err
+    return _wrap_list(
+        args.get("ticker"),
+        sec.get_offering_history(
+            str(args["ticker"]),
+            as_of=as_of,
+            limit=_optional_int(args.get("limit", 50)),
+        ),
+        "offerings",
+    )
+
+
+def _get_dilution_profile(args: dict[str, object], model: str) -> dict[str, object]:
+    """Deterministic dilution math; bad as_of gets self-correcting guidance."""
+    del model
+    as_of, as_of_err = _sec_date_arg(args, "get_dilution_profile", "as_of")
+    if as_of_err is not None:
+        return as_of_err
+    return sec.get_dilution_profile(str(args["ticker"]), as_of=as_of)
+
+
+def _get_transaction_status(args: dict[str, object], model: str) -> dict[str, object]:
+    """M&A filing context; bad as_of gets self-correcting guidance."""
+    del model
+    as_of, as_of_err = _sec_date_arg(args, "get_transaction_status", "as_of")
+    if as_of_err is not None:
+        return as_of_err
+    return _wrap_list(
+        args.get("ticker"),
+        sec.get_transaction_status(
+            str(args["ticker"]),
+            as_of=as_of,
+            limit=_optional_int(args.get("limit", 10)),
+        ),
+        "transactions",
+    )
+
+
 _MODEL_HANDLERS: dict[str, ModelHandler] = {
     "evaluate_mandate": lambda args, model: evaluate_mandate(),
     "get_fundamentals": lambda args, model: sec_facts.get_fundamentals(
@@ -5824,81 +6222,20 @@ _MODEL_HANDLERS: dict[str, ModelHandler] = {
         limit=int(str(args.get("limit", 200))),
     ),
     "list_sec_filings": _list_sec_filings,
-    "get_sec_filing": lambda args, model: sec.get_sec_filing(
-        str(args["accession_no"]), as_of=_str_or_none(args.get("as_of"))
-    ).to_dict(),
-    "list_sec_documents": lambda args, model: _wrap_list(
-        args.get("accession_no"),
-        sec.list_sec_documents(str(args["accession_no"]), as_of=_str_or_none(args.get("as_of"))),
-        "documents",
-    ),
+    "get_sec_filing": _get_sec_filing,
+    "list_sec_documents": _list_sec_documents,
     "get_sec_document": _get_sec_document,
     "diff_sec_filings": _diff_sec_filings,
-    "get_material_events": lambda args, model: _wrap_list(
-        args.get("ticker"),
-        sec.get_material_events(
-            str(args["ticker"]),
-            str(args["since"]),
-            as_of=_str_or_none(args.get("as_of")),
-            limit=_optional_int(args.get("limit", 50)),
-        ),
-        "events",
-    ),
+    "get_material_events": _get_material_events,
     "get_beneficial_ownership": _get_beneficial_ownership,
-    "get_ownership_changes": lambda args, model: _wrap_list(
-        args.get("ticker"),
-        sec.get_ownership_changes(
-            str(args["ticker"]),
-            as_of=_str_or_none(args.get("as_of")),
-            limit=_optional_int(args.get("limit", 20)),
-        ),
-        "changes",
-    ),
+    "get_ownership_changes": _get_ownership_changes,
     "get_insider_activity": _get_insider_activity,
-    "get_planned_insider_sales": lambda args, model: _wrap_list(
-        args.get("ticker"),
-        sec.get_planned_insider_sales(
-            str(args["ticker"]),
-            as_of=_str_or_none(args.get("as_of")),
-            limit=_optional_int(args.get("limit", 20)),
-        ),
-        "proposed_sales",
-    ),
-    "get_offering_history": lambda args, model: _wrap_list(
-        args.get("ticker"),
-        sec.get_offering_history(
-            str(args["ticker"]),
-            as_of=_str_or_none(args.get("as_of")),
-            limit=_optional_int(args.get("limit", 50)),
-        ),
-        "offerings",
-    ),
-    "get_dilution_profile": lambda args, model: sec.get_dilution_profile(
-        str(args["ticker"]),
-        as_of=_str_or_none(args.get("as_of")),
-    ),
-    "get_governance_events": lambda args, model: _wrap_list(
-        args.get("ticker"),
-        sec.get_governance_events(
-            str(args["ticker"]),
-            since=_str_or_none(args.get("since")),
-            as_of=_str_or_none(args.get("as_of")),
-            limit=_optional_int(args.get("limit", 10)),
-        ),
-        "events",
-    ),
-    "get_transaction_status": lambda args, model: _wrap_list(
-        args.get("ticker"),
-        sec.get_transaction_status(
-            str(args["ticker"]),
-            as_of=_str_or_none(args.get("as_of")),
-            limit=_optional_int(args.get("limit", 10)),
-        ),
-        "transactions",
-    ),
-    "get_short_pressure_profile": lambda args, model: sec.get_short_pressure_context(
-        str(args["ticker"]),
-    ),
+    "get_planned_insider_sales": _get_planned_insider_sales,
+    "get_offering_history": _get_offering_history,
+    "get_dilution_profile": _get_dilution_profile,
+    "get_governance_events": _get_governance_events,
+    "get_transaction_status": _get_transaction_status,
+    "get_short_pressure_profile": _get_short_pressure_profile,
     "search_tools": _search_tools,
     "list_tool_domains": _list_tool_domains,
     "describe_tool": _describe_tool,
@@ -5924,50 +6261,281 @@ _MODEL_HANDLERS: dict[str, ModelHandler] = {
     "get_current_time": _get_current_time,
 }
 
-# FINRA dispatch registry — kept next to the FINRA tool schemas above so the
-# parity test can prove every FINRA schema has an executable dispatcher.
-_FINRA_HANDLERS: dict[str, ModelHandler] = {
-    "get_short_interest_leaderboard": lambda args, model: screens.get_short_interest_leaderboard(
-        limit=_optional_int(args.get("limit")),
-        settlement_date=_str_or_none(args.get("settlement_date")),
-        as_of=_str_or_none(args.get("as_of")),
-    ),
-    "get_short_interest": lambda args, model: finra_client.get_short_interest(
-        str(args["ticker"]), _str_or_none(args.get("settlementDate"))
-    ),
-    "get_reg_sho_volume": lambda args, model: finra_client.get_reg_sho_volume(
-        str(args["ticker"]), _str_or_none(args.get("tradeDate"))
-    ),
-    "get_threshold_securities": lambda args, model: finra_client.get_threshold_securities(
-        _str_or_none(args.get("ticker")), _str_or_none(args.get("tradeDate"))
-    ),
-    "list_finra_datasets": lambda args, model: finra_client.list_datasets(
-        group=_str_or_none(args.get("group")), search=_str_or_none(args.get("search"))
-    ),
-    "describe_finra_dataset": lambda args, model: finra_client.describe_dataset(
-        str(args.get("dataset_id") or args.get("dataset") or "")
-    ),
-    "get_finra_datapoints": lambda args, model: finra_client.get_finra_datapoints(
-        str(args["dataset"]),
+
+_FINRA_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _finra_date(value: object, tool: str, key: str) -> tuple[str | None, dict[str, object] | None]:
+    """Validated YYYY-MM-DD date or a self-correcting invalid_tool_arguments error."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, None
+    text = value.strip() if isinstance(value, str) else ""
+    msg = f"tool '{tool}': invalid {key} {value!r}; expected YYYY-MM-DD"
+    if not _FINRA_DATE_RE.match(text):
+        return None, _invalid_args_error(tool, msg)
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return None, _invalid_args_error(tool, msg)
+    return text, None
+
+
+_FINRA_DATASET_HINT = "pass dataset as canonical group/name (e.g. otcMarket/regShoDaily); unambiguous bare names resolve, unknown/ambiguous ones are rejected"
+
+
+def _finra_dataset(args: dict[str, object], tool: str, key: str) -> tuple[str | None, dict[str, object] | None]:
+    """Canonical group/name dataset (or unambiguous legacy bare name) or an invalid_tool_arguments error."""
+    raw = args.get(key)
+    if not isinstance(raw, str) or not raw.strip():
+        return None, _invalid_args_error(tool, f"tool '{tool}': invalid {key} {raw!r}; {_FINRA_DATASET_HINT}")
+    text = raw.strip()
+    if "/" in text:
+        return text, None
+    try:
+        entry = finra_client._resolve_dataset(text)
+    except ValueError as exc:
+        return None, _invalid_args_error(tool, f"tool '{tool}': invalid {key} {raw!r}; {exc}")
+    return entry.dataset_id, None
+
+
+def _finra_ticker(args: dict[str, object]) -> str | None:
+    """Uppercase FINRA ticker; mixed-case values remap via the EDGAR index."""
+    value = _upper_arg(args, "ticker")
+    if value is None or value in _FINRA_ORG_WORDS:
+        return None
+    return _remap_mixed_case(args, "ticker", value)
+
+
+def _get_short_interest(args: dict[str, object], model: str) -> dict[str, object]:
+    """One ticker's biweekly short position; bad dates get self-correcting guidance."""
+    del model
+    ticker = _finra_ticker(args)
+    if ticker is None:
+        return _invalid_args_error("get_short_interest", "Provide a ticker (e.g. AAPL) for tool 'get_short_interest'")
+    val, err = _finra_date(args.get("settlementDate"), "get_short_interest", "settlementDate")
+    if err is not None:
+        return err
+    return finra_client.get_short_interest(ticker, val)
+
+
+_SHO_NYC = ZoneInfo("America/New_York")
+
+
+def _sho_week_range() -> tuple[str, str]:
+    """Monday-NYC start through today-NYC end (exchanges run on NYC dates)."""
+    now_utc = datetime.now(UTC)
+    nyc_today = now_utc.astimezone(_SHO_NYC).date()
+    monday = nyc_today - timedelta(days=nyc_today.weekday())
+    return monday.isoformat(), nyc_today.isoformat()
+
+
+def _sho_number(value: object) -> float | None:
+    """Lenient numeric coercion for FINRA metric sums/latest (None when unparseable)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sho_field_sum(metrics: dict[str, object], field: str) -> float | None:
+    """Sum for one metrics.fields entry, else None."""
+    fields = metrics.get("fields")
+    if not isinstance(fields, dict):
+        return None
+    entry = fields.get(field)
+    if not isinstance(entry, dict):
+        return None
+    return _sho_number(entry.get("sum"))
+
+
+def _sho_latest(metrics: dict[str, object], field: str) -> float | None:
+    """Latest value for one latest_vs_prior row, else None."""
+    rows = metrics.get("latest_vs_prior")
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if isinstance(row, dict) and row.get("field") == field:
+            return _sho_number(row.get("latest"))
+    return None
+
+
+def _sho_volumes(metrics: dict[str, object]) -> tuple[float | None, float | None]:
+    """(combined_short, total): latest-day triple when present, else aggregate sums."""
+    short_l = _sho_latest(metrics, "shortParQuantity")
+    exempt_l = _sho_latest(metrics, "shortExemptParQuantity")
+    total_l = _sho_latest(metrics, "totalParQuantity")
+    if short_l is not None and exempt_l is not None and total_l is not None and total_l > 0:
+        return short_l + exempt_l, total_l
+    short_s = _sho_field_sum(metrics, "shortParQuantity")
+    exempt_s = _sho_field_sum(metrics, "shortExemptParQuantity")
+    total_s = _sho_field_sum(metrics, "totalParQuantity")
+    if short_s is None or exempt_s is None or total_s is None or total_s <= 0:
+        return None, None
+    return short_s + exempt_s, total_s
+
+
+def _sho_int(value: float | None) -> int | float | None:
+    if value is None:
+        return None
+    return int(value) if value.is_integer() else value
+
+
+def _sho_enrich(result: dict[str, object]) -> dict[str, object]:
+    """Add short-volume ratio keys to a Reg SHO briefing; errors pass through."""
+    if not isinstance(result, dict) or "error" in result:
+        return result
+    metrics = result.get("metrics")
+    if not isinstance(metrics, dict):
+        return result
+    short_volume, total_volume = _sho_volumes(metrics)
+    ratio = round(short_volume / total_volume * 100, 2) if short_volume is not None and total_volume else None
+    enriched = dict(result)
+    enriched["short_volume"] = _sho_int(short_volume)
+    enriched["total_volume"] = _sho_int(total_volume)
+    enriched["short_volume_ratio_pct"] = ratio
+    enriched["short_volume_ratio_elevated"] = ratio is not None and ratio >= 40
+    enriched["short_volume_ratio_note"] = (
+        "Combined short + short-exempt share of total volume; "
+        "40-50% generally considered elevated (>=50% highly elevated)."
+    )
+    return enriched
+
+
+def _get_reg_sho_volume(args: dict[str, object], model: str) -> dict[str, object]:
+    """Ticker or company name; one ticker's daily Reg SHO volume."""
+    del model
+    ticker, terr = _ticker_or_company_name(args, "get_reg_sho_volume")
+    if terr is not None:
+        return terr
+    assert ticker is not None
+    val, err = _finra_date(args.get("tradeDate"), "get_reg_sho_volume", "tradeDate")
+    if err is not None:
+        return err
+    if val is None:
+        monday, today = _sho_week_range()
+        return _sho_enrich(
+            finra_client.query_dataset("otcMarket/regShoDaily", ticker, start_date=monday, end_date=today, limit=100)
+        )
+    return _sho_enrich(finra_client.get_reg_sho_volume(ticker, val))
+
+
+def _finra_range(args: dict[str, object], tool: str) -> tuple[str | None, str | None, dict[str, object] | None]:
+    """Validated start/end_date pair or a self-correcting invalid_tool_arguments error."""
+    start, err = _finra_date(args.get("start_date"), tool, "start_date")
+    if err is not None:
+        return None, None, err
+    end, err = _finra_date(args.get("end_date"), tool, "end_date")
+    if err is not None:
+        return None, None, err
+    return start, end, None
+
+
+def _get_threshold_securities(args: dict[str, object], model: str) -> dict[str, object]:
+    """Threshold list, optionally filtered; bad dates get self-correcting guidance."""
+    del model
+    val, err = _finra_date(args.get("tradeDate"), "get_threshold_securities", "tradeDate")
+    if err is not None:
+        return err
+    return finra_client.get_threshold_securities(_finra_ticker(args), val)
+
+
+def _get_finra_datapoints(args: dict[str, object], model: str) -> dict[str, object]:
+    """Exact datapoints; bad dates get self-correcting guidance."""
+    del model
+    start, end, err = _finra_range(args, "get_finra_datapoints")
+    if err is not None:
+        return err
+    dataset, err = _finra_dataset(args, "get_finra_datapoints", "dataset")
+    if err is not None or dataset is None:
+        assert err is not None
+        return err
+    ticker = _finra_ticker(args) or _str_or_none(args.get("symbol"))
+    sort_order = _str_or_none(args.get("sort_order"))
+    if sort_order is not None and sort_order not in ("asc", "desc"):
+        return _invalid_args_error(
+            "get_finra_datapoints",
+            f"tool 'get_finra_datapoints': invalid sort_order {sort_order!r}; expected one of ['asc', 'desc']",
+        )
+    return finra_client.get_finra_datapoints(
+        dataset,
         fields=args.get("fields"),
-        ticker=_str_or_none(args.get("ticker") or args.get("symbol")),
-        start_date=_str_or_none(args.get("start_date")),
-        end_date=_str_or_none(args.get("end_date")),
+        ticker=ticker,
+        start_date=start,
+        end_date=end,
         limit=_optional_int(args.get("limit")),
         filters=args.get("filters"),
         sort_fields=args.get("sort_fields"),
-        sort_order=_str_or_none(args.get("sort_order")),
-    ),
-    "query_finra": lambda args, model: finra_client.query_dataset(
-        str(args["dataset"]),
-        ticker=_str_or_none(args.get("ticker") or args.get("symbol")),
-        start_date=_str_or_none(args.get("start_date")),
-        end_date=_str_or_none(args.get("end_date")),
+        sort_order=sort_order,
+    )
+
+
+def _query_finra(args: dict[str, object], model: str) -> dict[str, object]:
+    """Analyzed briefing; bad dates get self-correcting guidance."""
+    del model
+    start, end, err = _finra_range(args, "query_finra")
+    if err is not None:
+        return err
+    dataset, err = _finra_dataset(args, "query_finra", "dataset")
+    if err is not None or dataset is None:
+        assert err is not None
+        return err
+    ticker = _finra_ticker(args) or _str_or_none(args.get("symbol"))
+    return finra_client.query_dataset(
+        dataset,
+        ticker=ticker,
+        start_date=start,
+        end_date=end,
         limit=_optional_int(args.get("limit")),
         offset=_optional_int(args.get("offset")),
         filters=args.get("filters"),
         analysis_goal=_str_or_none(args.get("analysis_goal")),
+    )
+
+
+def _get_short_interest_leaderboard(args: dict[str, object], model: str) -> dict[str, object]:
+    """Most-shorted screen; bad dates get self-correcting guidance."""
+    del model
+    settlement_date, err = _finra_date(args.get("settlement_date"), "get_short_interest_leaderboard", "settlement_date")
+    if err is not None:
+        return err
+    as_of, err = _finra_date(args.get("as_of"), "get_short_interest_leaderboard", "as_of")
+    if err is not None:
+        return err
+    return screens.get_short_interest_leaderboard(
+        limit=_optional_int(args.get("limit")),
+        settlement_date=settlement_date,
+        as_of=as_of,
+    )
+
+
+# FINRA dispatch registry — kept next to the FINRA tool schemas above so the
+# parity test can prove every FINRA schema has an executable dispatcher.
+def _describe_finra_dataset(args: dict[str, object], model: str) -> dict[str, object]:
+    """Dataset metadata; bare ids get self-correcting canonical guidance."""
+    del model
+    key = "dataset_id" if args.get("dataset_id") is not None else "dataset"
+    dataset, err = _finra_dataset(args, "describe_finra_dataset", key)
+    if err is not None or dataset is None:
+        assert err is not None
+        return err
+    return finra_client.describe_dataset(dataset)
+
+
+_FINRA_HANDLERS: dict[str, ModelHandler] = {
+    "get_short_interest_leaderboard": _get_short_interest_leaderboard,
+    "get_short_interest": _get_short_interest,
+    "get_reg_sho_volume": _get_reg_sho_volume,
+    "get_threshold_securities": _get_threshold_securities,
+    "list_finra_datasets": lambda args, model: finra_client.list_datasets(
+        group=_str_or_none(args.get("group")), search=_str_or_none(args.get("search"))
     ),
+    "describe_finra_dataset": _describe_finra_dataset,
+    "get_finra_datapoints": _get_finra_datapoints,
+    "query_finra": _query_finra,
 }
 
 _ROBINHOOD_HANDLERS: dict[str, ModelHandler] = {
@@ -6118,20 +6686,99 @@ def _required_keys(params: dict[str, object]) -> list[str]:
 
 def _tool_properties(name: str) -> dict[str, object]:
     """Property dict for one tool's parameters, else empty."""
-    return _schema_dict(_tool_schema(name).get("parameters"))
+    params = _schema_dict(_tool_schema(name).get("parameters"))
+    return _schema_dict(params.get("properties"))
+
+
+def _pattern_mismatch(name: str, key: str, value: object, pattern: str, prop: object) -> str | None:
+    """Pattern violation message for a present non-blank arg, else None (blank stays handler-lenient)."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if not isinstance(value, str):
+        return f"Invalid argument for tool '{name}': '{key}' must be a string matching {pattern}, got {value!r}"
+    if not re.fullmatch(pattern, value.strip()):
+        desc = prop.get("description") if isinstance(prop, dict) else None
+        tail = f"; {desc}" if isinstance(desc, str) and desc else ""
+        return f"Invalid argument for tool '{name}': '{key}' {value!r} does not match {pattern}{tail}"
+    return None
+
+
+def _enum_mismatch(name: str, key: str, value: object, allowed: list[str]) -> str | None:
+    """Enum violation message for a present non-blank arg, else None (blank stays handler-lenient)."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, str) and value in allowed:
+        return None
+    return f"Invalid argument for tool '{name}': '{key}' {value!r} is not one of {allowed}"
+
+
+def _schema_value_mismatch(name: str, key: str, value: object, prop: object) -> str | None:
+    """pattern/enum violation for one present argument, else None."""
+    if not isinstance(prop, dict):
+        return None
+    if name in _SEC_GUIDED_TOOLS and key == "accession_no":
+        return None  # handler owns the self-correcting message (key + format + packet source)
+    pattern = prop.get("pattern")
+    if isinstance(pattern, str) and pattern:
+        hit = _pattern_mismatch(name, key, value, pattern, prop)
+        if hit is not None:
+            return hit
+    allowed = prop.get("enum")
+    if isinstance(allowed, list) and allowed and all(isinstance(v, str) for v in allowed):
+        return _enum_mismatch(name, key, value, [str(v) for v in allowed])
+    return None
+
+
+_SEC_GUIDED_TOOLS = frozenset({"get_sec_filing", "get_sec_document", "list_sec_documents"})
+
+_DATE_ARG_KEYS = frozenset(
+    {
+        "as_of",
+        "since",
+        "start_date",
+        "end_date",
+        "tradeDate",
+        "settlementDate",
+        "settlement_date",
+        "start_published_date",
+        "end_published_date",
+    }
+)
+_RELATIVE_DATE_RE = re.compile(r"\b(today|now|yesterday|tomorrow)\b|this week|last week|last quarter")
+
+
+def _relative_date_mismatch(name: str, key: str, value: object) -> str | None:
+    """Reject today/now-style literals on date args with the YYYY-MM-DD hint."""
+    if key not in _DATE_ARG_KEYS or not isinstance(value, str) or not value.strip():
+        return None
+    if _RELATIVE_DATE_RE.search(value.strip().lower()):
+        return (
+            f"Invalid argument for tool '{name}': '{key}' {value!r} is a relative date; "
+            "decode it to YYYY-MM-DD first (today/now = Today UTC date)"
+        )
+    return None
 
 
 def _validate_tool_arguments(name: str, arguments: object) -> str | None:
-    """Schema-level argument check: object-ness plus required keys. Returns
-    an error message, or None when the arguments are acceptable. Type
-    checking is intentionally out of scope; lenient handler coercions
-    (int(...), ...) remain the source of truth for value shapes."""
+    """Schema-level argument check: object-ness, required keys, plus schema
+    pattern/enum when present. Returns an error message, or None when the
+    arguments are acceptable."""
     if not isinstance(arguments, dict):
         return f"Tool arguments must be a JSON object for tool '{name}'"
+    if name in _SEC_GUIDED_TOOLS and "accession_no" not in arguments:
+        return None  # handler owns the self-correcting message (key + format + packet source)
     required_keys = _required_keys(_schema_dict(_tool_schema(name).get("parameters")))
     missing = [key for key in required_keys if key not in arguments]
     if missing:
         return f"Missing required argument(s) for tool '{name}': {', '.join(missing)}"
+    props = _tool_properties(name)
+    for key, value in arguments.items():
+        hit = _relative_date_mismatch(name, key, value)
+        if hit is not None:
+            return hit
+        hit = _schema_value_mismatch(name, key, value, props.get(key))
+        if hit is not None:
+            return hit
     return None
 
 

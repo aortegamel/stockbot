@@ -234,6 +234,7 @@ def get_analyst_estimates(ticker: str) -> dict[str, object]:
     ks = _obj(data.get("defaultKeyStatistics"))
     price = _raw(fd.get("currentPrice"))
     shares = _int(ks.get("sharesOutstanding"))
+    float_shares = _int(ks.get("floatShares"))
     market_cap = _raw(ks.get("marketCap"))
     if market_cap is None and price is not None and shares is not None:
         market_cap = price * shares
@@ -247,6 +248,7 @@ def get_analyst_estimates(ticker: str) -> dict[str, object]:
         "source": "Yahoo Finance sell-side consensus (unofficial endpoint)",
         "quote": {"price": price, "currency": "USD"},
         "shares_outstanding": shares,
+        "float_shares": float_shares,
         "market_cap": round(market_cap) if market_cap is not None else None,
         "price_targets": {
             "mean": _raw(fd.get("targetMeanPrice")),

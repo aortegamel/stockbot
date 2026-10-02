@@ -113,6 +113,8 @@ def _dispatch_shape_render_doc(result: dict[str, object], max_bytes: int) -> str
         return _render_sec_facts(result, max_bytes)
     if result.get("result_type") == "web_search":
         return _render_web_search(result, max_bytes)
+    if _is_insider_envelope(result):
+        return _render_insider_activity(result, max_bytes)
     if _is_text_result(result):
         return _render_text_result(result, max_bytes)
     return _render_generic(result, max_bytes)
@@ -287,9 +289,7 @@ def render_final_result(result: dict[str, object], max_bytes: int = MAX_TOOL_MES
     _final_section(out, "Evidence refs", _final_claims_block(result.get("grounded_claims", result.get("claims"))))
     out.append(_final_scope_line(result.get("research_scope")))
     text = "\n\n".join(line for line in out if line.strip())
-    return _truncate_bytes(
-        text if text.strip() else _cell(result.get("answer")) or "No grounded findings.", max_bytes
-    )
+    return _truncate_bytes(text if text.strip() else _cell(result.get("answer")) or "No grounded findings.", max_bytes)
 
 
 def _finalize_counts(final: dict[str, object]) -> tuple[int, int]:
@@ -2454,6 +2454,58 @@ def _generic_head_lines(result: dict[str, object], acc: _GenericAccumulator) -> 
         value = result.get(key)
         if value is not None:
             acc.add(f"{key}: {_cell(value)}")
+
+
+_INSIDER_ROW_KEYS = (
+    "insider_name",
+    "transaction_code",
+    "transaction_kind",
+    "transaction_date",
+    "acquired_disposed",
+    "shares",
+    "price",
+    "filed_at",
+    "accession_no",
+)
+
+
+def _is_insider_envelope(result: dict[str, object]) -> bool:
+    """True for the get_insider_activity envelope: transactions list of dicts with codes."""
+    rows = result.get("transactions")
+    return isinstance(rows, list) and any(
+        isinstance(r, dict) and ("transaction_code" in r or "transaction_kind" in r) for r in rows
+    )
+
+
+def _insider_row_line(item: dict[str, object]) -> str:
+    """One insider row: identity + code/kind/date/A-D/shares/price (never the first-6 cut)."""
+    return ", ".join(f"{k} {_cell(item[k])}" for k in _INSIDER_ROW_KEYS if item.get(k) not in (None, ""))
+
+
+def _render_insider_activity(result: dict[str, object], max_bytes: int) -> str:
+    """Narrow insider renderer: head lines + one line per transaction row within budget."""
+    acc = _GenericAccumulator(max_bytes)
+    _generic_head_lines(result, acc)
+    for key, value in result.items():
+        if value is None or key in ("ticker", "source", "concept_searched", "transactions"):
+            continue
+        if isinstance(value, list):
+            _generic_list_value(key, value, acc)
+        else:
+            _generic_scalar_or_mapping(key, value, acc)
+    rows = result.get("transactions")
+    rows = rows if isinstance(rows, list) else []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        if not acc.add("  - " + _insider_row_line(item)):
+            acc.omitted.append("transactions")
+            break
+    if acc.omitted:
+        acc.add(f"{TRUNCATED_MARKER} (Omitted rows: {len(acc.omitted)} in {', '.join(acc.omitted)})")
+    if not acc.lines:
+        return _minimal(result, max_bytes)
+    return "\n".join(acc.lines)
 
 
 def _generic_list_value(key: str, value: list[object], acc: _GenericAccumulator) -> None:

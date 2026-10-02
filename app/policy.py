@@ -27,9 +27,8 @@ class RunLimits:
     max_tool_calls: int | None = None
     max_runtime: float | None = None  # seconds
     max_tool_result_bytes: int = 64 * 1024  # == tool_render.MAX_TOOL_MESSAGE_BYTES
-    # Context-window guard, not a research count: evidence text packed into one
-    # run context stays bounded; retrieval itself is unlimited (ledger + paged reads).
-    max_evidence_tokens: int | None = 48_000
+    # Retrieval unbounded: ledger + paged reads own safety; counters stay telemetry.
+    max_evidence_tokens: int | None = None
 
 
 @dataclass(frozen=True)

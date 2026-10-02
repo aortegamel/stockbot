@@ -117,6 +117,7 @@ def test_get_analyst_estimates_normalized(yahoo_session: None, fake_cache: FakeC
     assert targets["recommendation"] == "Strong Buy"
     valuation = _as_dict(result["valuation"])
     assert valuation["forward_pe"] == pytest.approx(16.336937)
+    assert result["float_shares"] == 23226192000
 
     periods = {r["period"]: r for r in _as_seq(result["forward_estimates"])}
     cq = _as_dict(periods["current_quarter"])

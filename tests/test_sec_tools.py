@@ -373,6 +373,43 @@ def test_list_sec_filings_dispatch_wraps_records(monkeypatch: pytest.MonkeyPatch
     assert result["source"] == "SEC EDGAR"
 
 
+def test_list_sec_filings_company_name_resolves_to_ticker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """identifier='Apple' resolves via the EDGAR index before SEC dispatch."""
+    seen: dict[str, object] = {}
+
+    def _fake_list(identifier: object, **kwargs: object) -> list[object]:
+        seen["identifier"] = identifier
+        return []
+
+    monkeypatch.setattr(tools.sec, "list_sec_filings", _fake_list)
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", lambda _name: "AAPL")
+    result = tools.execute_tool("list_sec_filings", {"identifier": "Apple"}, "test", context=_research_context())
+    assert result["subject"] == "AAPL"
+    assert seen["identifier"] == "AAPL"
+    assert result["source"] == "SEC EDGAR"
+
+
+def test_list_sec_filings_ticker_like_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+    """identifier='AAPL' hits the resolver zero times and dispatches as-is."""
+    seen: dict[str, object] = {}
+    calls: list[str] = []
+
+    def _fake_list(identifier: object, **kwargs: object) -> list[object]:
+        seen["identifier"] = identifier
+        return []
+
+    def _boom(name: str) -> str | None:
+        calls.append(name)
+        return "ZZZ"
+
+    monkeypatch.setattr(tools.sec, "list_sec_filings", _fake_list)
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _boom)
+    result = tools.execute_tool("list_sec_filings", {"identifier": "AAPL"}, "test", context=_research_context())
+    assert result["subject"] == "AAPL"
+    assert seen["identifier"] == "AAPL"
+    assert calls == []
+
+
 def test_list_sec_filings_rejects_old_ticker_key():
     result = tools.execute_tool("list_sec_filings", {"ticker": "FAKE"}, "test", context=_research_context())
     assert result["error_type"] == "invalid_tool_arguments"
@@ -1026,6 +1063,84 @@ def test_get_sec_document_dispatch_passes_through(monkeypatch: pytest.MonkeyPatc
 def test_missing_required_argument_is_tool_argument_error() -> None:
     result = tools.execute_tool("get_sec_document", {}, "test", context=_research_context())
     assert result["error_type"] == "invalid_tool_arguments"
+
+
+def test_bad_accession_names_key_and_format() -> None:
+    """'Elon Musk' / wrong-key shapes get self-correcting accession_no guidance."""
+    cases: tuple[dict[str, object], ...] = (
+        {"accession_no": "Elon Musk"},
+        {"accession_number": "0001628280-26-044069"},
+        {},
+    )
+    for args in cases:
+        result = tools.execute_tool("get_sec_filing", args, "test", context=_research_context())
+        assert result["error_type"] == "invalid_tool_arguments"
+        text = str(result["error"])
+        assert "accession_no" in text and "0001628280-26-044069" in text
+        assert "accession_number is not a valid key" in text
+
+
+def test_list_sec_documents_bad_accession_names_key_and_format() -> None:
+    """Bad accessions on list_sec_documents get the same self-correcting guidance."""
+    cases: tuple[dict[str, object], ...] = (
+        {"accession_no": "Elon Musk"},
+        {"accession_number": "0001628280-26-044069"},
+        {},
+    )
+    for args in cases:
+        result = tools.execute_tool("list_sec_documents", args, "test", context=_research_context())
+        assert result["error_type"] == "invalid_tool_arguments"
+        text = str(result["error"])
+        assert "accession_no" in text and "0001628280-26-044069" in text
+        assert "accession_number is not a valid key" in text
+
+
+def test_gate_and_handlers_reject_nvda_accession_this_week_dates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """NVDA-as-accession, 'this week' dates, bad enums: guided invalid_tool_arguments, zero SEC HTTP."""
+    from app import tools as tools_module
+
+    gate_cases = [
+        ("diff_sec_filings", {"current_accession": "NVDA", "previous_accession": "0000320193-25-000079"}),
+        ("list_sec_filings", {"identifier": "AAPL", "start_date": "this week"}),
+        ("search_sec_filings", {"query": "Acme", "end_date": "this week"}),
+        ("get_material_events", {"ticker": "AMD", "since": "this week"}),
+        ("get_governance_events", {"ticker": "AAPL", "since": "this week"}),
+        ("get_fundamentals", {"ticker": "AAPL", "metric": "bogus"}),
+        ("get_recent_ownership_filings", {"form_type": "bogus"}),
+    ]
+    for tool, args in gate_cases:
+        msg = tools_module._validate_tool_arguments(tool, args)
+        assert msg is not None and tool in msg, (tool, args, msg)
+    # Guided accession tools bypass the gate pattern (handler owns the packet-source message).
+    assert tools_module._validate_tool_arguments("get_sec_filing", {"accession_no": "NVDA"}) is None
+    guided = tools.execute_tool("get_sec_filing", {"accession_no": "NVDA"}, "test", context=_research_context())
+    assert guided["error_type"] == "invalid_tool_arguments", guided
+    assert "accession_no" in str(guided["error"]) and "0001628280-26-044069" in str(guided["error"]), guided
+    as_of_msg = tools_module._validate_tool_arguments(
+        "get_sec_filing", {"accession_no": "0000320193-25-000079", "as_of": "this week"}
+    )
+    assert as_of_msg is not None and "as_of" in as_of_msg and "YYYY-MM-DD" in as_of_msg, as_of_msg
+
+    called = {"n": 0}
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        called["n"] += 1
+        raise AssertionError("SEC provider must not run on rejected args")
+
+    monkeypatch.setattr(tools.sec, "get_material_events", _boom)
+    monkeypatch.setattr(tools.sec, "get_governance_events", _boom)
+    monkeypatch.setattr(tools.sec, "list_sec_filings", _boom)
+    monkeypatch.setattr(tools.sec, "diff_filings", _boom)
+    for tool, args in [
+        ("diff_sec_filings", {"current_accession": "NVDA", "previous_accession": "0000320193-25-000079"}),
+        ("get_material_events", {"ticker": "AMD", "since": "this week"}),
+        ("get_governance_events", {"ticker": "AAPL", "since": "this week"}),
+        ("list_sec_filings", {"identifier": "AAPL", "start_date": "this week"}),
+    ]:
+        result = tools.execute_tool(tool, args, "test", context=_research_context())
+        assert result["error_type"] == "invalid_tool_arguments", (tool, result)
+        assert "YYYY-MM-DD" in str(result["error"]) or "accession" in str(result["error"]), (tool, result)
+    assert called["n"] == 0
 
 
 def test_get_material_events_dispatch_carries_accession_citations(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1713,8 +1828,6 @@ def test_research_read_search_unknown_session_and_search(tmp_path: Path, monkeyp
     assert "s-nope" in str(unknown_search["error"])
 
 
-
-
 def test_research_read_search_rejects_bad_page_arguments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     context = _read_search_context(tmp_path, monkeypatch)
     _seed_read_search_ledger(tmp_path)
@@ -1798,3 +1911,84 @@ def test_search_sec_filings_remainder_names_read_search(monkeypatch: pytest.Monk
 
     uncapped = tools.execute_tool("search_sec_filings", {"query": "Acme Labs"}, "test", context=_research_context())
     assert _as_dict(uncapped["additional_hits"]) == {"count": 0}
+
+
+def test_list_sec_filings_rejects_date_like_forms_before_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """forms=['2025-01-01'] is a misrouted date arg: guided invalid_tool_arguments, zero provider call."""
+
+    def _boom(*args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("provider must not be called for date-like forms")
+
+    monkeypatch.setattr(tools.sec, "list_sec_filings", _boom)
+    result = tools.execute_tool(
+        "list_sec_filings",
+        {"identifier": "NVDA", "forms": ["2025-01-01"], "start_date": "2025-10-01", "end_date": "2025-10-31"},
+        "test",
+        context=_research_context(),
+    )
+    assert result["error_type"] == "invalid_tool_arguments"
+    assert "2025-01-01" in str(result["error"])
+    assert "10-K" in str(result["error"])
+
+
+def test_diff_sec_filings_rejects_date_like_forms_before_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ticker self-resolution path shares the guard: guided error, zero provider call."""
+
+    def _boom(*args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("provider must not be called for date-like forms")
+
+    monkeypatch.setattr(tools.sec, "list_sec_filings", _boom)
+    result = tools.execute_tool(
+        "diff_sec_filings", {"ticker": "NVDA", "forms": ["2025-01-01"]}, "test", context=_research_context()
+    )
+    assert result["error_type"] == "invalid_tool_arguments"
+    assert "2025-01-01" in str(result["error"])
+
+
+def test_list_sec_filings_valid_forms_reach_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Legit forms still coerce and reach the provider untouched."""
+    seen: dict[str, object] = {}
+
+    def _fake(*args: object, **kwargs: object) -> list[object]:
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(tools.sec, "list_sec_filings", _fake)
+    result = tools.execute_tool(
+        "list_sec_filings", {"identifier": "NVDA", "forms": ["10-K", "8-K"]}, "test", context=_research_context()
+    )
+    assert result["source"] == "SEC EDGAR"
+    assert seen["forms"] == ("10-K", "8-K")
+
+
+def test_get_insider_activity_self_contained_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Insider handler resolves ticker/company inline and dispatches without shared helpers."""
+    from types import SimpleNamespace
+
+    seen: dict[str, object] = {}
+
+    def _fake_activity(ticker: object, **kwargs: object) -> list[object]:
+        seen["ticker"] = ticker
+        seen.update(kwargs)
+        return [SimpleNamespace(to_dict=lambda: {"ticker": ticker})]
+
+    monkeypatch.setattr(tools.sec, "get_insider_activity", _fake_activity)
+    result = tools._get_insider_activity({"ticker": "AAPL", "limit": 5}, "test")
+    assert result["subject"] == "AAPL"
+    assert _as_seq(result["transactions"])[0]["ticker"] == "AAPL"
+    assert seen["limit"] == 5
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", lambda _name: "AAPL")
+    named = tools._get_insider_activity({"company_name": "Apple"}, "test")
+    assert named["subject"] == "AAPL"
+
+    bad = tools._get_insider_activity({"ticker": "AAPL", "as_of": "not-a-date"}, "test")
+    assert bad["error_type"] == "invalid_tool_arguments"
+
+
+def test_get_insider_activity_avoids_shared_helpers() -> None:
+    """Insider is a single self-contained function: no shared ticker helper calls."""
+    import inspect
+
+    source = inspect.getsource(tools._get_insider_activity)
+    assert "_ticker_or_company_name" not in source

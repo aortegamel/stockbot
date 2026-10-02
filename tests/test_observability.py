@@ -64,6 +64,13 @@ def test_redact_json_units():
     assert redact_json("not json") == "not json"
 
 
+def test_run_limits_default_unbounded_evidence():
+    """RunLimits defaults to no evidence-token ceiling (counters stay telemetry)."""
+    from app.policy import RunLimits
+
+    assert RunLimits().max_evidence_tokens is None
+
+
 def test_reserve_methods_enforce_runtime():
     """Reserves refuse once elapsed runtime is gone, even with call slots left."""
     budget = ExecutionBudget(

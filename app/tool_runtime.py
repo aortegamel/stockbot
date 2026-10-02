@@ -338,6 +338,7 @@ class ToolOutcome:
     error_type: str | None
     retryable: bool
     meta: ToolResultMeta
+    tool_result_id: str | None = None
 
 
 # ponytail: only handler-level tool_error retries; denials/budgets/validation are deterministic.
@@ -350,6 +351,12 @@ def outcome_from_result(tool_name: str, result: dict[str, object]) -> ToolOutcom
     refs = _extract_source_refs(result)
     source_refs = dict(refs) if refs else None
     raw_handle = result.get("source_handle")
+    if not isinstance(raw_handle, dict) or not raw_handle:
+        _meta = result.get("meta") if isinstance(result, dict) else None
+        if isinstance(_meta, dict):
+            _mh = _meta.get("source_handle")
+            if isinstance(_mh, dict) and _mh:
+                raw_handle = _mh
     source_handle = dict(raw_handle) if isinstance(raw_handle, dict) and raw_handle else None
     raw_error = result.get("error")
     error = str(raw_error) if raw_error is not None else None
@@ -365,6 +372,7 @@ def outcome_from_result(tool_name: str, result: dict[str, object]) -> ToolOutcom
         error_type=error_type,
         retryable=retryable,
         meta=_tool_result_meta(result),
+        tool_result_id=result.get("tool_result_id") if isinstance(result.get("tool_result_id"), str) else None,
     )
 
 
@@ -794,6 +802,24 @@ _REPLAYABLE_TOOL_RESULTS: frozenset[str] = frozenset(
         "get_threshold_securities",
         "get_short_interest_leaderboard",
         "search_web",
+        "list_sec_filings",
+        "get_sec_filing",
+        "get_insider_activity",
+        "get_planned_insider_sales",
+        "get_fundamentals",
+        "get_beneficial_ownership",
+        "get_ownership_changes",
+        "get_offering_history",
+        "get_dilution_profile",
+        "get_governance_events",
+        "get_transaction_status",
+        "get_financial_statements",
+        "get_xbrl_facts",
+        "get_obligations",
+        "get_valuation_metrics",
+        "get_recent_ownership_filings",
+        "get_material_events",
+        "search_sec_filings",
     }
 )
 """Staged tools whose success payloads persist for kernel evidence replay."""
@@ -1538,7 +1564,7 @@ def _execute_agent_tool(
             "error": _unavailable_data_response([(name, {"error": "empty tool result"})]),
             "error_type": "tool_error",
         }
-    _persist_staged_tool_result(name, result, staged, resolved_tc_id)
+    rid = _persist_staged_tool_result(name, result, staged, resolved_tc_id)
 
     # Gate 5: ingress scan on the rendered evidence; quarantined or blocked
     # results are withheld from the agent with a fixed placeholder.
@@ -1554,6 +1580,8 @@ def _execute_agent_tool(
         status=status,
         meta=meta,
     )
+    if rid is not None and isinstance(out, dict) and not out.get("error"):
+        out["tool_result_id"] = rid
     dur_ms = (time.perf_counter() - t0) * 1000.0
     if isinstance(out, dict) and out.get("error"):
         logger.warning(

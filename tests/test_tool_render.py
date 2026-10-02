@@ -702,3 +702,38 @@ def test_final_answer_card_renders_coverage_and_sources():
     assert "## Coverage" in text and "datasets_queried: short-interest" in text
     assert "## Sources" in text and "FINRA" in text and "rs:1:ev:1" in text
     assert "CANONICAL_STRUCTURED" in text
+
+
+def test_insider_envelope_names_code_kind_date_and_deal_envelope_unaffected():
+    """Narrow insider rows carry code/kind/date/A-D/shares/price; deal rows keep generic shape."""
+    insider_text = render_tool_result(
+        {
+            "subject": "TSLA",
+            "count": 1,
+            "transactions": [
+                {
+                    "insider_name": "X",
+                    "transaction_code": "S",
+                    "transaction_kind": "open_market_sale",
+                    "transaction_date": "2026-09-08",
+                    "acquired_disposed": "D",
+                    "shares": 2605,
+                    "price": 1.0,
+                    "filed_at": "2026-09-09",
+                    "accession_no": "a",
+                }
+            ],
+            "source": "SEC EDGAR",
+        }
+    )
+    for token in ("transaction_code S", "transaction_kind open_market_sale", "transaction_date 2026-09-08"):
+        assert token in insider_text
+    deal_text = render_tool_result(
+        {
+            "subject": "XYZ",
+            "count": 1,
+            "transactions": [{"event_id": "e1", "target": "T", "deal_type": "merger", "buyer": "B"}],
+            "source": "SEC EDGAR",
+        }
+    )
+    assert "event_id e1" in deal_text and "transaction_code" not in deal_text

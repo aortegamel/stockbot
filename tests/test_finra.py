@@ -1225,3 +1225,297 @@ def test_finra_schema_dispatch_parity() -> None:
     assert finra_names <= schema_names, "FINRA schema missing from TOOLS"
     assert set(tools_module._FINRA_HANDLERS) == finra_names, "FINRA dispatch registry out of sync with schemas"
     assert all(callable(h) for h in tools_module._FINRA_HANDLERS.values())
+
+
+def test_finra_mixed_case_ticker_remaps_to_aapl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mixed-case 'Apple' remaps via the EDGAR index; 'AAPL' passes through."""
+
+    def _resolve(_name: str) -> str:
+        return "AAPL"
+
+    def _short(ticker: str, _settlement_date: str | None = None) -> dict[str, object]:
+        return {"ticker": ticker}
+
+    def _sho_single(ticker: str, _trade_date: str | None = None) -> dict[str, object]:
+        return {"ticker": ticker}
+
+    def _sho_week(dataset: str, ticker: str | None = None, **kwargs: object) -> dict[str, object]:
+        return {"ticker": ticker}
+
+    def _threshold(ticker: str | None = None, _trade_date: str | None = None) -> dict[str, object]:
+        return {"ticker": ticker}
+
+    monkeypatch.setattr(tools_module, "_resolve_company_to_ticker", _resolve)
+    monkeypatch.setattr(finra_client, "get_short_interest", _short)
+    monkeypatch.setattr(finra_client, "get_reg_sho_volume", _sho_single)
+    monkeypatch.setattr(finra_client, "query_dataset", _sho_week)
+    monkeypatch.setattr(finra_client, "get_threshold_securities", _threshold)
+    for tool in ("get_short_interest", "get_reg_sho_volume", "get_threshold_securities"):
+        assert tools_module._FINRA_HANDLERS[tool]({"ticker": "AAPL"}, "test") == {"ticker": "AAPL"}
+        assert tools_module._FINRA_HANDLERS[tool]({"ticker": "Apple"}, "test") == {"ticker": "AAPL"}
+
+
+def test_reg_sho_company_name_resolves_before_http(http: dict[str, MagicMock], monkeypatch: pytest.MonkeyPatch) -> None:
+    """ticker='Apple' -> AAPL via the EDGAR index with zero extra FINRA HTTP."""
+    seen: dict[str, object] = {}
+    calls: list[str] = []
+
+    def _resolve(name: str) -> str:
+        calls.append(name)
+        return "AAPL"
+
+    def _sho(dataset: str, ticker: str | None = None, **kwargs: object) -> dict[str, object]:
+        seen["ticker"] = ticker
+        seen["dataset"] = dataset
+        return {"ticker": ticker}
+
+    monkeypatch.setattr(tools_module, "_resolve_company_to_ticker", _resolve)
+    monkeypatch.setattr(finra_client, "query_dataset", _sho)
+    result = execute_tool("get_reg_sho_volume", {"ticker": "Apple"}, model="test", context=LOCAL_CONTEXT)
+    assert result == {"ticker": "AAPL"}
+    assert seen["ticker"] == "AAPL"
+    assert calls == ["Apple"]
+    assert http["post"].call_count == 0
+
+
+def test_finra_rejects_non_iso_dates_with_format(http: dict[str, MagicMock]) -> None:
+    """'this week' can never reach FINRA: bad dates fail closed at the handler."""
+    cases = [
+        ("get_short_interest", {"ticker": "AAPL", "settlementDate": "this week"}, "settlementDate"),
+        ("get_reg_sho_volume", {"ticker": "AAPL", "tradeDate": "this week"}, "tradeDate"),
+        ("get_threshold_securities", {"tradeDate": "2026-13-45"}, "tradeDate"),
+        (
+            "query_finra",
+            {"dataset": "otcMarket/weeklySummary", "start_date": "this week"},
+            "start_date",
+        ),
+        (
+            "get_finra_datapoints",
+            {
+                "dataset": "otcMarket/weeklySummary",
+                "fields": ["issueSymbolIdentifier"],
+                "ticker": "AAPL",
+                "end_date": "not-a-date",
+            },
+            "end_date",
+        ),
+    ]
+    for tool, args, key in cases:
+        result = execute_tool(tool, args, model="test", context=LOCAL_CONTEXT)
+        assert result["error_type"] == "invalid_tool_arguments", (tool, result)
+        assert key in str(result["error"]), (tool, result)
+        assert "YYYY-MM-DD" in str(result["error"]), (tool, result)
+    assert http["post"].call_count == 0  # rejected before any FINRA request
+
+
+def test_gate_rejects_today_now_literals_with_decode_hint(http: dict[str, MagicMock]) -> None:
+    """Q3 regression: as_of 'today' must fail closed at the gate, not deep in insider/filings."""
+    for tool, args in [
+        ("get_insider_activity", {"ticker": "AAPL", "as_of": "today"}),
+        ("get_insider_activity", {"ticker": "AAPL", "as_of": "now"}),
+        ("get_reg_sho_volume", {"ticker": "AAPL", "tradeDate": "today"}),
+        ("get_short_interest", {"ticker": "AAPL", "settlementDate": "now"}),
+        ("get_material_events", {"ticker": "AMD", "since": "today"}),
+    ]:
+        msg = tools_module._validate_tool_arguments(tool, args)
+        assert msg is not None and "relative date" in msg, (tool, args, msg)
+        assert "YYYY-MM-DD" in msg, (tool, args, msg)
+        result = execute_tool(tool, args, model="test", context=LOCAL_CONTEXT)
+        assert result["error_type"] == "invalid_tool_arguments", (tool, result)
+        assert "relative date" in str(result["error"]), (tool, result)
+    # Valid ISO dates still pass the relative-date gate (substring list must not false-fire).
+    assert (
+        tools_module._validate_tool_arguments("get_insider_activity", {"ticker": "AAPL", "as_of": "2026-09-23"}) is None
+    )
+    assert (
+        tools_module._validate_tool_arguments("get_reg_sho_volume", {"ticker": "AAPL", "tradeDate": "2026-09-22"})
+        is None
+    )
+    assert http["post"].call_count == 0  # gate-only: no provider request issued
+
+
+def test_finra_ticker_missing_returns_none() -> None:
+    assert tools_module._finra_ticker({}) is None
+    assert tools_module._finra_ticker({"ticker": "   "}) is None
+    assert tools_module._finra_ticker({"ticker": 123}) is None
+
+
+def test_finra_missing_ticker_rejected_before_finra(http: dict[str, MagicMock]) -> None:
+    for tool in ("get_short_interest", "get_reg_sho_volume"):
+        missing = execute_tool(tool, {}, model="test", context=LOCAL_CONTEXT)
+        assert missing["error_type"] == "invalid_tool_arguments", (tool, missing)
+        blank = execute_tool(tool, {"ticker": "   "}, model="test", context=LOCAL_CONTEXT)
+        assert blank["error_type"] == "invalid_tool_arguments", (tool, blank)
+    assert http["post"].call_count == 0  # rejected before any FINRA request
+
+
+def test_gate_rejects_bad_accession_dates_datasets_enums_before_http(http: dict[str, MagicMock]) -> None:
+    """Gate-level pattern/enum: NVDA-as-accession, 'this week', bare regShoDaily, bad enums."""
+    gate_cases = [
+        ("diff_sec_filings", {"current_accession": "NVDA", "previous_accession": "0000320193-25-000079"}),
+        ("get_reg_sho_volume", {"ticker": "AAPL", "tradeDate": "this week"}),
+        ("get_short_interest", {"ticker": "AAPL", "settlementDate": "this week"}),
+        ("get_short_interest_leaderboard", {"settlement_date": "this week"}),
+        ("get_material_events", {"ticker": "AMD", "since": "this week"}),
+        ("search_web", {"query": "AMD news", "category": "bogus"}),
+        ("search_web", {"query": "AMD news", "search_type": "bogus"}),
+        ("get_fundamentals", {"ticker": "AAPL", "metric": "bogus"}),
+        ("get_financial_statements", {"ticker": "AAPL", "statement_type": "bogus"}),
+        (
+            "get_finra_datapoints",
+            {"dataset": "otcMarket/weeklySummary", "fields": ["issueSymbolIdentifier"], "sort_order": "sideways"},
+        ),
+    ]
+    for tool, args in gate_cases:
+        msg = tools_module._validate_tool_arguments(tool, args)
+        assert msg is not None and tool in msg, (tool, args, msg)
+    # Guided accession tools bypass the gate pattern (handler owns the packet-source message).
+    assert tools_module._validate_tool_arguments("get_sec_filing", {"accession_no": "NVDA"}) is None
+    guided = execute_tool("get_sec_filing", {"accession_no": "NVDA"}, model="test", context=LOCAL_CONTEXT)
+    assert guided["error_type"] == "invalid_tool_arguments", guided
+    assert "accession_no" in str(guided["error"]), guided
+    # Spot-check the named key + guided vocabulary in the message.
+    assert "current_accession" in str(
+        tools_module._validate_tool_arguments(
+            "diff_sec_filings", {"current_accession": "NVDA", "previous_accession": "0000320193-25-000079"}
+        )
+    )
+    assert "tradeDate" in str(
+        tools_module._validate_tool_arguments("get_reg_sho_volume", {"ticker": "AAPL", "tradeDate": "this week"})
+    )
+    assert "YYYY-MM-DD" in str(
+        tools_module._validate_tool_arguments("get_reg_sho_volume", {"ticker": "AAPL", "tradeDate": "this week"})
+    )
+    assert "metric" in str(tools_module._validate_tool_arguments("get_fundamentals", {"ticker": "AAPL", "metric": "x"}))
+    # Unambiguous bare names resolve at the handler (legacy); unknown/ambiguous fail there.
+    assert tools_module._validate_tool_arguments("describe_finra_dataset", {"dataset_id": "regShoDaily"}) is None
+    assert http["post"].call_count == 0  # gate-only: no FINRA request issued
+
+
+def test_handler_rejects_bare_unknown_ambiguous_datasets_before_data(http: dict[str, MagicMock]) -> None:
+    """Handler-level dataset canonicalization: unknown/ambiguous bare ids fail before any data POST."""
+    unknown = execute_tool(
+        "describe_finra_dataset", {"dataset_id": "notARealDataset"}, model="test", context=LOCAL_CONTEXT
+    )
+    assert unknown["error_type"] == "invalid_tool_arguments", unknown
+    assert "notARealDataset" in str(unknown["error"]), unknown
+    ambiguous = execute_tool("query_finra", {"dataset": "sharedName"}, model="test", context=LOCAL_CONTEXT)
+    assert ambiguous["error_type"] == "invalid_tool_arguments", ambiguous
+    assert "Ambiguous" in str(ambiguous["error"]), ambiguous
+    assert http["post"].call_count == 1  # catalog token only; no data POST
+
+
+def test_pressure_profile_normalizes_ticker_before_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_short_pressure_profile routes its ticker through _finra_ticker (mixed-case remap)."""
+    seen: dict[str, object] = {}
+
+    def _fake_context(ticker: str) -> dict[str, object]:
+        seen["ticker"] = ticker
+        return {"ticker": ticker}
+
+    monkeypatch.setattr(tools_module.sec, "get_short_pressure_context", _fake_context)
+    monkeypatch.setattr(tools_module, "_resolve_company_to_ticker", lambda _name: "AAPL")
+    out = execute_tool("get_short_pressure_profile", {"ticker": "Apple"}, model="test", context=LOCAL_CONTEXT)
+    assert out == {"ticker": "AAPL"}
+    assert seen["ticker"] == "AAPL"
+
+
+def test_finra_org_word_ticker_rejected_before_http(http: dict[str, MagicMock]) -> None:
+    """ticker='FINRA' is an org word, not a security: guided invalid_tool_arguments, zero FINRA HTTP."""
+    result = execute_tool("get_short_interest", {"ticker": "FINRA"}, model="test", context=LOCAL_CONTEXT)
+    assert result["error_type"] == "invalid_tool_arguments", ("get_short_interest", result)
+    assert "Provide a ticker" in str(result["error"]), ("get_short_interest", result)
+    result = execute_tool("get_reg_sho_volume", {"ticker": "FINRA"}, model="test", context=LOCAL_CONTEXT)
+    assert result["error_type"] == "invalid_tool_arguments", ("get_reg_sho_volume", result)
+    assert "company_name" in str(result["error"]), ("get_reg_sho_volume", result)
+    assert tools_module._finra_ticker({"ticker": "FINRA"}) is None
+    assert tools_module._finra_ticker({"ticker": "finra"}) is None
+    assert tools_module._finra_ticker({"ticker": "AAPL"}) == "AAPL"
+    assert http["post"].call_count == 0
+    assert http["get"].call_count == 0
+
+
+def test_ticker_or_company_name_org_word_keeps_guided_message() -> None:
+    """Org-word tickers fall through to the guided entity/company_name message."""
+    ticker, err = tools_module._ticker_or_company_name({"ticker": "FINRA"}, "get_beneficial_ownership")
+    assert ticker is None
+    assert err is not None
+    assert err["error_type"] == "invalid_tool_arguments"
+    assert "company_name" in str(err["error"])
+    ok, ok_err = tools_module._ticker_or_company_name({"ticker": "AAPL"}, "get_beneficial_ownership")
+    assert ok == "AAPL"
+    assert ok_err is None
+
+
+def test_reg_sho_volume_ratio_math_and_elevated(http: dict[str, MagicMock]) -> None:
+    """SHO enrich: combined short/total*100, elevated flags, existing keys kept."""
+    records = [
+        {
+            "securitiesInformationProcessorSymbolIdentifier": "AAPL",
+            "tradeReportDate": "2026-09-21",
+            "shortParQuantity": 60,
+            "shortExemptParQuantity": 20,
+            "totalParQuantity": 200,
+        },
+        {
+            "securitiesInformationProcessorSymbolIdentifier": "AAPL",
+            "tradeReportDate": "2026-09-22",
+            "shortParQuantity": 80,
+            "shortExemptParQuantity": 20,
+            "totalParQuantity": 200,
+        },
+    ]
+    http["post"].side_effect = [_token_response(), _response(records)]
+    result = execute_tool(
+        "get_reg_sho_volume", {"ticker": "AAPL", "tradeDate": "2026-09-22"}, model="test", context=LOCAL_CONTEXT
+    )
+    assert "error" not in result, result
+    assert result["short_volume"] == 100
+    assert result["total_volume"] == 200
+    assert result["short_volume_ratio_pct"] == 50.0
+    assert result["short_volume_ratio_elevated"] is True
+    assert "40-50%" in str(result["short_volume_ratio_note"])
+    assert "briefing" in result and "metrics" in result and "coverage" in result
+
+
+def test_reg_sho_volume_ratio_not_elevated(http: dict[str, MagicMock]) -> None:
+    records = [
+        {
+            "securitiesInformationProcessorSymbolIdentifier": "AAPL",
+            "tradeReportDate": "2026-09-22",
+            "shortParQuantity": 10,
+            "shortExemptParQuantity": 5,
+            "totalParQuantity": 100,
+        }
+    ]
+    http["post"].side_effect = [_token_response(), _response(records)]
+    result = execute_tool(
+        "get_reg_sho_volume", {"ticker": "AAPL", "tradeDate": "2026-09-22"}, model="test", context=LOCAL_CONTEXT
+    )
+    assert result["short_volume_ratio_pct"] == 15.0
+    assert result["short_volume_ratio_elevated"] is False
+
+
+def test_reg_sho_no_date_queries_monday_nyc_to_today(http: dict[str, MagicMock]) -> None:
+    """No-tradeDate path: Monday-NYC start through today, single tradeDate stays single-day."""
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    records = [
+        {
+            "securitiesInformationProcessorSymbolIdentifier": "AAPL",
+            "tradeReportDate": "2026-09-22",
+            "shortParQuantity": 10,
+            "shortExemptParQuantity": 5,
+            "totalParQuantity": 100,
+        }
+    ]
+    http["post"].side_effect = [_token_response(), _response(records)]
+    result = execute_tool("get_reg_sho_volume", {"ticker": "AAPL"}, model="test", context=LOCAL_CONTEXT)
+    assert "error" not in result, result
+    body = _data_body(http["post"])
+    nyc_today = datetime.now(UTC).astimezone(ZoneInfo("America/New_York")).date()
+    monday = (nyc_today - timedelta(days=nyc_today.weekday())).isoformat()
+    today = nyc_today.isoformat()
+    assert body["dateRangeFilters"] == [{"fieldName": "tradeReportDate", "startDate": monday, "endDate": today}]
+    assert result["short_volume_ratio_pct"] == 15.0
