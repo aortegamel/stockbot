@@ -16,3 +16,5 @@ coverage==7.16.1
 ruff==0.16.8
 mutmut==3.8.0
 hypothesis==6.168.0
+fastapi>=0.115
+uvicorn>=0.30
