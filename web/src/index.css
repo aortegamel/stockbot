@@ -1,0 +1,30 @@
+:root {
+  --bg: #0A0E14;
+  --panel: #11161F;
+  --panel2: #151C29;
+  --border: #1E2635;
+  --text: #E6ECF5;
+  --muted: #93A0B8;
+  --up: #26A69A;
+  --down: #EF5350;
+  --accent: #2962FF;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }

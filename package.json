@@ -42,7 +42,10 @@
     "sandbox-doctor": "venv/bin/python scripts/sandbox_doctor.py",
     "stockbot": "bun needle-harness/scripts/needle.ts",
     "llama": "llama-server --models-dir ${HOME}/.cache/huggingface/hub --models-preset ${HOME}/.config/llama-server/presets.ini --models-max 1 --host 127.0.0.1 --port 8080",
-    "lint": "venv/bin/ruff check . && venv/bin/ruff format --check . && (cd needle-harness && bun run lint)"
+    "lint": "venv/bin/ruff check . && venv/bin/ruff format --check . && (cd needle-harness && bun run lint)",
+    "dev:web": "cd web && bun run dev",
+    "dev:api": "venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8000",
+    "dev": "bun run dev:web & bun run dev:api & wait"
   },
   "dependencies": {
     "@typesafe-ai/sdk": "^0.6.0"
