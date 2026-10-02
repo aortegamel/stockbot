@@ -97,7 +97,7 @@ def test_archive_first_bounded_windows_and_local_fallback(tmp_path: Path, monkey
     assert (first["offset"], first["end_offset"], first["total_chars"]) == (0, 12000, 50000)
     assert first["more_available"] is True
     assert first["cache_hit"] is False
-    assert first["source_representation"] == "normalized_text"
+    assert first["source_representation"] == "source_bytes"
     digest = hashlib.sha256(BIG.encode("utf-8")).hexdigest()
     assert first["content_hash"] == digest
     assert first["source_content_hash"] == digest

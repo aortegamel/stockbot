@@ -1,5 +1,6 @@
 """Offline tests for app/sec/insider.py (no network)."""
 
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar, override
@@ -14,12 +15,13 @@ class _Activity:
     def __init__(
         self,
         code: str | None = None,
-        shares: str | int | None = None,
-        price: str | float | None = None,
+        shares: object = None,
+        price: object = None,
         date: str | None = None,
         title: str | None = None,
         ad: str | None = None,
-        holdings: str | int | None = None,
+        holdings: object = None,
+        transaction_type: str | None = None,
     ) -> None:
         self.transaction_code = code
         self.shares = shares
@@ -28,6 +30,7 @@ class _Activity:
         self.security_title = title
         self.acquired_disposed = ad
         self.holdings_after = holdings
+        self.transaction_type = transaction_type
 
 
 class _Obj:
@@ -66,6 +69,125 @@ def test_code_kinds_and_missing_fields():
     assert blank.transaction_date is None and blank.security is None
     assert blank.transaction_code is None and blank.holdings_after is None
     assert txns[0].shares == 1000 and txns[0].price == 10.5
+
+
+class _Row:
+    def __init__(self, mapping: dict[str, object]) -> None:
+        self._mapping = mapping
+
+    def to_dict(self) -> dict[str, object]:
+        return dict(self._mapping)
+
+
+class _Frame:
+    def __init__(self, rows: Sequence[object]) -> None:
+        self._rows = [_Row(r) if isinstance(r, dict) else r for r in rows]
+
+    def iterrows(self) -> list[object]:
+        return list(enumerate(self._rows))
+
+
+class _Table:
+    def __init__(self, rows: Sequence[object]) -> None:
+        self.transactions = SimpleNamespace(data=_Frame(rows))
+
+
+class _EnrichedObj(_Obj):
+    def __init__(
+        self,
+        rows: list[_Activity],
+        table_rows: Sequence[object],
+        name: str = "Jane Doe",
+        cik: str = "999",
+        reporting_period: str = "2024-01-31",
+    ) -> None:
+        super().__init__(rows, name, cik)
+        self.non_derivative_table = _Table(table_rows)
+        self.derivative_table = _Table([])
+        self.reporting_period = reporting_period
+
+
+def _enriched_txns() -> list[InsiderTransaction]:
+    rows = [
+        _Activity(code="S", shares=2605.75, price=360.134),
+        _Activity(code="M", shares=6539.0, price=0.0),
+    ]
+    table = [
+        {"Code": "M", "Shares": 6539.0, "Price": 0.0, "Date": "2024-03-05", "AcquiredDisposed": "A", "Remaining": 100},
+        {
+            "Code": "S",
+            "Shares": 2605.75,
+            "Price": 360.134,
+            "Date": "2024-03-08",
+            "AcquiredDisposed": "D",
+            "Remaining": 50,
+        },
+    ]
+    return insider.normalize_ownership_filing(
+        _EnrichedObj(rows, table), issuer="ACME", form="4", filed_at="2024-03-10", accession_no="x9"
+    )
+
+
+def test_enrichment_keyed_not_positional() -> None:
+    txns = _enriched_txns()
+    by_code = {t.transaction_code: t for t in txns}
+    assert by_code["S"].transaction_date == "2024-03-08"
+    assert by_code["M"].transaction_date == "2024-03-05"
+    assert by_code["S"].acquired_disposed == "D" and by_code["M"].acquired_disposed == "A"
+    assert by_code["S"].shares == 2605 and by_code["S"].holdings_after == 50
+
+
+def test_enrichment_permutation_stable() -> None:
+    rows = [
+        _Activity(code="S", shares=2605.75, price=360.134),
+        _Activity(code="M", shares=6539.0, price=0.0),
+    ]
+    table = [
+        {"Code": "M", "Shares": 6539.0, "Price": 0.0, "Date": "2024-03-05", "AcquiredDisposed": "A", "Remaining": 100},
+        {
+            "Code": "S",
+            "Shares": 2605.75,
+            "Price": 360.134,
+            "Date": "2024-03-08",
+            "AcquiredDisposed": "D",
+            "Remaining": 50,
+        },
+    ]
+    forward = insider.normalize_ownership_filing(
+        _EnrichedObj(rows, table), issuer="ACME", form="4", filed_at="2024-03-10", accession_no="x9"
+    )
+    backward = insider.normalize_ownership_filing(
+        _EnrichedObj(rows, list(reversed(table))), issuer="ACME", form="4", filed_at="2024-03-10", accession_no="x9"
+    )
+    assert {t.transaction_code: t.transaction_date for t in forward} == {
+        t.transaction_code: t.transaction_date for t in backward
+    }
+
+
+def test_enrichment_duplicate_and_miss_fall_back() -> None:
+    dup = [
+        {"Code": "S", "Shares": 10, "Price": 1.0, "Date": "2024-03-01", "AcquiredDisposed": "D"},
+        {"Code": "S", "Shares": 10, "Price": 1.0, "Date": "2024-03-02", "AcquiredDisposed": "D"},
+    ]
+    txns = insider.normalize_ownership_filing(
+        _EnrichedObj([_Activity(code="S", shares=10, price=1.0)], dup, reporting_period="2024-02-29"),
+        issuer="ACME",
+        form="4",
+        filed_at="2024-03-10",
+        accession_no="xd",
+    )
+    assert txns[0].transaction_date == "2024-03-01"
+    missed = insider.normalize_ownership_filing(
+        _EnrichedObj(
+            [_Activity(code="S", shares=10, price=1.0, transaction_type="sale")], [], reporting_period="2024-02-29"
+        ),
+        issuer="ACME",
+        form="4",
+        filed_at="2024-03-10",
+        accession_no="xm",
+    )
+    assert missed[0].transaction_date == "2024-02-29"
+    assert missed[0].acquired_disposed == "D"
 
 
 class _FakeDF:

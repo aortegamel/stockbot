@@ -177,20 +177,56 @@ def _fetch_shares_outstanding(ticker: str) -> object:
     try:
         from ..services import sec_facts
 
-        return sec_facts.get_fundamentals(ticker, "shares_outstanding").get("shares_outstanding")
+        payload = sec_facts.get_fundamentals(ticker, "shares_outstanding")
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get("shares_outstanding")
+        if isinstance(value, dict):
+            value = value.get("value")
+        if isinstance(value, bool):
+            return None
+        return value if isinstance(value, (int, float)) else None
     except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
         return None
 
 
+def _fetch_float_and_cap(ticker: str) -> tuple[object, object]:
+    """Yahoo float/market-cap best-effort; (None, None) on any failure."""
+    try:
+        from .. import analyst_client
+
+        data = analyst_client.get_analyst_estimates(ticker)
+    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+        return None, None
+    if not isinstance(data, dict) or "error" in data:
+        return None, None
+    return data.get("float_shares"), data.get("market_cap")
+
+
+def _briefing_short_position(short: dict[str, object]) -> int | float | None:
+    """currentShortPositionQuantity latest value from a real FINRA briefing, else None."""
+    metrics = short.get("metrics")
+    if not isinstance(metrics, dict):
+        return None
+    latest_prior = metrics.get("latest_vs_prior")
+    if isinstance(latest_prior, list):
+        for row in latest_prior:
+            if isinstance(row, dict) and row.get("field") == "currentShortPositionQuantity":
+                latest = row.get("latest")
+                if isinstance(latest, (int, float)):
+                    return latest
+    return None
+
+
 def _extract_short_position(short: dict[str, object] | None) -> int | float | None:
-    """First numeric short-position key; None when absent or non-numeric."""
+    """First numeric short-position key, then real briefing shape; None otherwise."""
     if not isinstance(short, dict):
         return None
     for key in _SHORT_POSITION_KEYS:
         value = short.get(key)
         if isinstance(value, (int, float)):
             return value
-    return None
+    return _briefing_short_position(short)
 
 
 def _short_ratio(
@@ -205,6 +241,14 @@ def _short_ratio(
     return round(short_position / shares * 100, 2)
 
 
+def _or_not_available(value: object) -> object:
+    return value if value is not None else "not_available"
+
+
+def _or_not_quantifiable(value: float | None) -> object:
+    return value if value is not None else "not_quantifiable"
+
+
 def get_short_pressure_context(ticker: str) -> dict[str, object]:
     """Short-interest context without manipulation claims (FTD deferred).
 
@@ -214,13 +258,27 @@ def get_short_pressure_context(ticker: str) -> dict[str, object]:
     """
     short = _fetch_short_position(ticker)
     shares = _fetch_shares_outstanding(ticker)
+    float_shares, market_cap = _fetch_float_and_cap(ticker)
     short_position = _extract_short_position(short)
     ratio = _short_ratio(short_position, shares)
+    float_ratio = _short_ratio(short_position, float_shares)
+    numbers: dict[str, object] = {
+        "short_position": short_position,
+        "shares_outstanding": shares if isinstance(shares, (int, float)) else None,
+        "float_shares": float_shares,
+        "market_cap": market_cap,
+        "short_pct_of_outstanding": ratio,
+        "short_pct_of_float": float_ratio,
+    }
     return {
         "ticker": ticker.upper(),
-        "short_position": short_position if short_position is not None else "not_available",
-        "shares_outstanding": shares if shares is not None else "not_available",
-        "short_pct_of_outstanding": ratio if ratio is not None else "not_quantifiable",
+        "short_position": _or_not_available(short_position),
+        "shares_outstanding": _or_not_available(shares),
+        "float_shares": _or_not_available(float_shares),
+        "market_cap": _or_not_available(market_cap),
+        "short_pct_of_outstanding": _or_not_quantifiable(ratio),
+        "short_pct_of_float": _or_not_quantifiable(float_ratio),
+        "metrics": numbers,
         "does_not_assess_manipulation": True,
         "note": "Context only: short interest describes positioning, never manipulation or causation.",
     }

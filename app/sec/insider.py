@@ -60,17 +60,100 @@ def classify_transaction(code: object) -> str:
 
 
 def _safe_int(value: object) -> int | None:
+    """Share counts truncate toward zero: SEC fractional shares (2605.75) must not null out."""
     try:
         if value is None or isinstance(value, bool):
             return None
         if isinstance(value, float):
-            return int(value) if value.is_integer() else None
+            return int(value)
         text = str(value).strip().replace(",", "")
         if not text or text.lower() in ("none", "nan", "na", "n/a", "--"):
             return None
         return int(float(text)) if "." in text else int(text)
     except ValueError, TypeError:
         return None
+
+
+_TYPE_TO_ACQUIRED = {
+    "purchase": "A",
+    "sale": "D",
+    "derivative_purchase": "A",
+    "derivative_sale": "D",
+    "exercise": "A",
+    "award": "A",
+    "tax": "D",
+    "gift": "D",
+    "conversion": "D",
+    "other_acquisition": "A",
+    "other_disposition": "D",
+}
+
+
+def _key_float(value: object) -> float | None:
+    try:
+        return float(str(value).strip().replace(",", "")) if value is not None else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _side_of_activity(activity: object) -> str:
+    """Table side of one activity: derivative rows join derivative rows only."""
+    if _str_or_none(_first(activity, "security_type")) == "derivative":
+        return "derivative"
+    if _first(activity, "is_derivative") is True:
+        return "derivative"
+    return "non-derivative"
+
+
+def _enrichment_key_of(activity: object) -> tuple[str, str | None, float | None, float | None] | None:
+    """Keyed join identity for one activity: (side, code, shares, price). Shared by both
+    sides so a table reorder cannot misalign dates. None when unkeyable."""
+    code = _str_or_none(_first(activity, "transaction_code", "code", "transaction_type"))
+    shares = _key_float(_first(activity, "shares", "shares_numeric"))
+    price = _key_float(_first(activity, "price_per_share", "price", "price_numeric"))
+    if code is None and shares is None:
+        return None
+    return _side_of_activity(activity), code, shares, price
+
+
+def _table_rows_of(obj: object) -> list[tuple[str, dict[str, object]]]:
+    """Non-derivative + derivative table rows as (side, dict); [] when unavailable."""
+    out: list[tuple[str, dict[str, object]]] = []
+    for table_name, side in (("non_derivative_table", "non-derivative"), ("derivative_table", "derivative")):
+        try:
+            table = getattr(obj, table_name, None)
+            data = getattr(getattr(table, "transactions", None), "data", None)
+            rows = list(data.iterrows()) if data is not None else []
+        except Exception:  # noqa: BLE001, S112 - table path degrades to [] on SDK shape change, never raises
+            continue
+        for _, row in rows:
+            try:
+                out.append((side, dict(row.to_dict()) if hasattr(row, "to_dict") else dict(row)))
+            except Exception:  # noqa: BLE001, S112 - malformed row is skipped, the scan continues
+                continue
+    return out
+
+
+def _enrichment_of(obj: object) -> dict[tuple[str, str | None, float | None, float | None], dict[str, object]]:
+    """First-wins keyed index of table rows; duplicates refuse (no guessing)."""
+    index: dict[tuple[str, str | None, float | None, float | None], dict[str, object]] = {}
+    for side, row in _table_rows_of(obj):
+        code = _str_or_none(row.get("Code"))
+        key = (side, code, _key_float(row.get("Shares")), _key_float(row.get("Price")))
+        if (code is None and key[2] is None) or key in index:
+            continue
+        index[key] = row
+    return index
+
+
+def _enriched_of(
+    activity: object, index: dict[tuple[str, str | None, float | None, float | None], dict[str, object]]
+) -> dict[str, object]:
+    """Table row for one activity by key; {} on miss (never a wrong row)."""
+    key = _enrichment_key_of(activity)
+    if key is None:
+        return {}
+    return index.get(key) or {}
 
 
 def _safe_float(value: object) -> float | None:
@@ -249,6 +332,41 @@ def _known_at_of(known_at: str | None, filed_at: str | None) -> str | None:
         return filed_at
 
 
+def _fallback_date_of(obj: object) -> str | None:
+    """Filing-level earliest-transaction date; None when absent."""
+    return _str_or_none(getattr(obj, "reporting_period", None))
+
+
+def _date_of(activity: object, enriched: dict[str, object], fallback: str | None) -> str | None:
+    """Per-row table date by key; reporting_period fallback; never a wrong row's date."""
+    return (
+        _str_or_none(_first(activity, "transaction_date", "date", "execution_date"))
+        or _str_or_none(enriched.get("Date"))
+        or fallback
+    )
+
+
+def _acquired_of(activity: object, enriched: dict[str, object]) -> str | None:
+    """A/D from the activity, the keyed table row, or the SDK transaction_type; never guessed."""
+    direct = _str_or_none(
+        _first(activity, "acquired_disposed", "acquired_disposed_code", "acquired_or_disposed", "action", "buy_or_sell")
+    )
+    if direct is not None:
+        return direct
+    table = _str_or_none(enriched.get("AcquiredDisposed"))
+    if table is not None:
+        return table
+    return _TYPE_TO_ACQUIRED.get(str(_first(activity, "transaction_type") or "").strip())
+
+
+def _holdings_of(activity: object, enriched: dict[str, object]) -> int | None:
+    """Direct holdings win, table Remaining on miss; 0 stays 0 (never falsy-fallback)."""
+    direct = _safe_int(
+        _first(activity, "holdings_after", "shares_owned_after", "holdings", "balance_after", "shares_held")
+    )
+    return direct if direct is not None else _safe_int(enriched.get("Remaining"))
+
+
 def _activity_record_of(
     activity: object,
     owner: dict[str, object],
@@ -260,8 +378,11 @@ def _activity_record_of(
     issuer_cik: str | None,
     document_name: str | None,
     known: str | None,
+    enriched: dict[str, object] | None = None,
+    fallback_date: str | None = None,
 ) -> InsiderTransaction:
     code = _str_or_none(_first(activity, "transaction_code", "code", "transaction_type"))
+    row = enriched or {}
     return InsiderTransaction(
         insider_name=_str_or_none(owner["name"]),
         insider_cik=_str_or_none(owner["cik"]),
@@ -269,7 +390,7 @@ def _activity_record_of(
         form=form,
         filed_at=filed_at,
         accession_no=accession_no,
-        transaction_date=_str_or_none(_first(activity, "transaction_date", "date", "execution_date")),
+        transaction_date=_date_of(activity, row, fallback_date),
         security=_str_or_none(_first(activity, "security", "security_title", "title", "security_name")),
         transaction_code=code,
         transaction_kind=classify_transaction(code),
@@ -277,14 +398,8 @@ def _activity_record_of(
             _first(activity, "shares", "share_count", "num_shares", "amount", "shares_transacted", "shares_numeric")
         ),
         price=_safe_float(_first(activity, "price", "price_per_share", "price_numeric", "execution_price")),
-        acquired_disposed=_str_or_none(
-            _first(
-                activity, "acquired_disposed", "acquired_disposed_code", "acquired_or_disposed", "action", "buy_or_sell"
-            )
-        ),
-        holdings_after=_safe_int(
-            _first(activity, "holdings_after", "shares_owned_after", "holdings", "balance_after", "shares_held")
-        ),
+        acquired_disposed=_acquired_of(activity, row),
+        holdings_after=_holdings_of(activity, row),
         issuer_cik=issuer_cik,
         is_director=_bool_or_none(owner["is_director"]),
         is_officer=_bool_or_none(owner["is_officer"]),
@@ -317,8 +432,11 @@ def normalize_ownership_filing(
     resolved_issuer, resolved_issuer_cik = _resolved_issuer_of(obj, issuer, issuer_cik)
     known = _known_at_of(known_at, filed_at)
     owners = _owners_of(obj, fallback[0], fallback[1])
+    index = _enrichment_of(obj)
+    fallback_date = _fallback_date_of(obj)
     out: list[InsiderTransaction] = []
     for activity in rows:
+        enriched = _enriched_of(activity, index)
         for owner in owners:
             try:
                 out.append(
@@ -332,6 +450,8 @@ def normalize_ownership_filing(
                         issuer_cik=resolved_issuer_cik,
                         document_name=document_name,
                         known=known,
+                        enriched=enriched,
+                        fallback_date=fallback_date,
                     )
                 )
             except Exception:  # noqa: BLE001, S112 - malformed activity is skipped, the filing continues
@@ -981,8 +1101,6 @@ def _holding_identifiers_of(holding: InstitutionalHolding) -> tuple[str | None, 
     return cusip, isin, _13f_security_id(cusip, isin)
 
 
-
-
 def _check_as_of_opt(as_of: str | None) -> str | None:
     """Strict YYYY-MM-DD gate shared by the live query wrappers."""
     if as_of is None:
@@ -1015,9 +1133,8 @@ def _cap_holdings(records: list[InstitutionalHolding], limit: int) -> list[Insti
 
 # Seam: live 13F holdings normalize per filing via SourceGateway + normalization + raw_archive + write_bundle; NOTE: warehouse slots behind live readers.
 
-def _manager_filings(
-    manager_cik: int | str, *, as_of: str | None, limit: int | None
-) -> list[InstitutionalHolding]:
+
+def _manager_filings(manager_cik: int | str, *, as_of: str | None, limit: int | None) -> list[InstitutionalHolding]:
     """Live 13F-HR/A holdings for one manager CIK via provider filings."""
     from .documents import get_by_accession_number
     from .filings import list_sec_filings as _live_list
@@ -1112,7 +1229,3 @@ def query_security_managers(
         [rec for rec in _manager_filings(security, as_of=bound, limit=None) if _security_matches(rec, want)],
         limit,
     )
-
-
-
-

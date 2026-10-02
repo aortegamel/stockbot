@@ -696,7 +696,11 @@ def _download_bytes_of(attachment: object) -> bytes | None:
         result = download()
     except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
         return None
-    return result if isinstance(result, bytes) else None
+    if isinstance(result, bytes):
+        return result
+    if isinstance(result, str):
+        return result.encode("utf-8")
+    return None
 
 
 def _attr_bytes_of(attachment: object, attr: str) -> bytes | None:
@@ -709,14 +713,18 @@ def _attr_bytes_of(attachment: object, attr: str) -> bytes | None:
             value = value()
         except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
             return None
-    return value if isinstance(value, bytes) else None
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    return None
 
 
 def _source_bytes_of(attachment: object) -> tuple[bytes | None, str | None]:
     """Exact source bytes when EdgarTools exposes them.
 
-    ``download()`` bytes win, then byte-valued ``content``/``text``.
-    Returns (None, None) when only transformed string text is available.
+    ``download()`` bytes win, then ``content``/``text`` (bytes as-is, str
+    encoded as UTF-8). Returns (None, None) only when no payload is exposed.
     """
     downloaded = _download_bytes_of(attachment)
     if downloaded is not None:
