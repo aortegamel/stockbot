@@ -111,19 +111,25 @@ def test_search_web_disabled_is_soft(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["soft"] is True
 
 
-def test_search_web_invalid_args_are_soft(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_search_web_invalid_args_rejected_before_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Schema gate rejects bad enums before any Exa call (invalid_tool_arguments, not soft)."""
     monkeypatch.setenv("EXA_ENABLED", "true")
     monkeypatch.setenv("EXA_API_KEY", "test-key")
+
+    def _boom(*args: object, **kwargs: object) -> dict[str, object]:
+        raise AssertionError("provider must not be called for invalid args")
+
+    monkeypatch.setattr(tools.exa_client, "search", _boom)
     result = tools.execute_tool(
         "search_web",
         {"query": "AMD news", "category": "gossip"},
         model="test",
         context=RESEARCH_CONTEXT,
     )
-    error = result["error"]
-    assert isinstance(error, str)
-    assert "Unsupported category 'gossip'" in error
-    assert result["soft"] is True
+    assert result["error_type"] == "invalid_tool_arguments"
+    assert "'category' 'gossip'" in str(result["error"])
+    assert "is not one of" in str(result["error"])
+    assert result.get("soft") is not True
 
     result = tools.execute_tool(
         "search_web",
@@ -131,7 +137,7 @@ def test_search_web_invalid_args_are_soft(monkeypatch: pytest.MonkeyPatch) -> No
         model="test",
         context=RESEARCH_CONTEXT,
     )
-    error = result["error"]
-    assert isinstance(error, str)
-    assert "Unsupported search_type 'deep'" in error
-    assert result["soft"] is True
+    assert result["error_type"] == "invalid_tool_arguments"
+    assert "'search_type' 'deep'" in str(result["error"])
+    assert "is not one of" in str(result["error"])
+    assert result.get("soft") is not True
