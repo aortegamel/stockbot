@@ -57,14 +57,14 @@ describe("timeout isolation", () => {
     const fakeChild = { kill: () => { killed = true; }, stdin: { write: () => { } } };
     type RouterSeam = {
       ensure: () => unknown;
-      call: (b: Record<string, unknown>, t: number) => Promise<unknown>;
+      rawCall: (b: Record<string, unknown>, k: string, t: number) => Promise<unknown>;
       onLine: (l: string) => void;
     };
     // Unchecked cast: private members have no public seam; structural read only.
     const seam: RouterSeam = router as unknown as RouterSeam;
     seam.ensure = () => fakeChild;
-    const slow = seam.call({ action: "slow" }, 20);
-    const sibling = seam.call({ action: "sibling" }, 1000);
+    const slow = seam.rawCall({ action: "slow" }, "route", 20);
+    const sibling = seam.rawCall({ action: "sibling" }, "route", 1000);
     await expect(slow).rejects.toThrow("timeout");
     expect(killed).toBe(false);
     seam.onLine(JSON.stringify({ id: "2", tool: null, arguments: {}, confidence: null, reasoning: "" }));

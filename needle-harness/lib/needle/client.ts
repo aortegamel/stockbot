@@ -10,6 +10,14 @@ export type NeedleRouteResult = {
   reasoning: string;
 };
 
+export type NeedleExtractResult = {
+  record: string | null;
+  fields: Record<string, unknown>;
+  withheld: boolean;
+  confidence: number | null;
+  reasoning: string;
+};
+
 
 export const TOOL_TIMEOUT_MS = 120_000;
 // Runtime gate mirroring server.py validate_needle_tool: Needle output must
@@ -28,11 +36,10 @@ const REPO_ROOT =
 const SERVER = `${REPO_ROOT}/needle-harness/lib/needle/server.py`;
 const VENV_PYTHON = `${homedir()}/.cache/needle-harness/.needle/bin/python`;
 
-type Pending = {
-  resolve: (v: NeedleRouteResult) => void;
-  reject: (e: Error) => void;
-  cancel: () => void;
-};
+type Pending =
+  | { kind: "route"; resolve: (v: NeedleRouteResult) => void; reject: (e: Error) => void; cancel: () => void }
+  | { kind: "extract"; resolve: (v: NeedleExtractResult) => void; reject: (e: Error) => void; cancel: () => void }
+  | { kind: "embed"; resolve: (v: number[]) => void; reject: (e: Error) => void; cancel: () => void };
 // ponytail: exclusive lock serializes Needle routing; per-session Needle state if Herdr panes need concurrency
 let needleTail: Promise<void> = Promise.resolve();
 
@@ -114,13 +121,36 @@ export class NeedleRouter {
       p.reject(new Error(msg.error));
       return;
     }
+    const confidence = "confidence" in msg && typeof msg.confidence === "number" ? msg.confidence : null;
+    const reasoning = "reasoning" in msg && typeof msg.reasoning === "string" ? msg.reasoning : "";
+    if (p.kind === "embed") {
+      const vec = "embedding" in msg && Array.isArray(msg.embedding) ? msg.embedding : null;
+      if (!vec || !vec.every((v) => typeof v === "number")) {
+        p.reject(new Error("needle embed failed: malformed server response"));
+        return;
+      }
+      p.resolve(vec as number[]);
+      return;
+    }
+    if (p.kind === "extract") {
+      const record = "record" in msg && (typeof msg.record === "string" || msg.record === null) ? msg.record : null;
+      const fields =
+        "fields" in msg && typeof msg.fields === "object" && msg.fields !== null
+          ? (msg.fields as Record<string, unknown>)
+          : null;
+      const withheld = "withheld" in msg && typeof msg.withheld === "boolean" ? msg.withheld : false;
+      if (fields === null) {
+        p.reject(new Error("needle extract failed: malformed server response"));
+        return;
+      }
+      p.resolve({ record, fields, withheld, confidence, reasoning });
+      return;
+    }
     const tool = "tool" in msg && (typeof msg.tool === "string" || msg.tool === null) ? msg.tool : null;
     const args =
       "arguments" in msg && typeof msg.arguments === "object" && msg.arguments !== null
         ? (msg.arguments as Record<string, unknown>)
         : {};
-    const confidence = "confidence" in msg && typeof msg.confidence === "number" ? msg.confidence : null;
-    const reasoning = "reasoning" in msg && typeof msg.reasoning === "string" ? msg.reasoning : "";
     p.resolve({ tool, arguments: args, confidence, reasoning });
   }
 
@@ -146,16 +176,25 @@ export class NeedleRouter {
     }
   }
 
-  private call(body: Record<string, unknown>, timeoutMs = TOOL_TIMEOUT_MS): Promise<NeedleRouteResult> {
+  private rawCall(
+    body: Record<string, unknown>,
+    kind: Pending["kind"],
+    timeoutMs = TOOL_TIMEOUT_MS,
+  ): Promise<NeedleRouteResult | NeedleExtractResult | number[]> {
     const child = this.ensure();
     if (!child.stdin) throw new Error("needle spawn failed");
     const id = String((this.nextId += 1));
-    return new Promise<NeedleRouteResult>((resolve, reject) => {
+    return new Promise<NeedleRouteResult | NeedleExtractResult | number[]>((resolve, reject) => {
       const timer = setTimeout(() => {
         delete this.pending[id];
         reject(new Error(`needle route timeout; stderr tail: ${this.bridgeStderrTail || "(empty)"}`));
       }, timeoutMs);
-      this.pending[id] = { resolve, reject, cancel: () => clearTimeout(timer) };
+      const entry = {
+        resolve: resolve as (v: never) => void,
+        reject,
+        cancel: () => clearTimeout(timer),
+      };
+      this.pending[id] = { ...entry, kind } as Pending;
       child.stdin?.write(JSON.stringify({ id, ...body }) + "\n", (err) => {
         if (err) {
           const p = this.pending[id];
@@ -183,13 +222,59 @@ export class NeedleRouter {
     if (!req.tool) throw new Error("generateArguments: tool must be a nonempty tool name");
     const release = await acquireNeedle();
     try {
-      const r = await this.call({ action: "arguments.generate", ...req });
+      const r = (await this.rawCall({ action: "arguments.generate", ...req }, "route")) as NeedleRouteResult;
       validateNeedleTool(req.tool, r.tool);
       return r;
     } finally {
       release();
     }
   }
+
+  // Structured extraction: one record shape in, typed fields out. Grammar
+  // admits exactly this record, never the full registry. JEV owns what to
+  // extract and whether fields suffice; mismatch/ungrounded rejects.
+  async extractFields(req: {
+    record: { name: string;[k: string]: unknown };
+    passage: string;
+    system?: string;
+    max_new_tokens?: number;
+    strict?: boolean;
+  }): Promise<NeedleExtractResult> {
+    if (!req.record || typeof req.record.name !== "string" || !req.record.name)
+      throw new Error("extractFields: record must carry a nonempty name");
+    if (typeof req.passage !== "string" || !req.passage.trim()) throw new Error("extractFields: passage must be nonempty");
+    const release = await acquireNeedle();
+    try {
+      const r = (await this.rawCall(
+        {
+          action: "extract",
+          record: req.record,
+          passage: req.passage,
+          system: req.system,
+          max_new_tokens: req.max_new_tokens ?? 512,
+          strict: req.strict ?? true,
+        },
+        "extract",
+      )) as NeedleExtractResult;
+      if (r.record !== null && r.record !== req.record.name)
+        throw new Error(`needle extract failed: malformed server response`);
+      return r;
+    } finally {
+      release();
+    }
+  }
+
+  // Retrieval embedding off the shared agent, serial like arguments.generate.
+  async embed(text: string): Promise<number[]> {
+    if (typeof text !== "string" || !text.trim()) throw new Error("embed: text must be nonempty");
+    const release = await acquireNeedle();
+    try {
+      return (await this.rawCall({ action: "embed", text }, "embed")) as number[];
+    } finally {
+      release();
+    }
+  }
+
   async close(): Promise<void> {
     const child = this.child;
     this.child = null;

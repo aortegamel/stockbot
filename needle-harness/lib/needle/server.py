@@ -166,6 +166,58 @@ def _bound_agent(tool, schema):
     return needle.Needle(**bound_kwargs)
 
 
+def _extract_agent(record, system=None):
+    """Fresh Needle bound to exactly one record shape (extraction is one-tool calling)."""
+    if not isinstance(record, dict) or not isinstance(record.get("name"), str) or not record["name"]:
+        raise ValueError("bad record")
+    bound_kwargs = dict(kwargs)
+    bound_kwargs["tools"] = [record]
+    if isinstance(system, str) and system.strip():
+        bound_kwargs["system"] = system
+    else:
+        bound_kwargs["system"] = _bound_system()
+    return needle.Needle(**bound_kwargs)
+
+
+def _extract_decision(record_name, r, strict=True):
+    """First call (or withheld call) as extracted fields; null record when nothing matched."""
+    calls = r.get("function_calls") or []
+    withheld = False
+    if not calls:
+        calls = r.get("suppressed_calls") or []
+        withheld = bool(calls)
+    if not calls:
+        return {
+            "record": None,
+            "fields": {},
+            "withheld": False,
+            "confidence": r.get("confidence"),
+            "reasoning": r.get("reasoning") or "",
+        }
+    call = calls[0] if isinstance(calls[0], dict) else {}
+    name = call.get("name")
+    if name != record_name:
+        raise ValueError(f"extract record mismatch: declared {record_name!r}, engine emitted {name!r}")
+    args = call.get("arguments") or {}
+    if not isinstance(args, dict):
+        raise ValueError("extract fields must be a mapping")
+    if strict:
+        validation = r.get("validation") or {}
+        flagged = list(validation.get("ungrounded") or [])
+        if validation.get("negation"):
+            flagged.append("negated request")
+        if flagged:
+            detail = ", ".join(sorted(str(f) for f in flagged))
+            raise ValueError(f"extraction returned values not grounded in the input: {detail}")
+    return {
+        "record": record_name,
+        "fields": args,
+        "withheld": withheld,
+        "confidence": r.get("confidence"),
+        "reasoning": r.get("reasoning") or "",
+    }
+
+
 def _decision(r):
     calls = r.get("function_calls") or []
     if r.get("type") == "call" and calls:
@@ -275,6 +327,45 @@ def handle(line):
                 except Exception:
                     pass
             validate_needle_tool(tool, _decision(r)["tool"])
+        elif action == "extract":
+            # Structured extraction: one record shape in, typed fields out.
+            # Never hands the full registry — the grammar admits exactly this record.
+            record = req.get("record")
+            passage = req.get("passage")
+            if not isinstance(record, dict) or not record.get("name"):
+                raise ValueError("bad record")
+            if not isinstance(passage, str) or not passage.strip():
+                raise ValueError("bad passage")
+            max_tokens = req.get("max_new_tokens", 512)
+            if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or not 1 <= max_tokens <= 4096:
+                raise ValueError("bad max_new_tokens")
+            strict = req.get("strict", True)
+            strict = strict if isinstance(strict, bool) else True
+            bound = _extract_agent(record, req.get("system"))
+            try:
+                r = bound.complete(passage, max_new_tokens=max_tokens)
+            finally:
+                try:
+                    bound.close()
+                except Exception:
+                    pass
+            out = {"id": rid}
+            out.update(_extract_decision(str(record["name"]), r, strict))
+            return out
+        elif action == "embed":
+            # Retrieval embedding off the shared agent; serial like start/step.
+            text = req.get("text", "")
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("bad text")
+            with _agent_lock:
+                vec = agent.embed(text)
+            if (
+                not isinstance(vec, list)
+                or not vec
+                or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vec)
+            ):
+                raise ValueError("bad embedding")
+            return {"id": rid, "embedding": vec}
         else:
             return {"id": rid, "error": "bad_action"}
         out = {"id": rid}

@@ -1,10 +1,10 @@
-"""Needle arguments worker: grounded arguments for the exact JEV-selected tool.
+"""Needle worker: grounded arguments, structured extraction, retrieval embeddings.
 
 JEV owns ALL selection; this worker never selects, chains, or judges
 sufficiency. It talks to needle-harness/lib/needle/server.py over JSONL on a
-persistent child ({id,action,tool,...} <-> {id,tool,arguments,error}) so
-weights load once, and returns {"tool", "arguments"}. Missing
-server/weights raise; never stub.
+persistent child ({id,action,...} <-> {id,...}) so weights load once.
+Serial single-flight (parallel decoders contend: 10.5s serial vs 71s parallel
+on realistic prompts). Missing server/weights raise; never stub.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import IO
 
@@ -25,7 +26,7 @@ from app.research.models import JSONValue, validate_json_mapping, validate_json_
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["close", "generate_arguments", "start", "validate_needle_tool"]
+__all__ = ["close", "embed", "extract_fields", "generate_arguments", "start", "validate_needle_tool"]
 
 # Mirror of TOOL_TIMEOUT_MS in needle-harness/lib/needle/client.ts.
 _TIMEOUT_S = 120.0
@@ -249,6 +250,66 @@ def _exchange_locked(proc: subprocess.Popen[str], tool: str, payload: dict[str, 
     }
 
 
+def _exchange_extract_locked(
+    proc: subprocess.Popen[str], record_name: str, payload: dict[str, JSONValue]
+) -> dict[str, JSONValue]:
+    """One extract round trip; record mismatch or ungrounded values raise."""
+    inp = proc.stdin
+    if inp is None:
+        raise RuntimeError(f"needle extract failed for {record_name!r}: server stdin missing")
+    inp.write(json.dumps(payload) + "\n")
+    inp.flush()
+    raw_line = _readline(proc, _TIMEOUT_S)
+    try:
+        decoded: object = json.loads(raw_line)
+    except ValueError as exc:
+        raise RuntimeError(f"needle extract failed for {record_name!r}: malformed server response") from exc
+    if not isinstance(decoded, dict) or decoded.get("id") != payload["id"]:
+        raise RuntimeError(f"needle extract failed for {record_name!r}: malformed server response")
+    resp = validate_json_mapping(decoded, "<needle_client>: 'server'")
+    if resp.get("error"):
+        raise RuntimeError(f"needle extract failed for {record_name!r}: {resp['error']}")
+    if resp.get("record") is not None and resp.get("record") != record_name:
+        raise RuntimeError(f"needle extract failed for {record_name!r}: malformed server response")
+    fields = resp.get("fields", {})
+    if not isinstance(fields, dict):
+        raise TypeError(f"needle extract fields for {record_name!r} must be a mapping")
+    return {
+        "record": resp.get("record"),
+        "fields": validate_json_mapping(fields, "<needle_client>: 'fields'"),
+        "reasoning": str(resp.get("reasoning") or ""),
+        "confidence": resp.get("confidence"),
+    }
+
+
+def _exchange_embed_locked(proc: subprocess.Popen[str], payload: dict[str, JSONValue]) -> list[float]:
+    """One embed round trip; malformed vectors raise."""
+    inp = proc.stdin
+    if inp is None:
+        raise RuntimeError("needle embed failed: server stdin missing")
+    inp.write(json.dumps(payload) + "\n")
+    inp.flush()
+    raw_line = _readline(proc, _TIMEOUT_S)
+    try:
+        decoded: object = json.loads(raw_line)
+    except ValueError as exc:
+        raise RuntimeError("needle embed failed: malformed server response") from exc
+    if not isinstance(decoded, dict) or decoded.get("id") != payload["id"]:
+        raise RuntimeError("needle embed failed: malformed server response")
+    resp = validate_json_mapping(decoded, "<needle_client>: 'server'")
+    if resp.get("error"):
+        raise RuntimeError(f"needle embed failed: {resp['error']}")
+    vec = resp.get("embedding", [])
+    if not isinstance(vec, list) or not vec:
+        raise RuntimeError("needle embed failed: malformed server response")
+    out: list[float] = []
+    for v in vec:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise TypeError("needle embed failed: malformed server response")
+        out.append(float(v))
+    return out
+
+
 def start() -> None:
     """Idempotent gate: reuse the live child, else spawn + ping once."""
     with _LOCK:
@@ -354,3 +415,103 @@ def generate_arguments(*args: object, **kwargs: object) -> dict[str, JSONValue]:
                     "yes" if isinstance(conf, (int, float)) and not isinstance(conf, bool) else "no",
                 )
                 return out
+
+
+def _restartable_dict(
+    label: str, exchange: Callable[[subprocess.Popen[str]], dict[str, JSONValue]]
+) -> dict[str, JSONValue]:
+    """One dict exchange with a single bounded restart on BrokenPipe/EOF."""
+    attempt = 0
+    while True:
+        try:
+            return exchange(_ensure_locked())
+        except TimeoutError as exc:
+            _kill_locked()
+            raise RuntimeError(
+                f"needle {label} timed out after {_TIMEOUT_S:g}s; stderr tail: {_tail_text() or '(empty)'}"
+            ) from exc
+        except OSError as exc:
+            _kill_locked()
+            if attempt >= 1:
+                raise RuntimeError(f"needle {label} failed: server unavailable ({exc})") from exc
+            attempt += 1
+
+
+def _restartable_vec(label: str, exchange: Callable[[subprocess.Popen[str]], list[float]]) -> list[float]:
+    """One vector exchange with a single bounded restart on BrokenPipe/EOF."""
+    attempt = 0
+    while True:
+        try:
+            return exchange(_ensure_locked())
+        except TimeoutError as exc:
+            _kill_locked()
+            raise RuntimeError(
+                f"needle {label} timed out after {_TIMEOUT_S:g}s; stderr tail: {_tail_text() or '(empty)'}"
+            ) from exc
+        except OSError as exc:
+            _kill_locked()
+            if attempt >= 1:
+                raise RuntimeError(f"needle {label} failed: server unavailable ({exc})") from exc
+            attempt += 1
+
+
+def extract_fields(
+    record: dict[str, object],
+    passage: str,
+    *,
+    system: str | None = None,
+    max_new_tokens: int = 512,
+    strict: bool = True,
+) -> dict[str, JSONValue]:
+    """Extract typed fields for one record shape from messy text.
+
+    Single-record binding only — never the full registry. Grammar guarantees
+    the parse; ungrounded values raise. JEV owns what to extract and whether
+    the fields suffice; this returns bytes only.
+    """
+    if not isinstance(record, dict) or not isinstance(record.get("name"), str) or not record["name"]:
+        raise ValueError("extract_fields: record must carry a nonempty name")
+    if not isinstance(passage, str) or not passage.strip():
+        raise ValueError("extract_fields: passage must be a nonempty string")
+    if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or not 1 <= max_new_tokens <= 4096:
+        raise TypeError("extract_fields: max_new_tokens must be an int in 1..4096")
+    if system is not None and not isinstance(system, str):
+        raise TypeError("extract_fields: system must be a string or None")
+    if not isinstance(strict, bool):
+        raise TypeError("extract_fields: strict must be a bool")
+    if not _server().exists():
+        raise RuntimeError(f"needle extract unavailable (gap: server missing: {_server()})")
+    _ensure_weights()
+    record_name = str(record["name"])
+    where = "<needle_client>"
+    payload: dict[str, JSONValue] = {
+        "id": f"needle:{uuid.uuid4().hex[:12]}",
+        "action": "extract",
+        "record": validate_json_value(record, where),
+        "passage": passage,
+        "system": validate_json_value(system, where),
+        "max_new_tokens": max_new_tokens,
+        "strict": strict,
+    }
+    with _LOCK:
+
+        def _run_extract(proc: subprocess.Popen[str]) -> dict[str, JSONValue]:
+            return _exchange_extract_locked(proc, record_name, payload)
+
+        return _restartable_dict(f"extract for {record_name!r}", _run_extract)
+
+
+def embed(text: str) -> list[float]:
+    """One retrieval vector off the shared agent (serial like arguments.generate)."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("embed: text must be a nonempty string")
+    if not _server().exists():
+        raise RuntimeError(f"needle embed unavailable (gap: server missing: {_server()})")
+    _ensure_weights()
+    payload: dict[str, JSONValue] = {"id": f"needle:{uuid.uuid4().hex[:12]}", "action": "embed", "text": text}
+
+    def _run_embed(proc: subprocess.Popen[str]) -> list[float]:
+        return _exchange_embed_locked(proc, payload)
+
+    with _LOCK:
+        return _restartable_vec("embed", _run_embed)

@@ -64,10 +64,18 @@ class _FakeProc:
         assert isinstance(raw, dict)
         if raw.get("action") == "ping":
             return json.dumps({"id": raw.get("id"), "ready": True}) + "\n"
-        if _FakeProc.behavior == "mismatch":
-            return json.dumps({"id": "needle:wrong", "tool": raw.get("tool"), "arguments": {}}) + "\n"
         if _FakeProc.behavior == "malformed":
             return "not json\n"
+        if raw.get("action") == "extract":
+            if _FakeProc.behavior == "mismatch":
+                return json.dumps({"id": raw.get("id"), "record": "wrong", "fields": {}}) + "\n"
+            rec = raw.get("record")
+            name = rec.get("name") if isinstance(rec, dict) else None
+            return json.dumps({"id": raw.get("id"), "record": name, "fields": {"q": 1}}) + "\n"
+        if raw.get("action") == "embed":
+            return json.dumps({"id": raw.get("id"), "embedding": [0.1, 0.2]}) + "\n"
+        if _FakeProc.behavior == "mismatch":
+            return json.dumps({"id": "needle:wrong", "tool": raw.get("tool"), "arguments": {}}) + "\n"
         return json.dumps({"id": raw.get("id"), "tool": raw.get("tool"), "arguments": {"q": 1}}) + "\n"
 
     def poll(self) -> int | None:
@@ -98,6 +106,50 @@ def worker(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     nc.close()
     _FakeProc.instances.clear()
     _FakeProc.behavior = "echo"
+
+
+def test_extract_fields_round_trip(worker: None) -> None:
+    """extract_fields sends one extract action and returns declared record fields."""
+    record: dict[str, object] = {"name": "web_row", "description": "one row", "parameters": {"type": "object"}}
+    out = nc.extract_fields(record, "NVDA news https://x.example/a up 5%")
+    assert out["record"] == "web_row"
+    assert out["fields"] == {"q": 1}
+    assert len(_FakeProc.instances) == 1
+    proc = _FakeProc.instances[0]
+    sent: object = json.loads(proc.written[-1])
+    assert isinstance(sent, dict) and sent.get("action") == "extract"
+
+
+def test_embed_round_trip(worker: None) -> None:
+    """embed sends one embed action and returns the server vector."""
+    vec = nc.embed("NVDA revenue")
+    assert vec == [0.1, 0.2]
+    proc = _FakeProc.instances[0]
+    sent: object = json.loads(proc.written[-1])
+    assert isinstance(sent, dict) and sent.get("action") == "embed"
+
+
+def test_extract_fields_rejects_blank_inputs(worker: None) -> None:
+    """Blank record/passage fail before any server write."""
+    with pytest.raises(ValueError, match="record"):
+        nc.extract_fields({}, "x")
+    with pytest.raises(ValueError, match="passage"):
+        nc.extract_fields({"name": "r"}, "  ")
+    assert _FakeProc.instances == []
+
+
+def test_extract_fields_record_mismatch_fails_closed(worker: None) -> None:
+    """Server answering a different record name is a malformed response."""
+    _FakeProc.behavior = "mismatch"
+    with pytest.raises(RuntimeError, match="malformed"):
+        nc.extract_fields({"name": "web_row"}, "some passage")
+
+
+def test_embed_round_trip_rejects_blank(worker: None) -> None:
+    """Blank embed text fails before spawn; server shape covered by exchange unit."""
+    with pytest.raises(ValueError, match="text"):
+        nc.embed("  ")
+    assert _FakeProc.instances == []
 
 
 def test_start_ping_then_two_calls_reuse_one_process(worker: None) -> None:
@@ -149,8 +201,11 @@ def _load_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> types.Modul
     stub = types.ModuleType("needle")
 
     class _FakeNeedle:
+        instances: ClassVar[list[object]] = []
+
         def __init__(self, **kwargs: object) -> None:
             self.kwargs = kwargs
+            _FakeNeedle.instances.append(self)
 
         def complete(self, *args: object, **kwargs: object) -> dict[str, object]:
             return {"type": "none"}
@@ -160,6 +215,10 @@ def _load_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> types.Modul
 
         def close(self) -> None:
             return None
+
+        def embed(self, text: str) -> list[float]:
+            assert text
+            return [0.1, 0.2, 0.3]
 
     stub.Needle = _FakeNeedle  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "needle", stub)
@@ -333,3 +392,81 @@ def test_arguments_prompt_omits_as_of_without_dates(monkeypatch: pytest.MonkeyPa
     instruction = str(decoded["instruction"])
     assert "as_of only from an explicit YYYY-MM-DD date" in instruction
     assert "omit as_of entirely (latest-available)" in instruction
+
+
+def test_extract_agent_binds_single_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Extraction binds exactly one record shape, never the registry."""
+    srv = _load_server(monkeypatch, tmp_path)
+    record = {"name": "web_row", "description": "one row", "parameters": {"type": "object"}}
+    agent = srv._extract_agent(record, None)
+    tools = agent.kwargs["tools"]
+    assert isinstance(tools, list) and tools == [record]
+
+
+def test_extract_agent_rejects_bad_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    srv = _load_server(monkeypatch, tmp_path)
+    with pytest.raises(ValueError, match="bad record"):
+        srv._extract_agent({}, None)
+    with pytest.raises(ValueError, match="bad record"):
+        srv._extract_agent({"name": ""}, None)
+
+
+def test_extract_decision_reads_withheld_call(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Withheld record lands in suppressed_calls; extract reads it (unlike args path)."""
+    srv = _load_server(monkeypatch, tmp_path)
+    r: dict[str, object] = {
+        "function_calls": [],
+        "suppressed_calls": [{"name": "web_row", "arguments": {"u": "x"}}],
+    }
+    out = srv._extract_decision("web_row", r)
+    assert out["record"] == "web_row" and out["fields"] == {"u": "x"} and out["withheld"] is True
+
+
+def test_extract_decision_empty_is_null_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    srv = _load_server(monkeypatch, tmp_path)
+    out = srv._extract_decision("web_row", {"function_calls": [], "suppressed_calls": []})
+    assert out["record"] is None and out["fields"] == {} and out["withheld"] is False
+
+
+def test_extract_decision_mismatch_and_ungrounded_raise(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    srv = _load_server(monkeypatch, tmp_path)
+    with pytest.raises(ValueError, match="mismatch"):
+        srv._extract_decision("web_row", {"function_calls": [{"name": "other", "arguments": {}}]})
+    bad: dict[str, object] = {
+        "function_calls": [{"name": "web_row", "arguments": {}}],
+        "validation": {"ungrounded": ["web_row.u"]},
+    }
+    with pytest.raises(ValueError, match="not grounded"):
+        srv._extract_decision("web_row", bad)
+    ok = srv._extract_decision("web_row", bad, strict=False)
+    assert ok["record"] == "web_row"
+
+
+def test_handle_extract_rejects_bad_shapes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Bad record/passage/max tokens fail closed before any decode."""
+    import json as _json
+
+    srv = _load_server(monkeypatch, tmp_path)
+    rec = {"name": "web_row"}
+    bad_passage = _json.dumps({"id": "e1", "action": "extract", "record": rec, "passage": "  "})
+    assert srv.handle(bad_passage)["error"] == "bad passage"
+    bad_record = _json.dumps({"id": "e2", "action": "extract", "record": {}, "passage": "x"})
+    assert srv.handle(bad_record)["error"] == "bad record"
+    bad_tokens = _json.dumps({"id": "e3", "action": "extract", "record": rec, "passage": "x", "max_new_tokens": 0})
+    assert srv.handle(bad_tokens)["error"] == "bad max_new_tokens"
+
+
+def test_handle_embed_rejects_blank(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import json as _json
+
+    srv = _load_server(monkeypatch, tmp_path)
+    out = srv.handle(_json.dumps({"id": "m1", "action": "embed", "text": "  "}))
+    assert out["error"] == "bad text"
+
+
+def test_handle_embed_returns_vector(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import json as _json
+
+    srv = _load_server(monkeypatch, tmp_path)
+    out = srv.handle(_json.dumps({"id": "m2", "action": "embed", "text": "NVDA revenue"}))
+    assert out["embedding"] == [0.1, 0.2, 0.3]
