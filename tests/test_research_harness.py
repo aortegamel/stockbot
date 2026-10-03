@@ -6461,3 +6461,41 @@ def test_hf_rejected_evidence_journals_event(tmp_path: Path, monkeypatch: pytest
     rejected = [e for e in repo.list_events(sid) if e.event_type == "evidence.rejected"]
     assert rejected and rejected[0].payload.get("evidence_id") == f"{sid}:ev:fin-rej"
     assert rejected[0].payload.get("reason") == "PIT_VIOLATION"
+
+
+def test_start_job_request_id_dedups_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same request_id returns the winner; no second job row persists."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _svc_sid(repo)
+    first = _svc.start_job(sid, "source_agent", repo=repo, wave_id=1, request_id="attempt-1")
+    second = _svc.start_job(sid, "source_agent", repo=repo, wave_id=1, request_id="attempt-1")
+    assert second["job_id"] == first["job_id"]
+    assert len(repo.list_jobs(sid)) == 2  # seed job + one winner
+
+
+def test_start_job_request_id_type_mismatch_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A request_id bound to source_agent rejects a committee type."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _svc_sid(repo)
+    _svc.start_job(sid, "source_agent", repo=repo, wave_id=1, request_id="attempt-1")
+    with pytest.raises(ValueError, match="already identifies"):
+        _svc.start_job(sid, "stockbot", repo=repo, wave_id=1, request_id="attempt-1")
+
+
+def test_evidence_insert_and_session_link_commit_together(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Evidence row + session.evidence_ids land in one batch."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _svc_sid(repo)
+    eid = f"{sid}:ev:atomic"
+    _svc.record_evidence(sid, src, _svc_item(eid), repo=repo)
+    assert eid in repo.get_session(sid).evidence_ids
+    assert repo.get_evidence(eid)["evidence_id"] == eid

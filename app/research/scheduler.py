@@ -842,21 +842,25 @@ def _block(kernel: Any, session_id: str, node_id: str, reason: str) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _attempt_job(kernel: Any, session_id: str, domain: str) -> str:
+def _attempt_job(kernel: Any, session_id: str, domain: str, *, request_id: str | None = None) -> str:
     """Start one source_agent job; domain-neutral retry on policy denial; synthesized id when the kernel cannot start."""
     # Policy-denied lanes (FINRA/WEB under the SEC-only default) must still persist a row:
     # swallowing the denial into a synthetic id breaks dispatch lookup (`unknown job_id`).
     # Provenance rides the per-attempt domain; stage/domain checks still run at dispatch.
     job_source = None if domain == "OTHER" else domain
     try:
-        job = kernel.start_job(session_id, type="source_agent", owner="kernel-scheduler", source=job_source)
+        job = kernel.start_job(
+            session_id, type="source_agent", owner="kernel-scheduler", source=job_source, request_id=request_id
+        )
         return str(_f(job, "job_id", default=f"job:{uuid.uuid4()}"))
     except ValueError:
         if job_source is None:
             logger.warning("toolflow attempt_job_synth sid=%s domain=%s", session_id, domain)
             return f"job:{uuid.uuid4()}"
         try:
-            job = kernel.start_job(session_id, type="source_agent", owner="kernel-scheduler", source=None)
+            job = kernel.start_job(
+                session_id, type="source_agent", owner="kernel-scheduler", source=None, request_id=request_id
+            )
             return str(_f(job, "job_id", default=f"job:{uuid.uuid4()}"))
         except Exception:
             logger.warning("toolflow attempt_job_synth sid=%s domain=%s", session_id, domain)

@@ -96,6 +96,10 @@ CREATE TABLE IF NOT EXISTS decisions (
   node_id TEXT, job_id TEXT, created_at TEXT NOT NULL, record TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS ix_decisions_session ON decisions(session_id);
 CREATE INDEX IF NOT EXISTS ix_decisions_node ON decisions(node_id);
+CREATE TABLE IF NOT EXISTS submissions (
+  session_id TEXT NOT NULL, request_id TEXT NOT NULL, job_id TEXT NOT NULL,
+  created_at TEXT NOT NULL, PRIMARY KEY (session_id, request_id));
+CREATE INDEX IF NOT EXISTS ix_submissions_job ON submissions(job_id);
 """
 
 
@@ -556,12 +560,125 @@ class ResearchRepository:
             conn.execute(_JOB_SQL, _job_params(job))
 
     def save_session_and_job(self, session: ResearchSession, job: Job) -> None:
-        """Upsert one session + one job in a single SQLite transaction."""
+        """Upsert one session + one job atomically under BEGIN IMMEDIATE (all-or-nothing)."""
         session.validate("<research.sqlite>")
         job.validate("<research.sqlite>")
+        conn = self._connect()
+        try:
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(_SESSION_SQL, _session_params(session))
+                conn.execute(_JOB_SQL, _job_params(job))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+
+    def commit_job_with_request(self, session: ResearchSession, job: Job, request_id: str) -> str:
+        """Claim one (session, request_id) slot and persist session + job atomically."""
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("<research.sqlite>: 'request_id' must be a non-empty string")
+        session.validate("<research.sqlite>")
+        job.validate("<research.sqlite>")
+        conn = self._connect()
+        try:
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT job_id FROM submissions WHERE session_id = ? AND request_id = ?",
+                    (session.session_id, request_id),
+                ).fetchone()
+                if row is not None:
+                    winner = str(row["job_id"])
+                    conn.rollback()
+                    self._check_submission_type(winner, job.job_type, request_id)
+                    return winner
+                conn.execute(
+                    "INSERT INTO submissions (session_id, request_id, job_id, created_at) VALUES (?, ?, ?, ?)",
+                    (session.session_id, request_id, job.job_id, utcnow().isoformat()),
+                )
+                conn.execute(_SESSION_SQL, _session_params(session))
+                conn.execute(_JOB_SQL, _job_params(job))
+                conn.commit()
+                return job.job_id
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                winner_row = self.submission_job_id(session.session_id, request_id)
+                if winner_row is None:
+                    raise
+                self._check_submission_type(winner_row, job.job_type, request_id)
+                return winner_row
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+
+    def _check_submission_type(self, winner_job_id: str, job_type: str, request_id: str) -> None:
+        """Raise when a request id already identifies a different job type."""
+        try:
+            winner = self.get_job(winner_job_id)
+        except KeyError:
+            return
+        if winner.job_type != job_type:
+            raise ValueError(f"<research.sqlite>: request {request_id!r} already identifies {winner.job_type!r}")
+
+    def submission_job_id(self, session_id: str, request_id: str) -> str | None:
+        """Winner job id for one (session, request_id) slot; None when unclaimed."""
         with self._connect() as conn:
-            conn.execute(_SESSION_SQL, _session_params(session))
-            conn.execute(_JOB_SQL, _job_params(job))
+            row = conn.execute(
+                "SELECT job_id FROM submissions WHERE session_id = ? AND request_id = ?",
+                (session_id, request_id),
+            ).fetchone()
+        return str(row["job_id"]) if row is not None else None
+
+    def save_evidence_and_session(self, session: ResearchSession, record: Mapping[str, object]) -> str:
+        """Insert one evidence row + link the session atomically under BEGIN IMMEDIATE.
+
+        Crash between insert and link used to orphan the row: a retry hit the
+        duplicate-identity path and returned without linking. One batch keeps
+        the row and the session.evidence_ids index together. Duplicate contract
+        matches save_evidence.
+        """
+        if not isinstance(record, Mapping):
+            raise ValueError("<research.sqlite>: evidence record must be a mapping")  # noqa: TRY004 - public error contract pins ValueError, tests are oracle
+        where = "<research.sqlite>: evidence"
+        evidence_id = record.get("evidence_id")
+        session_id = record.get("session_id")
+        if not isinstance(evidence_id, str) or not evidence_id:
+            raise ValueError(f"{where}: 'evidence_id' must be a non-empty string")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError(f"{where}: 'session_id' must be a non-empty string")
+        session.validate("<research.sqlite>")
+        identity_key = _evidence_identity_key(record)
+        created_known = _iso_or_none(record.get("known_at"), "known_at", where)
+        created_asof = _iso_or_none(record.get("as_of"), "as_of", where)
+        payload = _record_json(record, where)
+        conn = self._connect()
+        try:
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT INTO evidence (evidence_id, session_id, known_at, as_of, identity_key, record) VALUES (?, ?, ?, ?, ?, ?)",
+                    (evidence_id, session_id, created_known, created_asof, identity_key, payload),
+                )
+                conn.execute(_SESSION_SQL, _session_params(session))
+                conn.commit()
+            except sqlite3.IntegrityError:
+                err = _duplicate_evidence_error(conn, where, str(evidence_id), identity_key)
+                conn.rollback()
+                raise err from None
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+        return evidence_id
 
     def consume_dispatch_budget(self, session_id: str, job_id: str) -> tuple[ResearchSession, Job]:
         """Atomically consume one job + global dispatch slot under BEGIN IMMEDIATE."""

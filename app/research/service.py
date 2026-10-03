@@ -420,12 +420,21 @@ def start_job(
     owner: str = "kernel",
     wave_id: int = 1,
     model: str | None = None,
+    request_id: str | None = None,
 ) -> dict[str, JSONValue]:
-    """Create a queued job for the kernel scheduler to run, then mark it running. Returns the job."""
+    """Create a queued job for the kernel scheduler to run, then mark it running. Returns the job.
+
+    request_id dedups retries: a known id returns the winner without writing;
+    the claim + session + job persist in one BEGIN IMMEDIATE batch.
+    """
     store = _repo(repo)
     found = _require_session(store, session_id)
     existing = store.list_jobs(session_id)
     details: dict[str, object] = dict(budget or {})
+    if request_id is None:
+        raw_request: object = details.get("request_id")
+        if isinstance(raw_request, str) and raw_request:
+            request_id = raw_request
     token_budget = details.get("token_budget")
     tool_budget = details.get("tool_budget")
     child_budget = details.get("child_budget")
@@ -448,10 +457,11 @@ def start_job(
         tool_budget=tool_budget if isinstance(tool_budget, int) else None,
         child_budget=child_budget if isinstance(child_budget, int) else None,
     )
-    store.save_session(updated)
-    store.save_job(job)
     running = _jobs.start_job(job)
-    store.save_job(running)
+    if request_id is not None:
+        winner_id = store.commit_job_with_request(updated, running, request_id)
+        return store.get_job(winner_id).to_dict()
+    store.save_session_and_job(updated, running)
     return running.to_dict()
 
 
@@ -474,8 +484,11 @@ def complete_job(
         done = _jobs.complete_job(job, result=result)
     except ValueError:
         return job.to_dict()
-    store.save_job(done)
-    transition_job_completed(job.session_id, job.job_id, repo=store)
+    cur = store.get_session(job.session_id)
+    wave = done.wave_id if isinstance(done.wave_id, int) and done.wave_id >= 1 else 1
+    if wave > cur.current_wave:
+        cur = replace(cur, current_wave=wave, updated_at=utcnow())
+    store.save_session_and_job(cur, done)
     return store.get_job(job.job_id).to_dict()
 
 
@@ -1618,8 +1631,17 @@ def _persist_evidence_record(
     stored = evidence_to_dict(record)
     stored_meta = stored.get("metadata")
     stored["metadata"] = {**(stored_meta if isinstance(stored_meta, dict) else {}), "source_bytes": "archived"}
+    updated_found = (
+        found
+        if record.evidence_id in found.evidence_ids
+        else replace(
+            found,
+            evidence_ids=[*found.evidence_ids, record.evidence_id],
+            updated_at=utcnow(),
+        )
+    )
     try:
-        store.save_evidence(stored)
+        store.save_evidence_and_session(updated_found, stored)
     except ValueError as exc:
         if "identity_key" not in str(exc):
             raise
@@ -1651,14 +1673,6 @@ def _persist_evidence_record(
         )
     except Exception:  # noqa: BLE001, S110 - best-effort artifact mirror, never blocks acceptance
         pass
-    if record.evidence_id not in found.evidence_ids:
-        store.save_session(
-            replace(
-                found,
-                evidence_ids=[*found.evidence_ids, record.evidence_id],
-                updated_at=utcnow(),
-            )
-        )
     return stored
 
 
@@ -1684,8 +1698,17 @@ def _persist_finra_web_record(
         ledger, record, as_of=found.as_of, on_reject=lambda event, payload: _emit(store, session_id, event, payload)
     )
     stored = evidence_to_dict(record)
+    updated_found = (
+        found
+        if record.evidence_id in found.evidence_ids
+        else replace(
+            found,
+            evidence_ids=[*found.evidence_ids, record.evidence_id],
+            updated_at=utcnow(),
+        )
+    )
     try:
-        store.save_evidence(stored)
+        store.save_evidence_and_session(updated_found, stored)
     except ValueError as exc:
         if "identity_key" not in str(exc):
             raise
@@ -1703,14 +1726,6 @@ def _persist_finra_web_record(
             "tool_result_id": record.provenance.get("tool_result_id"),
         },
     )
-    if record.evidence_id not in found.evidence_ids:
-        store.save_session(
-            replace(
-                found,
-                evidence_ids=[*found.evidence_ids, record.evidence_id],
-                updated_at=utcnow(),
-            )
-        )
     return stored
 
 
@@ -2484,7 +2499,11 @@ def submit_source_result(
     dossier_id, _ = _submit_dossier(store, job, found, cov.get("useful_for_question"), ids, unresolved_questions, cov)
     telemetry = _submit_telemetry(store, job.session_id, cov, unresolved_questions)
     done = _jobs.complete_job(job, result={"coverage": cov, "evidence_ids": ids, "telemetry": telemetry})
-    store.save_job(done)
+    cur = store.get_session(job.session_id)
+    wave = done.wave_id if isinstance(done.wave_id, int) and done.wave_id >= 1 else 1
+    if wave > cur.current_wave:
+        cur = replace(cur, current_wave=wave, updated_at=utcnow())
+    store.save_session_and_job(cur, done)
     _emit(
         store,
         job.session_id,
@@ -2493,7 +2512,6 @@ def submit_source_result(
     )
     if warnings:
         _emit(store, job.session_id, "coverage.warning", {"job_id": job.job_id, "warnings": warnings})
-    transition_job_completed(job.session_id, job.job_id, repo=store)
     out: dict[str, JSONValue] = {
         "job_status": done.status,
         "job_id": done.job_id,
@@ -2540,8 +2558,7 @@ def retry_job(
         tool_budget=job.tool_budget,
         child_budget=None,  # re-derive from current policy; the stored echo is not an override
     )
-    store.save_session(updated)
-    store.save_job(replacement)
+    store.save_session_and_job(updated, replacement)
     return replacement.to_dict()
 
 
@@ -2914,10 +2931,9 @@ def _freeze_track_session(store: ResearchRepository, found: ResearchSession, fid
     out = _session.transition_session(found, SessionStatus.FREEZING)
     if fid not in out.freeze_ids:
         out = replace(out, freeze_ids=[*out.freeze_ids, fid], updated_at=utcnow())
-    store.save_session(out)
     if wave_id > out.current_wave:
         out = replace(out, current_wave=wave_id, updated_at=utcnow())
-        store.save_session(out)
+    store.save_session(out)
     return out
 
 
@@ -3029,9 +3045,8 @@ def _ensure_committee_roles(
             cur, job = _jobs.create_job(
                 cur, store.list_jobs(session_id), job_type=role, owner="kernel", wave_id=wave_id
             )
-            store.save_session(cur)
             started = _jobs.start_job(job)
-            store.save_job(started)
+            store.save_session_and_job(cur, started)
             created.append(started.job_id)
             started_ids.append(started.job_id)
             _emit(store, session_id, "committee.created", {"job_id": started.job_id, "role": role})
@@ -3174,12 +3189,11 @@ def record_committee_analysis(
     _committee_verify_write(store, session_id, fid)
     result = _committee_envelope(analysis, role, freeze_ids)
     done = _jobs.complete_job(job, result=result)
-    store.save_job(done)
     cur = found
     if cur.status == SessionStatus.FREEZING.value:
         cur = _session.transition_session(cur, SessionStatus.ANALYZING)
     cur = _committee_track_run(cur, fid, job_id, job.wave_id)
-    store.save_session(cur)
+    store.save_session_and_job(cur, done)
     _emit(store, session_id, "committee.created", {"job_id": job_id, "role": role, "freeze_id": fid})
     return done.to_dict()
 
@@ -3673,12 +3687,10 @@ def _finalize_persist(
     cur = store.get_session(session_id)
     if cur.status == SessionStatus.ANALYZING.value:
         cur = _session.transition_session(cur, SessionStatus.SYNTHESIZING)
-        store.save_session(cur)
-    cur = replace(store.get_session(session_id), final_result=validated, updated_at=utcnow())
-    store.save_session(cur)
+    cur = replace(cur, final_result=validated, updated_at=utcnow())
     if cur.status == SessionStatus.SYNTHESIZING.value:
         cur = _session.transition_session(cur, SessionStatus.COMPLETED)
-        store.save_session(cur)
+    store.save_session(cur)
     return {
         "session_id": session_id,
         "freeze_id": fid,
