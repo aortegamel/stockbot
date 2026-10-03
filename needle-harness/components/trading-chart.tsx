@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Bar,
   BarChart,
@@ -13,7 +13,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { calcMA, calcMACD, calcRSI, genCandles } from "@/lib/market-mock";
+import { calcMA, calcMACD, calcRSI, fetchCandles, type Candle } from "@/lib/market-data";
 
 const UP = "#26A69A";
 const DOWN = "#EF5350";
@@ -107,21 +107,53 @@ function CandleTooltip({
 
 export default function TradingChart({
   sym,
-  base,
-  volLabel,
 }: {
   sym: string;
-  base: number;
-  volLabel: string;
 }) {
   const [chartType, setChartType] = useState<"candles" | "line">("candles");
-  const [tab, setTab] = useState("1H");
+  const [tab, setTab] = useState("1D");
+  const [candles, setCandles] = useState<Candle[]>([]);
+  const [stale, setStale] = useState<string | null>(null);
 
-  const candles = useMemo(() => genCandles(base, 80), [sym, base]);
+  // Real OHLCV from /api/candles (Yahoo chart v8, delayed). No seeded RNG.
+  useEffect(() => {
+    let alive = true;
+    const ctrl = new AbortController();
+    fetchCandles(sym, "6mo", "1d", ctrl.signal)
+      .then((page) => {
+        if (!alive) return;
+        if (page.error || !page.candles?.length) {
+          setCandles([]);
+          setStale(page.error ?? "no data");
+          return;
+        }
+        setCandles(page.candles);
+        setStale(null);
+      })
+      .catch(() => {
+        if (alive) {
+          setCandles([]);
+          setStale("candles unavailable");
+        }
+      });
+    return () => {
+      alive = false;
+      ctrl.abort();
+    };
+  }, [sym]);
+
   const ma20 = useMemo(() => calcMA(candles, 20), [candles]);
   const ma50 = useMemo(() => calcMA(candles, 50), [candles]);
   const rsi = useMemo(() => calcRSI(candles), [candles]);
   const macdData = useMemo(() => calcMACD(candles), [candles]);
+
+  if (candles.length === 0) {
+    return (
+      <div style={{ padding: 16, fontSize: 12, color: "var(--muted, #7A8599)" }}>
+        {stale ?? `loading ${sym} · delayed…`}
+      </div>
+    );
+  }
 
   const data = candles.map((c, i) => ({
     ...c,
@@ -265,7 +297,7 @@ export default function TradingChart({
               {lastMacd.macd.toFixed(2)}
             </span>
           </span>
-          <span style={{ color: "var(--muted, #7A8599)" }}>VOL {volLabel}</span>
+          <span style={{ color: "var(--muted, #7A8599)" }}>VOL {(last.vol / 1e6).toFixed(1)}M · DELAYED</span>
         </span>
       </div>
 

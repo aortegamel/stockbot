@@ -4,69 +4,123 @@ import {
   WatchlistPanel,
   FinancialsPanel,
   NewsPanel,
-  PositionsPanel,
   AIPanel,
   type ChatMsg,
-  type AgentInfo,
 } from "./components/market-panels";
-import { SYMBOLS, TICKER_ITEMS } from "./lib/market-mock";
+import { fetchQuote, searchTickers, type SearchHit } from "./lib/market-data";
 
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
-
-// Classic/tahoe palette kept: deep navy base, blue/teal glass. Blobs drift like the
-// liquid scene but stay in the classic navy/blue/teal family — no purple/pink.
 const BG =
   "radial-gradient(120% 90% at 12% 0%, rgba(31,111,235,0.20), transparent 55%), radial-gradient(100% 80% at 100% 8%, rgba(41,72,150,0.35), transparent 60%), radial-gradient(90% 70% at 50% 112%, rgba(6,182,212,0.14), transparent 60%), linear-gradient(180deg, #141A30 0%, #101528 48%, #0C101F 100%)";
 
-const AGENTS_MOCK: AgentInfo[] = [
-  { name: "Scanner", task: "gap + volume scan", active: true },
-  { name: "Analyst", task: "earnings summarizer", active: true },
-  { name: "Risk", task: "position limits", active: false },
-];
+const STRIP_DEFAULTS = ["NVDA", "AAPL", "MSFT", "TSLA", "SPY", "QQQ"];
+
+function Strip() {
+  const [prices, setPrices] = useState<Record<string, number | null>>({});
+  useEffect(() => {
+    let alive = true;
+    const ctrl = new AbortController();
+    async function load() {
+      const next: Record<string, number | null> = {};
+      await Promise.all(
+        STRIP_DEFAULTS.map(async (sym) => {
+          try {
+            const q = await fetchQuote(sym, ctrl.signal);
+            next[sym] = typeof q.price === "number" ? q.price : null;
+          } catch {
+            next[sym] = null;
+          }
+        }),
+      );
+      if (alive) setPrices(next);
+    }
+    void load();
+    const id = setInterval(() => void load(), 60_000);
+    return () => {
+      alive = false;
+      ctrl.abort();
+      clearInterval(id);
+    };
+  }, []);
+  const items = [...STRIP_DEFAULTS, ...STRIP_DEFAULTS];
+  return (
+    <div style={{ display: "inline-block", animation: "tick 40s linear infinite" }}>
+      {items.map((sym, i) => (
+        <span key={i} style={{ marginRight: 18 }}>
+          <b>{sym}</b>{" "}
+          {prices[sym] == null ? "—" : prices[sym]!.toLocaleString(undefined, { maximumFractionDigits: 2 })}{" "}
+          <span style={{ color: "var(--muted, #93A0B8)", fontSize: 12 }}>DELAYED</span>
+        </span>
+      ))}
+    </div>
+  );
+}
 
 export default function App() {
   const [selected, setSelected] = useState("NVDA");
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<SearchHit[]>([]);
   const [chat, setChat] = useState<ChatMsg[]>([
-    { role: "ai", text: "Terminal online. Ask about any symbol, e.g. NVDA earnings risk." },
+    { role: "ai", text: "Terminal online · delayed data. Type a ticker above — any US symbol works." },
   ]);
   const [input, setInput] = useState("");
   const [clock, setClock] = useState("--:--:--");
 
+  // Clock ticks on its own interval — no synchronous setState in the effect body.
   useEffect(() => {
-    setClock(new Date().toLocaleTimeString("en-GB"));
     const id = setInterval(() => setClock(new Date().toLocaleTimeString("en-GB")), 1000);
     return () => clearInterval(id);
   }, []);
 
-  // Warm the mock API when up; local mocks render regardless — never throws offline.
+  // Any-ticker search: Yahoo validates the symbol, selecting it loads real data.
   useEffect(() => {
-    fetch(`${API_URL}/api/candles?sym=${selected}&n=80`).catch(() => { });
-  }, [selected]);
+    const q = query.trim();
+    let alive = true;
+    const ctrl = new AbortController();
+    if (q.length < 2) {
+      const id = setTimeout(() => alive && setHits([]), 0);
+      return () => {
+        alive = false;
+        clearTimeout(id);
+        ctrl.abort();
+      };
+    }
+    const id = setTimeout(() => {
+      searchTickers(q, ctrl.signal)
+        .then((page) => alive && setHits(page.hits.slice(0, 8)))
+        .catch(() => { });
+    }, 250);
+    return () => {
+      alive = false;
+      clearTimeout(id);
+      ctrl.abort();
+    };
+  }, [query]);
+
+  function pick(sym: string) {
+    const clean = sym.trim().toUpperCase();
+    if (!clean) return;
+    setSelected(clean);
+    setQuery("");
+    setHits([]);
+  }
 
   async function onSend() {
     const q = input.trim();
     if (!q) return;
-    const m = SYMBOLS[selected];
-    const fallback = `${selected} @ ${m.base} (${m.chg >= 0 ? "+" : ""}${m.chg}%) — mocked note: ${m.name}, 52W ${m.low52}–${m.high52}.`;
     setChat((c) => [...c, { role: "user", text: q }]);
     setInput("");
     try {
-      const r = await fetch(`${API_URL}/api/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: q, sym: selected }),
-      });
-      if (!r.ok) throw new Error("chat api");
-      const j = (await r.json()) as { reply: string };
-      setChat((c) => [...c, { role: "ai", text: j.reply }]);
+      const quote = await fetchQuote(selected);
+      const px = typeof quote.price === "number" ? quote.price.toFixed(2) : "—";
+      setChat((c) => [
+        ...c,
+        { role: "ai", text: `${selected} @ ${px} (delayed) — agent context at /api/viewer-context?sym=${selected} (unwired).` },
+      ]);
     } catch {
-      setChat((c) => [...c, { role: "ai", text: fallback }]);
+      setChat((c) => [...c, { role: "ai", text: `${selected}: quote unavailable — delayed feed down.` }]);
     }
   }
 
-  const m = SYMBOLS[selected];
-
-  // Single return: classic terminal view.
   return (
     <main
       style={{
@@ -112,8 +166,36 @@ export default function App() {
       >
         <span style={{ display: "flex", alignItems: "center", gap: 12, padding: "0 18px", height: 46, width: "100%", fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif" }}>
           <b style={{ fontSize: 18, fontWeight: 700, letterSpacing: "0.12em", color: "var(--text, #E6ECF5)" }}>NEEDLE TERMINAL</b>
+          <span style={{ position: "relative" }}>
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") pick(hits[0]?.sym ?? query);
+                if (e.key === "Escape") {
+                  setQuery("");
+                  setHits([]);
+                }
+              }}
+              placeholder="Search any US ticker…"
+              style={{ fontSize: 14, padding: "4px 10px", borderRadius: 999, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(255,255,255,0.07)", color: "#E6ECF5", width: 220 }}
+            />
+            {hits.length > 0 && (
+              <div style={{ position: "absolute", top: 30, left: 0, right: 0, background: "#141A30", border: "1px solid rgba(255,255,255,0.12)", borderRadius: 10, overflow: "hidden", zIndex: 10 }}>
+                {hits.map((h) => (
+                  <button
+                    key={h.sym}
+                    onClick={() => pick(h.sym)}
+                    style={{ display: "block", width: "100%", textAlign: "left", padding: "6px 10px", background: "transparent", border: 0, color: "#E6ECF5", cursor: "pointer", fontSize: 14 }}
+                  >
+                    <b>{h.sym}</b> <span style={{ opacity: 0.6 }}>{h.name ?? ""}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </span>
           <span style={{ marginLeft: "auto", color: "var(--muted, #93A0B8)", fontSize: 15 }}>
-            <span style={{ color: "var(--up, #26A69A)" }}>● LIVE</span> · {clock}
+            <span style={{ color: "var(--down, #EF5350)" }}>○ DELAYED</span> · {clock}
           </span>
         </span>
       </header>
@@ -122,16 +204,7 @@ export default function App() {
         className="strip"
         style={{ position: "relative", zIndex: 1, margin: "8px 14px 0", borderRadius: 14, overflow: "hidden", whiteSpace: "nowrap", padding: "7px 0", fontSize: 15, color: "var(--text, #E6ECF5)" }}
       >
-        <div style={{ display: "inline-block", animation: "tick 40s linear infinite" }}>
-          {[...TICKER_ITEMS, ...TICKER_ITEMS].map((t, i) => (
-            <span key={i} style={{ marginRight: 18 }}>
-              <b>{t.sym}</b> {t.val}{" "}
-              <span style={{ color: t.chg.startsWith("-") ? "var(--down, #EF5350)" : "var(--up, #26A69A)" }}>
-                {t.chg}
-              </span>
-            </span>
-          ))}
-        </div>
+        <Strip />
       </div>
 
       <div
@@ -147,36 +220,31 @@ export default function App() {
         }}
       >
         <div className="glass" style={{ overflow: "hidden", minHeight: 0, height: "100%" }}>
-          <WatchlistPanel selected={selected} onSelect={setSelected} />
+          <WatchlistPanel selected={selected} onSelect={pick} />
         </div>
         <div style={{ overflow: "hidden", minHeight: 0, display: "flex", flexDirection: "column", gap: 8 }}>
           <div className="glass" style={{ flex: "1.4 1 0", minHeight: 0 }}>
-            <TradingChart sym={selected} base={m.base} volLabel={m.vol} />
+            <TradingChart sym={selected} />
           </div>
-          <div style={{ flex: "0.9 1 0", minHeight: 0, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, overflow: "hidden" }}>
+          <div style={{ flex: "0.9 1 0", minHeight: 0, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, overflow: "hidden" }}>
             <div className="glass" style={{ minHeight: 0, minWidth: 0, overflow: "hidden", display: "flex" }}>
               <FinancialsPanel sym={selected} />
             </div>
             <div className="glass" style={{ minHeight: 0, minWidth: 0, overflow: "hidden", display: "flex" }}>
               <NewsPanel sym={selected} />
             </div>
-            <div className="glass" style={{ minHeight: 0, minWidth: 0, overflow: "hidden", display: "flex" }}>
-              <PositionsPanel />
-            </div>
           </div>
         </div>
         <div className="glass" style={{ overflow: "hidden", minHeight: 0, display: "flex" }}>
-          <AIPanel chat={chat} input={input} setInput={setInput} onSend={onSend} agents={AGENTS_MOCK} />
+          <AIPanel chat={chat} input={input} setInput={setInput} onSend={onSend} sym={selected} />
         </div>
       </div>
 
       <footer
         style={{ position: "relative", zIndex: 1, fontSize: 13, padding: "4px 12px", display: "flex", justifyContent: "space-between", color: "rgba(235,235,245,0.78)" }}
       >
-        <span>mock feed · api optional</span>
-        <span>
-          {selected} · {Object.keys(SYMBOLS).length} symbols · {(Object.values(SYMBOLS).reduce((a, s) => a + s.chg, 0) / Object.keys(SYMBOLS).length).toFixed(2)}% avg
-        </span>
+        <span>delayed feed · Yahoo + SEC + Google News RSS · agent context: /api/viewer-context (unwired)</span>
+        <span>{selected}</span>
       </footer>
     </main>
   );

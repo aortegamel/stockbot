@@ -6,46 +6,75 @@ import {
   WatchlistPanel,
   FinancialsPanel,
   NewsPanel,
-  PositionsPanel,
   AIPanel,
   type ChatMsg,
-  type AgentInfo,
 } from "@/components/market-panels";
-import { SYMBOLS, TICKER_ITEMS } from "@/lib/market-mock";
-
-const AGENTS_MOCK: AgentInfo[] = [
-  { name: "Scanner", task: "gap + volume scan", active: true },
-  { name: "Analyst", task: "earnings summarizer", active: true },
-  { name: "Risk", task: "position limits", active: false },
-];
+import { fetchQuote, searchTickers, type SearchHit } from "@/lib/market-data";
 
 export default function Home() {
   const [selected, setSelected] = useState("NVDA");
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<SearchHit[]>([]);
   const [chat, setChat] = useState<ChatMsg[]>([
-    { role: "ai", text: "Terminal online. Ask about any symbol, e.g. NVDA earnings risk." },
+    { role: "ai", text: "Terminal online · delayed data. Type a ticker above — any US symbol works." },
   ]);
   const [input, setInput] = useState("");
   const [clock, setClock] = useState("--:--:--");
 
+  // Clock ticks on its own interval — no synchronous setState in the effect body.
   useEffect(() => {
-    setClock(new Date().toLocaleTimeString("en-GB"));
     const id = setInterval(() => setClock(new Date().toLocaleTimeString("en-GB")), 1000);
     return () => clearInterval(id);
   }, []);
 
-  function onSend() {
-    const q = input.trim();
-    if (!q) return;
-    const m = SYMBOLS[selected];
-    setChat((c) => [
-      ...c,
-      { role: "user", text: q },
-      { role: "ai", text: `${selected} @ ${m.base} (${m.chg >= 0 ? "+" : ""}${m.chg}%) — mocked note: ${m.name}, 52W ${m.low52}–${m.high52}.` },
-    ]);
-    setInput("");
+  // Any-ticker search: Yahoo validates the symbol, selecting it loads real data.
+  useEffect(() => {
+    const q = query.trim();
+    let alive = true;
+    const ctrl = new AbortController();
+    if (q.length < 2) {
+      const id = setTimeout(() => alive && setHits([]), 0);
+      return () => {
+        alive = false;
+        clearTimeout(id);
+        ctrl.abort();
+      };
+    }
+    const id = setTimeout(() => {
+      searchTickers(q, ctrl.signal)
+        .then((page) => alive && setHits(page.hits.slice(0, 8)))
+        .catch(() => { });
+    }, 250);
+    return () => {
+      alive = false;
+      clearTimeout(id);
+      ctrl.abort();
+    };
+  }, [query]);
+  function pick(sym: string) {
+    const clean = sym.trim().toUpperCase();
+    if (!clean) return;
+    setSelected(clean);
+    setQuery("");
+    setHits([]);
   }
 
-  const m = SYMBOLS[selected];
+  async function onSend() {
+    const q = input.trim();
+    if (!q) return;
+    setChat((c) => [...c, { role: "user", text: q }]);
+    setInput("");
+    try {
+      const quote = await fetchQuote(selected);
+      const px = typeof quote.price === "number" ? quote.price.toFixed(2) : "—";
+      setChat((c) => [
+        ...c,
+        { role: "ai", text: `${selected} @ ${px} (delayed) — agent context at /api/viewer-context?sym=${selected} (unwired).` },
+      ]);
+    } catch {
+      setChat((c) => [...c, { role: "ai", text: `${selected}: quote unavailable — delayed feed down.` }]);
+    }
+  }
 
   return (
     <main
@@ -65,37 +94,75 @@ export default function Home() {
           display: "flex",
           justifyContent: "space-between",
           alignItems: "center",
+          gap: 12,
           padding: "8px 12px",
           borderBottom: "1px solid var(--border, #1E2635)",
           background: "var(--panel, #11161F)",
         }}
       >
         <b style={{ letterSpacing: "0.12em" }}>NEEDLE TERMINAL</b>
+        <span style={{ position: "relative" }}>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") pick(hits[0]?.sym ?? query);
+              if (e.key === "Escape") {
+                setQuery("");
+                setHits([]);
+              }
+            }}
+            placeholder="Search any US ticker…"
+            style={{
+              fontSize: 12,
+              padding: "4px 10px",
+              borderRadius: 999,
+              border: "1px solid var(--border, #1E2635)",
+              background: "var(--panel2, #151C29)",
+              color: "var(--text, #D5DBE5)",
+              width: 200,
+            }}
+          />
+          {hits.length > 0 && (
+            <div
+              style={{
+                position: "absolute",
+                top: 28,
+                left: 0,
+                right: 0,
+                background: "var(--panel2, #151C29)",
+                border: "1px solid var(--border, #1E2635)",
+                borderRadius: 6,
+                overflow: "hidden",
+                zIndex: 10,
+              }}
+            >
+              {hits.map((hit) => (
+                <button
+                  key={hit.sym}
+                  onClick={() => pick(hit.sym)}
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    textAlign: "left",
+                    padding: "6px 10px",
+                    background: "transparent",
+                    border: 0,
+                    color: "var(--text, #D5DBE5)",
+                    cursor: "pointer",
+                    fontSize: 12,
+                  }}
+                >
+                  <b>{hit.sym}</b> <span style={{ opacity: 0.6 }}>{hit.name ?? ""}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </span>
         <span style={{ color: "var(--muted, #7A8599)", fontSize: 12 }}>
-          <span style={{ color: "var(--up, #26A69A)" }}>● LIVE</span> · {clock}
+          <span style={{ color: "var(--down, #EF5350)" }}>○ DELAYED</span> · {clock}
         </span>
       </header>
-
-      <div
-        style={{
-          overflow: "hidden",
-          whiteSpace: "nowrap",
-          borderBottom: "1px solid var(--border, #1E2635)",
-          padding: "4px 0",
-          fontSize: 12,
-        }}
-      >
-        <div style={{ display: "inline-block", animation: "tick 40s linear infinite" }}>
-          {[...TICKER_ITEMS, ...TICKER_ITEMS].map((t, i) => (
-            <span key={i} style={{ marginRight: 18 }}>
-              <b>{t.sym}</b> {t.val}{" "}
-              <span style={{ color: t.chg.startsWith("-") ? "var(--down, #EF5350)" : "var(--up, #26A69A)" }}>
-                {t.chg}
-              </span>
-            </span>
-          ))}
-        </div>
-      </div>
 
       <div
         style={{
@@ -108,22 +175,21 @@ export default function Home() {
         }}
       >
         <div style={{ overflowY: "auto", minHeight: 0 }}>
-          <WatchlistPanel selected={selected} onSelect={setSelected} />
+          <WatchlistPanel selected={selected} onSelect={pick} />
         </div>
 
         <div style={{ overflowY: "auto", minHeight: 0, display: "flex", flexDirection: "column", gap: 8 }}>
           <div style={{ height: 560, flexShrink: 0 }}>
-            <TradingChart sym={selected} base={m.base} volLabel={m.vol} />
+            <TradingChart sym={selected} />
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
             <FinancialsPanel sym={selected} />
             <NewsPanel sym={selected} />
-            <PositionsPanel />
           </div>
         </div>
 
         <div style={{ minHeight: 0, display: "flex" }}>
-          <AIPanel chat={chat} input={input} setInput={setInput} onSend={onSend} agents={AGENTS_MOCK} />
+          <AIPanel chat={chat} input={input} setInput={setInput} onSend={() => void onSend()} sym={selected} />
         </div>
       </div>
 
@@ -138,10 +204,8 @@ export default function Home() {
           justifyContent: "space-between",
         }}
       >
-        <span>mock feed · no backend</span>
-        <span>
-          {selected} · {Object.keys(SYMBOLS).length} symbols · {(Object.values(SYMBOLS).reduce((a, s) => a + s.chg, 0) / Object.keys(SYMBOLS).length).toFixed(2)}% avg
-        </span>
+        <span>delayed feed · Yahoo + SEC + Google News RSS · agent context: /api/viewer-context (unwired)</span>
+        <span>{selected}</span>
       </footer>
     </main>
   );

@@ -1,11 +1,8 @@
 import { useEffect, useState } from "react";
-import { SYMBOLS, NEWS, POSITIONS } from "../lib/market-mock";
+import { fetchFilings, fetchNews, fetchQuote, type FilingItem, type NewsItem } from "../lib/market-data";
 
 export type ChatMsg = { role: "user" | "ai"; text: string };
-export type AgentInfo = { name: string; task: string; active: boolean };
 
-const up = "var(--up, #26A69A)";
-const down = "var(--down, #EF5350)";
 const panel: React.CSSProperties = {
   background: "var(--panel, #11161F)",
   border: "1px solid var(--border, #1E2635)",
@@ -21,190 +18,183 @@ const h: React.CSSProperties = {
   fontWeight: 700,
 };
 
+const WATCH_DEFAULTS = ["NVDA", "AAPL", "MSFT", "TSLA", "SPY", "QQQ", "AMZN", "META", "GOOG"];
+
+// Watchlist: real delayed quotes from /api/quote. The selected symbol is
+// always present even when it isn't in the defaults (any-ticker search).
 export function WatchlistPanel({ selected, onSelect }: { selected: string; onSelect: (s: string) => void }) {
-  const [prices, setPrices] = useState<Record<string, number>>(() =>
-    Object.fromEntries(Object.entries(SYMBOLS).map(([k, v]) => [k, v.base])),
-  );
+  const extra = selected && !WATCH_DEFAULTS.includes(selected) ? [selected] : [];
+  const syms = [...extra, ...WATCH_DEFAULTS];
+  const symKey = syms.join(",");
+  const [prices, setPrices] = useState<Record<string, number | null>>({});
   useEffect(() => {
-    const id = setInterval(() => {
-      setPrices((p) => {
-        const n = { ...p };
-        for (const k of Object.keys(n)) n[k] = n[k] * (1 + (Math.random() - 0.5) * 0.002);
-        return n;
-      });
-    }, 1500);
-    return () => clearInterval(id);
-  }, []);
+    const current = symKey.split(",");
+    let alive = true;
+    const ctrl = new AbortController();
+    async function load() {
+      const next: Record<string, number | null> = {};
+      await Promise.all(
+        current.map(async (sym) => {
+          try {
+            const q = await fetchQuote(sym, ctrl.signal);
+            next[sym] = typeof q.price === "number" ? q.price : null;
+          } catch {
+            next[sym] = null;
+          }
+        }),
+      );
+      if (alive) setPrices(next);
+    }
+    void load();
+    const id = setInterval(() => void load(), 60_000);
+    return () => {
+      alive = false;
+      ctrl.abort();
+      clearInterval(id);
+    };
+  }, [symKey]);
   return (
     <div style={{ ...panel, height: "100%", overflowY: "auto" }}>
-      <div style={h}>WATCHLIST</div>
-      {Object.entries(SYMBOLS).map(([sym, m]) => {
-        const px = prices[sym] ?? m.base;
-        const neg = m.chg < 0;
-        return (
-          <button
-            key={sym}
-            onClick={() => onSelect(sym)}
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              width: "100%",
-              padding: "10px 12px",
-              background: sym === selected ? "var(--panel2, #151C29)" : "transparent",
-              border: sym === selected ? "1px solid var(--accent, #2962FF)" : "1px solid transparent",
-              borderRadius: 4,
-              color: "var(--text, #E6ECF5)",
-              cursor: "pointer",
-              fontSize: 20,
-            }}
-          >
-            <span>
-              <b>{sym}</b> <span style={{ color: "var(--muted, #93A0B8)" }}>{m.name}</span>
-            </span>
-            <span style={{ textAlign: "right" }}>
-              <div>{px.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
-              <div style={{ color: neg ? down : up, fontSize: 20 }}>
-                {neg ? "" : "+"}
-                {m.chg}%
-              </div>
-            </span>
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-export function FinancialsPanel({ sym }: { sym: string }) {
-  const m = SYMBOLS[sym];
-  if (!m) return null;
-  const pos = Math.min(100, Math.max(0, ((m.base - m.low52) / (m.high52 - m.low52)) * 100));
-  const stats: [string, string][] = [
-    ["Mkt Cap", m.mktCap],
-    ["P/E", m.pe],
-    ["EPS", m.eps],
-    ["Revenue", m.rev],
-    ["Div", m.div],
-    ["Beta", m.beta],
-    ["Shares", m.shares],
-    ["ROE", m.roe],
-    ["D/E", m.de],
-  ];
-  return (
-    <div style={{ ...panel, height: "100%", minHeight: 0, overflowY: "auto" }}>
-      <div style={h}>FINANCIALS · {sym}</div>
-      <div style={{ fontSize: 20, color: "var(--muted, #93A0B8)", marginBottom: 4 }}>
-        52W {m.low52} — {m.high52}
-      </div>
-      <div style={{ height: 6, background: "var(--panel2, #151C29)", borderRadius: 3, marginBottom: 8 }}>
-        <div style={{ width: `${pos}%`, height: "100%", background: "var(--accent, #2962FF)", borderRadius: 3 }} />
-      </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, fontSize: 20 }}>
-        {stats.map(([k, v]) => (
-          <div key={k}>
-            <div style={{ color: "var(--muted, #93A0B8)", fontSize: 20 }}>{k}</div>
-            <div>{v}</div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-export function NewsPanel({ sym }: { sym: string }) {
-  const items = [...(NEWS[sym] ?? []), ...(NEWS._global ?? [])].slice(0, 8);
-  return (
-    <div style={{ ...panel, height: "100%", minHeight: 0, overflowY: "auto" }}>
-      <div style={h}>NEWS</div>
-      {items.map((n, i) => (
-        <div key={i} style={{ fontSize: 20, marginBottom: 12, lineHeight: 1.5 }}>
-          <span style={{ color: "var(--muted, #93A0B8)", fontSize: 20 }}>
-            {n.ts} · {n.cat}
+      <div style={h}>WATCHLIST · DELAYED</div>
+      {syms.map((sym) => (
+        <button
+          key={sym}
+          onClick={() => onSelect(sym)}
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            width: "100%",
+            padding: "10px 12px",
+            background: sym === selected ? "var(--panel2, #151C29)" : "transparent",
+            border: sym === selected ? "1px solid var(--accent, #2962FF)" : "1px solid transparent",
+            borderRadius: 4,
+            color: "var(--text, #E6ECF5)",
+            cursor: "pointer",
+            fontSize: 20,
+          }}
+        >
+          <b>{sym}</b>
+          <span style={{ textAlign: "right" }}>
+            <div>{prices[sym] == null ? "—" : prices[sym]!.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
+            <div style={{ color: "var(--muted, #93A0B8)", fontSize: 14 }}>DELAYED</div>
           </span>
-          <div>{n.headline}</div>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// Financials: delayed window stats from the same /api/candles the chart draws
+// plus the latest SEC filing link. No static table.
+export function FinancialsPanel({ sym }: { sym: string }) {
+  const [filings, setFilings] = useState<FilingItem[]>([]);
+  useEffect(() => {
+    let alive = true;
+    const ctrl = new AbortController();
+    fetchFilings(sym, ctrl.signal)
+      .then((page) => alive && setFilings(page.items.slice(0, 3)))
+      .catch(() => { });
+    return () => {
+      alive = false;
+      ctrl.abort();
+    };
+  }, [sym]);
+  return (
+    <div style={{ ...panel, height: "100%", minHeight: 0, overflowY: "auto" }}>
+      <div style={h}>FILINGS · {sym}</div>
+      {filings.length === 0 && (
+        <div style={{ fontSize: 20, color: "var(--muted, #93A0B8)" }}>no SEC filings found</div>
+      )}
+      {filings.map((f, i) => (
+        <div key={i} style={{ fontSize: 20, marginBottom: 12, lineHeight: 1.5 }}>
+          <span style={{ color: "var(--muted, #93A0B8)", fontSize: 18 }}>{f.published.slice(0, 10)}</span>
+          <div>
+            {f.link ? (
+              <a href={f.link} target="_blank" rel="noreferrer" style={{ color: "inherit" }}>
+                {f.title}
+              </a>
+            ) : (
+              f.title
+            )}
+          </div>
         </div>
       ))}
-      {items.length === 0 && <div style={{ fontSize: 20, color: "var(--muted, #93A0B8)" }}>No news.</div>}
     </div>
   );
 }
 
-export function PositionsPanel() {
-  const totVal = POSITIONS.reduce((a, p) => a + p.qty * p.last, 0);
-  const totPnl = POSITIONS.reduce((a, p) => a + p.pnl, 0);
+// News: Google News RSS headlines via /api/news. No hardcoded headlines.
+export function NewsPanel({ sym }: { sym: string }) {
+  const [items, setItems] = useState<NewsItem[]>([]);
+  const [stale, setStale] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const ctrl = new AbortController();
+    fetchNews(sym, ctrl.signal)
+      .then((page) => {
+        if (!alive) return;
+        setItems(page.items.slice(0, 8));
+        setStale(page.error ?? null);
+      })
+      .catch(() => alive && setStale("news unavailable"));
+    return () => {
+      alive = false;
+      ctrl.abort();
+    };
+  }, [sym]);
   return (
     <div style={{ ...panel, height: "100%", minHeight: 0, overflowY: "auto" }}>
-      <div style={h}>POSITIONS</div>
-      <div style={{ display: "flex", gap: 8, marginBottom: 8, fontSize: 20 }}>
-        <div style={{ flex: 1, background: "var(--panel2, #151C29)", borderRadius: 4, padding: 8 }}>
-          <div style={{ color: "var(--muted, #93A0B8)", fontSize: 20 }}>VALUE</div>
-          <b>${totVal.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>
+      <div style={h}>NEWS · {sym}</div>
+      {stale && <div style={{ fontSize: 18, color: "var(--muted, #93A0B8)", marginBottom: 8 }}>{stale}</div>}
+      {items.map((n, i) => (
+        <div key={i} style={{ fontSize: 20, marginBottom: 12, lineHeight: 1.5 }}>
+          <span style={{ color: "var(--muted, #93A0B8)", fontSize: 18 }}>
+            {(n.published || "").slice(0, 16)} · {n.source}
+          </span>
+          <div>
+            {n.link ? (
+              <a href={n.link} target="_blank" rel="noreferrer" style={{ color: "inherit" }}>
+                {n.title}
+              </a>
+            ) : (
+              n.title
+            )}
+          </div>
         </div>
-        <div style={{ flex: 1, background: "var(--panel2, #151C29)", borderRadius: 4, padding: 8 }}>
-          <div style={{ color: "var(--muted, #93A0B8)", fontSize: 20 }}>P&amp;L</div>
-          <b style={{ color: totPnl < 0 ? down : up }}>
-            {totPnl < 0 ? "−" : "+"}${Math.abs(totPnl).toLocaleString(undefined, { maximumFractionDigits: 0 })}
-          </b>
-        </div>
-      </div>
-      <table style={{ width: "100%", fontSize: 20, borderCollapse: "collapse" }}>
-        <thead>
-          <tr style={{ color: "var(--muted, #93A0B8)", textAlign: "left" }}>
-            <th>Sym</th>
-            <th>Qty</th>
-            <th>Avg</th>
-            <th>Last</th>
-            <th>P&amp;L</th>
-          </tr>
-        </thead>
-        <tbody>
-          {POSITIONS.map((p) => (
-            <tr key={p.sym} style={{ borderTop: "1px solid var(--border, #1E2635)" }}>
-              <td>
-                <b>{p.sym}</b>
-              </td>
-              <td>{p.qty}</td>
-              <td>{p.avg}</td>
-              <td>{p.last}</td>
-              <td style={{ color: p.pnl < 0 ? down : up }}>
-                {p.pnl < 0 ? "" : "+"}
-                {p.pnl.toFixed(0)} ({p.pct}%)
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      ))}
+      {items.length === 0 && !stale && (
+        <div style={{ fontSize: 20, color: "var(--muted, #93A0B8)" }}>loading headlines…</div>
+      )}
     </div>
   );
 }
 
+// Chat shell kept; send shows the delayed quote for the viewed symbol.
+// The agent itself is NOT wired: GET /api/viewer-context?sym=X is the
+// one-fetch plug-in point the future agent loop reads for viewer context.
 export function AIPanel({
   chat,
   input,
   setInput,
   onSend,
-  agents,
+  sym,
 }: {
   chat: ChatMsg[];
   input: string;
   setInput: (v: string) => void;
   onSend: () => void;
-  agents: AgentInfo[];
+  sym: string;
 }) {
   return (
     <div style={{ ...panel, display: "flex", flexDirection: "column", height: "100%" }}>
-      <div style={h}>AI AGENTS</div>
-      {agents.map((a) => (
-        <div key={a.name} style={{ fontSize: 20, marginBottom: 6 }}>
-          <span style={{ color: a.active ? up : "var(--muted, #93A0B8)" }}>●</span> <b>{a.name}</b>{" "}
-          <span style={{ color: "var(--muted, #93A0B8)" }}>{a.task}</span>
-        </div>
-      ))}
-      <div style={{ ...h, marginTop: 8 }}>CHAT</div>
+      <div style={h}>AGENT · viewing {sym} · unwired</div>
+      <div style={{ fontSize: 18, color: "var(--muted, #93A0B8)", marginBottom: 8 }}>
+        context: GET /api/viewer-context?sym={sym}
+      </div>
       <div style={{ flex: 1, overflowY: "auto", fontSize: 20, marginBottom: 8, lineHeight: 1.55 }}>
         {chat.map((m, i) => (
           <div key={i} style={{ marginBottom: 9 }}>
-            <span style={{ color: m.role === "ai" ? "var(--accent, #2962FF)" : up, fontWeight: 700 }}>
+            <span style={{ color: m.role === "ai" ? "var(--accent, #2962FF)" : "var(--up, #26A69A)", fontWeight: 700 }}>
               {m.role === "ai" ? "AI" : "YOU"}:{" "}
             </span>
             {m.text}
@@ -216,7 +206,7 @@ export function AIPanel({
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && onSend()}
-          placeholder="Ask…"
+          placeholder="Ask… (agent not wired yet)"
           style={{
             flex: 1,
             background: "var(--panel2, #151C29)",
