@@ -69,6 +69,7 @@ function reset(): void {
   kernelCalls.length = 0;
   invoked.length = 0;
   ended.length = 0;
+  process.env.STOCKBOT_DEBUG = "1";
 }
 
 type AgentEventShape = { type: string;[k: string]: unknown };
@@ -203,9 +204,42 @@ describe("agent entry route", () => {
 
   test("direct-answer failure ends the stream with a terminal event", async () => {
     reset();
+    process.env.STOCKBOT_DEBUG = "1";
     reasonDown = true;
     const events = await eventsFor("hello");
     expect(events.map((e) => e.type)).toEqual(["agent_start", "reasoning_start", "failed", "error"]);
     expect(runCalls.length).toBe(0);
+  });
+
+  test("prod mode summarizes: generic working + single error", async () => {
+    reset();
+    delete process.env.STOCKBOT_DEBUG;
+    reasonDown = true;
+    const events = await eventsFor("hello");
+    expect(events.map((e) => e.type)).toEqual(["agent_start", "reasoning_start", "error"]);
+    const working = events.find((e) => e.type === "reasoning_start");
+    expect(working?.model).toBe("stockbot");
+    const terminal = events.find((e) => e.type === "error");
+    expect(String(terminal?.message)).toMatch("Stockbot couldn't complete");
+  });
+
+  test("prod mode hides internal tool rows, debug shows them", async () => {
+    reset();
+    delete process.env.STOCKBOT_DEBUG;
+    winner = "get_current_time";
+    const prod = await eventsFor("what time is it?");
+    expect(prod.map((e) => e.type)).toEqual(["agent_start", "reasoning_start", "answer_delta", "done"]);
+    reset();
+    winner = "get_current_time";
+    const debug = await eventsFor("what time is it?");
+    expect(debug.map((e) => e.type)).toEqual([
+      "agent_start",
+      "needle_decision",
+      "tool_start",
+      "tool_result",
+      "reasoning_start",
+      "answer_delta",
+      "done",
+    ]);
   });
 });

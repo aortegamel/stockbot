@@ -18,7 +18,7 @@ export function PromptBox({ onSubmit, busy }: { onSubmit: (prompt: string) => vo
       <span className="pt-2 text-green-500">&gt;</span>
       <input
         className="flex-1 bg-transparent text-sm text-zinc-100 outline-none placeholder:text-zinc-600"
-        placeholder="Ask agent..."
+        placeholder="Ask Stockbot..."
         value={value}
         onChange={(e) => setValue(e.target.value)}
         disabled={busy}

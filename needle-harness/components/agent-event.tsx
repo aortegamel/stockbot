@@ -34,8 +34,8 @@ export function AgentEventView({ event }: { event: AgentEvent }) {
     case "reasoning_start":
       return (
         <div>
-          <span className="rounded border border-violet-900 px-1 text-[10px] text-violet-400">MUSE/REMOTE</span>{" "}
-          <span style={{ color: "#a78bfa" }}>● muse / reasoning over evidence…</span>
+          <span className="rounded border border-violet-900 px-1 text-[10px] text-violet-400">STOCKBOT</span>{" "}
+          <span style={{ color: "#a78bfa" }}>● stockbot / working…</span>
         </div>
       );
     case "answer_delta":
@@ -46,12 +46,12 @@ export function AgentEventView({ event }: { event: AgentEvent }) {
         <div className="pt-2 text-xs text-zinc-500">
           <div>── metrics ──</div>
           <div>
-            Needle calls: {m.needle.calls} · Tool calls: {m.tools.calls} · Muse calls: {m.muse.calls} · Evidence:{" "}
-            {m.evidence.count} · Evidence chars: {m.evidence.characters} · Muse input: {m.muse.inputTokens ?? "n/a"}{" "}
-            · Muse output: {m.muse.outputTokens ?? "n/a"}
+            Needle calls: {m.needle.calls} · Tool calls: {m.tools.calls} · Stockbot calls: {m.muse.calls} · Evidence:{" "}
+            {m.evidence.count} · Evidence chars: {m.evidence.characters} · Stockbot input: {m.muse.inputTokens ?? "n/a"}{" "}
+            · Stockbot output: {m.muse.outputTokens ?? "n/a"}
           </div>
           <div>
-            Needle: {Math.round(m.needle.totalMs)}ms · Tools: {Math.round(m.tools.totalMs)}ms · Muse:{" "}
+            Needle: {Math.round(m.needle.totalMs)}ms · Tools: {Math.round(m.tools.totalMs)}ms · Stockbot:{" "}
             {Math.round(m.muse.totalMs)}ms · Total: {Math.round(m.totalMs)}ms
           </div>
         </div>

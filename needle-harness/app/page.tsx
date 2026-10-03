@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AgentConsole } from "@/components/agent-console";
 import { PromptBox } from "@/components/prompt-box";
 import type { AgentEvent } from "@/lib/agent/types";
@@ -11,7 +11,16 @@ const STALL_TIMEOUT_MS = 120_000;
 export default function Home() {
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [busy, setBusy] = useState(false);
+  const [debug, setDebug] = useState(false);
   const reasoning = events.some((e) => e.type === "reasoning_start");
+
+  // Server .env flag: STOCKBOT_DEBUG=1 renders unfiltered working logs.
+  useEffect(() => {
+    fetch("/api/health")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((h) => setDebug(h?.debug === true))
+      .catch(() => { });
+  }, []);
 
   async function ask(prompt: string) {
     setBusy(true);
@@ -88,12 +97,14 @@ export default function Home() {
   return (
     <main className="flex h-screen flex-col">
       <header className="flex items-center justify-between border-b border-zinc-800 px-4 py-2 text-sm">
-        <span className="font-bold tracking-widest">NEEDLE</span>
+        <span className="font-bold tracking-widest">
+          STOCKBOT{debug && <span className="ml-2 rounded border border-amber-900 px-1 text-[10px] text-amber-400">DEBUG</span>}
+        </span>
         <span className="text-zinc-500">
           LOCAL <span className="text-green-500">●</span>
         </span>
       </header>
-      <AgentConsole events={events} reasoning={reasoning} />
+      <AgentConsole events={events} reasoning={reasoning} debug={debug} />
       <PromptBox onSubmit={ask} busy={busy} />
     </main>
   );

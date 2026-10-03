@@ -19,10 +19,33 @@ export async function POST(req: Request): Promise<Response> {
   const stream = new ReadableStream({
     async start(controller) {
       const enc = new TextEncoder();
+      // STOCKBOT_DEBUG=1 streams unfiltered working logs (routing, tools, model).
+      // Prod summarizes: generic working indicator, generic errors, Stockbot labels.
+      const debug = ["1", "true", "yes"].includes((process.env.STOCKBOT_DEBUG ?? "").trim().toLowerCase());
+      let terminalSent = false;
       const send = (e: AgentEvent) => {
         if (req.signal.aborted) return;
+        let out: AgentEvent | null = e;
+        if (!debug) {
+          switch (e.type) {
+            case "needle_decision":
+            case "tool_start":
+            case "tool_result":
+            case "tool_failed":
+              return;
+            case "reasoning_start":
+              out = { type: "reasoning_start", model: "stockbot" };
+              break;
+            case "failed":
+            case "error":
+              if (terminalSent) return;
+              terminalSent = true;
+              out = { type: "error", message: "Stockbot couldn't complete that request. Try again." };
+              break;
+          }
+        }
         try {
-          controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+          controller.enqueue(enc.encode(`data: ${JSON.stringify(out)}\n\n`));
         } catch {
           // Client disconnected mid-stream; remaining sends no-op, close below ends it.
         }
