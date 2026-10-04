@@ -971,6 +971,19 @@ def test_sho_withhold_falls_back_to_both_fields() -> None:
     assert args == {"ticker": "AAPL", "company_name": "Apple"}
 
 
+def test_with_company_seeds_ticker_and_name() -> None:
+    """'What is happening with Oracle now' resolves via the EDGAR index (live oracle-query defect)."""
+    assert sched._objective_company("What is happening with Oracle now") == ("Oracle", "ORCL")
+    assert sched._objective_subject_ticker("What is happening with Oracle now") == "ORCL"
+    repaired = sched._repair_tool_arguments("get_material_events", {}, "What is happening with Oracle now", "s", "n")
+    assert repaired == {"company_name": "Oracle", "ticker": "ORCL"}
+    assert sched._objective_company("What is happening with oracle now") == ("oracle", "ORCL")
+    assert sched._objective_subject_ticker("What is happening with oracle now") == "ORCL"
+    assert sched._objective_company("What drove growth this week?") is None
+    assert sched._objective_company("news for growth this week") is None
+    assert sched._objective_subject_ticker("news for growth this week") is None
+
+
 def test_sec_placeholder_forms_reseed_latest() -> None:
     """Needle forms ['YYYY-MM-DD'] on quarterly revenue re-lists latest 10-Q/10-K/8-K."""
 
@@ -1171,17 +1184,47 @@ def test_identifier_repair_keeps_valid_cik_and_case() -> None:
     assert args.get("identifier") == "aapl"
 
 
-def test_empty_search_withhold_stays_empty() -> None:
-    """Empty search_sec_filings args on a withhold-like objective escalate, never fabricate a query."""
+def test_empty_search_withhold_reselects() -> None:
+    """Empty search_sec_filings args on a withhold-like objective re-select, never invoke empty."""
+    import pytest
 
     async def fake_empty(**kw: Any) -> dict[str, Any]:
         return {"tool": "search_sec_filings", "arguments": {}, "reasoning": "r"}
 
     session = {"session_id": "s1", "objective": "What drove Growth this week?"}
-    args, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_empty, "search_sec_filings", [], session, _node(), [], [], None)
+    with pytest.raises(sched._ReselectRequest, match="re-selecting"):
+        asyncio.run(
+            sched._generate_tool_arguments(fake_empty, "search_sec_filings", [], session, _node(), [], [], None)
+        )
+
+
+def test_ungrounded_search_attempt_reselects() -> None:
+    """A reselect attempt settles as bookkeeping, never as a handler error."""
+
+    async def fake_empty(**kw: Any) -> dict[str, Any]:
+        return {"tool": "search_sec_filings", "arguments": {}, "reasoning": "r"}
+
+    kernel = _Kernel()
+    session = {"session_id": "s1", "objective": "What drove Growth this week?"}
+    out = asyncio.run(
+        sched._attempt_tool(
+            tool_name="search_sec_filings",
+            node=_node(),
+            session=session,
+            registry=[{"name": "search_sec_filings", "parameters": {}}],
+            evidence=[],
+            attempts=[],
+            kernel=kernel,
+            needle_generate=fake_empty,
+            invoke=lambda *a, **k: (_ for _ in ()).throw(AssertionError("ungrounded search must not invoke")),
+            to_outcome=lambda name, result: _outcome(),
+            tool_session=SimpleNamespace(),
+            as_of=None,
+        )
     )
-    assert args == {}
+    assert out["tool"] == "search_sec_filings" and out["error_type"] == "reselect"
+    settled, done = sched._settle_attempt(kernel, {**out, "outcome": None})
+    assert done is True and settled is not None and settled["tool"] == "search_sec_filings"
 
 
 def test_find_sec_entities_seeded_from_objective() -> None:

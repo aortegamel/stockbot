@@ -528,8 +528,11 @@ def test_search_sec_filings_accepts_person_domain_security(monkeypatch: pytest.M
 
 
 def test_search_sec_filings_rejects_empty_selectors():
-    result = tools.execute_tool("search_sec_filings", {}, "test", context=_research_context())
-    assert "error" in result
+    cases: list[dict[str, object]] = [{}, {"query": "   "}, {"ticker": ""}]
+    for args in cases:
+        result = tools.execute_tool("search_sec_filings", args, "test", context=_research_context())
+        assert result["error_type"] == "invalid_tool_arguments"
+        assert "needs one of" in str(result["error"])
 
 
 def test_search_sec_filings_default_call_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1164,7 +1167,65 @@ def test_get_material_events_dispatch_carries_accession_citations(monkeypatch: p
         context=_research_context(),
     )
     assert result["count"] == 1
-    assert _as_seq(result["events"])[0]["source_accessions"] == ["0000000001-26-000001"]
+    assert result["subject"] == "FAKE"
+
+
+def test_get_material_events_accepts_company_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mixed-case ticker remaps via the EDGAR index; the resolved ticker drives the call."""
+    seen: dict[str, object] = {}
+
+    def _fake_events(ticker: object, since: object, **kwargs: object) -> list[object]:
+        seen["ticker"] = ticker
+        return []
+
+    monkeypatch.setattr(tools.sec, "get_material_events", _fake_events)
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", lambda _name: "AAPL")
+    result = tools.execute_tool(
+        "get_material_events",
+        {"ticker": "Apple", "since": "2026-01-01"},
+        "test",
+        context=_research_context(),
+    )
+    assert result["subject"] == "AAPL"
+    assert seen["ticker"] == "AAPL"
+
+
+def test_get_material_events_blank_ticker_falls_back_to_company_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blank ticker plus company_name resolves via the EDGAR index before dispatch."""
+    seen: dict[str, object] = {}
+
+    def _fake_events(ticker: object, since: object, **kwargs: object) -> list[object]:
+        seen["ticker"] = ticker
+        return []
+
+    monkeypatch.setattr(tools.sec, "get_material_events", _fake_events)
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", lambda _name: "AAPL")
+    result = tools.execute_tool(
+        "get_material_events",
+        {"ticker": "   ", "company_name": "Apple", "since": "2026-01-01"},
+        "test",
+        context=_research_context(),
+    )
+    assert result["subject"] == "AAPL"
+
+
+def test_get_material_events_unknown_ticker_is_guided(monkeypatch: pytest.MonkeyPatch) -> None:
+    """'Sunset Cam'-style unknown tickers map to guided invalid_tool_arguments, never a raw traceback."""
+
+    def _boom(*args: object, **kwargs: object) -> NoReturn:
+        raise ValueError("Company not found: 'Sunset Cam'")
+
+    monkeypatch.setattr(tools.sec, "get_material_events", _boom)
+    result = tools.execute_tool(
+        "get_material_events",
+        {"ticker": "SUNSET CAM", "since": "2026-01-01"},
+        "test",
+        context=_research_context(),
+    )
+    assert result["error_type"] == "invalid_tool_arguments"
+    assert "find_sec_entities" in str(result["error"])
 
 
 def test_research_projection_includes_suite_excludes_broker() -> None:

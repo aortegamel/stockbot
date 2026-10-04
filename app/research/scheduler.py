@@ -1180,6 +1180,7 @@ _COMPANY_TOKEN_STOP = frozenset(
         "actually",
         "want",
         "file",
+        "growth",
     }
 )
 
@@ -1217,10 +1218,12 @@ def _objective_company(objective: object) -> tuple[str, str] | None:
     except Exception:
         return None
     _qm = re.search(
-        r"\bfor\s+([A-Z][a-zA-Z&.'\- ]{2,40}?)(?:\s+this\s+week|\s+last\s+|\s+daily|\s*$)", objective.strip()
+        r"\b(?:for|with)\s+([A-Z][a-zA-Z&.'\- ]{2,40}?)(?:\s+this\s+week|\s+last\s+|\s+daily|\s+now|\s*$)",
+        objective.strip(),
+        flags=re.IGNORECASE,
     )
     _cand = _qm.group(1).strip() if _qm else None
-    if not _cand or _cand.upper() in _ORG:
+    if not _cand or _cand.lower() in _COMPANY_TOKEN_STOP or _cand.upper() in _ORG:
         return None
     try:
         _rt = _resolve(_cand)
@@ -1427,10 +1430,12 @@ def _repair_tool_arguments(
         _nm = filled.get("company_name") if isinstance(filled, dict) else None
         if _nm is None and isinstance(objective, str) and objective.strip():
             _qm = re.search(
-                r"\bfor\s+([A-Z][a-zA-Z&.'\- ]{2,40}?)(?:\s+this\s+week|\s+last\s+|\s+daily|\s*$)", objective
+                r"\b(?:for|with)\s+([A-Z][a-zA-Z&.'\- ]{2,40}?)(?:\s+this\s+week|\s+last\s+|\s+daily|\s+now|\s*$)",
+                objective,
+                flags=re.IGNORECASE,
             )
             _cand = _qm.group(1).strip() if _qm else None
-            if _cand and _cand.upper() not in _ORG:
+            if _cand and _cand.lower() not in _COMPANY_TOKEN_STOP and _cand.upper() not in _ORG:
                 _rt0 = _sched_resolve(_cand)
                 if _rt0 is not None:
                     filled["company_name"] = _cand
@@ -1613,6 +1618,30 @@ def _repair_tool_arguments(
     return filled
 
 
+class _ReselectRequest(Exception):
+    """Reselect signal: search args ungroundable, so JEV re-selects instead of invoking."""
+
+
+_SEARCH_GROUNDING_KEYS = (
+    "query",
+    "ticker",
+    "cik",
+    "company_name",
+    "person_name",
+    "domain",
+    "accession_no",
+    "security_identifier",
+)
+
+
+def _search_reselect(objective: object, why: str) -> _ReselectRequest:
+    """Ungrounded-search reselect: never invoke the handler with empty selectors."""
+    return _ReselectRequest(
+        f"search_sec_filings ungrounded ({why}); re-selecting - "
+        "resolve the subject via find_sec_entities or search_web first"
+    )
+
+
 async def _generate_tool_arguments(
     needle_generate: Any,
     tool_name: str,
@@ -1723,6 +1752,8 @@ async def _generate_tool_arguments(
                 str(exc)[:80],
             )
             return seeded, "seeded SEC identifier from objective ticker after needle failure"
+        if tool_name == "search_sec_filings":
+            raise _search_reselect(objective, f"needle failure ({str(exc)[:80]}) and no ticker resolves") from exc
         raise
     needle_tool, generated_args, needle_reasoning = _split_generated(tool_name, generated)
     try:
@@ -1768,6 +1799,8 @@ async def _generate_tool_arguments(
                     ",".join(sorted(seeded)),
                 )
                 return seeded, "seeded SEC identifier from objective ticker after needle withhold"
+        if needle_tool is None and tool_name == "search_sec_filings":
+            raise _search_reselect(objective, "needle withheld and no ticker resolves") from None
         logger.info(
             "toolflow args_needle_mismatch sid=%s nid=%s tool=%s needle_tool=%s schema_empty=%s",
             sid,
@@ -1799,6 +1832,12 @@ async def _generate_tool_arguments(
         scope=_scope,
         session_as_of=_session_as_of,
     )
+    if tool_name == "search_sec_filings" and not any(
+        (value.strip() if isinstance(value, str) else value)
+        for key in _SEARCH_GROUNDING_KEYS
+        if (value := filled.get(key)) is not None
+    ):
+        raise _search_reselect(objective, "no grounding after repair")
     if _args_need_accession(tool_name, filled):
         carried = _carry_packet_accession(tool_name, filled, evidence, attempts, objective)
         if carried is not None:
@@ -1959,6 +1998,27 @@ async def _attempt_tool(
             _f(outcome, "retryable"),
         )
         return record
+    except _ReselectRequest as exc:
+        _fail_attempt_job(kernel, job_id, str(exc))
+        logger.info(
+            "toolflow reselect sid=%s nid=%s tool=%s reason=%.200s",
+            session_id,
+            node_id,
+            tool_name,
+            exc,
+        )
+        return {
+            "tool": tool_name,
+            "arguments": {},
+            "outcome": None,
+            "outcome_summary": "",
+            "error": str(exc)[:500],
+            "error_type": "reselect",
+            "reasoning": needle_reasoning[:2000],
+            "job_id": job_id,
+            "evidence_id": None,
+            "tool_result_ref": None,
+        }
     except Exception as exc:
         _fail_attempt_job(kernel, job_id, str(exc))
         logger.info(
@@ -2543,6 +2603,19 @@ def _failed_generation_attempt(attempt: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _reselect_generation_attempt(attempt: dict[str, object]) -> dict[str, object]:
+    """Bookkeeping attempt so an ungroundable search re-selects with visible progress."""
+    return {
+        "tool": attempt.get("tool"),
+        "arguments": {},
+        "outcome_summary": "",
+        "error": str(attempt.get("error") or "")[:500],
+        "job_id": attempt.get("job_id"),
+        "evidence_id": None,
+        "tool_result_ref": None,
+    }
+
+
 def _settle_attempt(
     kernel: Any,
     attempt: dict[str, Any],
@@ -2550,6 +2623,19 @@ def _settle_attempt(
     nid: str = "-",
 ) -> tuple[dict[str, Any] | None, bool]:
     """Record generation/outcome failures; returns (settle_attempt, settled)."""
+    if attempt.get("error_type") == "reselect":
+        try:
+            kernel.fail_job(attempt["job_id"], "tool_error", str(attempt.get("error"))[:2000])
+        except Exception:  # noqa: BLE001, S110 - terminal already recorded; attempt log carries the error
+            pass
+        logger.info(
+            "toolflow reselect sid=%s nid=%s tool=%s reason=%.200s",
+            sid,
+            nid,
+            attempt.get("tool"),
+            attempt.get("error"),
+        )
+        return _reselect_generation_attempt(attempt), True
     tool = attempt.get("tool")
     if attempt["error"] is not None and attempt["outcome"] is None:
         _record_generation_failure(kernel, attempt)

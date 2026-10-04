@@ -447,11 +447,18 @@ TOOLS: list[dict[str, object]] = [
         "type": "function",
         "function": {
             "name": "get_material_events",
-            "description": "What changed since a date: deterministic 8-K-derived events with accession citations. Call for 'what changed/what's new' questions. Takes a ticker and date; never load full history.",
+            "description": "What changed since a date: deterministic 8-K-derived events with accession citations. Call for 'what changed/what's new' questions. Pass a ticker (e.g. AAPL) or a company_name (e.g. Apple); the server maps the name. Never call with neither.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "ticker": {"type": "string"},
+                    "ticker": {
+                        "type": "string",
+                        "description": "Ticker (e.g. AAPL). If unknown, pass company_name instead; never call with neither.",
+                    },
+                    "company_name": {
+                        "type": "string",
+                        "description": "Company name (e.g. Apple) when the ticker is unknown; the server maps it to a ticker.",
+                    },
                     "since": {
                         "type": "string",
                         "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
@@ -5495,7 +5502,7 @@ def _find_sec_entities(args: dict[str, object], context: RequestContext) -> dict
 def _sec_search_result(args: dict[str, object], context: RequestContext) -> dict[str, object]:
     """Discovery search -> envelope with jobs + evidence IDs; exhaustive in a research session."""
     if not any(
-        args.get(key)
+        (value.strip() if isinstance(value, str) else value)
         for key in (
             "query",
             "ticker",
@@ -5506,11 +5513,13 @@ def _sec_search_result(args: dict[str, object], context: RequestContext) -> dict
             "accession_no",
             "security_identifier",
         )
+        if (value := args.get(key)) is not None
     ):
-        raise ValueError(
+        return _invalid_args_error(
+            "search_sec_filings",
             "search_sec_filings needs one of: query, ticker, cik, "
             "company_name, person_name, domain, accession_no, "
-            "security_identifier"
+            "security_identifier",
         )
     exhaustive, max_results, packet = _discovery_bounds(args, context)
     start, start_err = _sec_date_arg(args, "search_sec_filings", "start_date")
@@ -5962,12 +5971,20 @@ def _upper_arg(args: dict[str, object], key: str) -> str | None:
 
 
 def _remap_mixed_case(args: dict[str, object], key: str, value: str) -> str:
-    """Mixed-case values may be company names: remap when the EDGAR index resolves them."""
+    """Ticker or company name: exact-ticker passthrough, else EDGAR index remap."""
     raw = args.get(key)
-    if isinstance(raw, str) and raw != raw.upper():
-        resolved = _resolve_company_to_ticker(raw)
-        if resolved is not None and resolved != value:
-            return resolved
+    if not isinstance(raw, str) or not raw.strip():
+        return value
+    try:
+        from app.sec.client import resolve_cik as _resolve_cik
+
+        if _resolve_cik(value) is not None:
+            return value
+    except Exception:  # noqa: BLE001, S110 - exact-ticker check never blocks company remap
+        pass
+    resolved = _resolve_company_to_ticker(raw.strip())
+    if resolved is not None and resolved != value:
+        return resolved
     return value
 
 
@@ -6094,11 +6111,31 @@ def _get_material_events(args: dict[str, object], model: str) -> dict[str, objec
     as_of, err = _sec_date_arg(args, "get_material_events", "as_of")
     if err is not None:
         return err
-    return _wrap_list(
-        args.get("ticker"),
-        sec.get_material_events(str(args["ticker"]), since, as_of=as_of, limit=_optional_int(args.get("limit", 50))),
-        "events",
-    )
+    ticker = _upper_arg(args, "ticker")
+    if ticker is None or ticker in _FINRA_ORG_WORDS:
+        name = _company_arg(args)
+        if name is None:
+            return _invalid_args_error(
+                "get_material_events",
+                "Provide a ticker (e.g. AAPL) or company_name (e.g. Apple) for tool 'get_material_events'",
+            )
+        resolved = _resolve_company_to_ticker(name)
+        if resolved is None:
+            return _invalid_args_error("get_material_events", f"Unknown company name '{name}'; pass a ticker like AAPL")
+        ticker = resolved
+    else:
+        ticker = _remap_mixed_case(args, "ticker", ticker)
+    try:
+        events = sec.get_material_events(ticker, since, as_of=as_of, limit=_optional_int(args.get("limit", 50)))
+    except Exception as exc:
+        if "not found" in str(exc).lower():
+            return _invalid_args_error(
+                "get_material_events",
+                f"Unknown ticker '{ticker}'; resolve the company via find_sec_entities first, "
+                "then retry with its ticker",
+            )
+        raise
+    return _wrap_list(ticker, events, "events")
 
 
 def _get_governance_events(args: dict[str, object], model: str) -> dict[str, object]:
