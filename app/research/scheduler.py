@@ -424,6 +424,15 @@ _EXPAND_CAP = 3
 _REASON_SENTINELS = frozenset({"reasoning_required", "reason"})
 _RESOLVED_SENTINELS = frozenset({"node_resolved", "resolved"})
 
+_NEEDLE_CARRY_LIMIT = 2
+"""Consecutive carried-accession fallbacks before failing loud (D)."""
+
+_ACCESSION_FAMILY_TOOLS = frozenset({"get_sec_filing", "get_sec_document", "list_sec_documents"})
+"""Tools sharing one accession handle: same-accession repeats break as a family (C)."""
+
+_ACCESSION_FAMILY_LIMIT = 2
+"""Same-accession family repeats before the guided break fires (C)."""
+
 _FATAL_ERROR_TYPES = frozenset(
     {
         "auth_required",
@@ -1105,6 +1114,96 @@ def _identical_failure_break(attempts: list[dict[str, Any]]) -> dict[str, Any] |
     }
 
 
+def _needle_carry_streak(attempts: list[dict[str, Any]]) -> int:
+    """Consecutive tail attempts whose reasoning is the carried-accession fallback (D)."""
+    streak = 0
+    for attempt in reversed(attempts):
+        if not isinstance(attempt, dict):
+            break
+        if attempt.get("reasoning") != "carried accession from packet after needle failure":
+            break
+        streak += 1
+    return streak
+
+
+def _attempt_accession(attempt: dict[str, Any]) -> str | None:
+    """Normalized accession_no for one attempt's arguments; None when absent/invalid (C)."""
+    args = attempt.get("arguments")
+    if not isinstance(args, dict):
+        return None
+    raw = args.get("accession_no")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        from app.sec.discovery.service import normalize_accession_no
+
+        return normalize_accession_no(raw.strip())
+    except Exception:  # noqa: BLE001 - unparseable accession never joins a family
+        return None
+
+
+def _accession_family_break(attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Guided break when one accession repeats across filing/document tools (C)."""
+    if len(attempts) < _ACCESSION_FAMILY_LIMIT:
+        return None
+    tail = attempts[-_ACCESSION_FAMILY_LIMIT:]
+    accessions = [_attempt_accession(a) for a in tail]
+    if accessions[0] is None or not all(a == accessions[0] for a in accessions):
+        return None
+    if not all(
+        isinstance(a, dict)
+        and a.get("tool") in _ACCESSION_FAMILY_TOOLS
+        and isinstance(a.get("error"), str)
+        and a["error"]
+        for a in tail
+    ):
+        return None
+    tools = ",".join(str(a.get("tool")) for a in tail)
+    return {
+        "error": (
+            f"accession {accessions[0]} failed {_ACCESSION_FAMILY_LIMIT}x across filing/document tools "
+            f"({tools}); change the call — different accession or ask-for-dates — instead of retrying it"
+        ),
+        "error_type": "invalid_tool_arguments",
+        "tool": str(tail[0].get("tool")),
+    }
+
+
+def _same_accession_repeats(attempts: list[dict[str, Any]]) -> int:
+    """Consecutive tail attempts sharing one normalized accession (C)."""
+    count = 0
+    first: str | None = None
+    for attempt in reversed(attempts):
+        if not isinstance(attempt, dict):
+            break
+        accession = _attempt_accession(attempt)
+        if accession is None:
+            break
+        if first is None:
+            first = accession
+        if accession != first:
+            break
+        count += 1
+    return count
+
+
+def _needs_ambiguity_reason(attempts: list[dict[str, Any]], admitted: int) -> bool:
+    """True when a search ran with a query but admitted nothing (A)."""
+    if admitted != 0 or not attempts:
+        return False
+    for attempt in reversed(attempts):
+        if not isinstance(attempt, dict):
+            continue
+        if attempt.get("tool") != "search_sec_filings":
+            continue
+        if attempt.get("error") is not None or attempt.get("evidence_id") is not None:
+            return False
+        args = attempt.get("arguments")
+        query = args.get("query") if isinstance(args, dict) else None
+        return isinstance(query, str) and bool(query.strip())
+    return False
+
+
 _SEC_IDENTIFIER_TOOLS = frozenset({"list_sec_filings", "search_sec_filings"})
 _SHO_FALLBACK_TOOLS = frozenset({"get_reg_sho_volume"})
 _TICKER_FALLBACK_TOOLS = frozenset(
@@ -1721,6 +1820,8 @@ async def _generate_tool_arguments(
             )
         ):
             raise
+        if _needle_carry_streak(attempts) >= _NEEDLE_CARRY_LIMIT:
+            raise RuntimeError(f"needle arguments.generate unavailable ({_NEEDLE_CARRY_LIMIT}x carried fallbacks used)")
         if _args_need_accession(tool_name, {}):
             carried = _carry_packet_accession(tool_name, {}, evidence, attempts, objective)
             if carried is not None:
@@ -2866,6 +2967,8 @@ async def _settle_round(
         if done:
             attempts.append(settled)
             guided = _identical_failure_break(attempts)
+            if guided is None:
+                guided = _accession_family_break(attempts)
             if guided is not None:
                 logger.info("toolflow identical_break sid=%s nid=%s tool=%s", sid, nid, guided.get("tool"))
                 _block(kernel, sid, nid, str(guided.get("error"))[:500])
@@ -3105,6 +3208,7 @@ async def _drive_rounds(
     attempts: list[dict[str, Any]] = []
     admitted = 0
     select_failures = 0
+    ambiguity_done = False
     for round_no in range(1, _MAX_TOOL_ROUNDS + 1):
         # Working state: admitted evidence + recent unadmitted observations, never dropped.
         ctx_evidence = _context_evidence(evidence, attempts, cap_last=5 if select_failures else None)
@@ -3113,7 +3217,7 @@ async def _drive_rounds(
         # candidates but admits nothing) so the filing must open next round.
         # JEV still picks among the carry tools; no bypass.
         forced = _force_open_registry(registry, attempts, evidence, admitted)
-        if forced is not None:
+        if forced is not None and not _accession_family_break(attempts) and _same_accession_repeats(attempts) < 2:
             select_registry = forced
             logger.info("toolflow force_open sid=%s nid=%s tools=%s", sid, nid, len(forced))
         if len(attempts) >= 3:
@@ -3217,6 +3321,36 @@ async def _drive_rounds(
             break  # fresh select round; JEV re-escalates if reasoning is still needed.
         evidence = _load_evidence(sid, kernel, repo)
         if not step.get("progressed"):
+            continue
+        if _needs_ambiguity_reason(attempts, admitted) and not ambiguity_done:
+            ambiguity_done = True
+            logger.info("toolflow ambiguity_reason sid=%s nid=%s", sid, nid)
+            reason_step = await _run_round(
+                "reason",
+                {"tool_name": "reason", "selected": ["reason"]},
+                executors["reasoner"],
+                session,
+                node,
+                evidence,
+                ctx_evidence,
+                attempts,
+                jev,
+                kernel,
+                sid,
+                nid,
+                admitted,
+                registry,
+                executors["needle_generate"],
+                executors["invoke"],
+                executors["to_outcome"],
+                tool_session,
+                as_of_str,
+                repo,
+            )
+            admitted = reason_step["admitted"]
+            if reason_step.get("terminal") is not None:
+                return reason_step["terminal"]
+            evidence = _load_evidence(sid, kernel, repo)
             continue
     logger.info(
         "toolflow drive sid=%s nid=%s rounds_used=%s stop=%s admitted=%s",

@@ -1227,6 +1227,48 @@ def test_ungrounded_search_attempt_reselects() -> None:
     assert done is True and settled is not None and settled["tool"] == "search_sec_filings"
 
 
+def test_needle_carry_fails_loud_after_two() -> None:
+    """Two carried-accession fallbacks then a third needle outage raises, never carries again (D)."""
+    carried = {"reasoning": "carried accession from packet after needle failure"}
+
+    async def boom(**kw: Any) -> dict[str, Any]:
+        raise RuntimeError("needle worker closed")
+
+    session = {"session_id": "s1", "objective": "What drove NVDA revenue last quarter?"}
+    with __import__("pytest").raises(RuntimeError, match="carried fallbacks used"):
+        asyncio.run(
+            sched._generate_tool_arguments(
+                boom, "get_sec_filing", [], session, _node(), [], [{**carried}, {**carried}], None
+            )
+        )
+
+
+def test_accession_family_break_across_tools() -> None:
+    """Same accession failing across get_sec_filing/get_sec_document breaks as one family (C)."""
+    acc = "0001193125-09-214859"
+    attempts = [
+        {"tool": "get_sec_filing", "arguments": {"accession_no": acc}, "error": "boom-a"},
+        {"tool": "get_sec_document", "arguments": {"accession_no": acc}, "error": "boom-b"},
+    ]
+    guided = sched._accession_family_break(attempts)
+    assert guided is not None and guided["error_type"] == "invalid_tool_arguments"
+    assert acc in guided["error"]
+
+
+def test_ambiguity_reason_on_zero_evidence_search() -> None:
+    """A query-bearing search admitting nothing routes to the reasoner once (A)."""
+    searched = {
+        "tool": "search_sec_filings",
+        "arguments": {"ticker": "AAPL", "query": "how does orcl's manajure impact AAPL"},
+        "outcome_summary": "",
+        "error": None,
+        "evidence_id": None,
+    }
+    assert sched._needs_ambiguity_reason([searched], 0) is True
+    assert sched._needs_ambiguity_reason([searched], 1) is False
+    assert sched._needs_ambiguity_reason([{**searched, "error": "boom"}], 0) is False
+
+
 def test_find_sec_entities_seeded_from_objective() -> None:
     """find_sec_entities seeds a grounded query (ticker-first) instead of erroring on empty args."""
     from app.research import scheduler as _sched
