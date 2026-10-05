@@ -23,6 +23,15 @@ export async function POST(req: Request): Promise<Response> {
       // Prod summarizes: generic working indicator, generic errors, Stockbot labels.
       const debug = ["1", "true", "yes"].includes((process.env.STOCKBOT_DEBUG ?? "").trim().toLowerCase());
       let terminalSent = false;
+      // Stall keepalive: the kernel can run minutes without a displayable event in prod (tool rows hidden). SSE comments reset the client stall timer without rendering.
+      const heartbeat = setInterval(() => {
+        try {
+          controller.enqueue(enc.encode(`: heartbeat\n\n`));
+        } catch {
+          // Client disconnected mid-stream; close below ends it.
+        }
+      }, 20000);
+      req.signal.addEventListener("abort", () => clearInterval(heartbeat), { once: true });
       const send = (e: AgentEvent) => {
         if (req.signal.aborted) return;
         let out: AgentEvent | null = e;
@@ -156,12 +165,14 @@ export async function POST(req: Request): Promise<Response> {
         const winner = typeof routed.route === "string" ? routed.route : "research_required";
         if (winner === "reasoning_required") {
           await answerDirect();
+          clearInterval(heartbeat);
           controller.close();
           return;
         }
         // ponytail: worker output is untrusted — only identifier-shaped names single-shot; anything else researches.
         if (winner !== "research_required" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(winner)) {
           if (await answerSingleShot(winner)) {
+            clearInterval(heartbeat);
             controller.close();
             return;
           }
@@ -175,6 +186,7 @@ export async function POST(req: Request): Promise<Response> {
         console.error(`[web] [agent-api] runKernelAgent error: ${err instanceof Error ? err.message : String(err)}`);
         send({ type: "error", message: err instanceof Error ? err.message : String(err) });
       }
+      clearInterval(heartbeat);
       controller.close();
       console.log("[web] [agent-api] stream close");
     },

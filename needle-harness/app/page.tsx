@@ -64,6 +64,7 @@ export default function Home() {
         while ((idx = buf.indexOf("\n\n")) >= 0) {
           const frame = buf.slice(0, idx);
           buf = buf.slice(idx + 2);
+          if (frame.trim().startsWith(":")) continue;
           for (const line of frame.split("\n")) {
             const t = line.trim();
             if (!t.startsWith("data:")) continue;

@@ -1,6 +1,7 @@
 """Scheduler lifecycle: domain wiring, admit-then-complete, stall, expansion."""
 
 import asyncio
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -1269,6 +1270,35 @@ def test_ambiguity_reason_on_zero_evidence_search() -> None:
     assert sched._needs_ambiguity_reason([{**searched, "error": "boom"}], 0) is False
 
 
+def test_identical_unadmitted_searches_break_with_guidance() -> None:
+    """3 identical successful-but-unadmitted searches break instead of cycling forever."""
+    tail = [
+        {"tool": "search_web", "arguments": {"query": "orcls manjure latest news"}, "error": None, "evidence_id": None}
+        for _ in range(3)
+    ]
+    guided = sched._identical_unadmitted_break(tail)
+    assert guided is not None and guided["error_type"] == "invalid_tool_arguments"
+    assert "admitted nothing" in guided["error"]
+    assert sched._identical_unadmitted_break(tail[:2]) is None
+    varied = list(tail)
+    varied[2] = {**tail[2], "arguments": {"query": "oracle force majeure news"}}
+    assert sched._identical_unadmitted_break(varied) is None
+
+
+def test_search_grounding_hint_reaches_needle_context() -> None:
+    """search_web carries the plain-words query hint to Needle."""
+    seen: dict[str, Any] = {}
+
+    async def fake_gen(**kw: Any) -> dict[str, Any]:
+        ctx = kw.get("context")
+        seen["hint"] = ctx.get("grounding_hint") if isinstance(ctx, dict) else ""
+        return {"tool": "search_web", "arguments": {"query": "oracle news"}, "reasoning": "r"}
+
+    session = {"session_id": "s1", "objective": "after orcls manjure what will happen to apple stock?"}
+    asyncio.run(sched._generate_tool_arguments(fake_gen, "search_web", [], session, _node(), [], [], None))
+    assert "plain words" in str(seen.get("hint", ""))
+
+
 def test_find_sec_entities_seeded_from_objective() -> None:
     """find_sec_entities seeds a grounded query (ticker-first) instead of erroring on empty args."""
     from app.research import scheduler as _sched
@@ -1278,3 +1308,23 @@ def test_find_sec_entities_seeded_from_objective() -> None:
         "Did Tesla insiders actually sell shares last quarter, or only file planned-sale notices?",
     )
     assert seeded == {"query": "TSLA"}
+
+
+def test_mangled_hint_names_unresolved_tokens() -> None:
+    """Mangled prompt injects a decode hint with the current date; clean prompts stay untouched."""
+    hint = sched._mangled_hint("after orcls manjure what will happen to apple stock?")
+    assert "seems mangled" in hint
+    assert "orcls" in hint and "manjure" in hint
+    assert datetime.now(UTC).date().isoformat() in hint
+    assert sched._mangled_hint("What is AAPL EPS?") == ""
+
+
+def test_mangled_hint_rides_normal_reasoner_prompts() -> None:
+    """Analyze + expand carry the hint; clean prompts carry none."""
+    session = {"session_id": "s1", "objective": "after orcls manjure what will happen to apple stock?"}
+    node = {"node_id": "n1", "question": "after orcls manjure what will happen to apple stock?"}
+    assert "seems mangled" in sched._analyze_prompt(session, node, [], [])
+    assert "seems mangled" in sched._expand_prompt(session, node, {}, "s1", "n1")
+    clean = {"session_id": "s1", "objective": "What is AAPL EPS?"}
+    assert "seems mangled" not in sched._analyze_prompt(clean, node, [], [])
+    assert "seems mangled" not in sched._expand_prompt(clean, node, {}, "s1", "n1")

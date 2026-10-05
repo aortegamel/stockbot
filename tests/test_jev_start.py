@@ -159,6 +159,23 @@ def test_tool_options_prompt_stamp_idempotent() -> None:
     assert query_with_today_utc(stamped) == stamped
 
 
+def test_tool_options_prompt_carries_mangled_decode_hint() -> None:
+    from app.decision_client import _mangled_select_hint, _tool_options_prompt
+    from app.research.models import JSONValue
+
+    reg: list[dict[str, JSONValue]] = [{"name": "a", "description": "A tool"}]
+    mangled: dict[str, JSONValue] = {
+        "node_id": "n1",
+        "question": "after orcls manjure what will happen to apple stock?",
+    }
+    _, prompt = _tool_options_prompt(reg, mangled, [], [])
+    assert "seems mangled" in prompt and "orcls" in prompt
+    clean: dict[str, JSONValue] = {"node_id": "n1", "question": "What is AAPL EPS?"}
+    _, clean_prompt = _tool_options_prompt(reg, clean, [], [])
+    assert "seems mangled" not in clean_prompt
+    assert _mangled_select_hint("What is AAPL EPS?") == ""
+
+
 def test_outcome_dict_truncates_64k_content_keeps_error() -> None:
     from app.decision_client import _outcome_dict
 

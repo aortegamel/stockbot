@@ -387,6 +387,28 @@ def _manifest_line(entry: Mapping[str, JSONValue]) -> str:
     return line
 
 
+def _mangled_select_hint(question: object) -> str:
+    """Mangled-prompt decode hint for JEV select/adjudicate prompts; empty when clean."""
+    try:
+        from app.research.scheduler import _mangled_unresolved_tokens as _tokens
+        from app.research.scheduler import _needs_mangled_reason as _needs
+    except Exception:  # noqa: BLE001 - scheduler import miss means no mangled signal
+        return ""
+    try:
+        if not _needs(question):
+            return ""
+        unresolved = _tokens(question)
+    except Exception:  # noqa: BLE001 - detector miss means no mangled hint
+        return ""
+    names = ", ".join(unresolved) if unresolved else "unknown tokens"
+    return (
+        " The prompt seems mangled (misspelled companies, tickers, or actions; unresolved tokens: "
+        + names
+        + "). Decode each token against current dated context first: prefer search_web with a "
+        "decoded company/event query to identify the intended subjects before SEC/FINRA identifier tools."
+    )
+
+
 def _tool_options_prompt(
     registry: Sequence[Mapping[str, JSONValue]],
     node: Mapping[str, JSONValue],
@@ -432,6 +454,7 @@ def _tool_options_prompt(
                 recent.append((tool, error))
         for tool, error in recent[-_MAX_PRIOR_FAILURES:]:
             prompt += f" Prior attempt {tool} failed: {error[:200]}."
+    prompt += _mangled_select_hint(question)
     prompt += f" Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values."
     prompt += " Search packets list candidates only — page with research_read_search beyond display_limit and open each accession via get_sec_filing/get_sec_document until answered or guard trips."
     _qtext = stamped if isinstance(stamped, str) else (question if isinstance(question, str) else "")
