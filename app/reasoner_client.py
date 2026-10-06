@@ -325,8 +325,8 @@ class ReasonerClient:
     """
 
     model: str
-    api_key: str
     url: str
+    api_key: str = ""
     post: PostFn | None = None
 
     def _call(self, stage: str, prompt: str, keys: list[str]) -> dict[str, object]:

@@ -4,7 +4,6 @@ export type MuseUsage = {
   inputTokens?: number;
   outputTokens?: number;
   cachedTokens?: number;
-  cost?: number;
 };
 
 function requiredEnv(name: string): string {
@@ -12,10 +11,6 @@ function requiredEnv(name: string): string {
   if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
   return value;
 }
-// User-provided Muse Spark 1.3 Contributor per-1M-token rates.
-const INPUT_PER_M = 0.1;
-const OUTPUT_PER_M = 0.2;
-const CACHE_PER_M = 0.002;
 
 const SYSTEM = `You are Stockbot. Answer only from the EVIDENCE below. Structure your answer in three parts: sourced facts (cite [E1] ids), inference, uncertainty. If the evidence is thin, say what is missing. Never quote or repeat the [Today UTC YYYY-MM-DD] bracket from the request in answers or clarifications — decode it silently to dates.`;
 
@@ -102,13 +97,6 @@ async function readSse(
       }
     }
   }
-  const u = acc.usage;
-  if (u.inputTokens !== undefined || u.outputTokens !== undefined) {
-    // cachedTokens are a subset of inputTokens: bill them at the cache rate, not on top.
-    const cached = u.cachedTokens ?? 0;
-    const uncachedInput = Math.max(0, (u.inputTokens ?? 0) - cached);
-    u.cost = uncachedInput / 1e6 * INPUT_PER_M + cached / 1e6 * CACHE_PER_M + (u.outputTokens ?? 0) / 1e6 * OUTPUT_PER_M;
-  }
   return acc;
 }
 
@@ -153,7 +141,9 @@ export async function reason(opts: {
 }): Promise<{ text: string; usage: MuseUsage; missingEvidence?: string }> {
   const apiKey = requiredEnv("OPENCODE_API_KEY");
   const model = requiredEnv("OPENCODE_MODEL");
-  const base = requiredEnv("OPENCODE_URL").replace(/\/responses\/?$/, "");
+  const responsesUrl = requiredEnv("OPENCODE_URL");
+  if (!responsesUrl.endsWith("/responses")) throw new Error("opencode_unavailable: OPENCODE_URL must end in /responses");
+  const base = responsesUrl.slice(0, -"/responses".length);
   const session = crypto.randomUUID();
   const needsGapLine =
     opts.escalated || opts.incompleteGuard === true || (opts.unresolved !== undefined && opts.unresolved.length > 0);

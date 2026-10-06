@@ -91,7 +91,6 @@ export type Metrics = {
     inputTokens?: number;
     outputTokens?: number;
     cachedTokens?: number;
-    cost?: number;
     totalMs: number;
   };
   evidence: { count: number; characters: number };
