@@ -2261,7 +2261,11 @@ def _backfill_skip_current(_store: object, source: str, key: str, data_root: Pat
     # Live seam: checkpoint state lives on the job ledger; NOTE warehouse slots beside seam.
     _ = (source, key)
     try:
-        return bool(_store.is_partition_covered(source=source, form=key.split("/")[0], date_partition=key.split("/", 1)[1], root=data_root))
+        return bool(
+            _store.is_partition_covered(
+                source=source, form=key.split("/")[0], date_partition=key.split("/", 1)[1], root=data_root
+            )
+        )
     except Exception:
         return False
 
@@ -2535,9 +2539,7 @@ def _backfill_stage_flags(
     except ValueError:
         return False, False, False
     filing_done = bool(store.is_partition_covered(source=source, form=form, date_partition=partition, root=data_root))
-    doc_done = bool(
-        store.is_partition_covered(source=DOC_SOURCE, form=form, date_partition=partition, root=data_root)
-    )
+    doc_done = bool(store.is_partition_covered(source=DOC_SOURCE, form=form, date_partition=partition, root=data_root))
     typed_done = (not needs_typed) or bool(
         store.is_partition_covered(source=TYPED_SOURCE, form=form, date_partition=partition, root=data_root)
     )
@@ -3363,7 +3365,8 @@ def _search_entity_selectors(request: SECSearchRequest, entity_query: str | None
     selectors: list[str] = []
     _append_selector(selectors, request.cik)
     _append_selector(selectors, request.ticker)
-    _append_selector(selectors, entity_query)
+    if not ((request.cik or request.ticker) and entity_query == request.query):
+        _append_selector(selectors, entity_query)
     return selectors
 
 
@@ -4052,7 +4055,9 @@ def _assemble_covered_rows(
     return kept_all if result_limit is None else kept_all[:result_limit]
 
 
-def _covered_fully_evaluated(rows: list[Filing] | list[dict[str, object]], result_limit: int | None, state: _SearchState) -> bool:
+def _covered_fully_evaluated(
+    rows: list[Filing] | list[dict[str, object]], result_limit: int | None, state: _SearchState
+) -> bool:
     fully = result_limit is None or len(rows) <= result_limit
     if result_limit is not None and not fully:
         state.caller_capped = True
@@ -5289,8 +5294,6 @@ class _RelState:
 
         if self.want(label):
             self.typed.append({"relationship_type": normalize_label(label), "status": status, **row})
-
-
 
 
 def _rel_wanted(relationship_types: Iterable[str] | None) -> set[str] | None:

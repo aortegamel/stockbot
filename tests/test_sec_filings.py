@@ -194,6 +194,7 @@ def test_normalize_accession_tolerates_variants() -> None:
     assert documents._normalize_accession("000032019325000079") == "0000320193-25-000079"
     assert documents._normalize_accession("0003") == "0003"
 
+
 def test_missing_document_names_available(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     def _no_stored_text(*args: object, **kwargs: object) -> list[dict[str, object]]:
         return []
@@ -1029,3 +1030,18 @@ def test_attachment_exhibit_of_garbage_returns_none() -> None:
     assert documents._attachment_exhibit_of(SimpleNamespace()) is None
     assert documents._attachment_exhibit_of(object()) is None
 
+
+def test_entity_selectors_skip_query_when_ticker_scopes() -> None:
+    from app.sec.discovery.service import _search_entity_selectors
+    from app.sec.models import SECSearchRequest
+
+    req = SECSearchRequest(query="manjure query", ticker="ORCL")
+    assert _search_entity_selectors(req, "manjure query") == ["ORCL"]
+
+
+def test_entity_selectors_keep_query_only_lookup() -> None:
+    from app.sec.discovery.service import _search_entity_selectors
+    from app.sec.models import SECSearchRequest
+
+    req = SECSearchRequest(query="Acme Labs")
+    assert _search_entity_selectors(req, "Acme Labs") == ["Acme Labs"]
