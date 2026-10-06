@@ -81,6 +81,28 @@ def _shared_needle_generate() -> Callable[..., object]:
     return cast(Callable[..., object], generate)
 
 
+def _prewarm() -> None:
+    """Background warm: ticker index, CIK lookup, edgar identity, registry."""
+    import threading as _th
+
+    def _run() -> None:
+        try:
+            from app.research import scheduler as _sched
+
+            _sched.build_registry()
+        except Exception as exc:  # noqa: BLE001 - background warm never fails the run
+            logger.debug("prewarm registry failed: %s", exc)
+        try:
+            from app.sec.client import _fetch_lookup_frame, ensure_identity
+
+            ensure_identity()
+            _fetch_lookup_frame("warmup")
+        except Exception as exc:  # noqa: BLE001 - background warm never fails the run
+            logger.debug("prewarm CIK lookup failed: %s", exc)
+
+    _th.Thread(target=_run, name="kernel-prewarm", daemon=True).start()
+
+
 def _startup() -> JevClient:
     """Start shared JEV + Needle. Caller emits readiness only after this returns."""
     global _SHUTDOWN_DONE
@@ -95,6 +117,7 @@ def _startup() -> JevClient:
         # Needle down: stay live so ready still emits; JEV route/assess_entry
         # keep serving while arguments/run fail open per-request below.
         print(f"[kernel-worker] needle start failed: {exc}", file=sys.stderr)
+    _prewarm()
     return jev
 
 
@@ -783,13 +806,17 @@ async def _graph_intake(
             fetched_queries.append(query_text)
         all_raw.extend(raw)
         all_stats.append(stats)
+        prior_digest = digest
         digest = _build_digest(admitted)
+        # ponytail: round 2 with no new evidence and no corrected query reuses round-1 proposals.
+        if rounds >= 1 and digest == prior_digest and not isinstance(hints.get("corrected_query"), str):
+            _log_intake_round(sid, objective, raw, digest, {"proposals": proposals, "hints": hints}, stats, kernel)
+            break
         try:
             proposals, hints = _reasoner_decompose_with_retry(objective, as_of, sid, digest, progress)
         except Exception:
             crash_hints: dict[str, object] = {"fallback": "reasoner_crashed"}
             proposals, hints = _fallback_single(objective, sid), crash_hints
-        _log_intake_round(sid, objective, raw, digest, {"proposals": proposals, "hints": hints}, stats, kernel)
         rounds += 1
         if rounds >= _INTAKE_MAX_ROUNDS:
             break
@@ -1047,7 +1074,8 @@ def run_graph_prompt(
             _notify(progress, "intake_skipped", {"reason": "intake_failed"})
             proposals = []
     admitted: list[dict[str, object]] = _jev_admit(sid, objective, proposals, jev=client) if proposals else []
-    _create_nodes_topological(sid, stamped, admitted if admitted else [])
+    # ponytail: 4 concrete questions max; extra proposals never become nodes.
+    _create_nodes_topological(sid, stamped, admitted[:4] if admitted else [])
     return sid
 
 

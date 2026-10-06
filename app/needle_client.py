@@ -403,7 +403,11 @@ def generate_arguments(*args: object, **kwargs: object) -> dict[str, JSONValue]:
                 attempt += 1
             except Exception as exc:
                 logger.warning(
-                    "toolflow needle_gen_error sid=%s tool=%s err_type=%s", sid_hint, tool, type(exc).__name__
+                    "toolflow needle_gen_error sid=%s tool=%s err_type=%s err=%.200s",
+                    sid_hint,
+                    tool,
+                    type(exc).__name__,
+                    exc,
                 )
                 raise
             else:

@@ -623,6 +623,9 @@ def _manifest_prerequisites(required: list[str]) -> str:
     return f"needs {', '.join(needs)}" if needs else ""
 
 
+_REGISTRY_CACHE: list[dict[str, Any]] | None = None
+
+
 def build_registry() -> list[dict[str, Any]]:
     """Compact manifests for every canonical RESEARCH tool (meta tools excluded).
 
@@ -635,6 +638,10 @@ def build_registry() -> list[dict[str, Any]]:
     for Needle (single selected tool schema in). Catalog intent/useWhen/
     avoidWhen/conflicts/nextTools ride along for JEV probability.
     """
+    global _REGISTRY_CACHE
+    # ponytail: TOOLS + discovery metadata are import-time constants; rebuild once per process.
+    if _REGISTRY_CACHE is not None:
+        return _REGISTRY_CACHE
     from app.policy import Capability
     from app.security.action_policy import TOOL_DOMAINS
     from app.tools import TOOL_DISCOVERY_REGISTRY, tools_for_capabilities
@@ -683,8 +690,8 @@ def build_registry() -> list[dict[str, Any]]:
                 "parameters": params,
             }
         )
-    logger.info("toolflow registry sid=- nid=- size=%s excluded=%s seen=%s", len(manifests), excluded, seen)
     logger.debug("toolflow registry_detail sid=- nid=- tools=%s", ",".join(m.get("name", "?") for m in manifests))
+    _REGISTRY_CACHE = manifests
     return manifests
 
 
@@ -2976,6 +2983,14 @@ async def _settle_round(
             guided = _identical_failure_break(attempts)
             if guided is None:
                 guided = _accession_family_break(attempts)
+            if guided is None and _needle_error_streak(attempts) >= 3:
+                # ponytail: Needle down 3x in a row; end loud instead of burning rounds.
+                guided = {
+                    "tool": attempt.get("tool"),
+                    "error": f"needle arguments.generate failed 3x in a row ({str(attempt.get('error'))[:200]})",
+                    "error_type": "tool_error",
+                }
+                logger.info("toolflow needle_fail_fast sid=%s nid=%s tool=%s", sid, nid, attempt.get("tool"))
             if guided is not None:
                 logger.info("toolflow identical_break sid=%s nid=%s tool=%s", sid, nid, guided.get("tool"))
                 _block(kernel, sid, nid, str(guided.get("error"))[:500])
@@ -3198,6 +3213,16 @@ def _blocked_terminal(nid: str, admitted: int, attempts: list[dict[str, Any]]) -
     }
 
 
+def _needle_error_streak(attempts: list[dict[str, Any]]) -> int:
+    """Consecutive generation-shaped failures at the tail (no args ever produced)."""
+    n = 0
+    for attempt in reversed(attempts):
+        if attempt.get("error") is None or attempt.get("arguments"):
+            break
+        n += 1
+    return n
+
+
 async def _drive_rounds(
     node: Any,
     session: dict[str, Any],
@@ -3368,6 +3393,15 @@ async def _run_node(node: Any, session_id: str | None = None, **hooks: Any) -> d
 # ---------------------------------------------------------------------------
 
 
+_NODE_SEMAPHORE = asyncio.Semaphore(2)
+
+
+async def _run_one_node(node: Any, session_id: str, hooks: dict[str, Any], kernel: Any) -> dict[str, Any]:
+    """One node under the 2-lane cap; Needle stays serial so more lanes never help."""
+    async with _NODE_SEMAPHORE:
+        return await run_node(node, session_id, **{**hooks, "kernel": kernel})
+
+
 async def run(session_id: str, **hooks: Any) -> dict[str, Any]:
     """Run every ready node (parallel gather per round) until none remain or a round stalls."""
     repo = hooks.get("repo")
@@ -3398,9 +3432,7 @@ async def run(session_id: str, **hooks: Any) -> dict[str, Any]:
             incomplete_guard = True
             guard_reason = f"incomplete: runtime guard ({_MAX_TOOL_ROUNDS} session rounds without convergence)"
             break
-        round_results = await asyncio.gather(
-            *(run_node(node, session_id, **{**hooks, "kernel": kernel}) for node in nodes)
-        )
+        round_results = await asyncio.gather(*(_run_one_node(node, session_id, hooks, kernel) for node in nodes))
         node_results.extend(round_results)
         round_guard = any(r.get("incomplete_guard") for r in round_results)
         if round_guard:
