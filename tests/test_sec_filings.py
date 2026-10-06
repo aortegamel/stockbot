@@ -1071,3 +1071,42 @@ def test_lookup_frame_cached_second_call(monkeypatch: pytest.MonkeyPatch) -> Non
     assert client._fetch_lookup_frame("Acme") is frame
     assert client._fetch_lookup_frame("Acme") is frame
     assert calls["n"] == 1
+
+
+def test_drain_budget_stops_between_pages(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from app.sec import client
+
+    class _Hit:
+        def __init__(self, **kwargs: object) -> None:
+            self.__dict__.update(kwargs)
+
+    def _hit(i: int) -> _Hit:
+        return _Hit(
+            accession_number=f"0000000001-26-00000{i}",
+            form="10-K",
+            filed="2026-01-01",
+            company="Acme Labs Inc",
+            cik="1234567",
+            score=1.0,
+        )
+
+    pages: list[SimpleNamespace] = []
+    for i in range(3):
+        nxt = SimpleNamespace(total=100, results=[_hit(i)])
+        pages.append(nxt)
+    pages[0].next = lambda: pages[1]
+    pages[1].next = lambda: pages[2]
+    pages[2].next = lambda: pages[2]
+    times = iter([1000.0, 1000.0, 1000.0 + client._DRAIN_BUDGET_S])
+    monkeypatch.setattr(client.time, "monotonic", lambda: next(times))
+    attempts: list[object] = []
+    hits: list[object] = []
+    warnings: list[str] = []
+    page_num, _, _, _, _ = client._drain_pages(
+        pages[0], "Acme", "s1", {}, None, 100, 100, attempts, hits, set(), warnings, []
+    )
+    assert page_num == 2
+    assert len(hits) == 2
+    assert any("drain stopped" in w for w in warnings)

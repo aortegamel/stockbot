@@ -513,6 +513,9 @@ def _apply_drain_step(
     return page, pit_gaps, scope_gaps, failed_tail, source_capped
 
 
+_DRAIN_BUDGET_S = 30.0
+
+
 def _drain_pages(
     page: object,
     query: str,
@@ -528,7 +531,7 @@ def _drain_pages(
     errors: list[str],
     issuer_cik: int | None = None,
 ) -> tuple[int, int, int, bool, bool]:
-    """Drain EFTS pages; returns (page_num, pit_gaps, scope_gaps, failed_tail, source_capped)."""
+    """Drain EFTS pages within a 30s between-page budget; returns (page_num, pit_gaps, scope_gaps, failed_tail, source_capped)."""
     page_num = 0
     pit_gaps = 0
     scope_gaps = 0
@@ -536,8 +539,14 @@ def _drain_pages(
     failed_tail = False
 
     _attempt = _drain_recorder(attempts, search_id, query, filters, reported)
+    start = time.monotonic()
 
     while page is not None and len(hits) < limit:
+        if page_num > 0 and time.monotonic() - start >= _DRAIN_BUDGET_S:
+            warnings.append(
+                f"EFTS drain stopped after {_DRAIN_BUDGET_S:.0f}s; {len(hits)} of {reported} hits retrieved"
+            )
+            break
         page_num += 1
         page, pit, scope, failed_tail, source_capped = _apply_drain_step(
             page,
