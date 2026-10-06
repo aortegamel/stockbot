@@ -1045,3 +1045,29 @@ def test_entity_selectors_keep_query_only_lookup() -> None:
 
     req = SECSearchRequest(query="Acme Labs")
     assert _search_entity_selectors(req, "Acme Labs") == ["Acme Labs"]
+
+
+def test_lookup_frame_cached_second_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    from edgar.entity import tickers
+
+    from app.sec import client
+
+    calls = {"n": 0}
+
+    class _Frame:
+        def itertuples(self) -> list[object]:
+            return []
+
+    frame = _Frame()
+
+    def _get_frame() -> object:
+        calls["n"] += 1
+        return frame
+
+    monkeypatch.setattr(client, "ensure_identity", lambda: None)
+    monkeypatch.setattr(tickers, "get_cik_lookup_data", _get_frame)
+    client._lookup_cached_frame = None
+    client._lookup_cached_at = 0.0
+    assert client._fetch_lookup_frame("Acme") is frame
+    assert client._fetch_lookup_frame("Acme") is frame
+    assert calls["n"] == 1

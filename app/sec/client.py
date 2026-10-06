@@ -3,6 +3,8 @@ has no side effects and never touches the network."""
 
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Callable, Iterable
 from datetime import UTC
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -916,8 +918,35 @@ def _normalize_lookup_text(value: object) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[\W_]+", " ", text)).strip()
 
 
+_LOOKUP_TTL_S = 86400.0
+_lookup_lock = threading.Lock()
+_lookup_cached_at = 0.0
+_lookup_cached_frame: _FrameRows | None = None
+
+
+def _cached_lookup_frame() -> _FrameRows | None:
+    """Cached lookup frame when fresh; None when stale or empty."""
+    with _lookup_lock:
+        if _lookup_cached_frame is None:
+            return None
+        if time.monotonic() - _lookup_cached_at >= _LOOKUP_TTL_S:
+            return None
+        return _lookup_cached_frame
+
+
+def _store_lookup_frame(frame: _FrameRows) -> None:
+    """Cache one lookup frame with a fresh timestamp."""
+    global _lookup_cached_at, _lookup_cached_frame
+    with _lookup_lock:
+        _lookup_cached_frame = frame
+        _lookup_cached_at = time.monotonic()
+
+
 def _fetch_lookup_frame(query: str) -> _FrameRows:
-    """CIK lookup dataset; fetch failure raises (never zero-result)."""
+    """CIK lookup dataset, one-day process cache; fetch failure raises (never zero-result)."""
+    hit = _cached_lookup_frame()
+    if hit is not None:
+        return hit
     try:
         ensure_identity()
         from edgar.entity.tickers import get_cik_lookup_data
@@ -925,6 +954,7 @@ def _fetch_lookup_frame(query: str) -> _FrameRows:
         frame: object = get_cik_lookup_data()
         if not isinstance(frame, _FrameRows):
             raise SECClientError(f"cik lookup parse failed for {query!r}: bad frame")
+        _store_lookup_frame(frame)
         return frame
     except SECClientError:
         raise
