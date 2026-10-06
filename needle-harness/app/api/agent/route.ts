@@ -38,6 +38,9 @@ export async function POST(req: Request): Promise<Response> {
             case "tool_result":
             case "tool_failed":
               return;
+            case "progress":
+              out = { type: "progress", stage: "working" };
+              break;
             case "reasoning_start":
               out = { type: "reasoning_start", model: "stockbot" };
               break;

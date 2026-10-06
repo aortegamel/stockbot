@@ -31,6 +31,10 @@ export function AgentEventView({ event }: { event: AgentEvent }) {
           ├─ {event.tool} / {event.evidenceId ? `✓ ${event.evidenceId}` : "✗"} — {event.preview}
         </div>
       );
+    case "progress": {
+      const detail = event.detail !== undefined ? ` ${JSON.stringify(event.detail).slice(0, 160)}` : "";
+      return <div className="pl-4 text-zinc-500">├─ {event.stage}{detail}</div>;
+    }
     case "reasoning_start":
       return (
         <div>

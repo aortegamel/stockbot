@@ -204,4 +204,23 @@ describe("KernelRouter", () => {
       router.close();
     }
   });
+  test("progress lines reach onProgress without resolving the pending call", async () => {
+    const { router, children } = setup();
+    try {
+      const seen: Array<{ stage: string; detail?: Record<string, unknown> }> = [];
+      const pending = router.call({ op: "run", hold: true }, { timeoutMs: 1000, onProgress: (stage, detail) => seen.push(detail !== undefined ? { stage, detail } : { stage }) });
+      const first = children[0];
+      if (!first) throw new Error("expected one spawned child");
+      await Promise.resolve();
+      first.emitStdout('{"type":"progress","id":"1","stage":"intake_done","detail":{"calls":3}}\n');
+      await Promise.resolve();
+      expect(seen).toEqual([{ stage: "intake_done", detail: { calls: 3 } }]);
+      // Pending survives the progress line: the terminal reply still resolves it.
+      first.emitStdout('{"id":"1","marker":"res-1"}\n');
+      const res = await pending;
+      expect(markerOf(res)).toBe("res-1");
+    } finally {
+      router.close();
+    }
+  });
 });

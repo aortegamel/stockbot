@@ -75,6 +75,7 @@ export type AgentEvent =
   | { type: "needle_decision"; step: number; tool: string | null; arguments: Record<string, unknown>; confidence: number | null }
   | { type: "tool_start"; tool: string }
   | { type: "tool_result"; tool: string; evidenceId?: string; preview: string }
+  | { type: "progress"; stage: string; detail?: Record<string, unknown> }
   | { type: "reasoning_start"; model: string }
   | { type: "answer_delta"; text: string }
   | { type: "done"; metrics: Metrics }

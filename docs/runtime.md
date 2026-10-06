@@ -6,8 +6,16 @@ serves the Next.js harness. The harness posts prompts to
 `needle-harness/app/api/agent/route.ts`, which runs
 `runKernelAgent` (`needle-harness/lib/agent/kernel.ts`): one
 `app/research/kernel_worker.py` call per request, which persists the prompt
-verbatim as the objective, runs Reasoner decompose → JEV proposal disposition
-→ per-proposal nodes, then `app/research/scheduler.py run` over ready nodes.
+verbatim as the objective, runs the intake (SEC filing metadata + search
+snippets per resolved ticker plus one exact-text Exa search, settled with
+`continuation=False` so it admits evidence but never resolves), builds a
+verbatim digest, runs Reasoner decompose over raw query + digest (optional
+tickers/corrected_query hints feed at most one more intake round), then JEV
+proposal disposition → per-proposal nodes, then `app/research/scheduler.py
+run` over ready nodes. Each intake round logs an `intake_digest` decision.
+Progress lines (`session`, `intake_start`, `intake_done`, `reasoner_*`,
+`tool_start`, `tool_done`) stream as `progress` events; prod forwards a
+stripped `working` stage to keep the UI stall watchdog fed.
 
 Architecture: the kernel scheduler owns the agent loop (JEV selects over
 the whole registry every round, Needle fills arguments only, tools execute

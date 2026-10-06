@@ -1,9 +1,8 @@
 """Fail-closed authority guards: registry abort + JEV-outage objective-only.
 
-Pinned to HEAD ``_jev_admit(sid, objective, proposals, jev=None)``: outage is simulated by
-monkeypatching ``JevClient`` in ``app.decision_client`` or by passing a
-failing ``jev`` directly. If further injection params land, extend — do not
-replace — these tests.
+Pinned to HEAD ``_jev_admit(sid, objective, proposals, jev=None)``: outage is
+simulated by passing a failing ``jev`` directly. If further injection params
+land, extend — do not replace — these tests.
 """
 
 from unittest import mock
@@ -36,9 +35,11 @@ class _JevDown:
 
 
 def _run_outage(fn: object, *args: object) -> object:
-    with mock.patch("app.decision_client.JevClient", lambda: _JevDown()):
-        assert callable(fn)
-        return fn(*args)  # type: ignore[operator]
+    # Inject the failing client explicitly: _shared_jev() caches process-wide,
+    # so patching the JevClient constructor is order-dependent (a cached
+    # success bypasses the patch) and caching the double leaks into later tests.
+    assert callable(fn)
+    return fn(*args, jev=_JevDown())  # type: ignore[operator]
 
 
 def test_jev_outage_returns_objective_only() -> None:

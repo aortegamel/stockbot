@@ -79,6 +79,28 @@ def _str_list(stage: str, v: object, what: str) -> list[str]:
     return list(v)
 
 
+def check_decompose_hints(stage: str, value: object) -> dict[str, object]:
+    """Optional intake hints: tickers + corrected_query. Unknown fields still reject."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{stage}: malformed_opencode_json")
+    allowed = {"proposals", "tickers", "corrected_query"}
+    actual = set(value.keys())
+    if not actual <= allowed or "proposals" not in actual:
+        raise ValueError(f"{stage}: unexpected fields [{','.join(sorted(actual))}]")
+    out: dict[str, object] = {"proposals": value["proposals"]}
+    raw_tickers = value.get("tickers")
+    if raw_tickers is not None:
+        if not isinstance(raw_tickers, list) or any(not isinstance(t, str) or not t.strip() for t in raw_tickers):
+            raise ValueError(f"{stage}: tickers must be string[]")
+        out["tickers"] = [t.strip().upper() for t in raw_tickers if isinstance(t, str) and t.strip()]
+    raw_query = value.get("corrected_query")
+    if raw_query is not None:
+        if not isinstance(raw_query, str) or not raw_query.strip():
+            raise ValueError(f"{stage}: corrected_query must be a nonempty string")
+        out["corrected_query"] = raw_query.strip()
+    return out
+
+
 def check_proposals(stage: str, value: object, objective_id: str, prior_ids: set[str]) -> list[Proposal]:
     """Validate non-authoritative proposal candidates (mirrors run.ts checkProposals)."""
     if not isinstance(value, list):
@@ -249,8 +271,10 @@ def check_evidence_requests(stage: str, value: object, objective_id: str, node_i
     return out
 
 
-def _parse_opencode_output(stage: str, raw: object, keys: list[str]) -> dict[str, object]:
-    """Extract concatenated output_text, parse exact-keys JSON (mirrors run.ts)."""
+def _parse_opencode_output(
+    stage: str, raw: object, keys: list[str], optional: list[str] | None = None
+) -> dict[str, object]:
+    """Extract concatenated output_text, parse JSON with required + optional keys (mirrors run.ts)."""
     output = raw.get("output") if isinstance(raw, dict) else None
     if not isinstance(output, list):
         raise ValueError(f"{stage}: malformed_opencode_response")
@@ -275,7 +299,10 @@ def _parse_opencode_output(stage: str, raw: object, keys: list[str]) -> dict[str
         raise ValueError(f"{stage}: malformed_opencode_json") from None
     if not isinstance(parsed, dict):
         raise ValueError(f"{stage}: malformed_opencode_json")
-    _exact_keys(stage, parsed, keys)
+    allowed = set(keys) | set(optional or [])
+    actual = set(parsed.keys())
+    if not set(keys) <= actual <= allowed:
+        raise ValueError(f"{stage}: unexpected fields [{','.join(sorted(actual))}]")
     return parsed
 
 
@@ -329,23 +356,29 @@ class ReasonerClient:
     api_key: str = ""
     post: PostFn | None = None
 
-    def _call(self, stage: str, prompt: str, keys: list[str]) -> dict[str, object]:
+    def _call(self, stage: str, prompt: str, keys: list[str], optional: list[str] | None = None) -> dict[str, object]:
         if not prompt:
             raise ValueError(f"{stage}: malformed_prompt_builder")
         if self.post is not None:
-            return _parse_opencode_output(stage, self.post(prompt, self.model), keys)
+            return _parse_opencode_output(stage, self.post(prompt, self.model), keys, optional)
         if not self.model.strip():
             raise RuntimeError("opencode_unavailable: missing OPENCODE_MODEL")
         if not self.api_key:
             raise RuntimeError("opencode_unavailable: missing OPENCODE_API_KEY")
         if not self.url.strip():
             raise RuntimeError("opencode_unavailable: missing OPENCODE_URL")
-        return _parse_opencode_output(stage, _default_post(self.url, self.api_key, self.model, prompt), keys)
+        return _parse_opencode_output(stage, _default_post(self.url, self.api_key, self.model, prompt), keys, optional)
 
-    def decompose(self, prompt: str, objective_id: str) -> dict[str, list[Proposal]]:
+    def decompose(self, prompt: str, objective_id: str) -> dict[str, object]:
         """Propose follow-up questions; non-authoritative until JEV admits."""
-        out = self._call("decompose", prompt, ["proposals"])
-        return {"proposals": check_proposals("decompose", out["proposals"], objective_id, set())}
+        raw = self._call("decompose", prompt, ["proposals"], ["tickers", "corrected_query"])
+        hints = check_decompose_hints("decompose", raw)
+        out: dict[str, object] = {"proposals": check_proposals("decompose", hints["proposals"], objective_id, set())}
+        if "tickers" in hints:
+            out["tickers"] = hints["tickers"]
+        if "corrected_query" in hints:
+            out["corrected_query"] = hints["corrected_query"]
+        return out
 
     def analyze(self, prompt: str) -> dict[str, list[dict[str, object]]]:
         """Propose interpretations + evidence requests; non-authoritative until JEV adjudicates."""

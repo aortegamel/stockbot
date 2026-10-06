@@ -97,7 +97,7 @@ def test_two_requests_share_one_jev_identity(monkeypatch: pytest.MonkeyPatch) ->
     def _noop_node(*args: object, **kwargs: object) -> None:
         return None
 
-    def _two_proposals(*args: object, **kwargs: object) -> list[dict[str, object]]:
+    async def _two_intake(*args: object, **kwargs: object) -> list[dict[str, object]]:
         return _proposals(2)
 
     def _no_hit(*args: object, **kwargs: object) -> list[str]:
@@ -108,7 +108,7 @@ def test_two_requests_share_one_jev_identity(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr("app.research.scheduler.run", _fake_run)
     monkeypatch.setattr(kw, "_create_nodes_topological", _no_nodes)
-    monkeypatch.setattr(kw, "_propose_questions", _two_proposals)
+    monkeypatch.setattr(kw, "_graph_intake", _two_intake)
     monkeypatch.setattr(kw, "_registry_portfolio_hit", _no_hit)
 
     from app.research import service
@@ -120,7 +120,7 @@ def test_two_requests_share_one_jev_identity(monkeypatch: pytest.MonkeyPatch) ->
     out2 = kw._run({"id": "r2", "op": "run", "prompt": "beta?"})
     assert out1["id"] == "r1" and out2["id"] == "r2"
     assert seen == [fake, fake]  # same scheduler-run identity across both requests
-    assert fake.decide_calls == 0  # JEV-first entry admits nothing; first decision is in scheduler.run
+    assert fake.decide_calls == 2  # one entry disposition round per request; nodes follow in scheduler.run
 
 
 def test_stalled_run_reports_escalated_without_guard(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -149,10 +149,14 @@ def test_stalled_run_reports_escalated_without_guard(monkeypatch: pytest.MonkeyP
     def _no_hit(*args: object, **kwargs: object) -> list[str]:
         return _empty_strs()
 
+    async def _empty_intake(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        return []
+
     def _research(*args: object, **kwargs: object) -> str:
         return "rs:stalled"
 
     monkeypatch.setattr("app.research.scheduler.run", _stalled_run)
+    monkeypatch.setattr(kw, "_graph_intake", _empty_intake)
     monkeypatch.setattr(kw, "_registry_portfolio_hit", _no_hit)
 
     from app.research import service

@@ -121,8 +121,8 @@ type KernelPending = {
   resolve: (v: KernelResponse) => void;
   reject: (e: Error) => void;
   cancel: () => void;
+  onProgress?: (stage: string, detail?: Record<string, unknown>) => void;
 };
-
 export class KernelRouter {
   private child: KernelChild | null = null;
   private pending: Record<string, KernelPending> = {};
@@ -216,6 +216,17 @@ export class KernelRouter {
       if (rec.type === "ready") this.resolveReady();
       return;
     }
+    if (rec.type === "progress") {
+      const p = this.pending[rec.id];
+      const stage = typeof rec.stage === "string" ? rec.stage : "working";
+      const detail = rec.detail && typeof rec.detail === "object" ? (rec.detail as Record<string, unknown>) : undefined;
+      try {
+        p?.onProgress?.(stage, detail);
+      } catch {
+        // A dead progress listener never fails the run.
+      }
+      return;
+    }
     const p = this.pending[rec.id];
     if (!p) return;
     delete this.pending[rec.id];
@@ -246,7 +257,7 @@ export class KernelRouter {
     }
   }
 
-  call(body: Record<string, unknown>, opts?: { signal?: AbortSignal; timeoutMs?: number }): Promise<KernelResponse> {
+  call(body: Record<string, unknown>, opts?: { signal?: AbortSignal; timeoutMs?: number; onProgress?: (stage: string, detail?: Record<string, unknown>) => void }): Promise<KernelResponse> {
     const timeoutMs = opts?.timeoutMs ?? WORKER_TIMEOUT_MS;
     const child = this.ensure();
     if (!child.stdin) throw new Error("kernel worker spawn failed");
@@ -270,7 +281,7 @@ export class KernelRouter {
         p.cancel();
         p.reject(new Error("worker aborted"));
       };
-      this.pending[id] = { resolve, reject, cancel };
+      this.pending[id] = { resolve, reject, cancel, ...(opts?.onProgress ? { onProgress: opts.onProgress } : {}) };
       if (opts?.signal?.aborted) {
         onAbort();
         return;
@@ -440,7 +451,7 @@ export async function runKernelAgent(
   let res: KernelResponse;
   const workerStart = performance.now();
   try {
-    res = await router.call({ op: "run", prompt, deadlineMs: timeoutMs }, { signal: opts?.signal, timeoutMs });
+    res = await router.call({ op: "run", prompt, deadlineMs: timeoutMs }, { signal: opts?.signal, timeoutMs, onProgress: (stage, detail) => emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage }) });
   } catch (err) {
     // ponytail: needle-down shape — worker failure still ends at done, never throws to the route.
     const msg = err instanceof Error ? err.message : String(err);

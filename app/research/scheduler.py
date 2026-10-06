@@ -846,6 +846,16 @@ def _block(kernel: Any, session_id: str, node_id: str, reason: str) -> Any:
             return block(node_id)
 
 
+def _progress(progress: Any, stage: str, detail: Any = None) -> None:
+    """Best-effort progress callback; a dead listener never fails the run."""
+    if progress is None:
+        return
+    try:
+        progress(stage, detail or {})
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # One tool attempt: Needle (execution-only) -> ToolRuntime
 # ---------------------------------------------------------------------------
@@ -2054,8 +2064,9 @@ async def _attempt_tool(
     to_outcome: Any,
     tool_session: Any,
     as_of: str | None,
+    fixed_arguments: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if needle_generate is None:
+    if needle_generate is None and fixed_arguments is None:
         needle_generate = _default_needle_generate()  # raises a clear gap error when no client exists
     session_id = str(session.get("session_id"))
     node_id = str(_f(node, "node_id", "id"))
@@ -2065,9 +2076,13 @@ async def _attempt_tool(
     needle_reasoning = ""
     try:
         _heartbeat_attempt(kernel, job_id)
-        arguments, needle_reasoning = await _generate_tool_arguments(
-            needle_generate, tool_name, registry, session, node, evidence, attempts, as_of
-        )
+        if fixed_arguments is not None:
+            arguments = dict(fixed_arguments)
+            needle_reasoning = "fixed intake arguments; no Needle grounding needed"
+        else:
+            arguments, needle_reasoning = await _generate_tool_arguments(
+                needle_generate, tool_name, registry, session, node, evidence, attempts, as_of
+            )
         result, outcome = await _invoke_attempt_tool(
             invoke, to_outcome, tool_name, arguments, tool_session, node_id, session_id, as_of, job_id
         )
@@ -2942,6 +2957,7 @@ async def _settle_round(
     decision: Any,
     admitted: int,
     repo: Any = None,
+    continuation: bool = True,
 ) -> dict[str, Any]:
     """Settle every tool result: failures recorded, successes assessed/admitted; returns round signals."""
     progressed = False
@@ -2984,11 +3000,12 @@ async def _settle_round(
             progressed = True
         _complete_attempt_job(kernel, attempt, tool)
         attempts.append(_success_attempt_record(tool, attempt, outcome, decision, evidence_id))
-        terminal, fresh_round = _continuation_terminal(assessment, kernel, sid, nid, evidence, attempts, admitted)
-        if terminal is not None:
-            return {"terminal": terminal, "fresh_round": False, "progressed": progressed, "admitted": admitted}
-        if fresh_round:
-            return {"terminal": None, "fresh_round": True, "progressed": progressed, "admitted": admitted}
+        if continuation:
+            terminal, fresh_round = _continuation_terminal(assessment, kernel, sid, nid, evidence, attempts, admitted)
+            if terminal is not None:
+                return {"terminal": terminal, "fresh_round": False, "progressed": progressed, "admitted": admitted}
+            if fresh_round:
+                return {"terminal": None, "fresh_round": True, "progressed": progressed, "admitted": admitted}
     return {"terminal": None, "fresh_round": False, "progressed": progressed, "admitted": admitted}
 
 
@@ -3185,6 +3202,7 @@ async def _drive_rounds(
     executors: dict[str, Any],
     tool_session: Any,
     as_of_str: str | None,
+    progress: Any = None,
 ) -> dict[str, Any]:
     """Drive select/round/settle until resolved, stalled, or the runtime guard trips."""
     evidence = _load_evidence(sid, kernel, repo)
@@ -3255,6 +3273,7 @@ async def _drive_rounds(
             logger.info("toolflow select_failed sid=%s nid=%s fails=%s err=%s", sid, nid, select_failures, err)
             continue
         select_failures = 0
+        _progress(progress, "tool_start", {"node_id": nid, "action": action})
         step = await _run_round(
             action,
             decision,
@@ -3278,6 +3297,7 @@ async def _drive_rounds(
             repo,
         )
         admitted = step["admitted"]
+        _progress(progress, "tool_done", {"node_id": nid, "admitted": admitted})
         if step.get("terminal") is not None:
             logger.info(
                 "toolflow drive sid=%s nid=%s rounds_used=%s stop=%s admitted=%s",
@@ -3331,6 +3351,7 @@ async def _run_node(node: Any, session_id: str | None = None, **hooks: Any) -> d
         _node_hooks(hooks),
         ctx["tool_session"],
         ctx["as_of_str"],
+        hooks.get("progress"),
     )
 
 

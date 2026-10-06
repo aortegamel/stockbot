@@ -17,6 +17,7 @@ const kernelCalls: KernelCall[] = [];
 const invoked: unknown[][] = [];
 const ended: string[] = [];
 
+let emitProgress = false;
 mock.module("@/lib/agent/kernel", () => ({
   kernelRouter: {
     call: async (body: KernelCall) => {
@@ -35,6 +36,10 @@ mock.module("@/lib/agent/kernel", () => ({
   },
   runKernelAgent: async (...args: unknown[]) => {
     runCalls.push(args);
+    if (emitProgress) {
+      const emit = args[1] as (e: Record<string, unknown>) => void;
+      emit({ type: "progress", stage: "intake_done", detail: { calls: 3 } });
+    }
   },
 }));
 
@@ -63,6 +68,7 @@ function reset(): void {
   routeDown = false;
   argsDown = false;
   reasonDown = false;
+  emitProgress = false;
   verdicts = ["node_resolved"];
   runCalls.length = 0;
   reasonCalls.length = 0;
@@ -241,5 +247,16 @@ describe("agent entry route", () => {
       "answer_delta",
       "done",
     ]);
+  });
+  test("prod forwards stripped progress so the stall watchdog still resets", async () => {
+    reset();
+    delete process.env.STOCKBOT_DEBUG;
+    winner = "research_required";
+    emitProgress = true;
+    const events = await eventsFor("What drove NVDA revenue?");
+    const progress = events.filter((e) => e.type === "progress");
+    expect(progress.length).toBe(1);
+    expect(progress[0].stage).toBe("working");
+    expect("detail" in progress[0] ? progress[0].detail : undefined).toBeUndefined();
   });
 });
