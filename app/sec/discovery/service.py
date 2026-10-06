@@ -3370,23 +3370,31 @@ def _search_entity_selectors(request: SECSearchRequest, entity_query: str | None
     return selectors
 
 
+def _fetch_entity_selector(
+    request: SECSearchRequest, selector: str, as_of: str | None, data_root: Path | str | None
+) -> SECSearchResult | ValueError:
+    """One selector fetch with no shared-state mutation; caller adopts on its own thread."""
+    try:
+        return find_sec_entities(
+            selector,
+            as_of=as_of,
+            exhaustive=request.exhaustive,
+            max_results=request.max_results,
+            data_root=data_root,
+        )
+    except ValueError as exc:
+        return exc
+
+
 def _search_run_entity_selector(
     state: _SearchState, request: SECSearchRequest, selector: str, as_of: str | None, data_root: Path | str | None
 ) -> None:
-    try:
-        state.adopt(
-            find_sec_entities(
-                selector,
-                as_of=as_of,
-                exhaustive=request.exhaustive,
-                max_results=request.max_results,
-                data_root=data_root,
-            ),
-            route="entity",
-        )
-    except ValueError as exc:
-        state.record("entity-discovery", selector, "failed", error=exc)
-        state.errors.append(str(exc))
+    sub = _fetch_entity_selector(request, selector, as_of, data_root)
+    if isinstance(sub, ValueError):
+        state.record("entity-discovery", selector, "failed", error=sub)
+        state.errors.append(str(sub))
+        return
+    state.adopt(sub, route="entity")
 
 
 def _search_accession_route(state: _SearchState, request: SECSearchRequest, as_of: str | None) -> None:
@@ -3408,11 +3416,22 @@ def _search_entity_route(
     as_of: str | None,
     data_root: Path | str | None,
 ) -> list[EntityCandidate]:
-    # Route 2: exact CIK/ticker/name entity routes.
+    # Route 2: exact CIK/ticker/name entity routes; fetches overlap, adoption stays serial.
     entity_selectors = _search_entity_selectors(request, entity_query)
     if entity_selectors and request.search_entities:
-        for selector in entity_selectors:
-            _search_run_entity_selector(state, request, selector, as_of, data_root)
+        import concurrent.futures as _fut
+
+        with _fut.ThreadPoolExecutor(max_workers=len(entity_selectors)) as pool:
+            import functools as _ft
+
+            fetch = _ft.partial(_fetch_entity_selector, request, as_of=as_of, data_root=data_root)
+            subs = list(pool.map(fetch, entity_selectors))
+        for selector, sub in zip(entity_selectors, subs):
+            if isinstance(sub, ValueError):
+                state.record("entity-discovery", selector, "failed", error=sub)
+                state.errors.append(str(sub))
+            else:
+                state.adopt(sub, route="entity")
         return [e for e in state.entities.values() if e.verification_status == "verified"]
     _note_entity_skipped(state, request, entity_query)
     return []
@@ -3448,12 +3467,18 @@ def _explicit_request_cik(request: SECSearchRequest) -> int | None:
 
 
 def _search_issuer_cik(request: SECSearchRequest, verified: list[EntityCandidate]) -> int | None:
-    """Single verified filer corpus: explicit CIK wins, else sole verified CIK."""
+    """Single verified filer corpus: explicit CIK wins, else sole verified CIK, else ticker resolve."""
     explicit = _explicit_request_cik(request)
     if request.cik is not None:
         return explicit
     ciks = {e.cik for e in verified or () if e.cik is not None}
-    return next(iter(ciks)) if len(ciks) == 1 else None
+    if len(ciks) == 1:
+        return next(iter(ciks))
+    if request.ticker:
+        from ..client import resolve_cik
+
+        return resolve_cik(request.ticker.strip().upper())
+    return None
 
 
 def _search_efts_drive(
@@ -3630,9 +3655,7 @@ def _fetch_efts_variant(
     from ..client import search_sec_filings
 
     try:
-        # EFTS resolves ticker->CIK internally; pass it only when the single
-        # verified corpus matches the request ticker (else cik alone scopes).
-        ticker = request.ticker.strip().upper() if request.ticker and state.issuer_cik is not None else None
+        # CIK alone scopes EFTS; ticker would re-trigger resolve inside the client.
         return search_sec_filings(
             variant,
             forms=forms,
@@ -3641,7 +3664,7 @@ def _fetch_efts_variant(
             limit=per_variant or 10_000,
             as_of=as_of,
             cik=state.issuer_cik,
-            ticker=ticker,
+            ticker=None,
         )
     except Exception as exc:  # noqa: BLE001 - route failure records an attempt and degrades to no results
         state.record("efts", variant, "failed", error=exc, filters={"route": route})

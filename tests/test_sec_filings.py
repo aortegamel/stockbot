@@ -1110,3 +1110,40 @@ def test_drain_budget_stops_between_pages(monkeypatch: pytest.MonkeyPatch) -> No
     assert page_num == 2
     assert len(hits) == 2
     assert any("drain stopped" in w for w in warnings)
+
+
+def test_issuer_cik_resolves_ticker_without_verified(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec import client
+    from app.sec.discovery.service import _search_issuer_cik
+    from app.sec.models import SECSearchRequest
+
+    def _resolve(ticker: str | int) -> int | None:
+        return 320193 if ticker == "AAPL" else None
+
+    monkeypatch.setattr(client, "resolve_cik", _resolve)
+    req = SECSearchRequest(query="q", ticker="AAPL")
+    assert _search_issuer_cik(req, []) == 320193
+
+
+def test_entity_selectors_overlap_wall_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time as _time
+
+    import app.sec.discovery.service as svc
+    from app.sec.models import SECSearchRequest
+
+    seen: list[str] = []
+
+    def _fake_fetch(request: SECSearchRequest, selector: str, as_of: str | None, data_root: object) -> ValueError:
+        seen.append(selector)
+        _time.sleep(0.2)
+        return ValueError("nope")
+
+    monkeypatch.setattr(svc, "_fetch_entity_selector", _fake_fetch)
+    state = svc._SearchState("s1", None, "now")
+    req = SECSearchRequest(query="q", cik="320193", ticker="AAPL", company_name="Apple")
+    start = _time.perf_counter()
+    out = svc._search_entity_route(state, req, "Apple", None, None)
+    took = _time.perf_counter() - start
+    assert out == []
+    assert sorted(seen) == ["320193", "AAPL", "Apple"]
+    assert took < 0.5
