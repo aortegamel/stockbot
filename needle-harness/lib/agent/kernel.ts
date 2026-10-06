@@ -7,7 +7,11 @@ import { redactArgs } from "./types";
 import type { AgentEvent, Evidence, FailureCategory, Metrics } from "./types";
 
 // ponytail: persistent worker bridge (spawn-once, ready-gated); spawn/exit/stderr handling mirrors lib/needle/client.ts.
-const MUSE_MODEL = "muse-spark-1.3-contributor";
+function requiredEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
+  return value;
+}
 const WORKER_TIMEOUT_MS = 10 * 60 * 1000;
 const PREWARM_TIMEOUT_MS = 30_000;
 
@@ -524,7 +528,7 @@ export async function runKernelAgent(
 
   if (evidence.length === 0 && decisions.length === 0 && calls.length === 0 && unresolved.length === 0 && !incompleteGuard) {
     // ponytail: empty graph never closes silent — answer direct via Muse.
-    emit({ type: "reasoning_start", model: MUSE_MODEL });
+    emit({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
     const tm0 = performance.now();
     try {
       const r0 = await reasonFn({ prompt, evidence, escalated: false, direct: true, objective, nodes, decisions: persisted, unresolved, incompleteGuard, onDelta: (text) => emit({ type: "answer_delta", text }) });
@@ -539,7 +543,7 @@ export async function runKernelAgent(
     return;
   }
 
-  emit({ type: "reasoning_start", model: MUSE_MODEL });
+  emit({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
   const tm = performance.now();
   let usage: MuseUsage;
   try {

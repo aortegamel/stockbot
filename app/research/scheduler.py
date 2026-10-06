@@ -572,9 +572,9 @@ def _default_reasoner() -> Any:
     from app.reasoner_client import ReasonerClient
 
     return ReasonerClient(
-        api_key=os.environ.get("OPENCODE_API_KEY", ""),
-        url=os.environ.get("OPENCODE_URL", "https://opencode.ai/zen/go/v1/responses"),
-        model=os.environ.get("OPENCODE_MODEL", "muse-spark-1.3-contributor"),
+        api_key=(os.environ.get("OPENCODE_API_KEY") or "").strip(),
+        url=(os.environ.get("OPENCODE_URL") or "").strip(),
+        model=(os.environ.get("OPENCODE_MODEL") or "").strip(),
     )
 
 

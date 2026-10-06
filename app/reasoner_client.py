@@ -22,9 +22,6 @@ from typing import Literal, NotRequired, TypedDict
 from urllib import error as _urlerror
 from urllib import request as _urlrequest
 
-OPENCODE_URL = "https://opencode.ai/zen/go/v1/responses"
-DEFAULT_MODEL = "muse-spark-1.3-contributor"
-
 
 class Proposal(TypedDict):
     id: str
@@ -327,9 +324,9 @@ class ReasonerClient:
     evidence id sets (mirrors run.ts staging).
     """
 
-    model: str = DEFAULT_MODEL
-    api_key: str = ""
-    url: str = OPENCODE_URL
+    model: str
+    api_key: str
+    url: str
     post: PostFn | None = None
 
     def _call(self, stage: str, prompt: str, keys: list[str]) -> dict[str, object]:
@@ -337,8 +334,12 @@ class ReasonerClient:
             raise ValueError(f"{stage}: malformed_prompt_builder")
         if self.post is not None:
             return _parse_opencode_output(stage, self.post(prompt, self.model), keys)
+        if not self.model.strip():
+            raise RuntimeError("opencode_unavailable: missing OPENCODE_MODEL")
         if not self.api_key:
             raise RuntimeError("opencode_unavailable: missing OPENCODE_API_KEY")
+        if not self.url.strip():
+            raise RuntimeError("opencode_unavailable: missing OPENCODE_URL")
         return _parse_opencode_output(stage, _default_post(self.url, self.api_key, self.model, prompt), keys)
 
     def decompose(self, prompt: str, objective_id: str) -> dict[str, list[Proposal]]:

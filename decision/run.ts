@@ -36,8 +36,11 @@ import type {
 export { classifyProbability };
 export type { ChoiceDecision, Decision, DecisionResult, NoulDecision, ScoreDecision, SystemOneFn };
 
-const OPENCODE_URL = "https://opencode.ai/zen/go/v1/responses";
-const DEFAULT_MODEL = "muse-spark-1.3-contributor";
+function requiredEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
+  return value;
+}
 const RESULTS_ROOT = "decision/results";
 
 export function createSystemOne(fetchImpl?: typeof fetch): SystemOneFn {
@@ -200,12 +203,13 @@ async function postOpenCode(
   model: string,
   apiKey: string,
   fetchFn: typeof fetch,
+  url: string,
 ): Promise<unknown> {
   const body = { model, input };
   await writeFile(join(dir, `request-${name}.json`), JSON.stringify(body, null, 2) + "\n");
   let res: Response;
   try {
-    res = await fetchFn(OPENCODE_URL, {
+    res = await fetchFn(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, "x-opencode-session": crypto.randomUUID() },
       body: JSON.stringify(body),
@@ -247,9 +251,9 @@ export async function runScenario(
 ): Promise<string> {
   const scenario = scenarios.find((s) => s.id === scenarioId);
   if (!scenario) throw new Error(`unknown_scenario: ${scenarioId} (known: ${scenarios.map((s) => s.id).join(", ")})`);
-  const model = opts?.model ?? process.env.OPENCODE_MODEL ?? DEFAULT_MODEL;
-  const apiKey = process.env.OPENCODE_API_KEY;
-  if (!apiKey) throw new Error("opencode_unavailable: missing OPENCODE_API_KEY");
+  const model = opts?.model ?? requiredEnv("OPENCODE_MODEL");
+  const url = requiredEnv("OPENCODE_URL");
+  const apiKey = requiredEnv("OPENCODE_API_KEY");
   const fetchFn = opts?.fetchFn ?? fetch;
   const systemOne = opts?.systemOne ?? createSystemOne();
   const dir = opts?.outDir ?? join(RESULTS_ROOT, `${scenario.id}-${new Date().toISOString().replace(/[:.]/g, "-")}`);
@@ -262,7 +266,7 @@ export async function runScenario(
 
   // 1. decompose (reasoner proposes, never decides)
   const decomposeRaw = await postOpenCode(
-    dir, "decompose", promptText("decompose", decomposePrompt, base), model, apiKey, fetchFn,
+    dir, "decompose", promptText("decompose", decomposePrompt, base), model, apiKey, fetchFn, url,
   );
   const proposals = checkProposals(
     "decompose", parseOpenCodeOutput("decompose", decomposeRaw, ["proposals"]).proposals, objectiveId, new Set(),
@@ -301,7 +305,7 @@ export async function runScenario(
     priorRefs: { evidenceIds: [...evidenceIds], proposalIds: proposals.map((p) => p.id) },
   };
   const analyzeRaw = await postOpenCode(
-    dir, "analyze", promptText("analyze", analyzePrompt, analyzeCtx), model, apiKey, fetchFn,
+    dir, "analyze", promptText("analyze", analyzePrompt, analyzeCtx), model, apiKey, fetchFn, url,
   );
   const analyzeOut = parseOpenCodeOutput("analyze", analyzeRaw, ["analyses", "evidenceRequests"]);
   const analyzableIds = new Set([...analyzeIds, ...gatherIds]);
@@ -388,7 +392,7 @@ export async function runScenario(
     priorIds: [...proposalById.keys()], priorRefs: { proposalIds: [...proposalById.keys()] },
   };
   const expandRaw = await postOpenCode(
-    dir, "expand", promptText("expand", expandPrompt, expandCtx), model, apiKey, fetchFn,
+    dir, "expand", promptText("expand", expandPrompt, expandCtx), model, apiKey, fetchFn, url,
   );
   const expandOut = parseOpenCodeOutput("expand", expandRaw, ["evidenceRequests", "proposals"]);
   const priorIds = new Set(proposals.map((p) => p.id));

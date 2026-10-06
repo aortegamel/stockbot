@@ -93,6 +93,7 @@ function stubSystemOne(): SystemOneFn {
 async function successDir(secret: string): Promise<string> {
   process.env.OPENCODE_API_KEY = secret;
   process.env.OPENCODE_MODEL = "test-model";
+  process.env.OPENCODE_URL = "https://opencode.test/responses";
   const dir = await mkdtemp(join(tmpdir(), "run-test-"));
   const calls: string[] = [];
   const fetchFn = (async () => {
@@ -130,6 +131,7 @@ async function successDir(secret: string): Promise<string> {
 async function expectRunError(secret: string, fetchFn: typeof fetch, contains: string, systemOne?: SystemOneFn): Promise<string> {
   process.env.OPENCODE_API_KEY = secret;
   process.env.OPENCODE_MODEL = "test-model";
+  process.env.OPENCODE_URL = "https://opencode.test/responses";
   const dir = await mkdtemp(join(tmpdir(), "run-test-"));
   let err: unknown = null;
   try {

@@ -7,8 +7,11 @@ export type MuseUsage = {
   cost?: number;
 };
 
-const MODEL = "muse-spark-1.3-contributor";
-const BASE = "https://opencode.ai/zen/go/v1";
+function requiredEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
+  return value;
+}
 // User-provided Muse Spark 1.3 Contributor per-1M-token rates.
 const INPUT_PER_M = 0.1;
 const OUTPUT_PER_M = 0.2;
@@ -112,13 +115,14 @@ async function readSse(
 const FETCH_TIMEOUT_MS = 120_000;
 
 async function post(
+  base: string,
   apiKey: string,
   session: string,
   path: "/responses" | "/chat/completions",
   body: unknown,
   onDelta: (t: string) => void,
 ): Promise<{ text: string; usage: MuseUsage }> {
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await fetch(`${base}${path}`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -147,8 +151,9 @@ export async function reason(opts: {
   incompleteGuard?: boolean;
   onDelta: (text: string) => void;
 }): Promise<{ text: string; usage: MuseUsage; missingEvidence?: string }> {
-  const apiKey = process.env.OPENCODE_API_KEY;
-  if (!apiKey) throw new Error("OPENCODE_API_KEY missing");
+  const apiKey = requiredEnv("OPENCODE_API_KEY");
+  const model = requiredEnv("OPENCODE_MODEL");
+  const base = requiredEnv("OPENCODE_URL").replace(/\/responses\/?$/, "");
   const session = crypto.randomUUID();
   const needsGapLine =
     opts.escalated || opts.incompleteGuard === true || (opts.unresolved !== undefined && opts.unresolved.length > 0);
@@ -161,16 +166,17 @@ export async function reason(opts: {
     { role: "user", content: user },
   ];
   try {
-    const r = await post(apiKey, session, "/responses", { model: MODEL, input, stream: true }, opts.onDelta);
+    const r = await post(base, apiKey, session, "/responses", { model, input, stream: true }, opts.onDelta);
     return { ...r, missingEvidence: /^Missing-Evidence:\s*(.+)$/m.exec(r.text)?.[1] };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (!/(404|405|429|500|502|503|504)/.test(msg)) throw err;
     const r = await post(
+      base,
       apiKey,
       session,
       "/chat/completions",
-      { model: MODEL, messages: input.map((m) => ({ role: m.role, content: m.content })), stream: true },
+      { model, messages: input.map((m) => ({ role: m.role, content: m.content })), stream: true },
       opts.onDelta,
     );
     return { ...r, missingEvidence: /^Missing-Evidence:\s*(.+)$/m.exec(r.text)?.[1] };

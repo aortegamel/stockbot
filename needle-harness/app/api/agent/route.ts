@@ -3,6 +3,11 @@ import { kernelRouter, runKernelAgent } from "@/lib/agent/kernel";
 import { tools } from "@/lib/tools";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
 import { redactArgs, type AgentEvent, type Evidence, type FailureCategory } from "@/lib/agent/types";
+function requiredEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
+  return value;
+}
 export async function POST(req: Request): Promise<Response> {
   let prompt: unknown;
   try {
@@ -54,7 +59,7 @@ export async function POST(req: Request): Promise<Response> {
       const answerDirect = async (): Promise<boolean> => {
         const t0 = performance.now();
         send({ type: "agent_start", prompt });
-        send({ type: "reasoning_start", model: "muse-spark-1.3-contributor" });
+        send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
         try {
           const r = await reason({ prompt, evidence: [], escalated: false, direct: true, onDelta: (text) => send({ type: "answer_delta", text }) });
           send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: performance.now() - t0, ...r.usage }, evidence: { count: 0, characters: 0 }, failures: {} } });
@@ -132,7 +137,7 @@ export async function POST(req: Request): Promise<Response> {
             return false;
           }
           if (verdict === "node_resolved" || verdict === "reasoning_required") {
-            send({ type: "reasoning_start", model: "muse-spark-1.3-contributor" });
+            send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
             try {
               const m0 = performance.now();
               const r = await reason({ prompt, evidence, escalated: false, direct: evidence.length === 0, onDelta: (text) => send({ type: "answer_delta", text }) });

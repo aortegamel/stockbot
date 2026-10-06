@@ -194,15 +194,18 @@ def _propose_questions(objective: str, as_of: str | None, objective_id: str) -> 
     scheduler-driven reason-path helper only, never ahead of first tool selection.
     """
     # ponytail: no retry/backoff on model outage; single-node fallback keeps research live.
+    missing = [k for k in ("OPENCODE_API_KEY", "OPENCODE_MODEL", "OPENCODE_URL") if not (os.environ.get(k) or "").strip()]
+    if missing:
+        raise RuntimeError(f"opencode_unavailable: missing {', '.join(missing)}")
     try:
         from app.reasoner_client import ReasonerClient
     except Exception:
         return _fallback_single(objective, objective_id)
     try:
         client = ReasonerClient(
-            api_key=os.environ.get("OPENCODE_API_KEY", ""),
-            url=os.environ.get("OPENCODE_URL", "https://opencode.ai/zen/go/v1/responses"),
-            model=os.environ.get("OPENCODE_MODEL", "muse-spark-1.3-contributor"),
+            api_key=(os.environ.get("OPENCODE_API_KEY") or "").strip(),
+            url=(os.environ.get("OPENCODE_URL") or "").strip(),
+            model=(os.environ.get("OPENCODE_MODEL") or "").strip(),
         )
         out = client.decompose(_decompose_prompt(objective_id, objective, as_of), objective_id)
         raw = out.get("proposals") if isinstance(out, dict) else None
