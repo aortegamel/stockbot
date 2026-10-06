@@ -931,6 +931,25 @@ _LOOKUP_TTL_S = 86400.0
 _lookup_lock = threading.Lock()
 _lookup_cached_at = 0.0
 _lookup_cached_frame: _FrameRows | None = None
+_lookup_cached_index: list[tuple[str, str, int]] | None = None
+
+
+def _cached_lookup_index() -> list[tuple[str, str, int]] | None:
+    """Cached (normalized name, raw name, cik) rows when fresh; None when stale."""
+    with _lookup_lock:
+        if _lookup_cached_index is None:
+            return None
+        if time.monotonic() - _lookup_cached_at >= _LOOKUP_TTL_S:
+            return None
+        return _lookup_cached_index
+
+
+def _store_lookup_index(rows: list[tuple[str, str, int]]) -> None:
+    """Cache one normalized lookup index with a fresh timestamp."""
+    global _lookup_cached_at, _lookup_cached_index
+    with _lookup_lock:
+        _lookup_cached_index = rows
+        _lookup_cached_at = time.monotonic()
 
 
 def _cached_lookup_frame() -> _FrameRows | None:
@@ -982,16 +1001,27 @@ def _rank_lookup_name(normed: str, want: str) -> int | None:
     return None
 
 
-def _scan_lookup_frame(frame: _FrameRows, want: str) -> list[tuple[int, str, int]]:
-    """Deterministic normalized substring scan over lookup rows."""
-    rows: list[tuple[int, str, int]] = []
+def _build_lookup_index(frame: _FrameRows) -> list[tuple[str, str, int]]:
+    """Normalized (normed, raw, cik) rows built once per cached frame."""
+    rows: list[tuple[str, str, int]] = []
     for row in frame.itertuples():
         try:
             cik = int(str(getattr(row, "cik")).strip())  # noqa: B009 - dynamic boundary, no stubs; getattr keeps checker green
         except TypeError, ValueError:
             continue
         name = str(getattr(row, "name", ""))
-        rank = _rank_lookup_name(_normalize_lookup_text(name), want)
+        try:
+            rows.append((_normalize_lookup_text(name), name, cik))
+        except Exception:  # noqa: BLE001, S112 - one bad name never breaks the index
+            continue
+    return rows
+
+
+def _scan_lookup_index(index: list[tuple[str, str, int]], want: str) -> list[tuple[int, str, int]]:
+    """Deterministic rank over precomputed normalized names."""
+    rows: list[tuple[int, str, int]] = []
+    for normed, name, cik in index:
+        rank = _rank_lookup_name(normed, want)
         if rank is not None:
             rows.append((rank, name, cik))
     return rows
@@ -1007,11 +1037,16 @@ def _check_lookup_params(query: str, limit: int) -> str:
 
 
 def _scan_lookup_rows(frame: _FrameRows, query: str, want: str) -> list[tuple[int, str, int]]:
-    """Normalized scan over the lookup frame; parse failure raises."""
+    """Normalized scan over the precomputed index; parse failure raises."""
     try:
         if not want:
             return []
-        return _scan_lookup_frame(frame, want)
+        cached = _cached_lookup_index()
+        if cached is not None:
+            return _scan_lookup_index(cached, want)
+        index = _build_lookup_index(frame)
+        _store_lookup_index(index)
+        return _scan_lookup_index(index, want)
     except Exception as exc:
         raise SECClientError(f"cik lookup parse failed for {query!r}: {exc}") from exc
 
