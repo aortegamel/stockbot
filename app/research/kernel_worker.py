@@ -207,6 +207,78 @@ _INTAKE_DIGEST_CHARS = 6000
 _INTAKE_MAX_ROUNDS = 2
 _INTAKE_CALL_TIMEOUT_S = 30.0
 _INTAKE_BUDGET_S = 20.0
+_INTAKE_DOC_CHARS = 3000
+
+
+def _intake_cik(ticker: str) -> str:
+    """Ticker to CIK identifier for scoped intake; falls back to the ticker."""
+    try:
+        from app.sec.client import resolve_cik
+
+        cik = resolve_cik(ticker.strip().upper())
+    except Exception:  # noqa: BLE001 - import/resolve failure keeps the ticker identifier
+        return ticker
+    return str(cik) if cik is not None else ticker
+
+
+def _intake_newest_8k(result: object) -> str | None:
+    """Newest 8-K accession from a list_sec_filings result; None when absent."""
+    filings: object = None
+    if isinstance(result, dict):
+        inner = result.get("result")
+        filings = inner.get("filings") if isinstance(inner, dict) else result.get("filings")
+    if not isinstance(filings, list):
+        return None
+    for row in filings:
+        if isinstance(row, dict) and str(row.get("form") or "").upper() == "8-K":
+            acc = row.get("accession_no") or row.get("accession_number")
+            if isinstance(acc, str) and acc.strip():
+                return acc.strip()
+    return None
+
+
+async def _intake_ticker_chain(
+    ticker: str,
+    sid: str,
+    session: dict[str, object],
+    registry: list[dict[str, object]],
+    jev: object,
+    kernel: object,
+    as_of: str | None,
+) -> list[tuple[str, dict[str, object], dict[str, object], float]]:
+    """List one ticker, then open its newest 8-K; a slow ticker never holds the others."""
+    import time as _time
+
+    out: list[tuple[str, dict[str, object], dict[str, object], float]] = []
+    ident = _intake_cik(ticker)
+    start = _time.perf_counter()
+    listing = await _intake_attempt(
+        "list_sec_filings",
+        {"identifier": ident, "forms": list(_INTAKE_SEC_FORMS), "limit": _INTAKE_SEC_LIMIT},
+        sid,
+        session,
+        registry,
+        jev,
+        kernel,
+        as_of,
+    )
+    out.append(("list_sec_filings", {"identifier": ident}, listing, (_time.perf_counter() - start) * 1000.0))
+    acc = _intake_newest_8k(listing.get("result"))
+    if acc is None:
+        return out
+    start = _time.perf_counter()
+    doc = await _intake_attempt(
+        "get_sec_document",
+        {"accession_no": acc, "max_chars": _INTAKE_DOC_CHARS},
+        sid,
+        session,
+        registry,
+        jev,
+        kernel,
+        as_of,
+    )
+    out.append(("get_sec_document", {"accession_no": acc}, doc, (_time.perf_counter() - start) * 1000.0))
+    return out
 
 
 def _ev_field(ev: Mapping[str, object], *names: str) -> str:
@@ -568,32 +640,43 @@ async def _intake_round(
             taken = (_time.perf_counter() - start) * 1000.0
         return record, taken
 
-    calls: list[tuple[str, dict[str, object]]] = []
+    chains: list[asyncio.Task[object]] = []
     for ticker in tickers:
-        calls.append(
-            ("list_sec_filings", {"identifier": ticker, "forms": list(_INTAKE_SEC_FORMS), "limit": _INTAKE_SEC_LIMIT})
-        )
-        if query_text is not None:
-            calls.append(
-                ("search_sec_filings", {"ticker": ticker, "query": query_text[:200], "limit": _INTAKE_SEC_LIMIT})
+        chains.append(
+            asyncio.ensure_future(
+                asyncio.wait_for(
+                    _intake_ticker_chain(ticker, sid, session, registry, jev, kernel, as_of),
+                    timeout=_INTAKE_CALL_TIMEOUT_S,
+                )
             )
+        )
+    web: list[asyncio.Task[tuple[dict[str, object], float]]] = []
     if query_text is not None:
-        calls.append(("search_web", {"query": query_text}))
-    _notify(progress, "intake_start", {"calls": len(calls)})
-    tasks = {asyncio.ensure_future(_timed(tool, args)): (tool, args) for tool, args in calls}
+        web.append(asyncio.ensure_future(_timed("search_web", {"query": query_text})))
+    _notify(progress, "intake_start", {"calls": len(chains) + len(web)})
     # ponytail: overall budget keeps whatever finished; stragglers log as timeout.
-    done, _pending = await asyncio.wait(set(tasks), timeout=_INTAKE_BUDGET_S if calls else 0.0)
-    timed: list[tuple[dict[str, object], float]] = []
-    for task, (tool, args) in tasks.items():
+    all_tasks = [*chains, *web]
+    done, _pending = await asyncio.wait(set(all_tasks), timeout=_INTAKE_BUDGET_S if all_tasks else 0.0)
+    flat: list[tuple[str, dict[str, object], dict[str, object], float]] = []
+    for task in all_tasks:
         if task in done:
-            timed.append(task.result())
+            try:
+                res = task.result()
+            except TimeoutError:
+                logger.warning("intake timeout budget_s=%s", _INTAKE_BUDGET_S)
+                flat.append(("list_sec_filings", {}, {"error": "intake_timeout", "error_type": "timeout"}, 0.0))
+                continue
+            if isinstance(res, list):
+                flat.extend(res)
+            elif isinstance(res, tuple):
+                record, taken = res
+                flat.append(("search_web", {"query": query_text or ""}, record, taken))
         else:
             task.cancel()
-            logger.warning("intake budget timeout tool=%s budget_s=%s", tool, _INTAKE_BUDGET_S)
-            timed.append(
-                ({"tool": tool, "arguments": dict(args), "error": "intake_timeout", "error_type": "timeout"}, 0.0)
-            )
-    ms_total = sum(taken for _, taken in timed)
+            logger.warning("intake budget timeout budget_s=%s", _INTAKE_BUDGET_S)
+    calls = [(tool, args) for tool, args, _, _ in flat]
+    timed = [(record, taken) for _, _, record, taken in flat]
+    ms_total = sum(taken for _, _, _, taken in flat)
     from types import SimpleNamespace as _NS
 
     node_ns = _NS(nid="", session_id=sid, node_id="")
