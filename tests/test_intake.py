@@ -223,3 +223,151 @@ def test_run_emits_progress_before_terminal() -> None:
     assert out["id"] == "r1"
     assert stages[:2] == ["session", "intake_done"]
     assert stages[-2:] == ["tool_start", "tool_done"]
+
+
+def test_digest_strips_tags_keeps_text() -> None:
+    content = "Revenue rose <b>12%</b> on filing day.\n<table><tr><td>cell</td></tr></table>\n"
+    ev = _stored_evidence("ev-tag", content, source_uri="https://example.com/f")
+    digest = kw._build_digest([ev])
+    assert "12%" in digest and "<b>" not in digest and "<td>" not in digest
+
+
+def test_intake_prompt_carries_raw_query_and_digest() -> None:
+    prompt = kw._intake_reasoner_prompt("rs:t", "how will orcl's manjure affect AAPL?", None, "DIGEST-BYTES")
+    assert "how will orcl's manjure affect AAPL?" in prompt
+    assert "DIGEST-BYTES" in prompt
+    assert "at most 4 questions" in prompt
+
+
+def test_reasoner_no_retry_on_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"n": 0}
+
+    def fake_decompose(self: object, prompt: str, objective_id: str) -> dict[str, object]:
+        calls["n"] += 1
+        raise RuntimeError("opencode_unavailable: missing OPENCODE_URL")
+
+    monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", fake_decompose)
+    proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
+    assert calls["n"] == 1 and hints.get("fallback") == "reasoner_config"
+    assert len(proposals) == 1
+
+
+def test_node_cap_four_through_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """run_graph_prompt caps at 4 nodes (D4 cap lives at the entry slice)."""
+    import tempfile
+    from pathlib import Path
+    from typing import Any
+
+    from app.research import kernel_worker as kw2
+    from app.research import service as svc
+
+    seen: list[str] = []
+    orig_create = svc.create_node
+
+    def _count(sid: str, *a: Any, **k: Any) -> Any:
+        seen.append(sid)
+        return orig_create(sid, *a, **k)
+
+    async def _six(*a: Any, **k: Any) -> list[dict[str, object]]:
+        return [
+            {"id": f"s-q{i}", "objectiveId": "s", "question": f"q{i}?", "dependsOn": [], "whyItMatters": "w"}
+            for i in range(6)
+        ]
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
+    monkeypatch.setattr(svc, "create_node", _count)
+    monkeypatch.setattr(kw2, "_graph_intake", _six)
+
+    def _passthrough(sid: str, obj: str, props: list[dict[str, object]], **k: Any) -> list[dict[str, object]]:
+        return list(props)
+
+    monkeypatch.setattr(kw2, "_jev_admit", _passthrough)
+    kw2.run_graph_prompt("cap this down?")
+    assert len(seen) == 4
+
+
+def test_log_carries_outcomes_and_ids() -> None:
+    """intake_digest selected carries per-call outcomes + admitted ids beside stats (E1)."""
+    import inspect
+
+    src = inspect.getsource(kw._log_intake_round)
+    assert "admitted_ids" in src and "outcomes" in src
+
+
+def test_two_round_ceiling_without_new_hints(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No new tickers/query after round 2 exits at the ceiling (D6 needs a round 3 to fire)."""
+    import asyncio
+    from typing import Any
+
+    from app.research import kernel_worker as kw4
+
+    rounds = {"n": 0}
+
+    async def _one_round(*a: Any, **k: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+        rounds["n"] += 1
+        return ([], [], {"calls": 1, "admitted": 0})
+
+    def _decompose(*a: Any, **k: Any) -> tuple[list[dict[str, object]], dict[str, object]]:
+        return ([{"id": "s-q1", "objectiveId": "s", "question": "q?", "dependsOn": [], "whyItMatters": "w"}], {})
+
+    monkeypatch.setattr(kw4, "_intake_round", _one_round)
+    monkeypatch.setattr(kw4, "_reasoner_decompose_with_retry", _decompose)
+    out = asyncio.run(kw4._graph_intake("q?", None, "s1", {}, [], None, object(), None))
+    assert len(out) == 1 and rounds["n"] == 1
+
+
+def test_intake_never_searches_filings_and_chains_8k(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Intake calls list by CIK + chained doc + exact-text web; no search_sec_filings, no Needle (C)."""
+    import asyncio
+    from typing import Any
+
+    from app.research import kernel_worker as kw3
+    from app.research import scheduler as sched3
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def _fake_attempt(tool: str, args: dict[str, object], *a: Any, **k: Any) -> dict[str, Any]:
+        calls.append((tool, dict(args)))
+        if tool == "list_sec_filings":
+            return {
+                "tool": tool,
+                "arguments": args,
+                "job_id": "j-list",
+                "result": {"filings": [{"form": "8-K", "accession_no": "0001-26-000001"}]},
+                "outcome": SimpleNamespace(content="x", error=None),
+                "outcome_summary": "x",
+                "error": None,
+            }
+        return {
+            "tool": tool,
+            "arguments": args,
+            "job_id": f"j-{tool}",
+            "result": {"tool_result_id": "s1:tr:x", "evidence": []},
+            "outcome": SimpleNamespace(content="x", error=None),
+            "outcome_summary": "x",
+            "error": None,
+        }
+
+    def _cik(t: str) -> str:
+        return "320193"
+
+    def _no_evidence(sid: str, kernel: object, repo: object) -> list[dict[str, object]]:
+        return []
+
+    def _noop(*a: Any, **k: Any) -> None:
+        return None
+
+    def _evid(*a: Any, **k: Any) -> str:
+        return "ev-1"
+
+    monkeypatch.setattr(kw3, "_intake_attempt", _fake_attempt)
+    monkeypatch.setattr(kw3, "_intake_cik", _cik)
+    monkeypatch.setattr(sched3, "_load_evidence", _no_evidence)
+    kernel = SimpleNamespace(record_decision=_noop, record_evidence=_evid, complete_job=_noop)
+    asyncio.run(kw3._intake_round("how will orcl's manjure affect AAPL?", ["ORCL"], "s1", {}, [], None, kernel, None))
+    tools = [t for t, _ in calls]
+    assert "search_sec_filings" not in tools
+    assert tools.count("list_sec_filings") == 1 and "get_sec_document" in tools
+    web = [a for t, a in calls if t == "search_web"]
+    assert web and web[0].get("query") == "how will orcl's manjure affect AAPL?"
+    assert calls[0][0] == "list_sec_filings" and calls[0][1].get("identifier") == "320193"

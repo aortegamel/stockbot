@@ -154,8 +154,8 @@ def test_kernel_worker_stamps_route_assess_and_node() -> None:
     assess = _JevAssess("node_resolved")
     kw._assess_entry({"id": "s1", "prompt": "risk?", "tool": "t", "result": {}}, jev=assess)  # type: ignore[arg-type]
     assert isinstance(assess.seen[0][0], str) and assess.seen[0][0].startswith("[Today UTC ")
-    prompt = kw._decompose_prompt("rs:test", "objective?", None)
-    assert "[Today UTC " in prompt.split("CONTEXT: ", 1)[1]
+    prompt = kw._intake_reasoner_prompt("rs:test", "objective?", None, "")
+    assert "Today is" in prompt and "UTC" in prompt
 
 
 def test_arguments_mismatch_is_error_never_raise(monkeypatch: pytest.MonkeyPatch) -> None:

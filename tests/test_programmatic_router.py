@@ -40,6 +40,15 @@ def test_route_fast_path_marks_research():
     assert programmatic_route("hello") is None
 
 
+def test_small_talk_never_creates_session() -> None:
+    """thanks / never mind short-circuit to no_session (plan entry route)."""
+    from app.research.programmatic_router import programmatic_route
+
+    assert programmatic_route("thanks") == "no_session"
+    assert programmatic_route("never mind") == "no_session"
+    assert programmatic_route("What drove NVDA revenue last quarter?") == "research_required"
+
+
 def test_five_live_questions_first_hop():
     assert _pick("What drove NVDA revenue last quarter?") == ("invoke", "list_sec_filings")
     assert _pick("Which filings mention Elon Musk, and who actually filed them?") == ("invoke", "search_sec_filings")

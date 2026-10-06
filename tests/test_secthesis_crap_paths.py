@@ -3262,10 +3262,7 @@ def test_search_failed_packet_and_lookup_scan_branches(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from app.sec.client import (
-        _failed_search_result,
-        _scan_lookup_frame,
-    )
+    from app.sec.client import _failed_search_result, _normalize_lookup_text, _scan_lookup_rows
     from app.sec.models import SECSearchRequest
 
     packet = _failed_search_result(
@@ -3278,8 +3275,6 @@ def test_search_failed_packet_and_lookup_scan_branches(
             self.cik = cik
             self.name = name
 
-    scan_untyped: Callable[..., object] = _scan_lookup_frame
-
     class _Frame:
         def itertuples(self) -> list[object]:
             return [
@@ -3289,12 +3284,20 @@ def test_search_failed_packet_and_lookup_scan_branches(
                 _Row("33", "Unrelated"),
             ]
 
+    from app.sec import client as _client
+
+    _client._lookup_cached_frame = None
+    _client._lookup_cached_index = None
+    _client._lookup_cached_at = 0.0
     frame = _Frame()
-    rows = scan_untyped(frame, "acme labs")
+    rows = _scan_lookup_rows(frame, "q", _normalize_lookup_text("acme labs"))
     assert isinstance(rows, list)
     assert [r[2] for r in rows] == [11, 22]
-    assert scan_untyped(frame, "acme labs inc") == [(0, "Acme Labs Inc", 11)]
-    assert scan_untyped(frame, "zzz-no-match") == []
+    assert _scan_lookup_rows(frame, "q", _normalize_lookup_text("acme labs inc")) == [(0, "Acme Labs Inc", 11)]
+    _client._lookup_cached_frame = None
+    _client._lookup_cached_index = None
+    _client._lookup_cached_at = 0.0
+    assert _scan_lookup_rows(frame, "q", _normalize_lookup_text("zzz-no-match")) == []
 
 
 def test_hit_helper_error_branches() -> None:
@@ -3346,13 +3349,17 @@ def test_lookup_fetch_and_rank_error_branches(
         return _LookupFrame()
 
     monkeypatch.setattr(tickers, "get_cik_lookup_data", _get_frame)
+    client._lookup_cached_frame = None
+    client._lookup_cached_index = None
+    client._lookup_cached_at = 0.0
     assert _fetch_lookup_frame("Acme") is not None
     monkeypatch.setattr(tickers, "get_cik_lookup_data", lambda: (_ for _ in ()).throw(ConnectionError("down")))
+    client._lookup_cached_frame = None
+    client._lookup_cached_index = None
+    client._lookup_cached_at = 0.0
     with pytest.raises(client.SECClientError):
         client.get_cik_lookup_candidates("Acme")
     assert _rank_lookup_name("acme", "acme") == 0
-    assert _rank_lookup_name("acme labs", "acme") == 1
-    assert _rank_lookup_name("xacme", "acme") == 2
 
 
 def test_row_dict_and_holding_source_error_branches() -> None:

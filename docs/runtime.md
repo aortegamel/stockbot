@@ -12,7 +12,9 @@ snippets per resolved ticker plus one exact-text Exa search, settled with
 verbatim digest, runs Reasoner decompose over raw query + digest (optional
 tickers/corrected_query hints feed at most one more intake round), then JEV
 proposal disposition → per-proposal nodes, then `app/research/scheduler.py
-run` over ready nodes. Each intake round logs an `intake_digest` decision.
+run` over ready nodes. Each intake round logs one `intake_digest` decision in
+`runs.sqlite` `agent_events`: the request holds the raw query plus per-call
+summary views, the response holds the digest plus Reasoner output.
 Progress lines (`session`, `intake_start`, `intake_done`, `reasoner_*`,
 `tool_start`, `tool_done`) stream as `progress` events; prod forwards a
 stripped `working` stage to keep the UI stall watchdog fed.

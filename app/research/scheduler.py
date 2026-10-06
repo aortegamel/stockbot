@@ -26,12 +26,38 @@ import functools
 import inspect
 import logging
 import re
+import threading as _threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-_SEC_INTAKE_SEMAPHORE = asyncio.Semaphore(4)
+_SEC_THREAD_SEMAPHORE = _threading.BoundedSemaphore(4)
+_SEC_INTAKE_SEMAPHORE = _SEC_THREAD_SEMAPHORE
+
+
+async def _sec_thread_call(call: Any) -> Any:
+    """Sync SEC call under the process-wide cap; permit releases only when the thread ends."""
+    worker: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+
+    def _run() -> None:
+        with _SEC_THREAD_SEMAPHORE:
+            if not worker.done():
+                try:
+                    worker.set_result(call())
+                except BaseException as exc:  # noqa: BLE001 - transport errors ride the future
+                    if not worker.done():
+                        worker.set_exception(exc)
+
+    await asyncio.to_thread(_SEC_THREAD_SEMAPHORE.acquire)
+    runner: asyncio.Future[None] = asyncio.ensure_future(asyncio.to_thread(_run))
+    try:
+        return await asyncio.shield(worker)
+    finally:
+        if not runner.done():
+            await runner
+        _SEC_THREAD_SEMAPHORE.release()
+
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +104,15 @@ from app.tool_runtime import RuntimeToolSession, execute_agent_tool, outcome_fro
 _contract_outcome_from_result = outcome_from_result
 
 try:
-    from app.research.models import DecisionRecord, ResearchNode, ResearchNodeStatus, ToolDecision  # noqa: F401
-    from app.research.models import new_decision_id, new_node_id, query_with_today_utc  # noqa: F401
+    from app.research.models import (
+        DecisionRecord,
+        ResearchNode,
+        ResearchNodeStatus,
+        ToolDecision,
+        new_decision_id,
+        new_node_id,
+        query_with_today_utc,
+    )
 except ImportError:  # ponytail: contract stub until KernelPersistence lands
 
     class ResearchNodeStatus(str):  # type: ignore[no-redef]
@@ -133,7 +166,7 @@ except ImportError:  # ponytail: contract stub until KernelPersistence lands
 
 
 try:
-    from app.decision_client import JevClient  # noqa: F401
+    from app.decision_client import JevClient
 except ImportError:  # ponytail: contract stub until JevBridge lands
 
     class JevClient(Protocol):  # type: ignore[no-redef]
@@ -144,7 +177,7 @@ except ImportError:  # ponytail: contract stub until JevBridge lands
 
 
 try:
-    from app.reasoner_client import ReasonerClient  # noqa: F401
+    from app.reasoner_client import ReasonerClient
 except ImportError:  # ponytail: contract stub until ToolSelect lands reasoner
 
     class ReasonerClient(Protocol):  # type: ignore[no-redef]
@@ -1454,7 +1487,7 @@ def _as_day(value: object) -> str | None:
     if callable(iso):
         try:
             return str(iso())[:10] or None
-        except Exception:  # noqa: BLE001, S110 - non-date-likes stay ungrounded
+        except Exception:  # noqa: BLE001 - non-date-likes stay ungrounded
             return None
     return None
 
@@ -1560,16 +1593,15 @@ def _repair_tool_arguments(
             and isinstance(objective, str)
             and "revenue" in objective.lower()
             and "quarter" in objective.lower()
-        ):
-            if not filled.get("forms"):
-                filled["forms"] = ["10-Q", "10-K", "8-K"]
-                logger.info(
-                    "toolflow args_seed sid=%s nid=%s tool=%s keys=%s",
-                    sid,
-                    nid,
-                    tool_name,
-                    "forms",
-                )
+        ) and not filled.get("forms"):
+            filled["forms"] = ["10-Q", "10-K", "8-K"]
+            logger.info(
+                "toolflow args_seed sid=%s nid=%s tool=%s keys=%s",
+                sid,
+                nid,
+                tool_name,
+                "forms",
+            )
         _idv = filled.get("identifier") if isinstance(filled, dict) else None
         if tool_name == "list_sec_filings":
             from app.tools import _date_like_form as _id_date_like
@@ -2011,10 +2043,13 @@ async def _invoke_attempt_tool(
     )
     if inspect.iscoroutinefunction(invoke):
         result = await _awaited(call())
+    elif _source_for_tool(tool_name) == "SEC":
+        # ponytail: sync SEC gateway blocks the loop; threads overlap under the
+        # loop-independent process cap, Needle's _LOCK stays serial.
+        result = await _sec_thread_call(call)
     else:
-        # ponytail: sync gateway blocks the loop; threads overlap, Needle's _LOCK stays serial.
-        async with _SEC_INTAKE_SEMAPHORE:
-            result = await asyncio.to_thread(call)
+        result = await asyncio.to_thread(call)
+    result = await _awaited(result)
     if not isinstance(result, dict):
         raise ValueError(f"tool runtime for {tool_name!r} must return a mapping")
     return result, await _awaited(to_outcome(tool_name, result))
@@ -2404,7 +2439,7 @@ async def _expansion_decisions(
                 choice_options=options,
             )
         )
-    except Exception:  # noqa: BLE001, S110 - JEV outage expands nothing; tool path below still runs
+    except Exception:  # noqa: BLE001 - JEV outage expands nothing; tool path below still runs
         return None
     return decisions if isinstance(decisions, dict) else None
 

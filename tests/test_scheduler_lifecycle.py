@@ -1264,3 +1264,108 @@ def test_find_sec_entities_seeded_from_objective() -> None:
         "Did Tesla insiders actually sell shares last quarter, or only file planned-sale notices?",
     )
     assert seeded == {"query": "TSLA"}
+
+
+def test_sync_invoke_overlaps_not_serial() -> None:
+    """Two 0.3s sync SEC tools finish near the slower time, never the sum (A1)."""
+    import time as _time
+
+    def slow(name: str, args: dict[str, Any], sess: Any, **kw: Any) -> dict[str, Any]:
+        _time.sleep(0.3)
+        return {"ok": True, "tool_result_id": "s1:tr:x"}
+
+    async def _both() -> None:
+        await asyncio.gather(
+            *(
+                sched._invoke_attempt_tool(
+                    slow,
+                    lambda n, r: SimpleNamespace(error=None),
+                    "list_sec_filings",
+                    {},
+                    SimpleNamespace(),
+                    "n1",
+                    "s1",
+                    None,
+                    "j",
+                )
+                for _ in range(2)
+            )
+        )
+
+    start = _time.perf_counter()
+    asyncio.run(_both())
+    assert _time.perf_counter() - start < 0.55
+
+
+def test_needle_error_streak_breaks_at_three() -> None:
+    """3 consecutive generation-shaped errors streak 3; args-produced breaks it (D5)."""
+    bad = {"tool": "search_web", "error": "needle down", "arguments": {}}
+    assert sched._needle_error_streak([dict(bad), dict(bad)]) == 2
+    assert sched._needle_error_streak([dict(bad), dict(bad), dict(bad)]) == 3
+    grounded = dict(bad, arguments={"query": "q"})
+    assert sched._needle_error_streak([dict(bad), dict(bad), grounded]) == 0
+
+
+def test_intake_round_admits_citable_without_jev_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_intake_round admits citable bytes by code; uncitable/error close jobs (E1)."""
+    from types import SimpleNamespace as _NS
+
+    from app.research import kernel_worker as kw
+
+    kernel = _Kernel()
+
+    async def fake_attempt(tool: str, args: dict[str, Any], sid: str, *a: Any, **k: Any) -> dict[str, Any]:
+        if tool == "search_web":
+            return {
+                "tool": tool,
+                "arguments": args,
+                "job_id": "job-web",
+                "result": {
+                    "tool_result_id": "s1:tr:w",
+                    "evidence": [{"url": "https://example.com/a", "highlight": "Oracle merger filing mentions"}],
+                },
+                "outcome": _NS(content="web bytes here", error=None),
+                "outcome_summary": "web bytes here",
+                "error": None,
+            }
+        if tool == "get_sec_document":
+            return {
+                "tool": tool,
+                "arguments": args,
+                "job_id": "job-doc",
+                "result": {"tool_result_id": "s1:tr:d"},
+                "outcome": _NS(content="", error=None),
+                "outcome_summary": "",
+                "error": None,
+            }
+        return {"tool": tool, "arguments": args, "job_id": "job-bad", "error": "boom", "outcome": None}
+
+    async def fake_chain(*a: Any, **k: Any) -> list[tuple[str, dict[str, Any], dict[str, Any], float]]:
+        return [
+            ("list_sec_filings", {"ticker": "ORCL"}, await fake_attempt("list_sec_filings", {}, "s1"), 5.0),
+            ("get_sec_document", {"accession_no": "x"}, await fake_attempt("get_sec_document", {}, "s1"), 5.0),
+        ]
+
+    monkeypatch.setattr(kw, "_intake_attempt", fake_attempt)
+    monkeypatch.setattr(kw, "_intake_ticker_chain", fake_chain)
+    monkeypatch.setattr(sched, "_load_evidence", lambda sid, kernel, repo: [{"evidence_id": "ev-0"}])
+    admitted, raw, stats = asyncio.run(
+        kw._intake_round("orcl manjure", ["ORCL"], "s1", {}, [], None, kernel, None, None)
+    )
+    assert stats["outcomes"] == {"admitted": 1, "not_citable": 1, "error": 1, "timeout": 0}
+    assert stats["admitted_ids"] and stats["admitted"] == 1 and admitted == [{"evidence_id": "ev-0"}]
+
+
+def test_intake_round_budget_timeout_records_per_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pending budget tasks synthesize timeout records with wall_ms (A2)."""
+    from app.research import kernel_worker as kw
+
+    kernel = _Kernel()
+
+    async def slow_chain(*a: Any, **k: Any) -> list[tuple[str, dict[str, Any], dict[str, Any], float]]:
+        await asyncio.sleep(60)
+        return []
+
+    monkeypatch.setattr(kw, "_intake_ticker_chain", slow_chain)
+    monkeypatch.setattr(kw, "_INTAKE_BUDGET_S", 0.05)
+    monkeypatch.setattr(sched, "_load_evidence", lambda sid, kernel, repo: [])

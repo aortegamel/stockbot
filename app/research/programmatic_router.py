@@ -183,6 +183,12 @@ def _router_subset(ranked: list[tuple[int, str]], registry: _Registry, names: se
     return [e for e in registry if isinstance(e, dict) and e.get("name") in wanted]
 
 
+def _SMALL_TALK(prompt: str) -> bool:
+    """Exact small-talk only: thanks / never mind / ok variants create no session."""
+    text = " ".join(prompt.strip().lower().split())
+    return text in ("thanks", "thank you", "never mind", "nevermind", "ok", "okay", "got it", "great thanks")
+
+
 def programmatic_route(prompt: object) -> str | None:
     """Entry fast-path: research signals -> research_required, else None (JEV decides). Never raises."""
     try:
@@ -190,6 +196,8 @@ def programmatic_route(prompt: object) -> str | None:
 
         if not isinstance(prompt, str) or not prompt.strip():
             return "research_required"
+        if _SMALL_TALK(prompt):
+            return "no_session"
         norm, toks = _signals(prompt)
         if _ACCESSION_TOKEN_RE.search(prompt) is not None:
             return "research_required"

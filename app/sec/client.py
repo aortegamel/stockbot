@@ -937,17 +937,18 @@ _lookup_cached_index: list[tuple[str, str, int]] | None = None
 def _cached_lookup_index() -> list[tuple[str, str, int]] | None:
     """Cached (normalized name, raw name, cik) rows when fresh; None when stale."""
     with _lookup_lock:
-        if _lookup_cached_index is None:
+        if _lookup_cached_index is None or _lookup_cached_frame is None:
             return None
         if time.monotonic() - _lookup_cached_at >= _LOOKUP_TTL_S:
             return None
         return _lookup_cached_index
 
 
-def _store_lookup_index(rows: list[tuple[str, str, int]]) -> None:
-    """Cache one normalized lookup index with a fresh timestamp."""
-    global _lookup_cached_at, _lookup_cached_index
+def _store_lookup_entry(frame: _FrameRows, rows: list[tuple[str, str, int]]) -> None:
+    """Store frame + normalized index atomically with one timestamp."""
+    global _lookup_cached_at, _lookup_cached_frame, _lookup_cached_index
     with _lookup_lock:
+        _lookup_cached_frame = frame
         _lookup_cached_index = rows
         _lookup_cached_at = time.monotonic()
 
@@ -963,10 +964,11 @@ def _cached_lookup_frame() -> _FrameRows | None:
 
 
 def _store_lookup_frame(frame: _FrameRows) -> None:
-    """Cache one lookup frame with a fresh timestamp."""
-    global _lookup_cached_at, _lookup_cached_frame
+    """Cache one lookup frame; the index rebuilds on next scan."""
+    global _lookup_cached_at, _lookup_cached_frame, _lookup_cached_index
     with _lookup_lock:
         _lookup_cached_frame = frame
+        _lookup_cached_index = None
         _lookup_cached_at = time.monotonic()
 
 
@@ -1045,7 +1047,7 @@ def _scan_lookup_rows(frame: _FrameRows, query: str, want: str) -> list[tuple[in
         if cached is not None:
             return _scan_lookup_index(cached, want)
         index = _build_lookup_index(frame)
-        _store_lookup_index(index)
+        _store_lookup_entry(frame, index)
         return _scan_lookup_index(index, want)
     except Exception as exc:
         raise SECClientError(f"cik lookup parse failed for {query!r}: {exc}") from exc
