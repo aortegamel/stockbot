@@ -205,6 +205,8 @@ _INTAKE_SEC_FORMS = ("8-K", "10-Q", "10-K", "4")
 _INTAKE_SEC_LIMIT = 5
 _INTAKE_DIGEST_CHARS = 6000
 _INTAKE_MAX_ROUNDS = 2
+_INTAKE_CALL_TIMEOUT_S = 30.0
+_INTAKE_BUDGET_S = 20.0
 
 
 def _ev_field(ev: Mapping[str, object], *names: str) -> str:
@@ -335,7 +337,9 @@ def _propose_questions(objective: str, as_of: str | None, objective_id: str) -> 
     Legacy single-shot helper; the intake path uses _reasoner_decompose_with_retry.
     """
     # ponytail: no retry/backoff on model outage; single-node fallback keeps research live.
-    missing = [k for k in ("OPENCODE_API_KEY", "OPENCODE_MODEL", "OPENCODE_URL") if not (os.environ.get(k) or "").strip()]
+    missing = [
+        k for k in ("OPENCODE_API_KEY", "OPENCODE_MODEL", "OPENCODE_URL") if not (os.environ.get(k) or "").strip()
+    ]
     if missing:
         raise RuntimeError(f"opencode_unavailable: missing {', '.join(missing)}")
     try:
@@ -550,8 +554,16 @@ async def _intake_round(
 
     async def _timed(tool: str, args: dict[str, object]) -> tuple[dict[str, object], float]:
         start = _time.perf_counter()
+        record: dict[str, object]
         try:
-            record = await _intake_attempt(tool, args, sid, session, registry, jev, kernel, as_of)
+            # ponytail: timed-out thread keeps running; result discarded, logged as timeout.
+            record = await asyncio.wait_for(
+                _intake_attempt(tool, args, sid, session, registry, jev, kernel, as_of),
+                timeout=_INTAKE_CALL_TIMEOUT_S,
+            )
+        except TimeoutError:
+            logger.warning("intake timeout tool=%s timeout_s=%s", tool, _INTAKE_CALL_TIMEOUT_S)
+            record = {"tool": tool, "arguments": dict(args), "error": "intake_timeout", "error_type": "timeout"}
         finally:
             taken = (_time.perf_counter() - start) * 1000.0
         return record, taken
@@ -568,7 +580,19 @@ async def _intake_round(
     if query_text is not None:
         calls.append(("search_web", {"query": query_text}))
     _notify(progress, "intake_start", {"calls": len(calls)})
-    timed = await asyncio.gather(*(_timed(tool, args) for tool, args in calls))
+    tasks = {asyncio.ensure_future(_timed(tool, args)): (tool, args) for tool, args in calls}
+    # ponytail: overall budget keeps whatever finished; stragglers log as timeout.
+    done, _pending = await asyncio.wait(set(tasks), timeout=_INTAKE_BUDGET_S if calls else 0.0)
+    timed: list[tuple[dict[str, object], float]] = []
+    for task, (tool, args) in tasks.items():
+        if task in done:
+            timed.append(task.result())
+        else:
+            task.cancel()
+            logger.warning("intake budget timeout tool=%s budget_s=%s", tool, _INTAKE_BUDGET_S)
+            timed.append(
+                ({"tool": tool, "arguments": dict(args), "error": "intake_timeout", "error_type": "timeout"}, 0.0)
+            )
     ms_total = sum(taken for _, taken in timed)
     from types import SimpleNamespace as _NS
 
