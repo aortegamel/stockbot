@@ -22,6 +22,7 @@ frozen import paths live in the ``_default_*`` resolvers.
 """
 
 import asyncio
+import functools
 import inspect
 import logging
 import re
@@ -29,6 +30,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
+
+_SEC_INTAKE_SEMAPHORE = asyncio.Semaphore(4)
 
 logger = logging.getLogger(__name__)
 
@@ -1989,17 +1992,22 @@ async def _invoke_attempt_tool(
     job_id: str,
 ) -> tuple[dict[str, Any], Any]:
     """ToolRuntime invoke + outcome mapping; raises when the runtime misbehaves."""
-    result = await _awaited(
-        invoke(
-            tool_name,
-            dict(arguments),
-            tool_session,
-            tool_call_id=f"{node_id}:{tool_name}:{uuid.uuid4().hex[:8]}",
-            as_of=as_of,
-            active_research_session_id=session_id,
-            active_research_job_id=job_id,
-        )
+    call = functools.partial(
+        invoke,
+        tool_name,
+        dict(arguments),
+        tool_session,
+        tool_call_id=f"{node_id}:{tool_name}:{uuid.uuid4().hex[:8]}",
+        as_of=as_of,
+        active_research_session_id=session_id,
+        active_research_job_id=job_id,
     )
+    if inspect.iscoroutinefunction(invoke):
+        result = await _awaited(call())
+    else:
+        # ponytail: sync gateway blocks the loop; threads overlap, Needle's _LOCK stays serial.
+        async with _SEC_INTAKE_SEMAPHORE:
+            result = await asyncio.to_thread(call)
     if not isinstance(result, dict):
         raise ValueError(f"tool runtime for {tool_name!r} must return a mapping")
     return result, await _awaited(to_outcome(tool_name, result))
