@@ -155,12 +155,22 @@ export async function reason(opts: {
     { role: "system", content: system },
     { role: "user", content: user },
   ];
+  const body = { model, input, stream: true };
   try {
-    const r = await post(base, apiKey, session, "/responses", { model, input, stream: true }, opts.onDelta);
+    const r = await post(base, apiKey, session, "/responses", body, opts.onDelta);
     return { ...r, missingEvidence: /^Missing-Evidence:\s*(.+)$/m.exec(r.text)?.[1] };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (!/(404|405|429|500|502|503|504)/.test(msg)) throw err;
+    // ponytail: 429 is a usage window, not a wrong route — retry the same endpoint
+    // once after a short wait; only 404/405 (unsupported path) falls over.
+    if (/(429|GoUsageLimit)/.test(msg)) {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      setTimeout(resolve, 5000);
+      await promise;
+      const r = await post(base, apiKey, session, "/responses", body, opts.onDelta);
+      return { ...r, missingEvidence: /^Missing-Evidence:\s*(.+)$/m.exec(r.text)?.[1] };
+    }
+    if (!/(404|405|500|502|503|504)/.test(msg)) throw err;
     const r = await post(
       base,
       apiKey,

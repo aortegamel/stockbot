@@ -473,16 +473,34 @@ def test_timeout_record_without_job_id_skips_settle(monkeypatch: pytest.MonkeyPa
 
 
 def test_reasoner_quota_no_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Free-tier/billing markers fast-fail; 429 usage windows retry once then succeed."""
     calls = {"n": 0}
 
     def fake_decompose(self: object, prompt: str, objective_id: str) -> dict[str, object]:
         calls["n"] += 1
-        raise RuntimeError("429 monthly limit exceeded, quota exhausted")
+        raise RuntimeError("FreeUsageLimitError: subscribe to continue")
 
     monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", fake_decompose)
     proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
     assert calls["n"] == 1 and hints.get("fallback") == "reasoner_quota"
     assert len(proposals) == 1
+
+
+def test_reasoner_rate_limit_retries_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 429 Go usage window retries once; a spent window fails again as failed_twice."""
+    calls = {"n": 0}
+    good = {"id": "rs:t-q1", "objectiveId": "rs:t", "question": "Q?", "dependsOn": [], "whyItMatters": "W"}
+
+    def fake_decompose(self: object, prompt: str, objective_id: str) -> dict[str, object]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("429 Go usage limit exceeded, monthly window")
+        return {"proposals": [good]}
+
+    monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", fake_decompose)
+    proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
+    assert calls["n"] == 2 and [p["id"] for p in proposals] == ["rs:t-q1"]
+    assert "fallback" not in hints
 
 
 def test_reasoner_transient_retries_once(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -530,10 +548,12 @@ def test_reasoner_timeout_returns_without_waiting(monkeypatch: pytest.MonkeyPatc
 
 
 def test_quota_detector_ignores_digit_soup() -> None:
-    """14299 in a URL/id is not quota; standalone 429 and GoUsageLimitError are."""
+    """14299 in a URL/id is neither quota nor rate-limit; 429 is rate, free-tier is quota."""
     assert kw._is_quota_error(RuntimeError("see https://x/14299"), "see https://x/14299") is False
-    assert kw._is_quota_error(RuntimeError("429 too many requests"), "429 too many requests") is True
-    assert kw._is_quota_error(type("GoUsageLimitError", (RuntimeError,), {})("x"), "x") is True
+    assert kw._is_rate_limited(RuntimeError("see https://x/14299"), "see https://x/14299") is False
+    assert kw._is_rate_limited(RuntimeError("429 too many requests"), "429 too many requests") is True
+    assert kw._is_rate_limited(type("GoUsageLimitError", (RuntimeError,), {})("x"), "x") is True
+    assert kw._is_quota_error(RuntimeError("FreeUsageLimitError subscribe"), "freeusagelimit subscribe") is True
 
 
 def test_quota_like_transient_still_retries(monkeypatch: pytest.MonkeyPatch) -> None:

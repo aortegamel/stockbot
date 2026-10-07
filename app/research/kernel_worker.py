@@ -502,14 +502,22 @@ def _harvest_hints(out: dict[str, object]) -> dict[str, object]:
     return hints
 
 
-_QUOTA_RE = re.compile(r"(?:^|\D)(429)(?:\D|$)|usage.limit|monthly.limit|quota|rate.limit|too.many.requests")
+_RATE_RE = re.compile(r"(?:^|\D)(429)(?:\D|$)|usage.limit|monthly.limit|rate.limit|too.many.requests")
+_QUOTA_RE = re.compile(r"free.usage|freeusagelimit|subscribe|billing|payment.required|quota.exhausted")
+
+
+def _is_rate_limited(exc: BaseException, msg: str) -> bool:
+    """Retryable throttle: Go usage windows / 429 / rate markers. A spent window fails again fast."""
+    if "gousagelimit" in type(exc).__name__.lower():
+        return True
+    return bool(_RATE_RE.search(msg))
 
 
 def _is_quota_error(exc: BaseException, msg: str) -> bool:
-    """Quota/usage-limit signal: type name or a standalone 429/quota marker, never digit soup."""
-    if "gousagelimit" in type(exc).__name__.lower():
+    """Terminal quota: free-tier / billing / subscribe markers only, never digit soup or rate windows."""
+    if "freeusagelimit" in type(exc).__name__.lower():
         return True
-    return _QUOTA_RE.search(msg) is not None
+    return bool(_QUOTA_RE.search(msg))
 
 
 def _close_bootstrap_job(sid: str) -> None:
@@ -573,12 +581,15 @@ def _reasoner_decompose_with_retry(
             )
             if isinstance(exc, _futures.TimeoutError):
                 return _fallback_single(objective, objective_id), {"fallback": "reasoner_timeout"}
-            # ponytail: config errors never retry; transport errors get one resend.
+            # ponytail: config/quota never retry; throttles and transport get one resend.
             msg = str(exc).lower()
             if "opencode_unavailable" in msg or "missing opencode" in msg:
                 return _fallback_single(objective, objective_id), {"fallback": "reasoner_config"}
             if _is_quota_error(exc, msg):
                 return _fallback_single(objective, objective_id), {"fallback": "reasoner_quota"}
+            if _is_rate_limited(exc, msg):
+                _notify(progress, "reasoner_retry", {"attempt": 2, "reason": "rate_limited"})
+                continue
             if attempt >= 2:
                 return _fallback_single(objective, objective_id), {"fallback": "reasoner_failed_twice"}
             _notify(progress, "reasoner_retry", {"attempt": 2})
