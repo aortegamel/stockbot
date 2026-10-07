@@ -22,42 +22,25 @@ frozen import paths live in the ``_default_*`` resolvers.
 """
 
 import asyncio
+import concurrent.futures as _futures
 import functools
 import inspect
 import logging
 import re
-import threading as _threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-_SEC_THREAD_SEMAPHORE = _threading.BoundedSemaphore(4)
-_SEC_INTAKE_SEMAPHORE = _SEC_THREAD_SEMAPHORE
+# ponytail: 4 SEC workers max; pool size IS the cap (no semaphore to deadlock).
+# Module-level pool: never the loop's default executor, so asyncio.run never waits
+# for stragglers and wait_for cancellation returns immediately.
+_SEC_POOL = _futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="sec-gateway")
 
 
 async def _sec_thread_call(call: Any) -> Any:
-    """Sync SEC call under the process-wide cap; the worker thread owns the permit."""
-    worker: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-
-    def _run() -> None:
-        # ponytail: sole acquire site; outer acquire would take 2 permits per call and
-        # deadlock at 4 concurrent calls. Inner ownership also survives wait_for
-        # cancellation: the thread finishes and releases via the with block.
-        with _SEC_THREAD_SEMAPHORE:
-            if not worker.done():
-                try:
-                    worker.set_result(call())
-                except BaseException as exc:  # noqa: BLE001 - transport errors ride the future
-                    if not worker.done():
-                        worker.set_exception(exc)
-
-    runner: asyncio.Future[None] = asyncio.ensure_future(asyncio.to_thread(_run))
-    try:
-        return await asyncio.shield(worker)
-    finally:
-        if not runner.done():
-            await runner
+    """Sync SEC call on the 4-worker pool; cancel-safe, never blocks loop shutdown."""
+    return await asyncio.get_running_loop().run_in_executor(_SEC_POOL, call)
 
 
 logger = logging.getLogger(__name__)

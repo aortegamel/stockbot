@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
+import pytest
+
 from app.research import scheduler as sched
 
 
@@ -1382,6 +1384,49 @@ def test_sec_thread_cap_survives_four_concurrent_calls() -> None:
         return await asyncio.gather(*(_call(i) for i in range(5)))
 
     assert sorted(asyncio.run(_main())) == ["r0", "r1", "r2", "r3", "r4"]
+
+
+def test_sec_thread_call_timeout_returns_promptly() -> None:
+    """A 4s SEC call under a 0.5s timeout raises at ~0.5s, not 4s (executor fix)."""
+    import time
+
+    async def _main() -> None:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(sched._sec_thread_call(lambda: time.sleep(4)), timeout=0.5)
+
+    start = time.perf_counter()
+    asyncio.run(_main())
+    assert time.perf_counter() - start < 2.0
+
+
+def test_sec_pool_caps_concurrency_at_four() -> None:
+    """12 submitted SEC calls peak at exactly 4 concurrent workers."""
+    import threading
+    import time
+
+    peak = {"n": 0, "live": 0}
+    lock = threading.Lock()
+    full = threading.Event()
+
+    def _work(i: int) -> int:
+        with lock:
+            peak["live"] += 1
+            peak["n"] = max(peak["n"], peak["live"])
+            if peak["live"] >= 4:
+                full.set()
+        try:
+            assert full.wait(timeout=10)
+            time.sleep(0.05)
+            return i
+        finally:
+            with lock:
+                peak["live"] -= 1
+
+    async def _main() -> list[int]:
+        return await asyncio.gather(*[sched._sec_thread_call(lambda i=i: _work(i)) for i in range(12)])
+
+    assert sorted(asyncio.run(_main())) == list(range(12))
+    assert peak["n"] == 4
 
 
 def test_session_run_survives_second_event_loop() -> None:
