@@ -573,8 +573,10 @@ def test_decision_variants(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
         "t",
     )
     assert other["tool"] is None and other["withheld"] is False
-    plain = srv._decision({"type": "noul", "function_calls": [], "suppressed_calls": []}, "t")
-    assert plain["tool"] is None and plain["withheld"] is False
+    empty = srv._decision({"type": "call", "function_calls": [], "suppressed_calls": []}, "t")
+    assert empty["tool"] is None and empty["withheld"] is False
+    missing = srv._decision({"type": "call"}, "t")
+    assert missing["tool"] is None and missing["withheld"] is False
 
 
 def test_generate_withheld_accept_and_timeout(monkeypatch: pytest.MonkeyPatch) -> None:

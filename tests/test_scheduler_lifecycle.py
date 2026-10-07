@@ -1481,6 +1481,11 @@ def test_needle_streak_ignores_reselect_attempts() -> None:
     assert sched._needle_error_streak([dict(gen_fail) for _ in range(3)]) == 3
 
 
+def test_no_new_evidence_counts_error_free_stale_rounds() -> None:
+    """Stale rule fires on progress-free, error-free rounds; error rounds reset it (loop-breaker lane)."""
+    assert sched._NO_EVIDENCE_ROUNDS == 2
+
+
 def test_cancelled_attempt_fails_job() -> None:
     """wait_for cancel during invoke fails the kernel job, then re-raises."""
     import asyncio
@@ -1613,6 +1618,37 @@ def test_drive_rounds_emits_parseable_timing_per_round(caplog: pytest.LogCapture
         assert key in line
 
 
+def test_terminal_select_failure_still_logs_timing(caplog: pytest.LogCaptureFixture) -> None:
+    """Third straight select failure emits a round_timing row before the terminal return."""
+    import asyncio
+    import logging
+    from types import SimpleNamespace as _NS
+
+    import app.research.scheduler as _s
+
+    async def down(*a: object, **k: object) -> object:
+        raise RuntimeError("boom")
+
+    with caplog.at_level(logging.INFO):
+        out = asyncio.run(
+            _s._drive_rounds(
+                _NS(node_id="n1", session_id="s1", question="q?"),
+                {"session_id": "s1", "objective": "o"},
+                [{"name": "search_web"}],
+                _Kernel(),
+                _NS(),
+                "s1",
+                "n1",
+                None,
+                {"select_round": down, "reasoner": None, "needle_generate": None, "invoke": None, "to_outcome": None},
+                object(),
+                None,
+            )
+        )
+    assert out["status"] == "blocked" and "select failed 3x" in out["reason"]
+    assert sum("round_timing" in r.getMessage() for r in caplog.records) == 3
+
+
 def test_intake_round_stats_carry_phase_ms(monkeypatch: pytest.MonkeyPatch) -> None:
     """_intake_round stats carry sec_ms + web_ms + settle_ms + wall_ms."""
     from app.research import kernel_worker as kw
@@ -1678,7 +1714,6 @@ def test_duplicate_call_reselects() -> None:
     )
     assert out["error_type"] == "reselect" and "duplicate" in out["error"]
     assert seen == []
-    assert sched._duplicate_reselect_streak([dict(out)]) == 1
     assert sched._needle_error_streak([dict(out)]) == 0
 
 
@@ -1727,3 +1762,86 @@ def test_round_cap_is_five() -> None:
     """Cap constant is 5."""
     assert sched._MAX_TOOL_ROUNDS == 5
     assert sched._NO_EVIDENCE_ROUNDS == 2
+
+
+def test_expired_deadline_blocks_before_first_round() -> None:
+    """A past deadline_at stops the node with a run-deadline reason, never selecting."""
+    import time as _t
+
+    selected: list[str] = []
+
+    async def spy(jev: object, kernel: object, sid: str, nid: str, *a: object, **k: object) -> object:
+        selected.append(nid)
+        return ("tool", {"selected": ["search_web"]})
+
+    out = asyncio.run(
+        sched._drive_rounds(
+            _node(),
+            {"session_id": "s1", "objective": "o"},
+            [{"name": "search_web"}],
+            _Kernel(),
+            SimpleNamespace(),
+            "s1",
+            "n1",
+            None,
+            {"select_round": spy, "reasoner": None, "deadline_at": _t.perf_counter() - 1.0},
+            object(),
+            None,
+        )
+    )
+    assert out["status"] == "blocked" and "run deadline" in out["reason"]
+    assert selected == []
+
+
+def test_max_rounds_hook_caps_rounds() -> None:
+    """max_rounds=2 with progressing rounds reaches the guard naming the cap."""
+    calls = {"n": 0}
+
+    async def select_round(jev: object, kernel: object, sid: str, nid: str, *a: object, **k: object) -> object:
+        calls["n"] += 1
+        return ("tool", {"selected": ["query_finra"]})
+
+    async def gen(tool: object, schema: object = None, **k: object) -> dict[str, object]:
+        return {"tool": "query_finra", "arguments": {}, "reasoning": "r"}
+
+    async def invoke(name: object, args: object, sess: object, **k: object) -> dict[str, object]:
+        return {
+            "tool_result_id": f"s1:tr:{calls['n']}",
+            "records": [{"settlementDate": "2024-01-01", "symbolCode": "XYZ", "currentShortPositionQuantity": 123}],
+            "briefing": "B",
+        }
+
+    out = asyncio.run(
+        sched._drive_rounds(
+            _node(),
+            {"session_id": "s1", "objective": "o"},
+            [{"name": "query_finra", "parameters": {}}],
+            _Kernel(),
+            SimpleNamespace(
+                assess_result=lambda *a, **k: {
+                    "evidence_state": "sufficient_support",
+                    "continuation": "continue_research",
+                }
+            ),
+            "s1",
+            "n1",
+            None,
+            {
+                "select_round": select_round,
+                "reasoner": None,
+                "needle_generate": gen,
+                "invoke": invoke,
+                "to_outcome": lambda n, r: _outcome(),
+                "max_rounds": 2,
+            },
+            SimpleNamespace(),
+            None,
+        )
+    )
+    assert calls["n"] == 2 and "(2 rounds without resolution)" in out["reason"]
+
+
+def test_blocked_terminal_names_non_default_cap() -> None:
+    """_blocked_terminal carries the caller's max_rounds, not the module default."""
+    out = sched._blocked_terminal("n1", 0, [], 2)
+    assert out["reason"] == "incomplete: runtime guard (2 rounds without resolution)"

@@ -499,3 +499,34 @@ def test_reasoner_transient_retries_once(monkeypatch: pytest.MonkeyPatch) -> Non
     proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
     assert calls["n"] == 2 and [p["id"] for p in proposals] == ["rs:t-q1"]
     assert "fallback" not in hints
+
+
+def test_intake_budget_and_reasoner_timeouts_pinned() -> None:
+    """Intake caps: 15s budget, 15s call timeout, 45s Reasoner decompose bound."""
+    assert kw._INTAKE_BUDGET_S == 15.0
+    assert kw._INTAKE_CALL_TIMEOUT_S == 15.0
+    assert kw._INTAKE_REASONER_TIMEOUT_S == 45.0
+
+
+def test_quota_detector_ignores_digit_soup() -> None:
+    """14299 in a URL/id is not quota; standalone 429 and GoUsageLimitError are."""
+    assert kw._is_quota_error(RuntimeError("see https://x/14299"), "see https://x/14299") is False
+    assert kw._is_quota_error(RuntimeError("429 too many requests"), "429 too many requests") is True
+    assert kw._is_quota_error(type("GoUsageLimitError", (RuntimeError,), {})("x"), "x") is True
+
+
+def test_quota_like_transient_still_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 14299 id error retries once and succeeds; only true quota fast-fails."""
+    calls = {"n": 0}
+    good = {"id": "rs:t-q1", "objectiveId": "rs:t", "question": "Q?", "dependsOn": [], "whyItMatters": "W"}
+
+    def fake_decompose(self: object, prompt: str, objective_id: str) -> dict[str, object]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("request id 14299 failed, retry me")
+        return {"proposals": [good]}
+
+    monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", fake_decompose)
+    proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
+    assert calls["n"] == 2 and [p["id"] for p in proposals] == ["rs:t-q1"]
+    assert "fallback" not in hints

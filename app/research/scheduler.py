@@ -175,6 +175,9 @@ except ImportError:  # ponytail: contract stub until ToolSelect lands reasoner
 # ponytail: tight node budget; a trip blocks as visibly incomplete, never convergence.
 _MAX_TOOL_ROUNDS = 5
 
+# ponytail: 120s wall ceiling; stop starting new rounds after ~90s, finalize by 120s.
+_RUN_DEADLINE_S = 90.0
+
 # ponytail: consecutive rounds with no new evidence before the node stops.
 _NO_EVIDENCE_ROUNDS = 2
 
@@ -2877,7 +2880,7 @@ async def _assess_attempt(
     sid: str,
     nid: str,
     job_id: str,
-) -> dict[str, Any]:
+) -> tuple[Any, float]:
     """JEV result assessment with its decision record."""
     _t0 = _time.perf_counter()
     try:
@@ -3100,6 +3103,7 @@ async def _settle_round(
             kernel, sid, tool, attempt, outcome, ev_state, repo
         )
         if admit_failure is not None:
+            admit_failure["assess_ms"] = assess_ms
             attempts.append(admit_failure)
             continue
         if made_progress:
@@ -3281,12 +3285,16 @@ def _node_hooks(hooks: dict[str, Any]) -> dict[str, Any]:
         "invoke": hooks.get("invoke") or execute_agent_tool,
         "to_outcome": hooks.get("to_outcome") or _to_outcome,
         "select_round": hooks.get("select_round"),
+        "max_rounds": hooks.get("max_rounds"),
+        "deadline_at": hooks.get("deadline_at"),
     }
 
 
-def _blocked_terminal(nid: str, admitted: int, attempts: list[dict[str, Any]]) -> dict[str, Any]:
+def _blocked_terminal(
+    nid: str, admitted: int, attempts: list[dict[str, Any]], max_rounds: int = _MAX_TOOL_ROUNDS
+) -> dict[str, Any]:
     """Runtime-guard payload: visibly incomplete, never convergence."""
-    reason = f"incomplete: runtime guard ({_MAX_TOOL_ROUNDS} rounds without resolution)"
+    reason = f"incomplete: runtime guard ({max_rounds} rounds without resolution)"
     return {
         "node_id": nid,
         "status": "blocked",
@@ -3319,18 +3327,6 @@ def _is_duplicate_call(attempts: list[dict[str, Any]], tool: str, args: Any) -> 
     return isinstance(args, dict) and any(
         isinstance(a, dict) and a.get("tool") == tool and a.get("arguments") == args for a in attempts
     )
-
-
-def _duplicate_reselect_streak(attempts: list[dict[str, Any]]) -> int:
-    """Consecutive duplicate-guard reselections at the tail."""
-    n = 0
-    for attempt in reversed(attempts):
-        if not isinstance(attempt, dict) or attempt.get("error_type") != "reselect":
-            break
-        if "duplicate" not in str(attempt.get("error") or ""):
-            break
-        n += 1
-    return n
 
 
 def _needle_error_streak(attempts: list[dict[str, Any]]) -> int:
@@ -3397,13 +3393,27 @@ async def _drive_rounds(
     progress: Any = None,
 ) -> dict[str, Any]:
     """Drive select/round/settle until resolved, stalled, or the runtime guard trips."""
+    max_rounds = executors.get("max_rounds") if isinstance(executors, dict) else None
+    max_rounds = max_rounds if isinstance(max_rounds, int) and max_rounds > 0 else _MAX_TOOL_ROUNDS
+    deadline_at = executors.get("deadline_at") if isinstance(executors, dict) else None
+    deadline_at = deadline_at if isinstance(deadline_at, float) else _time.perf_counter() + _RUN_DEADLINE_S
     evidence = _load_evidence(sid, kernel, repo)
     attempts: list[dict[str, Any]] = []
     admitted = 0
     select_failures = 0
     stale_rounds = 0
 
-    for round_no in range(1, _MAX_TOOL_ROUNDS + 1):
+    for round_no in range(1, max_rounds + 1):
+        if _time.perf_counter() >= deadline_at:
+            _block(kernel, sid, nid, f"incomplete: run deadline reached before round {round_no}")
+            return {
+                "node_id": nid,
+                "status": "blocked",
+                "reason": f"incomplete: run deadline reached before round {round_no}",
+                "incomplete_guard": True,
+                "admitted": admitted,
+                "attempts": attempts,
+            }
         # Working state: admitted evidence + recent unadmitted observations, never dropped.
         ctx_evidence = _context_evidence(evidence, attempts, cap_last=5 if select_failures else None)
         guidance = _selection_guidance(ctx_evidence, attempts)
@@ -3462,6 +3472,7 @@ async def _drive_rounds(
             attempts.append(_reselect_attempt(f"select failed ({err}); retrying with trimmed history"))
             if select_failures >= 3:
                 _block(kernel, sid, nid, f"incomplete: select failed 3x in a row ({err})")
+                _log_round_timing(sid, nid, round_no, None, attempts, ev_before, evidence, select_ms)
                 return {
                     "node_id": nid,
                     "status": "blocked",
@@ -3542,12 +3553,12 @@ async def _drive_rounds(
         "toolflow drive sid=%s nid=%s rounds_used=%s stop=%s admitted=%s",
         sid,
         nid,
-        _MAX_TOOL_ROUNDS,
+        max_rounds,
         "runtime_guard",
         admitted,
     )
-    _block(kernel, sid, nid, f"incomplete: runtime guard ({_MAX_TOOL_ROUNDS} rounds without resolution)")
-    return _blocked_terminal(nid, admitted, attempts)
+    _block(kernel, sid, nid, f"incomplete: runtime guard ({max_rounds} rounds without resolution)")
+    return _blocked_terminal(nid, admitted, attempts, max_rounds)
 
 
 async def _run_node(node: Any, session_id: str | None = None, **hooks: Any) -> dict[str, Any]:
@@ -3600,9 +3611,13 @@ async def run(session_id: str, **hooks: Any) -> dict[str, Any]:
     rounds = 0
     incomplete_guard = False
     guard_reason: str | None = None
+    deadline_at = _time.perf_counter() + _RUN_DEADLINE_S
     # ponytail: per-run cap; a module-level Semaphore binds to the first loop and breaks
     # the second asyncio.run request with "bound to a different event loop".
     cap = asyncio.Semaphore(2)
+    run_hooks = dict(hooks)
+    run_hooks["deadline_at"] = deadline_at
+    run_hooks["run_deadline_at"] = deadline_at
     while True:
         try:
             nodes = await _awaited(ready(session_id))
@@ -3612,12 +3627,25 @@ async def run(session_id: str, **hooks: Any) -> dict[str, Any]:
         if not nodes:
             break
         rounds += 1
+        remaining = deadline_at - _time.perf_counter()
+        if remaining <= 0:
+            incomplete_guard = True
+            guard_reason = f"incomplete: run deadline reached before session round {rounds}"
+            break
         # ponytail: absolute emergency ceiling only; a trip is visibly incomplete, never convergence.
         if rounds > _MAX_TOOL_ROUNDS:
             incomplete_guard = True
             guard_reason = f"incomplete: runtime guard ({_MAX_TOOL_ROUNDS} session rounds without convergence)"
             break
-        round_results = await asyncio.gather(*(_run_one_node(node, session_id, hooks, kernel, cap) for node in nodes))
+        try:
+            round_results = await asyncio.wait_for(
+                asyncio.gather(*(_run_one_node(node, session_id, run_hooks, kernel, cap) for node in nodes)),
+                timeout=max(remaining, 0.01),
+            )
+        except TimeoutError:
+            incomplete_guard = True
+            guard_reason = "incomplete: run deadline reached during session round"
+            break
         node_results.extend(round_results)
         round_guard = any(r.get("incomplete_guard") for r in round_results)
         if round_guard:

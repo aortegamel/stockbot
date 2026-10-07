@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 export type NeedleRouteResult = {
   tool: string | null;
   arguments: Record<string, unknown>;
+  withheld: boolean;
   confidence: number | null;
   reasoning: string;
 };
@@ -151,7 +152,8 @@ export class NeedleRouter {
       "arguments" in msg && typeof msg.arguments === "object" && msg.arguments !== null
         ? (msg.arguments as Record<string, unknown>)
         : {};
-    p.resolve({ tool, arguments: args, confidence, reasoning });
+    const withheld = "withheld" in msg && typeof msg.withheld === "boolean" ? msg.withheld : false;
+    p.resolve({ tool, arguments: args, withheld, confidence, reasoning });
   }
 
   private onData(chunk: string): void {

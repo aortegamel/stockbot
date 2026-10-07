@@ -234,7 +234,9 @@ def _decision(r, want=None):
     if not calls:
         calls = r.get("suppressed_calls") or []
         withheld = bool(calls)
-    if r.get("type") == "call" or (withheld and (calls[0].get("name") if isinstance(calls[0], dict) else None) == want):
+    if (r.get("type") == "call" and calls) or (
+        withheld and (calls[0].get("name") if isinstance(calls[0], dict) else None) == want
+    ):
         call = calls[0] if isinstance(calls[0], dict) else {}
         return {
             "tool": call.get("name"),

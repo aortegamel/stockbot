@@ -210,8 +210,9 @@ _INTAKE_SEC_FORMS = ("8-K", "10-Q", "10-K", "4")
 _INTAKE_SEC_LIMIT = 5
 _INTAKE_DIGEST_CHARS = 6000
 _INTAKE_MAX_ROUNDS = 2
-_INTAKE_CALL_TIMEOUT_S = 30.0
-_INTAKE_BUDGET_S = 20.0
+_INTAKE_CALL_TIMEOUT_S = 15.0
+_INTAKE_BUDGET_S = 15.0
+_INTAKE_REASONER_TIMEOUT_S = 45.0
 _INTAKE_DOC_TIMEOUT_S = 10.0
 _INTAKE_DOC_CHARS = 3000
 
@@ -499,6 +500,39 @@ def _harvest_hints(out: dict[str, object]) -> dict[str, object]:
     return hints
 
 
+_QUOTA_RE = None
+
+
+def _is_quota_error(exc: BaseException, msg: str) -> bool:
+    """Quota/usage-limit signal: type name or a standalone 429/quota marker, never digit soup."""
+    global _QUOTA_RE
+    if _QUOTA_RE is None:
+        import re as _re
+
+        _QUOTA_RE = _re.compile(r"(?:^|\D)(429)(?:\D|$)|usage.limit|monthly.limit|quota|rate.limit|too.many.requests")
+    if "gousagelimit" in type(exc).__name__.lower():
+        return True
+    return _QUOTA_RE.search(msg) is not None
+
+
+def _close_bootstrap_job(sid: str) -> None:
+    """Cancel the create_research bootstrap source job when still open; best-effort."""
+    try:
+        from app.research import service as _svc
+        from app.research.repository import ResearchRepository as _Repo
+
+        repo = _Repo()
+        for job in repo.list_jobs(sid):
+            if job.job_type == "source_agent" and job.status in ("queued", "running"):
+                try:
+                    _svc.cancel_job(job.job_id)
+                except Exception:  # noqa: BLE001 - best-effort cleanup, never aborts
+                    pass
+                break
+    except Exception:  # noqa: BLE001 - cleanup never fails the run
+        pass
+
+
 def _reasoner_decompose_with_retry(
     objective: str, as_of: str | None, objective_id: str, digest: str, progress: ProgressFn | None = None
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
@@ -512,13 +546,15 @@ def _reasoner_decompose_with_retry(
     )
     prompt = _intake_reasoner_prompt(objective_id, objective, as_of, digest)
     _notify(progress, "reasoner_start")
+    import concurrent.futures as _futures
     import time as _time
 
     out: dict[str, object] | None = None
     for attempt in (1, 2):
         _t0 = _time.perf_counter()
         try:
-            out = client.decompose(prompt, objective_id)
+            with _futures.ThreadPoolExecutor(max_workers=1) as _pool:
+                out = _pool.submit(client.decompose, prompt, objective_id).result(timeout=_INTAKE_REASONER_TIMEOUT_S)
             logger.info(
                 "intake reasoner_attempt sid=%s attempt=%s ok=%s ms=%.1f",
                 objective_id,
@@ -539,13 +575,7 @@ def _reasoner_decompose_with_retry(
             msg = str(exc).lower()
             if "opencode_unavailable" in msg or "missing opencode" in msg:
                 return _fallback_single(objective, objective_id), {"fallback": "reasoner_config"}
-            if (
-                "gousagelimit" in type(exc).__name__.lower()
-                or "429" in msg
-                or "usage limit" in msg
-                or "monthly limit" in msg
-                or "quota" in msg
-            ):
+            if _is_quota_error(exc, msg):
                 return _fallback_single(objective, objective_id), {"fallback": "reasoner_quota"}
             if attempt >= 2:
                 return _fallback_single(objective, objective_id), {"fallback": "reasoner_failed_twice"}
@@ -1417,12 +1447,15 @@ def _run(
             "jev": client,
             "needle_generate": _shared_needle_generate(),
             "progress": progress,
+            "max_rounds": 2,
         }
         if select_round is not None:
             run_kwargs["select_round"] = select_round
         run_result: dict[str, JSONValue] = asyncio.run(scheduler.run(sid, **run_kwargs))
     except Exception as exc:
         return _terminal(rid, "provider_error", f"kernel run failed: {exc}")
+    finally:
+        _close_bootstrap_job(sid)
     if not isinstance(run_result, dict):
         return _terminal(rid, "provider_error", "kernel run failed: malformed result")
     if run_result.get("status") == "failed":

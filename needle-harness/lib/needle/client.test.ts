@@ -67,8 +67,8 @@ describe("timeout isolation", () => {
     const sibling = seam.rawCall({ action: "sibling" }, "route", 1000);
     await expect(slow).rejects.toThrow("timeout");
     expect(killed).toBe(false);
-    seam.onLine(JSON.stringify({ id: "2", tool: null, arguments: {}, confidence: null, reasoning: "" }));
-    await expect(sibling).resolves.toEqual({ tool: null, arguments: {}, confidence: null, reasoning: "" });
+    seam.onLine(JSON.stringify({ id: "2", tool: null, arguments: {}, withheld: false, confidence: null, reasoning: "" }));
+    await expect(sibling).resolves.toEqual({ tool: null, arguments: {}, withheld: false, confidence: null, reasoning: "" });
     await router.close();
   });
 });
