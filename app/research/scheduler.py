@@ -1740,6 +1740,21 @@ def _repair_tool_arguments(
             tool_name,
             "query",
         )
+    if (
+        tool_name == "get_sec_document"
+        and isinstance(objective, str)
+        and ("item 1a" in objective.lower() or "risk factor" in objective.lower())
+        and not filled.get("section")
+        and not filled.get("query")
+    ):
+        filled["section"] = "Item 1A"
+        logger.info(
+            "toolflow args_seed sid=%s nid=%s tool=%s keys=%s",
+            sid,
+            nid,
+            tool_name,
+            "section",
+        )
     return filled
 
 
