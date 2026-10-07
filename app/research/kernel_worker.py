@@ -26,9 +26,11 @@ import importlib
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import threading
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -500,16 +502,11 @@ def _harvest_hints(out: dict[str, object]) -> dict[str, object]:
     return hints
 
 
-_QUOTA_RE = None
+_QUOTA_RE = re.compile(r"(?:^|\D)(429)(?:\D|$)|usage.limit|monthly.limit|quota|rate.limit|too.many.requests")
 
 
 def _is_quota_error(exc: BaseException, msg: str) -> bool:
     """Quota/usage-limit signal: type name or a standalone 429/quota marker, never digit soup."""
-    global _QUOTA_RE
-    if _QUOTA_RE is None:
-        import re as _re
-
-        _QUOTA_RE = _re.compile(r"(?:^|\D)(429)(?:\D|$)|usage.limit|monthly.limit|quota|rate.limit|too.many.requests")
     if "gousagelimit" in type(exc).__name__.lower():
         return True
     return _QUOTA_RE.search(msg) is not None
@@ -552,9 +549,9 @@ def _reasoner_decompose_with_retry(
     out: dict[str, object] | None = None
     for attempt in (1, 2):
         _t0 = _time.perf_counter()
+        _pool = _futures.ThreadPoolExecutor(max_workers=1)
         try:
-            with _futures.ThreadPoolExecutor(max_workers=1) as _pool:
-                out = _pool.submit(client.decompose, prompt, objective_id).result(timeout=_INTAKE_REASONER_TIMEOUT_S)
+            out = _pool.submit(client.decompose, prompt, objective_id).result(timeout=_INTAKE_REASONER_TIMEOUT_S)
             logger.info(
                 "intake reasoner_attempt sid=%s attempt=%s ok=%s ms=%.1f",
                 objective_id,
@@ -563,6 +560,9 @@ def _reasoner_decompose_with_retry(
                 (_time.perf_counter() - _t0) * 1000.0,
             )
         except Exception as exc:  # noqa: BLE001 - transport raises RuntimeError; config split below
+            # ponytail: result(timeout) only stops the wait; the late decompose still runs,
+            # so drop the pool without joining and never spend a second 45s on a stuck call.
+            _pool.shutdown(wait=False, cancel_futures=True)
             logger.info(
                 "intake reasoner_attempt sid=%s attempt=%s ok=%s ms=%.1f err=%.120s",
                 objective_id,
@@ -571,6 +571,8 @@ def _reasoner_decompose_with_retry(
                 (_time.perf_counter() - _t0) * 1000.0,
                 exc,
             )
+            if isinstance(exc, _futures.TimeoutError):
+                return _fallback_single(objective, objective_id), {"fallback": "reasoner_timeout"}
             # ponytail: config errors never retry; transport errors get one resend.
             msg = str(exc).lower()
             if "opencode_unavailable" in msg or "missing opencode" in msg:
@@ -581,6 +583,8 @@ def _reasoner_decompose_with_retry(
                 return _fallback_single(objective, objective_id), {"fallback": "reasoner_failed_twice"}
             _notify(progress, "reasoner_retry", {"attempt": 2})
             continue
+        else:
+            _pool.shutdown(wait=False, cancel_futures=True)
         raw = out.get("proposals") if isinstance(out, dict) else None
         if not isinstance(raw, list) or not raw:
             if attempt >= 2:
@@ -1434,6 +1438,8 @@ def _run(
     as_of = raw_as_of if isinstance(raw_as_of, str) else None
     objective = prompt.strip()
     client = jev if jev is not None else _shared_jev()
+    # ponytail: 120s wall ceiling from request start; scheduler gets whatever remains.
+    _t0 = time.perf_counter()
     try:
         sid = run_graph_prompt(objective, as_of, jev=client, progress=progress)
     except RuntimeError as exc:
@@ -1443,11 +1449,15 @@ def _run(
     except Exception as exc:
         return _terminal(rid, "provider_error", f"session setup failed: {exc}")
     try:
+        elapsed = time.perf_counter() - _t0
+        # ponytail: scheduler gets remaining wall time, minus 20s for finalizing.
+        remaining = max(120.0 - elapsed - 20.0, 5.0)
         run_kwargs: dict[str, object] = {
             "jev": client,
             "needle_generate": _shared_needle_generate(),
             "progress": progress,
             "max_rounds": 2,
+            "deadline_at": time.perf_counter() + remaining,
         }
         if select_round is not None:
             run_kwargs["select_round"] = select_round

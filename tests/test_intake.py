@@ -508,6 +508,27 @@ def test_intake_budget_and_reasoner_timeouts_pinned() -> None:
     assert kw._INTAKE_REASONER_TIMEOUT_S == 45.0
 
 
+def test_reasoner_timeout_returns_without_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stuck decompose returns reasoner_timeout after one bound, not two full waits."""
+    import time as _t
+
+    calls = {"n": 0}
+
+    def fake_decompose(self: object, prompt: str, objective_id: str) -> dict[str, object]:
+        calls["n"] += 1
+        _t.sleep(2)
+        return {"proposals": []}
+
+    monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", fake_decompose)
+    monkeypatch.setattr(kw, "_INTAKE_REASONER_TIMEOUT_S", 0.2)
+    t0 = _t.perf_counter()
+    proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
+    elapsed = _t.perf_counter() - t0
+    assert calls["n"] == 1 and hints.get("fallback") == "reasoner_timeout"
+    assert len(proposals) == 1
+    assert elapsed < 5.0
+
+
 def test_quota_detector_ignores_digit_soup() -> None:
     """14299 in a URL/id is not quota; standalone 429 and GoUsageLimitError are."""
     assert kw._is_quota_error(RuntimeError("see https://x/14299"), "see https://x/14299") is False

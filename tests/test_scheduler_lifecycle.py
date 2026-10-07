@@ -1793,6 +1793,59 @@ def test_expired_deadline_blocks_before_first_round() -> None:
     assert selected == []
 
 
+def test_run_honors_caller_deadline_at() -> None:
+    """A caller-supplied past deadline_at stops run() before selecting, and reaches nodes."""
+    import time as _t
+    from types import SimpleNamespace as _NS
+
+    selected: list[str] = []
+
+    class _K:
+        def ready_nodes(self, sid: str) -> list[_NS]:
+            return [_NS(node_id="n1", session_id=sid, question="q?")]
+
+        def block_node(self, sid: str, nid: str, reason: str = "") -> None:
+            selected.append(nid)
+
+    out = asyncio.run(sched.run("s1", kernel=_K(), deadline_at=_t.perf_counter() - 1.0))
+    assert out["status"] == "incomplete_guard" and "run deadline" in str(out.get("reason"))
+    assert out["nodes"] == [] and selected == []
+
+
+def test_mid_round_timeout_blocks_each_node() -> None:
+    """A deadline during the session round records a blocked result per in-flight node."""
+    import time as _t
+
+    from types import SimpleNamespace as _NS
+
+    blocked: list[str] = []
+
+    class _K:
+        def ready_nodes(self, sid: str) -> list[_NS]:
+            if not hasattr(self, "seen"):
+                self.seen = True
+                return [_NS(node_id="n1", session_id=sid, question="q?"), _NS(node_id="n2", session_id=sid)]
+            return []
+
+        def block_node(self, sid: str, nid: str, reason: str = "") -> None:
+            blocked.append(nid)
+
+    async def slow(node: object, session_id: str, hooks: dict, kernel: object, cap: object) -> dict:
+        import asyncio as _a
+
+        await _a.sleep(60)
+        return {"node_id": "?", "status": "resolved"}
+
+    import unittest.mock as _mock
+
+    with _mock.patch.object(sched, "_run_one_node", slow):
+        out = asyncio.run(sched.run("s1", kernel=_K(), deadline_at=_t.perf_counter() + 0.05))
+    assert out["status"] == "incomplete_guard" and "during session round" in str(out.get("reason"))
+    assert sorted(r["node_id"] for r in out["nodes"]) == ["n1", "n2"]
+    assert all(r["status"] == "blocked" and r.get("incomplete_guard") for r in out["nodes"])
+    assert sorted(blocked) == ["n1", "n2"]
+
+
 def test_max_rounds_hook_caps_rounds() -> None:
     """max_rounds=2 with progressing rounds reaches the guard naming the cap."""
     calls = {"n": 0}

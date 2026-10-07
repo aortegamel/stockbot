@@ -3611,7 +3611,8 @@ async def run(session_id: str, **hooks: Any) -> dict[str, Any]:
     rounds = 0
     incomplete_guard = False
     guard_reason: str | None = None
-    deadline_at = _time.perf_counter() + _RUN_DEADLINE_S
+    deadline_at = hooks.get("deadline_at")
+    deadline_at = deadline_at if isinstance(deadline_at, float) else _time.perf_counter() + _RUN_DEADLINE_S
     # ponytail: per-run cap; a module-level Semaphore binds to the first loop and breaks
     # the second asyncio.run request with "bound to a different event loop".
     cap = asyncio.Semaphore(2)
@@ -3619,8 +3620,17 @@ async def run(session_id: str, **hooks: Any) -> dict[str, Any]:
     run_hooks["deadline_at"] = deadline_at
     run_hooks["run_deadline_at"] = deadline_at
     while True:
+        remaining = deadline_at - _time.perf_counter()
+        if remaining <= 0:
+            incomplete_guard = True
+            guard_reason = f"incomplete: run deadline reached before session round {rounds + 1}"
+            break
         try:
-            nodes = await _awaited(ready(session_id))
+            nodes = await asyncio.wait_for(_awaited(ready(session_id)), timeout=max(remaining, 0.01))
+        except TimeoutError:
+            incomplete_guard = True
+            guard_reason = f"incomplete: run deadline reached before session round {rounds + 1}"
+            break
         except Exception as exc:
             return {"session_id": session_id, "status": "failed", "error": str(exc)[:500], "nodes": node_results}
         nodes = list(nodes) if isinstance(nodes, (list, tuple)) else []
@@ -3628,10 +3638,6 @@ async def run(session_id: str, **hooks: Any) -> dict[str, Any]:
             break
         rounds += 1
         remaining = deadline_at - _time.perf_counter()
-        if remaining <= 0:
-            incomplete_guard = True
-            guard_reason = f"incomplete: run deadline reached before session round {rounds}"
-            break
         # ponytail: absolute emergency ceiling only; a trip is visibly incomplete, never convergence.
         if rounds > _MAX_TOOL_ROUNDS:
             incomplete_guard = True
@@ -3643,8 +3649,19 @@ async def run(session_id: str, **hooks: Any) -> dict[str, Any]:
                 timeout=max(remaining, 0.01),
             )
         except TimeoutError:
+            # ponytail: wait_for cancels in-flight nodes; their tool jobs fail as timeout,
+            # so record a blocked result per node instead of dropping the round.
             incomplete_guard = True
             guard_reason = "incomplete: run deadline reached during session round"
+            for node in nodes:
+                nid = str(_f(node, "node_id", "id", default="?"))
+                try:
+                    _block(kernel, session_id, nid, guard_reason)
+                except Exception:
+                    pass
+                node_results.append(
+                    {"node_id": nid, "status": "blocked", "reason": guard_reason, "incomplete_guard": True}
+                )
             break
         node_results.extend(round_results)
         round_guard = any(r.get("incomplete_guard") for r in round_results)
