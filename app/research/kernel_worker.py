@@ -266,7 +266,8 @@ async def _intake_ticker_chain(
     start = _time.perf_counter()
     # ponytail: 10s doc deadline sits inside the 20s intake budget, so the
     # chain returns the finished list result itself; no shield, no CancelledError
-    # catch — real cancellations propagate and nothing orphans.
+    # catch — real cancellations propagate (a sync SEC call already running in
+    # its worker thread may still finish; only the coroutine is cancelled).
     try:
         doc = await asyncio.wait_for(
             _intake_attempt(
