@@ -156,11 +156,13 @@ def _section_spans(view: str) -> list[tuple[str, int, int]]:
 
 def _resolve_section(view: str, bounds: list[tuple[str, int, int]], section: str) -> tuple[str, str, int] | None:
     want = section.strip().lower()
+    best: tuple[str, str, int] | None = None
     for name, start, end in bounds:
         lowered = name.lower()
-        if want in lowered or lowered in want:
-            return view[start:end], name, start
-    return None
+        # TOC entries match first but carry ~30 chars; the body match wins on length.
+        if (want in lowered or lowered in want) and (best is None or (end - start) > len(best[0])):
+            best = (view[start:end], name, start)
+    return best
 
 
 def _select_section(view: str, section: str | None) -> tuple[str, str | None, int]:
