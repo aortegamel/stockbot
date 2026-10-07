@@ -2113,14 +2113,14 @@ async def _attempt_tool(
     needle_reasoning = ""
     try:
         _heartbeat_attempt(kernel, job_id)
-        if fixed_arguments is not None:
-            arguments = dict(fixed_arguments)
-            needle_reasoning = "fixed intake arguments; no Needle grounding needed"
-        else:
-            arguments, needle_reasoning = await _generate_tool_arguments(
-                needle_generate, tool_name, registry, session, node, evidence, attempts, as_of
-            )
         try:
+            if fixed_arguments is not None:
+                arguments = dict(fixed_arguments)
+                needle_reasoning = "fixed intake arguments; no Needle grounding needed"
+            else:
+                arguments, needle_reasoning = await _generate_tool_arguments(
+                    needle_generate, tool_name, registry, session, node, evidence, attempts, as_of
+                )
             result, outcome = await _invoke_attempt_tool(
                 invoke, to_outcome, tool_name, arguments, tool_session, node_id, session_id, as_of, job_id
             )

@@ -1120,6 +1120,52 @@ def test_lookup_cold_fetch_single_flight(monkeypatch: pytest.MonkeyPatch) -> Non
     assert outs == [frame] * 8 and calls["n"] == 1
 
 
+def test_lookup_waiters_reraise_leader_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed leader wakes waiters with its error; no per-caller recurse."""
+    import threading
+    import time
+
+    from edgar.entity import tickers
+
+    from app.sec import client
+
+    entered = threading.Event()
+
+    def _get_frame() -> object:
+        entered.set()
+        time.sleep(0.3)  # hold the fetch open so the waiter overlaps
+        raise ConnectionError("SEC down")
+
+    monkeypatch.setattr(client, "ensure_identity", lambda: None)
+    monkeypatch.setattr(tickers, "get_cik_lookup_data", _get_frame)
+    monkeypatch.setattr(client, "_lookup_cached_frame", None)
+    monkeypatch.setattr(client, "_lookup_cached_index", None)
+    monkeypatch.setattr(client, "_lookup_cached_at", 0.0)
+    monkeypatch.setattr(client, "_lookup_fetching", None)
+    monkeypatch.setattr(client, "_lookup_error", None)
+
+    barrier = threading.Barrier(2)
+    outs: list[object] = []
+
+    def _call() -> None:
+        barrier.wait(timeout=10)
+        try:
+            client._fetch_lookup_frame("Acme")
+        except Exception as exc:  # noqa: BLE001 - both paths must surface SECClientError
+            outs.append(exc)
+
+    threads = [threading.Thread(target=_call) for _ in range(2)]
+    start = time.monotonic()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    elapsed = time.monotonic() - start
+    assert not any(t.is_alive() for t in threads)
+    assert len(outs) == 2 and all(isinstance(e, client.SECClientError) for e in outs)
+    assert elapsed < 30  # one shared failure, never 120s per caller
+
+
 def test_drain_budget_stops_between_pages(monkeypatch: pytest.MonkeyPatch) -> None:
     from types import SimpleNamespace
 

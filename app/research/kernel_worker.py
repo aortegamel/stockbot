@@ -138,7 +138,8 @@ def _shutdown() -> None:
         close_fn()
     except (ImportError, AttributeError, OSError):
         pass
-    # ponytail: straggler SEC/tool threads never hold interpreter exit.
+    # ponytail: shutdown drops queued pool work without blocking; running calls
+    # still join at interpreter exit, so this bounds shutdown, not exit.
     try:
         from app.research import scheduler as _sched
 

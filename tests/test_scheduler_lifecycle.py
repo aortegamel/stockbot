@@ -1503,3 +1503,37 @@ def test_cancelled_attempt_fails_job() -> None:
     with pytest.raises(TimeoutError):
         asyncio.run(_main())
     assert ("fail", "job-0", "timeout") in kernel.calls  # cancelled job fails as timeout, never running
+
+
+def test_cancelled_generation_fails_job() -> None:
+    """wait_for cancel during Needle generation fails the kernel job, then re-raises."""
+    import asyncio
+
+    kernel = _Kernel()
+
+    async def _slow(*a: Any, **k: Any) -> Any:
+        await asyncio.sleep(60)
+        raise AssertionError("unreachable")
+
+    async def _main() -> None:
+        await asyncio.wait_for(
+            sched._attempt_tool(
+                tool_name="list_sec_filings",
+                node=_node(),
+                session={"session_id": "s1", "objective": "q"},
+                registry=[],
+                evidence=[],
+                attempts=[],
+                kernel=kernel,
+                needle_generate=_slow,
+                invoke=_slow,
+                to_outcome=lambda n, r: _outcome(),
+                tool_session=SimpleNamespace(),
+                as_of=None,
+            ),
+            timeout=0.05,
+        )
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(_main())
+    assert ("fail", "job-0", "timeout") in kernel.calls  # generation cancel fails as timeout, never running
