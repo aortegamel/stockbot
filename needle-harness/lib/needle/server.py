@@ -218,17 +218,35 @@ def _extract_decision(record_name, r, strict=True):
     }
 
 
-def _decision(r):
+def _noncall_detail(r):
+    """One-line detail for a Needle non-call: type, suppressed names, confidence, truncated reasoning."""
+    rtype = r.get("type")
+    suppressed = r.get("suppressed_calls") or []
+    names = [c.get("name") for c in suppressed if isinstance(c, dict)][:5]
+    conf = r.get("confidence")
+    reasoning = " ".join(str(r.get("reasoning") or "").split())[:200]
+    return f"type={rtype!r} suppressed={names!r} confidence={conf!r} reasoning={reasoning!r}"
+
+
+def _decision(r, want=None):
     calls = r.get("function_calls") or []
-    if r.get("type") == "call" and calls:
-        tool = calls[0]["name"]
-        args = calls[0].get("arguments") or {}
-    else:
-        tool = None
-        args = {}
+    withheld = False
+    if not calls:
+        calls = r.get("suppressed_calls") or []
+        withheld = bool(calls)
+    if r.get("type") == "call" or (withheld and (calls[0].get("name") if isinstance(calls[0], dict) else None) == want):
+        call = calls[0] if isinstance(calls[0], dict) else {}
+        return {
+            "tool": call.get("name"),
+            "arguments": call.get("arguments") or {},
+            "withheld": withheld,
+            "confidence": r.get("confidence"),
+            "reasoning": r.get("reasoning") or "",
+        }
     return {
-        "tool": tool,
-        "arguments": args,
+        "tool": None,
+        "arguments": {},
+        "withheld": False,
         "confidence": r.get("confidence"),
         "reasoning": r.get("reasoning") or "",
     }
@@ -326,7 +344,15 @@ def handle(line):
                     bound.close()
                 except Exception:
                     pass
-            validate_needle_tool(tool, _decision(r)["tool"])
+            decision = _decision(r, tool)
+            try:
+                validate_needle_tool(tool, decision["tool"])
+            except ValueError:
+                if decision["tool"] is None:
+                    raise ValueError(
+                        f"needle tool mismatch: jev selected {tool!r}, needle emitted None ({_noncall_detail(r)})"
+                    ) from None
+                raise
         elif action == "extract":
             # Structured extraction: one record shape in, typed fields out.
             # Never hands the full registry — the grammar admits exactly this record.
@@ -369,7 +395,7 @@ def handle(line):
         else:
             return {"id": rid, "error": "bad_action"}
         out = {"id": rid}
-        out.update(_decision(r))
+        out.update(decision if action == "arguments.generate" else _decision(r))
         return out
     except Exception as e:
         return {"id": rid, "error": str(e)}

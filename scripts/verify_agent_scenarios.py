@@ -498,6 +498,21 @@ def evaluate_and_record(
     )
 
 
+def _close_bootstrap_jobs(sid: str) -> None:
+    """Cancel bootstrap source jobs left running; a scenario run must not leak them."""
+    from app.research import service
+
+    from app.research.repository import ResearchRepository
+
+    repo = ResearchRepository()
+    for job in repo.list_jobs(sid):
+        if job.status in ("queued", "running"):
+            try:
+                service.cancel_job(job.job_id)
+            except Exception:  # noqa: BLE001 - best-effort cleanup, never aborts
+                pass
+
+
 def _run_kernel_scenario(
     scenario: Scenario, provider: str, model: str, prompt_version: str, timeout_s: int
 ) -> EvalInput:
@@ -516,7 +531,10 @@ def _run_kernel_scenario(
                     scenario.question, scenario.notes or scenario.question, as_of=scenario.as_of
                 )
                 node = service.create_node(sid, scenario.question, "Route question.")
-                asyncio.run(scheduler.run_node(node, session_id=sid))
+                try:
+                    asyncio.run(scheduler.run_node(node, session_id=sid))
+                finally:
+                    _close_bootstrap_jobs(sid)
             except Exception as exc:  # noqa: BLE001 - the verdict reports the crash, never hides it
                 print(f"CRASH {type(exc).__name__}: {exc}", file=sys.stderr)
                 return _crash_eval_input(scenario, (time.monotonic() - t0) * 1000.0)

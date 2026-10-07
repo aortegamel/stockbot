@@ -27,6 +27,7 @@ import functools
 import inspect
 import logging
 import re
+import time as _time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -171,9 +172,11 @@ except ImportError:  # ponytail: contract stub until ToolSelect lands reasoner
         async def expand(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
-# ponytail: absolute emergency ceiling only; normal stop is the JEV
-# resolved/continue/reason verdicts. A trip blocks as visibly incomplete, never convergence.
-_MAX_TOOL_ROUNDS = 10
+# ponytail: tight node budget; a trip blocks as visibly incomplete, never convergence.
+_MAX_TOOL_ROUNDS = 5
+
+# ponytail: consecutive rounds with no new evidence before the node stops.
+_NO_EVIDENCE_ROUNDS = 2
 
 # Amendment: JEV sees the whole canonical RESEARCH registry every selection.
 # Meta/ranking-layer tools: never in front of JEV (no search_tools, no ranking
@@ -1770,7 +1773,7 @@ async def _generate_tool_arguments(
     evidence: list[Any],
     attempts: list[dict[str, Any]],
     as_of: str | None,
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], str, bool]:
     schema = _schema_for(tool_name, registry)
     objective = session.get("objective") or session.get("query") or ""
     scope = session.get("temporal_scope")
@@ -1861,7 +1864,7 @@ async def _generate_tool_arguments(
                     tool_name,
                     carried.get("accession_no"),
                 )
-                return carried, "carried accession from packet after needle failure"
+                return carried, "carried accession from packet after needle failure", False
         seeded = _fallback_sec_args(tool_name, objective)
         if seeded is not None:
             logger.info(
@@ -1872,11 +1875,11 @@ async def _generate_tool_arguments(
                 ",".join(sorted(seeded)),
                 str(exc)[:80],
             )
-            return seeded, "seeded SEC identifier from objective ticker after needle failure"
+            return seeded, "seeded SEC identifier from objective ticker after needle failure", False
         if tool_name == "search_sec_filings":
             raise _search_reselect(objective, f"needle failure ({str(exc)[:80]}) and no ticker resolves") from exc
         raise
-    needle_tool, generated_args, needle_reasoning = _split_generated(tool_name, generated)
+    needle_tool, generated_args, needle_reasoning, withheld = _split_generated(tool_name, generated)
     try:
         _validate_needle_tool(tool_name, needle_tool)
     except ValueError:
@@ -1909,7 +1912,7 @@ async def _generate_tool_arguments(
                         tool_name,
                         carried.get("accession_no") if isinstance(carried, dict) else None,
                     )
-                    return carried, needle_reasoning
+                    return carried, needle_reasoning, False
             seeded = _fallback_sec_args(tool_name, objective)
             if seeded is not None:
                 logger.info(
@@ -1919,7 +1922,7 @@ async def _generate_tool_arguments(
                     tool_name,
                     ",".join(sorted(seeded)),
                 )
-                return seeded, "seeded SEC identifier from objective ticker after needle withhold"
+                return seeded, "seeded SEC identifier from objective ticker after needle withhold", False
         if needle_tool is None and tool_name == "search_sec_filings":
             raise _search_reselect(objective, "needle withheld and no ticker resolves") from None
         logger.info(
@@ -2001,7 +2004,7 @@ async def _generate_tool_arguments(
         tool_name,
         _toolflow_trunc(objective),
     )
-    return filled, needle_reasoning
+    return filled, needle_reasoning, withheld
 
 
 async def _invoke_attempt_tool(
@@ -2050,6 +2053,7 @@ def _success_attempt(
     domain: str,
     needle_reasoning: str,
     job_id: str,
+    withheld: bool = False,
 ) -> dict[str, Any]:
     """Attempt record for an executed tool; outcome.error rides along for pre-assess triage."""
     outcome_error = _f(outcome, "error")
@@ -2063,9 +2067,12 @@ def _success_attempt(
         "error": None if outcome_error is None else str(outcome_error)[:500],
         "error_type": _f(outcome, "error_type"),
         "reasoning": needle_reasoning[:2000],
+        "withheld": withheld,
         "job_id": job_id,
         "evidence_id": None,
         "tool_result_ref": _tool_result_ref(result, outcome),
+        "generate_ms": 0.0,
+        "tool_ms": 0.0,
     }
 
 
@@ -2084,6 +2091,8 @@ def _failed_attempt(
         "job_id": job_id,
         "evidence_id": None,
         "tool_result_ref": None,
+        "generate_ms": 0.0,
+        "tool_ms": 0.0,
     }
 
 
@@ -2111,6 +2120,9 @@ async def _attempt_tool(
     job_id = _attempt_job(kernel, session_id, domain)
     arguments: dict[str, Any] = {}
     needle_reasoning = ""
+    needle_withheld = False
+    generate_ms = 0.0
+    tool_ms = 0.0
     try:
         _heartbeat_attempt(kernel, job_id)
         try:
@@ -2118,17 +2130,45 @@ async def _attempt_tool(
                 arguments = dict(fixed_arguments)
                 needle_reasoning = "fixed intake arguments; no Needle grounding needed"
             else:
-                arguments, needle_reasoning = await _generate_tool_arguments(
-                    needle_generate, tool_name, registry, session, node, evidence, attempts, as_of
+                needle_withheld = False
+                _t0 = _time.perf_counter()
+                try:
+                    arguments, needle_reasoning, needle_withheld = await _generate_tool_arguments(
+                        needle_generate, tool_name, registry, session, node, evidence, attempts, as_of
+                    )
+                finally:
+                    generate_ms = (_time.perf_counter() - _t0) * 1000.0
+            if _is_duplicate_call(attempts, tool_name, arguments):
+                _fail_attempt_job(kernel, job_id, f"duplicate {tool_name} {arguments!r}; re-selecting")
+                return {
+                    "tool": tool_name,
+                    "arguments": {},
+                    "outcome": None,
+                    "outcome_summary": "",
+                    "error": f"duplicate tool call {tool_name} with identical arguments; re-selecting",
+                    "error_type": "reselect",
+                    "reasoning": needle_reasoning[:2000],
+                    "job_id": job_id,
+                    "evidence_id": None,
+                    "tool_result_ref": None,
+                }
+
+            _t1 = _time.perf_counter()
+            try:
+                result, outcome = await _invoke_attempt_tool(
+                    invoke, to_outcome, tool_name, arguments, tool_session, node_id, session_id, as_of, job_id
                 )
-            result, outcome = await _invoke_attempt_tool(
-                invoke, to_outcome, tool_name, arguments, tool_session, node_id, session_id, as_of, job_id
-            )
+            finally:
+                tool_ms = (_time.perf_counter() - _t1) * 1000.0
         except asyncio.CancelledError:
             # ponytail: wait_for/budget cancel orphans the kernel job; fail it so no job stays running.
             _fail_attempt_job(kernel, job_id, f"cancelled during {tool_name}", "timeout")
             raise
-        record = _success_attempt(tool_name, arguments, outcome, result, domain, needle_reasoning, job_id)
+        record = _success_attempt(
+            tool_name, arguments, outcome, result, domain, needle_reasoning, job_id, needle_withheld
+        )
+        record["generate_ms"] = generate_ms
+        record["tool_ms"] = tool_ms
         logger.info(
             "toolflow attempt sid=%s nid=%s tool=%s ok=%s err_type=%s retryable=%s",
             session_id,
@@ -2159,6 +2199,8 @@ async def _attempt_tool(
             "job_id": job_id,
             "evidence_id": None,
             "tool_result_ref": None,
+            "generate_ms": generate_ms,
+            "tool_ms": tool_ms,
         }
     except Exception as exc:
         _fail_attempt_job(kernel, job_id, str(exc))
@@ -2169,7 +2211,10 @@ async def _attempt_tool(
             tool_name,
             exc,
         )
-        return _failed_attempt(tool_name, arguments, needle_reasoning, job_id, exc)
+        rec = _failed_attempt(tool_name, arguments, needle_reasoning, job_id, exc)
+        rec["generate_ms"] = generate_ms
+        rec["tool_ms"] = tool_ms
+        return rec
 
 
 def _needle_takes_kwargs(fn: Any) -> bool:
@@ -2180,18 +2225,21 @@ def _needle_takes_kwargs(fn: Any) -> bool:
     return any(p.kind in (p.VAR_KEYWORD, p.KEYWORD_ONLY) or p.name in ("tool", "schema") for p in params.values())
 
 
-def _split_generated(jev_tool: str, generated: Any) -> tuple[Any, Any, str]:
+def _split_generated(jev_tool: str, generated: Any) -> tuple[Any, Any, str, bool]:
     if isinstance(generated, dict):
         reasoning = generated.get("reasoning")
         return (
             generated.get("tool", jev_tool),
             generated.get("arguments", {}),
             reasoning if isinstance(reasoning, str) else "",
+            generated.get("withheld") is True,
         )
+    withheld = _f(generated, "withheld", default=False) is True
     return (
         _f(generated, "tool", default=jev_tool),
         _f(generated, "arguments", default={}),
         (_f(generated, "reasoning", default="") if isinstance(_f(generated, "reasoning", default=""), str) else ""),
+        withheld,
     )
 
 
@@ -2831,9 +2879,13 @@ async def _assess_attempt(
     job_id: str,
 ) -> dict[str, Any]:
     """JEV result assessment with its decision record."""
-    assessment = await _awaited(
-        jev.assess_result(node, outcome, _context_evidence(evidence, attempts), session_id=sid, job_id=job_id)
-    )
+    _t0 = _time.perf_counter()
+    try:
+        assessment = await _awaited(
+            jev.assess_result(node, outcome, _context_evidence(evidence, attempts), session_id=sid, job_id=job_id)
+        )
+    finally:
+        assess_ms = (_time.perf_counter() - _t0) * 1000.0
     _record(
         kernel,
         sid,
@@ -2845,7 +2897,9 @@ async def _assess_attempt(
         job_id=job_id,
         confidence=_f(assessment, "confidence"),
     )
-    return assessment
+    if isinstance(assessment, dict):
+        assessment["assess_ms"] = assess_ms
+    return assessment, assess_ms
 
 
 def _admittable_candidate(
@@ -2923,7 +2977,7 @@ def _complete_attempt_job(kernel: Any, attempt: dict[str, Any], tool: str) -> No
 
 
 def _success_attempt_record(
-    tool: str, attempt: dict[str, Any], outcome: Any, decision: Any, evidence_id: str | None
+    tool: str, attempt: dict[str, Any], outcome: Any, decision: Any, evidence_id: str | None, assess_ms: float = 0.0
 ) -> dict[str, Any]:
     """Attempt record for an assessed tool outcome."""
     return {
@@ -2937,6 +2991,7 @@ def _success_attempt_record(
         "job_id": attempt.get("job_id"),
         "evidence_id": evidence_id,
         "tool_result_ref": attempt.get("tool_result_ref"),
+        "assess_ms": assess_ms,
     }
 
 
@@ -3037,7 +3092,9 @@ async def _settle_round(
             continue
         outcome = attempt["outcome"]
         tool = attempt["tool"]
-        assessment = await _assess_attempt(jev, kernel, node, outcome, evidence, attempts, sid, nid, attempt["job_id"])
+        assessment, assess_ms = await _assess_attempt(
+            jev, kernel, node, outcome, evidence, attempts, sid, nid, attempt["job_id"]
+        )
         ev_state = _f(assessment, "evidence_state", "decision", default=None)
         evidence_id, made_progress, admit_failure = _admit_attempt_evidence(
             kernel, sid, tool, attempt, outcome, ev_state, repo
@@ -3049,7 +3106,7 @@ async def _settle_round(
             admitted += 1
             progressed = True
         _complete_attempt_job(kernel, attempt, tool)
-        attempts.append(_success_attempt_record(tool, attempt, outcome, decision, evidence_id))
+        attempts.append(_success_attempt_record(tool, attempt, outcome, decision, evidence_id, assess_ms))
         if continuation:
             terminal, fresh_round = _continuation_terminal(assessment, kernel, sid, nid, evidence, attempts, admitted)
             if terminal is not None:
@@ -3240,6 +3297,42 @@ def _blocked_terminal(nid: str, admitted: int, attempts: list[dict[str, Any]]) -
     }
 
 
+def _selection_guidance(ctx_evidence: list[Any], attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Intake digest ids plus one-line summaries and do-not-repeat instruction for JEV."""
+    lines: list[str] = []
+    for ev in ctx_evidence:
+        eid = _f(ev, "evidence_id", "id", default=None)
+        text = _f(ev, "content", "text", "fact", "passage", default=None)
+        if isinstance(eid, str) and eid and isinstance(text, str) and text.strip():
+            lines.append(f"{eid}: {' '.join(text.split())[:160]}")
+    prior = [f"{a.get('tool')} {a.get('arguments')!r}" for a in attempts if isinstance(a, dict) and a.get("tool")]
+    return {
+        "type": "selection_guidance",
+        "intake_evidence": lines,
+        "instruction": "Do not repeat a tool call with identical arguments to an earlier attempt; pick a new tool or new arguments.",
+        "prior_calls": prior[-10:],
+    }
+
+
+def _is_duplicate_call(attempts: list[dict[str, Any]], tool: str, args: Any) -> bool:
+    """True when tool plus equal args already ran earlier in this node."""
+    return isinstance(args, dict) and any(
+        isinstance(a, dict) and a.get("tool") == tool and a.get("arguments") == args for a in attempts
+    )
+
+
+def _duplicate_reselect_streak(attempts: list[dict[str, Any]]) -> int:
+    """Consecutive duplicate-guard reselections at the tail."""
+    n = 0
+    for attempt in reversed(attempts):
+        if not isinstance(attempt, dict) or attempt.get("error_type") != "reselect":
+            break
+        if "duplicate" not in str(attempt.get("error") or ""):
+            break
+        n += 1
+    return n
+
+
 def _needle_error_streak(attempts: list[dict[str, Any]]) -> int:
     """Consecutive Needle generation failures at the tail (reselects don't count)."""
     n = 0
@@ -3250,6 +3343,43 @@ def _needle_error_streak(attempts: list[dict[str, Any]]) -> int:
             break
         n += 1
     return n
+
+
+def _log_round_timing(
+    sid: str,
+    nid: str,
+    round_no: int,
+    decision: Any,
+    attempts: list[dict[str, Any]],
+    ev_before: int,
+    evidence: list[Any],
+    select_ms: float,
+) -> None:
+    """One parseable per-round line: round, tool, 4 phase ms, evidence before/after."""
+    tools = _selection_tools(decision)
+    tool = tools[0] if tools else "-"
+    rec: dict[str, Any] | None = None
+    for cand in reversed(attempts):
+        if isinstance(cand, dict) and cand.get("tool") == tool:
+            rec = cand
+            break
+    rec = rec or (attempts[-1] if attempts else None)
+    generate_ms = float(rec.get("generate_ms") or 0.0) if isinstance(rec, dict) else 0.0
+    tool_ms = float(rec.get("tool_ms") or 0.0) if isinstance(rec, dict) else 0.0
+    assess_ms = float(rec.get("assess_ms") or 0.0) if isinstance(rec, dict) else 0.0
+    logger.info(
+        "toolflow round_timing sid=%s nid=%s round=%s tool=%s ev_before=%s ev_after=%s select_ms=%.1f generate_ms=%.1f tool_ms=%.1f assess_ms=%.1f",
+        sid,
+        nid,
+        round_no,
+        tool,
+        ev_before,
+        len(evidence),
+        select_ms,
+        generate_ms,
+        tool_ms,
+        assess_ms,
+    )
 
 
 async def _drive_rounds(
@@ -3271,9 +3401,15 @@ async def _drive_rounds(
     attempts: list[dict[str, Any]] = []
     admitted = 0
     select_failures = 0
+    stale_rounds = 0
+
     for round_no in range(1, _MAX_TOOL_ROUNDS + 1):
         # Working state: admitted evidence + recent unadmitted observations, never dropped.
         ctx_evidence = _context_evidence(evidence, attempts, cap_last=5 if select_failures else None)
+        guidance = _selection_guidance(ctx_evidence, attempts)
+        sel_ctx = [*ctx_evidence, guidance]
+        n_before = len(attempts)
+
         select_registry = registry
         # Force-open: nav-only packets carry an accession (search lists
         # candidates but admits nothing) so the filing must open next round.
@@ -3312,11 +3448,15 @@ async def _drive_rounds(
                     ]
                     logger.info("toolflow select_drop sid=%s nid=%s tool=%s fails=4-of-5", sid, nid, repeated)
         select_round = executors.get("select_round") or _select_round
+        ev_before = len(evidence)
+        _sel_t0 = _time.perf_counter()
         try:
             action, decision = await select_round(
-                jev, kernel, sid, nid, session, node, select_registry, ctx_evidence, attempts
+                jev, kernel, sid, nid, session, node, select_registry, sel_ctx, attempts
             )
+            select_ms = (_time.perf_counter() - _sel_t0) * 1000.0
         except Exception as exc:
+            select_ms = (_time.perf_counter() - _sel_t0) * 1000.0
             select_failures += 1
             err = str(exc)[:120]
             attempts.append(_reselect_attempt(f"select failed ({err}); retrying with trimmed history"))
@@ -3333,6 +3473,7 @@ async def _drive_rounds(
             admitted_kept = [a for a in attempts[:-5] if isinstance(a, dict) and a.get("evidence_id")]
             attempts[:] = admitted_kept + attempts[-5:]
             logger.info("toolflow select_failed sid=%s nid=%s fails=%s err=%s", sid, nid, select_failures, err)
+            _log_round_timing(sid, nid, round_no, None, attempts, ev_before, evidence, select_ms)
             continue
         select_failures = 0
         _progress(progress, "tool_start", {"node_id": nid, "action": action})
@@ -3360,6 +3501,7 @@ async def _drive_rounds(
         )
         admitted = step["admitted"]
         _progress(progress, "tool_done", {"node_id": nid, "admitted": admitted})
+        _log_round_timing(sid, nid, round_no, step.get("decision"), attempts, ev_before, evidence, select_ms)
         if step.get("terminal") is not None:
             logger.info(
                 "toolflow drive sid=%s nid=%s rounds_used=%s stop=%s admitted=%s",
@@ -3384,6 +3526,18 @@ async def _drive_rounds(
             evidence = _load_evidence(sid, kernel, repo)
             break  # fresh select round; JEV re-escalates if reasoning is still needed.
         evidence = _load_evidence(sid, kernel, repo)
+        made_error = any(isinstance(a, dict) and a.get("error") is not None for a in attempts[n_before:])
+        stale_rounds = stale_rounds + 1 if (not step.get("progressed") and not made_error) else 0
+        if stale_rounds >= _NO_EVIDENCE_ROUNDS:
+            _block(kernel, sid, nid, "incomplete: no new evidence")
+            return {
+                "node_id": nid,
+                "status": "blocked",
+                "reason": "incomplete: no new evidence",
+                "incomplete_guard": True,
+                "admitted": admitted,
+                "attempts": attempts,
+            }
     logger.info(
         "toolflow drive sid=%s nid=%s rounds_used=%s stop=%s admitted=%s",
         sid,

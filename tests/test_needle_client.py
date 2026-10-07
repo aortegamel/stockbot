@@ -163,10 +163,17 @@ def test_start_ping_then_two_calls_reuse_one_process(worker: None) -> None:
     assert ping_raw.get("action") == "ping" and isinstance(ping_raw.get("id"), str)
 
     first = nc.generate_arguments(tool="search_sec_filings", schema={}, objective="o", node="n", context={})
+    assert first["withheld"] is False
     second = nc.generate_arguments(
         {"tool": "search_sec_filings", "schema": {}, "objective": "o", "node": "n", "context": {}}
     )
-    assert first == {"tool": "search_sec_filings", "arguments": {"q": 1}, "reasoning": "", "confidence": None}
+    assert first == {
+        "tool": "search_sec_filings",
+        "arguments": {"q": 1},
+        "reasoning": "",
+        "confidence": None,
+        "withheld": False,
+    }
     assert second == first
     assert len(_FakeProc.instances) == 1
     ids = [_request_id(w) for w in proc.written[1:]]
@@ -189,7 +196,13 @@ def test_malformed_response_fails_closed(worker: None) -> None:
 def test_broken_pipe_restarts_once(worker: None) -> None:
     _FakeProc.behavior = "broken-once"
     out = nc.generate_arguments(tool="search_sec_filings")
-    assert out == {"tool": "search_sec_filings", "arguments": {"q": 1}, "reasoning": "", "confidence": None}
+    assert out == {
+        "tool": "search_sec_filings",
+        "arguments": {"q": 1},
+        "reasoning": "",
+        "confidence": None,
+        "withheld": False,
+    }
     assert len(_FakeProc.instances) == 2
 
 
@@ -470,3 +483,140 @@ def test_handle_embed_returns_vector(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     srv = _load_server(monkeypatch, tmp_path)
     out = srv.handle(_json.dumps({"id": "m2", "action": "embed", "text": "NVDA revenue"}))
     assert out["embedding"] == [0.1, 0.2, 0.3]
+
+
+def test_noncall_detail_plain_and_suppressed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """_noncall_detail pins type/suppressed/confidence/reasoning in one line."""
+    srv = _load_server(monkeypatch, tmp_path)
+    plain = srv._noncall_detail({"type": "noul", "suppressed_calls": [], "confidence": 0.5, "reasoning": "why"})
+    assert "noul" in plain and "0.5" in plain and "why" in plain
+    supp = srv._noncall_detail(
+        {
+            "type": "withheld",
+            "suppressed_calls": [{"name": "get_sec_filing"}],
+            "confidence": 0.9,
+            "reasoning": "  a  b  ",
+        }
+    )
+    assert "get_sec_filing" in supp and "0.9" in supp
+
+
+def test_handle_mismatch_error_carries_detail(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Needle None mismatch error carries type/suppressed/confidence/reasoning."""
+    import json as _json
+
+    srv = _load_server(monkeypatch, tmp_path)
+
+    class _R:
+        def complete(self, prompt: str, max_new_tokens: int = 0) -> dict[str, object]:
+            return {
+                "type": "noul",
+                "function_calls": [],
+                "suppressed_calls": [{"name": "x"}],
+                "confidence": 0.4,
+                "reasoning": "need grounding",
+            }
+
+    class _B:
+        def complete(self, prompt: str, max_new_tokens: int = 0) -> dict[str, object]:
+            return _R().complete(prompt, max_new_tokens)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(srv, "_bound_agent", lambda tool, schema: _B())
+    line = _json.dumps({"id": "m1", "action": "arguments.generate", "tool": "search_sec_filings", "schema": {}})
+    out = srv.handle(line)
+    assert "error" in out
+    err = str(out["error"])
+    assert "mismatch" in err and "suppressed" in err and "confidence" in err and "reasoning" in err
+
+
+def test_handle_withheld_same_name_returns_tool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Validated suppressed same-name decision reaches the response (tool + withheld:true)."""
+    import json as _json
+
+    srv = _load_server(monkeypatch, tmp_path)
+
+    class _B:
+        def complete(self, prompt: str, max_new_tokens: int = 0) -> dict[str, object]:
+            return {
+                "type": "withheld",
+                "function_calls": [],
+                "suppressed_calls": [{"name": "search_sec_filings", "arguments": {"q": "x"}}],
+                "confidence": 0.8,
+                "reasoning": "withheld grounding",
+            }
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(srv, "_bound_agent", lambda tool, schema: _B())
+    line = _json.dumps({"id": "w1", "action": "arguments.generate", "tool": "search_sec_filings", "schema": {}})
+    out = srv.handle(line)
+    assert out["tool"] == "search_sec_filings" and out["withheld"] is True
+    assert out["arguments"] == {"q": "x"}
+
+
+def test_decision_variants(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """_decision: call, suppressed same-name (withheld), suppressed other-name, plain."""
+    srv = _load_server(monkeypatch, tmp_path)
+    call = srv._decision({"type": "call", "function_calls": [{"name": "t", "arguments": {"a": 1}}]}, "t")
+    assert call["tool"] == "t" and call["arguments"] == {"a": 1} and call["withheld"] is False
+    same = srv._decision(
+        {"type": "withheld", "function_calls": [], "suppressed_calls": [{"name": "t", "arguments": {"a": 2}}]},
+        "t",
+    )
+    assert same["tool"] == "t" and same["arguments"] == {"a": 2} and same["withheld"] is True
+    other = srv._decision(
+        {"type": "withheld", "function_calls": [], "suppressed_calls": [{"name": "x", "arguments": {}}]},
+        "t",
+    )
+    assert other["tool"] is None and other["withheld"] is False
+    plain = srv._decision({"type": "noul", "function_calls": [], "suppressed_calls": []}, "t")
+    assert plain["tool"] is None and plain["withheld"] is False
+
+
+def test_generate_withheld_accept_and_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stubbed engine: withheld same-name accepted; short timeout uses generate limit."""
+    import json as _json
+
+    nc.close()
+    _FakeProc.instances.clear()
+    _FakeProc.behavior = "echo"
+
+    def _fake_readline(proc: object, timeout_s: float) -> str:
+        assert proc is _FakeProc.instances[-1]
+        raw: object = _json.loads(proc.written[-1])  # type: ignore[attr-defined]
+        assert isinstance(raw, dict)
+        if raw.get("action") == "ping":
+            return _json.dumps({"id": raw.get("id"), "ready": True}) + "\n"
+        return (
+            _json.dumps({"id": raw.get("id"), "tool": raw.get("tool"), "arguments": {"q": 1}, "withheld": True}) + "\n"
+        )
+
+    monkeypatch.setattr(subprocess, "Popen", _FakeProc)
+    monkeypatch.setattr(nc, "_ensure_weights", lambda: None)
+    monkeypatch.setattr(nc, "_readline", _fake_readline)
+    assert nc._GENERATE_TIMEOUT_S == 10.0
+    out = nc.generate_arguments(tool="search_sec_filings")
+    assert out["withheld"] is True
+    assert out["tool"] == "search_sec_filings"
+    nc.close()
+    _FakeProc.instances.clear()
+
+    def _slow(proc: object, timeout_s: float) -> str:
+        raw2: object = _json.loads(proc.written[-1])  # type: ignore[attr-defined]
+        assert isinstance(raw2, dict)
+        if raw2.get("action") == "ping":
+            assert timeout_s == nc._TIMEOUT_S
+            return _json.dumps({"id": raw2.get("id"), "ready": True}) + "\n"
+        assert timeout_s == nc._GENERATE_TIMEOUT_S
+        raise TimeoutError("slow")
+
+    monkeypatch.setattr(nc, "_readline", _slow)
+    with pytest.raises(RuntimeError, match="timed out after 10s"):
+        nc.generate_arguments(tool="search_sec_filings")
+    nc.close()
+    _FakeProc.instances.clear()
+    _FakeProc.behavior = "echo"

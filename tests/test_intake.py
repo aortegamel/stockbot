@@ -470,3 +470,32 @@ def test_timeout_record_without_job_id_skips_settle(monkeypatch: pytest.MonkeyPa
     kernel = SimpleNamespace(record_decision=lambda *a, **k: None, record_evidence=lambda *a, **k: "ev")  # pyrefly: ignore[implicit-any-lambda]
     _admitted, _raw, stats = asyncio.run(kwt._intake_round(None, ["ORCL"], "s1", {}, [], None, kernel, None))
     assert isinstance(stats, dict) and stats["outcomes"]["timeout"] == 1 and settled == []
+
+
+def test_reasoner_quota_no_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"n": 0}
+
+    def fake_decompose(self: object, prompt: str, objective_id: str) -> dict[str, object]:
+        calls["n"] += 1
+        raise RuntimeError("429 monthly limit exceeded, quota exhausted")
+
+    monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", fake_decompose)
+    proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
+    assert calls["n"] == 1 and hints.get("fallback") == "reasoner_quota"
+    assert len(proposals) == 1
+
+
+def test_reasoner_transient_retries_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"n": 0}
+    good = {"id": "rs:t-q1", "objectiveId": "rs:t", "question": "Q?", "dependsOn": [], "whyItMatters": "W"}
+
+    def fake_decompose(self: object, prompt: str, objective_id: str) -> dict[str, object]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("connection reset by peer")
+        return {"proposals": [good]}
+
+    monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", fake_decompose)
+    proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
+    assert calls["n"] == 2 and [p["id"] for p in proposals] == ["rs:t-q1"]
+    assert "fallback" not in hints

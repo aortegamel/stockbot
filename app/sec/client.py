@@ -946,6 +946,8 @@ class _LookupFlight:
 
 _lookup_flight: _LookupFlight | None = None
 
+_LOOKUP_FLIGHT_WAIT_S = 120.0
+
 
 def _cached_lookup_index() -> list[tuple[str, str, int]] | None:
     """Cached (normalized name, raw name, cik) rows when fresh; None when stale."""
@@ -1020,7 +1022,7 @@ def _fetch_lookup_frame(query: str) -> _FrameRows:
             flight = _lookup_flight
             leader = False
     if not leader:
-        flight.done.wait(timeout=120.0)
+        flight.done.wait(timeout=_LOOKUP_FLIGHT_WAIT_S)
         hit = _cached_lookup_frame()
         if hit is not None:
             return hit

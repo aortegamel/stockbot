@@ -523,8 +523,11 @@ def test_repeated_winner_drop_triggers_on_4_of_5() -> None:
                 "decision": "insufficient",
             }
 
+    _gen_n = {"n": 0}
+
     async def fake_gen(**kw: Any) -> dict[str, Any]:
-        return {"tool": "get_reg_sho_volume", "arguments": {}, "reasoning": "r"}
+        _gen_n["n"] += 1
+        return {"tool": "get_reg_sho_volume", "arguments": {"round": _gen_n["n"]}, "reasoning": "r"}
 
     async def fake_invoke(name: str, args: dict[str, Any], sess: Any, **kw: Any) -> dict[str, Any]:
         return {"tool_result_id": "s1:tr:x"}
@@ -693,14 +696,14 @@ def test_accession_carry_fills_from_packet_context() -> None:
 
     session = {"session_id": "s1", "objective": "q?"}
     filing_evidence = [{"outcome_summary": f"filing {acc} 10-K", "tool": "search_sec_filings"}]
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_gen, "get_sec_filing", [], session, _node(), filing_evidence, [], None)
     )
     assert args.get("accession_no") == acc
     doc_evidence = [
         {"source_handle": {"accession_no": acc, "document_name": "nvda-10k.htm"}, "outcome_summary": f"read {acc}"}
     ]
-    doc_args, _ = asyncio.run(
+    doc_args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_doc_gen, "get_sec_document", [], session, _node(), doc_evidence, [], None)
     )
     assert doc_args.get("accession_no") == acc
@@ -716,7 +719,7 @@ def test_accession_carry_withheld_none_still_fills_from_packet() -> None:
 
     session = {"session_id": "s1", "objective": "q?"}
     evidence = [{"outcome_summary": f"filing {acc} 10-K", "tool": "search_sec_filings"}]
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_gen, "get_sec_filing", [], session, _node(), evidence, [], None)
     )
     assert args.get("accession_no") == acc
@@ -736,7 +739,7 @@ def test_accession_carry_leaves_args_without_packet() -> None:
         return {"tool": "get_sec_filing", "arguments": {}, "reasoning": "r"}
 
     session = {"session_id": "s1", "objective": "q?"}
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_gen, "get_sec_filing", [], session, _node(), [], [], None)
     )
     assert "accession_no" not in args
@@ -751,7 +754,7 @@ def test_runtime_mismatch_carry_returns_packet_accession() -> None:
 
     session = {"session_id": "s1", "objective": "q?"}
     evidence = [{"outcome_summary": f"filing {acc} 10-K", "tool": "search_sec_filings"}]
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_gen, "get_sec_filing", [], session, _node(), evidence, [], None)
     )
     assert args.get("accession_no") == acc
@@ -845,14 +848,14 @@ def test_scan_finds_accession_in_full_json() -> None:
 
 
 def test_identical_failures_break_with_guided_message() -> None:
-    """3 identical failing calls block with guidance instead of burning 10 rounds."""
+    """3 identical failing calls short-circuit duplicates instead of burning 10 rounds."""
+
+    async def fake_gen(**kw: Any) -> dict[str, Any]:
+        return {"tool": "query_finra", "arguments": {"ticker": "X"}, "reasoning": "r"}
 
     class _JLoop:
         async def select_tool(self, *a: Any, **k: Any) -> SimpleNamespace:
             return SimpleNamespace(tool_name="query_finra", probabilities={}, confidence=1.0)
-
-    async def fake_gen(**kw: Any) -> dict[str, Any]:
-        return {"tool": "query_finra", "arguments": {"ticker": "X"}, "reasoning": "r"}
 
     async def fake_invoke(name: str, args: dict[str, Any], sess: Any, **kw: Any) -> dict[str, Any]:
         return {"tool_result_id": "s1:tr:x"}
@@ -862,24 +865,32 @@ def test_identical_failures_break_with_guided_message() -> None:
         out.error = "boom provider down detail identical"
         return out
 
-    with mock.patch.object(sched, "_MAX_TOOL_ROUNDS", 10):
-        out = asyncio.run(
-            sched._run_node(
-                _node(),
-                session_id="s1",
-                kernel=_Kernel(),
-                jev=_JLoop(),
-                repo=None,
-                needle_generate=fake_gen,
-                invoke=fake_invoke,
-                to_outcome=bad_outcome,
-                registry=[{"name": "query_finra", "parameters": {}}],
-                tool_session=SimpleNamespace(),
-            )
+    out = asyncio.run(
+        sched._run_node(
+            _node(),
+            session_id="s1",
+            kernel=_Kernel(),
+            jev=_JLoop(),
+            repo=None,
+            needle_generate=fake_gen,
+            invoke=fake_invoke,
+            to_outcome=bad_outcome,
+            registry=[{"name": "query_finra", "parameters": {}}],
+            tool_session=SimpleNamespace(),
         )
+    )
     assert out["status"] == "blocked" and out["incomplete_guard"] is True
-    assert len(out["attempts"]) == 3
-    assert "3x" in str(out["reason"]) and "different ticker/dataset/accession" in str(out["reason"])
+    assert any("duplicate" in str(a.get("error")) for a in out["attempts"])
+    assert (
+        sched._identical_failure_break(
+            [
+                {"tool": "t", "arguments": {"a": 1}, "error": "boom x"},
+                {"tool": "t", "arguments": {"a": 1}, "error": "boom x"},
+                {"tool": "t", "arguments": {"a": 1}, "error": "boom x"},
+            ]
+        )
+        is not None
+    )
 
 
 def test_force_open_registry_carry_tools_on_nav_packet() -> None:
@@ -918,11 +929,11 @@ def test_relative_tradedate_scrubbed_to_wtd_omit() -> None:
         }
 
     session = {"session_id": "s1", "objective": "Apple this week?"}
-    scrubbed, _ = asyncio.run(
+    scrubbed, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_phrase, "get_reg_sho_volume", [], session, _node(), [], [], None)
     )
     assert scrubbed == {"ticker": "AAPL"}
-    kept, _ = asyncio.run(
+    kept, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_valid, "get_reg_sho_volume", [], session, _node(), [], [], None)
     )
     assert kept == {"ticker": "AAPL", "tradeDate": "2026-09-22"}
@@ -935,11 +946,11 @@ def test_sec_withhold_falls_back_to_objective_ticker_latest() -> None:
         return {"tool": None, "arguments": {}, "reasoning": "withheld: ungrounded"}
 
     session = {"session_id": "s1", "objective": "What drove NVDA revenue last quarter?"}
-    listed, _ = asyncio.run(
+    listed, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_none, "list_sec_filings", [], session, _node(), [], [], None)
     )
     assert listed == {"identifier": "NVDA", "forms": ["10-Q", "10-K", "8-K"]}
-    searched, _ = asyncio.run(
+    searched, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_none, "search_sec_filings", [], session, _node(), [], [], None)
     )
     assert searched["ticker"] == "NVDA" and "start_date" not in searched and "end_date" not in searched
@@ -967,7 +978,7 @@ def test_sho_withhold_falls_back_to_both_fields() -> None:
         return {"tool": None, "arguments": {}, "reasoning": "withheld: ungrounded"}
 
     session = {"session_id": "s1", "objective": "What does FINRA Reg SHO daily short volume show for Apple this week?"}
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_none, "get_reg_sho_volume", [], session, _node(), [], [], None)
     )
     assert args == {"ticker": "AAPL", "company_name": "Apple"}
@@ -997,7 +1008,7 @@ def test_sec_placeholder_forms_reseed_latest() -> None:
         }
 
     session = {"session_id": "s1", "objective": "What drove NVDA revenue last quarter?"}
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_placeholder, "list_sec_filings", [], session, _node(), [], [], None)
     )
     assert args == {"identifier": "NVDA", "forms": ["10-Q", "10-K", "8-K"]}
@@ -1014,7 +1025,7 @@ def test_sho_org_ticker_remaps_from_objective() -> None:
         }
 
     session = {"session_id": "s1", "objective": "What does FINRA Reg SHO daily short volume show for Apple this week?"}
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_org, "get_reg_sho_volume", [], session, _node(), [], [], None)
     )
     assert args == {"ticker": "AAPL", "company_name": "Apple"}
@@ -1033,7 +1044,7 @@ def test_repeat_8k_swaps_to_packet_10q() -> None:
         {"tool": "get_sec_filing", "arguments": {"accession_no": acc8}, "error": None},
     ]
     evidence = [{"outcome_summary": f"filing {acc8} 8-K filing {accq} 10-Q", "tool": "list_sec_filings"}]
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_8k, "get_sec_filing", [], session, _node(), evidence, attempts, None)
     )
     assert args.get("accession_no") == accq
@@ -1052,7 +1063,7 @@ def test_withhold_carry_repairs_query_and_swaps_10q() -> None:
         {"tool": "get_sec_document", "arguments": {"accession_no": acc8}, "error": None},
     ]
     evidence = [{"outcome_summary": f"filing {acc8} 8-K filing {accq} 10-Q", "tool": "list_sec_filings"}]
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_none, "get_sec_document", [], session, _node(), evidence, attempts, None)
     )
     assert args.get("accession_no") == accq
@@ -1072,7 +1083,7 @@ def test_repeat_8k_error_swaps_to_packet_10q() -> None:
         {"tool": "get_sec_document", "arguments": {"accession_no": acc8}, "error": "query not found"},
     ]
     evidence = [{"outcome_summary": f"filing {acc8} 8-K filing {accq} 10-Q", "tool": "list_sec_filings"}]
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_8k, "get_sec_document", [], session, _node(), evidence, attempts, None)
     )
     assert args.get("accession_no") == accq
@@ -1085,7 +1096,7 @@ def test_revenue_document_seeds_query() -> None:
         return {"tool": "get_sec_document", "arguments": {"accession_no": "0001045810-26-000075"}, "reasoning": "r"}
 
     session = {"session_id": "s1", "objective": "What drove NVDA revenue last quarter?"}
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_doc, "get_sec_document", [], session, _node(), [], [], None)
     )
     assert args.get("query") == "revenue increased"
@@ -1105,7 +1116,7 @@ def test_stale_as_of_dropped_dateless_objective() -> None:
         "session_id": "s1",
         "objective": "For Apple's 10-K accession 0000320193-25-000079, give me the filing metadata (form, dates, filer)",
     }
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_stale, "get_sec_filing", [], session, _node(), [], [], None)
     )
     assert args == {"accession_no": "0000320193-25-000079"}
@@ -1125,7 +1136,7 @@ def test_explicit_as_of_kept_when_in_objective() -> None:
         "session_id": "s1",
         "objective": "For Apple's 10-K accession 0000320193-25-000079 as of 2025-09-27, give me the filing metadata",
     }
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_kept, "get_sec_filing", [], session, _node(), [], [], None)
     )
     assert args == {"accession_no": "0000320193-25-000079", "as_of": "2025-09-27"}
@@ -1147,7 +1158,7 @@ def test_session_as_of_kept_when_datetime() -> None:
         "objective": "For Apple's 10-K accession 0000320193-25-000079, give me the filing metadata",
         "as_of": datetime(2025, 9, 27, 12, 0, 0),
     }
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_kept, "get_sec_filing", [], session, _node(), [], [], "2025-09-27")
     )
     assert args == {"accession_no": "0000320193-25-000079", "as_of": "2025-09-27"}
@@ -1160,7 +1171,7 @@ def test_garbage_identifier_reseeded_from_objective() -> None:
         return {"tool": "list_sec_filings", "arguments": {"identifier": "F1"}, "reasoning": "r"}
 
     session = {"session_id": "s1", "objective": "List Apple's most recent 10-K and 10-Q filings."}
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_garbage, "list_sec_filings", [], session, _node(), [], [], None)
     )
     assert args.get("identifier") == "AAPL"
@@ -1176,11 +1187,11 @@ def test_identifier_repair_keeps_valid_cik_and_case() -> None:
         return {"tool": "list_sec_filings", "arguments": {"identifier": "aapl"}, "reasoning": "r"}
 
     session = {"session_id": "s1", "objective": "List Apple's most recent 10-K and 10-Q filings."}
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_cik, "list_sec_filings", [], session, _node(), [], [], None)
     )
     assert args.get("identifier") == "0000320193"
-    args, _ = asyncio.run(
+    args, _, _ = asyncio.run(
         sched._generate_tool_arguments(fake_lower, "list_sec_filings", [], session, _node(), [], [], None)
     )
     assert args.get("identifier") == "aapl"
@@ -1540,3 +1551,179 @@ def test_cancelled_generation_fails_job() -> None:
     with pytest.raises(TimeoutError):
         asyncio.run(_main())
     assert ("fail", "job-0", "timeout") in kernel.calls  # generation cancel fails as timeout, never running
+
+
+def test_drive_rounds_emits_parseable_timing_per_round(caplog: pytest.LogCaptureFixture) -> None:
+    """One toolflow round_timing line per round with 4 phase ms + ev before/after."""
+    import logging
+    from types import SimpleNamespace as _NS
+
+    kernel = _Kernel()
+    node = _NS(node_id="n1", session_id="s1", question="q?")
+    session = {"session_id": "s1", "objective": "o"}
+
+    async def select_round(jev, kernel, sid, nid, session, node, registry, ctx_ev, attempts):
+        return ("tool", {"selected": ["search_web"]})
+
+    async def gen(tool, schema=None, **k):
+        return {"tool": "search_web", "arguments": {"query": "q"}, "reasoning": "", "confidence": 1.0}
+
+    async def invoke(name, args, sess, **k):
+        return {"status": "ok", "rows": [{"url": "https://e.com", "title": "t", "passage": "p" * 50}]}
+
+    def to_outcome(name, result):
+        return {"error": None, "rows": result["rows"]}
+
+    jev = _NS(
+        assess_result=lambda *a, **k: {"evidence_state": "insufficient", "continuation": "resolve_node"},
+    )
+    import app.research.scheduler as _s
+
+    orig_max = _s._MAX_TOOL_ROUNDS
+    _s._MAX_TOOL_ROUNDS = 1
+    try:
+        with caplog.at_level(logging.INFO):
+            asyncio.run(
+                _s._drive_rounds(
+                    node,
+                    session,
+                    [{"name": "search_web"}],
+                    kernel,
+                    jev,
+                    "s1",
+                    "n1",
+                    None,
+                    {
+                        "select_round": select_round,
+                        "reasoner": None,
+                        "needle_generate": gen,
+                        "invoke": invoke,
+                        "to_outcome": to_outcome,
+                    },
+                    object(),
+                    None,
+                )
+            )
+    finally:
+        _s._MAX_TOOL_ROUNDS = orig_max
+    lines = [r.getMessage() for r in caplog.records if "round_timing" in r.getMessage()]
+    assert len(lines) >= 1
+    line = lines[0]
+    for key in ("round=", "tool=", "select_ms=", "generate_ms=", "tool_ms=", "assess_ms=", "ev_before=", "ev_after="):
+        assert key in line
+
+
+def test_intake_round_stats_carry_phase_ms(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_intake_round stats carry sec_ms + web_ms + settle_ms + wall_ms."""
+    from app.research import kernel_worker as kw
+
+    kernel = _Kernel()
+
+    async def fake_attempt(tool: str, args: dict, sid: str, *a, **k):
+        return {
+            "tool": tool,
+            "arguments": dict(args),
+            "outcome": {"error": None},
+            "result": {"bytes": "x" * 100},
+            "job_id": "j",
+        }
+
+    monkeypatch.setattr(kw, "_intake_attempt", fake_attempt)
+
+    async def _empty_chain():
+        return []
+
+    monkeypatch.setattr(kw, "_intake_ticker_chain", lambda *a, **k: _empty_chain())
+    import app.research.scheduler as _s2
+
+    monkeypatch.setattr(_s2, "_load_evidence", lambda sid, kernel, repo: [])
+    monkeypatch.setattr(_s2, "_evidence_candidate", lambda *a, **k: None)
+    monkeypatch.setattr(_s2, "_attempt_domain", lambda *a, **k: "web")
+
+    async def _main():
+        return await kw._intake_round("q", [], "s1", {"objective": "o"}, [], object(), kernel, None)
+
+    _admitted, _raw, stats = asyncio.run(_main())
+    for key in ("sec_ms", "web_ms", "settle_ms", "wall_ms", "ms", "per_source"):
+        assert key in stats
+
+
+def test_selection_guidance_carries_intake_digest() -> None:
+    """Seeded guidance holds intake ids plus summaries and the do-not-repeat line."""
+    ev = [{"evidence_id": "ev-1", "content": "Apple 10-K revenue rose"}]
+    g = sched._selection_guidance(ev, [{"tool": "search_web", "arguments": {"query": "q"}}])
+    assert g["intake_evidence"] == ["ev-1: Apple 10-K revenue rose"]
+    assert "identical arguments" in g["instruction"]
+
+
+def test_duplicate_call_reselects() -> None:
+    """Same tool plus equal args returns a duplicate reselect, never invokes."""
+    kernel = _Kernel()
+    seen: list[str] = []
+    out = asyncio.run(
+        sched._attempt_tool(
+            tool_name="search_web",
+            node=_node(),
+            session={"session_id": "s1", "objective": "q"},
+            registry=[],
+            evidence=[],
+            attempts=[{"tool": "search_web", "arguments": {"query": "q"}}],
+            kernel=kernel,
+            needle_generate=lambda **kw: {"tool": "search_web", "arguments": {"query": "q"}, "reasoning": "r"},
+            invoke=lambda *a, **k: seen.append("invoked") or {},
+            to_outcome=lambda n, r: _outcome(),
+            tool_session=SimpleNamespace(),
+            as_of=None,
+        )
+    )
+    assert out["error_type"] == "reselect" and "duplicate" in out["error"]
+    assert seen == []
+    assert sched._duplicate_reselect_streak([dict(out)]) == 1
+    assert sched._needle_error_streak([dict(out)]) == 0
+
+
+def test_no_new_evidence_stops_after_two() -> None:
+    """Two rounds without progress block with reason no new evidence."""
+    kernel = _Kernel()
+    calls = {"n": 0}
+
+    async def select_round(jev, kernel, sid, nid, session, node, registry, ctx_ev, attempts):
+        calls["n"] += 1
+        assert any(isinstance(e, dict) and e.get("type") == "selection_guidance" for e in ctx_ev)
+        return ("tool", {"selected": ["search_web"]})
+
+    async def gen(tool, schema=None, **k):
+        return {"tool": "search_web", "arguments": {"query": f"q{calls['n']}"}, "reasoning": "", "confidence": 1.0}
+
+    out = asyncio.run(
+        sched._drive_rounds(
+            _node(),
+            {"session_id": "s1", "objective": "o"},
+            [{"name": "search_web"}],
+            kernel,
+            SimpleNamespace(
+                assess_result=lambda *a, **k: {"evidence_state": "insufficient", "continuation": "continue_research"}
+            ),
+            "s1",
+            "n1",
+            None,
+            {
+                "select_round": select_round,
+                "reasoner": None,
+                "needle_generate": gen,
+                "invoke": lambda n, a, s, **k: {},
+                "to_outcome": lambda n, r: _outcome(),
+            },
+            SimpleNamespace(),
+            None,
+            None,
+        )
+    )
+    assert out["status"] == "blocked" and out["reason"] == "incomplete: no new evidence"
+    assert calls["n"] == 2
+
+
+def test_round_cap_is_five() -> None:
+    """Cap constant is 5."""
+    assert sched._MAX_TOOL_ROUNDS == 5
+    assert sched._NO_EVIDENCE_ROUNDS == 2

@@ -512,14 +512,41 @@ def _reasoner_decompose_with_retry(
     )
     prompt = _intake_reasoner_prompt(objective_id, objective, as_of, digest)
     _notify(progress, "reasoner_start")
+    import time as _time
+
     out: dict[str, object] | None = None
     for attempt in (1, 2):
+        _t0 = _time.perf_counter()
         try:
             out = client.decompose(prompt, objective_id)
+            logger.info(
+                "intake reasoner_attempt sid=%s attempt=%s ok=%s ms=%.1f",
+                objective_id,
+                attempt,
+                True,
+                (_time.perf_counter() - _t0) * 1000.0,
+            )
         except Exception as exc:  # noqa: BLE001 - transport raises RuntimeError; config split below
+            logger.info(
+                "intake reasoner_attempt sid=%s attempt=%s ok=%s ms=%.1f err=%.120s",
+                objective_id,
+                attempt,
+                False,
+                (_time.perf_counter() - _t0) * 1000.0,
+                exc,
+            )
             # ponytail: config errors never retry; transport errors get one resend.
-            if "opencode_unavailable" in str(exc) or "missing OPENCODE" in str(exc):
+            msg = str(exc).lower()
+            if "opencode_unavailable" in msg or "missing opencode" in msg:
                 return _fallback_single(objective, objective_id), {"fallback": "reasoner_config"}
+            if (
+                "gousagelimit" in type(exc).__name__.lower()
+                or "429" in msg
+                or "usage limit" in msg
+                or "monthly limit" in msg
+                or "quota" in msg
+            ):
+                return _fallback_single(objective, objective_id), {"fallback": "reasoner_quota"}
             if attempt >= 2:
                 return _fallback_single(objective, objective_id), {"fallback": "reasoner_failed_twice"}
             _notify(progress, "reasoner_retry", {"attempt": 2})
@@ -730,6 +757,18 @@ async def _intake_round(
         entry = per_source.setdefault(tool, {"count": 0, "ms": 0.0})
         entry["count"] += 1
         entry["ms"] += taken
+    sec_ms = sum(v.get("ms", 0.0) for k, v in per_source.items() if k != "search_web")
+    web_ms = sum(v.get("ms", 0.0) for k, v in per_source.items() if k == "search_web")
+    logger.info(
+        "intake round_timing sid=%s calls=%s admitted=%s sec_ms=%.1f web_ms=%.1f settle_ms=%.1f wall_ms=%.1f",
+        sid,
+        len(calls),
+        len(admitted),
+        sec_ms,
+        web_ms,
+        settle_ms,
+        wall_ms,
+    )
     _notify(
         progress,
         "intake_done",
@@ -753,6 +792,8 @@ async def _intake_round(
         "settle_ms": settle_ms,
         "settle_errors": settle_errors,
         "per_source": per_source,
+        "sec_ms": sec_ms,
+        "web_ms": web_ms,
     }
     return admitted, raw, stats
 

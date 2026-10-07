@@ -18,8 +18,8 @@ export type NeedleExtractResult = {
   reasoning: string;
 };
 
-
 export const TOOL_TIMEOUT_MS = 120_000;
+export const GENERATE_TIMEOUT_MS = 10_000;
 // Runtime gate mirroring server.py validate_needle_tool: Needle output must
 // invoke the exact JEV-selected tool. JEV owns selection; Needle never
 // selects, chains, or judges sufficiency. Throws on mismatch (incl. null).
@@ -222,7 +222,7 @@ export class NeedleRouter {
     if (!req.tool) throw new Error("generateArguments: tool must be a nonempty tool name");
     const release = await acquireNeedle();
     try {
-      const r = (await this.rawCall({ action: "arguments.generate", ...req }, "route")) as NeedleRouteResult;
+      const r = (await this.rawCall({ action: "arguments.generate", ...req }, "route", GENERATE_TIMEOUT_MS)) as NeedleRouteResult;
       validateNeedleTool(req.tool, r.tool);
       return r;
     } finally {

@@ -240,6 +240,23 @@ def _gs_run_to_freeze() -> tuple[object, str, str]:
     return repo, sid, fid
 
 
+def test_bootstrap_jobs_closed_after_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A full gs run leaves zero queued/running jobs (bootstrap leak guard)."""
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+
+    from app.research import service as _svc
+    from app.research.repository import ResearchRepository as _Repo
+
+    repo = _Repo()
+    sid, src = _gs_sid(repo)
+    eid = f"{sid}:ev:1"
+    _svc.record_evidence(sid, src, _gs_item(eid), repo=repo)
+    _gs_submit(src, eid, repo)
+    _svc.freeze_session(sid, 1, repo=repo)
+    leaked = [j.job_id for j in repo.list_jobs(sid) if j.status in ("queued", "running")]
+    assert leaked == []
+
+
 def test_gs_arch_session_created() -> None:
     import os as _os
     import tempfile as _tf
