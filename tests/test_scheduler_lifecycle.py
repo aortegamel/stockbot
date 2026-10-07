@@ -18,7 +18,7 @@ class _Kernel:
     """Fake kernel recording lifecycle order; evidence store is in-memory."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, Any]] = []
+        self.calls: list[tuple[Any, ...]] = []
         self.evidence: list[str] = []
 
     def start_job(self, sid: str, **kw: Any) -> dict[str, str]:
@@ -40,7 +40,7 @@ class _Kernel:
         self.calls.append(("complete", jid))
 
     def fail_job(self, jid: str, cat: str, msg: str) -> None:
-        self.calls.append(("fail", jid))
+        self.calls.append(("fail", jid, cat))
 
     def record_decision(self, sid: str, dtype: str, **kw: Any) -> None:
         pass
@@ -1502,4 +1502,4 @@ def test_cancelled_attempt_fails_job() -> None:
 
     with pytest.raises(TimeoutError):
         asyncio.run(_main())
-    assert ("fail", "job-0") in kernel.calls  # job failed, never left running
+    assert ("fail", "job-0", "timeout") in kernel.calls  # cancelled job fails as timeout, never running

@@ -925,10 +925,10 @@ def _heartbeat_attempt(kernel: Any, job_id: str) -> None:
         pass
 
 
-def _fail_attempt_job(kernel: Any, job_id: str, message: str) -> None:
+def _fail_attempt_job(kernel: Any, job_id: str, message: str, category: str = "tool_error") -> None:
     """Terminal-fail one job; terminal already recorded so failures never raise."""
     try:
-        kernel.fail_job(job_id, "tool_error", message[:2000])
+        kernel.fail_job(job_id, category, message[:2000])
     except Exception:
         pass
 
@@ -2126,7 +2126,7 @@ async def _attempt_tool(
             )
         except asyncio.CancelledError:
             # ponytail: wait_for/budget cancel orphans the kernel job; fail it so no job stays running.
-            _fail_attempt_job(kernel, job_id, f"cancelled during {tool_name}")
+            _fail_attempt_job(kernel, job_id, f"cancelled during {tool_name}", "timeout")
             raise
         record = _success_attempt(tool_name, arguments, outcome, result, domain, needle_reasoning, job_id)
         logger.info(
