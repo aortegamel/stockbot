@@ -348,11 +348,17 @@ def test_intake_never_searches_filings_and_chains_8k(monkeypatch: pytest.MonkeyP
     async def _fake_attempt(tool: str, args: dict[str, object], *a: Any, **k: Any) -> dict[str, Any]:
         calls.append((tool, dict(args)))
         if tool == "list_sec_filings":
+            # real _wrap_list shape: tool result carries filings directly (accession_no key).
             return {
                 "tool": tool,
                 "arguments": args,
                 "job_id": "j-list",
-                "result": {"filings": [{"form": "8-K", "accession_no": "0001-26-000001"}]},
+                "result": {
+                    "subject": "320193",
+                    "count": 1,
+                    "filings": [{"form": "8-K", "accession_no": "0001-26-000001"}],
+                    "source": "SEC EDGAR",
+                },
                 "outcome": SimpleNamespace(content="x", error=None),
                 "outcome_summary": "x",
                 "error": None,

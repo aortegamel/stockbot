@@ -1468,3 +1468,38 @@ def test_needle_streak_ignores_reselect_attempts() -> None:
     assert sched._needle_error_streak([dict(reselect) for _ in range(3)]) == 0
     gen_fail = {"tool": "query_finra", "arguments": {}, "error": "needle blew up"}
     assert sched._needle_error_streak([dict(gen_fail) for _ in range(3)]) == 3
+
+
+def test_cancelled_attempt_fails_job() -> None:
+    """wait_for cancel during invoke fails the kernel job, then re-raises."""
+    import asyncio
+
+    kernel = _Kernel()
+
+    async def _slow(*a: Any, **k: Any) -> Any:
+        await asyncio.sleep(60)
+        raise AssertionError("unreachable")
+
+    async def _main() -> None:
+        await asyncio.wait_for(
+            sched._attempt_tool(
+                tool_name="list_sec_filings",
+                node=_node(),
+                session={"session_id": "s1", "objective": "q"},
+                registry=[],
+                evidence=[],
+                attempts=[],
+                kernel=kernel,
+                needle_generate=None,
+                invoke=_slow,
+                to_outcome=lambda n, r: _outcome(),
+                tool_session=SimpleNamespace(),
+                as_of=None,
+                fixed_arguments={"identifier": "320193"},
+            ),
+            timeout=0.05,
+        )
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(_main())
+    assert ("fail", "job-0") in kernel.calls  # job failed, never left running

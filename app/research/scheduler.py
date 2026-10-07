@@ -2120,9 +2120,14 @@ async def _attempt_tool(
             arguments, needle_reasoning = await _generate_tool_arguments(
                 needle_generate, tool_name, registry, session, node, evidence, attempts, as_of
             )
-        result, outcome = await _invoke_attempt_tool(
-            invoke, to_outcome, tool_name, arguments, tool_session, node_id, session_id, as_of, job_id
-        )
+        try:
+            result, outcome = await _invoke_attempt_tool(
+                invoke, to_outcome, tool_name, arguments, tool_session, node_id, session_id, as_of, job_id
+            )
+        except asyncio.CancelledError:
+            # ponytail: wait_for/budget cancel orphans the kernel job; fail it so no job stays running.
+            _fail_attempt_job(kernel, job_id, f"cancelled during {tool_name}")
+            raise
         record = _success_attempt(tool_name, arguments, outcome, result, domain, needle_reasoning, job_id)
         logger.info(
             "toolflow attempt sid=%s nid=%s tool=%s ok=%s err_type=%s retryable=%s",

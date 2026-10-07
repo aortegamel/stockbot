@@ -138,6 +138,14 @@ def _shutdown() -> None:
         close_fn()
     except (ImportError, AttributeError, OSError):
         pass
+    # ponytail: straggler SEC/tool threads never hold interpreter exit.
+    try:
+        from app.research import scheduler as _sched
+
+        for pool in (_sched._SEC_POOL, _sched._TOOL_POOL):
+            pool.shutdown(wait=False, cancel_futures=True)
+    except (ImportError, AttributeError, RuntimeError):
+        pass
 
 
 # Mirror of decision/jev.ts DISPOSITION_OPTIONS (choice labels are the contract).
@@ -220,14 +228,11 @@ def _intake_cik(ticker: str) -> str:
 
 def _intake_newest_8k(result: object) -> str | None:
     """Newest 8-K accession from a list_sec_filings result; None when absent."""
-    filings: object = None
-    if isinstance(result, dict):
-        inner = result.get("result")
-        filings = inner.get("filings") if isinstance(inner, dict) else result.get("filings")
+    filings: object = result.get("filings") if isinstance(result, dict) else None
     if not isinstance(filings, list):
         return None
     for row in filings:
-        if isinstance(row, dict) and str(row.get("form") or "").upper() == "8-K":
+        if isinstance(row, dict) and str(row.get("form") or "").upper().startswith("8-K"):
             acc = row.get("accession_no") or row.get("accession_number")
             if isinstance(acc, str) and acc.strip():
                 return acc.strip()
