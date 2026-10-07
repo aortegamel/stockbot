@@ -1369,3 +1369,40 @@ def test_intake_round_budget_timeout_records_per_call(monkeypatch: pytest.Monkey
     monkeypatch.setattr(kw, "_intake_ticker_chain", slow_chain)
     monkeypatch.setattr(kw, "_INTAKE_BUDGET_S", 0.05)
     monkeypatch.setattr(sched, "_load_evidence", lambda sid, kernel, repo: [])
+
+
+def test_sec_thread_cap_survives_four_concurrent_calls() -> None:
+    """4 concurrent SEC thread calls complete; double-acquire would deadlock (bug 1)."""
+    import time
+
+    async def _main() -> list[str]:
+        async def _call(i: int) -> str:
+            return await asyncio.wait_for(sched._sec_thread_call(lambda: (time.sleep(0.1), f"r{i}")[1]), timeout=10)
+
+        return await asyncio.gather(*(_call(i) for i in range(5)))
+
+    assert sorted(asyncio.run(_main())) == ["r0", "r1", "r2", "r3", "r4"]
+
+
+def test_session_run_survives_second_event_loop() -> None:
+    """Two asyncio.run sessions back-to-back; loop-bound cap would fail run 2 (bug 2)."""
+    from types import SimpleNamespace
+    from unittest import mock
+
+    class _KS:
+        def __init__(self) -> None:
+            self.seen: set[str] = set()
+
+        def ready_nodes(self, sid: str) -> list[SimpleNamespace]:
+            if sid in self.seen:
+                return []
+            self.seen.add(sid)
+            return [SimpleNamespace(node_id="n1", session_id=sid, question="q?", why_it_matters="w")]
+
+    async def done(n: Any, sid: str, **kw: Any) -> dict[str, Any]:
+        return {"node_id": "n1", "status": "resolved", "admitted": 1, "incomplete_guard": False}
+
+    with mock.patch.object(sched, "run_node", done):
+        first = asyncio.run(sched.run("s1", kernel=_KS(), repo=None))
+        second = asyncio.run(sched.run("s2", kernel=_KS(), repo=None))
+    assert first["status"] == "complete" and second["status"] == "complete"

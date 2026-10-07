@@ -286,12 +286,31 @@ def test_node_cap_four_through_entry(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(seen) == 4
 
 
-def test_log_carries_outcomes_and_ids() -> None:
-    """intake_digest selected carries per-call outcomes + admitted ids beside stats (E1)."""
-    import inspect
+def test_log_carries_outcomes_and_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Normal path logs one intake_digest carrying outcomes + admitted ids (bug 3)."""
+    seen: list[dict[str, object]] = []
 
-    src = inspect.getsource(kw._log_intake_round)
-    assert "admitted_ids" in src and "outcomes" in src
+    async def _one_round(*a: Any, **k: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+        return (
+            [],
+            [{"tool": "list_sec_filings"}],
+            {"calls": 1, "admitted": 0, "admitted_ids": ["ev-1"], "outcomes": {"admitted": 1}},
+        )
+
+    def _decompose(*a: Any, **k: Any) -> tuple[list[dict[str, object]], dict[str, object]]:
+        return ([{"id": "s-q1", "objectiveId": "s", "question": "q?", "dependsOn": [], "whyItMatters": "w"}], {})
+
+    class _K:
+        def record_decision(self, sid: str, dtype: str, **k: Any) -> None:
+            seen.append({"sid": sid, "dtype": dtype, **k})
+
+    monkeypatch.setattr(kw, "_intake_round", _one_round)
+    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
+    out = asyncio.run(kw._graph_intake("q?", None, "s1", {}, [], None, _K(), None))
+    assert len(out) == 1 and len(seen) == 1 and seen[0]["dtype"] == "intake_digest"
+    selected = seen[0]["selected"]
+    assert isinstance(selected, dict) and selected["admitted_ids"] == ["ev-1"]
+    assert isinstance(selected, dict) and selected["outcomes"] == {"admitted": 1}
 
 
 def test_two_round_ceiling_without_new_hints(monkeypatch: pytest.MonkeyPatch) -> None:

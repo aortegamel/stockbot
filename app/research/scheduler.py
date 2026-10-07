@@ -37,10 +37,13 @@ _SEC_INTAKE_SEMAPHORE = _SEC_THREAD_SEMAPHORE
 
 
 async def _sec_thread_call(call: Any) -> Any:
-    """Sync SEC call under the process-wide cap; permit releases only when the thread ends."""
+    """Sync SEC call under the process-wide cap; the worker thread owns the permit."""
     worker: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
 
     def _run() -> None:
+        # ponytail: sole acquire site; outer acquire would take 2 permits per call and
+        # deadlock at 4 concurrent calls. Inner ownership also survives wait_for
+        # cancellation: the thread finishes and releases via the with block.
         with _SEC_THREAD_SEMAPHORE:
             if not worker.done():
                 try:
@@ -49,14 +52,12 @@ async def _sec_thread_call(call: Any) -> Any:
                     if not worker.done():
                         worker.set_exception(exc)
 
-    await asyncio.to_thread(_SEC_THREAD_SEMAPHORE.acquire)
     runner: asyncio.Future[None] = asyncio.ensure_future(asyncio.to_thread(_run))
     try:
         return await asyncio.shield(worker)
     finally:
         if not runner.done():
             await runner
-        _SEC_THREAD_SEMAPHORE.release()
 
 
 logger = logging.getLogger(__name__)
@@ -3428,12 +3429,11 @@ async def _run_node(node: Any, session_id: str | None = None, **hooks: Any) -> d
 # ---------------------------------------------------------------------------
 
 
-_NODE_SEMAPHORE = asyncio.Semaphore(2)
-
-
-async def _run_one_node(node: Any, session_id: str, hooks: dict[str, Any], kernel: Any) -> dict[str, Any]:
-    """One node under the 2-lane cap; Needle stays serial so more lanes never help."""
-    async with _NODE_SEMAPHORE:
+async def _run_one_node(
+    node: Any, session_id: str, hooks: dict[str, Any], kernel: Any, cap: asyncio.Semaphore
+) -> dict[str, Any]:
+    """One node under the per-run 2-lane cap; Needle stays serial so more lanes never help."""
+    async with cap:
         return await run_node(node, session_id, **{**hooks, "kernel": kernel})
 
 
@@ -3453,6 +3453,9 @@ async def run(session_id: str, **hooks: Any) -> dict[str, Any]:
     rounds = 0
     incomplete_guard = False
     guard_reason: str | None = None
+    # ponytail: per-run cap; a module-level Semaphore binds to the first loop and breaks
+    # the second asyncio.run request with "bound to a different event loop".
+    cap = asyncio.Semaphore(2)
     while True:
         try:
             nodes = await _awaited(ready(session_id))
@@ -3467,7 +3470,7 @@ async def run(session_id: str, **hooks: Any) -> dict[str, Any]:
             incomplete_guard = True
             guard_reason = f"incomplete: runtime guard ({_MAX_TOOL_ROUNDS} session rounds without convergence)"
             break
-        round_results = await asyncio.gather(*(_run_one_node(node, session_id, hooks, kernel) for node in nodes))
+        round_results = await asyncio.gather(*(_run_one_node(node, session_id, hooks, kernel, cap) for node in nodes))
         node_results.extend(round_results)
         round_guard = any(r.get("incomplete_guard") for r in round_results)
         if round_guard:

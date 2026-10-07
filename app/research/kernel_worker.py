@@ -793,6 +793,7 @@ async def _graph_intake(
             crash_hints: dict[str, object] = {"fallback": "reasoner_crashed"}
             proposals, hints = _fallback_single(objective, sid), crash_hints
         rounds += 1
+        _log_intake_round(sid, objective, raw, digest, {"proposals": proposals, "hints": hints}, stats, kernel)
         if rounds >= _INTAKE_MAX_ROUNDS:
             break
         next_tickers: list[str] = []
