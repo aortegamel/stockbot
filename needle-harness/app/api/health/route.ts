@@ -1,18 +1,21 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fingerprintKey } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(): Promise<Response> {
   const needleWeights = process.env.NEEDLE_WEIGHTS ?? null;
+  const opencodeKey = process.env.OPENCODE_API_KEY ?? "";
   const weightsPresent =
     needleWeights !== null ? existsSync(needleWeights) : existsSync(join(process.cwd(), "..", "needle3.cact"));
   return Response.json(
     {
       ok: true,
       port: process.env.PORT ?? "3000",
-      hasOpencodeKey: Boolean(process.env.OPENCODE_API_KEY),
+      hasOpencodeKey: Boolean(opencodeKey),
+      opencodeFingerprint: opencodeKey ? fingerprintKey(opencodeKey) : null,
       needleWeights,
       weightsPresent,
       venvPresent: existsSync(`${homedir()}/.cache/needle-harness/.needle/bin/python`),

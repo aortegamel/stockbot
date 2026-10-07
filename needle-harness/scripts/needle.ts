@@ -4,6 +4,7 @@ import { rm, writeFile } from "node:fs/promises";
 import { homedir, networkInterfaces } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { fingerprintKey, loadDotenvAuthoritative } from "../lib/env";
 
 const HARNESS_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 const ROOT_DIR = dirname(HARNESS_DIR);
@@ -15,8 +16,14 @@ if (!existsSync(SERVER)) {
 }
 
 const DOTENV = join(ROOT_DIR, ".env");
-const dotenvLoaded = typeof process.loadEnvFile === "function" && existsSync(DOTENV);
-if (dotenvLoaded) process.loadEnvFile(DOTENV);
+// .env is authoritative: stale inherited exports (daemon broker, shell) lose.
+const { loaded: dotenvLoaded, overridden } = loadDotenvAuthoritative(DOTENV);
+for (const o of overridden) {
+  process.stdout.write(`needle [env]: override ${o.key} inherited ${o.oldRedacted} → .env ${o.newRedacted}\n`);
+}
+if (process.env.OPENCODE_API_KEY) {
+  process.stdout.write(`needle [env]: opencode identity fp=${fingerprintKey(process.env.OPENCODE_API_KEY)}\n`);
+}
 
 const VENV_PYTHON = `${homedir()}/.cache/needle-harness/.needle/bin/python`;
 const WARMUP_TIMEOUT_MS = 120_000;
