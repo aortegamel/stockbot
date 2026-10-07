@@ -1467,7 +1467,7 @@ def _run(
             "jev": client,
             "needle_generate": _shared_needle_generate(),
             "progress": progress,
-            "max_rounds": 2,
+            "max_rounds": 4,
             "deadline_at": time.perf_counter() + remaining,
         }
         if select_round is not None:

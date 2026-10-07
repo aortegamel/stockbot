@@ -554,31 +554,115 @@ export async function runKernelAgent(
     return;
   }
 
-  emit({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
-  const tm = performance.now();
-  let usage: MuseUsage;
-  try {
-    const projection = graphProjection({ objective, nodes, decisions: persisted, unresolved, incompleteGuard, escalated: res.escalated ?? false });
-    const r = await reasonFn({
-      prompt: `${prompt}\n\n${projection}`,
-      evidence,
-      escalated: res.escalated ?? false,
-      direct: (res.escalated ?? false) && evidence.length === 0,
-      objective,
-      nodes,
-      decisions: persisted,
-      unresolved,
-      incompleteGuard,
-      onDelta: (text) => emit({ type: "answer_delta", text }),
-    });
-    usage = r.usage;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    countFailure("provider_error");
-    emit({ type: "tool_failed", tool: "muse", category: "provider_error", preview: msg.slice(0, 160) });
-    emit({ type: "failed", category: "provider_error", message: msg.slice(0, 160) });
-    emit({ type: "done", metrics: buildMetrics(decisions.length, calls.length, evidence, workerMs, (res.escalations ?? 0) + 1, failures, { calls: 0, totalMs: 0 }) });
-    return;
+  // Fail-closed evidence loop: a Missing-Evidence line means the graph is
+  // partial — run one follow-up pass with the gap as the objective, merge,
+  // and rewrite. A second gap fails the report instead of shipping partial.
+  let pass = 1;
+  const mergedEvidence = evidence;
+  let mergedNodes = nodes;
+  let mergedDecisions = persisted;
+  let mergedUnresolved = unresolved;
+  let mergedGuard = incompleteGuard;
+  let mergedEscalated = res.escalated ?? false;
+  let totalWorkerMs = workerMs;
+  let totalDecisions = decisions.length;
+  let totalCalls = calls.length;
+  let totalEscalations = res.escalations ?? 0;
+  let museCalls = 0;
+  let museMs = 0;
+  let usage: MuseUsage = {};
+  for (; ;) {
+    emit({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
+    const tm = performance.now();
+    let gap: string | undefined;
+    try {
+      const projection = graphProjection({ objective, nodes: mergedNodes, decisions: mergedDecisions, unresolved: mergedUnresolved, incompleteGuard: mergedGuard, escalated: mergedEscalated });
+      const r = await reasonFn({
+        prompt: `${prompt}\n\n${projection}`,
+        evidence: mergedEvidence,
+        escalated: mergedEscalated,
+        direct: mergedEscalated && mergedEvidence.length === 0,
+        objective,
+        nodes: mergedNodes,
+        decisions: mergedDecisions,
+        unresolved: mergedUnresolved,
+        incompleteGuard: mergedGuard,
+        onDelta: (text) => emit({ type: "answer_delta", text }),
+      });
+      usage = { ...usage, ...r.usage };
+      gap = r.missingEvidence?.trim() || undefined;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      countFailure("provider_error");
+      emit({ type: "tool_failed", tool: "muse", category: "provider_error", preview: msg.slice(0, 160) });
+      emit({ type: "failed", category: "provider_error", message: msg.slice(0, 160) });
+      emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations + 1, failures, { calls: museCalls, totalMs: museMs }) });
+      return;
+    }
+    museCalls += 1;
+    museMs += performance.now() - tm;
+    if (gap === undefined || pass >= 2) {
+      if (gap !== undefined) {
+        countFailure("incomplete_evidence");
+        emit({ type: "tool_failed", tool: "muse", category: "incomplete_evidence", preview: gap.slice(0, 160) });
+        emit({ type: "failed", category: "incomplete_evidence", message: gap.slice(0, 160) });
+        emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations + 1, failures, { calls: museCalls, totalMs: museMs, ...usage }) });
+        return;
+      }
+      emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations, failures, { calls: museCalls, totalMs: museMs, ...usage }) });
+      return;
+    }
+    pass += 1;
+    emit({ type: "progress", stage: "evidence_gap", detail: { missing: gap.slice(0, 300) } });
+    const followStart = performance.now();
+    let follow: KernelResponse;
+    try {
+      follow = await router.call({ op: "run", prompt: `${prompt}\nStill missing: ${gap}`, deadlineMs: timeoutMs }, { signal: opts?.signal, timeoutMs, onProgress: (stage, detail) => emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage }) });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      countFailure("provider_error");
+      emit({ type: "tool_failed", tool: "needle", category: "provider_error", preview: msg.slice(0, 160) });
+      emit({ type: "failed", category: "provider_error", message: msg.slice(0, 160) });
+      emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations + 1, failures, { calls: museCalls, totalMs: museMs, ...usage }) });
+      return;
+    }
+    totalWorkerMs += performance.now() - followStart;
+    const followEvidence: Evidence[] = (Array.isArray(follow.evidence) ? follow.evidence : []).map((e) => ({
+      id: String(e.id),
+      source: e.source ?? "kernel",
+      ...(e.title !== undefined ? { title: e.title } : {}),
+      ...(e.url !== undefined ? { url: e.url } : {}),
+      retrievedAt: e.retrievedAt ?? new Date().toISOString(),
+      content: String(e.content ?? ""),
+    }));
+    const seen = new Set(mergedEvidence.map((e) => e.id));
+    for (const e of followEvidence) if (!seen.has(e.id)) {
+      seen.add(e.id);
+      mergedEvidence.push(e);
+    }
+    const followNodes: KernelGraphNode[] = (Array.isArray(follow.nodes) ? follow.nodes : [])
+      .filter((n) => n && typeof n.node_id === "string")
+      .map((n) => ({ node_id: String(n.node_id), question: String(n.question ?? ""), status: String(n.status ?? ""), depends_on: Array.isArray(n.depends_on) ? n.depends_on.map(String) : [] }));
+    mergedNodes = [...mergedNodes, ...followNodes];
+    mergedDecisions = [...mergedDecisions, ...(Array.isArray(follow.decisions) ? follow.decisions : [])];
+    mergedUnresolved = [...mergedUnresolved, ...(Array.isArray(follow.unresolved) ? follow.unresolved.map(String) : [])];
+    mergedGuard = mergedGuard || (follow.incompleteGuard ?? follow.incomplete_guard ?? false);
+    mergedEscalated = mergedEscalated || (follow.escalated ?? false);
+    totalDecisions += (Array.isArray(follow.toolExecutions) ? follow.toolExecutions : follow.needleDecisions ?? []).length;
+    totalCalls += (Array.isArray(follow.toolCalls) ? follow.toolCalls : []).length;
+    totalEscalations += follow.escalations ?? 0;
+    if (follow.failures && typeof follow.failures === "object") {
+      for (const [k, v] of Object.entries(follow.failures)) if (typeof v === "number") failures[k as FailureCategory] = (failures[k as FailureCategory] ?? 0) + v;
+    }
+    const followCalls = Array.isArray(follow.toolCalls) ? follow.toolCalls : [];
+    const byFollowId: Record<string, Evidence> = {};
+    for (const e of mergedEvidence) byFollowId[e.id] = e;
+    for (const c of followCalls) {
+      emit({ type: "tool_start", tool: c.tool });
+      if (c.ok) {
+        const ev = c.evidenceId ? byFollowId[c.evidenceId] : undefined;
+        emit({ type: "tool_result", tool: c.tool, evidenceId: c.evidenceId, preview: (ev?.content ?? "").slice(0, 160) });
+      }
+    }
   }
-  emit({ type: "done", metrics: buildMetrics(decisions.length, calls.length, evidence, workerMs, res.escalations ?? 0, failures, { calls: 1, totalMs: performance.now() - tm, ...usage }) });
 }

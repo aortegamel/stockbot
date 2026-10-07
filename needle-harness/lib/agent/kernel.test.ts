@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { KernelRouter, type KernelChild } from "./kernel";
+import { KernelRouter, runKernelAgent, type KernelChild } from "./kernel";
 
 class FakeChild implements KernelChild {
   exitCode: number | null = null;
   killCalls = 0;
   written: string[] = [];
+  reply: ((id: string) => string) | null = null;
   private stdoutListeners: ((chunk: Buffer) => void)[] = [];
   private handlers: Record<string, ((arg?: unknown) => void)[]> = {};
   stdin = {
@@ -16,7 +17,8 @@ class FakeChild implements KernelChild {
         // test-only: { hold: true } suppresses the auto-reply so the test drives timing.
         const held = "hold" in body && body.hold === true;
         if (!held) {
-          queueMicrotask(() => this.emitStdout(`${JSON.stringify({ id, marker: `res-${id}` })}\n`));
+          const line = this.reply ? this.reply(id) : `${JSON.stringify({ id, marker: `res-${id}` })}\n`;
+          queueMicrotask(() => this.emitStdout(line));
         }
       }
       cb?.(null);
@@ -222,5 +224,60 @@ describe("KernelRouter", () => {
     } finally {
       router.close();
     }
+  });
+});
+
+describe("runKernelAgent evidence loop", () => {
+  const graphReply = (id: string): string =>
+    `${JSON.stringify({ id, objective: "q", evidence: [{ id: "ev:1", content: "fact" }], nodes: [{ node_id: "n1", question: "q", status: "blocked", depends_on: [] }], decisions: [], unresolved: ["n1"], incomplete_guard: true, toolExecutions: [], toolCalls: [], failures: {}, escalations: 1, escalated: true })}\n`;
+  const graphSpawn = (): KernelChild => {
+    const c = new FakeChild();
+    c.reply = graphReply;
+    queueMicrotask(() => c.emitStdout('{"type":"ready"}\n'));
+    return c;
+  };
+  test("gap triggers one follow-up pass, clean second write ends done", async () => {
+    process.env.OPENCODE_MODEL = "test-model";
+    const events: Array<{ type: string; stage?: string }> = [];
+    let writes = 0;
+    await runKernelAgent("q", (e) => void events.push(e), {
+      deps: {
+        python: "py",
+        workerPath: "w",
+        spawnFn: graphSpawn,
+        reason: async (o) => {
+          writes += 1;
+          o.onDelta("text");
+          return writes === 1
+            ? { text: "t", usage: {}, missingEvidence: "need doc X" }
+            : { text: "t2", usage: {} };
+        },
+      },
+    });
+    const types = events.map((e) => e.type);
+    expect(types.filter((t) => t === "reasoning_start").length).toBe(2);
+    expect(events.some((e) => e.type === "progress" && e.stage === "evidence_gap")).toBe(true);
+    expect(types.at(-1)).toBe("done");
+    expect(writes).toBe(2);
+  });
+
+  test("second gap fails the report with incomplete_evidence", async () => {
+    const events: Array<{ type: string; category?: string }> = [];
+    await runKernelAgent("q", (e) => void events.push(e as { type: string }), {
+      deps: {
+        python: "py",
+        workerPath: "w",
+        spawnFn: graphSpawn,
+        reason: async (o) => {
+          o.onDelta("text");
+          return { text: "t", usage: {}, missingEvidence: "still need doc X" };
+        },
+      },
+    });
+    const types = events.map((e) => e.type);
+    expect(types.filter((t) => t === "reasoning_start").length).toBe(2);
+    expect(types).toContain("failed");
+    expect(events.find((e) => e.type === "failed")?.category).toBe("incomplete_evidence");
+    expect(types.at(-1)).toBe("done");
   });
 });

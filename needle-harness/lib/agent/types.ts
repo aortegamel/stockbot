@@ -13,7 +13,7 @@ export type FailureCategory =
   | "model_error"
   | "model_output_failure"
   | "no_evidence"
-  | "pit_violation"
+  | "incomplete_evidence"
   | "freeze_mismatch"
   | "committee_deadlock"
   | "synthesis_failed"
