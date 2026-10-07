@@ -393,34 +393,56 @@ def test_intake_never_searches_filings_and_chains_8k(monkeypatch: pytest.MonkeyP
 
 
 def test_chain_keeps_list_result_when_doc_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Slow 8-K open keeps the finished list result; chain returns partial (medium 4)."""
+    """Real chain+attempt path, slow get_sec_document executor: budget keeps the list."""
     import asyncio
     from typing import Any
 
+    from app import tool_runtime as rt
     from app.research import kernel_worker as kwc
+    from app.research import scheduler as schedc
 
-    async def _attempt(tool: str, args: dict[str, object], *a: Any, **k: Any) -> dict[str, Any]:
+    async def _invoke(tool: str, args: dict[str, object], *a: Any, **k: Any) -> Any:
         if tool == "list_sec_filings":
-            return {
-                "tool": tool,
-                "arguments": args,
-                "job_id": "j-list",
-                "result": {"filings": [{"form": "8-K", "accession_no": "0001-26-000001"}]},
-                "outcome": SimpleNamespace(content="x", error=None),
-                "outcome_summary": "x",
-                "error": None,
-            }
-        await asyncio.sleep(60)
-        raise AssertionError("doc open should have been cancelled")
+            return {"filings": [{"form": "8-K", "accession_no": "0001-26-000001"}]}
+        await asyncio.sleep(60)  # doc open slower than doc deadline + budget
+        raise AssertionError("unreachable")
 
-    monkeypatch.setattr(kwc, "_intake_attempt", _attempt)
+    def _outcome(tool: str, result: Any) -> Any:
+        return SimpleNamespace(content="x", error=None, retryable=False)
+
+    class _Kernel:
+        def create_job(self, *a: Any, **k: Any) -> str:
+            return "j"
+
+        def heartbeat_job(self, *a: Any, **k: Any) -> None:
+            return None
+
+        def complete_job(self, *a: Any, **k: Any) -> None:
+            return None
+
+        def fail_job(self, *a: Any, **k: Any) -> None:
+            return None
+
+        def record_decision(self, *a: Any, **k: Any) -> None:
+            return None
+
+        def record_evidence(self, *a: Any, **k: Any) -> str:
+            return "ev"
+
+    monkeypatch.setattr(rt, "execute_agent_tool", _invoke)
     monkeypatch.setattr(kwc, "_intake_cik", lambda t: "320193")  # pyrefly: ignore[implicit-any-lambda]
+    monkeypatch.setattr(kwc, "_INTAKE_DOC_TIMEOUT_S", 0.05, raising=False)
+    monkeypatch.setattr(kwc, "_INTAKE_BUDGET_S", 0.2)
+    monkeypatch.setattr("app.tool_runtime.outcome_from_result", _outcome)
+    monkeypatch.setattr(schedc, "_load_evidence", lambda sid, kernel, repo: [])  # pyrefly: ignore[implicit-any-lambda]
 
-    async def _main() -> Any:
-        return await asyncio.wait_for(kwc._intake_ticker_chain("ORCL", "s1", {}, [], None, object(), None), timeout=5)
+    async def _round() -> Any:
+        return await kwc._intake_round(None, ["ORCL"], "s1", {}, [], None, _Kernel(), None)
 
-    out = asyncio.run(_main())
-    assert len(out) == 1 and out[0][0] == "list_sec_filings"
+    _admitted, raw, _stats = asyncio.run(_round())
+    assert len(raw) == 1 and raw[0]["tool"] == "list_sec_filings"
+    record = raw[0]["record"]
+    assert record.get("error") is None and record.get("job_id")  # real list, not synthetic timeout
 
 
 def test_timeout_record_without_job_id_skips_settle(monkeypatch: pytest.MonkeyPatch) -> None:

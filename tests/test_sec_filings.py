@@ -1066,8 +1066,8 @@ def test_lookup_frame_cached_second_call(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(client, "ensure_identity", lambda: None)
     monkeypatch.setattr(tickers, "get_cik_lookup_data", _get_frame)
-    client._lookup_cached_frame = None
-    client._lookup_cached_at = 0.0
+    monkeypatch.setattr(client, "_lookup_cached_frame", None)
+    monkeypatch.setattr(client, "_lookup_cached_at", 0.0)
     assert client._fetch_lookup_frame("Acme") is frame
     assert client._fetch_lookup_frame("Acme") is frame
     assert calls["n"] == 1
@@ -1099,10 +1099,10 @@ def test_lookup_cold_fetch_single_flight(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(client, "ensure_identity", lambda: None)
     monkeypatch.setattr(tickers, "get_cik_lookup_data", _get_frame)
-    client._lookup_cached_frame = None
-    client._lookup_cached_index = None
-    client._lookup_cached_at = 0.0
-    client._lookup_fetching = None
+    monkeypatch.setattr(client, "_lookup_cached_frame", None)
+    monkeypatch.setattr(client, "_lookup_cached_index", None)
+    monkeypatch.setattr(client, "_lookup_cached_at", 0.0)
+    monkeypatch.setattr(client, "_lookup_fetching", None)
 
     barrier = threading.Barrier(8)
     outs: list[object] = []

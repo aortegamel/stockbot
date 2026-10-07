@@ -203,6 +203,7 @@ _INTAKE_DIGEST_CHARS = 6000
 _INTAKE_MAX_ROUNDS = 2
 _INTAKE_CALL_TIMEOUT_S = 30.0
 _INTAKE_BUDGET_S = 20.0
+_INTAKE_DOC_TIMEOUT_S = 10.0
 _INTAKE_DOC_CHARS = 3000
 
 
@@ -263,10 +264,11 @@ async def _intake_ticker_chain(
     if acc is None:
         return out
     start = _time.perf_counter()
+    # ponytail: 10s doc deadline sits inside the 20s intake budget, so the
+    # chain returns the finished list result itself; no shield, no CancelledError
+    # catch — real cancellations propagate and nothing orphans.
     try:
-        # ponytail: shield keeps the finished list result when the 8-K open times out;
-        # the chain returns partial instead of discarding everything.
-        doc = await asyncio.shield(
+        doc = await asyncio.wait_for(
             _intake_attempt(
                 "get_sec_document",
                 {"accession_no": acc, "max_chars": _INTAKE_DOC_CHARS},
@@ -276,9 +278,10 @@ async def _intake_ticker_chain(
                 jev,
                 kernel,
                 as_of,
-            )
+            ),
+            timeout=_INTAKE_DOC_TIMEOUT_S,
         )
-    except (TimeoutError, asyncio.CancelledError):
+    except TimeoutError:
         logger.warning("intake chain doc timeout ticker=%s acc=%s", ticker, acc)
         return out
     out.append(("get_sec_document", {"accession_no": acc}, doc, (_time.perf_counter() - start) * 1000.0))
@@ -467,18 +470,15 @@ def _intake_reasoner_prompt(objective_id: str, objective: str, as_of: str | None
         "5. Never use memory as evidence; cite only evidence_ids present in the digest.\n"
         "6. Authority: propose questions, interpretations, and evidence requests ONLY. NEVER emit\n"
         "   approved/selected/finalDecision/shouldContinue/verdict/decision/buy/sell/hold/order/portfolio/committee\n"
-        "   fields under any name. Research never decides; the user decides.\n"
-        "7. You propose; you never decide, approve, buy, sell, or recommend.\n"
+        "   fields under any name; you propose, you never decide, approve, buy, sell, or recommend.\n"
+        "   Research never decides; the user decides.\n"
         "\n"
         "Output exactly one JSON object and nothing else:\n"
         '{"proposals": [{"id","objectiveId","question","dependsOn","whyItMatters"}],\n'
         ' "tickers"?: string[], "corrected_query"?: string}\n'
         f'Proposal ids start with "{objective_id}-". dependsOn may reference only ids you\n'
         "propose in this same output. "
-        f"Today is {utcnow().date().isoformat()} UTC; decode relative dates against it: "
-        "'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, "
-        "'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); "
-        "'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values.\n"
+        f"Today is {utcnow().date().isoformat()} UTC; decode relative dates against it.\n"
     )
 
 
