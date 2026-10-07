@@ -932,6 +932,7 @@ _lookup_lock = threading.Lock()
 _lookup_cached_at = 0.0
 _lookup_cached_frame: _FrameRows | None = None
 _lookup_cached_index: list[tuple[str, str, int]] | None = None
+_lookup_fetching: threading.Event | None = None
 
 
 def _cached_lookup_index() -> list[tuple[str, str, int]] | None:
@@ -991,9 +992,27 @@ def _store_lookup_frame(frame: _FrameRows) -> None:
 
 def _fetch_lookup_frame(query: str) -> _FrameRows:
     """CIK lookup dataset, one-day process cache; fetch failure raises (never zero-result)."""
+    global _lookup_fetching
     hit = _cached_lookup_frame()
     if hit is not None:
         return hit
+    # ponytail: cold-fetch single-flight; late callers wait on the in-flight fetch
+    # instead of duplicating get_cik_lookup_data. Lock never held across network.
+    with _lookup_lock:
+        if _lookup_fetching is None:
+            _lookup_fetching = threading.Event()
+            leader = True
+            waiter: threading.Event | None = None
+        else:
+            waiter = _lookup_fetching
+            leader = False
+    if not leader:
+        assert waiter is not None
+        waiter.wait(timeout=120.0)
+        hit = _cached_lookup_frame()
+        if hit is not None:
+            return hit
+        return _fetch_lookup_frame(query)
     try:
         ensure_identity()
         from edgar.entity.tickers import get_cik_lookup_data
@@ -1007,6 +1026,11 @@ def _fetch_lookup_frame(query: str) -> _FrameRows:
         raise
     except Exception as exc:
         raise SECClientError(f"cik lookup fetch failed for {query!r}: {exc}") from exc
+    finally:
+        with _lookup_lock:
+            event, _lookup_fetching = _lookup_fetching, None
+        if event is not None:
+            event.set()
 
 
 def _rank_lookup_name(normed: str, want: str) -> int | None:

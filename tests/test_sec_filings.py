@@ -1073,6 +1073,53 @@ def test_lookup_frame_cached_second_call(monkeypatch: pytest.MonkeyPatch) -> Non
     assert calls["n"] == 1
 
 
+def test_lookup_cold_fetch_single_flight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """8 concurrent cold lookups share one get_cik_lookup_data fetch."""
+    import threading
+    import time
+
+    from edgar.entity import tickers
+
+    from app.sec import client
+
+    calls = {"n": 0}
+    entered = threading.Event()
+
+    class _Frame:
+        def itertuples(self) -> list[object]:
+            return []
+
+    frame = _Frame()
+
+    def _get_frame() -> object:
+        calls["n"] += 1
+        entered.set()
+        time.sleep(0.3)  # hold the fetch open so all 8 callers overlap
+        return frame
+
+    monkeypatch.setattr(client, "ensure_identity", lambda: None)
+    monkeypatch.setattr(tickers, "get_cik_lookup_data", _get_frame)
+    client._lookup_cached_frame = None
+    client._lookup_cached_index = None
+    client._lookup_cached_at = 0.0
+    client._lookup_fetching = None
+
+    barrier = threading.Barrier(8)
+    outs: list[object] = []
+
+    def _call() -> None:
+        barrier.wait(timeout=10)
+        outs.append(client._fetch_lookup_frame("Acme"))
+
+    threads = [threading.Thread(target=_call) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads)
+    assert outs == [frame] * 8 and calls["n"] == 1
+
+
 def test_drain_budget_stops_between_pages(monkeypatch: pytest.MonkeyPatch) -> None:
     from types import SimpleNamespace
 
