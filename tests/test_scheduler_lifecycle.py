@@ -1511,11 +1511,14 @@ def test_cancelled_generation_fails_job() -> None:
 
     kernel = _Kernel()
 
-    async def _slow(*a: Any, **k: Any) -> Any:
+    async def _slow(*a: object, **k: object) -> object:
         await asyncio.sleep(60)
         raise AssertionError("unreachable")
 
     async def _main() -> None:
+        def _never_outcome(n: object, r: object) -> SimpleNamespace:
+            return _outcome()
+
         await asyncio.wait_for(
             sched._attempt_tool(
                 tool_name="list_sec_filings",
@@ -1527,7 +1530,7 @@ def test_cancelled_generation_fails_job() -> None:
                 kernel=kernel,
                 needle_generate=_slow,
                 invoke=_slow,
-                to_outcome=lambda n, r: _outcome(),
+                to_outcome=_never_outcome,
                 tool_session=SimpleNamespace(),
                 as_of=None,
             ),

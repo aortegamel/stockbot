@@ -1102,7 +1102,7 @@ def test_lookup_cold_fetch_single_flight(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(client, "_lookup_cached_frame", None)
     monkeypatch.setattr(client, "_lookup_cached_index", None)
     monkeypatch.setattr(client, "_lookup_cached_at", 0.0)
-    monkeypatch.setattr(client, "_lookup_fetching", None)
+    monkeypatch.setattr(client, "_lookup_flight", None)
 
     barrier = threading.Barrier(8)
     outs: list[object] = []
@@ -1121,7 +1121,7 @@ def test_lookup_cold_fetch_single_flight(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_lookup_waiters_reraise_leader_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failed leader wakes waiters with its error; no per-caller recurse."""
+    """A failed leader wakes waiters with its error; one fetch, no per-caller recurse."""
     import threading
     import time
 
@@ -1130,10 +1130,13 @@ def test_lookup_waiters_reraise_leader_error(monkeypatch: pytest.MonkeyPatch) ->
     from app.sec import client
 
     entered = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
 
     def _get_frame() -> object:
+        calls["n"] += 1
         entered.set()
-        time.sleep(0.3)  # hold the fetch open so the waiter overlaps
+        assert release.wait(timeout=10)  # waiters join before the leader fails
         raise ConnectionError("SEC down")
 
     monkeypatch.setattr(client, "ensure_identity", lambda: None)
@@ -1141,10 +1144,9 @@ def test_lookup_waiters_reraise_leader_error(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(client, "_lookup_cached_frame", None)
     monkeypatch.setattr(client, "_lookup_cached_index", None)
     monkeypatch.setattr(client, "_lookup_cached_at", 0.0)
-    monkeypatch.setattr(client, "_lookup_fetching", None)
-    monkeypatch.setattr(client, "_lookup_error", None)
+    monkeypatch.setattr(client, "_lookup_flight", None)
 
-    barrier = threading.Barrier(2)
+    barrier = threading.Barrier(3)
     outs: list[object] = []
 
     def _call() -> None:
@@ -1154,15 +1156,19 @@ def test_lookup_waiters_reraise_leader_error(monkeypatch: pytest.MonkeyPatch) ->
         except Exception as exc:  # noqa: BLE001 - both paths must surface SECClientError
             outs.append(exc)
 
-    threads = [threading.Thread(target=_call) for _ in range(2)]
+    threads = [threading.Thread(target=_call) for _ in range(3)]
     start = time.monotonic()
     for t in threads:
         t.start()
+    assert entered.wait(timeout=10)
+    time.sleep(0.2)  # both waiters blocked on the flight before it fails
+    release.set()
     for t in threads:
         t.join(timeout=30)
     elapsed = time.monotonic() - start
     assert not any(t.is_alive() for t in threads)
-    assert len(outs) == 2 and all(isinstance(e, client.SECClientError) for e in outs)
+    assert len(outs) == 3 and all(isinstance(e, client.SECClientError) for e in outs)
+    assert calls["n"] == 1  # single shared fetch, waiters never refetch
     assert elapsed < 30  # one shared failure, never 120s per caller
 
 

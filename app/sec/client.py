@@ -932,8 +932,19 @@ _lookup_lock = threading.Lock()
 _lookup_cached_at = 0.0
 _lookup_cached_frame: _FrameRows | None = None
 _lookup_cached_index: list[tuple[str, str, int]] | None = None
-_lookup_fetching: threading.Event | None = None
-_lookup_error: SECClientError | None = None
+
+
+class _LookupFlight:
+    """One in-flight CIK fetch: waiters hold this, never the replaceable global."""
+
+    __slots__ = ("done", "error")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.error: SECClientError | None = None
+
+
+_lookup_flight: _LookupFlight | None = None
 
 
 def _cached_lookup_index() -> list[tuple[str, str, int]] | None:
@@ -993,32 +1004,28 @@ def _store_lookup_frame(frame: _FrameRows) -> None:
 
 def _fetch_lookup_frame(query: str) -> _FrameRows:
     """CIK lookup dataset, one-day process cache; fetch failure raises (never zero-result)."""
-    global _lookup_fetching, _lookup_error
+    global _lookup_flight
     hit = _cached_lookup_frame()
     if hit is not None:
         return hit
-    # ponytail: cold-fetch single-flight; late callers wait on the in-flight fetch
-    # instead of duplicating get_cik_lookup_data. A failed leader wakes waiters
-    # with its error, so one cold failure never costs 120s per caller.
+    # ponytail: cold-fetch single-flight; late callers wait on the flight object
+    # they joined, so a later flight never clears their error. One cold failure
+    # wakes every waiter with the leader error, never 120s per caller.
     with _lookup_lock:
-        if _lookup_fetching is None:
-            _lookup_fetching = threading.Event()
-            _lookup_error = None
+        if _lookup_flight is None:
+            _lookup_flight = _LookupFlight()
+            flight = _lookup_flight
             leader = True
-            waiter: threading.Event | None = None
         else:
-            waiter = _lookup_fetching
+            flight = _lookup_flight
             leader = False
     if not leader:
-        assert waiter is not None
-        waiter.wait(timeout=120.0)
+        flight.done.wait(timeout=120.0)
         hit = _cached_lookup_frame()
         if hit is not None:
             return hit
-        with _lookup_lock:
-            err = _lookup_error
-        if err is not None:
-            raise err
+        if flight.error is not None:
+            raise flight.error
         raise SECClientError(f"cik lookup fetch failed for {query!r}: leader timed out")
     try:
         ensure_identity()
@@ -1030,19 +1037,17 @@ def _fetch_lookup_frame(query: str) -> _FrameRows:
         _store_lookup_frame(frame)
         return frame
     except SECClientError as exc:
-        with _lookup_lock:
-            _lookup_error = exc
+        flight.error = exc
         raise
     except Exception as exc:
         wrapped = SECClientError(f"cik lookup fetch failed for {query!r}: {exc}")
-        with _lookup_lock:
-            _lookup_error = wrapped
+        flight.error = wrapped
         raise wrapped from exc
     finally:
         with _lookup_lock:
-            event, _lookup_fetching = _lookup_fetching, None
-        if event is not None:
-            event.set()
+            if _lookup_flight is flight:
+                _lookup_flight = None
+        flight.done.set()
 
 
 def _rank_lookup_name(normed: str, want: str) -> int | None:
