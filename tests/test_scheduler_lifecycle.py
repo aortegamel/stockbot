@@ -1455,3 +1455,16 @@ def test_session_run_survives_second_event_loop() -> None:
         second = asyncio.run(sched.run("s2", kernel=_KS(), repo=None))
     assert first["status"] == "complete" and second["status"] == "complete"
     assert len(first["nodes"]) == 3 and len(second["nodes"]) == 3
+
+
+def test_needle_streak_ignores_reselect_attempts() -> None:
+    """3 routine reselects never trip needle fail-fast (medium 7)."""
+    reselect = {
+        "tool": "search_sec_filings",
+        "arguments": {},
+        "error": "ungrounded; re-selecting",
+        "error_type": "reselect",
+    }
+    assert sched._needle_error_streak([dict(reselect) for _ in range(3)]) == 0
+    gen_fail = {"tool": "query_finra", "arguments": {}, "error": "needle blew up"}
+    assert sched._needle_error_streak([dict(gen_fail) for _ in range(3)]) == 3

@@ -32,10 +32,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-# ponytail: 4 SEC workers max; pool size IS the cap (no semaphore to deadlock).
-# Module-level pool: never the loop's default executor, so asyncio.run never waits
-# for stragglers and wait_for cancellation returns immediately.
-_SEC_POOL = _futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="sec-gateway")
+# ponytail: pool size IS the cap (no semaphore to deadlock). Never the loop's
+# default executor, so asyncio.run never waits for stragglers. Plain pools:
+# 3.14 spawns non-daemon workers with no hook, so shutdown still joins them.
+_SEC_POOL = _futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="sec")
+_TOOL_POOL = _futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="tool")
 
 
 async def _sec_thread_call(call: Any) -> Any:
@@ -2032,7 +2033,9 @@ async def _invoke_attempt_tool(
         # loop-independent process cap, Needle's _LOCK stays serial.
         result = await _sec_thread_call(call)
     else:
-        result = await asyncio.to_thread(call)
+        # ponytail: non-SEC sync tools also leave the default executor, so a stuck
+        # Exa call never holds asyncio.run exit up to EXA_TIMEOUT_SECONDS.
+        result = await asyncio.get_running_loop().run_in_executor(_TOOL_POOL, call)
     result = await _awaited(result)
     if not isinstance(result, dict):
         raise ValueError(f"tool runtime for {tool_name!r} must return a mapping")
@@ -3233,10 +3236,12 @@ def _blocked_terminal(nid: str, admitted: int, attempts: list[dict[str, Any]]) -
 
 
 def _needle_error_streak(attempts: list[dict[str, Any]]) -> int:
-    """Consecutive generation-shaped failures at the tail (no args ever produced)."""
+    """Consecutive Needle generation failures at the tail (reselects don't count)."""
     n = 0
     for attempt in reversed(attempts):
-        if attempt.get("error") is None or attempt.get("arguments"):
+        # ponytail: reselect attempts carry error + empty args by design; counting
+        # them would block a node after 3 routine re-selects with a needle-down lie.
+        if attempt.get("error") is None or attempt.get("arguments") or attempt.get("error_type") == "reselect":
             break
         n += 1
     return n

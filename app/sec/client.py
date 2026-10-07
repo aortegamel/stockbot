@@ -953,6 +953,23 @@ def _store_lookup_entry(frame: _FrameRows, rows: list[tuple[str, str, int]]) -> 
         _lookup_cached_at = time.monotonic()
 
 
+def _lookup_index_single_flight(frame: _FrameRows) -> list[tuple[str, str, int]]:
+    """Shared index build: one builder under lock, cold callers wait on it."""
+    global _lookup_cached_at, _lookup_cached_frame, _lookup_cached_index
+    with _lookup_lock:
+        if (
+            _lookup_cached_index is not None
+            and _lookup_cached_frame is frame
+            and time.monotonic() - _lookup_cached_at < _LOOKUP_TTL_S
+        ):
+            return _lookup_cached_index
+        index = _build_lookup_index(frame)
+        _lookup_cached_frame = frame
+        _lookup_cached_index = index
+        _lookup_cached_at = time.monotonic()
+        return index
+
+
 def _cached_lookup_frame() -> _FrameRows | None:
     """Cached lookup frame when fresh; None when stale or empty."""
     with _lookup_lock:
@@ -1043,12 +1060,8 @@ def _scan_lookup_rows(frame: _FrameRows, query: str, want: str) -> list[tuple[in
     try:
         if not want:
             return []
-        cached = _cached_lookup_index()
-        if cached is not None:
-            return _scan_lookup_index(cached, want)
-        index = _build_lookup_index(frame)
-        _store_lookup_entry(frame, index)
-        return _scan_lookup_index(index, want)
+        # ponytail: frame arg still selects the dataset; single-flight builds once.
+        return _scan_lookup_index(_lookup_index_single_flight(frame), want)
     except Exception as exc:
         raise SECClientError(f"cik lookup parse failed for {query!r}: {exc}") from exc
 

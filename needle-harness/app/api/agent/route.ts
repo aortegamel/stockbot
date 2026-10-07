@@ -163,8 +163,7 @@ export async function POST(req: Request): Promise<Response> {
         const routed = await kernelRouter.call({ op: "route", prompt }, { signal: req.signal });
         const winner = typeof routed.route === "string" ? routed.route : "research_required";
         if (winner === "no_session") {
-          send({ type: "agent_start", prompt });
-          send({ type: "done", metrics: { totalMs: 0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures: {} } });
+          await answerDirect();
           controller.close();
           return;
         }

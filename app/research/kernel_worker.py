@@ -263,16 +263,24 @@ async def _intake_ticker_chain(
     if acc is None:
         return out
     start = _time.perf_counter()
-    doc = await _intake_attempt(
-        "get_sec_document",
-        {"accession_no": acc, "max_chars": _INTAKE_DOC_CHARS},
-        sid,
-        session,
-        registry,
-        jev,
-        kernel,
-        as_of,
-    )
+    try:
+        # ponytail: shield keeps the finished list result when the 8-K open times out;
+        # the chain returns partial instead of discarding everything.
+        doc = await asyncio.shield(
+            _intake_attempt(
+                "get_sec_document",
+                {"accession_no": acc, "max_chars": _INTAKE_DOC_CHARS},
+                sid,
+                session,
+                registry,
+                jev,
+                kernel,
+                as_of,
+            )
+        )
+    except (TimeoutError, asyncio.CancelledError):
+        logger.warning("intake chain doc timeout ticker=%s acc=%s", ticker, acc)
+        return out
     out.append(("get_sec_document", {"accession_no": acc}, doc, (_time.perf_counter() - start) * 1000.0))
     return out
 
@@ -457,14 +465,20 @@ def _intake_reasoner_prompt(objective_id: str, objective: str, as_of: str | None
         "   meant). Reason in any form you need; these are hints, not a template, and\n"
         "   nothing you write is filtered or rewritten by code.\n"
         "5. Never use memory as evidence; cite only evidence_ids present in the digest.\n"
-        "6. You propose; you never decide, approve, buy, sell, or recommend.\n"
+        "6. Authority: propose questions, interpretations, and evidence requests ONLY. NEVER emit\n"
+        "   approved/selected/finalDecision/shouldContinue/verdict/decision/buy/sell/hold/order/portfolio/committee\n"
+        "   fields under any name. Research never decides; the user decides.\n"
+        "7. You propose; you never decide, approve, buy, sell, or recommend.\n"
         "\n"
         "Output exactly one JSON object and nothing else:\n"
         '{"proposals": [{"id","objectiveId","question","dependsOn","whyItMatters"}],\n'
         ' "tickers"?: string[], "corrected_query"?: string}\n'
         f'Proposal ids start with "{objective_id}-". dependsOn may reference only ids you\n'
         "propose in this same output. "
-        f"Today is {utcnow().date().isoformat()} UTC; decode relative dates against it.\n"
+        f"Today is {utcnow().date().isoformat()} UTC; decode relative dates against it: "
+        "'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, "
+        "'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); "
+        "'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values.\n"
     )
 
 
@@ -666,10 +680,12 @@ async def _intake_round(
         raw.append({"tool": tool, "arguments": dict(args), "record": _jsonable_record(record)})
         if record.get("error") is not None or record.get("outcome") is None:
             outcomes["timeout" if record.get("error_type") == "timeout" else "error"] += 1
-            try:
-                scheduler._settle_attempt(kernel, dict(record), sid, "")
-            except Exception as exc:  # noqa: BLE001 - orphaned job close never fails intake
-                logger.warning("intake settle failed tool=%s err=%s", tool, exc)
+            if record.get("job_id") is not None:
+                # ponytail: timeout records carry no job_id; nothing to close.
+                try:
+                    scheduler._settle_attempt(kernel, dict(record), sid, "")
+                except Exception as exc:  # noqa: BLE001 - orphaned job close never fails intake
+                    logger.warning("intake settle failed tool=%s err=%s", tool, exc)
             continue
         s0 = _time.perf_counter()
         try:
@@ -1049,9 +1065,11 @@ def run_graph_prompt(
             logger.warning("intake failed sid=%s (%s)", sid, exc, exc_info=True)
             _notify(progress, "intake_skipped", {"reason": "intake_failed"})
             proposals = []
-    admitted: list[dict[str, object]] = _jev_admit(sid, objective, proposals, jev=client) if proposals else []
-    # ponytail: 4 concrete questions max; extra proposals never become nodes.
-    _create_nodes_topological(sid, stamped, admitted[:4] if admitted else [])
+    # ponytail: 4 concrete questions max; cap BEFORE JEV so disposition never judges
+    # proposals that can't become nodes, and dropped deps never silently vanish.
+    capped: list[dict[str, object]] = proposals[:4] if proposals else []
+    admitted: list[dict[str, object]] = _jev_admit(sid, objective, capped, jev=client) if capped else []
+    _create_nodes_topological(sid, stamped, admitted if admitted else [])
     return sid
 
 

@@ -3485,7 +3485,16 @@ def _search_efts_drive(
     state: _SearchState, request: SECSearchRequest, as_of: str | None, result_limit: int | None
 ) -> None:
     forms, per_variant = _search_efts_params(request)
-    for variant, route in state.variants:
+    import time as _time
+
+    # ponytail: global 30s EFTS deadline across variants; each variant keeps its own
+    # per-drain budget, but several slow variants no longer stack past the search bound.
+    deadline = _time.monotonic() + 30.0
+    for i, (variant, route) in enumerate(state.variants):
+        if i > 0 and _time.monotonic() >= deadline:
+            state.warnings.append(f"EFTS variants stopped after 30s; {variant!r} skipped")
+            state.record("efts", variant, "not_applicable", filters={"reason": "global EFTS deadline"})
+            continue
         _search_efts_variant(state, request, variant, route, forms, per_variant, as_of, result_limit)
 
 

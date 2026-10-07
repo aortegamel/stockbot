@@ -390,3 +390,55 @@ def test_intake_never_searches_filings_and_chains_8k(monkeypatch: pytest.MonkeyP
     web = [a for t, a in calls if t == "search_web"]
     assert web and web[0].get("query") == "how will orcl's manjure affect AAPL?"
     assert calls[0][0] == "list_sec_filings" and calls[0][1].get("identifier") == "320193"
+
+
+def test_chain_keeps_list_result_when_doc_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Slow 8-K open keeps the finished list result; chain returns partial (medium 4)."""
+    import asyncio
+    from typing import Any
+
+    from app.research import kernel_worker as kwc
+
+    async def _attempt(tool: str, args: dict[str, object], *a: Any, **k: Any) -> dict[str, Any]:
+        if tool == "list_sec_filings":
+            return {
+                "tool": tool,
+                "arguments": args,
+                "job_id": "j-list",
+                "result": {"filings": [{"form": "8-K", "accession_no": "0001-26-000001"}]},
+                "outcome": SimpleNamespace(content="x", error=None),
+                "outcome_summary": "x",
+                "error": None,
+            }
+        await asyncio.sleep(60)
+        raise AssertionError("doc open should have been cancelled")
+
+    monkeypatch.setattr(kwc, "_intake_attempt", _attempt)
+    monkeypatch.setattr(kwc, "_intake_cik", lambda t: "320193")  # pyrefly: ignore[implicit-any-lambda]
+
+    async def _main() -> Any:
+        return await asyncio.wait_for(kwc._intake_ticker_chain("ORCL", "s1", {}, [], None, object(), None), timeout=5)
+
+    out = asyncio.run(_main())
+    assert len(out) == 1 and out[0][0] == "list_sec_filings"
+
+
+def test_timeout_record_without_job_id_skips_settle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Jobless timeout records count timeout without settle KeyError noise (medium 4)."""
+    import asyncio
+
+    from app.research import kernel_worker as kwt
+    from app.research import scheduler as schedt
+
+    async def _slow(*a: Any, **k: Any) -> Any:
+        await asyncio.sleep(60)
+        return []
+
+    settled: list[str] = []
+    monkeypatch.setattr(kwt, "_intake_ticker_chain", _slow)
+    monkeypatch.setattr(kwt, "_INTAKE_BUDGET_S", 0.05)
+    monkeypatch.setattr(schedt, "_load_evidence", lambda sid, kernel, repo: [])  # pyrefly: ignore[implicit-any-lambda]
+    monkeypatch.setattr(schedt, "_settle_attempt", lambda *a, **k: settled.append("settle") or (None, False))  # pyrefly: ignore[implicit-any-lambda]
+    kernel = SimpleNamespace(record_decision=lambda *a, **k: None, record_evidence=lambda *a, **k: "ev")  # pyrefly: ignore[implicit-any-lambda]
+    _admitted, _raw, stats = asyncio.run(kwt._intake_round(None, ["ORCL"], "s1", {}, [], None, kernel, None))
+    assert isinstance(stats, dict) and stats["outcomes"]["timeout"] == 1 and settled == []
