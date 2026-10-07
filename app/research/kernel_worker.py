@@ -1466,6 +1466,7 @@ def _run(
         return _terminal(rid, "provider_error", f"kernel run failed: {exc}")
     finally:
         _close_bootstrap_job(sid)
+        logger.info("run wall_timing rid=%s elapsed_s=%.1f", rid, time.perf_counter() - _t0)
     if not isinstance(run_result, dict):
         return _terminal(rid, "provider_error", "kernel run failed: malformed result")
     if run_result.get("status") == "failed":

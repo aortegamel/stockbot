@@ -328,7 +328,12 @@ def handle(line):
             tool = req.get("tool")
             if not isinstance(tool, str) or not tool:
                 raise ValueError("bad tool")
+            import time as _t
+
+            _gen_t0 = _t.perf_counter()
+            _init_ms = 0.0
             bound = _bound_agent(tool, req.get("schema"))
+            _init_ms = (_t.perf_counter() - _gen_t0) * 1000.0
             try:
                 objective = req.get("objective")
                 prompt = _arguments_prompt(
@@ -346,6 +351,9 @@ def handle(line):
                     bound.close()
                 except Exception:
                     pass
+            _gen_ms = (_t.perf_counter() - _gen_t0) * 1000.0
+            sys.stderr.write(f"needle timing tool={tool} init_ms={_init_ms:.1f} generate_ms={_gen_ms:.1f}\n")
+            sys.stderr.flush()
             decision = _decision(r, tool)
             try:
                 validate_needle_tool(tool, decision["tool"])
