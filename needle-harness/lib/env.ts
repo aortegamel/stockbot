@@ -44,6 +44,9 @@ export function redactKey(key: string): string {
 
 export type EnvOverride = { key: string; oldRedacted: string; newRedacted: string };
 
+// Explicit runtime overrides always win: PORT=3101 bun run stockbot must work.
+const INHERITED_WINS: Record<string, true> = { PORT: true };
+
 export function loadDotenvAuthoritative(dotenvPath: string): { loaded: boolean; overridden: EnvOverride[] } {
   if (!existsSync(dotenvPath)) return { loaded: false, overridden: [] };
   const parsed = parseDotenv(readFileSync(dotenvPath, "utf8"));
@@ -52,7 +55,7 @@ export function loadDotenvAuthoritative(dotenvPath: string): { loaded: boolean; 
     const old = process.env[k];
     if (old === undefined) {
       process.env[k] = v;
-    } else if (old !== v) {
+    } else if (old !== v && !INHERITED_WINS[k]) {
       overridden.push({ key: k, oldRedacted: redactKey(old), newRedacted: redactKey(v) });
       process.env[k] = v;
     }
