@@ -1385,7 +1385,7 @@ def test_sec_thread_cap_survives_four_concurrent_calls() -> None:
 
 
 def test_session_run_survives_second_event_loop() -> None:
-    """Two asyncio.run sessions back-to-back; loop-bound cap would fail run 2 (bug 2)."""
+    """Two asyncio.run sessions with 3 contending nodes; loop-bound cap would fail run 2 (bug 2)."""
     from types import SimpleNamespace
     from unittest import mock
 
@@ -1397,12 +1397,16 @@ def test_session_run_survives_second_event_loop() -> None:
             if sid in self.seen:
                 return []
             self.seen.add(sid)
-            return [SimpleNamespace(node_id="n1", session_id=sid, question="q?", why_it_matters="w")]
+            return [
+                SimpleNamespace(node_id=f"n{i}", session_id=sid, question="q?", why_it_matters="w") for i in range(3)
+            ]
 
     async def done(n: Any, sid: str, **kw: Any) -> dict[str, Any]:
-        return {"node_id": "n1", "status": "resolved", "admitted": 1, "incomplete_guard": False}
+        await asyncio.sleep(0)  # yield so the 3rd node actually waits on the 2-lane cap
+        return {"node_id": n.node_id, "status": "resolved", "admitted": 1, "incomplete_guard": False}
 
     with mock.patch.object(sched, "run_node", done):
         first = asyncio.run(sched.run("s1", kernel=_KS(), repo=None))
         second = asyncio.run(sched.run("s2", kernel=_KS(), repo=None))
     assert first["status"] == "complete" and second["status"] == "complete"
+    assert len(first["nodes"]) == 3 and len(second["nodes"]) == 3
