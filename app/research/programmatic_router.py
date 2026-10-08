@@ -53,6 +53,50 @@ _Registry = list[dict[str, JSONValue]]
 _Attempts = list[dict[str, JSONValue]]
 
 
+_VARIANTS = {
+    "search_sec_filings": "search_sec_filings_bounded",
+    "find_sec_entities": "find_sec_entities_bounded",
+}
+_BOUNDED = {bounded: full for full, bounded in _VARIANTS.items()}
+_COVERAGE_TOKS = frozenset({"all", "every", "each", "complete", "full", "list"})
+
+
+def _wants_coverage(norm: str, toks: set[str]) -> bool:
+    """Coverage ask (all/every/each/complete/full/list, who filed) needs the exhaustive variant."""
+    return bool(toks & _COVERAGE_TOKS) or "who filed" in norm or "who actually filed" in norm
+
+
+def _pick_variant(tool: str, norm: str, toks: set[str], names: set[str]) -> str:
+    """One exhaustive/bounded pair, decided by code: coverage stays exhaustive, else bounded."""
+    for full, bounded in _VARIANTS.items():
+        if tool in (full, bounded):
+            want = full if _wants_coverage(norm, toks) else bounded
+            return want if want in names else tool
+    return tool
+
+
+def _variant_decision(decision: ToolDecision, norm: str, toks: set[str], names: set[str]) -> ToolDecision:
+    """Rewrite a JEV pick inside a pair to the code-chosen variant; non-pair decisions pass through."""
+    if decision.action != "invoke" or not decision.tool_names:
+        return decision
+    mapped = tuple(dict.fromkeys(_pick_variant(t, norm, toks, names) for t in decision.tool_names))
+    if mapped == decision.tool_names:
+        return decision
+    name = decision.tool_name
+    new_name = _pick_variant(name, norm, toks, names) if isinstance(name, str) else None
+    probs = {_pick_variant(k, norm, toks, names): v for k, v in decision.probabilities.items()}
+    out = ToolDecision(
+        action="invoke",
+        tool_name=new_name,
+        tool_names=mapped,
+        probabilities=probs,
+        confidence=decision.confidence,
+    )
+    out.validate("<programmatic_router>")
+    logger.info("toolflow programmatic_variant tool=%s -> %s", decision.tool_names, mapped)
+    return out
+
+
 def _signals(text: str) -> tuple[str, set[str]]:
     """Normalized text + keyword tokens (same helpers as _search_tools)."""
     from app.tools import _discovery_keywords, _normalize_discovery_text
@@ -65,10 +109,17 @@ def _registry_names(registry: _Registry) -> set[str]:
 
 
 def _ranked(norm: str, toks: set[str], names: set[str]) -> list[tuple[int, str]]:
-    """Scorer hits restricted to the live registry, best first."""
+    """Scorer hits restricted to the live registry, best first; one entry per variant pair."""
     from app.tools import _score_registry
 
-    return [(s, n) for s, n in _score_registry(norm, toks, None) if n in names]
+    best: dict[str, int] = {}
+    for s, n in _score_registry(norm, toks, None):
+        if n not in names:
+            continue
+        key = _BOUNDED.get(n, n)
+        if s > best.get(key, -(10**9)):
+            best[key] = s
+    return sorted(((s, n) for n, s in best.items()), key=lambda x: -x[0])
 
 
 def _ambiguous(top: str, second: str, ranked: list[str]) -> bool:
@@ -148,16 +199,12 @@ def _router_pick(
         if "get_insider_activity" in names:
             return "get_insider_activity", "insider"
     # 5. Person-mention filing search (accession unknown; filer comes from hits).
-    # Coverage asks ("all/every/who filed") stay exhaustive; one-mention checks use bounded.
+    # "10-K" tokenizes to "10k" (no "filing" token), so match the form too.
+    _FORM = "10-k" in norm or "10k" in toks or "10-q" in norm or "8-k" in norm
     if ("search_sec_filings" in names or "search_sec_filings_bounded" in names) and (
-        ("filing" in toks and "mention" in norm) or "who filed" in norm or "who actually filed" in norm
+        (("filing" in toks or _FORM) and "mention" in norm) or "who filed" in norm or "who actually filed" in norm
     ):
-        coverage = toks & {"all", "every"} or "who filed" in norm or "who actually filed" in norm
-        if coverage and "search_sec_filings" in names:
-            return "search_sec_filings", "person-mention"
-        if "search_sec_filings_bounded" in names:
-            return "search_sec_filings_bounded", "person-mention-bounded"
-        return "search_sec_filings", "person-mention"
+        return _pick_variant("search_sec_filings", norm, toks, names), "person-mention"
     # 6. Quarterly revenue always starts from the filing list.
     if "revenue" in toks and "quarter" in toks and "list_sec_filings" in names:
         return "list_sec_filings", "revenue-quarter"
@@ -183,7 +230,12 @@ def _router_subset(ranked: list[tuple[int, str]], registry: _Registry, names: se
     """Top-5 scorer subset for the JEV fallback; None when the scorer is blank or the registry is already small."""
     if not ranked:
         return None
-    wanted = {n for _, n in ranked[:_TOP_N]} & names
+    wanted = {n for _, n in ranked[:_TOP_N]}
+    # _ranked collapses each pair under the exhaustive name; re-expand so JEV keeps both variants.
+    for full, bounded in _VARIANTS.items():
+        if full in wanted:
+            wanted |= {full, bounded}
+    wanted &= names
     if not wanted or len(wanted) >= len(names):
         return None
     return [e for e in registry if isinstance(e, dict) and e.get("name") in wanted]
@@ -239,6 +291,7 @@ async def programmatic_select_round(
     pick = _router_pick(text, norm, toks, names, ranked, attempts or [], ctx_evidence or [])
     if pick is not None:
         tool, reason = pick
+        tool = _pick_variant(tool, norm, toks, names)
         decision = ToolDecision(
             action="invoke", tool_name=tool, tool_names=(tool,), probabilities={tool: 1.0}, confidence=None
         )
@@ -265,5 +318,13 @@ async def programmatic_select_round(
             len(subset),
             len(registry),
         )
-        return await sched._select_round(jev, kernel, sid, nid, session, node, subset, ctx_evidence, attempts)
-    return await sched._select_round(jev, kernel, sid, nid, session, node, registry, ctx_evidence, attempts)
+        action, decision = await sched._select_round(
+            jev, kernel, sid, nid, session, node, subset, ctx_evidence, attempts
+        )
+    else:
+        action, decision = await sched._select_round(
+            jev, kernel, sid, nid, session, node, registry, ctx_evidence, attempts
+        )
+    if isinstance(decision, ToolDecision):
+        decision = _variant_decision(decision, norm, toks, names)
+    return action, decision

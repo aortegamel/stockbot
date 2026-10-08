@@ -3,7 +3,14 @@
 import asyncio
 
 from app.research import scheduler
-from app.research.programmatic_router import programmatic_route, programmatic_select_round
+from app.research.programmatic_router import (
+    _ranked,
+    _registry_names,
+    _router_pick,
+    _signals,
+    programmatic_route,
+    programmatic_select_round,
+)
 
 
 class _Kernel:
@@ -88,3 +95,90 @@ def test_ambiguous_falls_back_to_jev_subset():
         )
     )
     assert act == "reason" and seen["n"] == len(reg)
+
+
+def test_mention_check_selects_bounded_without_jev() -> None:
+    """One-mention ask resolves by rule 9; a JEV stub that fails must never run."""
+
+    class _BoomJev:
+        async def select_tool(self, *a: object, **k: object) -> object:
+            raise AssertionError("router must not call JEV")
+
+    reg = scheduler.build_registry()
+    names = _registry_names(reg)
+    objective = "Which 10-K mentions Jensen Huang?"
+    action, dec = asyncio.run(
+        programmatic_select_round(
+            _BoomJev(),
+            _Kernel(),
+            "s1",
+            "n1",
+            {"session_id": "s1", "objective": objective},
+            _node(objective),
+            reg,
+            [],
+            [],
+        )
+    )
+    assert (action, dec.tool_name) == ("invoke", "search_sec_filings_bounded")
+    ranked = [n for _, n in _ranked(" ".join(objective.split()), {"10k", "mention"}, names)]
+    assert not ({"search_sec_filings", "search_sec_filings_bounded"} <= set(ranked))
+
+
+def test_coverage_ask_stays_exhaustive() -> None:
+    """Coverage asks keep the exhaustive variant."""
+    assert _pick("Who filed all filings that mention Jensen Huang?") == ("invoke", "search_sec_filings")
+
+
+def test_variant_falls_back_to_registered_member() -> None:
+    """A missing wanted variant falls back to the registered pair member."""
+    from app.research.programmatic_router import _pick_variant
+
+    assert (
+        _pick_variant("search_sec_filings", "which 10k mention", {"mention"}, {"search_sec_filings"})
+        == "search_sec_filings"
+    )
+    assert (
+        _pick_variant("search_sec_filings_bounded", "who filed all", {"all"}, {"search_sec_filings_bounded"})
+        == "search_sec_filings_bounded"
+    )
+
+
+def test_jev_fallback_rewritten_to_coverage_variant() -> None:
+    """JEV's bounded pick becomes exhaustive on a coverage ask."""
+    from app.research.models import ToolDecision
+
+    class _J:
+        async def select_tool(self, objective, node, registry, evidence, attempts, session_id=None, job_id=None):
+            return ToolDecision(
+                action="invoke",
+                tool_name="search_sec_filings_bounded",
+                tool_names=("search_sec_filings_bounded",),
+                probabilities={"search_sec_filings_bounded": 0.9},
+                confidence=0.9,
+            )
+
+    reg = scheduler.build_registry()
+    # "all companies" carries coverage but no mention/filing trigger, so no rule
+    # fires and the JEV fallback runs; the bounded pick then rewrites to exhaustive.
+    ask = "zqxj vbnm all companies qqqq"
+
+    norm, toks = _signals(f"{ask} {ask}")
+    names = _registry_names(reg)
+    ranked = _ranked(norm, toks, names)
+    assert _router_pick(f"{ask} {ask}", norm, toks, names, ranked, [], []) is None
+    action, dec = asyncio.run(
+        programmatic_select_round(
+            _J(),
+            _Kernel(),
+            "s1",
+            "n1",
+            {"session_id": "s1", "objective": ask},
+            _node(ask),
+            reg,
+            [],
+            [],
+        )
+    )
+    assert (action, dec.tool_name) == ("invoke", "search_sec_filings")
+    assert dec.tool_names == ("search_sec_filings",)
