@@ -616,8 +616,18 @@ class JevClient:
             raise RuntimeError(f"jev ping failed: unexpected sidecar ack for {payload['id']!r}")
 
     def close(self) -> None:
-        with self._lock:
-            proc, self._proc = self._proc, None
+        if self._lock.acquire(blocking=False):
+            try:
+                proc, self._proc = self._proc, None
+            finally:
+                self._lock.release()
+        else:
+            # A roundtrip holds the lock while blocked in readline; waiting
+            # here would freeze the event loop on a hung sidecar. Terminate
+            # the live handle lock-free so its readline returns EOF; the
+            # holder then discards it, releases the lock, and the next call
+            # restarts via _ensure_proc.
+            proc = self._proc
         if proc is not None:
             _LIVE_PROCS.discard(proc)
             try:
@@ -745,7 +755,9 @@ class JevClient:
                 asyncio.to_thread(self._sidecar_roundtrip, payload), timeout=self._timeout_s
             )
         except _SidecarUnavailable:
-            raw = await asyncio.to_thread(self._http_system_one, state, questions)
+            raw = await asyncio.wait_for(
+                asyncio.to_thread(self._http_system_one, state, questions), timeout=self._timeout_s
+            )
             logger.debug(
                 "toolflow invoke_detail sid=- nid=- via=http qids=[%s]", ",".join(sorted(str(k) for k in questions))
             )

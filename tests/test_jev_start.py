@@ -7,6 +7,8 @@ import json
 import select
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -168,3 +170,75 @@ def test_outcome_dict_truncates_64k_content_keeps_error() -> None:
     assert isinstance(out["content"], str) and len(out["content"]) <= 2000
     assert out["error"] == err
     assert out["error_type"] == "boom"
+
+
+class _HungStdout:
+    """readline blocks until terminate releases it, then reports EOF."""
+
+    def __init__(self) -> None:
+        self._released = threading.Event()
+
+    def readline(self) -> str:
+        self._released.wait(timeout=30)
+        return ""
+
+
+class _HungProc:
+    def __init__(self) -> None:
+        self.stdin = _FakeStdin()
+        self.stdout = _HungStdout()
+        self.terminated = threading.Event()
+
+    def poll(self) -> None:
+        return None
+
+    def terminate(self) -> None:
+        self.terminated.set()
+        self.stdout._released.set()
+
+    def kill(self) -> None:
+        self.terminate()
+
+
+def test_hung_sidecar_timeout_keeps_loop_responsive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = Path(__file__).resolve().parent.parent
+    client = JevClient(data_root=tmp_path, runtime_path=root / "decision" / "runtime.ts", timeout_s=0.2)
+    hung = _HungProc()
+    client._proc = hung  # type: ignore[assignment]
+
+    def _noop(**kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_persist", _noop)
+
+    async def _decide_hung() -> None:
+        await client.decide(
+            {"s": 1},
+            {"q": {"type": "noul", "instructions": "x"}},
+            decision_type="t",
+            session_id="s",
+        )
+
+    start = time.monotonic()
+    with pytest.raises(RuntimeError, match="timeout"):
+        asyncio.run(_decide_hung())
+    assert time.monotonic() - start < 5
+
+    async def _probe() -> None:
+        await asyncio.wait_for(asyncio.sleep(0.01), timeout=2)
+
+    asyncio.run(_probe())
+    assert hung.terminated.is_set()
+    deadline = time.monotonic() + 5
+    while client._lock.locked() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not client._lock.locked()
+
+    async def _stub(state: object, questions: object) -> object:
+        return {"answers": {"q": {"type": "noul", "noul": 0.7}}}
+
+    client._transport = _stub  # type: ignore[assignment]
+    out = asyncio.run(
+        client.decide({"s": 1}, {"q": {"type": "noul", "instructions": "x"}}, decision_type="t", session_id="s")
+    )
+    assert out == {"q": {"kind": "noul", "probability": 0.7}}
