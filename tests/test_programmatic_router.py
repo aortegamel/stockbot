@@ -242,3 +242,30 @@ def test_form_mentions_route_person_mention() -> None:
         )
         assert (action, dec.tool_name) == ("invoke", "search_sec_filings_bounded")
 
+
+def test_insider_verbs_stay_research_and_advice_stays_direct(monkeypatch: object) -> None:
+    """Bare sell/hold tokens route research; should+verb and good-investment route direct."""
+    import app.tools as _tools
+
+    def _resolve(name: str) -> str | None:
+        return {"TSLA": "TSLA", "NVDA": "NVDA"}.get(name)
+
+    monkeypatch.setattr(  # type: ignore[union-attr]
+        _tools,
+        "_resolve_company_to_ticker",
+        _resolve,
+    )
+    assert programmatic_route("Did Musk sell TSLA shares") == "research_required"
+    assert programmatic_route("Who holds the most NVDA shares") == "research_required"
+    assert programmatic_route("should I buy NVDA") == "reasoning_required"
+    assert programmatic_route("is NVDA a good investment") == "reasoning_required"
+
+
+def test_tokenizer_merges_form_pairs_only() -> None:
+    """(10,k/q) and (8,k) merge; other 10/8 pairs never merge."""
+    from app.tools import _normalize_discovery_text as _norm
+
+    assert "10q" in _norm("Which 10-Q mentions X?")
+    assert "8k" in _norm("filed 8-K accession here")
+    assert "10k" in _norm("Which 10-K mentions X?")
+    assert "10key" not in _norm("10 key facts") and "10" in _norm("10 key facts")
