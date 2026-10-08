@@ -388,3 +388,62 @@ def test_decompose_retry_skipped_when_setup_budget_spent(monkeypatch: pytest.Mon
     proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "s", "", None, None, _time.perf_counter() + 5.0)
     assert calls["n"] == 1 and hints.get("fallback") == "setup_budget"
     assert len(proposals) == 1
+
+
+def test_followup_reuses_session_skips_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """sessionId+gap creates one node in the live session; no new session, no intake."""
+    import asyncio
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from app.research import service
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
+    sid = service.create_research("q?", "q?")
+    node = service.create_node(sid, "q1?", "w")
+    service.block_node(sid, node.node_id, "incomplete: pass 1 gap")
+
+    created: list[str] = []
+    orig_graph = kw.run_graph_prompt
+
+    def _boom_graph(*a: object, **k: object) -> str:
+        raise AssertionError("follow-up must not run setup")
+
+    async def _fake_sched(run_sid: str, **hooks: object) -> dict[str, object]:
+        assert run_sid == sid
+        nodes = service.ready_nodes(sid)
+        assert [n.node_id for n in nodes] == created
+        service.resolve_node(sid, nodes[0].node_id)
+        return {"status": "complete", "nodes": [], "incomplete_guard": False}
+
+    orig_create = service.create_node
+
+    def _count(run_sid: str, *a: object, **k: object) -> object:
+        out = orig_create(run_sid, *a, **k)
+        if isinstance(out, SimpleNamespace) or hasattr(out, "node_id"):
+            created.append(out.node_id)  # type: ignore[attr-defined]
+        return out
+
+    monkeypatch.setattr(kw, "run_graph_prompt", _boom_graph)
+    monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
+    monkeypatch.setattr("app.research.service.create_node", _count)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", lambda s: None)
+    out = asyncio.run(asyncio.to_thread(kw._run, {"id": "r2", "prompt": "q?", "sessionId": sid, "gap": "need doc X"}))
+    assert out["sessionId"] == sid
+    assert out["unresolved"] == []
+    assert len(created) == 1
+    nodes = out["nodes"]
+    assert isinstance(nodes, list) and len(nodes) == 2
+    kw.run_graph_prompt = orig_graph  # type: ignore[method-assign]
+
+
+def test_followup_unknown_session_is_invalid_params(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unknown sessionId returns invalid_params, never a new session."""
+    import tempfile
+    from pathlib import Path
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
+    out = kw._run({"id": "r9", "prompt": "q?", "sessionId": "rs:nope", "gap": "need doc X"})
+    terminal = out.get("terminal")
+    assert isinstance(terminal, dict) and terminal.get("category") == "invalid_params"

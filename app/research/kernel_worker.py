@@ -1241,6 +1241,17 @@ def _create_nodes_topological(sid: str, objective: str, admitted: list[dict[str,
             id_to_node[pid] = node_id
 
 
+def _followup_gap_nodes(sid: str, gap: str) -> tuple[str, list[str]]:
+    """Pass-2 entry: one gap node in the pass-1 session, no intake. Returns (sid, [new node ids])."""
+    from app.research import service
+    from app.research.repository import ResearchRepository
+
+    store = ResearchRepository()
+    store.get_session(sid)  # KeyError on unknown session; caller reports invalid_params
+    node = service.create_node(sid, query_with_today_utc(gap), "Missing evidence named by the writer.")
+    return sid, [node.node_id] if node.node_id else []
+
+
 def _toolflow() -> str:
     """Normalized STOCKBOT_TOOLFLOW ("" = programmatic default)."""
     return (os.environ.get("STOCKBOT_TOOLFLOW") or "").strip().lower()
@@ -1506,8 +1517,18 @@ def _run(
         run_wall = min(_RUN_WALL_S, raw_deadline / 1000.0)
     setup_deadline = _t0 + min(_SETUP_S, run_wall - _FINALIZE_S - _SCHEDULER_MIN_S)
     run_deadline = _t0 + run_wall - _FINALIZE_S
+    raw_session = req.get("sessionId")
+    raw_gap = req.get("gap")
+    followup = isinstance(raw_session, str) and raw_session.strip() and isinstance(raw_gap, str) and raw_gap.strip()
+    followup_nodes: list[str] = []
     try:
-        sid = run_graph_prompt(objective, as_of, jev=client, progress=progress, setup_deadline=setup_deadline)
+        if followup:
+            assert isinstance(raw_session, str) and isinstance(raw_gap, str)
+            sid, followup_nodes = _followup_gap_nodes(raw_session.strip(), raw_gap.strip())
+        else:
+            sid = run_graph_prompt(objective, as_of, jev=client, progress=progress, setup_deadline=setup_deadline)
+    except KeyError as exc:
+        return _terminal(rid, "invalid_params", f"unknown session: {exc}")
     except RuntimeError as exc:
         if "registry guard forbids" in str(exc):
             return _terminal(rid, "provider_error", str(exc))
@@ -1641,6 +1662,10 @@ def _run(
     unresolved: list[JSONValue] = [
         str(n["node_id"]) for n in nodes_payload if isinstance(n, dict) and n.get("status") != "resolved"
     ]
+    if followup_nodes:
+        # ponytail: follow-up gates only the new gap node; pass-1 nodes keep
+        # their own states in nodes_payload but never gate the writer again.
+        unresolved = [nid for nid in unresolved if nid in followup_nodes]
     escalated = bool(unresolved) or incomplete_guard or stalled
     if stalled:
         failures["stalled"] = failures.get("stalled", 0) + 1
@@ -1649,6 +1674,7 @@ def _run(
     out: dict[str, JSONValue] = {
         "id": rid,
         "objective": objective,
+        "sessionId": sid,
         "evidence": evidence,
         "nodes": nodes_payload,
         "decisions": decisions_payload,

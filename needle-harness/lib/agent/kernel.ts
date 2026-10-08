@@ -70,6 +70,7 @@ export type KernelReasonInput = {
 export type KernelResponse = {
   id?: string;
   objective?: string;
+  sessionId?: string;
   evidence: KernelEvidence[];
   nodes?: KernelGraphNode[];
   decisions?: Record<string, unknown>[];
@@ -616,8 +617,15 @@ export async function runKernelAgent(
     emit({ type: "progress", stage: "evidence_gap", detail: { missing: gap.slice(0, 300) } });
     const followStart = performance.now();
     let follow: KernelResponse;
+    // ponytail: pass 2 reuses the pass-1 session — one gap node, no intake,
+    // full session evidence visible. Old workers without sessionId keep the
+    // legacy full-prompt call.
+    const followBody: Record<string, unknown> =
+      typeof res.sessionId === "string" && res.sessionId
+        ? { op: "run", prompt, sessionId: res.sessionId, gap, deadlineMs: timeoutMs }
+        : { op: "run", prompt: `${prompt}\nStill missing: ${gap}`, deadlineMs: timeoutMs };
     try {
-      follow = await router.call({ op: "run", prompt: `${prompt}\nStill missing: ${gap}`, deadlineMs: timeoutMs }, { signal: opts?.signal, timeoutMs, onProgress: (stage, detail) => emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage }) });
+      follow = await router.call(followBody, { signal: opts?.signal, timeoutMs, onProgress: (stage, detail) => emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage }) });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       countFailure("provider_error");
@@ -643,10 +651,13 @@ export async function runKernelAgent(
     const followNodes: KernelGraphNode[] = (Array.isArray(follow.nodes) ? follow.nodes : [])
       .filter((n) => n && typeof n.node_id === "string")
       .map((n) => ({ node_id: String(n.node_id), question: String(n.question ?? ""), status: String(n.status ?? ""), depends_on: Array.isArray(n.depends_on) ? n.depends_on.map(String) : [] }));
-    mergedNodes = [...mergedNodes, ...followNodes];
-    mergedDecisions = [...mergedDecisions, ...(Array.isArray(follow.decisions) ? follow.decisions : [])];
-    // ponytail: pass 2 is a new worker session — pass-1 node ids can never
-    // resolve there, so only the latest pass's unresolved list gates the writer.
+    // ponytail: same-session pass 2 returns the full session lists — replace,
+    // never append (appending would duplicate pass-1 nodes/decisions).
+    const sameSession = typeof follow.sessionId === "string" && follow.sessionId === res.sessionId;
+    mergedNodes = sameSession ? followNodes : [...mergedNodes, ...followNodes];
+    mergedDecisions = sameSession
+      ? (Array.isArray(follow.decisions) ? follow.decisions : [])
+      : [...mergedDecisions, ...(Array.isArray(follow.decisions) ? follow.decisions : [])];
     mergedUnresolved = Array.isArray(follow.unresolved) ? follow.unresolved.map(String) : [];
     mergedGuard = follow.incompleteGuard ?? follow.incomplete_guard ?? false;
     mergedEscalated = follow.escalated ?? false;

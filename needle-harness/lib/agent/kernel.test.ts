@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { KernelRouter, runKernelAgent, type KernelChild } from "./kernel";
+import { KernelRouter, runKernelAgent, type KernelChild, type KernelSpawn } from "./kernel";
 
 class FakeChild implements KernelChild {
   exitCode: number | null = null;
@@ -279,5 +279,82 @@ describe("runKernelAgent evidence loop", () => {
     expect(types).toContain("failed");
     expect(events.find((e) => e.type === "failed")?.category).toBe("incomplete_evidence");
     expect(types.at(-1)).toBe("done");
+  });
+
+  test("pass 2 reuses the pass-1 session and replaces full lists", async () => {
+    const events: Array<{ type: string }> = [];
+    const seenReasons: Array<Record<string, unknown>> = [];
+    const written: string[] = [];
+    const spawn: KernelSpawn = (): KernelChild => {
+      const c = new FakeChild();
+      const origWrite = c.stdin.write;
+      c.stdin.write = (data: string, cb?: (err?: Error | null) => void): void => {
+        written.push(data);
+        origWrite.call(c.stdin, data, cb);
+      };
+      c.reply = (id: string): string => {
+        const pass2 = written.length > 1;
+        return `${JSON.stringify(
+          pass2
+            ? {
+              id,
+              objective: "q",
+              sessionId: "s1",
+              evidence: [{ id: "ev:1", content: "fact" }, { id: "ev:2", content: "gap filled" }],
+              nodes: [
+                { node_id: "n1", question: "q", status: "blocked", depends_on: [] },
+                { node_id: "n2", question: "gap", status: "resolved", depends_on: [] },
+              ],
+              decisions: [{ decision_id: "d2" }],
+              unresolved: [],
+              incomplete_guard: false,
+              toolExecutions: [],
+              toolCalls: [],
+              failures: {},
+              escalations: 0,
+              escalated: false,
+            }
+            : {
+              id,
+              objective: "q",
+              sessionId: "s1",
+              evidence: [{ id: "ev:1", content: "fact" }],
+              nodes: [{ node_id: "n1", question: "q", status: "blocked", depends_on: [] }],
+              decisions: [{ decision_id: "d1" }],
+              unresolved: ["n1"],
+              incomplete_guard: true,
+              toolExecutions: [],
+              toolCalls: [],
+              failures: {},
+              escalations: 1,
+              escalated: true,
+            },
+        )}\n`;
+      };
+      queueMicrotask(() => c.emitStdout('{"type":"ready"}\n'));
+      return c;
+    };
+    let writes = 0;
+    await runKernelAgent("q", (e) => void events.push(e as { type: string }), {
+      deps: {
+        python: "py",
+        workerPath: "w",
+        spawnFn: spawn,
+        reason: async (o) => {
+          writes += 1;
+          seenReasons.push({ unresolved: o.unresolved, nodes: o.nodes });
+          o.onDelta("text");
+          return writes === 1 ? { text: "t", usage: {}, missingEvidence: "need doc X" } : { text: "t2", usage: {} };
+        },
+      },
+    });
+    expect(written.length).toBe(2);
+    const second = JSON.parse(written[1] ?? "{}") as Record<string, unknown>;
+    expect(second.sessionId).toBe("s1");
+    expect(second.gap).toBe("need doc X");
+    const finalReason = seenReasons[1] as { unresolved: string[]; nodes: unknown[] };
+    expect(finalReason.unresolved).toEqual([]);
+    expect(finalReason.nodes.length).toBe(2);
+    expect(events.map((e) => e.type).at(-1)).toBe("done");
   });
 });
