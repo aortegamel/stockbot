@@ -147,10 +147,16 @@ def test_arguments_uses_shared_needle_and_schema_fallback(monkeypatch: pytest.Mo
 
 
 def test_kernel_worker_stamps_route_assess_and_node() -> None:
+    # Clock asks short-circuit in programmatic_route, so JEV never sees them;
+    # the stamp check uses an unroutable prompt that still reaches JEV.
     jev = _JevRoute("get_current_time")
     out = kw._route({"id": "r1", "op": "route", "prompt": "what time is it?"}, jev=jev)  # type: ignore[arg-type]
     assert out == {"id": "r1", "route": "get_current_time"}
-    assert isinstance(jev.seen[0][0], str) and jev.seen[0][0].startswith("[Today UTC ")
+    assert jev.seen == []
+    jev2 = _JevRoute("research_required")
+    out2 = kw._route({"id": "r2", "op": "route", "prompt": "halp money stuff?"}, jev=jev2)  # type: ignore[arg-type]
+    assert out2 == {"id": "r2", "route": "research_required"}
+    assert isinstance(jev2.seen[0][0], str) and jev2.seen[0][0].startswith("[Today UTC ")
     assess = _JevAssess("node_resolved")
     kw._assess_entry({"id": "s1", "prompt": "risk?", "tool": "t", "result": {}}, jev=assess)  # type: ignore[arg-type]
     assert isinstance(assess.seen[0][0], str) and assess.seen[0][0].startswith("[Today UTC ")

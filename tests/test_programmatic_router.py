@@ -47,6 +47,14 @@ def test_route_fast_path_marks_research():
     assert programmatic_route("hello") is None
 
 
+def test_route_clock_and_advice_fast_paths() -> None:
+    """Clock asks single-shot; pure advice answers direct; mixed/insider asks research."""
+    assert programmatic_route("what time is it") == "get_current_time"
+    assert programmatic_route("should I buy NVDA") == "reasoning_required"
+    assert programmatic_route("should I buy NVDA after its Q3 revenue") == "research_required"
+    assert programmatic_route("did NVDA insiders sell") == "research_required"
+
+
 def test_small_talk_never_creates_session() -> None:
     """thanks / never mind short-circuit to no_session (plan entry route)."""
     from app.research.programmatic_router import programmatic_route

@@ -148,7 +148,7 @@ export async function reason(opts: {
   const needsGapLine =
     opts.escalated || opts.incompleteGuard === true || (opts.unresolved !== undefined && opts.unresolved.length > 0);
   const system = opts.direct
-    ? "You are Stockbot. Answer the user directly and briefly from the supplied context. Never quote or repeat the [Today UTC YYYY-MM-DD] bracket from the request in answers or clarifications — decode it silently to dates. If the request is unclear, ask what they mean and say what you can look up: the time, SEC filings, or a web search."
+    ? "You are Stockbot. Answer the user directly and briefly from the supplied context. Stockbot does not give buy, sell or hold advice; say this and offer facts that you can look up. Never quote or repeat the [Today UTC YYYY-MM-DD] bracket from the request in answers or clarifications — decode it silently to dates. If the request is unclear, ask what they mean and say what you can look up: the time, SEC filings, or a web search."
     : SYSTEM + (needsGapLine ? "\nRetrieval escalated with no usable evidence. End your answer with a line: Missing-Evidence: <what is needed>." : "");
   const user = opts.direct ? `USER REQUEST\n${opts.prompt}` : `USER REQUEST\n${opts.prompt}\n\nEVIDENCE\n${formatEvidence(opts.evidence)}`;
   const input = [

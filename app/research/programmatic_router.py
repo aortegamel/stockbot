@@ -24,6 +24,7 @@ _TOP_N = 5
 
 _SHORT_TOKS = frozenset({"betting", "short", "shorting", "shorted", "bearish"})
 _INSIDER_TOKS = frozenset({"insider", "executive", "traded", "trading", "bought", "sold"})
+_ADVICE_TOKS = frozenset({"buy", "sell", "hold", "should"})
 _PLANNED_TOKS = frozenset({"planned", "proposed", "144"})
 _EXECUTED_TOKS = frozenset({"executed", "actual", "actually", "trade", "traded", "sell", "sold", "sale"})
 _READ_TOKS = frozenset({"revenue", "read", "text", "says", "mention", "section", "risk", "document"})
@@ -257,8 +258,16 @@ def programmatic_route(prompt: object) -> str | None:
         if _SMALL_TALK(prompt):
             return "no_session"
         norm, toks = _signals(prompt)
+        if toks and toks <= _TIME_TOKS and not (toks & _RESEARCH_TOKS):
+            return "get_current_time"
         if _ACCESSION_TOKEN_RE.search(prompt) is not None:
             return "research_required"
+        if (
+            toks & _ADVICE_TOKS
+            and (_objective_ticker(prompt) is not None or _objective_company(prompt) is not None)
+            and not (toks & _RESEARCH_TOKS)
+        ):
+            return "reasoning_required"
         if _objective_ticker(prompt) is not None or _objective_company(prompt) is not None:
             return "research_required"
         if toks & _RESEARCH_TOKS or "reg sho" in norm or "betting against" in norm:
