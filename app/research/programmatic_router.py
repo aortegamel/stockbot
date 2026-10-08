@@ -72,7 +72,10 @@ def _pick_variant(tool: str, norm: str, toks: set[str], names: set[str]) -> str:
     for full, bounded in _VARIANTS.items():
         if tool in (full, bounded):
             want = full if _wants_coverage(norm, toks) else bounded
-            return want if want in names else tool
+            if want in names:
+                return want
+            other = bounded if want == full else full
+            return other if other in names else tool
     return tool
 
 

@@ -150,6 +150,11 @@ def test_variant_falls_back_to_registered_member() -> None:
         _pick_variant("search_sec_filings_bounded", "who filed all", {"all"}, {"search_sec_filings_bounded"})
         == "search_sec_filings_bounded"
     )
+    # Rule 5 passes the exhaustive key; bounded-only registry must not return it.
+    assert (
+        _pick_variant("search_sec_filings", "who filed all", {"all"}, {"search_sec_filings_bounded"})
+        == "search_sec_filings_bounded"
+    )
 
 
 def test_jev_fallback_rewritten_to_coverage_variant() -> None:
