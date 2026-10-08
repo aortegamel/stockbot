@@ -1249,7 +1249,16 @@ def _followup_gap_nodes(sid: str, gap: str) -> tuple[str, list[str]]:
 
     store = ResearchRepository()
     store.get_session(sid)  # KeyError on unknown session; caller reports invalid_params
+    leftover = [n.node_id for n in service.ready_nodes(sid)]
     node = service.create_node(sid, query_with_today_utc(gap), "Missing evidence named by the writer.")
+    for nid in leftover:
+        try:
+            current = store.get_node(nid)
+        except KeyError:
+            continue
+        if current.status not in ("proposed", "gathering"):
+            continue
+        service.block_node(sid, nid, "pass-2 superseded by gap node")
     return sid, [node.node_id] if node.node_id else []
 
 
@@ -1522,20 +1531,28 @@ def _run(
     raw_gap = req.get("gap")
     followup = isinstance(raw_session, str) and raw_session.strip() and isinstance(raw_gap, str) and raw_gap.strip()
     followup_nodes: list[str] = []
-    try:
-        if followup:
-            assert isinstance(raw_session, str) and isinstance(raw_gap, str)
+    preexisting_evidence: set[str] = set()
+    if followup:
+        assert isinstance(raw_session, str) and isinstance(raw_gap, str)
+        try:
             sid, followup_nodes = _followup_gap_nodes(raw_session.strip(), raw_gap.strip())
-        else:
+        except KeyError as exc:
+            return _terminal(rid, "invalid_params", f"unknown session: {exc}")
+        except Exception as exc:  # noqa: BLE001 - followup setup defects report provider_error, never crash the worker
+            return _terminal(rid, "provider_error", f"session setup failed: {exc}")
+        try:
+            preexisting_evidence = set(ResearchRepository().list_evidence_ids(sid))
+        except Exception:  # noqa: BLE001 - snapshot miss degrades to unscoped linkage, never fails followup
+            preexisting_evidence = set()
+    else:
+        try:
             sid = run_graph_prompt(objective, as_of, jev=client, progress=progress, setup_deadline=setup_deadline)
-    except KeyError as exc:
-        return _terminal(rid, "invalid_params", f"unknown session: {exc}")
-    except RuntimeError as exc:
-        if "registry guard forbids" in str(exc):
-            return _terminal(rid, "provider_error", str(exc))
-        return _terminal(rid, "provider_error", f"session setup failed: {exc}")
-    except Exception as exc:
-        return _terminal(rid, "provider_error", f"session setup failed: {exc}")
+        except RuntimeError as exc:
+            if "registry guard forbids" in str(exc):
+                return _terminal(rid, "provider_error", str(exc))
+            return _terminal(rid, "provider_error", f"session setup failed: {exc}")
+        except Exception as exc:
+            return _terminal(rid, "provider_error", f"session setup failed: {exc}")
     try:
         run_kwargs: dict[str, object] = {
             "jev": client,
@@ -1586,6 +1603,8 @@ def _run(
     evidence: list[JSONValue] = []
     # ponytail: success linkage is FIFO over unclaimed admitted ids (scheduler
     # admits sequentially in attempt order); an explicit attempt evidence_id wins.
+    # Follow-up: pre-pass-2 ids never seed unclaimed, so a pass-2 attempt
+    # without evidence_id pops a pass-2 id. Payload still lists all evidence.
     unclaimed: list[str] = []
     for i, rec in enumerate(records):
         text = _evidence_text(rec)
@@ -1594,7 +1613,8 @@ def _run(
         row_id = _evidence_id(rec, f"ev-{i}")
         row: dict[str, JSONValue] = {"id": row_id, "content": text}
         evidence.append(row)
-        unclaimed.append(row_id)
+        if row_id not in preexisting_evidence:
+            unclaimed.append(row_id)
     tool_executions: list[JSONValue] = []
     tool_calls: list[JSONValue] = []
     failures: dict[str, int] = {}

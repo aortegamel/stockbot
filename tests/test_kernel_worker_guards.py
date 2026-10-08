@@ -453,3 +453,99 @@ def test_followup_unknown_session_is_invalid_params(monkeypatch: pytest.MonkeyPa
     out = kw._run({"id": "r9", "prompt": "q?", "sessionId": "rs:nope", "gap": "need doc X"})
     terminal = out.get("terminal")
     assert isinstance(terminal, dict) and terminal.get("category") == "invalid_params"
+
+
+def test_followup_blocks_leftover_proposed_node(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A leftover pass-1 proposed node is blocked; the scheduler sees only the gap node."""
+    import asyncio
+    import tempfile
+    from pathlib import Path
+
+    from app.research import service
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
+    sid = service.create_research("q?", "q?")
+    leftover = service.create_node(sid, "pass-1 leftover?", "w")
+
+    gap_ids: list[str] = []
+
+    async def _fake_sched(run_sid: str, **hooks: object) -> dict[str, object]:
+        assert run_sid == sid
+        assert [n.node_id for n in service.ready_nodes(run_sid)] == gap_ids
+        service.resolve_node(run_sid, gap_ids[0])
+        return {"status": "complete", "nodes": [], "incomplete_guard": False}
+
+    orig_create = service.create_node
+
+    def _count(run_sid: str, *a: object, **k: object) -> object:
+        out = orig_create(run_sid, *a, **k)
+        node_id = getattr(out, "node_id", "")
+        if isinstance(node_id, str) and node_id:
+            gap_ids.append(node_id)
+        return out
+
+    monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
+    monkeypatch.setattr("app.research.service.create_node", _count)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", lambda s: None)
+    out = asyncio.run(asyncio.to_thread(kw._run, {"id": "r3", "prompt": "q?", "sessionId": sid, "gap": "need doc X"}))
+    assert out["sessionId"] == sid
+    assert len(gap_ids) == 1
+    from app.research.repository import ResearchRepository
+
+    assert ResearchRepository().get_node(leftover.node_id).status == "blocked"
+
+
+def test_followup_links_new_evidence_not_pass1(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pass-2 attempt without evidence_id links the new id, never a pass-1 id."""
+    import asyncio
+    import tempfile
+    from pathlib import Path
+
+    from app.research import service
+    from app.research.repository import ResearchRepository
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
+    sid = service.create_research("q?", "q?")
+    service.create_node(sid, "q1?", "w")
+    store = ResearchRepository()
+    store.save_evidence({"evidence_id": "ev-pass1", "session_id": sid, "content": "pass-1 fact"})
+
+    new_eid = "ev-pass2"
+
+    async def _fake_sched(run_sid: str, **hooks: object) -> dict[str, object]:
+        assert run_sid == sid
+        for n in service.ready_nodes(run_sid):
+            service.resolve_node(run_sid, n.node_id)
+        ResearchRepository().save_evidence({"evidence_id": new_eid, "session_id": run_sid, "content": "pass-2 fact"})
+        return {
+            "status": "complete",
+            "nodes": [{"node_id": "n", "attempts": [{"tool": "search_sec_filings", "arguments": {}}]}],
+            "incomplete_guard": False,
+        }
+
+    monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", lambda s: None)
+    out = asyncio.run(asyncio.to_thread(kw._run, {"id": "r4", "prompt": "q?", "sessionId": sid, "gap": "need doc Y"}))
+    calls = out["toolCalls"]
+    assert isinstance(calls, list) and len(calls) == 1
+    first = calls[0]
+    assert isinstance(first, dict) and first.get("evidenceId") == new_eid
+    ids = [e["id"] for e in out["evidence"] if isinstance(e, dict)]
+    assert "ev-pass1" in ids and new_eid in ids
+
+
+def test_setup_keyerror_is_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A KeyError inside run_graph_prompt reports provider_error, not invalid_params."""
+    import tempfile
+    from pathlib import Path
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
+
+    def _boom(*a: object, **k: object) -> str:
+        raise KeyError("missing-key")
+
+    monkeypatch.setattr(kw, "run_graph_prompt", _boom)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", lambda s: None)
+    out = kw._run({"id": "r5", "op": "run", "prompt": "hello?"})
+    terminal = out.get("terminal")
+    assert isinstance(terminal, dict) and terminal.get("category") == "provider_error"
