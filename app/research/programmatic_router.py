@@ -148,9 +148,15 @@ def _router_pick(
         if "get_insider_activity" in names:
             return "get_insider_activity", "insider"
     # 5. Person-mention filing search (accession unknown; filer comes from hits).
-    if "search_sec_filings" in names and (
+    # Coverage asks ("all/every/who filed") stay exhaustive; one-mention checks use bounded.
+    if ("search_sec_filings" in names or "search_sec_filings_bounded" in names) and (
         ("filing" in toks and "mention" in norm) or "who filed" in norm or "who actually filed" in norm
     ):
+        coverage = toks & {"all", "every"} or "who filed" in norm or "who actually filed" in norm
+        if coverage and "search_sec_filings" in names:
+            return "search_sec_filings", "person-mention"
+        if "search_sec_filings_bounded" in names:
+            return "search_sec_filings_bounded", "person-mention-bounded"
         return "search_sec_filings", "person-mention"
     # 6. Quarterly revenue always starts from the filing list.
     if "revenue" in toks and "quarter" in toks and "list_sec_filings" in names:

@@ -42,8 +42,8 @@ None
 ## Optional arguments
 
 - `as_of` (string): Point-in-time date YYYY-MM-DD; filings known after it are excluded.
-- `current_accession` (string)
+- `current_accession` (string): SEC accession number, e.g. 0000320193-25-000079. Named current_accession/previous_accession for diffs.
 - `forms` (array)
-- `previous_accession` (string)
+- `previous_accession` (string): SEC accession number, e.g. 0000320193-25-000079. Named current_accession/previous_accession for diffs.
 - `section` (string)
 - `ticker` (string)

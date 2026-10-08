@@ -44,7 +44,7 @@ None
 ## Optional arguments
 
 - `as_of` (string): Point-in-time date YYYY-MM-DD; filings known after it are excluded.
-- `end_date` (string)
+- `end_date` (string): YYYY-MM-DD.
 - `forms` (array)
 - `limit` (integer)
-- `start_date` (string)
+- `start_date` (string): YYYY-MM-DD. Combined with end_date as a range.

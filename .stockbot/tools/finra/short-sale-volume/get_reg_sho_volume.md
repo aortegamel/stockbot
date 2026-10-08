@@ -34,8 +34,10 @@ None
 
 ## Required arguments
 
-- `ticker` (string)
+None
 
 ## Optional arguments
 
+- `company_name` (string): Company name (e.g. Apple) when the ticker is unknown; the server maps it to a ticker.
+- `ticker` (string): Ticker (e.g. AAPL). If unknown, pass company_name instead; never call with neither.
 - `tradeDate` (string): Optional trade date YYYY-MM-DD.

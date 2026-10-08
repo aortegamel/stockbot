@@ -37,6 +37,6 @@ None
 
 ## Optional arguments
 
-- `as_of` (string)
+- `as_of` (string): Point-in-time date YYYY-MM-DD.
 - `company_name` (string): Company name (e.g. Apple) when the ticker is unknown; the server maps it to a ticker.
 - `limit` (integer)

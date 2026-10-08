@@ -90,7 +90,7 @@ def test_discovery_coordinates_complete():
 
     kebab = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
     snake = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
-    assert len(tools.TOOL_DISCOVERY_REGISTRY) == 59
+    assert len(tools.TOOL_DISCOVERY_REGISTRY) == 61
     assert "research_read_search" in tools.TOOL_DISCOVERY_REGISTRY
     for name, meta in tools.TOOL_DISCOVERY_REGISTRY.items():
         assert meta.domain and kebab.match(meta.domain), name

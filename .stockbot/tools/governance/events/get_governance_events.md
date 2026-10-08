@@ -36,6 +36,5 @@ None
 
 ## Optional arguments
 
-- `as_of` (string)
-- `limit` (integer)
-- `since` (string)
+- `as_of` (string): Point-in-time date YYYY-MM-DD.
+- `since` (string): YYYY-MM-DD; events known on or after this date.

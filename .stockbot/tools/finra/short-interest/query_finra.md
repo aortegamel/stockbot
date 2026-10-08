@@ -37,7 +37,7 @@ None
 
 ## Required arguments
 
-- `dataset` (string): Canonical id group/name (e.g. fixedIncomeMarket/treasuryDailyAggregates). Legacy bare names accepted when unambiguous.
+- `dataset` (string): Canonical id group/name (e.g. otcMarket/regShoDaily); unambiguous bare names resolve, unknown/ambiguous ones are rejected.
 
 ## Optional arguments
 

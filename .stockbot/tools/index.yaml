@@ -612,6 +612,18 @@ tools:
     summary: "Resolve a company name, ticker, or CIK to verified SEC entity candidates with CIKs and tickers."
     version: 2
     keywords: [candidate, cik, company, entity, exact, find, known, name, not, resolve, sec, starting, ticker, verified]
+  - name: find_sec_entities_bounded
+    domain: sec
+    family: entity-discovery
+    path: "/sec/entity-discovery/find_sec_entities_bounded"
+    intent: resolve_sec_entity_bounded
+    output_kind: candidate_records
+    source: sec
+    entity_scope: entity_query
+    time_mode: current
+    summary: "Quick bounded entity lookup: same verified candidates, fast routes only, capped at limit."
+    version: 2
+    keywords: [bounded, candidate, capped, check, coverage, entity, fast, find, full, identity, limit, lookup, needed, not, one, only, quick, resolve, route, same, sec, verified]
   - name: get_sec_document
     domain: sec
     family: filing-catalog
@@ -708,6 +720,18 @@ tools:
     summary: "General EDGAR full-text disclosure search across entity, EFTS, and 10-K/10-Q routes, with mentions."
     version: 2
     keywords: [10, 10k, aapl, accession, acros, cik, company, disclosed, disclosure, domain, edgar, eft, entity, factor, filing, full, general, identifier, language, least, mention, name, no, number, one, person, query, required, risk, route, search, searching, sec, security, text, ticker, unknown]
+  - name: search_sec_filings_bounded
+    domain: sec
+    family: filing-search
+    path: "/sec/filing-search/search_sec_filings_bounded"
+    intent: search_filing_text_bounded
+    output_kind: search_results
+    source: sec
+    entity_scope: multi_entity
+    time_mode: date_range_or_as_of
+    summary: "Quick bounded EDGAR lookup: same filing-text search, fast routes only, capped at limit."
+    version: 2
+    keywords: [aapl, accession, bounded, capped, check, cik, company, coverage, domain, edgar, factor, fast, filing, full, identifier, least, limit, lookup, mention, name, needed, no, not, one, only, person, query, quick, required, risk, route, same, search, sec, security, text, ticker]
   - name: thesis_create
     domain: thesis
     family: lifecycle

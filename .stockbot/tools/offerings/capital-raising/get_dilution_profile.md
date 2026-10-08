@@ -36,4 +36,4 @@ None
 
 ## Optional arguments
 
-- `as_of` (string)
+- `as_of` (string): Point-in-time date YYYY-MM-DD.

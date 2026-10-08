@@ -171,6 +171,29 @@ TOOLS: list[dict[str, object]] = [
     {
         "type": "function",
         "function": {
+            "name": "find_sec_entities_bounded",
+            "description": "Quick bounded entity lookup: same verified SEC entity candidates as find_sec_entities, but only the fast routes, capped at limit (default 20). Pick this for one identity check when full coverage is not needed; pick find_sec_entities when the question needs every candidate.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "as_of": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "Point-in-time date YYYY-MM-DD; former names apply only within their known/valid interval.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max candidates returned (default 20).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_sec_filings",
             "description": 'EDGAR discovery over entity, full-text (EFTS), filer-submissions, global filing, and local routes. Dispatched inside a deep research session, every applicable route is drained by default and limit bounds only the returned hit packet (default 20; page the rest with research_read_search); pass exhaustive=false for the quick bounded lookup, which is also the default outside a research session. Hits are text mentions: each names the filer (filer_name/filer_cik) and the exact matched document, never inferred subject identity. Returns coverage, attempts, counts, PIT basis, warnings/errors, auto-queued backfill jobs, and bounded evidence IDs. Required: at least one of query, ticker, cik, company_name, person_name, domain, accession_no, security_identifier (a call with none is rejected). Optional: forms, start_date, end_date, as_of, exhaustive, limit. Example: {"query": "risk factors", "ticker": "AAPL", "forms": ["10-K"], "limit": 10}.',
             "parameters": {
@@ -214,6 +237,54 @@ TOOLS: list[dict[str, object]] = [
                     "limit": {
                         "type": "integer",
                         "description": "Max hits in the returned packet (default 20); under exhaustive retrieval it does not reduce retrieval.",
+                    },
+                },
+                "required": list[str](),
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_sec_filings_bounded",
+            "description": "Quick bounded EDGAR lookup: same filing-text search as search_sec_filings, but fast routes only, capped at limit (default 20). Pick this for one mention check; pick search_sec_filings when the question needs all/every mention or full coverage.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "ticker": {"type": "string"},
+                    "cik": {"type": "string"},
+                    "company_name": {"type": "string"},
+                    "person_name": {"type": "string"},
+                    "domain": {"type": "string"},
+                    "security_identifier": {
+                        "type": "string",
+                        "description": "Ticker, CUSIP, ISIN, or class title; never treated as issuer identity.",
+                    },
+                    "accession_no": {
+                        "type": "string",
+                        "pattern": "^\\d{10}-?\\d{2}-?\\d{6}$",
+                        "description": "SEC accession number, e.g. 0000320193-25-000079. Named accession_no, not accession_number.",
+                    },
+                    "forms": {"type": "array", "items": {"type": "string"}},
+                    "start_date": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "YYYY-MM-DD. Combined with end_date as a range.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "YYYY-MM-DD.",
+                    },
+                    "as_of": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                        "description": "Point-in-time date YYYY-MM-DD; records known after it are excluded.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max hits returned (default 20).",
                     },
                 },
                 "required": list[str](),
@@ -3470,11 +3541,36 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         time_mode="current",
         summary="Resolve a company name, ticker, or CIK to verified SEC entity candidates with CIKs and tickers.",
         choose_when=("Starting from a company name when the exact ticker or CIK is not known.",),
-        reject_when=("Unneeded when the exact ticker or CIK is already known.",),
-        conflicts_with=(),
+        reject_when=(
+            "Unneeded when the exact ticker or CIK is already known.",
+            "Not for the quick bounded lookup (find_sec_entities_bounded).",
+        ),
+        conflicts_with=("find_sec_entities_bounded",),
         related_tools=(
+            "find_sec_entities_bounded",
             "list_sec_filings",
             "search_sec_filings",
+        ),
+        prerequisites=(),
+    ),
+    "find_sec_entities_bounded": ToolDiscovery(
+        domain="sec",
+        family="entity-discovery",
+        intent="resolve_sec_entity_bounded",
+        output_kind="candidate_records",
+        source="sec",
+        entity_scope="entity_query",
+        time_mode="current",
+        summary="Quick bounded entity lookup: same verified candidates, fast routes only, capped at limit.",
+        choose_when=("One identity check when full candidate coverage is not needed.",),
+        reject_when=(
+            "Not for full candidate coverage (find_sec_entities).",
+            "Unneeded when the exact ticker or CIK is already known.",
+        ),
+        conflicts_with=("find_sec_entities",),
+        related_tools=(
+            "find_sec_entities",
+            "list_sec_filings",
         ),
         prerequisites=(),
     ),
@@ -4222,18 +4318,45 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
             "Do NOT use for year-over-year risk-factor changes (diff_risk_factors).",
             "Do NOT use for full-filing diffs between accessions (diff_sec_filings).",
             "Do NOT use for one filing metadata record by accession (get_sec_filing).",
+            "Not for the quick bounded lookup (search_sec_filings_bounded).",
         ),
         conflicts_with=(
             "diff_risk_factors",
             "diff_sec_filings",
             "list_sec_filings",
             "get_sec_filing",
+            "search_sec_filings_bounded",
         ),
         related_tools=(
+            "search_sec_filings_bounded",
             "list_sec_filings",
             "get_sec_filing",
             "find_sec_entities",
             "diff_risk_factors",
+        ),
+        prerequisites=(),
+    ),
+    "search_sec_filings_bounded": ToolDiscovery(
+        domain="sec",
+        family="filing-search",
+        intent="search_filing_text_bounded",
+        output_kind="search_results",
+        source="sec",
+        entity_scope="multi_entity",
+        time_mode="date_range_or_as_of",
+        summary="Quick bounded EDGAR lookup: same filing-text search, fast routes only, capped at limit.",
+        choose_when=(
+            "One mention check when full coverage is not needed.",
+            'Required: at least one of query, ticker, cik, company_name, person_name, domain, accession_no, security_identifier; e.g. query="risk factors", ticker="AAPL".',
+        ),
+        reject_when=(
+            "Not for all/every-mention or full-coverage questions (search_sec_filings).",
+            "Not a filing lister for a known ticker (list_sec_filings).",
+        ),
+        conflicts_with=("search_sec_filings",),
+        related_tools=(
+            "search_sec_filings",
+            "list_sec_filings",
         ),
         prerequisites=(),
     ),
@@ -5557,6 +5680,16 @@ def _sec_search_result(args: dict[str, object], context: RequestContext) -> dict
     return _search_envelope(sec.SECDiscoveryService(data_root=get_data_root()).search(request), limit=packet)
 
 
+def _find_sec_entities_bounded(args: dict[str, object], context: RequestContext) -> dict[str, object]:
+    """Bounded entity lookup: forced exhaustive=false through the shared handler."""
+    return _find_sec_entities({**args, "exhaustive": False}, context)
+
+
+def _sec_search_result_bounded(args: dict[str, object], context: RequestContext) -> dict[str, object]:
+    """Bounded filings lookup: forced exhaustive=false through the shared handler."""
+    return _sec_search_result({**args, "exhaustive": False}, context)
+
+
 class _DocView(TypedDict, total=False):
     """get_sec_document view kwargs (section/query/raw only when supplied)."""
 
@@ -6613,7 +6746,9 @@ TOOL_CAPABILITIES: dict[str, Capability] = {
     "evaluate_mandate": Capability.PORTFOLIO_READ,
     "get_fundamentals": Capability.RESEARCH,
     "find_sec_entities": Capability.RESEARCH,
+    "find_sec_entities_bounded": Capability.RESEARCH,
     "search_sec_filings": Capability.RESEARCH,
+    "search_sec_filings_bounded": Capability.RESEARCH,
     "search_sec_relationships": Capability.RESEARCH,
     "get_sec_search_coverage": Capability.RESEARCH,
     "list_sec_filings": Capability.RESEARCH,
@@ -7811,7 +7946,9 @@ _RESEARCH_HANDLERS: dict[str, ContextHandler] = {
 
 _SEC_DISCOVERY_HANDLERS: dict[str, ContextHandler] = {
     "find_sec_entities": _find_sec_entities,
+    "find_sec_entities_bounded": _find_sec_entities_bounded,
     "search_sec_filings": _sec_search_result,
+    "search_sec_filings_bounded": _sec_search_result_bounded,
 }
 
 # Thesis/research tools are direct local dispatch (no broker) but take

@@ -494,6 +494,27 @@ async def _awaited(value: Any) -> Any:
     return value
 
 
+async def _call_reasoner_blocking(stage: str, call: Any, timeout: float | None) -> Any:
+    """Sync reasoner HTTP in a worker thread; async stubs await inline. Never calls sync code on the loop."""
+    if inspect.iscoroutinefunction(call):
+        coro = call()
+        return await coro if timeout is None else await asyncio.wait_for(coro, timeout=timeout)
+    if inspect.iscoroutinefunction(getattr(call, "func", None)):
+        coro = call()
+        return await coro if timeout is None else await asyncio.wait_for(coro, timeout=timeout)
+    loop = asyncio.get_running_loop()
+    if timeout is None:
+        return await loop.run_in_executor(_TOOL_POOL, call)
+    return await asyncio.wait_for(loop.run_in_executor(_TOOL_POOL, call), timeout=timeout)
+
+
+def _reasoner_timeout(deadline_at: float | None) -> float | None:
+    """Remaining run budget for one reasoner call; None when no deadline binds this run."""
+    if deadline_at is None:
+        return None
+    return max(deadline_at - _time.perf_counter(), 0.01)
+
+
 def _node_dict(node: Any) -> dict[str, Any]:
     if isinstance(node, dict):
         return dict(node)
@@ -944,6 +965,7 @@ _GROUNDING_HINT_TOOLS = frozenset(
     {
         "list_sec_filings",
         "search_sec_filings",
+        "search_sec_filings_bounded",
         "query_finra",
         "get_finra_datapoints",
         "describe_finra_dataset",
@@ -1016,10 +1038,12 @@ def _scan_packet_accession(packet: Any) -> tuple[str | None, str | None]:
 def _force_open_registry(
     registry: list[dict[str, Any]], attempts: list[dict[str, Any]], evidence: list[Any], admitted: int
 ) -> list[dict[str, Any]] | None:
-    """Carry-tools-only registry when admitted==0 and a packet carries an accession, else None."""
+    """Carry-tools-only registry when admitted==0 and this node's own attempts carry an accession."""
     if admitted != 0:
         return None
-    for packet in [*attempts, *evidence]:
+    # ponytail: intake evidence stays out — its 8-K accession would force-open
+    # every round-1 select before the real rule (short/insider/time) matches.
+    for packet in attempts:
         candidates = (packet, packet.get("outcome_summary")) if isinstance(packet, dict) else (packet,)
         for candidate in candidates:
             if candidate is None:
@@ -1231,7 +1255,7 @@ def _same_accession_repeats(attempts: list[dict[str, Any]]) -> int:
     return count
 
 
-_SEC_IDENTIFIER_TOOLS = frozenset({"list_sec_filings", "search_sec_filings"})
+_SEC_IDENTIFIER_TOOLS = frozenset({"list_sec_filings", "search_sec_filings", "search_sec_filings_bounded"})
 _SHO_FALLBACK_TOOLS = frozenset({"get_reg_sho_volume"})
 _TICKER_FALLBACK_TOOLS = frozenset(
     {"get_short_interest", "get_insider_activity", "get_planned_insider_sales", "get_fundamentals"}
@@ -1449,7 +1473,11 @@ def _fallback_sec_args(tool_name: str, objective: object) -> dict[str, Any] | No
         if tool_name == "get_fundamentals" and isinstance(objective, str) and "eps" in objective.lower():
             return {"ticker": _ticker, "metric": "eps"}
         return {"ticker": _ticker}
-    if tool_name == "find_sec_entities" and isinstance(objective, str) and objective.strip():
+    if (
+        tool_name in ("find_sec_entities", "find_sec_entities_bounded")
+        and isinstance(objective, str)
+        and objective.strip()
+    ):
         _ticker = _objective_subject_ticker(objective)
         if _ticker is not None:
             return {"query": _ticker}
@@ -1620,7 +1648,7 @@ def _repair_tool_arguments(
                         tool_name,
                         _seeded["identifier"],
                     )
-        if tool_name == "search_sec_filings" and not any(
+        if tool_name in ("search_sec_filings", "search_sec_filings_bounded") and not any(
             filled.get(_k)
             for _k in (
                 "query",
@@ -1894,7 +1922,7 @@ async def _generate_tool_arguments(
                 str(exc)[:80],
             )
             return seeded, "seeded SEC identifier from objective ticker after needle failure", False
-        if tool_name == "search_sec_filings":
+        if tool_name in ("search_sec_filings", "search_sec_filings_bounded"):
             raise _search_reselect(objective, f"needle failure ({str(exc)[:80]}) and no ticker resolves") from exc
         raise
     needle_tool, generated_args, needle_reasoning, withheld = _split_generated(tool_name, generated)
@@ -1941,7 +1969,7 @@ async def _generate_tool_arguments(
                     ",".join(sorted(seeded)),
                 )
                 return seeded, "seeded SEC identifier from objective ticker after needle withhold", False
-        if needle_tool is None and tool_name == "search_sec_filings":
+        if needle_tool is None and tool_name in ("search_sec_filings", "search_sec_filings_bounded"):
             raise _search_reselect(objective, "needle withheld and no ticker resolves") from None
         logger.info(
             "toolflow args_needle_mismatch sid=%s nid=%s tool=%s needle_tool=%s schema_empty=%s",
@@ -1974,7 +2002,7 @@ async def _generate_tool_arguments(
         scope=_scope,
         session_as_of=_session_as_of,
     )
-    if tool_name == "search_sec_filings" and not any(
+    if tool_name in ("search_sec_filings", "search_sec_filings_bounded") and not any(
         (value.strip() if isinstance(value, str) else value)
         for key in _SEARCH_GROUNDING_KEYS
         if (value := filled.get(key)) is not None
@@ -2318,13 +2346,19 @@ def _grounded_allowed_ids(evidence: list[Any], attempts: list[Any]) -> set[str]:
 
 
 async def _reasoner_analyze(
-    reasoner: Any, session: dict[str, Any], node: Any, evidence: list[Any], attempts: list[Any]
+    reasoner: Any,
+    session: dict[str, Any],
+    node: Any,
+    evidence: list[Any],
+    attempts: list[Any],
+    deadline_at: float | None = None,
 ) -> Any:
     """Analyze stage (mirrors decision/run.ts): interpretations + evidence requests, never proposals."""
     analyze = getattr(reasoner, "analyze", None)
     if analyze is None:
         raise RuntimeError("reasoner has no analyze entrypoint (analyze-then-expand only)")
-    raw = await _awaited(analyze(_analyze_prompt(session, node, evidence, attempts)))
+    prompt = _analyze_prompt(session, node, evidence, attempts)
+    raw = await _call_reasoner_blocking("analyze", functools.partial(analyze, prompt), _reasoner_timeout(deadline_at))
     if not isinstance(raw, dict) or not isinstance(raw.get("analyses"), list):
         return raw
     from app.research.grounding import attach_scenario_impact, check_grounded_analysis
@@ -2406,13 +2440,15 @@ async def _reasoner_expand(
     analysis: Any,
     objective_id: str,
     node_id: str,
+    deadline_at: float | None = None,
 ) -> Any:
     """Expand stage over analyze output + unresolved context; proposals need JEV disposition."""
     expand = getattr(reasoner, "expand", None)
     if expand is None:
         raise RuntimeError("reasoner has no expand entrypoint (analyze-then-expand only)")
     prompt = _expand_prompt(session, node, analysis, objective_id, node_id)
-    return await _awaited(expand(prompt, objective_id, {node_id} if node_id else set()))
+    call = functools.partial(expand, prompt, objective_id, {node_id} if node_id else set())
+    return await _call_reasoner_blocking("expand", call, _reasoner_timeout(deadline_at))
 
 
 def _has_trusted_evidence(evidence: list[Any], attempts: list[dict[str, Any]]) -> bool:
@@ -2725,15 +2761,26 @@ async def _reason_phase(
     nid: str,
     decision: Any,
     admitted: int,
+    deadline_at: float | None = None,
 ) -> dict[str, Any]:
     """Reason branch: analyze, adjudicate, maybe resolve, else expand; falls through on verdict tools."""
     active_reasoner = reasoner if reasoner is not None else _default_reasoner()
-    analysis = await _reasoner_analyze(active_reasoner, session, node, ctx_evidence, attempts)
+    try:
+        analysis = await _reasoner_analyze(active_reasoner, session, node, ctx_evidence, attempts, deadline_at)
+    except TimeoutError:
+        attempts.append(_reselect_attempt("reasoner analyze hit the run deadline; re-selecting"))
+        return {"done": True, "terminal": None, "decision": decision}
     verdict = await _adjudicate_analysis(jev, kernel, analysis, node, sid, nid)
     if _selection_action(verdict) == "resolved":
         terminal = _resolve_or_reselect(kernel, sid, nid, ctx_evidence, attempts, admitted)
         return {"done": True, "terminal": terminal, "decision": verdict}
-    expansion = await _reasoner_expand(active_reasoner, session, node, ctx_evidence, attempts, analysis, sid, nid)
+    try:
+        expansion = await _reasoner_expand(
+            active_reasoner, session, node, ctx_evidence, attempts, analysis, sid, nid, deadline_at
+        )
+    except TimeoutError:
+        attempts.append(_reselect_attempt("reasoner expand hit the run deadline; re-selecting"))
+        return {"done": True, "terminal": None, "decision": verdict}
     await _expand_graph(
         jev, kernel, sid, query_with_today_utc(session.get("objective") or session.get("query") or ""), nid, expansion
     )
@@ -3246,6 +3293,7 @@ async def _run_round(
     tool_session: Any,
     as_of_str: str | None,
     repo: Any = None,
+    deadline_at: float | None = None,
 ) -> dict[str, Any]:
     """One tool round: resolved/reason dispatch, invoke, settle; returns step signals."""
     if action == "resolved":
@@ -3253,7 +3301,7 @@ async def _run_round(
         return {"terminal": resolved_out, "continue": resolved_out is None, "decision": decision, "admitted": admitted}
     if action == "reason":
         reason_out = await _reason_phase(
-            reasoner, session, node, ctx_evidence, attempts, jev, kernel, sid, nid, decision, admitted
+            reasoner, session, node, ctx_evidence, attempts, jev, kernel, sid, nid, decision, admitted, deadline_at
         )
         if reason_out.get("done"):
             return {
@@ -3524,6 +3572,7 @@ async def _drive_rounds(
             tool_session,
             as_of_str,
             repo,
+            deadline_at,
         )
         admitted = step["admitted"]
         _progress(progress, "tool_done", {"node_id": nid, "admitted": admitted})

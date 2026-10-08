@@ -36,7 +36,7 @@ None
 
 ## Required arguments
 
-- `dataset` (string): Canonical id group/name (e.g. otcMarket/consolidatedShortInterest). Legacy bare names accepted when unambiguous.
+- `dataset` (string): Canonical id group/name (e.g. otcMarket/regShoDaily); unambiguous bare names resolve, unknown/ambiguous ones are rejected.
 - `fields` (array): Exact field names to return (e.g. settlementDate, symbolCode, currentShortPositionQuantity for short interest).
 
 ## Optional arguments

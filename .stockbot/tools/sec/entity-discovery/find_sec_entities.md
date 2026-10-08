@@ -17,13 +17,15 @@ Resolve a company name, ticker, or CIK to verified SEC entity candidates with CI
 ## Reject when
 
 - Unneeded when the exact ticker or CIK is already known.
+- Not for the quick bounded lookup (find_sec_entities_bounded).
 
 ## Conflicts with
 
-None
+- find_sec_entities_bounded
 
 ## Related tools
 
+- find_sec_entities_bounded
 - list_sec_filings
 - search_sec_filings
 

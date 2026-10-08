@@ -37,10 +37,10 @@ None
 
 ## Required arguments
 
-- `since` (string)
-- `ticker` (string)
+- `since` (string): YYYY-MM-DD; events known on or after this date.
+- `ticker` (string): Ticker (e.g. AAPL). If unknown, pass company_name instead; never call with neither.
 
 ## Optional arguments
 
-- `as_of` (string)
-- `limit` (integer)
+- `as_of` (string): Point-in-time date YYYY-MM-DD.
+- `company_name` (string): Company name (e.g. Apple) when the ticker is unknown; the server maps it to a ticker.

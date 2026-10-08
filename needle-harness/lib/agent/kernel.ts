@@ -645,9 +645,11 @@ export async function runKernelAgent(
       .map((n) => ({ node_id: String(n.node_id), question: String(n.question ?? ""), status: String(n.status ?? ""), depends_on: Array.isArray(n.depends_on) ? n.depends_on.map(String) : [] }));
     mergedNodes = [...mergedNodes, ...followNodes];
     mergedDecisions = [...mergedDecisions, ...(Array.isArray(follow.decisions) ? follow.decisions : [])];
-    mergedUnresolved = [...mergedUnresolved, ...(Array.isArray(follow.unresolved) ? follow.unresolved.map(String) : [])];
-    mergedGuard = mergedGuard || (follow.incompleteGuard ?? follow.incomplete_guard ?? false);
-    mergedEscalated = mergedEscalated || (follow.escalated ?? false);
+    // ponytail: pass 2 is a new worker session — pass-1 node ids can never
+    // resolve there, so only the latest pass's unresolved list gates the writer.
+    mergedUnresolved = Array.isArray(follow.unresolved) ? follow.unresolved.map(String) : [];
+    mergedGuard = follow.incompleteGuard ?? follow.incomplete_guard ?? false;
+    mergedEscalated = follow.escalated ?? false;
     totalDecisions += (Array.isArray(follow.toolExecutions) ? follow.toolExecutions : follow.needleDecisions ?? []).length;
     totalCalls += (Array.isArray(follow.toolCalls) ? follow.toolCalls : []).length;
     totalEscalations += follow.escalations ?? 0;
