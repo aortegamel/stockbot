@@ -173,6 +173,12 @@ def test_arguments_mismatch_is_error_never_raise(monkeypatch: pytest.MonkeyPatch
 
 def test_arguments_withhold_seeds_sec_and_sho(monkeypatch: pytest.MonkeyPatch) -> None:
     """Needle withhold seeds SEC identifier / SHO ticker+company; unseedable stays error."""
+    import app.tools as _tools
+
+    def _resolve(name: str) -> str | None:
+        return {"NVDA": "NVDA", "Apple": "AAPL"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
 
     def _boom(**kwargs: object) -> object:
         raise RuntimeError("needle tool mismatch: jev selected 'x', needle emitted None")
@@ -194,6 +200,12 @@ def test_arguments_withhold_seeds_sec_and_sho(monkeypatch: pytest.MonkeyPatch) -
 
 def test_arguments_repairs_needle_placeholders(monkeypatch: pytest.MonkeyPatch) -> None:
     """Needle placeholder forms / org ticker repair through the shared scheduler path."""
+    import app.tools as _tools
+
+    def _resolve(name: str) -> str | None:
+        return {"Apple": "AAPL"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
 
     def _gen(**kwargs: object) -> object:
         tool = kwargs.get("tool")

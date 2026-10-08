@@ -47,8 +47,18 @@ def test_route_fast_path_marks_research():
     assert programmatic_route("hello") is None
 
 
-def test_route_clock_and_advice_fast_paths() -> None:
+def test_route_clock_and_advice_fast_paths(monkeypatch: object) -> None:
     """Clock asks single-shot; pure advice answers direct; mixed/insider asks research."""
+    import app.tools as _tools
+
+    def _resolve(name: str) -> str | None:
+        return {"NVDA": "NVDA"}.get(name)
+
+    monkeypatch.setattr(  # type: ignore[union-attr]
+        _tools,
+        "_resolve_company_to_ticker",
+        _resolve,
+    )
     assert programmatic_route("what time is it") == "get_current_time"
     assert programmatic_route("should I buy NVDA") == "reasoning_required"
     assert programmatic_route("should I buy NVDA after its Q3 revenue") == "research_required"

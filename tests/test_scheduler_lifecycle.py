@@ -939,8 +939,14 @@ def test_relative_tradedate_scrubbed_to_wtd_omit() -> None:
     assert kept == {"ticker": "AAPL", "tradeDate": "2026-09-22"}
 
 
-def test_sec_withhold_falls_back_to_objective_ticker_latest() -> None:
+def test_sec_withhold_falls_back_to_objective_ticker_latest(monkeypatch: pytest.MonkeyPatch) -> None:
     """Needle withhold (None) on SEC tools seeds explicit objective ticker, latest (no dates)."""
+    import app.tools as _tools
+
+    def _resolve(name: str) -> str | None:
+        return {"NVDA": "NVDA"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
 
     async def fake_none(**kw: Any) -> dict[str, Any]:
         return {"tool": None, "arguments": {}, "reasoning": "withheld: ungrounded"}
@@ -971,8 +977,14 @@ def test_sec_withhold_without_ticker_still_raises() -> None:
         raise AssertionError("withhold without explicit ticker must still raise mismatch")
 
 
-def test_sho_withhold_falls_back_to_both_fields() -> None:
+def test_sho_withhold_falls_back_to_both_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     """Needle withhold (None) on SHO seeds ticker+company_name from for-<Company>."""
+    import app.tools as _tools
+
+    def _resolve(name: str) -> str | None:
+        return {"Apple": "AAPL"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
 
     async def fake_none(**kw: Any) -> dict[str, Any]:
         return {"tool": None, "arguments": {}, "reasoning": "withheld: ungrounded"}
@@ -984,8 +996,14 @@ def test_sho_withhold_falls_back_to_both_fields() -> None:
     assert args == {"ticker": "AAPL", "company_name": "Apple"}
 
 
-def test_with_company_seeds_ticker_and_name() -> None:
+def test_with_company_seeds_ticker_and_name(monkeypatch: pytest.MonkeyPatch) -> None:
     """'What is happening with Oracle now' resolves via the EDGAR index (live oracle-query defect)."""
+    import app.tools as _tools
+
+    def _resolve(name: str) -> str | None:
+        return {"Oracle": "ORCL", "oracle": "ORCL"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
     assert sched._objective_company("What is happening with Oracle now") == ("Oracle", "ORCL")
     assert sched._objective_subject_ticker("What is happening with Oracle now") == "ORCL"
     repaired = sched._repair_tool_arguments("get_material_events", {}, "What is happening with Oracle now", "s", "n")
@@ -1014,8 +1032,14 @@ def test_sec_placeholder_forms_reseed_latest() -> None:
     assert args == {"identifier": "NVDA", "forms": ["10-Q", "10-K", "8-K"]}
 
 
-def test_sho_org_ticker_remaps_from_objective() -> None:
+def test_sho_org_ticker_remaps_from_objective(monkeypatch: pytest.MonkeyPatch) -> None:
     """Needle ticker FINRA + company Apple remaps to AAPL from the objective."""
+    import app.tools as _tools
+
+    def _resolve(name: str) -> str | None:
+        return {"Apple": "AAPL"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
 
     async def fake_org(**kw: Any) -> dict[str, Any]:
         return {
@@ -1164,8 +1188,14 @@ def test_session_as_of_kept_when_datetime() -> None:
     assert args == {"accession_no": "0000320193-25-000079", "as_of": "2025-09-27"}
 
 
-def test_garbage_identifier_reseeded_from_objective() -> None:
+def test_garbage_identifier_reseeded_from_objective(monkeypatch: pytest.MonkeyPatch) -> None:
     """Needle identifier F1/TODAY/SEC on an Apple query reseeds to AAPL."""
+    import app.tools as _tools
+
+    def _resolve(name: str) -> str | None:
+        return {"Apple": "AAPL"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
 
     async def fake_garbage(**kw: Any) -> dict[str, Any]:
         return {"tool": "list_sec_filings", "arguments": {"identifier": "F1"}, "reasoning": "r"}
@@ -1268,10 +1298,15 @@ def test_accession_family_break_across_tools() -> None:
     assert acc in guided["error"]
 
 
-def test_find_sec_entities_seeded_from_objective() -> None:
+def test_find_sec_entities_seeded_from_objective(monkeypatch: pytest.MonkeyPatch) -> None:
     """find_sec_entities seeds a grounded query (ticker-first) instead of erroring on empty args."""
+    import app.tools as _tools
     from app.research import scheduler as _sched
 
+    def _resolve(name: str) -> str | None:
+        return {"Tesla": "TSLA"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
     seeded = _sched._fallback_sec_args(
         "find_sec_entities",
         "Did Tesla insiders actually sell shares last quarter, or only file planned-sale notices?",
