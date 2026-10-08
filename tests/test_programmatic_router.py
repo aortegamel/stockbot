@@ -182,3 +182,24 @@ def test_jev_fallback_rewritten_to_coverage_variant() -> None:
     )
     assert (action, dec.tool_name) == ("invoke", "search_sec_filings")
     assert dec.tool_names == ("search_sec_filings",)
+
+
+def test_short_interest_beats_intake_accession() -> None:
+    """Intake evidence with an 8-K accession never diverts a short ask to get_sec_filing."""
+    intake = [{"id": "ev:1", "content": "filed 8-K accession 0000320193-25-000079, see filing"}]
+    reg = scheduler.build_registry()
+    objective = "What's AAPL's short interest?"
+    action, dec = asyncio.run(
+        programmatic_select_round(
+            None,
+            _Kernel(),
+            "s1",
+            "n1",
+            {"session_id": "s1", "objective": objective},
+            _node(objective),
+            reg,
+            intake,
+            [],
+        )
+    )
+    assert (action, dec.tool_name) == ("invoke", "get_short_interest")

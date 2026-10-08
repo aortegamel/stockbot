@@ -1987,3 +1987,26 @@ def test_bounded_reasoner_clamps_real_client_only() -> None:
     stub = SimpleNamespace(analyze=lambda p: {})
     assert sched._bounded_reasoner(stub, 3.0) is stub
     assert sched._bounded_reasoner(client, None) is client
+
+
+def test_force_open_ignores_intake_evidence() -> None:
+    """Intake 8-K accession with no node attempts never forces the carry registry."""
+    intake = [{"id": "ev:1", "content": "filed 8-K accession 0000320193-25-000079, see filing"}]
+    reg = [{"name": "get_sec_filing"}, {"name": "get_sec_document"}, {"name": "get_short_interest"}]
+    assert sched._force_open_registry(reg, [], intake, 0) is None
+
+
+def test_force_open_fires_on_node_attempt_accession() -> None:
+    """This node's own attempt carrying an accession narrows to the carry tools."""
+    attempts = [
+        {
+            "tool": "list_sec_filings",
+            "arguments": {},
+            "outcome_summary": "saw accession 0000320193-25-000079",
+            "error": None,
+        }
+    ]
+    reg = [{"name": "get_sec_filing"}, {"name": "get_sec_document"}, {"name": "get_short_interest"}]
+    out = sched._force_open_registry(reg, attempts, [], 0)
+    assert out is not None and {e["name"] for e in out} == {"get_sec_filing", "get_sec_document"}
+    assert sched._force_open_registry(reg, attempts, [], 1) is None

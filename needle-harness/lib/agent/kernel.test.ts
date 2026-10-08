@@ -261,6 +261,39 @@ describe("runKernelAgent evidence loop", () => {
     expect(writes).toBe(2);
   });
 
+  test("pass-2 unresolved gates the second write, clean list ends done", async () => {
+    const seen: string[][] = [];
+    const spawn = (): KernelChild => {
+      const c = new FakeChild();
+      let calls = 0;
+      c.reply = (id: string): string => {
+        calls += 1;
+        const unresolved = calls === 1 ? ["n1"] : [];
+        return `${JSON.stringify({ id, objective: "q", evidence: [{ id: "ev:1", content: "fact" }], nodes: [{ node_id: "n1", question: "q", status: "blocked", depends_on: [] }], decisions: [], unresolved, incomplete_guard: unresolved.length > 0, toolExecutions: [], toolCalls: [], failures: {}, escalations: unresolved.length, escalated: unresolved.length > 0 })}\n`;
+      };
+      queueMicrotask(() => c.emitStdout('{"type":"ready"}\n'));
+      return c;
+    };
+    const events: Array<{ type: string; category?: string }> = [];
+    let writes = 0;
+    await runKernelAgent("q", (e) => void events.push(e as { type: string; category?: string }), {
+      deps: {
+        python: "py",
+        workerPath: "w",
+        spawnFn: spawn,
+        reason: async (o) => {
+          writes += 1;
+          seen.push([...o.unresolved]);
+          o.onDelta("text");
+          return writes === 1 ? { text: "t", usage: {}, missingEvidence: "need doc X" } : { text: "t2", usage: {} };
+        },
+      },
+    });
+    expect(seen).toEqual([["n1"], []]);
+    expect(events.map((e) => e.type).at(-1)).toBe("done");
+    expect(events.some((e) => e.type === "failed")).toBe(false);
+  });
+
   test("second gap fails the report with incomplete_evidence", async () => {
     const events: Array<{ type: string; category?: string }> = [];
     await runKernelAgent("q", (e) => void events.push(e as { type: string }), {
