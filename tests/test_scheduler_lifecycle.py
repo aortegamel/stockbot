@@ -1898,3 +1898,92 @@ def test_blocked_terminal_names_non_default_cap() -> None:
     """_blocked_terminal carries the caller's max_rounds, not the module default."""
     out = sched._blocked_terminal("n1", 0, [], 2)
     assert out["reason"] == "incomplete: runtime guard (2 rounds without resolution)"
+
+
+def test_reasoner_analyze_times_out_slow_call() -> None:
+    """A 2s sync analyze with a 0.2s deadline raises TimeoutError in <1s."""
+    import time as _time
+
+    class _Slow:
+        def analyze(self, prompt: str) -> dict[str, object]:
+            _time.sleep(2.0)
+            return {"analyses": [], "evidenceRequests": []}
+
+    attempts: list[dict[str, Any]] = []
+    t0 = _time.perf_counter()
+    with pytest.raises(TimeoutError):
+        asyncio.run(
+            sched._reasoner_analyze(
+                _Slow(),
+                {"session_id": "s1", "objective": "o"},
+                _node(),
+                [],
+                attempts,
+                _time.perf_counter() + 0.2,
+            )
+        )
+    assert _time.perf_counter() - t0 < 1.0
+
+
+def test_reasoner_uses_own_pool_and_deadline() -> None:
+    """Sync reasoner calls run on reasoner-* threads and honor the per-call timeout."""
+    import threading
+    import time as _time
+
+    seen: list[str] = []
+
+    def _slow() -> str:
+        seen.append(threading.current_thread().name)
+        _time.sleep(2.0)
+        return "late"
+
+    t0 = _time.perf_counter()
+    with pytest.raises(TimeoutError):
+        asyncio.run(sched._call_reasoner_blocking("analyze", _slow, 0.2))
+    assert _time.perf_counter() - t0 < 1.0
+    assert seen and seen[0].startswith("reasoner")
+    # Fast path still works inline on the same pool.
+    out = asyncio.run(sched._call_reasoner_blocking("analyze", lambda: "ok", None))
+    assert out == "ok"
+
+
+def test_reason_phase_skips_when_too_little_time() -> None:
+    """A deadline 5s away never calls analyze; it adds the 'too little time' attempt."""
+    import time as _time
+
+    class _Boom:
+        def analyze(self, prompt: str) -> dict[str, object]:
+            raise AssertionError("analyze must not run")
+
+    attempts: list[dict[str, Any]] = []
+    out = asyncio.run(
+        sched._reason_phase(
+            _Boom(),
+            {"session_id": "s1", "objective": "o"},
+            _node(),
+            [],
+            attempts,
+            SimpleNamespace(),
+            _Kernel(),
+            "s1",
+            "n1",
+            SimpleNamespace(),
+            0,
+            _time.perf_counter() + 5.0,
+        )
+    )
+    assert out["done"] is True and out["terminal"] is None
+    assert len(attempts) == 1 and "too little time" in str(attempts[0].get("error"))
+
+
+def test_bounded_reasoner_clamps_real_client_only() -> None:
+    """Real clients get timeout_s=min(config, remaining); stubs return unchanged."""
+    from app.reasoner_client import ReasonerClient
+
+    client = ReasonerClient(model="m", url="u", api_key="k", timeout_s=120.0)
+    bounded = sched._bounded_reasoner(client, 3.0)
+    assert isinstance(bounded, ReasonerClient) and bounded.timeout_s == 3.0
+    assert client.timeout_s == 120.0  # the shared client is never mutated
+    stub = SimpleNamespace(analyze=lambda p: {})
+    assert sched._bounded_reasoner(stub, 3.0) is stub
+    assert sched._bounded_reasoner(client, None) is client

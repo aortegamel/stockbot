@@ -563,6 +563,7 @@ def _reasoner_decompose_with_retry(
         api_key=os.environ.get("OPENCODE_API_KEY", ""),
         url=os.environ.get("OPENCODE_URL", ""),
         model=os.environ.get("OPENCODE_MODEL", ""),
+        timeout_s=timeout_s if timeout_s is not None else _INTAKE_REASONER_TIMEOUT_S,
     )
     prompt = _intake_reasoner_prompt(objective_id, objective, as_of, digest)
     _notify(progress, "reasoner_start")

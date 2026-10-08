@@ -309,7 +309,7 @@ def _parse_opencode_output(
 PostFn = Callable[[str, str], dict[str, object]]
 
 
-def _default_post(url: str, api_key: str, model: str, prompt: str) -> dict[str, object]:
+def _default_post(url: str, api_key: str, model: str, prompt: str, timeout_s: float = 120.0) -> dict[str, object]:
     body = json.dumps({"model": model, "input": prompt}).encode()
     req = _urlrequest.Request(
         url,
@@ -322,7 +322,7 @@ def _default_post(url: str, api_key: str, model: str, prompt: str) -> dict[str, 
         },
     )
     try:
-        with _urlrequest.urlopen(req, timeout=120) as res:
+        with _urlrequest.urlopen(req, timeout=timeout_s) as res:
             loaded = json.load(res)
     except _urlerror.HTTPError as e:
         try:
@@ -355,6 +355,7 @@ class ReasonerClient:
     url: str
     api_key: str = ""
     post: PostFn | None = None
+    timeout_s: float = 120.0
 
     def _call(self, stage: str, prompt: str, keys: list[str], optional: list[str] | None = None) -> dict[str, object]:
         if not prompt:
@@ -367,7 +368,9 @@ class ReasonerClient:
             raise RuntimeError("opencode_unavailable: missing OPENCODE_API_KEY")
         if not self.url.strip():
             raise RuntimeError("opencode_unavailable: missing OPENCODE_URL")
-        return _parse_opencode_output(stage, _default_post(self.url, self.api_key, self.model, prompt), keys, optional)
+        return _parse_opencode_output(
+            stage, _default_post(self.url, self.api_key, self.model, prompt, self.timeout_s), keys, optional
+        )
 
     def decompose(self, prompt: str, objective_id: str) -> dict[str, object]:
         """Propose follow-up questions; non-authoritative until JEV admits."""

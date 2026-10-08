@@ -38,6 +38,7 @@ from typing import Any, Protocol
 # 3.14 spawns non-daemon workers with no hook, so shutdown still joins them.
 _SEC_POOL = _futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="sec")
 _TOOL_POOL = _futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="tool")
+_REASONER_POOL = _futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="reasoner")
 
 
 async def _sec_thread_call(call: Any) -> Any:
@@ -504,8 +505,8 @@ async def _call_reasoner_blocking(stage: str, call: Any, timeout: float | None) 
         return await coro if timeout is None else await asyncio.wait_for(coro, timeout=timeout)
     loop = asyncio.get_running_loop()
     if timeout is None:
-        return await loop.run_in_executor(_TOOL_POOL, call)
-    return await asyncio.wait_for(loop.run_in_executor(_TOOL_POOL, call), timeout=timeout)
+        return await loop.run_in_executor(_REASONER_POOL, call)
+    return await asyncio.wait_for(loop.run_in_executor(_REASONER_POOL, call), timeout=timeout)
 
 
 def _reasoner_timeout(deadline_at: float | None) -> float | None:
@@ -513,6 +514,20 @@ def _reasoner_timeout(deadline_at: float | None) -> float | None:
     if deadline_at is None:
         return None
     return max(deadline_at - _time.perf_counter(), 0.01)
+
+
+def _bounded_reasoner(reasoner: Any, timeout: float | None) -> Any:
+    """Real HTTP clients get the remaining budget; test stubs pass through unchanged."""
+    import dataclasses
+
+    from app.reasoner_client import ReasonerClient
+
+    if timeout is None or not isinstance(reasoner, ReasonerClient):
+        return reasoner
+    return dataclasses.replace(reasoner, timeout_s=max(min(reasoner.timeout_s, timeout), 1.0))
+
+
+_REASON_MIN_S = 10.0
 
 
 def _node_dict(node: Any) -> dict[str, Any]:
@@ -2354,11 +2369,12 @@ async def _reasoner_analyze(
     deadline_at: float | None = None,
 ) -> Any:
     """Analyze stage (mirrors decision/run.ts): interpretations + evidence requests, never proposals."""
-    analyze = getattr(reasoner, "analyze", None)
+    timeout = _reasoner_timeout(deadline_at)
+    analyze = getattr(_bounded_reasoner(reasoner, timeout), "analyze", None)
     if analyze is None:
         raise RuntimeError("reasoner has no analyze entrypoint (analyze-then-expand only)")
     prompt = _analyze_prompt(session, node, evidence, attempts)
-    raw = await _call_reasoner_blocking("analyze", functools.partial(analyze, prompt), _reasoner_timeout(deadline_at))
+    raw = await _call_reasoner_blocking("analyze", functools.partial(analyze, prompt), timeout)
     if not isinstance(raw, dict) or not isinstance(raw.get("analyses"), list):
         return raw
     from app.research.grounding import attach_scenario_impact, check_grounded_analysis
@@ -2443,12 +2459,13 @@ async def _reasoner_expand(
     deadline_at: float | None = None,
 ) -> Any:
     """Expand stage over analyze output + unresolved context; proposals need JEV disposition."""
-    expand = getattr(reasoner, "expand", None)
+    timeout = _reasoner_timeout(deadline_at)
+    expand = getattr(_bounded_reasoner(reasoner, timeout), "expand", None)
     if expand is None:
         raise RuntimeError("reasoner has no expand entrypoint (analyze-then-expand only)")
     prompt = _expand_prompt(session, node, analysis, objective_id, node_id)
     call = functools.partial(expand, prompt, objective_id, {node_id} if node_id else set())
-    return await _call_reasoner_blocking("expand", call, _reasoner_timeout(deadline_at))
+    return await _call_reasoner_blocking("expand", call, timeout)
 
 
 def _has_trusted_evidence(evidence: list[Any], attempts: list[dict[str, Any]]) -> bool:
@@ -2764,6 +2781,9 @@ async def _reason_phase(
     deadline_at: float | None = None,
 ) -> dict[str, Any]:
     """Reason branch: analyze, adjudicate, maybe resolve, else expand; falls through on verdict tools."""
+    if deadline_at is not None and deadline_at - _time.perf_counter() < _REASON_MIN_S:
+        attempts.append(_reselect_attempt("too little time for reasoner; re-selecting"))
+        return {"done": True, "terminal": None, "decision": decision}
     active_reasoner = reasoner if reasoner is not None else _default_reasoner()
     try:
         analysis = await _reasoner_analyze(active_reasoner, session, node, ctx_evidence, attempts, deadline_at)
