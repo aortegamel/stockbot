@@ -216,3 +216,29 @@ def test_short_interest_beats_intake_accession() -> None:
         )
     )
     assert (action, dec.tool_name) == ("invoke", "get_short_interest")
+
+
+def test_form_mentions_route_person_mention() -> None:
+    """10-Q and 8-K mentions resolve by rule 5 without JEV."""
+
+    class _BoomJev:
+        async def select_tool(self, *a: object, **k: object) -> object:
+            raise AssertionError("router must not call JEV")
+
+    reg = scheduler.build_registry()
+    for objective in ("Which 10-Q mentions Jensen Huang?", "Which 8-K mentions Elon Musk?"):
+        action, dec = asyncio.run(
+            programmatic_select_round(
+                _BoomJev(),
+                _Kernel(),
+                "s1",
+                "n1",
+                {"session_id": "s1", "objective": objective},
+                _node(objective),
+                reg,
+                [],
+                [],
+            )
+        )
+        assert (action, dec.tool_name) == ("invoke", "search_sec_filings_bounded")
+

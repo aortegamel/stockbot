@@ -47,6 +47,9 @@ _RESEARCH_TOKS = frozenset(
         "dividend",
         "10",
         "8",
+        "10k",
+        "10q",
+        "8k",
     }
 )
 
@@ -202,9 +205,8 @@ def _router_pick(
             return "get_planned_insider_sales", "insider-planned"
         if "get_insider_activity" in names:
             return "get_insider_activity", "insider"
-    # 5. Person-mention filing search (accession unknown; filer comes from hits).
-    # "10-K" tokenizes to "10k" (no "filing" token), so match the form too.
-    _FORM = "10-k" in norm or "10k" in toks or "10-q" in norm or "8-k" in norm
+    # Form names tokenize to 10k/10q/8k; match merged tokens only.
+    _FORM = bool({"10k", "10q", "8k"} & toks)
     if ("search_sec_filings" in names or "search_sec_filings_bounded" in names) and (
         (("filing" in toks or _FORM) and "mention" in norm) or "who filed" in norm or "who actually filed" in norm
     ):

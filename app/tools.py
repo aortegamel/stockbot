@@ -4941,9 +4941,22 @@ def _normalize_discovery_text(value: str) -> list[str]:
         .replace("changed", "change")
     )
     cleaned = "".join(c if c.isalnum() or c == " " else " " for c in lowered)
-    collapsed = " ".join(cleaned.split()).replace("10 k", "10k")
+    raw = " ".join(cleaned.split()).split()
+    merged: list[str] = []
+    skip = False
+    for i, token in enumerate(raw):
+        if skip:
+            skip = False
+            continue
+        nxt = raw[i + 1] if i + 1 < len(raw) else ""
+        pair = (token, nxt.rstrip("s"))
+        if token in ("10", "8") and nxt and pair in (("10", "k"), ("10", "q"), ("8", "k")):
+            merged.append(pair[0] + pair[1])
+            skip = True
+        else:
+            merged.append(token)
     tokens: list[str] = []
-    for token in collapsed.split():
+    for token in merged:
         if len(token) > 3:
             if token.endswith("ies"):
                 token = token[:-3] + "y"
