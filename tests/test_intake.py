@@ -199,7 +199,7 @@ def test_run_emits_progress_before_terminal() -> None:
 
     orig_graph = kw.run_graph_prompt
 
-    def fake_graph(prompt: str, as_of: Any = None, jev: Any = None, progress: Any = None) -> str:
+    def fake_graph(prompt: str, as_of: Any = None, jev: Any = None, progress: Any = None, **k: Any) -> str:
         if progress is not None:
             progress("session", {"session_id": "s1"})
             progress("intake_done", {"calls": 1})

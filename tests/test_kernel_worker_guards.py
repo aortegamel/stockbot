@@ -297,3 +297,94 @@ def test_entry_prompts_carry_temporal_decoding() -> None:
     assert isinstance(assess_q, dict)
     assess_text = str(next(iter(assess_q.values()))["instructions"])
     assert "Today UTC is" in assess_text and "decode relative dates before choosing" in assess_text
+
+
+def test_run_scheduler_deadline_honors_shared_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_run passes run_deadline to the scheduler; setup gets _SETUP_S of the wall."""
+    import time as _time
+
+    seen: dict[str, object] = {}
+
+    def _fake_graph(prompt: str, as_of: object = None, **k: object) -> str:
+        deadline = k.get("setup_deadline")
+        assert isinstance(deadline, float)
+        seen["setup_deadline"] = deadline
+        _time.sleep(0.05)
+        return "s1"
+
+    async def _fake_sched(sid: str, **hooks: object) -> dict[str, object]:
+        seen["deadline_at"] = hooks.get("deadline_at")
+        return {"status": "complete", "nodes": [], "incomplete_guard": False}
+
+    monkeypatch.setattr(kw, "run_graph_prompt", _fake_graph)
+    monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", lambda sid: None)
+    t0 = _time.perf_counter()
+    out = kw._run({"id": "r1", "op": "run", "prompt": "hello?"}, jev=object())  # type: ignore[arg-type]
+    assert out["id"] == "r1"
+    assert isinstance(seen["setup_deadline"], float)
+    assert isinstance(seen["deadline_at"], float)
+    assert abs(seen["setup_deadline"] - (t0 + kw._SETUP_S)) < 5.0
+    assert abs(seen["deadline_at"] - (t0 + kw._RUN_WALL_S - kw._FINALIZE_S)) < 5.0
+
+
+def test_round2_skipped_for_corrected_query_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 2 runs only for new tickers; a corrected query alone never earns it."""
+    import asyncio
+
+    rounds = {"n": 0}
+
+    async def _one_round(*a: object, **k: object) -> tuple[list[object], list[object], dict[str, object]]:
+        rounds["n"] += 1
+        return ([], [], {"calls": 1, "admitted": 0})
+
+    def _decompose(*a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
+        return (
+            [{"id": "s-q1", "objectiveId": "s", "question": "q?", "dependsOn": [], "whyItMatters": "w"}],
+            {"corrected_query": "fixed query"},
+        )
+
+    monkeypatch.setattr(kw, "_intake_round", _one_round)
+    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
+    out = asyncio.run(kw._graph_intake("q?", None, "s1", {}, [], None, object(), None))
+    assert len(out) == 1 and rounds["n"] == 1
+
+
+def test_jev_admit_timeout_falls_back_to_objective() -> None:
+    """A hanging JEV decide returns the objective fallback before the setup deadline."""
+    import asyncio
+    import time as _time
+
+    class _Hang:
+        async def decide(self, *a: object, **k: object) -> object:
+            await asyncio.sleep(30.0)
+            raise AssertionError("must time out")
+
+    t0 = _time.perf_counter()
+    out = kw._jev_admit(
+        "s",
+        "Exact user objective?",
+        _props(),
+        jev=_Hang(),  # type: ignore[arg-type]
+        setup_deadline=t0 + 0.2,
+    )
+    assert _time.perf_counter() - t0 < 5.0
+    assert isinstance(out, list) and len(out) == 1
+    first = out[0]
+    assert isinstance(first, dict) and first["question"] == "Exact user objective?"
+
+
+def test_decompose_retry_skipped_when_setup_budget_spent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transient decompose failure with <15s left returns setup_budget, no retry."""
+    import time as _time
+
+    calls = {"n": 0}
+
+    def _boom(self: object, prompt: str, objective_id: str) -> dict[str, object]:
+        calls["n"] += 1
+        raise RuntimeError("connection reset by peer")
+
+    monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", _boom)
+    proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "s", "", None, None, _time.perf_counter() + 5.0)
+    assert calls["n"] == 1 and hints.get("fallback") == "setup_budget"
+    assert len(proposals) == 1

@@ -218,6 +218,15 @@ _INTAKE_REASONER_TIMEOUT_S = 45.0
 _INTAKE_DOC_TIMEOUT_S = 10.0
 _INTAKE_DOC_CHARS = 3000
 
+# One wall budget per op:run. Setup stops at _SETUP_S so the scheduler keeps
+# at least _SCHEDULER_MIN_S; _FINALIZE_S stays for the writer side.
+_RUN_WALL_S = 120.0
+_FINALIZE_S = 20.0
+_SCHEDULER_MIN_S = 50.0
+_SETUP_S = _RUN_WALL_S - _FINALIZE_S - _SCHEDULER_MIN_S
+_SETUP_RETRY_MIN_S = 15.0
+_SETUP_ROUND2_MIN_S = 25.0
+
 
 def _intake_cik(ticker: str) -> str:
     """Ticker to CIK identifier for scoped intake; falls back to the ticker."""
@@ -539,7 +548,13 @@ def _close_bootstrap_job(sid: str) -> None:
 
 
 def _reasoner_decompose_with_retry(
-    objective: str, as_of: str | None, objective_id: str, digest: str, progress: ProgressFn | None = None
+    objective: str,
+    as_of: str | None,
+    objective_id: str,
+    digest: str,
+    progress: ProgressFn | None = None,
+    timeout_s: float | None = None,
+    deadline: float | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     """Reasoner decompose over raw query + digest; at most 2 attempts, none on config errors."""
     from app.reasoner_client import ReasonerClient
@@ -554,12 +569,13 @@ def _reasoner_decompose_with_retry(
     import concurrent.futures as _futures
     import time as _time
 
+    call_timeout = timeout_s if timeout_s is not None else _INTAKE_REASONER_TIMEOUT_S
     out: dict[str, object] | None = None
     for attempt in (1, 2):
         _t0 = _time.perf_counter()
         _pool = _futures.ThreadPoolExecutor(max_workers=1)
         try:
-            out = _pool.submit(client.decompose, prompt, objective_id).result(timeout=_INTAKE_REASONER_TIMEOUT_S)
+            out = _pool.submit(client.decompose, prompt, objective_id).result(timeout=call_timeout)
             logger.info(
                 "intake reasoner_attempt sid=%s attempt=%s ok=%s ms=%.1f",
                 objective_id,
@@ -587,6 +603,8 @@ def _reasoner_decompose_with_retry(
                 return _fallback_single(objective, objective_id), {"fallback": "reasoner_config"}
             if _is_quota_error(exc, msg):
                 return _fallback_single(objective, objective_id), {"fallback": "reasoner_quota"}
+            if deadline is not None and deadline - _time.perf_counter() < _SETUP_RETRY_MIN_S:
+                return _fallback_single(objective, objective_id), {"fallback": "setup_budget"}
             if _is_rate_limited(exc, msg):
                 _notify(progress, "reasoner_retry", {"attempt": 2, "reason": "rate_limited"})
                 continue
@@ -600,6 +618,8 @@ def _reasoner_decompose_with_retry(
         if not isinstance(raw, list) or not raw:
             if attempt >= 2:
                 return _fallback_single(objective, objective_id), {"fallback": "empty_proposals"}
+            if deadline is not None and deadline - _time.perf_counter() < _SETUP_RETRY_MIN_S:
+                return _fallback_single(objective, objective_id), {"fallback": "setup_budget"}
             _notify(progress, "reasoner_retry", {"attempt": 2})
             continue
         try:
@@ -607,6 +627,8 @@ def _reasoner_decompose_with_retry(
         except ValueError:
             if attempt >= 2:
                 return _fallback_single(objective, objective_id), {"fallback": "invalid_output_twice"}
+            if deadline is not None and deadline - _time.perf_counter() < _SETUP_RETRY_MIN_S:
+                return _fallback_single(objective, objective_id), {"fallback": "setup_budget"}
             _notify(progress, "reasoner_retry", {"attempt": 2})
             continue
         _notify(progress, "reasoner_done", {"proposals": len(norm)})
@@ -852,8 +874,11 @@ async def _graph_intake(
     jev: object,
     kernel: object,
     progress: ProgressFn | None = None,
+    setup_deadline: float | None = None,
 ) -> list[dict[str, object]]:
     """Intake rounds + Reasoner + escape hatch; logs each round as intake_digest. Returns proposals."""
+    import time as _time
+
     from app.research import scheduler
 
     try:
@@ -874,6 +899,10 @@ async def _graph_intake(
     tickers = list(start_tickers)
     query_text: str | None = objective
     while True:
+        if setup_deadline is not None and rounds >= 1:
+            left = setup_deadline - _time.perf_counter()
+            if left <= _SETUP_ROUND2_MIN_S:
+                break
         admitted, raw, stats = await _intake_round(
             query_text if query_text not in fetched_queries else None,
             [t for t in tickers if t not in fetched_tickers],
@@ -896,8 +925,13 @@ async def _graph_intake(
         if rounds >= 1 and digest == prior_digest and not isinstance(hints.get("corrected_query"), str):
             _log_intake_round(sid, objective, raw, digest, {"proposals": proposals, "hints": hints}, stats, kernel)
             break
+        decompose_timeout: float | None = None
+        if setup_deadline is not None:
+            decompose_timeout = max(setup_deadline - _time.perf_counter() - 5.0, 1.0)
         try:
-            proposals, hints = _reasoner_decompose_with_retry(objective, as_of, sid, digest, progress)
+            proposals, hints = _reasoner_decompose_with_retry(
+                objective, as_of, sid, digest, progress, decompose_timeout, setup_deadline
+            )
         except Exception:
             crash_hints: dict[str, object] = {"fallback": "reasoner_crashed"}
             proposals, hints = _fallback_single(objective, sid), crash_hints
@@ -917,7 +951,9 @@ async def _graph_intake(
         raw_q = hints.get("corrected_query")
         if isinstance(raw_q, str) and raw_q.strip() and raw_q.strip() not in fetched_queries:
             next_query = raw_q.strip()
-        if not next_tickers and next_query is None:
+        # ponytail: round 2 costs ~40s; only new tickers earn it, never a
+        # corrected query alone (writer/scheduler already see it).
+        if not next_tickers:
             break
         tickers = [*tickers, *next_tickers]
         query_text = next_query
@@ -1028,7 +1064,11 @@ def _objective_or_admitted(
 
 
 def _jev_admit(
-    sid: str, objective: str, proposals: list[dict[str, object]], jev: JevClient | None = None
+    sid: str,
+    objective: str,
+    proposals: list[dict[str, object]],
+    jev: JevClient | None = None,
+    setup_deadline: float | None = None,
 ) -> list[dict[str, object]]:
     """JEV disposition per proposal (run.ts relevance); objective-only on JEV outage.
 
@@ -1058,15 +1098,19 @@ def _jev_admit(
             }
             choice_options[pid] = dict(_DISPOSITION_OPTIONS)
         state = {"objective": {"prompt": objective}, "proposals": proposals}
-        decisions = asyncio.run(
-            client.decide(
-                state,
-                questions,
-                decision_type="proposal_disposition",
-                session_id=sid,
-                choice_options=choice_options,
-            )
+        call = client.decide(
+            state,
+            questions,
+            decision_type="proposal_disposition",
+            session_id=sid,
+            choice_options=choice_options,
         )
+        if setup_deadline is None:
+            decisions = asyncio.run(call)
+        else:
+            import time as _time
+
+            decisions = asyncio.run(asyncio.wait_for(call, timeout=max(setup_deadline - _time.perf_counter(), 1.0)))
         admitted: list[dict[str, object]] = []
         for p in proposals:
             d = decisions.get(str(p["id"]))
@@ -1109,6 +1153,7 @@ def run_graph_prompt(
     as_of: str | None = None,
     jev: JevClient | None = None,
     progress: ProgressFn | None = None,
+    setup_deadline: float | None = None,
 ) -> str:
     """Shared graph entry: session + intake evidence + Reasoner proposals. Returns sid.
 
@@ -1153,7 +1198,9 @@ def run_graph_prompt(
         try:
             session = scheduler._load_session(sid, kernel, None)
             session.setdefault("session_id", sid)
-            proposals = asyncio.run(_graph_intake(objective, as_of, sid, session, registry, client, kernel, progress))
+            proposals = asyncio.run(
+                _graph_intake(objective, as_of, sid, session, registry, client, kernel, progress, setup_deadline)
+            )
         except Exception as exc:
             logger.warning("intake failed sid=%s (%s)", sid, exc, exc_info=True)
             _notify(progress, "intake_skipped", {"reason": "intake_failed"})
@@ -1161,7 +1208,9 @@ def run_graph_prompt(
     # ponytail: 4 concrete questions max; cap BEFORE JEV so disposition never judges
     # proposals that can't become nodes, and dropped deps never silently vanish.
     capped: list[dict[str, object]] = proposals[:4] if proposals else []
-    admitted: list[dict[str, object]] = _jev_admit(sid, objective, capped, jev=client) if capped else []
+    admitted: list[dict[str, object]] = (
+        _jev_admit(sid, objective, capped, jev=client, setup_deadline=setup_deadline) if capped else []
+    )
     _create_nodes_topological(sid, stamped, admitted if admitted else [])
     return sid
 
@@ -1449,10 +1498,16 @@ def _run(
     as_of = raw_as_of if isinstance(raw_as_of, str) else None
     objective = prompt.strip()
     client = jev if jev is not None else _shared_jev()
-    # ponytail: 120s wall ceiling from request start; scheduler gets whatever remains.
+    # One wall budget: setup stops at _SETUP_S so the scheduler keeps the rest.
     _t0 = time.perf_counter()
+    run_wall = _RUN_WALL_S
+    raw_deadline = req.get("deadlineMs")
+    if isinstance(raw_deadline, (int, float)) and not isinstance(raw_deadline, bool) and raw_deadline > 0:
+        run_wall = min(_RUN_WALL_S, raw_deadline / 1000.0)
+    setup_deadline = _t0 + min(_SETUP_S, run_wall - _FINALIZE_S - _SCHEDULER_MIN_S)
+    run_deadline = _t0 + run_wall - _FINALIZE_S
     try:
-        sid = run_graph_prompt(objective, as_of, jev=client, progress=progress)
+        sid = run_graph_prompt(objective, as_of, jev=client, progress=progress, setup_deadline=setup_deadline)
     except RuntimeError as exc:
         if "registry guard forbids" in str(exc):
             return _terminal(rid, "provider_error", str(exc))
@@ -1460,15 +1515,12 @@ def _run(
     except Exception as exc:
         return _terminal(rid, "provider_error", f"session setup failed: {exc}")
     try:
-        elapsed = time.perf_counter() - _t0
-        # ponytail: scheduler gets remaining wall time, minus 20s for finalizing.
-        remaining = max(120.0 - elapsed - 20.0, 5.0)
         run_kwargs: dict[str, object] = {
             "jev": client,
             "needle_generate": _shared_needle_generate(),
             "progress": progress,
             "max_rounds": 4,
-            "deadline_at": time.perf_counter() + remaining,
+            "deadline_at": run_deadline,
         }
         if select_round is not None:
             run_kwargs["select_round"] = select_round
