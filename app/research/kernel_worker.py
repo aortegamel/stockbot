@@ -574,9 +574,13 @@ def _reasoner_decompose_with_retry(
     out: dict[str, object] | None = None
     for attempt in (1, 2):
         _t0 = _time.perf_counter()
+        if deadline is None:
+            _wait = call_timeout
+        else:
+            _wait = min(call_timeout, max(deadline - _time.perf_counter() - 1.0, 1.0))
         _pool = _futures.ThreadPoolExecutor(max_workers=1)
         try:
-            out = _pool.submit(client.decompose, prompt, objective_id).result(timeout=call_timeout)
+            out = _pool.submit(client.decompose, prompt, objective_id).result(timeout=_wait)
             logger.info(
                 "intake reasoner_attempt sid=%s attempt=%s ok=%s ms=%.1f",
                 objective_id,

@@ -751,20 +751,24 @@ class JevClient:
         if choice_options:
             payload["choiceOptions"] = {k: dict(v) for k, v in choice_options.items()}
         try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(self._sidecar_roundtrip, payload), timeout=self._timeout_s
-            )
-        except _SidecarUnavailable:
-            raw = await asyncio.wait_for(
-                asyncio.to_thread(self._http_system_one, state, questions), timeout=self._timeout_s
-            )
-            logger.debug(
-                "toolflow invoke_detail sid=- nid=- via=http qids=[%s]", ",".join(sorted(str(k) for k in questions))
-            )
-            return parse_decisions(questions, raw, choice_options), raw, "http"
-        except TimeoutError as exc:
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(self._sidecar_roundtrip, payload), timeout=self._timeout_s
+                )
+            except _SidecarUnavailable:
+                raw = await asyncio.wait_for(
+                    asyncio.to_thread(self._http_system_one, state, questions), timeout=self._timeout_s
+                )
+                logger.debug(
+                    "toolflow invoke_detail sid=- nid=- via=http qids=[%s]", ",".join(sorted(str(k) for k in questions))
+                )
+                return parse_decisions(questions, raw, choice_options), raw, "http"
+            except TimeoutError as exc:
+                self.close()
+                raise RuntimeError(f"decide: typesafe timeout after {self._timeout_s}s") from exc
+        except asyncio.CancelledError:
             self.close()
-            raise RuntimeError(f"decide: typesafe timeout after {self._timeout_s}s") from exc
+            raise
         if not isinstance(response, dict) or response.get("id") != payload["id"]:
             raise RuntimeError("decide: malformed sidecar response")
         if "error" in response:

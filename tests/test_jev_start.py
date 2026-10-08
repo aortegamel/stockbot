@@ -242,3 +242,45 @@ def test_hung_sidecar_timeout_keeps_loop_responsive(tmp_path: Path, monkeypatch:
         client.decide({"s": 1}, {"q": {"type": "noul", "instructions": "x"}}, decision_type="t", session_id="s")
     )
     assert out == {"q": {"kind": "noul", "probability": 0.7}}
+
+
+def test_outer_cancel_closes_hung_sidecar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = Path(__file__).resolve().parent.parent
+    client = JevClient(data_root=tmp_path, runtime_path=root / "decision" / "runtime.ts", timeout_s=60)
+    hung = _HungProc()
+    client._proc = hung  # type: ignore[assignment]
+
+    def _noop(**kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_persist", _noop)
+
+    async def _decide_hung() -> None:
+        await client.decide(
+            {"s": 1},
+            {"q": {"type": "noul", "instructions": "x"}},
+            decision_type="t",
+            session_id="s",
+        )
+
+    async def _outer() -> None:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.ensure_future(_decide_hung()), timeout=0.2)
+
+    start = time.monotonic()
+    asyncio.run(_outer())
+    elapsed = time.monotonic() - start
+    assert elapsed < 5
+
+    async def _probe() -> None:
+        await asyncio.wait_for(asyncio.sleep(0.01), timeout=2)
+
+    asyncio.run(_probe())
+    assert hung.terminated.is_set()
+    assert client._proc is None or hung.terminated.is_set()
+    deadline = time.monotonic() + 5
+    while client._lock.locked() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not client._lock.locked()
+    assert client._lock.acquire(blocking=False)
+    client._lock.release()

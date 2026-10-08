@@ -547,6 +547,31 @@ def test_reasoner_timeout_returns_without_waiting(monkeypatch: pytest.MonkeyPatc
     assert elapsed < 5.0
 
 
+def test_reasoner_retry_hang_capped_by_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rate-limit then hang: attempt 2 waits on remaining setup budget, not full timeout."""
+    import time as _t
+
+    calls = {"n": 0}
+
+    def fake_decompose(self: object, prompt: str, objective_id: str) -> dict[str, object]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("429 too many requests")
+        _t.sleep(60)
+        return {"proposals": []}
+
+    monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", fake_decompose)
+    monkeypatch.setattr(kw, "_SETUP_RETRY_MIN_S", 0)
+    t0 = _t.perf_counter()
+    proposals, hints = kw._reasoner_decompose_with_retry(
+        "q?", None, "rs:t", "", timeout_s=30.0, deadline=_t.perf_counter() + 2.0
+    )
+    elapsed = _t.perf_counter() - t0
+    assert calls["n"] == 2 and hints.get("fallback") == "reasoner_timeout"
+    assert len(proposals) == 1
+    assert elapsed < 10.0
+
+
 def test_quota_detector_ignores_digit_soup() -> None:
     """14299 in a URL/id is neither quota nor rate-limit; 429 is rate, free-tier is quota."""
     assert kw._is_quota_error(RuntimeError("see https://x/14299"), "see https://x/14299") is False
