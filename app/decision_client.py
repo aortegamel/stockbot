@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import concurrent.futures as _futures
 import contextvars
+import functools
 import inspect
 import json
 import logging
@@ -609,6 +611,10 @@ class JevClient:
         self._cancel_guard = threading.Lock()
         self._sidecar_owner: tuple[object, object] | None = None
         self._http_live: dict[object, object] = {}
+        self._cancelled: set[object] = set()
+        # ponytail: own HTTP pool, never the loop default executor, so a
+        # cancelled asyncio.run never waits for a stuck urlopen thread.
+        self._http_pool = _futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="jev-http")
         root = Path(__file__).resolve().parent.parent
         self._runtime_ts = Path(runtime_path) if runtime_path is not None else root / "decision" / "runtime.ts"
         self._repo_root = root
@@ -644,9 +650,14 @@ class JevClient:
             self._terminate_proc(proc)
 
     def _cancel_owned(self, token: object) -> None:
+        # ponytail: the entry stays until the orphaned thread prunes it on
+        # exit (skip-check or path finally); a cancel racing thread exit
+        # leaks one tiny entry. Never prune here or in the invoke finally
+        # on the cancel path: the waiter skip-check needs the entry later.
         target: object | None = None
         resp: object | None = None
         with self._cancel_guard:
+            self._cancelled.add(token)
             if self._sidecar_owner is not None and self._sidecar_owner[0] is token:
                 _, target = self._sidecar_owner
                 self._sidecar_owner = None
@@ -688,6 +699,11 @@ class JevClient:
     def _sidecar_roundtrip(self, payload: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         token = _INVOKE_TOKEN.get()
         with self._lock:
+            if token is not None:
+                with self._cancel_guard:
+                    if token in self._cancelled:
+                        self._cancelled.discard(token)
+                        raise asyncio.CancelledError
             try:
                 proc = self._ensure_proc()
             except _SidecarUnavailable:
@@ -721,6 +737,7 @@ class JevClient:
                     with self._cancel_guard:
                         if self._sidecar_owner is not None and self._sidecar_owner[0] is token:
                             self._sidecar_owner = None
+                        self._cancelled.discard(token)
             if not raw_line:
                 _LIVE_PROCS.discard(proc)
                 try:
@@ -769,6 +786,7 @@ class JevClient:
             if token is not None:
                 with self._cancel_guard:
                     self._http_live.pop(token, None)
+                    self._cancelled.discard(token)
         if not isinstance(raw, dict):
             raise ValueError("decide: malformed_typesafe_response")
         return validate_json_mapping(raw, "<decision_client>: 'http'")
@@ -797,14 +815,22 @@ class JevClient:
             payload["choiceOptions"] = {k: dict(v) for k, v in choice_options.items()}
         token = object()
         reset = _INVOKE_TOKEN.set(token)
+        cancelled_call = False
         try:
             try:
                 response = await asyncio.wait_for(
                     asyncio.to_thread(self._sidecar_roundtrip, payload), timeout=self._timeout_s
                 )
             except _SidecarUnavailable:
+                loop = asyncio.get_running_loop()
+                # ponytail: run_in_executor drops context (unlike to_thread),
+                # so copy it in; the worker needs the token to register.
+                ctx = contextvars.copy_context()
                 raw = await asyncio.wait_for(
-                    asyncio.to_thread(self._http_system_one, state, questions), timeout=self._timeout_s
+                    loop.run_in_executor(
+                        self._http_pool, functools.partial(ctx.run, self._http_system_one, state, questions)
+                    ),
+                    timeout=self._timeout_s,
                 )
                 logger.debug(
                     "toolflow invoke_detail sid=- nid=- via=http qids=[%s]", ",".join(sorted(str(k) for k in questions))
@@ -814,10 +840,14 @@ class JevClient:
                 self.close()
                 raise RuntimeError(f"decide: typesafe timeout after {self._timeout_s}s") from exc
         except asyncio.CancelledError:
+            cancelled_call = True
             self._cancel_owned(token)
             raise
         finally:
             _INVOKE_TOKEN.reset(reset)
+            if not cancelled_call:
+                with self._cancel_guard:
+                    self._cancelled.discard(token)
         if not isinstance(response, dict) or response.get("id") != payload["id"]:
             raise RuntimeError("decide: malformed sidecar response")
         if "error" in response:

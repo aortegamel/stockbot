@@ -395,6 +395,7 @@ def test_outer_cancel_stops_hung_http_fallback(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(client, "_persist", _noop)
     monkeypatch.setattr(client, "_sidecar_roundtrip", _missing)
     monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: resp)  # type: ignore[arg-type]
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
 
     async def _scenario() -> None:
         call = asyncio.ensure_future(
@@ -410,3 +411,77 @@ def test_outer_cancel_stops_hung_http_fallback(tmp_path: Path, monkeypatch: pyte
         assert resp.closed.is_set()
 
     asyncio.run(_scenario())
+
+
+def test_cancelled_waiter_never_starts_after_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A call cancelled while queued must not write once it finally gets the lock."""
+    root = Path(__file__).resolve().parent.parent
+    client = JevClient(data_root=tmp_path, runtime_path=root / "decision" / "runtime.ts", timeout_s=30)
+    gate = threading.Event()
+    proc = _GateProc(gate)
+    client._proc = proc  # type: ignore[assignment]
+
+    def _noop(**kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_persist", _noop)
+
+    async def _scenario() -> None:
+        kw: dict[str, str] = {"decision_type": "t", "session_id": "s"}
+        questions = {"q": {"type": "noul", "instructions": "x"}}
+        holder = asyncio.ensure_future(client.decide({"s": 1}, questions, **kw))  # type: ignore[arg-type]
+        await asyncio.sleep(0.3)
+        waiter = asyncio.ensure_future(client.decide({"s": 1}, questions, **kw))  # type: ignore[arg-type]
+        await asyncio.sleep(0.3)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        gate.set()
+        assert await asyncio.wait_for(holder, timeout=5) == {"q": {"kind": "noul", "probability": 0.5}}
+        await asyncio.sleep(0.5)
+        assert len(proc.stdin.writes) == 1
+
+    asyncio.run(_scenario())
+
+
+def test_http_fallback_runs_on_client_pool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fallback uses run_in_executor on the client pool, never to_thread."""
+    import urllib.request
+
+    from app.decision_client import _SidecarUnavailable
+
+    root = Path(__file__).resolve().parent.parent
+    client = JevClient(data_root=tmp_path, runtime_path=root / "decision" / "runtime.ts", timeout_s=30)
+    seen: dict[str, object] = {}
+    entered = threading.Event()
+    resp = _BlockingHttpResp(entered)
+
+    def _noop(**kwargs: object) -> None:
+        return None
+
+    def _missing(payload: object) -> object:
+        raise _SidecarUnavailable("no sidecar")
+
+    async def _run_and_close() -> object:
+        loop = asyncio.get_running_loop()
+        orig = loop.run_in_executor
+
+        def _spy(executor: object, func: object, *args: object) -> object:
+            seen["executor"] = executor
+            return orig(executor, func, *args)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(loop, "run_in_executor", _spy)
+        call = asyncio.ensure_future(
+            client.decide({"s": 1}, {"q": {"type": "noul", "instructions": "x"}}, decision_type="t", session_id="s")  # type: ignore[arg-type]
+        )
+        assert await asyncio.to_thread(entered.wait, 3)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        return seen.get("executor")
+
+    monkeypatch.setattr(client, "_persist", _noop)
+    monkeypatch.setattr(client, "_sidecar_roundtrip", _missing)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: resp)  # type: ignore[arg-type]
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    assert asyncio.run(_run_and_close()) is client._http_pool
