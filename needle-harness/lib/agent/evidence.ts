@@ -31,6 +31,3 @@ export function makeEvidence(
   };
 }
 
-export function preview(evidence: Evidence): string {
-  return evidence.content.slice(0, 160);
-}

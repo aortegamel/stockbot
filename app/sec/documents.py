@@ -3,6 +3,8 @@
 Seam: live reads via SourceGateway + normalization + raw_archive (write-once) + write_bundle; NOTE: a future warehouse slots in behind these live readers, never inside normalization.
 """
 
+from __future__ import annotations
+
 import hashlib
 import re
 import shutil
@@ -10,7 +12,7 @@ import subprocess
 import tempfile
 from collections.abc import Iterable
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, override
@@ -111,7 +113,7 @@ def _parse_view(cleaned: str) -> str:
     try:
         parser.feed(cleaned)
         parser.close()
-    except Exception:  # noqa: BLE001 - malformed filing HTML degrades to tag-strip, never raises
+    except ValueError, TypeError, RuntimeError:
         return _WS_RE.sub(" ", _TAG_RE.sub(" ", cleaned)).strip()
     lines = [_WS_RE.sub(" ", ln).strip(" |") for ln in parser.text().splitlines()]
     return "\n".join(ln for ln in lines if ln)
@@ -225,7 +227,7 @@ def _filing(accession_no: str) -> EdgarFiling:
         filing = get_by_accession_number(accession_no)
     except ValueError:
         raise
-    except Exception as exc:
+    except (OSError, RuntimeError, AttributeError) as exc:
         raise ValueError(f"invalid accession number: {accession_no!r}") from exc
     if filing is None:
         raise ValueError(f"invalid accession number: {accession_no!r}")
@@ -273,7 +275,7 @@ def list_sec_documents(accession_no: str, as_of: str | None = None) -> list[Fili
 def _primary_attachment_of(filing: EdgarFiling, accession_no: str) -> object:
     try:
         attachment = filing.document
-    except Exception as exc:
+    except (OSError, RuntimeError, AttributeError) as exc:
         raise ValueError(f"no primary document for accession: {accession_no!r}") from exc
     if attachment is None:
         raise ValueError(f"no primary document for accession: {accession_no!r}")
@@ -282,10 +284,7 @@ def _primary_attachment_of(filing: EdgarFiling, accession_no: str) -> object:
 
 def _attachment_document_name(attachment: object) -> str | None:
     """Best-effort document filename; None when unreadable or blank (one shared probe)."""
-    try:
-        name = getattr(attachment, "document")  # noqa: B009 - dynamic boundary, no stubs; getattr keeps checker green
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
-        return None
+    name = _attachment_attr_of(attachment, "document")
     return name if isinstance(name, str) and name else None
 
 
@@ -302,7 +301,7 @@ def _missing_document_error(accession_no: str, document_name: str, names: list[s
 def _named_attachment_of(filing: EdgarFiling, accession_no: str, document_name: str) -> object:
     try:
         attachments = filing.attachments
-    except Exception as exc:
+    except (OSError, RuntimeError, AttributeError) as exc:
         raise ValueError(f"no documents for accession: {accession_no!r}") from exc
     names: list[str] = []
     want_exhibit = _normalize_exhibit(document_name)
@@ -328,12 +327,12 @@ def _resolve_in(filing: EdgarFiling, accession_no: str, document_name: str | Non
 def _attr_text_of(attachment: object, attr: str) -> str | None:
     try:
         value = getattr(attachment, attr)
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except OSError, RuntimeError, AttributeError:
         return None
     if callable(value):
         try:
             value = value()
-        except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+        except OSError, RuntimeError, TypeError, ValueError:
             return None
     if isinstance(value, bytes):
         return value.decode("utf-8", "replace")
@@ -363,18 +362,22 @@ def _utcnow() -> str:
 
 
 def _check_window(offset: str | float, max_chars: str | float | None) -> tuple[int, int | None]:
+    if isinstance(offset, bool):
+        raise TypeError(f"offset must be an integer, got {offset!r}")
     try:
         offset = int(offset)
     except TypeError, ValueError:
-        raise ValueError(f"offset must be an integer, got {offset!r}") from None
+        raise TypeError(f"offset must be an integer, got {offset!r}") from None
     if offset < 0:
         raise ValueError(f"offset must be >= 0, got {offset}")
     if max_chars is None:
         return offset, None
+    if isinstance(max_chars, bool):
+        raise TypeError(f"max_chars must be an integer, got {max_chars!r}")
     try:
         max_chars = int(max_chars)
     except TypeError, ValueError:
-        raise ValueError(f"max_chars must be an integer, got {max_chars!r}") from None
+        raise TypeError(f"max_chars must be an integer, got {max_chars!r}") from None
     if max_chars < 1 or max_chars > _MAX_CHARS:
         raise ValueError(f"max_chars must be 1..{_MAX_CHARS}, got {max_chars}")
     return offset, max_chars
@@ -412,7 +415,7 @@ def _local_stamp(value: object) -> str | None:
         return moment.astimezone().isoformat()
     if isinstance(value, str):
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value)
         except ValueError:
             return None
         if parsed.tzinfo is None:
@@ -696,7 +699,7 @@ def _download_bytes_of(attachment: object) -> bytes | None:
         return None
     try:
         result = download()
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except OSError, RuntimeError:
         return None
     if isinstance(result, bytes):
         return result
@@ -708,12 +711,12 @@ def _download_bytes_of(attachment: object) -> bytes | None:
 def _attr_bytes_of(attachment: object, attr: str) -> bytes | None:
     try:
         value = getattr(attachment, attr)
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except OSError, RuntimeError, AttributeError:
         return None
     if callable(value):
         try:
             value = value()
-        except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+        except OSError, RuntimeError, TypeError, ValueError:
             return None
     if isinstance(value, bytes):
         return value
@@ -743,7 +746,7 @@ def _filing_row_of(accession_no: str, as_of: str | None, data_root: Path | str |
 
     try:
         filings = _store.query_filings(accession=accession_no, as_of=as_of, limit=5, root=data_root)
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except OSError, ValueError, RuntimeError:
         return None
     return filings[0] if filings else None
 
@@ -789,6 +792,10 @@ def _known_at_or_before(row: dict[str, object], as_of: str) -> bool:
     return bool(known) and known[:10] <= as_of
 
 
+def _archived_row_order(row: dict[str, object]) -> tuple[str, str, str]:
+    return (str(row.get("known_at") or ""), str(row.get("retrieved_at") or ""), str(row.get("content_hash") or ""))
+
+
 def _archived_rows_of(
     accession_no: str,
     document_name: str | None,
@@ -805,19 +812,12 @@ def _archived_rows_of(
         return []
     try:
         records = list(_archive.iter_archived_documents(accession_no, effective, root=_raw_root_for(data_root)))
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except OSError, ValueError, RuntimeError:
         return []
     rows = [_archived_row_of(record, accession_no=accession_no, document_name=effective) for record in records]
     if as_of is not None:
         rows = [row for row in rows if _known_at_or_before(row, as_of)]
-    rows.sort(
-        key=lambda row: (
-            str(row.get("known_at") or ""),
-            str(row.get("retrieved_at") or ""),
-            str(row.get("content_hash") or ""),
-        ),
-        reverse=True,
-    )
+    rows.sort(key=_archived_row_order, reverse=True)
     return rows
 
 
@@ -977,7 +977,7 @@ def _archived_response(
 def _attachment_attr_of(attachment: object, name: str) -> object:
     try:
         found: object = getattr(attachment, name)
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except OSError, RuntimeError, AttributeError:
         return None
     narrowed: object = found
     return narrowed
@@ -1113,7 +1113,7 @@ def _coerce_window_alias(
 def get_sec_document(
     accession_no: str,
     document_name: str | None = None,
-    as_of: str | None = None,
+    as_of: str | date | datetime | None = None,
     *,
     offset: int = 0,
     max_chars: int | None = None,
@@ -1183,7 +1183,7 @@ def get_sec_document(
 def get_sec_filing_text(accession_no: str, document_name: str | None = None, as_of: str | None = None) -> str:
     text = get_sec_document(accession_no, document_name, as_of=as_of, raw=True)["text"]
     if not isinstance(text, str):
-        raise ValueError(f"no text for accession: {accession_no!r}")  # noqa: TRY004 - public error contract pins ValueError, tests are oracle
+        raise TypeError(f"no text for accession: {accession_no!r}")
     return text
 
 
@@ -1275,7 +1275,7 @@ def _document_haystack(document_name: object, description: object) -> str | None
     """Lowercased filename+description text; None when untrusted input will not coerce."""
     try:
         return f"{document_name or ''} {description or ''}".lower()
-    except Exception:  # noqa: BLE001 - untrusted display strings coerce to other, never raise
+    except TypeError, ValueError:
         return None
 
 
@@ -1324,7 +1324,7 @@ def _exhibit_dict(accession_no: str, attachment: object) -> dict[str, object]:
         try:
             value: object = getattr(attachment, name)
             return value
-        except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+        except OSError, RuntimeError, AttributeError:
             return None
 
     url = _get("url") or ""

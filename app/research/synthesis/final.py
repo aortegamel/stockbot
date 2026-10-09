@@ -37,7 +37,6 @@ from app.research.agents import (
 from app.research.agents.bearbot import BearAnalysis
 from app.research.agents.bullbot import BullAnalysis
 from app.research.agents.stockbot import StockbotAnalysis
-
 from app.research.evidence import evidence_domain, evidence_integrity
 
 from .committee import CommitteeDisagreement, _coerce_wave_id
@@ -135,6 +134,7 @@ class FinalSynthesis:
             "as_of": self.as_of,
         }
 
+
 def scoped_absence(text: str, domain: str | None = None) -> str:
     """Scoped absence phrasing: what a searched scope located, never real-world nonexistence."""
     clean = text.strip()[:2000]
@@ -148,6 +148,7 @@ def scoped_absence(text: str, domain: str | None = None) -> str:
     if clean.lower().startswith("no disclosure"):
         return clean
     return f"{scope}: {clean}"
+
 
 def _union_texts(groups: tuple[Sequence[str], ...]) -> list[str]:
     out: list[str] = []
@@ -444,6 +445,8 @@ def _synth_changes(stock: StockbotAnalysis, bull: BullAnalysis, bear: BearAnalys
             list(getattr(bear, "what_would_change", []) or []),
         )
     )
+
+
 def _synth_limitations(evidence_limitations: Sequence[str] | None, scope: Mapping[str, object]) -> list[str]:
     """Caller limitations plus the explicit searched-source boundary."""
     lims = [v.strip() for v in (evidence_limitations or []) if isinstance(v, str) and v.strip()]
@@ -465,6 +468,7 @@ def _effect_line(row: Mapping[str, object]) -> str:
 def _section(title: str, lines: Sequence[str]) -> list[str]:
     """One rendered section ([] when it has no lines)."""
     return [f"{title}:", *(f"- {line}" for line in lines if line)] if any(lines) else []
+
 
 _COVERAGE_VERDICT_KEYS: frozenset[str] = frozenset(
     {"source_domain", "source_sufficiency", "useful_for_question", "complete"}
@@ -494,7 +498,11 @@ def _coverage_lines(coverage: Mapping[str, object]) -> list[str]:
         parts = [f"{name}: {', '.join(items)}" for name, items in _coverage_scope_items(section)]
         detail = _as_text(section.get("detail") or section.get("summary"))
         head = f"{key.upper()}"
-        lines.append(f"{head} — {'; '.join(parts)}{(' — ' + detail) if detail and not parts else (detail if detail else '')}" if (parts or detail) else head)
+        lines.append(
+            f"{head} — {'; '.join(parts)}{(' — ' + detail) if detail and not parts else (detail if detail else '')}"
+            if (parts or detail)
+            else head
+        )
     extra = _strs(coverage.get("gaps"))
     if extra:
         lines.append(f"gaps: {', '.join(extra)}")
@@ -637,15 +645,23 @@ def _deep_answer(synth: FinalSynthesis) -> str:
         out.append(f"Consensus: {synth.consensus}")
     if synth.base_case:
         out += _section("Base case: Base case (stockbot)", [synth.base_case])
-    out += _section("Major evidence \u2014 What the evidence directly shows", [_effect_line(row) for row in synth.direct_evidence])
-    out += _section("First-order effects \u2014 First-order impact", [_effect_line(row) for row in synth.first_order_effects])
-    out += _section("Second-order effects \u2014 Second-order impact", [_effect_line(row) for row in synth.second_order_effects])
+    out += _section(
+        "Major evidence \u2014 What the evidence directly shows", [_effect_line(row) for row in synth.direct_evidence]
+    )
+    out += _section(
+        "First-order effects \u2014 First-order impact", [_effect_line(row) for row in synth.first_order_effects]
+    )
+    out += _section(
+        "Second-order effects \u2014 Second-order impact", [_effect_line(row) for row in synth.second_order_effects]
+    )
     out += _section("Bull case \u2014 Bull case (bullbot)", [synth.bull_case])
     out += _section("Bear case \u2014 Bear case (bearbot)", [synth.bear_case])
     out += _section("Disagreements \u2014 Critical disagreements", synth.critical_disagreements)
     out += _section("Positioning", synth.positioning)
     out += _section("Catalysts", synth.catalysts)
-    out += _section("Uncertainties \u2014 Unknowns / unresolved", _union_texts((synth.unknowns, synth.absence_observations)))
+    out += _section(
+        "Uncertainties \u2014 Unknowns / unresolved", _union_texts((synth.unknowns, synth.absence_observations))
+    )
     out += _section("What changes the view \u2014 What would change the view", synth.what_would_change)
     out += _section("Limitations \u2014 Source limitations", synth.evidence_limitations)
     out += _section("Coverage", _coverage_lines(synth.coverage))

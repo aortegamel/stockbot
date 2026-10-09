@@ -22,6 +22,7 @@ without changing the public protocol.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import threading
 from collections.abc import Mapping
@@ -35,6 +36,8 @@ from app.tools import tools_for_capabilities
 
 _sessions: dict[str, AgentToolSession] = {}
 _sessions_lock = threading.Lock()
+
+logger = logging.getLogger(__name__)
 
 
 def _required_string(request: Mapping[str, object], key: str) -> str | None:
@@ -86,6 +89,7 @@ def _invoke(request: Mapping[str, object], protocol_id: str) -> dict[str, object
         )
         return {"id": protocol_id, "result": result}
     except Exception:
+        logger.exception("tool bridge failed id=%s tool=%s", protocol_id, name)
         return {"id": protocol_id, "error": "bridge_failed"}
 
 
@@ -118,7 +122,7 @@ def main() -> None:
             continue
         try:
             request = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:
             response: dict[str, object] = {"error": "bad_request"}
         else:
             response = handle(request) if isinstance(request, dict) else {"error": "bad_request"}

@@ -841,13 +841,11 @@ def evidence_from_dict(data: Mapping[str, object]) -> Evidence:
 
 def edgartools_version() -> str | None:
     """Installed edgartools version, or None when unresolvable (provenance metadata, never a gate)."""
-    try:
-        from importlib.metadata import version
-    except Exception:
-        return None
+    from importlib.metadata import PackageNotFoundError, version
+
     try:
         return version("edgartools")
-    except Exception:
+    except PackageNotFoundError:
         return None
 
 

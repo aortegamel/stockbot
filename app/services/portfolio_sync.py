@@ -271,13 +271,12 @@ def _snapshot_header(row: Mapping[str, object]) -> tuple[str, datetime, str]:
     """(snapshot id, created_at, broker) from the newest snapshot row."""
     return str(row["snapshot_id"]), _snapshot_created_at(row["created_at"]), str(row["broker"])
 
+
 def _snapshot_decimals(row: Mapping[str, object]) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
     """(cash, invested, total) as canonical decimals (None stays None)."""
     return (
         _canonical_decimal(Decimal(str(row["cash"])) if row.get("cash") is not None else None),
-        _canonical_decimal(
-            Decimal(str(row["invested_value"])) if row.get("invested_value") is not None else None
-        ),
+        _canonical_decimal(Decimal(str(row["invested_value"])) if row.get("invested_value") is not None else None),
         _canonical_decimal(Decimal(str(row["total_value"])) if row.get("total_value") is not None else None),
     )
 

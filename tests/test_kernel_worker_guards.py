@@ -1,15 +1,42 @@
-"""Fail-closed authority guards: registry abort + JEV-outage objective-only.
+"""Fail-closed guard contracts: failures propagate, envelopes preserved."""
 
-Pinned to HEAD ``_jev_admit(sid, objective, proposals, jev=None)``: outage is
-simulated by passing a failing ``jev`` directly. If further injection params
-land, extend — do not replace — these tests.
-"""
-
+import json
+from collections.abc import Mapping, Sequence
+from io import StringIO
+from pathlib import Path
+from types import ModuleType
+from typing import override
 from unittest import mock
 
 import pytest
 
+from app.decision_client import JevClient
 from app.research import kernel_worker as kw
+from app.research import scheduler as sched
+from app.research.models import DecisionRecord, JSONValue, ResearchNode
+from app.research.repository import ResearchRepository
+
+
+def _no_bootstrap(sid: str) -> None:
+    return None
+
+
+def _evidence_none(self: ResearchRepository, sid: str) -> list[dict[str, JSONValue]]:
+    return []
+
+
+def _nodes_none(self: ResearchRepository, sid: str) -> list[ResearchNode]:
+    return []
+
+
+def _decisions_none(self: ResearchRepository, sid: str) -> list[DecisionRecord]:
+    return []
+
+
+def _empty_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ResearchRepository, "list_evidence", _evidence_none)
+    monkeypatch.setattr(ResearchRepository, "list_nodes", _nodes_none)
+    monkeypatch.setattr(ResearchRepository, "list_decisions", _decisions_none)
 
 
 def test_registry_failure_raises_not_empty() -> None:
@@ -29,34 +56,25 @@ def _props() -> list[dict[str, object]]:
     ]
 
 
-class _JevDown:
-    def decide(self, *a: object, **k: object) -> object:
+class _JevDown(JevClient):
+    @override
+    async def decide(self, *a: object, **k: object) -> dict[str, dict[str, JSONValue]]:
         raise RuntimeError("jev down")
 
 
-def _run_outage(fn: object, *args: object) -> object:
-    # Inject the failing client explicitly: _shared_jev() caches process-wide,
-    # so patching the JevClient constructor is order-dependent (a cached
-    # success bypasses the patch) and caching the double leaks into later tests.
-    assert callable(fn)
-    return fn(*args, jev=_JevDown())  # type: ignore[operator]
+def test_jev_outage_propagates() -> None:
+    with pytest.raises(RuntimeError, match="jev down"):
+        kw._jev_admit("s", "Exact user objective?", _props(), jev=_JevDown())
 
 
-def test_jev_outage_returns_objective_only() -> None:
-    props = _props()
-    out = _run_outage(kw._jev_admit, "s", "Exact user objective?", props)
-    assert out == [props[1]]
+def test_jev_outage_missing_objective_propagates() -> None:
+    with pytest.raises(RuntimeError, match="jev down"):
+        kw._jev_admit("s", "Missing objective?", _props(), jev=_JevDown())
 
 
-def test_jev_outage_synthesizes_single_objective_node() -> None:
-    out = _run_outage(kw._jev_admit, "s", "Missing objective?", _props())
-    assert isinstance(out, list) and len(out) == 1
-    first = out[0]
-    assert isinstance(first, dict) and first["question"] == "Missing objective?"
-
-
-class _JevAdmitTwoOfThree:
-    async def decide(self, *a: object, **k: object) -> dict[str, dict[str, str]]:
+class _JevAdmitTwoOfThree(JevClient):
+    @override
+    async def decide(self, *a: object, **k: object) -> dict[str, dict[str, JSONValue]]:
         return {"s-q1": {"choice": "analyze"}, "s-q2": {"choice": "gather_evidence"}, "s-q3": {"choice": "reject"}}
 
 
@@ -66,7 +84,7 @@ def test_jev_success_preserves_all_admitted_proposals() -> None:
         {"id": "s-q2", "objectiveId": "s", "question": "Exact user objective?", "dependsOn": [], "whyItMatters": "w"},
         {"id": "s-q3", "objectiveId": "s", "question": "Tangent?", "dependsOn": [], "whyItMatters": "w"},
     ]
-    out = kw._jev_admit("s", "Exact user objective?", props, jev=_JevAdmitTwoOfThree())  # type: ignore[arg-type]
+    out = kw._jev_admit("s", "Exact user objective?", props, jev=_JevAdmitTwoOfThree())
     assert out == props[:2]
 
 
@@ -83,13 +101,15 @@ def test_graph_prompt_registry_failure_is_terminal() -> None:
     assert isinstance(terminal, dict) and "registry guard forbids" in str(terminal.get("message"))
 
 
-class _JevRoute:
+class _JevRoute(JevClient):
     def __init__(self, choice: str | None = None, fail: bool = False) -> None:
+        super().__init__()
         self.choice = choice
         self.fail = fail
-        self.seen: list[object] = []
+        self.seen: list[tuple[str, Sequence[Mapping[str, JSONValue]] | None]] = []
 
-    async def route_entry(self, prompt: str, registry: object | None = None) -> str:
+    @override
+    async def route_entry(self, prompt: str, registry: Sequence[Mapping[str, JSONValue]] | None = None) -> str:
         if self.fail:
             raise RuntimeError("jev down")
         self.seen.append((prompt, registry))
@@ -97,22 +117,22 @@ class _JevRoute:
 
 
 def test_route_reasoning_choice_returns_fast_path() -> None:
-    out = kw._route({"id": "r1", "op": "route", "prompt": "hello"}, jev=_JevRoute("reasoning_required"))  # type: ignore[arg-type]
+    out = kw._route({"id": "r1", "op": "route", "prompt": "hello"}, jev=_JevRoute("reasoning_required"))
     assert out == {"id": "r1", "route": "reasoning_required"}
 
 
-def test_route_outage_fails_open_to_research() -> None:
-    out = kw._route({"id": "r1", "op": "route", "prompt": "hello"}, jev=_JevRoute(fail=True))  # type: ignore[arg-type]
-    assert out == {"id": "r1", "route": "research_required"}
+def test_route_outage_propagates() -> None:
+    with pytest.raises(RuntimeError, match="jev down"):
+        kw._route({"id": "r1", "op": "route", "prompt": "hello"}, jev=_JevRoute(fail=True))
 
 
 def test_route_blank_prompt_needs_no_jev() -> None:
-    out = kw._route({"id": "r1", "op": "route", "prompt": "  "}, jev=_JevRoute("reasoning_required"))  # type: ignore[arg-type]
+    out = kw._route({"id": "r1", "op": "route", "prompt": "  "}, jev=_JevRoute("reasoning_required"))
     assert out == {"id": "r1", "route": "research_required"}
 
 
 def test_route_tool_winner_returns_exact_tool() -> None:
-    out = kw._route({"id": "r1", "op": "route", "prompt": "what time is it?"}, jev=_JevRoute("get_current_time"))  # type: ignore[arg-type]
+    out = kw._route({"id": "r1", "op": "route", "prompt": "what time is it?"}, jev=_JevRoute("get_current_time"))
     assert out == {"id": "r1", "route": "get_current_time"}
 
 
@@ -132,7 +152,11 @@ def test_arguments_uses_shared_needle_and_schema_fallback(monkeypatch: pytest.Mo
     monkeypatch.setattr(
         "app.research.scheduler.build_registry", lambda: [{"name": "query_finra", "parameters": {"type": "object"}}]
     )
-    monkeypatch.setattr("app.research.scheduler._schema_for", lambda name, reg: {"type": "object"})
+
+    def _schema(name: str, reg: list[dict[str, object]]) -> dict[str, object]:
+        return {"type": "object"}
+
+    monkeypatch.setattr("app.research.scheduler._schema_for", _schema)
     out = kw._arguments({"id": "a1", "op": "arguments", "tool": "query_finra", "objective": "short interest?"})
     assert out == {
         "id": "a1",
@@ -147,18 +171,16 @@ def test_arguments_uses_shared_needle_and_schema_fallback(monkeypatch: pytest.Mo
 
 
 def test_kernel_worker_stamps_route_assess_and_node() -> None:
-    # Clock asks short-circuit in programmatic_route, so JEV never sees them;
-    # the stamp check uses an unroutable prompt that still reaches JEV.
     jev = _JevRoute("get_current_time")
-    out = kw._route({"id": "r1", "op": "route", "prompt": "what time is it?"}, jev=jev)  # type: ignore[arg-type]
+    out = kw._route({"id": "r1", "op": "route", "prompt": "what time is it?"}, jev=jev)
     assert out == {"id": "r1", "route": "get_current_time"}
     assert jev.seen == []
     jev2 = _JevRoute("research_required")
-    out2 = kw._route({"id": "r2", "op": "route", "prompt": "halp money stuff?"}, jev=jev2)  # type: ignore[arg-type]
+    out2 = kw._route({"id": "r2", "op": "route", "prompt": "halp money stuff?"}, jev=jev2)
     assert out2 == {"id": "r2", "route": "research_required"}
     assert isinstance(jev2.seen[0][0], str) and jev2.seen[0][0].startswith("[Today UTC ")
     assess = _JevAssess("node_resolved")
-    kw._assess_entry({"id": "s1", "prompt": "risk?", "tool": "t", "result": {}}, jev=assess)  # type: ignore[arg-type]
+    kw._assess_entry({"id": "s1", "prompt": "risk?", "tool": "t", "result": {}}, jev=assess)
     assert isinstance(assess.seen[0][0], str) and assess.seen[0][0].startswith("[Today UTC ")
     prompt = kw._intake_reasoner_prompt("rs:test", "objective?", None, "")
     assert "Today is" in prompt and "UTC" in prompt
@@ -172,7 +194,7 @@ def test_arguments_mismatch_is_error_never_raise(monkeypatch: pytest.MonkeyPatch
 
 
 def test_arguments_withhold_seeds_sec_and_sho(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Needle withhold seeds SEC identifier / SHO ticker+company; unseedable stays error."""
+    """Genuine Needle withhold (returns None) seeds SEC/SHO; unseedable stays error."""
     import app.tools as _tools
 
     def _resolve(name: str) -> str | None:
@@ -180,10 +202,10 @@ def test_arguments_withhold_seeds_sec_and_sho(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
 
-    def _boom(**kwargs: object) -> object:
-        raise RuntimeError("needle tool mismatch: jev selected 'x', needle emitted None")
+    def _withhold(**kwargs: object) -> object:
+        return None
 
-    monkeypatch.setattr(kw, "_shared_needle_generate", lambda: _boom)
+    monkeypatch.setattr(kw, "_shared_needle_generate", lambda: _withhold)
     sho = kw._arguments(
         {
             "id": "s1",
@@ -196,6 +218,48 @@ def test_arguments_withhold_seeds_sec_and_sho(monkeypatch: pytest.MonkeyPatch) -
     assert sec["arguments"] == {"identifier": "NVDA", "forms": ["10-Q", "10-K", "8-K"]}
     none = kw._arguments({"id": "s3", "tool": "get_reg_sho_volume", "objective": "Which filings mention Elon Musk?"})
     assert none["id"] == "s3" and "error" in none
+
+
+def test_arguments_generation_failure_is_error_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A raising Needle generate reaches the outer error envelope, never seeded success."""
+
+    def _boom(**kwargs: object) -> object:
+        raise RuntimeError("needle boom")
+
+    monkeypatch.setattr(kw, "_shared_needle_generate", lambda: _boom)
+    out = kw._arguments({"id": "s9", "tool": "list_sec_filings", "objective": "What drove NVDA revenue last quarter?"})
+    assert out["id"] == "s9" and "error" in out
+    assert "needle boom" in str(out["error"])
+    assert "arguments" not in out
+
+
+def test_arguments_schema_failure_is_error_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    gen = _FailGenerate({"tool": "query_finra", "arguments": {"ticker": "NVDA"}, "confidence": 0.9, "reasoning": "r"})
+    monkeypatch.setattr(kw, "_shared_needle_generate", lambda: gen)
+
+    def _bad_schema(name: str, reg: object) -> object:
+        raise RuntimeError("schema boom")
+
+    monkeypatch.setattr("app.research.scheduler._schema_for", _bad_schema)
+    out = kw._arguments({"id": "a9", "op": "arguments", "tool": "query_finra"})
+    assert out["id"] == "a9" and "error" in out
+    assert "schema boom" in str(out["error"])
+
+
+def test_arguments_repair_failure_is_error_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    gen = _FailGenerate({"tool": "query_finra", "arguments": {"ticker": "NVDA"}, "confidence": 0.9, "reasoning": "r"})
+    monkeypatch.setattr(kw, "_shared_needle_generate", lambda: gen)
+    monkeypatch.setattr(
+        "app.research.scheduler.build_registry", lambda: [{"name": "query_finra", "parameters": {"type": "object"}}]
+    )
+
+    def _bad_repair(*a: object, **k: object) -> object:
+        raise RuntimeError("repair boom")
+
+    monkeypatch.setattr("app.research.scheduler._repair_tool_arguments", _bad_repair)
+    out = kw._arguments({"id": "a10", "tool": "query_finra", "objective": "q?", "schema": {"type": "object"}})
+    assert out["id"] == "a10" and "error" in out
+    assert "repair boom" in str(out["error"])
 
 
 def test_arguments_repairs_needle_placeholders(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -244,15 +308,21 @@ def test_arguments_repairs_needle_placeholders(monkeypatch: pytest.MonkeyPatch) 
     assert sho["arguments"] == {"ticker": "AAPL", "company_name": "Apple"}
 
 
-class _JevAssess:
+class _JevAssess(JevClient):
     def __init__(self, verdict: str | None = None, fail: bool = False) -> None:
+        super().__init__()
         self.verdict = verdict
         self.fail = fail
-        self.seen: list[object] = []
+        self.seen: list[tuple[str, str, Mapping[str, JSONValue] | None, Mapping[str, JSONValue] | None]] = []
 
+    @override
     async def assess_entry_tool(
-        self, prompt: str, tool: str, arguments: object = None, result: object = None
-    ) -> str | None:
+        self,
+        prompt: str,
+        tool: str,
+        arguments: Mapping[str, JSONValue] | None = None,
+        result: Mapping[str, JSONValue] | None = None,
+    ) -> str:
         if self.fail:
             raise RuntimeError("jev down")
         self.seen.append((prompt, tool, arguments, result))
@@ -263,22 +333,23 @@ def test_assess_entry_returns_verdict() -> None:
     jev = _JevAssess("get_sec_document")
     out = kw._assess_entry(
         {"id": "s1", "prompt": "risk?", "tool": "search_sec_filings", "arguments": {}, "result": {"ok": True}},
-        jev=jev,  # type: ignore[arg-type]
+        jev=jev,
     )
     assert out == {"id": "s1", "verdict": "get_sec_document"}
 
 
-def test_assess_entry_outage_and_blank_fail_open_to_research() -> None:
-    out = kw._assess_entry({"id": "s2", "prompt": "p", "tool": "t", "result": {}}, jev=_JevAssess(fail=True))  # type: ignore[arg-type]
-    assert out == {"id": "s2", "verdict": "research_required"}
-    out = kw._assess_entry({"id": "s3", "prompt": "  ", "tool": "t"}, jev=_JevAssess("node_resolved"))  # type: ignore[arg-type]
+def test_assess_entry_outage_propagates() -> None:
+    with pytest.raises(RuntimeError, match="jev down"):
+        kw._assess_entry({"id": "s2", "prompt": "p", "tool": "t", "result": {}}, jev=_JevAssess(fail=True))
+
+
+def test_assess_entry_blank_still_research_required() -> None:
+    out = kw._assess_entry({"id": "s3", "prompt": "  ", "tool": "t"}, jev=_JevAssess("node_resolved"))
     assert out == {"id": "s3", "verdict": "research_required"}
 
 
 def test_entry_prompts_carry_temporal_decoding() -> None:
     import asyncio
-
-    from app.decision_client import JevClient
 
     seen: dict[str, object] = {}
 
@@ -286,7 +357,7 @@ def test_entry_prompts_carry_temporal_decoding() -> None:
         seen["questions"] = questions
         assert isinstance(questions, dict)
         qid = next(iter(questions))
-        opts = questions[qid]["criteria"] if isinstance(questions[qid], dict) else {}
+        opts: object = questions[qid]["criteria"] if isinstance(questions[qid], dict) else {}
         assert isinstance(opts, dict)
         winner = "reasoning_required" if "reasoning_required" in opts else next(iter(opts))
         return {
@@ -300,8 +371,12 @@ def test_entry_prompts_carry_temporal_decoding() -> None:
             }
         }
 
-    client = JevClient(transport=_stub, data_root=__import__("pathlib").Path("/tmp"))
-    client._persist = lambda **kwargs: None  # type: ignore[method-assign]
+    class _NoPersistJev(JevClient):
+        @override
+        def _persist(self, **kwargs: object) -> None:
+            return None
+
+    client = _NoPersistJev(transport=_stub, data_root=Path("/tmp"))
     out = asyncio.run(client.route_entry("hello"))
     assert out == "reasoning_required"
     entry_q = seen["questions"]
@@ -322,6 +397,7 @@ def test_run_scheduler_deadline_honors_shared_budget(monkeypatch: pytest.MonkeyP
     import time as _time
 
     seen: dict[str, object] = {}
+    closed: list[str] = []
 
     def _fake_graph(prompt: str, as_of: object = None, **k: object) -> str:
         deadline = k.get("setup_deadline")
@@ -334,12 +410,17 @@ def test_run_scheduler_deadline_honors_shared_budget(monkeypatch: pytest.MonkeyP
         seen["deadline_at"] = hooks.get("deadline_at")
         return {"status": "complete", "nodes": [], "incomplete_guard": False}
 
+    def _close(sid: str) -> None:
+        closed.append(sid)
+
     monkeypatch.setattr(kw, "run_graph_prompt", _fake_graph)
     monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
-    monkeypatch.setattr(kw, "_close_bootstrap_job", lambda sid: None)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", _close)
+    _empty_repo(monkeypatch)
     t0 = _time.perf_counter()
-    out = kw._run({"id": "r1", "op": "run", "prompt": "hello?"}, jev=object())  # type: ignore[arg-type]
+    out = kw._run({"id": "r1", "op": "run", "prompt": "hello?"}, jev=JevClient())
     assert out["id"] == "r1"
+    assert closed == ["s1"]
     assert isinstance(seen["setup_deadline"], float)
     assert isinstance(seen["deadline_at"], float)
     assert abs(seen["setup_deadline"] - (t0 + kw._SETUP_S)) < 5.0
@@ -351,6 +432,7 @@ def test_run_scheduler_deadline_honors_absolute_deadline_at(monkeypatch: pytest.
     import time as _time
 
     seen: dict[str, object] = {}
+    closed: list[str] = []
 
     def _fake_graph(prompt: str, as_of: object = None, **k: object) -> str:
         return "s1"
@@ -359,19 +441,74 @@ def test_run_scheduler_deadline_honors_absolute_deadline_at(monkeypatch: pytest.
         seen["deadline_at"] = hooks.get("deadline_at")
         return {"status": "complete", "nodes": [], "incomplete_guard": False}
 
+    def _close(sid: str) -> None:
+        closed.append(sid)
+
     monkeypatch.setattr(kw, "run_graph_prompt", _fake_graph)
     monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
-    monkeypatch.setattr(kw, "_close_bootstrap_job", lambda sid: None)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", _close)
+    _empty_repo(monkeypatch)
     t0 = _time.perf_counter()
     kw._run(
         {"id": "r2", "op": "run", "prompt": "hello?", "deadlineAt": _time.time() * 1000 + 60_000},
-        jev=object(),  # type: ignore[arg-type]
+        jev=JevClient(),
     )
     assert isinstance(seen["deadline_at"], float)
     assert abs(float(seen["deadline_at"]) - (t0 + 60 - kw._FINALIZE_S)) < 5.0
+    assert closed == ["s1"]
     for bad in (True, "soon"):
-        kw._run({"id": "r3", "op": "run", "prompt": "hello?", "deadlineAt": bad}, jev=object())  # type: ignore[arg-type]
+        kw._run({"id": "r3", "op": "run", "prompt": "hello?", "deadlineAt": bad}, jev=JevClient())
         assert abs(float(seen["deadline_at"]) - (t0 + kw._RUN_WALL_S - kw._FINALIZE_S)) < 5.0
+
+
+def test_run_repository_read_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_graph(prompt: str, as_of: object = None, **k: object) -> str:
+        return "s1"
+
+    async def _fake_sched(sid: str, **hooks: object) -> dict[str, object]:
+        return {"status": "complete", "nodes": [], "incomplete_guard": False}
+
+    def _boom(self: ResearchRepository, sid: str) -> list[dict[str, JSONValue]]:
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(kw, "run_graph_prompt", _fake_graph)
+    monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", _no_bootstrap)
+    monkeypatch.setattr(ResearchRepository, "list_evidence", _boom)
+    with pytest.raises(RuntimeError, match="store down"):
+        kw._run({"id": "r9", "op": "run", "prompt": "hello?"}, jev=JevClient())
+
+
+def _kernel_with_decision_log(recorded: list[dict[str, object]]) -> sched._Kernel:
+    class _K(sched._Kernel):
+        @override
+        def record_decision(
+            self,
+            session_id: str,
+            decision_type: str,
+            candidates: Mapping[str, object],
+            probabilities: Mapping[str, object],
+            selected: object,
+            *,
+            node_id: str | None = None,
+            job_id: str | None = None,
+            confidence: float | None = None,
+            request: object = None,
+            response: object = None,
+        ) -> DecisionRecord:
+            recorded.append({"dtype": decision_type, "selected": selected})
+            return DecisionRecord(
+                decision_id="dec-test",
+                session_id=session_id,
+                node_id=node_id,
+                job_id=job_id,
+                decision_type=decision_type,
+                candidates={},
+                probabilities={},
+                selected={},
+            )
+
+    return _K()
 
 
 def test_round2_skipped_for_corrected_query_only(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -379,6 +516,7 @@ def test_round2_skipped_for_corrected_query_only(monkeypatch: pytest.MonkeyPatch
     import asyncio
 
     rounds = {"n": 0}
+    recorded: list[dict[str, object]] = []
 
     async def _one_round(*a: object, **k: object) -> tuple[list[object], list[object], dict[str, object]]:
         rounds["n"] += 1
@@ -390,38 +528,39 @@ def test_round2_skipped_for_corrected_query_only(monkeypatch: pytest.MonkeyPatch
             {"corrected_query": "fixed query"},
         )
 
+    kernel = _kernel_with_decision_log(recorded)
     monkeypatch.setattr(kw, "_intake_round", _one_round)
     monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
-    out = asyncio.run(kw._graph_intake("q?", None, "s1", {}, [], None, object(), None))
+    out = asyncio.run(kw._graph_intake("q?", None, "s1", {}, [], JevClient(), kernel, None))
     assert len(out) == 1 and rounds["n"] == 1
+    assert recorded and recorded[0].get("dtype") == "intake_digest"
 
 
-def test_jev_admit_timeout_falls_back_to_objective() -> None:
-    """A hanging JEV decide returns the objective fallback before the setup deadline."""
+def test_jev_admit_timeout_propagates() -> None:
+    """A hanging JEV decide raises TimeoutError before the setup deadline."""
     import asyncio
     import time as _time
 
-    class _Hang:
-        async def decide(self, *a: object, **k: object) -> object:
+    class _Hang(JevClient):
+        @override
+        async def decide(self, *a: object, **k: object) -> dict[str, dict[str, JSONValue]]:
             await asyncio.sleep(30.0)
             raise AssertionError("must time out")
 
     t0 = _time.perf_counter()
-    out = kw._jev_admit(
-        "s",
-        "Exact user objective?",
-        _props(),
-        jev=_Hang(),  # type: ignore[arg-type]
-        setup_deadline=t0 + 0.2,
-    )
+    with pytest.raises(TimeoutError):
+        kw._jev_admit(
+            "s",
+            "Exact user objective?",
+            _props(),
+            jev=_Hang(),
+            setup_deadline=t0 + 0.2,
+        )
     assert _time.perf_counter() - t0 < 5.0
-    assert isinstance(out, list) and len(out) == 1
-    first = out[0]
-    assert isinstance(first, dict) and first["question"] == "Exact user objective?"
 
 
-def test_decompose_retry_skipped_when_setup_budget_spent(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A transient decompose failure with <15s left returns setup_budget, no retry."""
+def test_decompose_retry_budget_propagates_original(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transient decompose failure with <15s left propagates, no synthesized proposal."""
     import time as _time
 
     calls = {"n": 0}
@@ -431,17 +570,213 @@ def test_decompose_retry_skipped_when_setup_budget_spent(monkeypatch: pytest.Mon
         raise RuntimeError("connection reset by peer")
 
     monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", _boom)
-    proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "s", "", None, None, _time.perf_counter() + 5.0)
-    assert calls["n"] == 1 and hints.get("fallback") == "setup_budget"
-    assert len(proposals) == 1
+    with pytest.raises(RuntimeError, match="connection reset by peer"):
+        kw._reasoner_decompose_with_retry("q?", None, "s", "", None, None, _time.perf_counter() + 5.0)
+    assert calls["n"] == 1
+
+
+def test_notify_progress_failure_propagates_with_setup_error_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Listener errors propagate directly and setup reports the real provider_error boundary."""
+    failure = RuntimeError("listener down")
+
+    def _bad(stage: str, detail: dict[str, object]) -> None:
+        raise failure
+
+    with pytest.raises(RuntimeError, match="listener down") as raised:
+        kw._notify(_bad, "intake_start", {"calls": 1})
+    assert raised.value is failure
+
+    def _fake_graph(
+        prompt: str,
+        as_of: object = None,
+        *,
+        progress: kw.ProgressFn | None = None,
+        **k: object,
+    ) -> str:
+        kw._notify(progress, "intake_start", {"calls": 1})
+        return "s1"
+
+    monkeypatch.setattr(kw, "run_graph_prompt", _fake_graph)
+    out = kw._run({"id": "rp", "op": "run", "prompt": "hello?"}, jev=JevClient(), progress=_bad)
+    assert out["id"] == "rp"
+    terminal = out["terminal"]
+    assert isinstance(terminal, dict)
+    assert terminal["category"] == "provider_error"
+    assert out["error"] == "session setup failed: listener down"
+    assert terminal["message"] == out["error"]
+    assert out["failures"] == {"provider_error": 1}
+    assert out["escalated"] is True
+    assert out["evidence"] == []
+
+
+def test_normalize_proposals_malformed_raises_typeerror() -> None:
+    with pytest.raises(TypeError):
+        kw._normalize_proposals([object()], "s")
+    with pytest.raises(TypeError):
+        kw._normalize_proposals("not-a-list", "s")
+
+
+def test_create_nodes_topological_cycle_rejects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cyclic dependsOn rejects; no nodes persist for the cyclic batch."""
+    import tempfile
+
+    from app.research import service
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
+    sid = service.create_research("q?", "q?")
+    cyclic: list[dict[str, object]] = [
+        {"id": "s-q1", "objectiveId": "s", "question": "q1?", "dependsOn": ["s-q2"], "whyItMatters": "w"},
+        {"id": "s-q2", "objectiveId": "s", "question": "q2?", "dependsOn": ["s-q1"], "whyItMatters": "w"},
+    ]
+    with pytest.raises(ValueError, match="cyclic"):
+        kw._create_nodes_topological(sid, "q?", cyclic)
+    assert ResearchRepository().list_nodes(sid) == []
+
+
+def test_startup_jev_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _BadJev(JevClient):
+        @override
+        def start(self) -> None:
+            raise RuntimeError("jev start down")
+
+    monkeypatch.setattr(kw, "_shared_jev", lambda: _BadJev())
+    monkeypatch.setattr(kw, "_prewarm", lambda: None)
+    with pytest.raises(RuntimeError, match="jev start down"):
+        kw._startup()
+
+
+def test_startup_needle_failure_stays_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+
+    jev = JevClient()
+
+    def _noop_start(self: JevClient) -> None:
+        return None
+
+    monkeypatch.setattr(kw, "_shared_jev", lambda: jev)
+    monkeypatch.setattr(JevClient, "start", _noop_start)
+    monkeypatch.setattr(kw, "_prewarm", lambda: None)
+    real_import = importlib.import_module
+
+    def _bad_needle(name: str, package: str | None = None) -> ModuleType:
+        if name == "app.needle_client":
+            raise RuntimeError("needle down")
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", _bad_needle)
+    assert kw._startup() is jev
+
+
+def test_close_bootstrap_job_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.research import service as _svc
+    from app.research.models import Job
+
+    list_failure = RuntimeError("db down")
+    cancel_failure = RuntimeError("cancel down")
+
+    def _boom_list(self: ResearchRepository, sid: str) -> list[Job]:
+        raise list_failure
+
+    monkeypatch.setattr(ResearchRepository, "list_jobs", _boom_list)
+    with pytest.raises(RuntimeError, match="db down") as raised:
+        kw._close_bootstrap_job("rs:x")
+    assert raised.value is list_failure
+
+    def _one_job(self: ResearchRepository, sid: str) -> list[Job]:
+        return [Job(job_id="j1", session_id=sid, wave_id=1, parent_job_id=None, job_type="source_agent", owner="k")]
+
+    monkeypatch.setattr(ResearchRepository, "list_jobs", _one_job)
+
+    def _boom_cancel(job_id: str) -> None:
+        raise cancel_failure
+
+    monkeypatch.setattr(_svc, "cancel_job", _boom_cancel)
+    with pytest.raises(RuntimeError, match="cancel down") as raised:
+        kw._close_bootstrap_job("rs:x")
+    assert raised.value is cancel_failure
+
+
+def test_run_bootstrap_cleanup_failure_propagates_with_worker_error_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cleanup errors escape _run but the JSONL worker emits a provider_error terminal."""
+    failure = RuntimeError("jobs down")
+    jev = JevClient()
+
+    def _fake_graph(prompt: str, as_of: object = None, **k: object) -> str:
+        return "s1"
+
+    async def _fake_sched(sid: str, **hooks: object) -> dict[str, object]:
+        return {"status": "complete", "nodes": [], "incomplete_guard": False}
+
+    def _boom_jobs(self: ResearchRepository, sid: str) -> list[object]:
+        raise failure
+
+    monkeypatch.setattr(kw, "run_graph_prompt", _fake_graph)
+    monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
+    monkeypatch.setattr(ResearchRepository, "list_jobs", _boom_jobs)
+    _empty_repo(monkeypatch)
+    request: dict[str, JSONValue] = {"id": "rc", "op": "run", "prompt": "hello?"}
+    with pytest.raises(RuntimeError, match="jobs down") as raised:
+        kw._run(request, jev=jev)
+    assert raised.value is failure
+
+    stdout = StringIO()
+    monkeypatch.setattr(kw, "_startup", lambda: jev)
+    monkeypatch.setattr(kw, "_shutdown", lambda: None)
+    monkeypatch.setattr(kw.sys, "stdin", StringIO(json.dumps(request) + "\n"))
+    monkeypatch.setattr(kw.sys, "stdout", stdout)
+    with mock.patch.object(kw.signal, "signal"):
+        kw.main()
+
+    responses: list[object] = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert len(responses) == 2
+    assert responses[0] == {"type": "ready"}
+    out = responses[1]
+    assert isinstance(out, dict)
+    assert out["id"] == "rc"
+    terminal = out["terminal"]
+    assert isinstance(terminal, dict)
+    assert terminal["category"] == "provider_error"
+    assert out["error"] == "worker failed: jobs down"
+    assert terminal["message"] == out["error"]
+    assert out["failures"] == {"provider_error": 1}
+    assert out["escalated"] is True
+    assert out["evidence"] == []
+
+
+def test_graph_intake_reasoner_crash_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    recorded: list[dict[str, object]] = []
+
+    async def _one_round(*a: object, **k: object) -> tuple[list[object], list[object], dict[str, object]]:
+        return ([], [{"tool": "list_sec_filings"}], {"calls": 1, "admitted": 0})
+
+    def _crash(*a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
+        raise RuntimeError("reasoner crash")
+
+    monkeypatch.setattr(kw, "_intake_round", _one_round)
+    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _crash)
+    with pytest.raises(RuntimeError, match="reasoner crash"):
+        asyncio.run(kw._graph_intake("q?", None, "s1", {}, [], JevClient(), _kernel_with_decision_log(recorded), None))
+
+
+def test_graph_intake_round_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    recorded: list[dict[str, object]] = []
+
+    async def _boom_round(*a: object, **k: object) -> tuple[list[object], list[object], dict[str, object]]:
+        raise RuntimeError("intake round down")
+
+    monkeypatch.setattr(kw, "_intake_round", _boom_round)
+    with pytest.raises(RuntimeError, match="intake round down"):
+        asyncio.run(kw._graph_intake("q?", None, "s1", {}, [], JevClient(), _kernel_with_decision_log(recorded), None))
 
 
 def test_followup_reuses_session_skips_setup(monkeypatch: pytest.MonkeyPatch) -> None:
     """sessionId+gap creates one node in the live session; no new session, no intake."""
     import asyncio
     import tempfile
-    from pathlib import Path
-    from types import SimpleNamespace
 
     from app.research import service
 
@@ -465,29 +800,34 @@ def test_followup_reuses_session_skips_setup(monkeypatch: pytest.MonkeyPatch) ->
 
     orig_create = service.create_node
 
-    def _count(run_sid: str, *a: object, **k: object) -> object:
-        out = orig_create(run_sid, *a, **k)
-        if isinstance(out, SimpleNamespace) or hasattr(out, "node_id"):
-            created.append(out.node_id)  # type: ignore[attr-defined]
+    def _count(
+        run_sid: str,
+        question: str,
+        why_it_matters: str,
+        depends_on: Sequence[str] | None = None,
+        *,
+        repo: ResearchRepository | Path | str | None = None,
+    ) -> ResearchNode:
+        out = orig_create(run_sid, question, why_it_matters, depends_on, repo=repo)
+        created.append(out.node_id)
         return out
 
     monkeypatch.setattr(kw, "run_graph_prompt", _boom_graph)
     monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
     monkeypatch.setattr("app.research.service.create_node", _count)
-    monkeypatch.setattr(kw, "_close_bootstrap_job", lambda s: None)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", _no_bootstrap)
     out = asyncio.run(asyncio.to_thread(kw._run, {"id": "r2", "prompt": "q?", "sessionId": sid, "gap": "need doc X"}))
     assert out["sessionId"] == sid
     assert out["unresolved"] == []
     assert len(created) == 1
     nodes = out["nodes"]
     assert isinstance(nodes, list) and len(nodes) == 2
-    kw.run_graph_prompt = orig_graph  # type: ignore[method-assign]
+    kw.run_graph_prompt = orig_graph
 
 
 def test_followup_unknown_session_is_invalid_params(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unknown sessionId returns invalid_params, never a new session."""
     import tempfile
-    from pathlib import Path
 
     monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
     out = kw._run({"id": "r9", "prompt": "q?", "sessionId": "rs:nope", "gap": "need doc X"})
@@ -499,7 +839,6 @@ def test_followup_blocks_leftover_proposed_node(monkeypatch: pytest.MonkeyPatch)
     """A leftover pass-1 proposed node is blocked; the scheduler sees only the gap node."""
     import asyncio
     import tempfile
-    from pathlib import Path
 
     from app.research import service
 
@@ -517,32 +856,34 @@ def test_followup_blocks_leftover_proposed_node(monkeypatch: pytest.MonkeyPatch)
 
     orig_create = service.create_node
 
-    def _count(run_sid: str, *a: object, **k: object) -> object:
-        out = orig_create(run_sid, *a, **k)
-        node_id = getattr(out, "node_id", "")
-        if isinstance(node_id, str) and node_id:
-            gap_ids.append(node_id)
+    def _count(
+        run_sid: str,
+        question: str,
+        why_it_matters: str,
+        depends_on: Sequence[str] | None = None,
+        *,
+        repo: ResearchRepository | Path | str | None = None,
+    ) -> ResearchNode:
+        out = orig_create(run_sid, question, why_it_matters, depends_on, repo=repo)
+        if out.node_id:
+            gap_ids.append(out.node_id)
         return out
 
     monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
     monkeypatch.setattr("app.research.service.create_node", _count)
-    monkeypatch.setattr(kw, "_close_bootstrap_job", lambda s: None)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", _no_bootstrap)
     out = asyncio.run(asyncio.to_thread(kw._run, {"id": "r3", "prompt": "q?", "sessionId": sid, "gap": "need doc X"}))
     assert out["sessionId"] == sid
     assert len(gap_ids) == 1
-    from app.research.repository import ResearchRepository
-
     assert ResearchRepository().get_node(leftover.node_id).status == "blocked"
 
 
-def test_followup_links_new_evidence_not_pass1(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A pass-2 attempt without evidence_id links the new id, never a pass-1 id."""
+def test_followup_links_only_explicit_known_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pass-2 calls cite their own known ids (pass-1 duplicate winner, repeats); others get no evidenceId."""
     import asyncio
     import tempfile
-    from pathlib import Path
 
     from app.research import service
-    from app.research.repository import ResearchRepository
 
     monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
     sid = service.create_research("q?", "q?")
@@ -550,34 +891,47 @@ def test_followup_links_new_evidence_not_pass1(monkeypatch: pytest.MonkeyPatch) 
     store = ResearchRepository()
     store.save_evidence({"evidence_id": "ev-pass1", "session_id": sid, "content": "pass-1 fact"})
 
-    new_eid = "ev-pass2"
-
     async def _fake_sched(run_sid: str, **hooks: object) -> dict[str, object]:
         assert run_sid == sid
         for n in service.ready_nodes(run_sid):
             service.resolve_node(run_sid, n.node_id)
-        ResearchRepository().save_evidence({"evidence_id": new_eid, "session_id": run_sid, "content": "pass-2 fact"})
-        return {
-            "status": "complete",
-            "nodes": [{"node_id": "n", "attempts": [{"tool": "search_sec_filings", "arguments": {}}]}],
-            "incomplete_guard": False,
-        }
+        ResearchRepository().save_evidence({"evidence_id": "ev-pass2", "session_id": run_sid, "content": "pass-2 fact"})
+        attempts: list[dict[str, JSONValue]] = [
+            {"tool": "search_sec_filings", "arguments": {}},
+            {"tool": "get_sec_filing", "arguments": {}, "evidence_id": "ev-pass1"},
+            {"tool": "get_sec_document", "arguments": {}, "evidence_id": "ev-pass2"},
+            {"tool": "get_sec_document", "arguments": {}, "evidence_id": "ev-pass2"},
+            {"tool": "search_web", "arguments": {}, "evidence_id": "ev-ghost"},
+            {"tool": "query_finra", "arguments": {}, "error": "boom", "evidence_id": "ev-pass2"},
+            {"tool": "get_sec_filing", "arguments": {}, "evidence_id": None, "evidenceId": "ev-pass1"},
+            {"tool": "get_sec_filing", "arguments": {}, "evidence_id": "", "evidenceId": "ev-pass2"},
+        ]
+        return {"status": "complete", "nodes": [{"node_id": "n", "attempts": attempts}], "incomplete_guard": False}
 
     monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
-    monkeypatch.setattr(kw, "_close_bootstrap_job", lambda s: None)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", _no_bootstrap)
     out = asyncio.run(asyncio.to_thread(kw._run, {"id": "r4", "prompt": "q?", "sessionId": sid, "gap": "need doc Y"}))
     calls = out["toolCalls"]
-    assert isinstance(calls, list) and len(calls) == 1
-    first = calls[0]
-    assert isinstance(first, dict) and first.get("evidenceId") == new_eid
-    ids = [e["id"] for e in out["evidence"] if isinstance(e, dict)]
-    assert "ev-pass1" in ids and new_eid in ids
+    assert isinstance(calls, list)
+    assert [c.get("evidenceId") for c in calls if isinstance(c, dict)] == [
+        None,
+        "ev-pass1",
+        "ev-pass2",
+        "ev-pass2",
+        None,
+        None,
+        "ev-pass1",
+        "ev-pass2",
+    ]
+    evidence = out["evidence"]
+    assert isinstance(evidence, list)
+    ids = [e["id"] for e in evidence if isinstance(e, dict)]
+    assert "ev-pass1" in ids and "ev-pass2" in ids
 
 
 def test_setup_keyerror_is_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A KeyError inside run_graph_prompt reports provider_error, not invalid_params."""
     import tempfile
-    from pathlib import Path
 
     monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
 
@@ -585,7 +939,7 @@ def test_setup_keyerror_is_provider_error(monkeypatch: pytest.MonkeyPatch) -> No
         raise KeyError("missing-key")
 
     monkeypatch.setattr(kw, "run_graph_prompt", _boom)
-    monkeypatch.setattr(kw, "_close_bootstrap_job", lambda s: None)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", _no_bootstrap)
     out = kw._run({"id": "r5", "op": "run", "prompt": "hello?"})
     terminal = out.get("terminal")
     assert isinstance(terminal, dict) and terminal.get("category") == "provider_error"

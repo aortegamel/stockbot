@@ -14,6 +14,7 @@
     "coverage": "bun run coverage:py && bun run coverage:ts && bun run coverage:rs",
     "crap": "poly-crap --coverage coverage-python.lcov --coverage coverage-ts/lcov.info $([ -f coverage-rust.lcov ] && echo \"--coverage coverage-rust.lcov\")",
     "crap:changed": "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.mnemonicprefix GIT_CONFIG_VALUE_0=false poly-crap --diff-base main --fail-above --coverage coverage-python.lcov --coverage coverage-ts/lcov.info $([ -f coverage-rust.lcov ] && echo \"--coverage coverage-rust.lcov\")",
+    "mutation:ts": "stryker run",
     "smoke-mock": "RUN_FINRA_SMOKE=1 venv/bin/pytest -m finra_smoke -q",
     "smoke-prod": "RUN_FINRA_PRODUCTION_SMOKE=1 venv/bin/pytest -m finra_production_smoke -q",
     "smoke-robinhood": "RUN_ROBINHOOD_SMOKE=1 venv/bin/pytest -m robinhood_smoke -q",
@@ -53,6 +54,6 @@
     "bun-types": "^1.4.2",
     "fast-check": "^4.10.0",
     "knip": "^6.35.1",
-    "typescript": "^7.0.2"
+    "typescript": "^5"
   }
 }

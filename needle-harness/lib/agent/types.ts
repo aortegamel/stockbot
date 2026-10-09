@@ -27,23 +27,9 @@ export type FailureCategory =
   | "duplicate_research_action"
   | "research_loop_detected";
 
-// ponytail: display-only kernel vocabulary mirror (§30 TS mirrors are UX, never policy authority). Kernel owns transitions; TS never gates on these.
-export type SessionStatus =
-  | "created"
-  | "planning"
-  | "researching"
-  | "freezing"
-  | "analyzing"
-  | "targeted_research"
-  | "synthesizing"
-  | "completed"
-  | "failed"
-  | "cancelled";
-export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "timed_out";
-
 // ponytail: research caps live in the kernel (None=null=unlimited); no TS budget mirror (DISPLAY_CHAR_LIMIT in loop.ts is a model-view bound, never termination).
 
-export type JSONSchema = {
+type JSONSchema = {
   type: string;
   properties?: Record<string, unknown>;
   required?: string[];

@@ -99,10 +99,8 @@ def _trio_freezes(runs: object, jobs: object = None) -> list[str]:
         job_ids = entry.get("jobs")
         if not (isinstance(fid, str) and isinstance(job_ids, list) and len(job_ids) == 3):
             continue
-        if by_id is None:
-            out.append(fid)
-        elif all(isinstance(j, str) for j in job_ids) and {by_id.get(j) for j in job_ids} == set(
-            GOLDEN_COMMITTEE_ROLES
+        if by_id is None or (
+            all(isinstance(j, str) for j in job_ids) and {by_id.get(j) for j in job_ids} == set(GOLDEN_COMMITTEE_ROLES)
         ):
             out.append(fid)
     return out

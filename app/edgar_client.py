@@ -25,6 +25,7 @@ from . import cache
 
 if TYPE_CHECKING:
     import pandas as pd
+    from edgar.entity.entity_facts import EntityFacts
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +118,7 @@ def _cached_or_fetch(key: str, fetch: Callable[[], dict[str, object]]) -> dict[s
             canonical["result_content_hash"] = _result_content_hash(canonical)
         try:
             cache.set(key, canonical)
-        except Exception:  # noqa: BLE001, S110 - intentional best-effort boundary, never aborts
+        except OSError, ValueError, RuntimeError:
             pass
         out = dict(canonical)
         out["cache_hit"] = False
@@ -138,7 +139,7 @@ _MISSING_QUARTER_GAP_DAYS = 130
 _DERIVED_Q4_OFFSET_DAYS = 91
 
 
-def _facts_dataframe(facts) -> pd.DataFrame:
+def _facts_dataframe(facts: EntityFacts) -> pd.DataFrame:
     """EntityFacts frame with filing metadata when the SDK offers it."""
     try:
         return facts.to_dataframe(include_metadata=True)
@@ -348,7 +349,7 @@ def _dividend_live_quote(ticker: str) -> dict[str, object] | None:
         from . import valuation as _valuation
 
         quote = _valuation.get_live_quote(ticker)
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except ImportError, OSError, ValueError, RuntimeError, AttributeError:
         return None
     return dict(quote) if isinstance(quote, dict) else None
 
@@ -436,7 +437,7 @@ def get_fundamentals(ticker: str, metric: str, *, include_dividend_price: bool =
         if result.get("dividend_status") != "insufficient_data":
             if result.get("ttm_dividend_per_share") is None or not _is_recent_dividend_period(
                 latest_end,
-                _dt.date.today(),  # noqa: DTZ011 - trading-calendar local date has no tz meaning
+                _dt.datetime.now(_dt.UTC).date(),
             ):
                 result["ttm_dividend_per_share"] = None
                 result["dividend_status"] = "unknown"
@@ -448,25 +449,25 @@ def get_fundamentals(ticker: str, metric: str, *, include_dividend_price: bool =
     return result
 
 
-def _fact_field(row: pd.Series[float], name: str, *alts: str) -> str | None:
+def _fact_field(row: pd.Series[str], name: str, *alts: str) -> str | None:
     """First present/non-blank meta field on a fact row (None when absent)."""
     for k in (name, *alts):
         try:
             v = row.get(k)
-        except Exception:  # noqa: BLE001, S112 - intentional best-effort boundary, never aborts
+        except AttributeError, TypeError, ValueError:
             continue
         if v is not None and str(v) not in ("", "nan", "NaT"):
             return str(v)
     return None
 
 
-def _copy_fact_meta(r: pd.Series[float]) -> dict[str, object]:
+def _copy_fact_meta(r: pd.Series[str]) -> dict[str, object]:
     """accession/form/filed meta off a fact row (first alias wins)."""
     meta: dict[str, object] = {}
     for _k in ("accession", "accn", "form", "form_type", "filed", "filed_at", "filing_date"):
         try:
             _v = r.get(_k)
-        except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+        except AttributeError, TypeError, ValueError:
             _v = None
         if _v is not None and str(_v) not in ("", "nan", "NaT"):
             _out = (
@@ -669,7 +670,7 @@ def _balance_sheet_text(bs: object) -> dict[str, object]:
     try:
         latest = bs.get_latest() if hasattr(bs, "get_latest") else bs
         return latest.to_dict() if hasattr(latest, "to_dict") else {"raw": str(latest)}
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except AttributeError, TypeError, ValueError:
         return {"raw": str(bs)}
 
 
@@ -704,7 +705,7 @@ def _fetch_fundamentals(ticker: str, metric: str) -> dict[str, object]:
         if metric == "balance_sheet":
             return _fundamentals_balance(ticker, company, _cik, _facts_url)
         return {"error": f"Unknown metric '{metric}'"}
-    except Exception as e:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except (ImportError, OSError, ValueError, RuntimeError, AttributeError) as e:
         logger.warning("get_fundamentals(%s, %s) failed: %s", ticker, metric, e)
         return _no_data(ticker, f"error retrieving {metric}: {e}")
 
@@ -727,51 +728,45 @@ def get_recent_ownership_filings(form_type: str = "both", limit: int = 10) -> di
 
 
 def _resolve_issuer_ticker(cik: int) -> str | None:
-    """Best-effort CIK -> ticker for drill-down (cached; None when unresolvable)."""
+    """CIK -> ticker for drill-down (cached; None when the index has no ticker)."""
     key = f"cik_ticker:{cik:010d}"
     hit = cache.get(key, ttl=_OWNERSHIP_TICKER_TTL_SECONDS)
     if isinstance(hit, str):
         return hit or None
-    try:
-        tickers = Company(cik).tickers
-        value = tickers[0] if tickers else ""
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
-        value = ""
+    tickers = Company(cik).tickers
+    value = tickers[0] if tickers else ""
     cache.set(key, value)
     return value or None
 
 
 def _ownership_filing_doc(filing: Filing) -> tuple[dict[str, object], object | None]:
-    """Base feed row plus parsed doc (None doc degrades to filer-only)."""
+    """Base feed row plus parsed doc (SDK parse failures propagate)."""
     row: dict[str, object] = {
         "form": str(getattr(filing, "form", "")),
         "filed": str(getattr(filing, "filing_date", "")),
         "accession_no": getattr(filing, "accession_no", None),
     }
-    try:
-        return row, filing.obj()
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
-        row["filer"] = str(getattr(filing, "company", ""))
-        row["note"] = "filing detail unavailable"
-        return row, None
+    return row, filing.obj()
 
 
 def _ownership_percent(doc: object) -> float | None:
     """Beneficial-ownership percent or None when absent/unparseable."""
-    if getattr(doc, "total_percent", None) is None:
+    total = getattr(doc, "total_percent", None)
+    if total is None:
         return None
     try:
-        return round(float(getattr(doc, "total_percent")), 2)  # noqa: B009 - dynamic boundary, no stubs; getattr keeps checker green
+        return round(float(total), 2)
     except TypeError, ValueError:
         return None
 
 
 def _ownership_shares(doc: object) -> int | None:
     """Beneficial-ownership share count or None when absent/unparseable."""
-    if getattr(doc, "total_shares", None) is None:
+    total = getattr(doc, "total_shares", None)
+    if total is None:
         return None
     try:
-        return int(getattr(doc, "total_shares"))  # noqa: B009 - dynamic boundary, no stubs; getattr keeps checker green
+        return int(total)
     except TypeError, ValueError:
         return None
 
@@ -792,7 +787,7 @@ def _ownership_doc_detail(row: dict[str, object], doc: object) -> None:
         if shares is not None:
             row["shares"] = shares
         row["event_date"] = str(getattr(doc, "date_of_event", "") or "") or None
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except OSError, ValueError, RuntimeError, AttributeError:
         row["note"] = "ownership detail unavailable (pre-XML filing)"
 
 
@@ -829,17 +824,14 @@ def _ownership_limit(limit: object) -> int | None:
 
 
 def _ownership_form_rows(forms: list[str]) -> list[dict[str, object]]:
-    """Merged, deduped feed rows across form variants (one failure never sinks)."""
+    """Merged, deduped feed rows across form variants (feed failures propagate)."""
     from edgar import get_current_filings
 
     rows: list[dict[str, object]] = []
     seen: set[str] = set()
     for form in forms:
-        try:
-            # ponytail: 10 filings per variant (40 merged max); raise page_size if daily 13D/G volume exceeds it
-            feed = get_current_filings(form=form, page_size=10)
-        except Exception:  # noqa: BLE001, S112 - intentional best-effort boundary, never aborts
-            continue  # one variant failing must not sink the feed
+        # ponytail: 10 filings per variant (40 merged max); raise page_size if daily 13D/G volume exceeds it
+        feed = get_current_filings(form=form, page_size=10)
         for filing in feed:
             accession = str(getattr(filing, "accession_no", ""))
             if accession in seen:
@@ -850,7 +842,7 @@ def _ownership_form_rows(forms: list[str]) -> list[dict[str, object]]:
 
 
 def _attach_ownership_tickers(rows: list[dict[str, object]], limit: int) -> list[dict[str, object]]:
-    """Newest-first rows trimmed to limit with best-effort issuer tickers."""
+    """Newest-first rows trimmed to limit with issuer tickers (unparseable CIKs stay tickerless)."""
     rows.sort(key=_filed_key, reverse=True)
     trimmed = rows[:limit]
     for row in trimmed:
@@ -864,7 +856,7 @@ def _attach_ownership_tickers(rows: list[dict[str, object]], limit: int) -> list
 
 
 def _ownership_feed_row(filing: Filing) -> dict[str, object]:
-    """One feed row with issuer/filer detail; never raises (detail degrades to filer-only)."""
+    """One feed row with issuer/filer detail (parse failures propagate; a None doc returns the bare row)."""
     row, doc = _ownership_filing_doc(filing)
     if doc is None:
         return row
@@ -895,7 +887,7 @@ def _fetch_recent_ownership_filings(form_type: str, limit: object) -> dict[str, 
             "filings": rows,
             "source": "SEC EDGAR current filings (SC 13D/G)",
         }
-    except Exception as e:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except (ImportError, OSError, ValueError, RuntimeError, AttributeError) as e:
         logger.warning("get_recent_ownership_filings(%s) failed: %s", form_type, e)
         return {"error": f"No data found: error retrieving recent {label} filings: {e}"}
 
@@ -972,7 +964,7 @@ def _fetch_latest_earnings_release(ticker: str) -> dict[str, object]:
         if filing is not None and text is not None:
             return _earnings_out(ticker, filing, text, "10-Q MD&A", _cik)
         return _no_data(ticker, "no 8-K Item 2.02 or 10-Q filing found")
-    except Exception as e:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except (ImportError, OSError, ValueError, RuntimeError, AttributeError) as e:
         logger.warning("get_latest_earnings_release(%s) failed: %s", ticker, e)
         return _no_data(ticker, f"error retrieving earnings release: {e}")
 
@@ -987,7 +979,7 @@ def diff_risk_factors(ticker: str) -> dict[str, object]:
 def _risk_text(filing: Filing) -> str | None:
     try:
         rf = getattr(filing.obj(), "risk_factors", None)
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except OSError, ValueError, RuntimeError, AttributeError:
         return None
     if rf is None:
         return None
@@ -1064,7 +1056,7 @@ def _fetch_diff_risk_factors(ticker: str) -> dict[str, object]:
             return _no_data(ticker, "fewer than two filings with risk factors found")
         (latest, latest_text), (prior, prior_text) = with_text[0], with_text[1]
         return _risk_diff_payload(ticker, latest, latest_text, prior, prior_text, _cik)
-    except Exception as e:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except (ImportError, OSError, ValueError, RuntimeError, AttributeError) as e:
         logger.warning("diff_risk_factors(%s) failed: %s", ticker, e)
         return _no_data(ticker, f"error diffing risk factors: {e}")
 
@@ -1099,7 +1091,7 @@ def _statement_text(stmt: object) -> str:
         if hasattr(stmt, "to_string"):
             return str(stmt.to_string())
         return str(stmt)
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except AttributeError, TypeError, ValueError:
         return str(stmt)
 
 
@@ -1124,7 +1116,7 @@ def _fetch_financial_statements(ticker: str, statement_type: str) -> dict[str, o
         if _facts_url:
             out["source_url"] = _facts_url
         return out
-    except Exception as e:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except (ImportError, OSError, ValueError, RuntimeError, AttributeError) as e:
         logger.warning("get_financial_statements(%s, %s) failed: %s", ticker, statement_type, e)
         return _no_data(ticker, f"error retrieving {statement_type}: {e}")
 
@@ -1236,6 +1228,6 @@ def _fetch_xbrl_facts(ticker: str, concept: str) -> dict[str, object]:
         if _facts_url:
             out["source_url"] = _facts_url
         return out
-    except Exception as e:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except (ImportError, OSError, ValueError, RuntimeError, AttributeError) as e:
         logger.warning("get_xbrl_facts(%s, %s) failed: %s", ticker, concept, e)
         return _no_data(ticker, f"error retrieving facts for '{concept}': {e}")

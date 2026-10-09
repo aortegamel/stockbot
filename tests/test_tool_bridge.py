@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.tool_runtime import AgentToolSession
 from scripts import tool_bridge
 
@@ -11,15 +13,13 @@ def test_describe_exposes_canonical_research_tools() -> None:
     names = {
         fn["name"]
         for item in tools
-        if isinstance(item, dict)
-        and isinstance((fn := item.get("function")), dict)
-        and isinstance(fn.get("name"), str)
+        if isinstance(item, dict) and isinstance((fn := item.get("function")), dict) and isinstance(fn.get("name"), str)
     }
     assert "search_web" in names
     assert "search_sec_filings" in names
 
 
-def test_invoke_reuses_generic_session_and_end_drops_it(monkeypatch) -> None:
+def test_invoke_reuses_generic_session_and_end_drops_it(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[AgentToolSession] = []
 
     def fake_execute(
@@ -57,9 +57,7 @@ def test_invoke_reuses_generic_session_and_end_drops_it(monkeypatch) -> None:
         assert len(seen) == 2
         assert seen[0] is seen[1]
 
-        ended = tool_bridge.handle(
-            {"id": "e1", "op": "tool.session.end", "session_id": "generic-1"}
-        )
+        ended = tool_bridge.handle({"id": "e1", "op": "tool.session.end", "session_id": "generic-1"})
         assert ended == {"id": "e1", "result": {"ended": True}}
 
         tool_bridge.handle(
@@ -77,6 +75,32 @@ def test_invoke_reuses_generic_session_and_end_drops_it(monkeypatch) -> None:
 
 
 def test_invoke_requires_explicit_session() -> None:
-    assert tool_bridge.handle(
-        {"id": "bad", "op": "tool.invoke", "name": "search_web", "arguments": {}}
-    ) == {"id": "bad", "error": "missing_arg"}
+    assert tool_bridge.handle({"id": "bad", "op": "tool.invoke", "name": "search_web", "arguments": {}}) == {
+        "id": "bad",
+        "error": "missing_arg",
+    }
+
+
+def test_invoke_failure_reports_bridge_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(
+        name: str,
+        arguments: dict[str, object],
+        session: AgentToolSession,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(tool_bridge, "execute_agent_tool", _boom)
+    tool_bridge._sessions.pop("boom-1", None)
+    try:
+        assert tool_bridge.handle(
+            {
+                "id": "f1",
+                "op": "tool.invoke",
+                "name": "search_web",
+                "arguments": {"query": "NVDA"},
+                "session_id": "boom-1",
+            }
+        ) == {"id": "f1", "error": "bridge_failed"}
+    finally:
+        tool_bridge._sessions.pop("boom-1", None)

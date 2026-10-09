@@ -9,8 +9,8 @@ const ROOT = process.cwd().endsWith("needle-harness")
 const BRIDGE_CMD = `${ROOT}/venv/bin/python`;
 const BRIDGE_ARGS = [`${ROOT}/scripts/tool_bridge.py`];
 
-export type BridgeResultMeta = { source_handle?: unknown; source_refs?: unknown };
-export type BridgeReply = {
+type BridgeResultMeta = { source_handle?: unknown; source_refs?: unknown };
+type BridgeReply = {
   id?: unknown;
   result?: { content?: unknown; error?: unknown; error_type?: unknown; meta?: BridgeResultMeta };
   error?: unknown;

@@ -60,7 +60,7 @@ def _is_parseable_timestamp(value: object) -> bool:
     if not isinstance(value, str) or not value.strip():
         return False
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        datetime.fromisoformat(value)
     except ValueError:
         return False
     return True
@@ -72,7 +72,18 @@ def _validate(rows: list[dict[str, object]], model: type[pa.DataFrameModel]) -> 
         model.validate(pl.from_dicts(rows, strict=False))
 
 
-class FinancialFactsFrame(pa.DataFrameModel):
+class _LenientConfig(pa.DataFrameModel.Config):
+    strict = False
+    coerce = True
+
+
+class _LenientFrame(pa.DataFrameModel):
+    """Shared non-strict, coercing config; pandera names each subclass schema after the class."""
+
+    Config = _LenientConfig
+
+
+class FinancialFactsFrame(_LenientFrame):
     """Boundary shape for ``financial_facts`` rows."""
 
     fact_id: Series[str] = pa.Field(nullable=False)
@@ -81,12 +92,10 @@ class FinancialFactsFrame(pa.DataFrameModel):
     content_hash: Series[str] = pa.Field(nullable=False)
     source_url: Series[str] = pa.Field(nullable=False)
     source_record_id: Series[str] = pa.Field(nullable=False)
-    class Config:  # pyrefly: ignore[bad-override] - canonical pandera DataFrameModel Config pattern
-        strict = False
-        coerce = True
 
-    @pa.check("fact_id", "known_at", "retrieved_at", "content_hash", "source_url", "source_record_id",
-              element_wise=True)
+    @pa.check(
+        "fact_id", "known_at", "retrieved_at", "content_hash", "source_url", "source_record_id", element_wise=True
+    )
     def _non_blank(cls, value: object) -> bool:
         return _is_non_blank(value)
 
@@ -95,7 +104,7 @@ class FinancialFactsFrame(pa.DataFrameModel):
         return _is_parseable_timestamp(value)
 
 
-class ShortInterestFrame(pa.DataFrameModel):
+class ShortInterestFrame(_LenientFrame):
     """Boundary shape for ``short_interest`` rows."""
 
     row_id: Series[str] = pa.Field(nullable=False)
@@ -104,12 +113,8 @@ class ShortInterestFrame(pa.DataFrameModel):
     content_hash: Series[str] = pa.Field(nullable=False)
     source_url: Series[str] = pa.Field(nullable=False)
     source_record_id: Series[str] = pa.Field(nullable=False)
-    class Config:  # pyrefly: ignore[bad-override] - canonical pandera DataFrameModel Config pattern
-        strict = False
-        coerce = True
 
-    @pa.check("row_id", "known_at", "retrieved_at", "content_hash", "source_url", "source_record_id",
-              element_wise=True)
+    @pa.check("row_id", "known_at", "retrieved_at", "content_hash", "source_url", "source_record_id", element_wise=True)
     def _non_blank(cls, value: object) -> bool:
         return _is_non_blank(value)
 
@@ -118,16 +123,13 @@ class ShortInterestFrame(pa.DataFrameModel):
         return _is_parseable_timestamp(value)
 
 
-class DividendEventsFrame(pa.DataFrameModel):
+class DividendEventsFrame(_LenientFrame):
     """Boundary shape for ``dividend_events`` rows."""
 
     dividend_event_id: Series[str] = pa.Field(nullable=False)
     known_at: Series[str] = pa.Field(nullable=False)
     content_hash: Series[str] = pa.Field(nullable=False)
     source_url: Series[str] = pa.Field(nullable=False)
-    class Config:  # pyrefly: ignore[bad-override] - canonical pandera DataFrameModel Config pattern
-        strict = False
-        coerce = True
 
     @pa.check("dividend_event_id", "known_at", "content_hash", "source_url", element_wise=True)
     def _non_blank(cls, value: object) -> bool:
@@ -138,16 +140,13 @@ class DividendEventsFrame(pa.DataFrameModel):
         return _is_parseable_timestamp(value)
 
 
-class EntityFrame(pa.DataFrameModel):
+class EntityFrame(_LenientFrame):
     """Boundary shape for ``entities`` rows."""
 
     entity_id: Series[str] = pa.Field(nullable=False)
     known_at: Series[str] = pa.Field(nullable=False)
     retrieved_at: Series[str] = pa.Field(nullable=False)
     content_hash: Series[str] = pa.Field(nullable=False)
-    class Config:  # pyrefly: ignore[bad-override] - canonical pandera DataFrameModel Config pattern
-        strict = False
-        coerce = True
 
     @pa.check("entity_id", "known_at", "retrieved_at", "content_hash", element_wise=True)
     def _non_blank(cls, value: object) -> bool:
@@ -158,7 +157,7 @@ class EntityFrame(pa.DataFrameModel):
         return _is_parseable_timestamp(value)
 
 
-class AliasFrame(pa.DataFrameModel):
+class AliasFrame(_LenientFrame):
     """Boundary shape for ``entity_aliases`` rows."""
 
     alias_type: Series[str] = pa.Field(nullable=False)
@@ -169,12 +168,17 @@ class AliasFrame(pa.DataFrameModel):
     known_at: Series[str] = pa.Field(nullable=False)
     retrieved_at: Series[str] = pa.Field(nullable=False)
     content_hash: Series[str] = pa.Field(nullable=False)
-    class Config:  # pyrefly: ignore[bad-override] - canonical pandera DataFrameModel Config pattern
-        strict = False
-        coerce = True
 
-    @pa.check("alias_type", "alias_value", "entity_id", "source", "known_at", "retrieved_at", "content_hash",
-              element_wise=True)
+    @pa.check(
+        "alias_type",
+        "alias_value",
+        "entity_id",
+        "source",
+        "known_at",
+        "retrieved_at",
+        "content_hash",
+        element_wise=True,
+    )
     def _non_blank(cls, value: object) -> bool:
         return _is_non_blank(value)
 
@@ -183,16 +187,13 @@ class AliasFrame(pa.DataFrameModel):
         return _is_parseable_timestamp(value)
 
 
-class SecurityFrame(pa.DataFrameModel):
+class SecurityFrame(_LenientFrame):
     """Boundary shape for ``securities`` rows."""
 
     security_id: Series[str] = pa.Field(nullable=False)
     known_at: Series[str] = pa.Field(nullable=False)
     retrieved_at: Series[str] = pa.Field(nullable=False)
     content_hash: Series[str] = pa.Field(nullable=False)
-    class Config:  # pyrefly: ignore[bad-override] - canonical pandera DataFrameModel Config pattern
-        strict = False
-        coerce = True
 
     @pa.check("security_id", "known_at", "retrieved_at", "content_hash", element_wise=True)
     def _non_blank(cls, value: object) -> bool:

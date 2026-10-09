@@ -344,6 +344,7 @@ HANDLER_CALL_TIMEOUT_S = 60
 EXTRA_FIXTURE_OVERRIDES: dict[str, dict[str, object]] = {
     "diff_sec_filings": {"ticker": "AAPL"},
     "search_sec_filings": {"query": "Apple"},
+    "search_sec_filings_bounded": {"query": "Apple"},
     "get_finra_datapoints": {"ticker": "AAPL"},
 }
 
@@ -399,6 +400,12 @@ def _fake_search_envelope(*args: object, **kwargs: object) -> object:
     return SimpleNamespace(to_dict=dict)
 
 
+def _fake_fixed_utc_now(*args: object, **kwargs: object) -> object:
+    from datetime import UTC, datetime
+
+    return datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+
+
 def _fake_entities_empty(*args: object, **kwargs: object) -> object:
     return SimpleNamespace(entities=[])
 
@@ -431,7 +438,10 @@ _SEAM_MAP: dict[str, list[tuple[object, str, object]]] = {
         (tools_mod.sec, "diff_filings", _fake_empty_dict),
     ],
     "find_sec_entities": [(tools_mod.sec, "find_sec_entities", _fake_search_envelope)],
+    "find_sec_entities_bounded": [(tools_mod.sec, "find_sec_entities", _fake_search_envelope)],
     "search_sec_filings": [(tools_mod.sec, "SECDiscoveryService", _FakeDiscoveryService)],
+    "search_sec_filings_bounded": [(tools_mod.sec, "SECDiscoveryService", _FakeDiscoveryService)],
+    "get_current_time": [(tools_mod, "_utc_now", _fake_fixed_utc_now)],
     "search_sec_relationships": [(tools_mod.sec, "search_sec_relationships", _fake_empty_dict)],
     "get_material_events": [(tools_mod.sec, "get_material_events", _fake_empty_list)],
     "get_beneficial_ownership": [(tools_mod.sec, "get_beneficial_ownership", _fake_empty_list)],

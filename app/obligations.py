@@ -681,8 +681,6 @@ def _xbrl_gateway_facts(ticker: str) -> list[FinancialFactRow]:
     the provider has nothing (ingestion gap). Raises only on unexpected
     provider errors.
     """
-    from datetime import date
-
     from .data_sources import SourceGateway
     from .sec.client import resolve_cik
     from .services import sec_facts as _sec_facts
@@ -690,7 +688,7 @@ def _xbrl_gateway_facts(ticker: str) -> list[FinancialFactRow]:
     cik = resolve_cik(ticker.strip().upper())
     if cik is None:
         return []
-    today = date.today().isoformat()  # noqa: DTZ011 - trading-calendar local date has no tz meaning
+    today = datetime.now(UTC).date().isoformat()
     facts = SourceGateway().company_facts(cik, as_of=today)
     rows = facts.get("financial_facts") if isinstance(facts, dict) else None
     needles = tuple(_XBRL_OBLIGATION_CONCEPTS)
@@ -765,9 +763,11 @@ def _xbrl_load_gateway_facts(ticker: str) -> list[FinancialFactRow]:
     """Gateway facts with provider failures logged as warnings, never raised."""
     try:
         return _xbrl_gateway_facts(ticker)
-    except Exception as e:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except (ImportError, OSError, ValueError, RuntimeError, AttributeError) as e:
         logger.warning("xbrl gateway read failed for %s: %s", ticker, e)
         return []
+
+
 def _xbrl_store_row(kind: str, fact: FinancialFactRow) -> dict[str, object] | None:
     """One gateway-backed obligation row (None when value missing)."""
     concept = fact.get("concept")
@@ -834,8 +834,8 @@ def _xbrl_obligations(ticker: str, *, manifest: list[dict[str, object]] | None =
     """
     error: str | None = None
     try:
-        gateway_by_kind = _xbrl_best_by_kind(_xbrl_gateway_facts(ticker))
-    except Exception as e:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+        gateway_by_kind: dict[str, FinancialFactRow] = _xbrl_best_by_kind(_xbrl_gateway_facts(ticker))
+    except (ImportError, OSError, ValueError, RuntimeError, AttributeError) as e:
         logger.warning("xbrl gateway read failed for %s: %s", ticker, e)
         gateway_by_kind = {}
         error = str(e)
@@ -1343,7 +1343,12 @@ def _balance_sheet_latest(ticker: str) -> tuple[str | None, tuple[Filing, object
 
 def _balance_sheet_markdown(doc: object) -> str:
     """Balance-sheet markdown from the filing's financials seam."""
-    bs = getattr(doc, "financials").balance_sheet()  # noqa: B009 - dynamic boundary, no stubs; getattr keeps checker green
+    financials = getattr(doc, "financials", None)
+    if financials is None:
+        raise AttributeError("filing exposes no financials seam")
+    bs = financials.balance_sheet()
+    if bs is None:
+        raise ValueError("balance sheet not available")
     return bs.to_markdown() if hasattr(bs, "to_markdown") else str(bs)
 
 
@@ -1392,7 +1397,7 @@ def _balance_sheet_liabilities(
         _annotate_archive(rows[start:], ticker, filing, md, archive=archive)
         if manifest is not None:
             manifest.append(_manifest_entry(form, filing, ["balance_sheet"], len(rows) - start, 0, "scanned"))
-    except Exception as e:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except (ImportError, OSError, ValueError, RuntimeError, AttributeError) as e:
         logger.warning("balance sheet obligations failed for %s: %s", ticker, e)
         if manifest is not None:
             manifest.append(_manifest_entry(form or "10-Q/10-K", filing, ["balance_sheet"], 0, 0, "failed", str(e)))
@@ -1434,7 +1439,7 @@ def _8k_company_filings(ticker: str, manifest: list[dict[str, object]] | None) -
                 if isinstance(f, _Filing):
                     rows.append(f)
         return rows
-    except Exception as e:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except (ImportError, OSError, ValueError, RuntimeError, AttributeError) as e:
         logger.warning("8-K scan failed for %s: %s", ticker, e)
         if manifest is not None:
             manifest.append(_manifest_entry("8-K", None, [], 0, 0, "failed", str(e)))
@@ -1596,7 +1601,7 @@ def _8k_scan_one(
                 manifest.append(_manifest_entry("8-K", filing, sections, 0, 0, "scanned"))
             return
         _8k_collect_filing(ticker, filing, rows, start, text, sections, archive=archive, manifest=manifest)
-    except Exception as e:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except (ImportError, OSError, ValueError, RuntimeError, AttributeError) as e:
         _8k_scan_error(filing, rows, start, sections, e, manifest)
 
 
@@ -2117,7 +2122,7 @@ def _obligations_fetch(
         rows.extend(_balance_sheet_liabilities(ticker, archive=True, manifest=manifest))
         rows.extend(_scan_8k_obligations(ticker, archive=True, manifest=manifest))
         return rows, unquantified, capital_raw
-    except Exception as e:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except (ImportError, OSError, ValueError, RuntimeError, AttributeError) as e:
         logger.warning("obligations failed for %s: %s", ticker, e)
         return None
 
@@ -2250,6 +2255,7 @@ def _obligations_stash_warnings(
             if warning:
                 stashed.append(str(warning))
     return stashed
+
 
 def _obligations_filings_examined(manifest: list[dict[str, object]], rows: list[dict[str, object]]) -> list[str]:
     """Filing dates examined (manifest first, row fallback when empty)."""

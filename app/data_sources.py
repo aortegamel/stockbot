@@ -87,9 +87,8 @@ def _archived_ticker_aliases(want: str, as_of: datetime) -> list[TickerAlias] | 
         payload = json.loads(latest.payload_path.read_bytes())
         datasets = _norm.normalize_sec_tickers(payload, retrieved_at=latest.retrieved_at, content_hash=latest.sha256)
         return [alias for alias in _ticker_aliases_of(datasets.get("entity_aliases")) if alias.alias_value == want]
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except OSError, ValueError:
         return None
-
 
 
 class SourceGateway:
@@ -193,14 +192,14 @@ class SourceGateway:
             return list(cached)
         return [row for row in cached if isinstance(row, dict) and _known_as_of(row, as_of)]
 
-    def _normalized_short_rows(self, records: list[dict]) -> list[dict[str, object]]:
+    def _normalized_short_rows(self, records: list[dict[str, object]]) -> list[dict[str, object]]:
         """Exact FINRA records grouped by settlement date through the normalizer."""
         from .config import finra_use_mock
 
         name = "consolidatedShortInterest" + ("Mock" if finra_use_mock() else "")
         url = f"{_finra.FINRA_API_BASE}/data/group/otcMarket/name/{name}"
         retrieved_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        grouped: dict[str, list[dict]] = {}
+        grouped: dict[str, list[dict[str, object]]] = {}
         for record in records:
             day = str(record.get("settlementDate") or "")
             if day:
@@ -250,9 +249,7 @@ class SourceGateway:
             retrieved_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             content_hash = hashlib.sha256(payload).hexdigest()
             raw = json.loads(payload)
-            datasets = _norm.normalize_sec_tickers(
-                raw, retrieved_at=retrieved_at, content_hash=content_hash
-            )
+            datasets = _norm.normalize_sec_tickers(raw, retrieved_at=retrieved_at, content_hash=content_hash)
             cached = _ticker_aliases_of(datasets.get("entity_aliases"))
             self._cache[key] = cached
         assert isinstance(cached, list)

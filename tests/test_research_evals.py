@@ -223,14 +223,11 @@ def _gs_envelope(eid: str) -> dict[str, object]:
     }
 
 
-def _gs_run_to_freeze() -> tuple[object, str, str]:
-    import os as _os
-    import tempfile as _tf
-
+def _gs_run_to_freeze(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[object, str, str]:
     from app.research import service as _svc
     from app.research.repository import ResearchRepository as _Repo
 
-    _os.environ["RESEARCH_DB_PATH"] = _tf.mktemp(suffix=".sqlite")
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     repo = _Repo()
     sid, src = _gs_sid(repo)
     eid = f"{sid}:ev:1"
@@ -256,11 +253,8 @@ def test_bootstrap_jobs_closed_after_run(tmp_path: Path, monkeypatch: pytest.Mon
     assert leaked == []
 
 
-def test_gs_arch_session_created() -> None:
-    import os as _os
-    import tempfile as _tf
-
-    _os.environ["RESEARCH_DB_PATH"] = _tf.mktemp(suffix=".sqlite")
+def test_gs_arch_session_created(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     from app.research.repository import ResearchRepository as _Repo
 
     repo = _Repo()
@@ -268,11 +262,8 @@ def test_gs_arch_session_created() -> None:
     assert repo.get_session(sid).query == _GS_Q  # (1) session created
 
 
-def test_gs_arch_source_job_created() -> None:
-    import os as _os
-    import tempfile as _tf
-
-    _os.environ["RESEARCH_DB_PATH"] = _tf.mktemp(suffix=".sqlite")
+def test_gs_arch_source_job_created(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     from app.research.repository import ResearchRepository as _Repo
 
     repo = _Repo()
@@ -364,16 +355,16 @@ def test_gs_arch_derived_views_linked() -> None:
     assert "offset" in sig and "max_chars" in sig
 
 
-def test_gs_arch_one_valid_submit() -> None:
-    repo, sid, _ = _gs_run_to_freeze()  # (10) one valid submit
+def test_gs_arch_one_valid_submit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, sid, _ = _gs_run_to_freeze(tmp_path, monkeypatch)  # (10) one valid submit
     from app.research.repository import ResearchRepository as _Repo
 
     assert isinstance(repo, _Repo)
     assert repo.get_session(sid).status not in ("completed", "failed", "cancelled")
 
 
-def test_gs_arch_freeze() -> None:
-    _, sid, fid = _gs_run_to_freeze()  # (11) freeze
+def test_gs_arch_freeze(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, sid, fid = _gs_run_to_freeze(tmp_path, monkeypatch)  # (11) freeze
     assert fid == f"{sid}:1:freeze"
 
 

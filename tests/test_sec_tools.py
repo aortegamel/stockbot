@@ -4,6 +4,7 @@ Offline: app.sec seams are monkeypatched at the tools.sec boundary; no
 network, no edgar import.
 """
 
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NoReturn
@@ -47,6 +48,10 @@ SEC_SUITE = [
 
 def _research_context() -> RequestContext:
     return RequestContext("research", frozenset({Capability.RESEARCH}))
+
+
+def _resolve_aapl(_name: str) -> str | None:
+    return "AAPL"
 
 
 def _tool_names(schemas: object) -> set[str]:
@@ -382,7 +387,7 @@ def test_list_sec_filings_company_name_resolves_to_ticker(monkeypatch: pytest.Mo
         return []
 
     monkeypatch.setattr(tools.sec, "list_sec_filings", _fake_list)
-    monkeypatch.setattr(tools, "_resolve_company_to_ticker", lambda _name: "AAPL")
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_aapl)
     result = tools.execute_tool("list_sec_filings", {"identifier": "Apple"}, "test", context=_research_context())
     assert result["subject"] == "AAPL"
     assert seen["identifier"] == "AAPL"
@@ -1134,12 +1139,13 @@ def test_gate_and_handlers_reject_nvda_accession_this_week_dates(monkeypatch: py
     monkeypatch.setattr(tools.sec, "get_governance_events", _boom)
     monkeypatch.setattr(tools.sec, "list_sec_filings", _boom)
     monkeypatch.setattr(tools.sec, "diff_filings", _boom)
-    for tool, args in [
+    handler_cases: list[tuple[str, dict[str, object]]] = [
         ("diff_sec_filings", {"current_accession": "NVDA", "previous_accession": "0000320193-25-000079"}),
         ("get_material_events", {"ticker": "AMD", "since": "this week"}),
         ("get_governance_events", {"ticker": "AAPL", "since": "this week"}),
         ("list_sec_filings", {"identifier": "AAPL", "start_date": "this week"}),
-    ]:
+    ]
+    for tool, args in handler_cases:
         result = tools.execute_tool(tool, args, "test", context=_research_context())
         assert result["error_type"] == "invalid_tool_arguments", (tool, result)
         assert "YYYY-MM-DD" in str(result["error"]) or "accession" in str(result["error"]), (tool, result)
@@ -1179,7 +1185,7 @@ def test_get_material_events_accepts_company_name(monkeypatch: pytest.MonkeyPatc
         return []
 
     monkeypatch.setattr(tools.sec, "get_material_events", _fake_events)
-    monkeypatch.setattr(tools, "_resolve_company_to_ticker", lambda _name: "AAPL")
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_aapl)
     result = tools.execute_tool(
         "get_material_events",
         {"ticker": "Apple", "since": "2026-01-01"},
@@ -1201,7 +1207,7 @@ def test_get_material_events_blank_ticker_falls_back_to_company_name(
         return []
 
     monkeypatch.setattr(tools.sec, "get_material_events", _fake_events)
-    monkeypatch.setattr(tools, "_resolve_company_to_ticker", lambda _name: "AAPL")
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_aapl)
     result = tools.execute_tool(
         "get_material_events",
         {"ticker": "   ", "company_name": "Apple", "since": "2026-01-01"},
@@ -1761,6 +1767,114 @@ def test_edgar_ranking_quantified_10k_outranks_unrelated_form4() -> None:
     assert ranked[-1].form == "4"
 
 
+def test_edgar_ranking_embedding_tiebreak_reorders_only_and_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.needle_client as needle
+    from app.sec.discovery.service import rank_hits
+
+    def _hit(accession: str, snippet: str) -> SECTextHit:
+        return SECTextHit(
+            search_id="s1",
+            attempt_id="s1-efts-1",
+            query="MSFT OpenAI",
+            accession_no=accession,
+            form="10-K",
+            filed_at="2026-02-14",
+            filer_cik=789790,
+            filer_name="Microsoft Corp",
+            matched_document="primary.htm",
+            file_type="10-K",
+            snippet=snippet,
+            score=1.0,
+        )
+
+    def _rank() -> tuple[SECTextHit, ...]:
+        return rank_hits(
+            (
+                _hit("0000950170-26-001234", "plain earnings summary"),
+                _hit("0000950170-26-009999", "zebra disclosure"),
+            ),
+            verified_ciks=(789790,),
+            verified_names=("Microsoft Corp",),
+            relevant_forms=("10-K",),
+            query="zebra filing",
+        )
+
+    def _boom(_text: str) -> list[float]:
+        raise RuntimeError("needle down")
+
+    def _fake_embed(text: str) -> list[float]:
+        return [1.0, 0.0] if "zebra" in text else [0.0, 1.0]
+
+    monkeypatch.setattr(needle, "embed", _boom)
+    base = _rank()
+    assert [h.accession_no for h in base] == ["0000950170-26-001234", "0000950170-26-009999"]
+
+    monkeypatch.setattr(needle, "embed", _fake_embed)
+    reranked = _rank()
+    assert {h.accession_no for h in reranked} == {h.accession_no for h in base}
+    assert [h.accession_no for h in reranked] == ["0000950170-26-009999", "0000950170-26-001234"]
+
+    monkeypatch.setattr(needle, "embed", _boom)
+    assert _rank() == base
+
+def test_packet_display_fields_grounded_and_ungrounded_drops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Needle display labels verify against stored bytes; ungrounded output drops to None."""
+    from app.sec.discovery import service as disc
+
+    hit = SECTextHit(
+        search_id="s1",
+        attempt_id="s1-efts-1",
+        query="MSFT OpenAI",
+        accession_no="0000950170-26-001234",
+        form="10-K",
+        filed_at="2026-02-14",
+        filer_cik=789790,
+        filer_name="Microsoft Corp",
+        matched_document="primary.htm",
+        file_type="10-K",
+        file_description="Risk Factors",
+        snippet="concentration with OpenAI counterparties",
+        score=1.0,
+    )
+
+    def _grounded(record: dict[str, object], passage: str, *, strict: bool = True) -> dict[str, object]:
+        assert strict is True
+        assert "concentration with OpenAI counterparties" in passage
+        assert isinstance(record.get("name"), str) and record["name"]
+        return {
+            "record": record["name"],
+            "fields": {
+                "section": "Risk Factors",
+                "term": "concentration",
+                "snippet": "concentration with OpenAI counterparties",
+            },
+        }
+
+    import app.needle_client as _needle
+
+    monkeypatch.setattr(_needle, "extract_fields", _grounded)
+    got = disc.packet_display_fields(hit)
+    assert got == {
+        "section": "Risk Factors",
+        "term": "concentration",
+        "snippet": "concentration with OpenAI counterparties",
+    }
+
+    def _ungrounded(record: dict[str, object], passage: str, *, strict: bool = True) -> dict[str, object]:
+        assert strict is True
+        return {"record": record["name"], "fields": {"section": "Invented Section", "term": 42, "snippet": ""}}
+    monkeypatch.setattr(_needle, "extract_fields", _ungrounded)
+    assert disc.packet_display_fields(hit) == {"section": None, "term": None, "snippet": None}
+
+    def _boom(record: dict[str, object], passage: str, *, strict: bool = True) -> dict[str, object]:
+        raise RuntimeError("needle down")
+
+    monkeypatch.setattr(_needle, "extract_fields", _boom)
+    assert disc.packet_display_fields(hit) == {"section": None, "term": None, "snippet": None}
+
+
 def test_edgar_alias_expansion_validated_keeps_provenance_no_false_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2039,7 +2153,7 @@ def test_get_insider_activity_self_contained_dispatch(monkeypatch: pytest.Monkey
     assert _as_seq(result["transactions"])[0]["ticker"] == "AAPL"
     assert seen["limit"] == 5
 
-    monkeypatch.setattr(tools, "_resolve_company_to_ticker", lambda _name: "AAPL")
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_aapl)
     named = tools._get_insider_activity({"company_name": "Apple"}, "test")
     assert named["subject"] == "AAPL"
 
@@ -2053,3 +2167,70 @@ def test_get_insider_activity_avoids_shared_helpers() -> None:
 
     source = inspect.getsource(tools._get_insider_activity)
     assert "_ticker_or_company_name" not in source
+
+
+def test_sec_document_window_wrong_type_is_type_error() -> None:
+    """Wrong-type window bounds raise TypeError; range violations stay ValueError."""
+    import app.sec.documents as _docs
+
+    # Malformed inputs sit outside the str | float signature on purpose; the untyped alias keeps the checker green.
+    check_untyped: Callable[..., object] = _docs._check_window
+    for bad in ("abc", None, object()):
+        try:
+            check_untyped(bad, None)
+        except TypeError as exc:
+            assert "offset must be an integer" in str(exc)
+        else:
+            raise AssertionError(f"offset {bad!r} must raise TypeError")
+    for bad in ("abc", object()):
+        try:
+            check_untyped(0, bad)
+        except TypeError as exc:
+            assert "max_chars must be an integer" in str(exc)
+        else:
+            raise AssertionError(f"max_chars {bad!r} must raise TypeError")
+    assert _docs._check_window(5, None) == (5, None)
+    for bad_offset in (True, False):
+        try:
+            _docs._check_window(bad_offset, None)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError(f"offset {bad_offset!r} must raise TypeError")
+    try:
+        _docs._check_window(-1, None)
+    except ValueError as exc:
+        assert "offset must be >= 0" in str(exc)
+    else:
+        raise AssertionError("negative offset must raise ValueError")
+    try:
+        _docs._check_window(0, 0)
+    except ValueError as exc:
+        assert "max_chars must be 1" in str(exc)
+    else:
+        raise AssertionError("zero max_chars must raise ValueError")
+
+
+def test_sec_facts_gateway_failure_raises_with_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provider failures surface as errors, never silent empty rows."""
+    from datetime import date
+
+    from app.services import sec_facts
+
+    class _BoomGateway:
+        def company_facts(self, cik: int, as_of: str | None = None) -> dict[str, object]:
+            raise OSError("connection reset")
+
+    monkeypatch.setattr(sec_facts, "_gateway", lambda: _BoomGateway())
+    try:
+        sec_facts._live_fact_rows("sec:cik:0000320193", ("Revenue",), date(2026, 8, 14))
+    except RuntimeError as exc:
+        assert "company facts unavailable" in str(exc)
+    else:
+        raise AssertionError("financial-facts gateway failure must raise")
+    try:
+        sec_facts._store_dividend_events("sec:cik:0000320193", date(2026, 8, 14), None)
+    except RuntimeError as exc:
+        assert "dividend events unavailable" in str(exc)
+    else:
+        raise AssertionError("dividend-events gateway failure must raise")

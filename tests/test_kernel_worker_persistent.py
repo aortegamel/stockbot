@@ -9,10 +9,14 @@ import threading
 import time
 import types
 from collections.abc import Callable, Mapping
+from typing import Never, override
 
 import pytest
 
 import app.research.kernel_worker as kw
+from app.research import scheduler as sched
+from app.research.models import DecisionRecord, Job, JSONValue, ResearchNode
+from app.research.repository import ResearchRepository
 
 
 class _FakeJev:
@@ -69,7 +73,42 @@ def _empty_objs() -> list[object]:
     return out
 
 
-def test_two_requests_share_one_jev_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.fixture
+def _offline_research(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Kernel(sched._Kernel):
+        @override
+        def get_session(self, session_id: str) -> dict[str, JSONValue]:
+            return {"session_id": session_id, "objective": "test", "query": "", "as_of": None}
+
+    kernel = _Kernel()
+
+    def _get_kernel() -> sched._Kernel:
+        return kernel
+
+    def _list_evidence(self: ResearchRepository, session_id: str) -> list[dict[str, JSONValue]]:
+        return []
+
+    def _list_nodes(self: ResearchRepository, session_id: str) -> list[ResearchNode]:
+        return []
+
+    def _list_decisions(self: ResearchRepository, session_id: str) -> list[DecisionRecord]:
+        return []
+
+    def _list_jobs(self: ResearchRepository, session_id: str) -> list[Job]:
+        return []
+
+    def _no_database(self: ResearchRepository) -> Never:
+        raise AssertionError("Persistent worker tests must not access the database")
+
+    monkeypatch.setattr(sched, "_default_kernel", _get_kernel)
+    monkeypatch.setattr(ResearchRepository, "list_evidence", _list_evidence)
+    monkeypatch.setattr(ResearchRepository, "list_nodes", _list_nodes)
+    monkeypatch.setattr(ResearchRepository, "list_decisions", _list_decisions)
+    monkeypatch.setattr(ResearchRepository, "list_jobs", _list_jobs)
+    monkeypatch.setattr(ResearchRepository, "_connect", _no_database)
+
+
+def test_two_requests_share_one_jev_identity(monkeypatch: pytest.MonkeyPatch, _offline_research: None) -> None:
     monkeypatch.setattr(kw, "_JEV", None)
     monkeypatch.setattr(kw, "_SHUTDOWN_DONE", False)
     fake = _FakeJev()
@@ -119,11 +158,13 @@ def test_two_requests_share_one_jev_identity(monkeypatch: pytest.MonkeyPatch) ->
     out1 = kw._run({"id": "r1", "op": "run", "prompt": "alpha?"})
     out2 = kw._run({"id": "r2", "op": "run", "prompt": "beta?"})
     assert out1["id"] == "r1" and out2["id"] == "r2"
+    assert out1["sessionId"] == "rs:t"
+    assert out2["sessionId"] == "rs:t"
     assert seen == [fake, fake]  # same scheduler-run identity across both requests
     assert fake.decide_calls == 2  # one entry disposition round per request; nodes follow in scheduler.run
 
 
-def test_stalled_run_reports_escalated_without_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stalled_run_reports_escalated_without_guard(monkeypatch: pytest.MonkeyPatch, _offline_research: None) -> None:
     monkeypatch.setattr(kw, "_JEV", None)
     monkeypatch.setattr(kw, "_SHUTDOWN_DONE", False)
     fake = _FakeJev()
@@ -168,6 +209,7 @@ def test_stalled_run_reports_escalated_without_guard(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(service, "create_node", _noop_node)
     out = kw._run({"id": "stall-1", "op": "run", "prompt": "stall?"})
     assert out["id"] == "stall-1"
+    assert out["sessionId"] == "rs:stalled"
     assert out["stalled"] is True
     assert out["escalated"] is True
     assert out["incomplete_guard"] is False

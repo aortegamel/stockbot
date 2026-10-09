@@ -12,13 +12,14 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import math
 import os
 import select
 import subprocess
 import sys
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import IO
 
@@ -26,7 +27,15 @@ from app.research.models import JSONValue, validate_json_mapping, validate_json_
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["close", "embed", "extract_fields", "generate_arguments", "start", "validate_needle_tool"]
+__all__ = [
+    "close",
+    "embed",
+    "extract_fields",
+    "generate_arguments",
+    "similarity_order",
+    "start",
+    "validate_needle_tool",
+]
 
 _TIMEOUT_S = 120.0
 _STDERR_TAIL_CHARS = 2000
@@ -172,7 +181,7 @@ def _readable_selected(stream: IO[str], timeout_s: float) -> list[IO[str]] | Non
     empty_x: list[IO[str]] = []
     try:
         selected = select.select([stream], empty_w, empty_x, timeout_s)[0]
-    except (OSError, ValueError, TypeError):
+    except OSError, ValueError, TypeError:
         # Fakes without fileno (tests) read directly; real pipes always select.
         return None
     return selected if isinstance(selected, list) else []
@@ -522,3 +531,55 @@ def embed(text: str) -> list[float]:
 
     with _LOCK:
         return _restartable_vec("embed", _run_embed)
+
+
+_RERANK_MAX_TEXTS = 50
+_RERANK_MAX_CHARS = 1000
+
+
+def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
+    """Cosine similarity; 0.0 when either norm is zero or dims differ."""
+    if len(left) != len(right):
+        return 0.0
+    dot = sum(x * y for x, y in zip(left, right))
+    left_norm = math.sqrt(sum(x * x for x in left))
+    right_norm = math.sqrt(sum(y * y for y in right))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+def similarity_order(
+    texts: Sequence[str],
+    reference: str,
+    *,
+    max_texts: int = _RERANK_MAX_TEXTS,
+    max_chars: int = _RERANK_MAX_CHARS,
+) -> list[int] | None:
+    """Order of indices by descending cosine similarity to the reference; None keeps order.
+
+    Bounded (at most max_texts texts, each truncated to max_chars) and total:
+    blank reference, fewer than two texts, an over-cap set, or any embed
+    failure returns None so the caller keeps its deterministic order. Blank
+    texts sink; ties keep input order under a stable sort.
+    """
+    items = list(texts or [])
+    if not isinstance(reference, str) or not reference.strip() or len(items) < 2 or len(items) > max_texts:
+        return None
+    try:
+        ref_vec = embed(reference.strip()[:max_chars])
+        scored: list[tuple[float, int]] = []
+        for pos, text in enumerate(items):
+            if not isinstance(text, str) or not text.strip():
+                scored.append((float("-inf"), pos))
+                continue
+            scored.append((_cosine(ref_vec, embed(text.strip()[:max_chars])), pos))
+        scored.sort(key=_score_key, reverse=True)
+        return [pos for _, pos in scored]
+    except Exception:  # noqa: BLE001 - embedding is a tiebreak; failure keeps deterministic order
+        return None
+
+
+def _score_key(pair: tuple[float, int]) -> float:
+    """Sort key for one (similarity, position) pair."""
+    return pair[0]

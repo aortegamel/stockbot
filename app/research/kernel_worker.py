@@ -31,9 +31,9 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -42,21 +42,19 @@ from app.research.models import JSONValue, query_with_today_utc, utcnow
 if TYPE_CHECKING:
     from app.decision_client import JevClient
     from app.research.models import DecisionRecord, ResearchNode
+    from app.research.scheduler import _Kernel
 
 logger = logging.getLogger(__name__)
 
 ProgressFn = Callable[[str, dict[str, object]], None]
-"""Progress callback: stage plus JSON-safe detail; a dead listener never fails the run."""
+"""Progress callback: stage plus JSON-safe detail; listener errors propagate."""
 
 
 def _notify(progress: ProgressFn | None, stage: str, detail: dict[str, object] | None = None) -> None:
-    """Best-effort progress emit; a dead listener never fails the run."""
+    """Emit progress when a listener is present; listener errors propagate."""
     if progress is None:
         return
-    try:
-        progress(stage, detail or {})
-    except Exception:
-        pass
+    progress(stage, detail or {})
 
 
 # Process-lifetime shared runtime: one JevClient + one Needle worker per kernel
@@ -79,8 +77,8 @@ def _shared_jev() -> JevClient:
 def _shared_needle_generate() -> Callable[..., object]:
     """Return the shared Needle arguments hook (no spawn here; start() owns it)."""
     needle_mod = importlib.import_module("app.needle_client")
-    generate = needle_mod.generate_arguments
-    return cast(Callable[..., object], generate)
+    generate: Callable[..., object] = needle_mod.generate_arguments
+    return generate
 
 
 def _prewarm() -> None:
@@ -92,15 +90,15 @@ def _prewarm() -> None:
             from app.research import scheduler as _sched
 
             _sched.build_registry()
-        except Exception as exc:  # noqa: BLE001 - background warm never fails the run
-            logger.debug("prewarm registry failed: %s", exc)
+        except Exception as exc:
+            logger.debug("prewarm registry failed: %s", exc, exc_info=True)
         try:
             from app.sec.client import _fetch_lookup_frame, ensure_identity
 
             ensure_identity()
             _fetch_lookup_frame("warmup")
-        except Exception as exc:  # noqa: BLE001 - background warm never fails the run
-            logger.debug("prewarm CIK lookup failed: %s", exc)
+        except Exception as exc:
+            logger.debug("prewarm CIK lookup failed: %s", exc, exc_info=True)
 
     _th.Thread(target=_run, name="kernel-prewarm", daemon=True).start()
 
@@ -118,6 +116,7 @@ def _startup() -> JevClient:
     except Exception as exc:
         # Needle down: stay live so ready still emits; JEV route/assess_entry
         # keep serving while arguments/run fail open per-request below.
+        logger.exception("kernel-worker needle start failed")
         print(f"[kernel-worker] needle start failed: {exc}", file=sys.stderr)
     _prewarm()
     return jev
@@ -138,7 +137,7 @@ def _shutdown() -> None:
         needle_mod = importlib.import_module("app.needle_client")
         close_fn = needle_mod.close
         close_fn()
-    except (ImportError, AttributeError, OSError):
+    except ImportError, AttributeError, OSError:
         pass
     # ponytail: shutdown drops queued pool work without blocking; running calls
     # still join at interpreter exit, so this bounds shutdown, not exit.
@@ -147,7 +146,7 @@ def _shutdown() -> None:
 
         for pool in (_sched._SEC_POOL, _sched._TOOL_POOL):
             pool.shutdown(wait=False, cancel_futures=True)
-    except (ImportError, AttributeError, RuntimeError):
+    except ImportError, AttributeError, RuntimeError:
         pass
 
 
@@ -230,12 +229,9 @@ _SETUP_ROUND2_MIN_S = 25.0
 
 def _intake_cik(ticker: str) -> str:
     """Ticker to CIK identifier for scoped intake; falls back to the ticker."""
-    try:
-        from app.sec.client import resolve_cik
+    from app.sec.client import resolve_cik
 
-        cik = resolve_cik(ticker.strip().upper())
-    except Exception:  # noqa: BLE001 - import/resolve failure keeps the ticker identifier
-        return ticker
+    cik = resolve_cik(ticker.strip().upper())
     return str(cik) if cik is not None else ticker
 
 
@@ -255,10 +251,10 @@ def _intake_newest_8k(result: object) -> str | None:
 async def _intake_ticker_chain(
     ticker: str,
     sid: str,
-    session: dict[str, object],
-    registry: list[dict[str, object]],
+    session: dict[str, JSONValue],
+    registry: list[dict[str, JSONValue]],
     jev: object,
-    kernel: object,
+    kernel: _Kernel,
     as_of: str | None,
 ) -> list[tuple[str, dict[str, object], dict[str, object], float]]:
     """List one ticker, then open its newest 8-K; a slow ticker never holds the others."""
@@ -376,13 +372,13 @@ def _digest_age_days(date: str) -> str:
         from datetime import date as _date
 
         day = _date.fromisoformat(date[:10])
-        delta = utcnow().date() - day
-        return f"{delta.days}d"
-    except Exception:
+    except TypeError, ValueError:
         return ""
+    delta = utcnow().date() - day
+    return f"{delta.days}d"
 
 
-def _digest_sort_key(item: dict[str, object]) -> str:
+def _digest_sort_key(item: Mapping[str, object]) -> str:
     """Newest-first sort key over stored evidence datetimes; empty dates sort last."""
     for key in ("published_at", "known_at", "retrieved_at"):
         val = item.get(key)
@@ -391,7 +387,7 @@ def _digest_sort_key(item: dict[str, object]) -> str:
     return ""
 
 
-def _build_digest(admitted: list[dict[str, object]]) -> str:
+def _build_digest(admitted: Sequence[Mapping[str, object]]) -> str:
     """Dedupe by URL/accession/title, verbatim-substring cuts, 6k cap, newest first."""
     seen: set[str] = set()
     seen_titles: set[str] = set()
@@ -438,11 +434,11 @@ def _build_digest(admitted: list[dict[str, object]]) -> str:
 def _normalize_proposals(raw: object, objective_id: str) -> list[dict[str, object]]:
     """Normalize validated proposals; raises on any malformed entry."""
     if not isinstance(raw, list) or not raw:
-        raise ValueError("decompose: empty proposals")
+        raise TypeError("decompose: empty proposals")
     norm: list[dict[str, object]] = []
     for p in raw:
         if not isinstance(p, Mapping):
-            raise ValueError("decompose: proposal must be an object")
+            raise TypeError("decompose: proposal must be an object")
         raw_deps: object = p.get("dependsOn")
         dep_list: list[str] = [str(d) for d in raw_deps] if isinstance(raw_deps, list) else []
         norm.append(
@@ -530,21 +526,15 @@ def _is_quota_error(exc: BaseException, msg: str) -> bool:
 
 
 def _close_bootstrap_job(sid: str) -> None:
-    """Cancel the create_research bootstrap source job when still open; best-effort."""
-    try:
-        from app.research import service as _svc
-        from app.research.repository import ResearchRepository as _Repo
+    """Cancel the create_research bootstrap source job when still open; errors propagate."""
+    from app.research import service as _svc
+    from app.research.repository import ResearchRepository as _Repo
 
-        repo = _Repo()
-        for job in repo.list_jobs(sid):
-            if job.job_type == "source_agent" and job.status in ("queued", "running"):
-                try:
-                    _svc.cancel_job(job.job_id)
-                except Exception:  # noqa: BLE001 - best-effort cleanup, never aborts
-                    pass
-                break
-    except Exception:  # noqa: BLE001 - cleanup never fails the run
-        pass
+    repo = _Repo()
+    for job in repo.list_jobs(sid):
+        if job.job_type == "source_agent" and job.status in ("queued", "running"):
+            _svc.cancel_job(job.job_id)
+            break
 
 
 def _reasoner_decompose_with_retry(
@@ -588,7 +578,7 @@ def _reasoner_decompose_with_retry(
                 True,
                 (_time.perf_counter() - _t0) * 1000.0,
             )
-        except Exception as exc:  # noqa: BLE001 - transport raises RuntimeError; config split below
+        except Exception as exc:
             # ponytail: result(timeout) only stops the wait; the late decompose still runs,
             # so drop the pool without joining and never spend a second 45s on a stuck call.
             _pool.shutdown(wait=False, cancel_futures=True)
@@ -599,22 +589,23 @@ def _reasoner_decompose_with_retry(
                 False,
                 (_time.perf_counter() - _t0) * 1000.0,
                 exc,
+                exc_info=True,
             )
             if isinstance(exc, _futures.TimeoutError):
-                return _fallback_single(objective, objective_id), {"fallback": "reasoner_timeout"}
-            # ponytail: config/quota never retry; throttles and transport get one resend.
+                raise TimeoutError(f"reasoner decompose timed out after {_wait:g}s") from exc
+            # ponytail: config never retries; throttles and transport get one resend.
             msg = str(exc).lower()
             if "opencode_unavailable" in msg or "missing opencode" in msg:
-                return _fallback_single(objective, objective_id), {"fallback": "reasoner_config"}
+                raise
             if _is_quota_error(exc, msg):
-                return _fallback_single(objective, objective_id), {"fallback": "reasoner_quota"}
+                raise
             if deadline is not None and deadline - _time.perf_counter() < _SETUP_RETRY_MIN_S:
-                return _fallback_single(objective, objective_id), {"fallback": "setup_budget"}
+                raise
             if _is_rate_limited(exc, msg):
                 _notify(progress, "reasoner_retry", {"attempt": 2, "reason": "rate_limited"})
                 continue
             if attempt >= 2:
-                return _fallback_single(objective, objective_id), {"fallback": "reasoner_failed_twice"}
+                raise
             _notify(progress, "reasoner_retry", {"attempt": 2})
             continue
         else:
@@ -622,33 +613,33 @@ def _reasoner_decompose_with_retry(
         raw = out.get("proposals") if isinstance(out, dict) else None
         if not isinstance(raw, list) or not raw:
             if attempt >= 2:
-                return _fallback_single(objective, objective_id), {"fallback": "empty_proposals"}
+                raise TypeError("decompose: empty proposals")
             if deadline is not None and deadline - _time.perf_counter() < _SETUP_RETRY_MIN_S:
-                return _fallback_single(objective, objective_id), {"fallback": "setup_budget"}
+                raise RuntimeError("reasoner setup budget spent before retry")
             _notify(progress, "reasoner_retry", {"attempt": 2})
             continue
         try:
             norm = _normalize_proposals(raw, objective_id)
-        except ValueError:
+        except TypeError, ValueError:
             if attempt >= 2:
-                return _fallback_single(objective, objective_id), {"fallback": "invalid_output_twice"}
+                raise
             if deadline is not None and deadline - _time.perf_counter() < _SETUP_RETRY_MIN_S:
-                return _fallback_single(objective, objective_id), {"fallback": "setup_budget"}
+                raise
             _notify(progress, "reasoner_retry", {"attempt": 2})
             continue
         _notify(progress, "reasoner_done", {"proposals": len(norm)})
         return norm, _harvest_hints(out) if isinstance(out, dict) else {}
-    return _fallback_single(objective, objective_id), {"fallback": "reasoner_failed_twice"}
+    raise RuntimeError("reasoner decompose failed twice without proposals")
 
 
 async def _intake_attempt(
     tool_name: str,
     fixed_arguments: dict[str, object],
     sid: str,
-    session: dict[str, object],
-    registry: list[dict[str, object]],
+    session: dict[str, JSONValue],
+    registry: list[dict[str, JSONValue]],
     jev: object,
-    kernel: object,
+    kernel: _Kernel,
     as_of: str | None,
 ) -> dict[str, object]:
     """One fixed-argument intake call through _attempt_tool, settled with continuation=False."""
@@ -693,13 +684,13 @@ async def _intake_round(
     query_text: str | None,
     tickers: list[str],
     sid: str,
-    session: dict[str, object],
-    registry: list[dict[str, object]],
+    session: dict[str, JSONValue],
+    registry: list[dict[str, JSONValue]],
     jev: object,
-    kernel: object,
+    kernel: _Kernel,
     as_of: str | None,
     progress: ProgressFn | None = None,
-) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
+) -> tuple[list[dict[str, JSONValue]], list[dict[str, object]], dict[str, object]]:
     """Fetch SEC + Exa in parallel; settle each with continuation=False. Returns (admitted, raw, stats)."""
     import time as _time
 
@@ -780,7 +771,7 @@ async def _intake_round(
     raw: list[dict[str, object]] = []
     settle_ms = 0.0
     settle_errors = 0
-    outcomes: dict[str, int] = {"admitted": 0, "not_citable": 0, "error": 0, "timeout": 0}
+    outcomes: dict[str, int] = {"admitted": 0, "duplicate": 0, "not_citable": 0, "error": 0, "timeout": 0}
     admitted_ids: list[str] = []
     for (tool, args), (record, _taken) in zip(calls, timed):
         raw.append({"tool": tool, "arguments": dict(args), "record": _jsonable_record(record)})
@@ -788,10 +779,7 @@ async def _intake_round(
             outcomes["timeout" if record.get("error_type") == "timeout" else "error"] += 1
             if record.get("job_id") is not None:
                 # ponytail: timeout records carry no job_id; nothing to close.
-                try:
-                    scheduler._settle_attempt(kernel, dict(record), sid, "")
-                except Exception as exc:  # noqa: BLE001 - orphaned job close never fails intake
-                    logger.warning("intake settle failed tool=%s err=%s", tool, exc)
+                scheduler._settle_attempt(kernel, dict(record), sid, "")
             continue
         s0 = _time.perf_counter()
         try:
@@ -803,27 +791,21 @@ async def _intake_round(
                 record.get("result"),
                 record.get("outcome"),
                 kernel,
-                None,
             )
             if candidate is None:
                 outcomes["not_citable"] += 1
             else:
-                eid = scheduler._persist_admitted_evidence(kernel, sid, record, candidate)
+                eid, accepted = scheduler._persist_admitted_evidence(kernel, sid, record, candidate)
                 record["evidence_id"] = eid
-                admitted_ids.append(eid)
-                outcomes["admitted"] += 1
+                if accepted:
+                    admitted_ids.append(eid)
+                    outcomes["admitted"] += 1
+                else:
+                    outcomes["duplicate"] += 1
             scheduler._complete_attempt_job(kernel, record, tool)
-        except Exception as exc:
-            settle_errors += 1
-            logger.warning("intake settle failed tool=%s err=%s", tool, exc)
         finally:
             settle_ms += (_time.perf_counter() - s0) * 1000.0
-    admitted: list[dict[str, object]] = []
-    try:
-        admitted = scheduler._load_evidence(sid, kernel, None)
-    except Exception as exc:  # noqa: BLE001 - store read never fails intake
-        logger.warning("intake evidence read failed sid=%s err=%s", sid, exc)
-        _notify(progress, "intake_skipped", {"reason": "evidence_read_failed"})
+    admitted: list[dict[str, JSONValue]] = scheduler._load_evidence(sid, kernel)
     per_source: dict[str, dict[str, float]] = {}
     for (tool, _args), (_record, taken) in zip(calls, timed):
         entry = per_source.setdefault(tool, {"count": 0, "ms": 0.0})
@@ -874,10 +856,10 @@ async def _graph_intake(
     objective: str,
     as_of: str | None,
     sid: str,
-    session: dict[str, object],
-    registry: list[dict[str, object]],
+    session: dict[str, JSONValue],
+    registry: list[dict[str, JSONValue]],
     jev: object,
-    kernel: object,
+    kernel: _Kernel,
     progress: ProgressFn | None = None,
     setup_deadline: float | None = None,
 ) -> list[dict[str, object]]:
@@ -886,13 +868,10 @@ async def _graph_intake(
 
     from app.research import scheduler
 
-    try:
-        start_tickers: list[str] = []
-        resolved = scheduler._objective_subject_ticker(objective)
-        if isinstance(resolved, str) and resolved.strip():
-            start_tickers = [resolved.strip().upper()]
-    except Exception:
-        start_tickers = []
+    start_tickers: list[str] = []
+    resolved = scheduler._objective_subject_ticker(objective)
+    if isinstance(resolved, str) and resolved.strip():
+        start_tickers = [resolved.strip().upper()]
     all_raw: list[dict[str, object]] = []
     all_stats: list[dict[str, object]] = []
     digest = ""
@@ -933,13 +912,9 @@ async def _graph_intake(
         decompose_timeout: float | None = None
         if setup_deadline is not None:
             decompose_timeout = max(setup_deadline - _time.perf_counter() - 5.0, 1.0)
-        try:
-            proposals, hints = _reasoner_decompose_with_retry(
-                objective, as_of, sid, digest, progress, decompose_timeout, setup_deadline
-            )
-        except Exception:
-            crash_hints: dict[str, object] = {"fallback": "reasoner_crashed"}
-            proposals, hints = _fallback_single(objective, sid), crash_hints
+        proposals, hints = _reasoner_decompose_with_retry(
+            objective, as_of, sid, digest, progress, decompose_timeout, setup_deadline
+        )
         rounds += 1
         _log_intake_round(sid, objective, raw, digest, {"proposals": proposals, "hints": hints}, stats, kernel)
         if rounds >= _INTAKE_MAX_ROUNDS:
@@ -978,18 +953,15 @@ def _log_intake_round(
     from app.research import service as _svc
 
     record = getattr(kernel, "record_decision", None) or _svc.record_decision
-    try:
-        record(
-            sid,
-            "intake_digest",
-            candidates={},
-            probabilities={},
-            selected={"stats": stats, "admitted_ids": stats.get("admitted_ids"), "outcomes": stats.get("outcomes")},
-            request={"query": objective, "calls": raw},
-            response={"digest": digest, "reasoner": reasoner_out},
-        )
-    except Exception as exc:
-        logger.warning("intake_digest log failed sid=%s err=%s", sid, exc)
+    record(
+        sid,
+        "intake_digest",
+        candidates={},
+        probabilities={},
+        selected={"stats": stats, "admitted_ids": stats.get("admitted_ids"), "outcomes": stats.get("outcomes")},
+        request={"query": objective, "calls": raw},
+        response={"digest": digest, "reasoner": reasoner_out},
+    )
 
 
 def _assert_acyclic(proposals: list[dict[str, object]], prior_ids: set[str]) -> None:
@@ -1075,58 +1047,52 @@ def _jev_admit(
     jev: JevClient | None = None,
     setup_deadline: float | None = None,
 ) -> list[dict[str, object]]:
-    """JEV disposition per proposal (run.ts relevance); objective-only on JEV outage.
+    """JEV disposition per proposal (run.ts relevance); JEV failures propagate.
 
     Entry never calls this ahead of first tool selection; the scheduler's
     reason-path expansion owns JEV disposition inside scheduler flow.
     """
     if len(proposals) <= 1:
         return list(proposals)
-    # ponytail: single disposition round only; no re-ask on partial failure (objective-only instead).
-    try:
-        client = jev if jev is not None else _shared_jev()
-    except Exception:
-        return _objective_or_admitted(objective, sid, proposals)
-    try:
-        criteria: dict[str, JSONValue] = {k: v for k, v in _DISPOSITION_OPTIONS.items()}
-        questions: dict[str, JSONValue] = {}
-        choice_options: dict[str, dict[str, str]] = {}
-        for p in proposals:
-            pid = str(p["id"])
-            questions[pid] = {
-                "type": "choice",
-                "instructions": (
-                    "What should happen to this proposed question relative to the user's objective? "
-                    f"Question: {p['question']}"
-                ),
-                "criteria": criteria,
-            }
-            choice_options[pid] = dict(_DISPOSITION_OPTIONS)
-        state = {"objective": {"prompt": objective}, "proposals": proposals}
-        call = client.decide(
-            state,
-            questions,
-            decision_type="proposal_disposition",
-            session_id=sid,
-            choice_options=choice_options,
-        )
-        if setup_deadline is None:
-            decisions = asyncio.run(call)
-        else:
-            import time as _time
+    # ponytail: single disposition round only; no re-ask on partial failure.
+    client = jev if jev is not None else _shared_jev()
+    criteria: dict[str, JSONValue] = {k: v for k, v in _DISPOSITION_OPTIONS.items()}
+    questions: dict[str, JSONValue] = {}
+    choice_options: dict[str, dict[str, str]] = {}
+    for p in proposals:
+        pid = str(p["id"])
+        questions[pid] = {
+            "type": "choice",
+            "instructions": (
+                "What should happen to this proposed question relative to the user's objective? "
+                f"Question: {p['question']}"
+            ),
+            "criteria": criteria,
+        }
+        choice_options[pid] = dict(_DISPOSITION_OPTIONS)
+    state = {"objective": {"prompt": objective}, "proposals": proposals}
+    call = client.decide(
+        state,
+        questions,
+        decision_type="proposal_disposition",
+        session_id=sid,
+        choice_options=choice_options,
+    )
+    if setup_deadline is None:
+        decisions = asyncio.run(call)
+    else:
+        import time as _time
 
-            decisions = asyncio.run(asyncio.wait_for(call, timeout=max(setup_deadline - _time.perf_counter(), 1.0)))
-        admitted: list[dict[str, object]] = []
-        for p in proposals:
-            d = decisions.get(str(p["id"]))
-            if isinstance(d, dict) and d.get("choice") == "reject":
-                continue
-            admitted.append(p)
-        if admitted:
-            return admitted
-        return _objective_or_admitted(objective, sid, proposals)
-    except Exception:
-        return _objective_or_admitted(objective, sid, proposals)
+        decisions = asyncio.run(asyncio.wait_for(call, timeout=max(setup_deadline - _time.perf_counter(), 1.0)))
+    admitted: list[dict[str, object]] = []
+    for p in proposals:
+        d = decisions.get(str(p["id"]))
+        if isinstance(d, dict) and d.get("choice") == "reject":
+            continue
+        admitted.append(p)
+    if admitted:
+        return admitted
+    return _objective_or_admitted(objective, sid, proposals)
 
 
 def _registry_portfolio_hit() -> list[str]:
@@ -1137,12 +1103,9 @@ def _registry_portfolio_hit() -> list[str]:
         reg = scheduler.build_registry()
     except Exception as exc:
         raise RuntimeError(f"registry guard forbids portfolio tools: registry unavailable ({exc})") from exc
-    try:
-        from app.tools import PORTFOLIO_AUTHORIZED_TOOLS as _PORT
+    from app.tools import PORTFOLIO_AUTHORIZED_TOOLS as _PORT
 
-        forbidden: set[str] = set(_PORT)
-    except Exception:
-        forbidden = {"evaluate_mandate", "get_portfolio_snapshot", "get_scans", "run_scan"}
+    forbidden: set[str] = set(_PORT)
     names: set[str] = set()
     if isinstance(reg, list):
         for entry in reg:
@@ -1188,28 +1151,13 @@ def run_graph_prompt(
     )
     _notify(progress, "session", {"session_id": sid})
     client = jev if jev is not None else _shared_jev()
-    try:
-        registry: list[dict[str, object]] = scheduler.build_registry()
-    except Exception:
-        registry = []
-    try:
-        kernel = scheduler._default_kernel()
-    except Exception as exc:
-        logger.warning("intake skipped: default kernel unavailable (%s)", exc)
-        _notify(progress, "intake_skipped", {"reason": "kernel_unavailable"})
-        kernel = None
-    proposals: list[dict[str, object]] = []
-    if kernel is not None:
-        try:
-            session = scheduler._load_session(sid, kernel, None)
-            session.setdefault("session_id", sid)
-            proposals = asyncio.run(
-                _graph_intake(objective, as_of, sid, session, registry, client, kernel, progress, setup_deadline)
-            )
-        except Exception as exc:
-            logger.warning("intake failed sid=%s (%s)", sid, exc, exc_info=True)
-            _notify(progress, "intake_skipped", {"reason": "intake_failed"})
-            proposals = []
+    registry: list[dict[str, JSONValue]] = scheduler.build_registry()
+    kernel = scheduler._default_kernel()
+    session = scheduler._load_session(sid, kernel)
+    session.setdefault("session_id", sid)
+    proposals: list[dict[str, object]] = asyncio.run(
+        _graph_intake(objective, as_of, sid, session, registry, client, kernel, progress, setup_deadline)
+    )
     # ponytail: 4 concrete questions max; cap BEFORE JEV so disposition never judges
     # proposals that can't become nodes, and dropped deps never silently vanish.
     capped: list[dict[str, object]] = proposals[:4] if proposals else []
@@ -1227,11 +1175,8 @@ def _create_nodes_topological(sid: str, objective: str, admitted: list[dict[str,
     if not admitted:
         service.create_node(sid, objective, "Route question.")
         return
-    try:
-        _assert_acyclic(admitted, set())
-        ordered = _topo_sort(admitted)
-    except Exception:
-        ordered = list(admitted)
+    _assert_acyclic(admitted, set())
+    ordered = _topo_sort(admitted)
     id_to_node: dict[str, str] = {}
     for p in ordered:
         pid = str(p["id"])
@@ -1272,7 +1217,7 @@ def _toolflow() -> str:
 
 
 def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
-    """Programmatic-fast entry route: code signals -> research_required, else JEV decides. Fail-open to research; zero session/DB."""
+    """Programmatic-fast entry route: code signals -> research_required, else JEV decides. Zero session/DB."""
     raw_id = req.get("id")
     rid = raw_id if isinstance(raw_id, str) else "?"
     prompt = req.get("prompt")
@@ -1287,14 +1232,10 @@ def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[s
             logger.info("toolflow route rid=%s route=%s via=programmatic", rid, fast)
             return {"id": rid, "route": fast}
     logger.debug("toolflow route_entry rid=%s prompt=%.200s", rid, prompt.strip())
-    try:
-        client = jev if jev is not None else _shared_jev()
-        winner = asyncio.run(client.route_entry(query_with_today_utc(prompt.strip())))
-        logger.info("toolflow route rid=%s route=%s", rid, winner)
-        return {"id": rid, "route": winner}
-    except Exception as exc:
-        logger.warning("toolflow route_fail_open rid=%s route=research_required err_type=%s", rid, type(exc).__name__)
-        return {"id": rid, "route": "research_required"}
+    client = jev if jev is not None else _shared_jev()
+    winner = asyncio.run(client.route_entry(query_with_today_utc(prompt.strip())))
+    logger.info("toolflow route rid=%s route=%s", rid, winner)
+    return {"id": rid, "route": winner}
 
 
 def _arguments(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
@@ -1379,35 +1320,24 @@ def _arguments(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         schema_raw = req.get("schema")
         schema: JSONValue = validate_json_value(schema_raw if schema_raw is not None else {}, "<arguments>: 'schema'")
         if not isinstance(schema, dict) or not schema:
-            try:
-                from app.research import scheduler
+            from app.research import scheduler
 
-                schema = scheduler._schema_for(tool, scheduler.build_registry())
-            except Exception:
-                fallback: JSONValue = {}
-                schema = fallback
+            schema = scheduler._schema_for(tool, scheduler.build_registry())
         node_raw = req.get("node")
         node: JSONValue = validate_json_value(node_raw, "<arguments>: 'node'") if node_raw is not None else None
         context_raw = req.get("context")
         context: JSONValue = (
             validate_json_value(context_raw, "<arguments>: 'context'") if context_raw is not None else None
         )
-        generated: object = None
-        try:
-            generated = _shared_needle_generate()(
-                tool=tool, schema=schema, objective=prompt, node=node, context=context
-            )
-        except Exception:
-            generated = None
+        generated: object = _shared_needle_generate()(
+            tool=tool, schema=schema, objective=prompt, node=node, context=context
+        )
         if generated is None:
-            # Scheduler-seeded fallback (explicit objective ticker/company,
-            # latest = no filing-date window); fail-open error when unseedable.
-            try:
-                from app.research import scheduler as _sched
+            # Genuine Needle withhold: seed from the explicit objective
+            # ticker/company (latest = no filing-date window); unseedable stays error.
+            from app.research import scheduler as _sched
 
-                seeded = _sched._fallback_sec_args(tool, prompt)
-            except Exception:
-                seeded = None
+            seeded = _sched._fallback_sec_args(tool, prompt)
             if isinstance(seeded, dict):
                 logger.info("toolflow arguments rid=%s tool=%s conf=no fallback=seeded", rid, tool)
                 return {
@@ -1426,10 +1356,7 @@ def _arguments(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         raw_args: object = generated.get("arguments", {}) if isinstance(generated, dict) else {}
         from app.research.scheduler import _repair_tool_arguments as _kw_repair
 
-        try:
-            repaired = _kw_repair(tool, dict(raw_args) if isinstance(raw_args, dict) else {}, prompt, "-", "-")
-        except Exception:
-            repaired: dict[str, JSONValue] = dict(raw_args) if isinstance(raw_args, dict) else {}
+        repaired = _kw_repair(tool, dict(raw_args) if isinstance(raw_args, dict) else {}, prompt, "-", "-")
         arguments = validate_json_mapping(repaired, "<arguments>: 'arguments'")
         out: dict[str, JSONValue] = {"id": rid, "tool": tool, "arguments": arguments}
         if isinstance(generated, dict):
@@ -1449,7 +1376,9 @@ def _arguments(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         )
         return out
     except Exception as exc:
-        logger.warning("toolflow arguments_fail_open rid=%s tool=%s err_type=%s", rid, tool, type(exc).__name__)
+        logger.warning(
+            "toolflow arguments_fail_open rid=%s tool=%s err_type=%s", rid, tool, type(exc).__name__, exc_info=True
+        )
         return {"id": rid, "error": str(exc)[:500] or "needle arguments failed"}
 
 
@@ -1457,8 +1386,8 @@ def _assess_entry(req: Mapping[str, JSONValue], jev: JevClient | None = None) ->
     """Post-tool entry verdict: JEV assesses one tool result without a session.
 
     Returns {"id", "verdict"} where verdict is node_resolved /
-    reasoning_required / research_required / a registry tool name. Fail-open to
-    research_required on any error or blank input (never raises).
+    reasoning_required / research_required / a registry tool name. Blank input
+    stays research_required; JEV failures propagate.
     """
     raw_id = req.get("id")
     rid = raw_id if isinstance(raw_id, str) else "?"
@@ -1471,30 +1400,19 @@ def _assess_entry(req: Mapping[str, JSONValue], jev: JevClient | None = None) ->
         logger.info("toolflow assess rid=%s verdict=research_required reason=tool-required", rid)
         return {"id": rid, "verdict": "research_required"}
     logger.debug("toolflow assess_entry rid=%s tool=%s prompt=%.200s", rid, tool, prompt.strip())
-    try:
-        raw_args = req.get("arguments")
-        args_map: Mapping[str, JSONValue] = raw_args if isinstance(raw_args, dict) else {}
-        raw_result = req.get("result")
-        result_map: Mapping[str, JSONValue] = raw_result if isinstance(raw_result, dict) else {}
-        client = jev if jev is not None else _shared_jev()
-        verdict = asyncio.run(
-            client.assess_entry_tool(query_with_today_utc(prompt.strip()), tool, args_map, result_map)
-        )
-        if not isinstance(verdict, str) or not verdict:
-            logger.warning(
-                "toolflow assess_fail_open rid=%s tool=%s verdict=research_required reason=blank-verdict", rid, tool
-            )
-            return {"id": rid, "verdict": "research_required"}
-        logger.info("toolflow assess rid=%s tool=%s verdict=%s", rid, tool, verdict)
-        return {"id": rid, "verdict": verdict}
-    except Exception as exc:
+    raw_args = req.get("arguments")
+    args_map: Mapping[str, JSONValue] = raw_args if isinstance(raw_args, dict) else {}
+    raw_result = req.get("result")
+    result_map: Mapping[str, JSONValue] = raw_result if isinstance(raw_result, dict) else {}
+    client = jev if jev is not None else _shared_jev()
+    verdict = asyncio.run(client.assess_entry_tool(query_with_today_utc(prompt.strip()), tool, args_map, result_map))
+    if not isinstance(verdict, str) or not verdict:
         logger.warning(
-            "toolflow assess_fail_open rid=%s tool=%s verdict=research_required err_type=%s",
-            rid,
-            tool,
-            type(exc).__name__,
+            "toolflow assess_fail_open rid=%s tool=%s verdict=research_required reason=blank-verdict", rid, tool
         )
         return {"id": rid, "verdict": "research_required"}
+    logger.info("toolflow assess rid=%s tool=%s verdict=%s", rid, tool, verdict)
+    return {"id": rid, "verdict": verdict}
 
 
 def _run(
@@ -1536,27 +1454,25 @@ def _run(
     raw_gap = req.get("gap")
     followup = isinstance(raw_session, str) and raw_session.strip() and isinstance(raw_gap, str) and raw_gap.strip()
     followup_nodes: list[str] = []
-    preexisting_evidence: set[str] = set()
     if followup:
         assert isinstance(raw_session, str) and isinstance(raw_gap, str)
         try:
             sid, followup_nodes = _followup_gap_nodes(raw_session.strip(), raw_gap.strip())
         except KeyError as exc:
             return _terminal(rid, "invalid_params", f"unknown session: {exc}")
-        except Exception as exc:  # noqa: BLE001 - followup setup defects report provider_error, never crash the worker
+        except Exception as exc:
+            logger.exception("kernel session followup setup failed rid=%s", rid)
             return _terminal(rid, "provider_error", f"session setup failed: {exc}")
-        try:
-            preexisting_evidence = set(ResearchRepository().list_evidence_ids(sid))
-        except Exception:  # noqa: BLE001 - snapshot miss degrades to unscoped linkage, never fails followup
-            preexisting_evidence = set()
     else:
         try:
             sid = run_graph_prompt(objective, as_of, jev=client, progress=progress, setup_deadline=setup_deadline)
         except RuntimeError as exc:
+            logger.exception("kernel session setup failed rid=%s", rid)
             if "registry guard forbids" in str(exc):
                 return _terminal(rid, "provider_error", str(exc))
             return _terminal(rid, "provider_error", f"session setup failed: {exc}")
         except Exception as exc:
+            logger.exception("kernel session setup failed rid=%s", rid)
             return _terminal(rid, "provider_error", f"session setup failed: {exc}")
     try:
         run_kwargs: dict[str, object] = {
@@ -1570,6 +1486,7 @@ def _run(
             run_kwargs["select_round"] = select_round
         run_result: dict[str, JSONValue] = asyncio.run(scheduler.run(sid, **run_kwargs))
     except Exception as exc:
+        logger.exception("kernel run failed rid=%s sid=%s", rid, sid)
         return _terminal(rid, "provider_error", f"kernel run failed: {exc}")
     finally:
         _close_bootstrap_job(sid)
@@ -1596,21 +1513,14 @@ def _run(
         raw_att = nr.get("attempts")
         if isinstance(raw_att, list):
             attempts.extend([a for a in raw_att if isinstance(a, Mapping)])
-    try:
-        store = ResearchRepository()
-        records: list[dict[str, JSONValue]] = store.list_evidence(sid)
-        node_rows: list[ResearchNode] = store.list_nodes(sid)
-        decision_rows: list[DecisionRecord] = store.list_decisions(sid)
-    except Exception:
-        records: list[dict[str, JSONValue]] = []
-        node_rows: list[ResearchNode] = []
-        decision_rows: list[DecisionRecord] = []
+    store = ResearchRepository()
+    records: list[dict[str, JSONValue]] = store.list_evidence(sid)
+    node_rows: list[ResearchNode] = store.list_nodes(sid)
+    decision_rows: list[DecisionRecord] = store.list_decisions(sid)
     evidence: list[JSONValue] = []
-    # ponytail: success linkage is FIFO over unclaimed admitted ids (scheduler
-    # admits sequentially in attempt order); an explicit attempt evidence_id wins.
-    # Follow-up: pre-pass-2 ids never seed unclaimed, so a pass-2 attempt
-    # without evidence_id pops a pass-2 id. Payload still lists all evidence.
-    unclaimed: list[str] = []
+    # Linkage: a successful call carries only its own evidence_id (fresh or duplicate winner,
+    # pass-1 ids included) and only when that id is a known session row; never a guessed id.
+    known_ids: set[str] = set()
     for i, rec in enumerate(records):
         text = _evidence_text(rec)
         if not text:
@@ -1618,8 +1528,7 @@ def _run(
         row_id = _evidence_id(rec, f"ev-{i}")
         row: dict[str, JSONValue] = {"id": row_id, "content": text}
         evidence.append(row)
-        if row_id not in preexisting_evidence:
-            unclaimed.append(row_id)
+        known_ids.add(row_id)
     tool_executions: list[JSONValue] = []
     tool_calls: list[JSONValue] = []
     failures: dict[str, int] = {}
@@ -1642,14 +1551,9 @@ def _run(
         )
         call: dict[str, JSONValue] = {"tool": tool_name, "ok": ok, "step": step}
         if ok:
-            claimed = attempt.get("evidence_id", attempt.get("evidenceId"))
-            eid = str(claimed) if isinstance(claimed, str) and claimed else None
-            if eid is not None and eid in unclaimed:
-                unclaimed.remove(eid)
-            else:
-                eid = unclaimed.pop(0) if unclaimed else None
-            if eid is not None:
-                call["evidenceId"] = eid
+            claimed = attempt.get("evidence_id") or attempt.get("evidenceId")
+            if isinstance(claimed, str) and claimed in known_ids:
+                call["evidenceId"] = claimed
         else:
             raw_category = attempt.get("error_type", attempt.get("category"))
             category = str(raw_category) if isinstance(raw_category, str) and raw_category else "tool_error"
@@ -1659,10 +1563,7 @@ def _run(
         tool_calls.append(call)
     nodes_payload: list[JSONValue] = []
     for n in node_rows:
-        try:
-            d = n.to_dict()
-        except Exception:
-            continue
+        d = n.to_dict()
         nid = d.get("node_id")
         if not isinstance(nid, str) or not nid:
             continue
@@ -1680,10 +1581,7 @@ def _run(
         )
     decisions_payload: list[JSONValue] = []
     for dec in decision_rows:
-        try:
-            dd = dec.to_dict()
-        except Exception:
-            continue
+        dd = dec.to_dict()
         decisions_payload.append(dd)
     unresolved: list[JSONValue] = [
         str(n["node_id"]) for n in nodes_payload if isinstance(n, dict) and n.get("status") != "resolved"
@@ -1740,7 +1638,7 @@ def main() -> None:
     try:
         signal.signal(signal.SIGINT, _on_signal)
         signal.signal(signal.SIGTERM, _on_signal)
-    except (OSError, ValueError):
+    except OSError, ValueError:
         pass
     _write_lock = threading.Lock()
 
@@ -1755,16 +1653,14 @@ def main() -> None:
         rid = raw_rid if isinstance(raw_rid, str) else "?"
 
         def _progress(stage: str, detail: dict[str, object] | None = None) -> None:
-            try:
-                safe = cast("JSONValue", json.loads(json.dumps(detail or {}, default=str)))
-                line: dict[str, JSONValue] = {"type": "progress", "id": rid, "stage": stage, "detail": safe}
-                _emit(line)
-            except Exception:
-                pass
+            safe: JSONValue = json.loads(json.dumps(detail or {}, default=str))
+            line: dict[str, JSONValue] = {"type": "progress", "id": rid, "stage": stage, "detail": safe}
+            _emit(line)
 
         try:
             resp = _run(req, jev=worker_jev, progress=_progress)
         except Exception as exc:  # never raise out of the worker
+            logger.exception("kernel worker run failed rid=%s", rid)
             resp = _terminal(rid, "provider_error", f"worker failed: {exc}")
         _emit(resp)
 
@@ -1803,6 +1699,7 @@ def main() -> None:
                     except Exception as exc:  # never raise out of the worker
                         raw_rid = req.get("id")
                         rid = raw_rid if isinstance(raw_rid, str) else "?"
+                        logger.exception("kernel worker direct op failed rid=%s op=%s", rid, req.get("op"))
                         _emit(_terminal(rid, "provider_error", f"worker failed: {exc}"))
                 else:
                     pool.submit(_do_run, req, jev)

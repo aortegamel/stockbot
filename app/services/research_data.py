@@ -68,7 +68,7 @@ def _parse_ticker_ciks(payload_json: object) -> dict[str, int]:
             continue
         try:
             cik = int(cik_raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
         ticker_ciks[ticker] = cik
     return ticker_ciks
@@ -143,7 +143,7 @@ def refresh_sec_company_facts(cik: int, *, data_root: Path | None = None) -> dic
         root=data_root / "raw",
     )
     datasets = _normalize_company_facts(cik, payload, retrieved_at=now, url=url)
-    _ = _gateway().company_facts(int(cik))
+    _ = _gateway().company_facts(cik)
     rows = sum(len(rows) for rows in datasets.values())
     return {
         "source": "sec:companyfacts",
@@ -203,20 +203,17 @@ def replay_sec_facts_from_archive(*, data_root: Path | None = None) -> dict[str,
 
 
 def iter_archive_company_facts(cik: int, *, data_root: Path | None = None) -> Sequence[Mapping[str, object]]:
-    """Yield typed normalized financial-fact rows for one archived CIK (oldest first)."""
+    """Yield typed normalized financial-fact rows for one archived CIK (oldest first). Corrupt payloads raise; use replay for isolated per-payload failure reports."""
     data_root = Path(data_root) if data_root else get_data_root()
     raw_root = data_root / "raw"
     out: list[Mapping[str, object]] = []
-    for record in raw_archive.iter_archive("sec", f"cik{int(cik):010d}", "companyfacts", root=raw_root):
-        try:
-            datasets = _normalize_company_facts(
-                int(cik),
-                record.payload_path.read_bytes(),
-                retrieved_at=record.retrieved_at,
-                url=record.url,
-            )
-        except Exception:  # noqa: BLE001 - corrupt payloads skip, replay reports them
-            continue
+    for record in raw_archive.iter_archive("sec", f"cik{cik:010d}", "companyfacts", root=raw_root):
+        datasets = _normalize_company_facts(
+            cik,
+            record.payload_path.read_bytes(),
+            retrieved_at=record.retrieved_at,
+            url=record.url,
+        )
         facts = datasets.get("financial_facts")
         if isinstance(facts, list):
             out.extend(row for row in facts if isinstance(row, dict))
@@ -418,5 +415,6 @@ def prepare_short_interest_data(
         "unresolved_tickers": unresolved,
         "failed_enrichments": failed_enrichments,
     }
+
 
 # Seam: FINRA snapshots refresh live via SourceGateway + normalization + raw_archive + write_bundle; NOTE: a future warehouse slots behind refresh, never here.

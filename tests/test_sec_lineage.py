@@ -99,9 +99,7 @@ def test_xbrl_lineage_as_of_excludes_restatement(monkeypatch: pytest.MonkeyPatch
         assert cik == 1
         if as_of is None:
             return _facts_payload(list(rows))
-        return _facts_payload(
-            [row for row in rows if str(row.get("known_at") or "")[:10] <= as_of]
-        )
+        return _facts_payload([row for row in rows if str(row.get("known_at") or "")[:10] <= as_of])
 
     monkeypatch.setattr(SourceGateway, "company_facts", _fake_company_facts)
     early = lineage.xbrl_lineage("sec:cik:0000000001", "Revenues", as_of="2025-02-15")

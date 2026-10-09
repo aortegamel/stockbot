@@ -41,11 +41,11 @@ class _Gateway:
         self.alias_rows: list[dict[str, object]] = []
         self.facts_by_cik: dict[int, dict[str, list[dict[str, object]]]] = {}
 
-    def ticker_candidates(self, ticker: str, as_of: object = None) -> list["TickerAlias"]:
+    def ticker_candidates(self, ticker: str, as_of: object = None) -> list[TickerAlias]:
         """All aliases for the ticker, unfiltered (PIT stays in resolve_ticker_aliases)."""
         del as_of
         want = str(ticker).strip().upper()
-        out: list["TickerAlias"] = []
+        out: list[TickerAlias] = []
         for row in self.alias_rows:
             if str(row.get("alias_value") or "").strip().upper() != want:
                 continue
@@ -76,9 +76,7 @@ class _Gateway:
         for name, rows in out.items():
             if isinstance(rows, list):
                 out[name] = [
-                    row
-                    for row in rows
-                    if isinstance(row, dict) and str(row.get("known_at") or "")[:10] <= as_of
+                    row for row in rows if isinstance(row, dict) and str(row.get("known_at") or "")[:10] <= as_of
                 ]
         return out
 
@@ -96,7 +94,6 @@ def _merge(gw: _Gateway, cik: int, datasets: dict[str, list[dict[str, object]]])
     for name, rows in datasets.items():
         merged[name] = list(merged.get(name, [])) + list(rows)
     gw.facts_by_cik[cik] = merged
-
 
 
 def _seed_ticker(gw: _Gateway, cik: int, ticker: str) -> None:
@@ -629,7 +626,9 @@ def test_explicit_as_of_empty_gateway_is_pit_unavailable(gateway: _Gateway, monk
     assert calls == []
 
 
-def test_gateway_empty_without_edgar_rows_is_pit_unavailable(gateway: _Gateway, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gateway_empty_without_edgar_rows_is_pit_unavailable(
+    gateway: _Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _seed_ticker(gateway, KO_CIK, "KO")
 
     def _boom(ticker: str, metric: str, include_dividend_price: bool = True) -> dict[str, object]:

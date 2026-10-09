@@ -7,7 +7,7 @@ opt-in via tests/test_finra_smoke.py (pytest -m finra_smoke).
 
 import json
 from collections.abc import Iterator
-from datetime import date, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -249,7 +249,7 @@ def test_short_interest_payload(http: dict[str, MagicMock]) -> None:
 def test_latest_short_interest_rejects_stale_production_data(
     http: dict[str, MagicMock], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    stale_date = (date.today() - timedelta(days=finra_client.STALE_AFTER_DAYS + 1)).isoformat()  # noqa: DTZ011 - trading-calendar local date has no tz meaning
+    stale_date = (datetime.now(UTC).date() - timedelta(days=finra_client.STALE_AFTER_DAYS + 1)).isoformat()
     http["post"].side_effect = [
         _token_response(),
         _response(
@@ -1280,7 +1280,7 @@ def test_reg_sho_company_name_resolves_before_http(http: dict[str, MagicMock], m
 
 def test_finra_rejects_non_iso_dates_with_format(http: dict[str, MagicMock]) -> None:
     """'this week' can never reach FINRA: bad dates fail closed at the handler."""
-    cases = [
+    cases: list[tuple[str, dict[str, object], str]] = [
         ("get_short_interest", {"ticker": "AAPL", "settlementDate": "this week"}, "settlementDate"),
         ("get_reg_sho_volume", {"ticker": "AAPL", "tradeDate": "this week"}, "tradeDate"),
         ("get_threshold_securities", {"tradeDate": "2026-13-45"}, "tradeDate"),
@@ -1310,13 +1310,14 @@ def test_finra_rejects_non_iso_dates_with_format(http: dict[str, MagicMock]) -> 
 
 def test_gate_rejects_today_now_literals_with_decode_hint(http: dict[str, MagicMock]) -> None:
     """Q3 regression: as_of 'today' must fail closed at the gate, not deep in insider/filings."""
-    for tool, args in [
+    cases: list[tuple[str, dict[str, object]]] = [
         ("get_insider_activity", {"ticker": "AAPL", "as_of": "today"}),
         ("get_insider_activity", {"ticker": "AAPL", "as_of": "now"}),
         ("get_reg_sho_volume", {"ticker": "AAPL", "tradeDate": "today"}),
         ("get_short_interest", {"ticker": "AAPL", "settlementDate": "now"}),
         ("get_material_events", {"ticker": "AMD", "since": "today"}),
-    ]:
+    ]
+    for tool, args in cases:
         msg = tools_module._validate_tool_arguments(tool, args)
         assert msg is not None and "relative date" in msg, (tool, args, msg)
         assert "YYYY-MM-DD" in msg, (tool, args, msg)
@@ -1414,7 +1415,11 @@ def test_pressure_profile_normalizes_ticker_before_provider(monkeypatch: pytest.
         return {"ticker": ticker}
 
     monkeypatch.setattr(tools_module.sec, "get_short_pressure_context", _fake_context)
-    monkeypatch.setattr(tools_module, "_resolve_company_to_ticker", lambda _name: "AAPL")
+
+    def _resolve(_name: str) -> str | None:
+        return "AAPL"
+
+    monkeypatch.setattr(tools_module, "_resolve_company_to_ticker", _resolve)
     out = execute_tool("get_short_pressure_profile", {"ticker": "Apple"}, model="test", context=LOCAL_CONTEXT)
     assert out == {"ticker": "AAPL"}
     assert seen["ticker"] == "AAPL"

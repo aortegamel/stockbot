@@ -9,6 +9,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import fc from "fast-check";
 import {
   assertAcyclic,
   askDecisions,
@@ -85,6 +86,106 @@ test("choice winner must be declared; distribution exactly matches options", () 
   expect(() => parseChoiceAnswer("n", "id", {
     type: "choice", choice: "analyze", probabilities: dispProbs, confidence: NaN,
   }, DISPOSITION_OPTIONS)).toThrow("malformed");
+});
+
+test("choice rejects malformed answer and probability shapes", () => {
+  for (const ans of [null, ["choice"], "choice"])
+    expect(() => parseChoiceAnswer("n", "id", ans, DISPOSITION_OPTIONS)).toThrow("n: malformed_typesafe_answer for id");
+  expect(() => parseChoiceAnswer("n", "id", {
+    type: "noul", choice: "analyze", probabilities: dispProbs, confidence: 0.8,
+  }, DISPOSITION_OPTIONS)).toThrow("n: malformed_typesafe_answer for id");
+  for (const probabilities of [null, ["x"], "x"])
+    expect(() => parseChoiceAnswer("n", "id", {
+      type: "choice", choice: "analyze", probabilities, confidence: 0.8,
+    }, DISPOSITION_OPTIONS)).toThrow("n: malformed_typesafe_answer for id");
+  expect(() => parseChoiceAnswer("n", "id", {
+    type: "choice", choice: "analyze",
+    probabilities: { analyze: 0.7, gather_evidence: 0.2, bogus: 0.1 }, confidence: 0.8,
+  }, DISPOSITION_OPTIONS)).toThrow("n: malformed_typesafe_answer for id");
+});
+
+test("choice rejects non-number confidence with the existing error shape", () => {
+  for (const confidence of ["0.8", null])
+    expect(() => parseChoiceAnswer("n", "id", {
+      type: "choice", choice: "analyze", probabilities: dispProbs, confidence,
+    }, DISPOSITION_OPTIONS)).toThrow("n: malformed_typesafe_answer for id");
+});
+
+test("choice rejects inherited labels with the existing error shape", () => {
+  for (const choice of ["toString", "constructor", "__proto__"]) {
+    expect(() => parseChoiceAnswer("n", "id", {
+      type: "choice", choice, probabilities: { safe: 0.7 }, confidence: 0.8,
+    }, { safe: "Configured choice" })).toThrow("n: malformed_typesafe_answer for id");
+  }
+  const options = { safe: "Configured choice" };
+  Object.setPrototypeOf(options, { inherited: "Not an own choice" });
+  expect(() => parseChoiceAnswer("n", "id", {
+    type: "choice", choice: "inherited", probabilities: { safe: 0.7 }, confidence: 0.8,
+  }, options)).toThrow("n: malformed_typesafe_answer for id");
+});
+
+test("choice retains explicitly configured prototype-like labels and raw probabilities", () => {
+  const labels = ["toString", "safe", "__proto__", "constructor", "10", "2"];
+  const options = Object.fromEntries(labels.map((label) => [label, "Configured choice"]));
+  const probabilities = Object.fromEntries(labels.map((label, i) => [label, i / 10]));
+  for (const choice of labels) {
+    const d = parseChoiceAnswer("n", "id", {
+      type: "choice", choice, probabilities, confidence: 0.37,
+    }, options);
+    expect(d.choice).toBe(choice);
+    expect(d.confidence).toBe(0.37);
+    expect(d.probabilities).toEqual(probabilities);
+    expect(Object.keys(d.probabilities)).toEqual(["2", "10", "__proto__", "constructor", "safe", "toString"]);
+    expect(Object.getPrototypeOf(d.probabilities)).toBe(Object.prototype);
+    expect(JSON.parse(JSON.stringify(d.probabilities))).toEqual(probabilities);
+    for (const label of labels) {
+      expect(Object.hasOwn(d.probabilities, label)).toBe(true);
+      expect(Object.getOwnPropertyDescriptor(d.probabilities, label)).toEqual({
+        value: probabilities[label], enumerable: true, writable: true, configurable: true,
+      });
+    }
+  }
+});
+
+test("choice preserves arbitrary own labels and their raw probabilities", () => {
+  fc.assert(fc.property(
+    fc.uniqueArray(fc.tuple(
+      fc.oneof(fc.string(), fc.constantFrom("toString", "constructor", "__proto__")),
+      fc.double({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true }),
+    ), { selector: ([label]) => label, minLength: 1, maxLength: 12 }),
+    fc.double({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true }),
+    (entries, confidence) => {
+      const options = Object.fromEntries(entries.map(([label]) => [label, "Configured choice"]));
+      const probabilities = Object.fromEntries(entries);
+      for (const [choice] of entries) {
+        const d = parseChoiceAnswer("n", "id", {
+          type: "choice", choice, probabilities, confidence,
+        }, options);
+        expect(d.choice).toBe(choice);
+        expect(d.confidence).toBe(confidence);
+        expect(d.probabilities).toEqual(probabilities);
+        expect(Object.keys(d.probabilities).sort()).toEqual(Object.keys(options).sort());
+        expect(Object.getPrototypeOf(d.probabilities)).toBe(Object.prototype);
+        for (const [label, probability] of entries) {
+          expect(Object.hasOwn(d.probabilities, label)).toBe(true);
+          expect(d.probabilities[label]).toBe(probability);
+        }
+      }
+    },
+  ), { seed: 20261009, numRuns: 100 });
+});
+
+test("choice rejects arbitrary unknown and inherited labels", () => {
+  fc.assert(fc.property(
+    fc.oneof(fc.string(), fc.constantFrom("toString", "constructor", "__proto__"))
+      .filter((choice) => choice !== "safe"),
+    fc.double({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true }),
+    (choice, probability) => {
+      expect(() => parseChoiceAnswer("n", "id", {
+        type: "choice", choice, probabilities: { safe: probability }, confidence: 0.8,
+      }, { safe: "Configured choice" })).toThrow("n: malformed_typesafe_answer for id");
+    },
+  ), { seed: 20261009, numRuns: 100 });
 });
 
 test("score keeps finite value; optional distribution/confidence/legend retained", () => {

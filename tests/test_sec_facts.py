@@ -65,9 +65,7 @@ class _Gateway:
         for name, rows in out.items():
             if isinstance(rows, list):
                 out[name] = [
-                    row
-                    for row in rows
-                    if isinstance(row, dict) and str(row.get("known_at") or "")[:10] <= as_of
+                    row for row in rows if isinstance(row, dict) and str(row.get("known_at") or "")[:10] <= as_of
                 ]
         return out
 
@@ -419,6 +417,7 @@ def test_company_facts_failure_returns_pit_unavailable(gateway: _Gateway, monkey
         _ds.SourceGateway().company_facts(NVDA_CIK)
     result = sec_facts.get_fundamentals("NVDA", "shares_outstanding", as_of="2026-08-10")
     assert result["error_type"] == "pit_data_unavailable"
+
 
 # ---------------------------------------------------------------------------
 # Always-live metrics + XBRL envelope

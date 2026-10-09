@@ -7,6 +7,8 @@ are injected via monkeypatch; nothing touches the network or cache.db.
 import pytest
 
 from app import valuation
+from app.policy import LOCAL_CONTEXT
+from app.tools import execute_tool
 
 
 class FakeCache:
@@ -338,6 +340,7 @@ def test_fy_schedule_separation_no_blended_fallback(monkeypatch: pytest.MonkeyPa
         monkeypatch.setattr(valuation.obligations, "get_obligations", _run_obligations)
         monkeypatch.setattr(valuation, "_revenue_matched_margin", _run_margin)
         return valuation.get_valuation_metrics("NVDA")
+
     shares = 24.221  # 24_221_000_000 from _estimates
     result = _run([scheduled])
     fe = result["forward_eps"]
@@ -610,3 +613,31 @@ def test_get_live_quote_yahoo_failure_yields_none(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(valuation.analyst_client, "_quote_summary", _boom)
     assert valuation.get_live_quote("KO") == {"price": None, "retrieved_at": None}
+
+
+def test_eps_gateway_failure_reaches_tool_error_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _DownGateway:
+        def company_facts(self, cik: int, as_of: str | None = None) -> dict[str, object]:
+            raise OSError("SEC companyfacts unreachable")
+
+    def _entity(ticker: str, as_of: object, data_root: object) -> str:
+        return "sec:cik:0001045810"
+
+    def _price(ticker: str) -> float:
+        return 213.05
+
+    def _fake_estimates(ticker: str) -> dict[str, object]:
+        return _estimates()
+
+    cache = FakeCache()
+    monkeypatch.setattr(valuation, "cache", cache)
+    monkeypatch.setattr(valuation, "get_live_price", _price)
+    monkeypatch.setattr(valuation.analyst_client, "get_analyst_estimates", _fake_estimates)
+    monkeypatch.setattr(valuation.sec_facts, "_resolve_entity", _entity)
+    monkeypatch.setattr(valuation.sec_facts, "_gateway", _DownGateway)
+    message = "company facts unavailable for sec:cik:0001045810: SEC companyfacts unreachable"
+    with pytest.raises(RuntimeError, match=message):
+        valuation.get_valuation_metrics("NVDA")
+    result = execute_tool("get_valuation_metrics", {"ticker": "NVDA"}, "test", context=LOCAL_CONTEXT)
+    assert result == {"error": f"Tool 'get_valuation_metrics' failed: {message}"}
+    assert cache.store == {}

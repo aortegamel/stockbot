@@ -9,7 +9,6 @@ import pytest
 
 from app.domain.evidence import relationship_evaluation as EV
 from app.domain.evidence import relationships as R
-from app.sec import store as sec_store
 from app.sec.discovery import service as disc
 from app.sec.discovery.service import search_sec_relationships
 from app.sec.models import Filing
@@ -230,7 +229,6 @@ def test_revise_expired_and_guards() -> None:
         raise AssertionError("empty reason accepted")
 
 
-
 def test_typed_search_reads_live_per_direction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     live_row = {
         "filer_cik": "2",
@@ -314,6 +312,7 @@ def test_live_sc13d_row_resolves_per_accession(tmp_path: Path, monkeypatch: pyte
     assert rows[0]["filer_cik"] == "2"
     assert rows[0]["subject_cik"] == "1"
     assert sec_store_mod.query_beneficial_ownership(root=tmp_path) == []
+
 
 # --- Phase 9: deterministic PIT walk-forward type evaluation ---
 #
@@ -524,9 +523,6 @@ def test_relationship_search_exhaustive_propagates_guard_and_bounds_output(
     monkeypatch.setattr(sec_store_mod, "query_beneficial_ownership", _empty_rows)
     monkeypatch.setattr(sec_store_mod, "query_insider_transactions", _empty_rows)
     monkeypatch.setattr(sec_store_mod, "query_13f_holdings", _empty_rows)
-    ev_rows = [
-        {"relationship_id": f"rel:e{i}", "relationship_type": "supplier_of", "accession": f"EACC-{i}"} for i in range(5)
-    ]
     doc_rows = [
         {
             "accession": f"DACC-{i}",
@@ -721,20 +717,23 @@ def test_inverse_route_reports_unmapped_issuer_without_scan(tmp_path: Path, monk
 def test_hydrate_deal_forms_normalize_live_per_filing(tmp_path: Path) -> None:
     from app.sec import transactions as _txn
 
-    assert _txn.normalize_transaction(
-        "ACC-S4",
-        "S-4",
-        target="Target Co",
-        filed_at="2024-02-01",
-        text="Merger with Target Co for $10 per share",
-        filer_cik=111,
-        filer_name="Acquirer Inc",
-        subject_cik=222,
-        subject_name="Target Co",
-        document_name="primary.htm",
-        known_at="2024-02-01T00:00:00Z",
-        source_url="http://x",
-    ).target == "Target Co"
+    assert (
+        _txn.normalize_transaction(
+            "ACC-S4",
+            "S-4",
+            target="Target Co",
+            filed_at="2024-02-01",
+            text="Merger with Target Co for $10 per share",
+            filer_cik=111,
+            filer_name="Acquirer Inc",
+            subject_cik=222,
+            subject_name="Target Co",
+            document_name="primary.htm",
+            known_at="2024-02-01T00:00:00Z",
+            source_url="http://x",
+        ).target
+        == "Target Co"
+    )
 
 
 def test_live_filing_batch_includes_amendments(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -811,14 +810,11 @@ def test_backfill_failure_marks_job_failed_and_no_coverage(tmp_path: Path, monke
     assert sec_store_mod.query_coverage(source=source, form=form, root=tmp_path) == []
 
 
-
-
 def test_hydrate_amendment_forms_use_base_parsers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import app.sec.archive as sec_archive
     import app.sec.documents as sec_docs
     import app.sec.insider as sec_insider
     import app.sec.ownership as sec_own
-    import app.sec.store as sec_store_mod
 
     def _fake_doc(accession_no: str, document_name: str | None = None, **kwargs: object) -> dict[str, object]:
         return {"text": "t", "document_name": "primary", "url": "http://x"}

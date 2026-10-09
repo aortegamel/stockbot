@@ -792,12 +792,6 @@ def test_term_filter_applies_before_limit_slice(monkeypatch: pytest.MonkeyPatch,
     assert unfiltered["continuation"] is True
 
 
-
-
-
-
-
-
 def test_query_scope_over_1000_never_checkpoints(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _enable(monkeypatch)
     refreshes = ["2026-09-02"]
@@ -1097,10 +1091,6 @@ def test_checkpoint_replay_is_scope_exact(monkeypatch: pytest.MonkeyPatch, tmp_p
     for obs in ny_obs:
         assert _child(obs, "features")["diffusion"] == pytest.approx(1.0)
         assert _nested(obs, "features", "coverage", "geos_covered") == ["New York"]
-
-
-
-
 
 
 # Entity + macro ------------------------------------------------------------
@@ -1758,9 +1748,3 @@ def test_youtube_default_search_ceiling_is_80(monkeypatch: pytest.MonkeyPatch) -
     assert _config.get_youtube_search_daily_limit() == 80
     assert _config.get_bq_daily_bytes_limit() == 10737418240
     assert _config.get_bq_monthly_bytes_limit() == 536870912000
-
-
-
-
-
-

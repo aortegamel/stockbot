@@ -56,13 +56,14 @@ except Exception:  # noqa: BLE001, S110 - intentional best-effort boundary, neve
     pass
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.research.repository import ResearchRepository
 from app.tools import TOOL_DISCOVERY_REGISTRY, ToolDiscovery
 
 try:
@@ -607,7 +608,7 @@ DEFAULT_CONCURRENCY = 3
 def _parse_concurrency(raw: str | None) -> int:
     try:
         value = int(raw or "")
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         raise ValueError("STOCKBOT_VERIFY_CONCURRENCY must be an integer >= 1")
     if value < 1:
         raise ValueError("STOCKBOT_VERIFY_CONCURRENCY must be an integer >= 1")
@@ -779,7 +780,7 @@ def _call_arg_as_of(arguments: str) -> str:
     """as_of cutoff from tool arguments_json (YYYY-MM-DD or '')."""
     try:
         payload = json.loads(arguments or "")
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return ""
     return _payload_as_of(payload)
 
@@ -889,7 +890,7 @@ def _evidence_known_at(text: str) -> str:
     found: list[str] = []
     try:
         packet = json.loads(text)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         packet = None
     if isinstance(packet, (dict, list)):
         date = _extract_known_at(packet)
@@ -2288,6 +2289,7 @@ def _tally_telemetry_rows(tel: Telemetry, rows: list[tuple[object, ...]]) -> lis
 
 
 def collect_telemetry(db_path: Path, run_id: str | None = None) -> Telemetry:
+    """Legacy recorder-DB telemetry reader; the live path uses _kernel_telemetry."""
     tel: Telemetry = {
         "search_count": 0,
         "browse_count": 0,
@@ -2315,11 +2317,6 @@ def collect_telemetry(db_path: Path, run_id: str | None = None) -> Telemetry:
         conn.close()
 
 
-def _latest_run_id(conn: sqlite3.Connection) -> str | None:
-    rows = _q(conn, "SELECT run_id FROM agent_runs ORDER BY started_at DESC LIMIT 1")
-    return str(rows[0][0]) if rows and rows[0][0] else None
-
-
 def _truncate_evidence(text: str, limit: int = 200000) -> str:
     """Cap evidence text with an explicit truncation marker."""
     return text[:limit] + ("[...truncated]" if len(text) > limit else "")
@@ -2328,7 +2325,7 @@ def _truncate_evidence(text: str, limit: int = 200000) -> str:
 def _load_evidence(
     conn: sqlite3.Connection, filt: str, args: tuple[str, ...]
 ) -> tuple[dict[str, str], dict[str, list[str]]]:
-    """(evidence texts, per-call known_at dates) for one run."""
+    """Legacy (evidence texts, per-call known_at dates) for one recorder run."""
     ev_texts: dict[str, str] = {}
     ev_known: dict[str, list[str]] = {}
     for tc_id, rendered in _q(conn, f"SELECT tool_call_id, rendered_text FROM evidence {filt}", args):
@@ -2340,6 +2337,62 @@ def _load_evidence(
         if date:
             ev_known.setdefault(str(tc_id), []).append(date)
     return ev_texts, ev_known
+
+
+def _attach_evidence_calls(trace: Trace, conn: sqlite3.Connection, filt: str, args: tuple[str, ...]) -> None:
+    """Legacy evidence/call split; the live path uses _kernel_calls."""
+    ev_texts, ev_known = _load_evidence(conn, filt, args)
+    rows = _q(
+        conn,
+        f"SELECT tool_call_id, tool_name, status, error_type,"
+        f" source_names, truncated, error_message FROM tool_calls {filt}",
+        args,
+    )
+    calls, discovery_texts = _split_calls(rows, ev_texts, ev_known)
+    trace["research_calls"] = calls
+    trace["evidence_kinds"] = _evidence_kinds_of(calls)
+    trace["evidence_texts"] = ev_texts
+    trace["discovery_texts"] = discovery_texts
+
+
+def _latest_run_id(conn: sqlite3.Connection) -> str | None:
+    """Legacy latest recorder run id; the live path reads the attempt research DB."""
+    rows = _q(conn, "SELECT run_id FROM agent_runs ORDER BY started_at DESC LIMIT 1")
+    return str(rows[0][0]) if rows and rows[0][0] else None
+
+
+def _read_run_id(db_path: Path) -> str | None:
+    """Legacy latest run id from the attempt DB, None on any sqlite error."""
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return _latest_run_id(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def _run_statuses(conn: sqlite3.Connection, filt: str, args: tuple[str, ...]) -> list[str]:
+    """Legacy recorder run statuses; the live path reads session status."""
+    return [str(r[0] or "") for r in _q(conn, f"SELECT status FROM agent_runs {filt}", args)]
+
+
+def _mark_terminal(trace: Trace, conn: sqlite3.Connection, filt: str, args: tuple[str, ...]) -> None:
+    """Legacy terminal flag from recorder statuses; the live path uses sessions."""
+    statuses = _run_statuses(conn, filt, args)
+    trace["terminal"] = bool(statuses) and all(s == "completed" for s in statuses)
+
+
+def _assemble_trace(conn: sqlite3.Connection, trace: Trace, db_path: Path, run_id: str | None) -> Trace:
+    """Legacy recorder-DB trace assembly; the live path uses _kernel_trace."""
+    filt = "WHERE run_id = ?" if run_id else ""
+    args = (run_id,) if run_id else ()
+    _mark_terminal(trace, conn, filt, args)
+    trace["telemetry"] = collect_telemetry(db_path, run_id)
+    _attach_evidence_calls(trace, conn, filt, args)
+    _attach_security(trace, conn, filt, args)
+    return trace
 
 
 def _first_source(sources: object) -> str:
@@ -2466,56 +2519,290 @@ def _attach_security(trace: Trace, conn: sqlite3.Connection, filt: str, args: tu
     trace["capability_violations"] = _denied_security_reasons(sec_rows) + _capability_error_reasons(cap_rows)
 
 
-def _run_statuses(conn: sqlite3.Connection, filt: str, args: tuple[str, ...]) -> list[str]:
-    return [str(r[0] or "") for r in _q(conn, f"SELECT status FROM agent_runs {filt}", args)]
-
-
-def _mark_terminal(trace: Trace, conn: sqlite3.Connection, filt: str, args: tuple[str, ...]) -> None:
-    """Terminal flag from agent_runs statuses."""
-    statuses = _run_statuses(conn, filt, args)
-    trace["terminal"] = bool(statuses) and all(s == "completed" for s in statuses)
-
-
 def _evidence_kinds_of(calls: list[ResearchCall]) -> list[str]:
     return sorted({c.get("output_kind", "") for c in calls if c.get("success") and c.get("output_kind")})
 
 
-def _attach_evidence_calls(trace: Trace, conn: sqlite3.Connection, filt: str, args: tuple[str, ...]) -> None:
-    """Evidence texts plus research/discovery call split."""
-    ev_texts, ev_known = _load_evidence(conn, filt, args)
-    rows = _q(
-        conn,
-        f"SELECT tool_call_id, tool_name, status, error_type,"
-        f" source_names, truncated, error_message FROM tool_calls {filt}",
-        args,
-    )
-    calls, discovery_texts = _split_calls(rows, ev_texts, ev_known)
+def _session_terminal(repo: ResearchRepository, session_id: str) -> bool:
+    """Terminal flag from the attempt session status."""
+    try:
+        sess = repo.get_session(session_id)
+    except KeyError:
+        return False
+    return sess.status == "completed"
+
+
+def _known_at_of(record: object) -> str:
+    """Knowability date from one kernel evidence record."""
+    items: list[object] = [record]
+    meta = record.get("metadata") if isinstance(record, dict) else None
+    if isinstance(meta, dict):
+        items.append(meta)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in ("known_at", "filed_at", "filing_date", "published_at"):
+            value = item.get(key)
+            if isinstance(value, str):
+                match = _DATE_RE.search(value)
+                if match:
+                    return match.group(0)
+    text = record if isinstance(record, str) else json.dumps(record, sort_keys=True, default=str)
+    return _evidence_known_at(text)
+
+
+def _evidence_text_of(record: object) -> str:
+    """Model-visible text for one kernel evidence record."""
+    if isinstance(record, dict):
+        for key in ("content", "claim_text", "matching_passage", "record_identity"):
+            value = record.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return json.dumps(record, sort_keys=True, default=str)
+
+
+def _evidence_call_tool(record: Mapping[str, object]) -> str:
+    """Tool name for one evidence record: direct fields, then provenance, then default."""
+    tool = str(record.get("tool_name") or record.get("tool") or "")
+    if not tool:
+        provenance = record.get("provenance")
+        if isinstance(provenance, dict):
+            tool = str(provenance.get("tool_name") or "")
+    return tool or "evidence"
+
+
+def _evidence_call_domain(record: Mapping[str, object], tool: str) -> str:
+    """Domain for one evidence call: provenance evidence_domain, else registry field."""
+    domain = ""
+    provenance = record.get("provenance")
+    if isinstance(provenance, dict):
+        from app.research.evidence import evidence_domain
+
+        domain = evidence_domain(provenance)
+    if not domain or domain == "SOURCE":
+        domain = _registry_field(_registry_meta(tool), "domain")
+    return domain
+
+
+def _evidence_research_call(record: Mapping[str, object], tool: str, ev_known: dict[str, list[str]]) -> ResearchCall:
+    """ResearchCall for one non-discovery evidence record."""
+    meta = _registry_meta(tool)
+    _domain, output_kind = _research_call_fields(tool, meta)
+    evidence_id = str(record.get("evidence_id") or "")
+    return {
+        "tool": tool,
+        "success": True,
+        "domain": _evidence_call_domain(record, tool),
+        "source": _call_source(record.get("source_name") or record.get("source"), meta),
+        "known_at": max(ev_known.get(evidence_id, []), default=""),
+        "limitations": [],
+        "output_kind": output_kind,
+        "tool_call_id": evidence_id,
+    }
+
+
+def _evidence_calls(
+    repo: ResearchRepository, session_id: str, ev_known: dict[str, list[str]]
+) -> tuple[list[ResearchCall], list[str]]:
+    """Research calls plus discovery texts from attempt evidence rows."""
+    calls: list[ResearchCall] = []
+    discovery_texts: list[str] = []
+    for record in repo.list_evidence(session_id):
+        if not isinstance(record, dict):
+            continue
+        tool = _evidence_call_tool(record)
+        if tool in DISCOVERY_TOOLS or str(record.get("record_kind") or "evidence") == "discovery":
+            discovery_texts.append(_truncate_evidence(_evidence_text_of(record)))
+            continue
+        calls.append(_evidence_research_call(record, tool, ev_known))
+    return calls, discovery_texts
+
+
+def _tool_result_call(row: Mapping[str, object], ev_known: dict[str, list[str]]) -> ResearchCall | None:
+    """ResearchCall for one tool-result row; None when it duplicates an evidence call."""
+    tool = str(row.get("tool_name") or "")
+    if not tool or tool in DISCOVERY_TOOLS:
+        return None
+    meta = _registry_meta(tool)
+    domain, output_kind = _research_call_fields(tool, meta)
+    rid = str(row.get("tool_result_id") or "")
+    return {
+        "tool": tool,
+        "success": True,
+        "domain": domain,
+        "source": _call_source("", meta),
+        "known_at": max(ev_known.get(rid, []), default=""),
+        "limitations": [],
+        "output_kind": output_kind,
+        "tool_call_id": rid,
+    }
+
+
+def _has_evidence_call(calls: list[ResearchCall], tool: str) -> bool:
+    """True when an evidence call already covers this tool with an ID."""
+    return any(call.get("tool") == tool and call.get("tool_call_id") for call in calls)
+
+
+def _kernel_calls(
+    repo: ResearchRepository, session_id: str, ev_known: dict[str, list[str]]
+) -> tuple[list[ResearchCall], list[str]]:
+    """Research calls plus discovery texts from attempt evidence/tool results."""
+    calls, discovery_texts = _evidence_calls(repo, session_id, ev_known)
+    for row in repo.list_tool_results(session_id):
+        if not isinstance(row, dict):
+            continue
+        call = _tool_result_call(row, ev_known)
+        if call is None or _has_evidence_call(calls, str(call["tool"])):
+            continue
+        calls.append(call)
+    return calls, discovery_texts
+
+
+def _record_known_at(ev_known: dict[str, list[str]], key: str, record: object) -> None:
+    """Append the knowability date for one record when present."""
+    date = _known_at_of(record)
+    if date:
+        ev_known.setdefault(key, []).append(date)
+
+
+def _evidence_row_texts(
+    repo: ResearchRepository, session_id: str, ev_texts: dict[str, str], ev_known: dict[str, list[str]]
+) -> None:
+    """Evidence texts plus dates from attempt evidence rows."""
+    for record in repo.list_evidence(session_id):
+        if not isinstance(record, dict):
+            continue
+        evidence_id = record.get("evidence_id")
+        if not isinstance(evidence_id, str) or not evidence_id:
+            continue
+        ev_texts[evidence_id] = _truncate_evidence(_evidence_text_of(record))
+        _record_known_at(ev_known, evidence_id, record)
+
+
+def _tool_result_texts(
+    repo: ResearchRepository, session_id: str, ev_texts: dict[str, str], ev_known: dict[str, list[str]]
+) -> None:
+    """Evidence texts plus dates from tool results missing an evidence row."""
+    for row in repo.list_tool_results(session_id):
+        if not isinstance(row, dict):
+            continue
+        rid = row.get("tool_result_id")
+        if not isinstance(rid, str) or not rid or rid in ev_texts:
+            continue
+        ev_texts[rid] = _truncate_evidence(json.dumps(row.get("result", row), sort_keys=True, default=str))
+        _record_known_at(ev_known, rid, row)
+
+
+def _kernel_evidence(repo: ResearchRepository, session_id: str) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Evidence texts plus known_at dates from the attempt research DB."""
+    ev_texts: dict[str, str] = {}
+    ev_known: dict[str, list[str]] = {}
+    _evidence_row_texts(repo, session_id, ev_texts, ev_known)
+    _tool_result_texts(repo, session_id, ev_texts, ev_known)
+    return ev_texts, ev_known
+
+
+def _kernel_telemetry(repo: ResearchRepository, session_id: str) -> Telemetry:
+    """Telemetry from attempt tool results and evidence counts."""
+    tel: Telemetry = {
+        "search_count": 0,
+        "browse_count": 0,
+        "candidate_count": 0,
+        "research_count": 0,
+        "failed_calls": 0,
+        "retries": 0,
+    }
+    names: list[str] = []
+    for row in repo.list_tool_results(session_id):
+        if isinstance(row, dict) and isinstance(row.get("tool_name"), str):
+            names.append(str(row.get("tool_name")))
+    for record in repo.list_evidence(session_id):
+        if isinstance(record, dict):
+            names.append(str(record.get("tool_name") or record.get("tool") or "evidence"))
+    for name in names:
+        _tally_kind(tel, name, None)
+    tel["retries"] = max(0, len(names) - len(set(names)))
+    return tel
+
+
+def _kernel_trace(repo: ResearchRepository, trace: Trace, session_id: str) -> Trace:
+    """Fill research/evidence/security sections from the attempt research DB."""
+    ev_texts, ev_known = _kernel_evidence(repo, session_id)
+    calls, discovery_texts = _kernel_calls(repo, session_id, ev_known)
+    trace["terminal"] = _session_terminal(repo, session_id)
+    trace["telemetry"] = _kernel_telemetry(repo, session_id)
     trace["research_calls"] = calls
     trace["evidence_kinds"] = _evidence_kinds_of(calls)
     trace["evidence_texts"] = ev_texts
     trace["discovery_texts"] = discovery_texts
-
-
-def _assemble_trace(conn: sqlite3.Connection, trace: Trace, db_path: Path, run_id: str | None) -> Trace:
-    """Fill research/evidence/security sections for one run."""
-    filt = "WHERE run_id = ?" if run_id else ""
-    args = (run_id,) if run_id else ()
-    _mark_terminal(trace, conn, filt, args)
-    trace["telemetry"] = collect_telemetry(db_path, run_id)
-    _attach_evidence_calls(trace, conn, filt, args)
-    _attach_security(trace, conn, filt, args)
+    trace["tool_args"] = {}
+    trace["private_transmissions"] = []
+    trace["capability_violations"] = []
     return trace
 
 
-def build_trace(db_path: Path, scenario: Scenario, answer_text: str = "") -> Trace:
-    """Build the evaluator trace for one attempt DB.
+def _walk_to_completed(repo: ResearchRepository, session_id: str) -> None:
+    """Walk the session forward to COMPLETED along legal edges; never invents a jump."""
+    from app.research import session as _session
+    from app.research.models import SessionStatus
+
+    order = (
+        SessionStatus.PLANNING,
+        SessionStatus.RESEARCHING,
+        SessionStatus.FREEZING,
+        SessionStatus.ANALYZING,
+        SessionStatus.SYNTHESIZING,
+        SessionStatus.COMPLETED,
+    )
+    for _ in range(8):
+        progressed = False
+        for target in order:
+            cur = repo.get_session(session_id)
+            if cur.status in ("failed", "completed", "cancelled"):
+                return
+            if cur.status == target.value:
+                continue
+            try:
+                repo.save_session(_session.transition_session(cur, target))
+                progressed = True
+                break
+            except ValueError:
+                continue
+        if not progressed:
+            return
+
+
+def _store_empty_terminal(repo: ResearchRepository, session_id: str) -> None:
+    """Persist a durable COMPLETED no-evidence result with limitations text."""
+    from dataclasses import replace
+
+    from app.research.models import utcnow, validate_json_mapping
+
+    empty = validate_json_mapping(
+        {
+            "answer": (
+                "No PIT-eligible evidence was found; the question cannot be answered "
+                "from the allowed sources within the session scope. Limitations: "
+                "searched-source scope, as_of-filtered corpus."
+            ),
+            "freeze_id": "",
+            "claims": [],
+        },
+        "<verify_judge>: 'final_result'",
+    )
+    cur = repo.get_session(session_id)
+    cur = replace(cur, final_result=empty, updated_at=utcnow())
+    repo.save_session(cur)
+    _walk_to_completed(repo, session_id)
+
+
+def build_trace(store_dir: Path, scenario: Scenario, answer_text: str = "") -> Trace:
+    """Build the evaluator trace from the attempt research DB.
 
     final_answer comes ONLY from the caller-supplied terminal answer text
-    (kernel attempt output), persisted redacted via persist_answer — never from
-    final_answer_hash, which is unidirectional. known_at is parsed from
-    evidence content (rendered_text JSON knowability dates) plus tool result
-    freshness metadata — never from the as_of columns, which echo the query
-    cutoff. Evidence texts load per run into evidence_texts for grounding.
+    (kernel attempt output), persisted redacted via persist_answer. Terminal
+    state, research calls, evidence texts, and tool results all read the same
+    attempt research DB the producer wrote — never agent_runs in runs.sqlite.
     """
     trace: Trace = {
         "terminal": False,
@@ -2523,25 +2810,29 @@ def build_trace(db_path: Path, scenario: Scenario, answer_text: str = "") -> Tra
         "capability_violations": [],
         "private_transmissions": [],
         "final_answer": answer_text or "",
-        "telemetry": collect_telemetry(db_path),
+        "telemetry": {
+            "search_count": 0,
+            "browse_count": 0,
+            "candidate_count": 0,
+            "research_count": 0,
+            "failed_calls": 0,
+            "retries": 0,
+        },
         "scenario": scenario,
         "evidence_kinds": [],
         "evidence_texts": {},
     }
     try:
-        conn = sqlite3.connect(str(db_path))
-    except sqlite3.Error:
+        repo = ResearchRepository(data_root=store_dir)
+        session_id = _latest_session_id(repo)
+    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+        return trace
+    if session_id is None:
         return trace
     try:
-        # NOTE: source_freshness carries retrieval dates (retrieved_at first),
-        # so a 2023 filing fetched in 2026 would read known_at=2026 and
-        # false-fail. It is never a PIT input — known_at comes only from
-        # evidence-content availability extraction (or a dedicated recorded
-        # known_at); missing stays missing and takes the
-        # incomplete-coverage path.
-        return _assemble_trace(conn, trace, db_path, _latest_run_id(conn))
-    finally:
-        conn.close()
+        return _kernel_trace(repo, trace, session_id)
+    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+        return trace
 
 
 # --------------------------------------------------------------------------
@@ -2627,22 +2918,73 @@ def _attempt_dirs(batch_root: Path, tool: str, attempt: int, retry: int = 0) -> 
     return attempt_dir / "runs.sqlite", attempt_dir / "store"
 
 
+def _kernel_repo(store_dir: Path) -> ResearchRepository:
+    """Research repository rooted at the per-attempt store."""
+    return ResearchRepository(data_root=store_dir)
+
+
+def _close_attempt_jobs(repo: ResearchRepository, sid: str) -> None:
+    """Cancel queued/running jobs so the attempt leaves no open work."""
+    from app.research import service
+
+    for job in repo.list_jobs(sid):
+        if job.status in ("queued", "running"):
+            service.cancel_job(job.job_id, repo=repo)
+
+
+def _kernel_final_answer(repo: ResearchRepository, sid: str) -> str:
+    """Terminal answer from the attempt session final_result; '' when absent."""
+    try:
+        final = repo.get_session(sid).final_result or {}
+    except KeyError:
+        return ""
+    answer = final.get("answer") if isinstance(final, dict) else None
+    return answer if isinstance(answer, str) else ""
+
+
+def _attempt_invoke(
+    data_root: Path,
+) -> object:
+    """Tool invoke bound to the per-attempt store (thesis + research reads stay isolated)."""
+    from functools import partial
+
+    from app.tool_runtime import execute_agent_tool
+
+    return partial(execute_agent_tool, data_root=data_root)
+
+
 def _run_kernel_attempt(
     prompt: str, db_path: Path, cwd: Path, stockbot_store: Path | None = None
 ) -> tuple[int, bool, str, str, bool]:
-    """Run one scenario attempt through the shared graph fan-out (no Pi subprocess)."""
+    """Run one scenario attempt through create_research + node + run_node."""
     import asyncio
 
-    from app.research import scheduler
-    from app.research.kernel_worker import run_graph_prompt
+    from app.decision_client import JevClient
+    from app.research import scheduler, service
 
-    _ = (db_path, cwd, stockbot_store)  # isolation is per-batch-root, not per-process
+    _ = (db_path, cwd)  # recorder DB path rides alongside; research state lives in the attempt store
+    store_dir = Path(stockbot_store).resolve() if stockbot_store is not None else Path.cwd()
+    store_dir.mkdir(parents=True, exist_ok=True)
+    repo = _kernel_repo(store_dir)
     try:
-        sid = run_graph_prompt(prompt, None)
-        asyncio.run(scheduler.run(sid))
+        sid = service.create_research(prompt, prompt, as_of=None, repo=repo)
+        node = service.create_node(sid, prompt, "Route question.", repo=repo)
+        try:
+            jev = JevClient(data_root=store_dir)
+            try:
+                asyncio.run(
+                    scheduler.run_node(node, session_id=sid, repo=repo, jev=jev, invoke=_attempt_invoke(store_dir))
+                )
+            finally:
+                jev.close()
+        finally:
+            _close_attempt_jobs(repo, sid)
+        if not repo.list_evidence(sid):
+            _store_empty_terminal(repo, sid)
+        answer = _kernel_final_answer(repo, sid)
+        return 0, False, answer, "", bool(answer.strip())
     except Exception as exc:  # noqa: BLE001 - the verdict reports the crash, never hides it
         return 1, False, "", str(exc), False
-    return 0, False, prompt, "", True
 
 
 def _seeded_prompt(scenario: Scenario, store_dir: Path, prompt: str) -> tuple[str, dict[str, object] | None]:
@@ -2678,11 +3020,11 @@ def _as_db_path(value: object) -> Path:
 
 def _run_attempts(
     scenario: Scenario, batch_root: Path, cwd: Path, index: int, run_attempt: _RunAttempt, attempt_dirs: _AttemptDirs
-) -> tuple[Path, bool, str, int | dict[str, object]]:
-    """Kernel attempts with one retry on timeout; (db_path, timed_out, out, code)."""
+) -> tuple[Path, bool, str, str, int | dict[str, object]]:
+    """Kernel attempts with one retry on timeout; (db_path, timed_out, out, err, code)."""
     prompt = scenario["prompt"]
     code: int | dict[str, object] = 1
-    timed_out, out_text = False, ""
+    timed_out, out_text, err_text = False, "", ""
     db_path = _as_db_path(attempt_dirs(batch_root, f"agent-{scenario['id']}", index)[0])
     for attempt in (1, 2):
         db_path, store_dir = attempt_dirs(batch_root, f"agent-{scenario['id']}", index, retry=attempt - 1)
@@ -2692,29 +3034,34 @@ def _run_attempts(
             attempt_prompt, err = _seeded_prompt(scenario, store_dir, prompt)
             if err is not None:
                 err["db"] = str(db_path)
-                return db_path, False, "", err
-        exit_code, timed_out, out_text, _err, _saw_complete = run_attempt(attempt_prompt, db_path, cwd, store_dir)
+                return db_path, False, "", "", err
+        exit_code, timed_out, out_text, err_text, _saw_complete = run_attempt(attempt_prompt, db_path, cwd, store_dir)
         code = exit_code
         if not timed_out:
             break
-    return db_path, timed_out, out_text, code
+    return db_path, timed_out, out_text, err_text, code
 
 
-def _read_run_id(db_path: Path) -> str | None:
-    """Latest run id from the attempt DB, None on any sqlite error."""
+def _latest_session_id(repo: ResearchRepository) -> str | None:
+    """Newest session id from the attempt store, None when empty."""
+    sessions = repo.list_sessions(limit=1)
+    if not sessions:
+        return None
+    session_id = sessions[0].get("session_id") if isinstance(sessions[0], dict) else None
+    return session_id if isinstance(session_id, str) and session_id else None
+
+
+def _read_session_id(store_dir: Path) -> str | None:
+    """Latest session id from the attempt store, None on any storage error."""
     try:
-        conn = sqlite3.connect(str(db_path))
-        try:
-            return _latest_run_id(conn)
-        finally:
-            conn.close()
-    except sqlite3.Error:
+        return _latest_session_id(ResearchRepository(data_root=store_dir))
+    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
         return None
 
 
-def _evaluate_live(scenario: Scenario, answer_text: str, db_path: Path) -> tuple[bool, str]:
-    """Evaluate the persisted terminal answer for one live attempt."""
-    trace = build_trace(db_path, scenario, answer_text)
+def _evaluate_live(scenario: Scenario, answer_text: str, store_dir: Path) -> tuple[bool, str]:
+    """Evaluate the persisted terminal answer from the attempt research DB."""
+    trace = build_trace(store_dir, scenario, answer_text)
     evaluator = EVALUATORS.get(scenario["evaluator"])
     if evaluator is None:
         return False, f"unknown evaluator: {scenario['evaluator']}"
@@ -2730,17 +3077,26 @@ def _live_result_dict(
     db_path: object,
     answer_file: object,
     start: float,
+    err_text: str = "",
 ) -> dict[str, object]:
-    return {
+    result: dict[str, object] = {
         "id": scenario["id"],
         "ok": ok,
-        "reason": reason,
+        "reason": f"{reason} (attempt error: {err_text[:500]})" if err_text.strip() and not ok else reason,
         "exit": code,
         "timed_out": timed_out,
         "db": str(db_path),
         "answer_file": str(answer_file) if answer_file else None,
         "duration_s": time.monotonic() - start,
     }
+    if err_text.strip():
+        result["attempt_error"] = err_text[:2000]
+    return result
+
+
+def _store_dir_of(db_path: Path) -> Path:
+    """Attempt store directory beside the recorder DB."""
+    return db_path.parent / "store"
 
 
 def run_scenario_live(scenario: Scenario, batch_root: Path, cwd: Path, index: int) -> dict[str, object]:
@@ -2750,17 +3106,20 @@ def run_scenario_live(scenario: Scenario, batch_root: Path, cwd: Path, index: in
     the pre-seeded thesis ID as run context (see SEEDED_THESIS_SCENARIOS).
     """
     start = time.monotonic()
-    db_path, timed_out, out_text, code = _run_attempts(
+    db_path, timed_out, out_text, err_text, code = _run_attempts(
         scenario, batch_root, cwd, index, _run_kernel_attempt, _attempt_dirs
     )
     if isinstance(code, dict):
         code["duration_s"] = time.monotonic() - start
         return code
     answer_text = (out_text or "").strip()
-    run_id = _read_run_id(db_path)
-    answer_file = persist_answer(db_path, run_id, scenario["id"], answer_text)
-    ok, reason = _evaluate_live(scenario, answer_text, db_path)
-    return _live_result_dict(scenario, ok, reason, code, timed_out, db_path, answer_file, start)
+    store_dir = _store_dir_of(db_path)
+    session_id = _read_session_id(store_dir)
+    answer_file = persist_answer(db_path, session_id, scenario["id"], answer_text)
+    ok, reason = _evaluate_live(scenario, answer_text, store_dir)
+    summary = f"{reason} (attempt error: {err_text[:500]})" if err_text.strip() and not ok else reason
+    print(f"{'PASS' if ok else 'FAIL'} {scenario['id']}: {summary}", file=sys.stderr)
+    return _live_result_dict(scenario, ok, reason, code, timed_out, db_path, answer_file, start, err_text)
 
 
 def _self_check_ontology() -> tuple[set[str], set[str], set[str]]:

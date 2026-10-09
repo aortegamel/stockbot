@@ -17,7 +17,6 @@ from operator import itemgetter
 
 from ._guards import as_dict, as_int, as_list, as_str_list
 
-
 _PERIOD_KEYS = ("source_period", "period", "week", "observed_at", "date")
 _GEO_KEYS = ("geo", "geography")
 _RANK_KEYS = ("rank", "position")
@@ -437,5 +436,3 @@ def normalize_candidate(
 
 
 # Seam: ephemeral per-collection compute via collect_trends + normalization; caller logs to the run bundle + raw_archive; NOTE: warehouse slots behind live readers.
-
-

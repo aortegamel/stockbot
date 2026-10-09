@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import override
 
+import httpx2
 import pandas as pd
 import pytest
 from edgar import Company as _RealCompany
@@ -1353,12 +1354,12 @@ def test_edgar_dividend_valuation_arms(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_edgar_fact_field_and_copy_meta_arms():
-    row: pd.Series[float] = pd.Series({"accession": "", "accn": "A1", "form": "10-K", "filed": "bad-nan"})
+    row: pd.Series[str] = pd.Series({"accession": "", "accn": "A1", "form": "10-K", "filed": "bad-nan"}, dtype=object)
     assert ec._fact_field(row, "accession", "accn") == "A1"
     assert ec._fact_field(row, "missing") is None
 
-    def _boom_row() -> pd.Series[float]:
-        s: pd.Series[float] = pd.Series({"accn": "A1"})
+    def _boom_row() -> pd.Series[str]:
+        s: pd.Series[str] = pd.Series({"accn": "A1"}, dtype=object)
 
         def _raise(key: object, default: object = None) -> object:
             raise RuntimeError("x")
@@ -1366,10 +1367,12 @@ def test_edgar_fact_field_and_copy_meta_arms():
         s.__dict__["get"] = _raise
         return s
 
-    assert ec._fact_field(_boom_row(), "a") is None
-    meta = ec._copy_fact_meta(pd.Series({"accn": "A1", "filed_at": "2024-01-01", "form": "4"}))
+    with pytest.raises(RuntimeError, match="^x$"):
+        ec._fact_field(_boom_row(), "a")
+    meta = ec._copy_fact_meta(pd.Series({"accn": "A1", "filed_at": "2024-01-01", "form": "4"}, dtype=object))
     assert meta == {"accession": "A1", "form": "4", "filed": "2024-01-01"}
-    assert ec._copy_fact_meta(_boom_row()) == {}
+    with pytest.raises(RuntimeError, match="^x$"):
+        ec._copy_fact_meta(_boom_row())
 
 
 def test_edgar_fundamentals_overview_shares_arms(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1573,7 +1576,8 @@ def test_edgar_balance_helpers_arms():
     setattr(fin_boom, "get_latest", _get_latest_boom)  # noqa: B010 - test double: setattr keeps the fake invisible to the checker
     assert ec._balance_sheet_stmt(fin_none) == "BS"
     assert ec._balance_sheet_text(fin_ok_inner) == {"a": 1}
-    assert ec._balance_sheet_text(fin_boom)["raw"] is not None
+    with pytest.raises(RuntimeError, match="^x$"):
+        ec._balance_sheet_text(fin_boom)
     assert "error" in ec._fundamentals_balance("T", _company(financials=None)("T"), None, None)
     got = ec._fundamentals_balance("T", _company(financials=fin_ok)("T"), "1", "http://u")
     assert got["balance_sheet"] == {"a": 1} and got["source_url"] == "http://u"
@@ -1640,35 +1644,59 @@ def test_edgar_get_fundamentals_dividend_arms(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_edgar_resolve_ticker_arms(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert ec._resolve_issuer_ticker(1) is None or isinstance(ec._resolve_issuer_ticker(1), (str, type(None)))
+    calls: list[int] = []
 
-    def _f928_86(cik: object) -> object:
+    def _company_with_tickers(cik: int) -> SimpleNamespace:
+        calls.append(cik)
         return SimpleNamespace(tickers=["AAA", "BBB"])
 
-    monkeypatch.setattr(ec, "Company", _f928_86)
-    getattr(ec.cache, "store").clear()  # noqa: B009 - cache type lacks store statically; getattr keeps pyrefly-0
+    monkeypatch.setattr(ec, "Company", _company_with_tickers)
     assert ec._resolve_issuer_ticker(123) == "AAA"
-    assert ec._resolve_issuer_ticker(123) == "AAA"  # cache hit arm
-    getattr(ec.cache, "store").clear()  # noqa: B009 - cache type lacks store statically; getattr keeps pyrefly-0
+    assert ec._resolve_issuer_ticker(123) == "AAA"
+    assert calls == [123]
 
-    def _f933_87(cik: object) -> object:
+    def _company_without_tickers(cik: int) -> SimpleNamespace:
         return SimpleNamespace(tickers=[])
 
-    monkeypatch.setattr(ec, "Company", _f933_87)
-    assert ec._resolve_issuer_ticker(123) is None
+    monkeypatch.setattr(ec, "Company", _company_without_tickers)
+    assert ec._resolve_issuer_ticker(124) is None
 
-    def _f935_88(cik: object) -> object:
-        raise RuntimeError("x")
+    request = httpx2.Request("GET", "https://data.sec.gov/submissions/CIK0000000001.json")
+    failure = httpx2.HTTPStatusError(
+        "404 Not Found",
+        request=request,
+        response=httpx2.Response(404, request=request),
+    )
 
-    monkeypatch.setattr(ec, "Company", _f935_88)
-    getattr(ec.cache, "store").clear()  # noqa: B009 - cache type lacks store statically; getattr keeps pyrefly-0
-    assert ec._resolve_issuer_ticker(123) is None
+    def _company_failure(cik: int) -> SimpleNamespace:
+        raise failure
+
+    monkeypatch.setattr(ec, "Company", _company_failure)
+    with pytest.raises(httpx2.HTTPStatusError, match="404 Not Found") as raised:
+        ec._resolve_issuer_ticker(1)
+    assert raised.value is failure
+
+    runtime_failure = RuntimeError("x")
+
+    def _company_runtime_failure(cik: int) -> SimpleNamespace:
+        raise runtime_failure
+
+    monkeypatch.setattr(ec, "Company", _company_runtime_failure)
+    with pytest.raises(RuntimeError, match="^x$") as runtime_raised:
+        ec._resolve_issuer_ticker(125)
+    assert runtime_raised.value is runtime_failure
+
+    monkeypatch.setattr(ec, "Company", _company_with_tickers)
+    assert ec._resolve_issuer_ticker(1) == "AAA"
+    assert ec._resolve_issuer_ticker(125) == "AAA"
+    assert calls == [123, 1, 125]
 
 
 def _filing(**kw: object) -> Filing:
     from edgar import Filing as _FilingCls
 
-    doc = kw.pop("_doc", None)
+    missing_doc = object()
+    doc = kw.pop("_doc", missing_doc)
     url_override = kw.pop("filing_url", None)
     base: dict[str, object] = {
         "form": "SC 13D",
@@ -1679,7 +1707,7 @@ def _filing(**kw: object) -> Filing:
     base.update(kw)
 
     def _obj() -> object:
-        if doc is None:
+        if doc is missing_doc:
             raise RuntimeError("no doc")
         return doc
 
@@ -1702,8 +1730,15 @@ def _filing(**kw: object) -> Filing:
 
 def test_edgar_ownership_row_arms():
     f = _filing()
-    row = ec._ownership_feed_row(f)
-    assert row["note"] == "filing detail unavailable"
+    with pytest.raises(RuntimeError, match="^no doc$"):
+        ec._ownership_feed_row(f)
+    with pytest.raises(RuntimeError, match="^no doc$"):
+        ec._ownership_filing_doc(f)
+    assert ec._ownership_feed_row(_filing(_doc=None)) == {
+        "form": "SC 13D",
+        "filed": "2024-01-02",
+        "accession_no": "A1",
+    }
     doc = SimpleNamespace(
         reporting_persons=[SimpleNamespace(name="P1")],
         issuer_info=SimpleNamespace(name="Iss", cik="123"),
@@ -1713,17 +1748,27 @@ def test_edgar_ownership_row_arms():
     )
     f2 = _filing(_doc=doc)
     row = ec._ownership_feed_row(f2)
-    assert row["filers"] == ["P1"] and row["percent"] == 5.5 and row["shares"] == 100
+    assert row == {
+        "form": "SC 13D",
+        "filed": "2024-01-02",
+        "accession_no": "A1",
+        "filers": ["P1"],
+        "issuer": "Iss",
+        "issuer_cik": "123",
+        "percent": 5.5,
+        "shares": 100,
+        "event_date": "2024-01-01",
+    }
     assert ec._ownership_percent(SimpleNamespace(total_percent=None)) is None
     assert ec._ownership_percent(SimpleNamespace(total_percent="bad")) is None
     assert ec._ownership_shares(SimpleNamespace(total_shares=None)) is None
     assert ec._ownership_shares(SimpleNamespace(total_shares="bad")) is None
     _row3, doc3 = ec._ownership_filing_doc(_filing(_doc=doc))
     assert doc3 is doc
-    # pre-XML branch: detail raises -> note
+    assert _row3 == {"form": "SC 13D", "filed": "2024-01-02", "accession_no": "A1"}
     row4: dict[str, object] = {"filers": []}
     ec._ownership_doc_detail(row4, object())
-    assert row4["filers"] == [] or True
+    assert row4["filers"] == []
     row5: dict[str, object] = {}
     ec._ownership_doc_detail(
         row5,
@@ -1731,7 +1776,7 @@ def test_edgar_ownership_row_arms():
             reporting_persons=None, issuer_info=None, total_percent=None, total_shares=None, date_of_event=None
         ),
     )
-    assert row5["filers"] == [] or True
+    assert row5["filers"] == []
 
 
 def test_edgar_ownership_forms_limit_arms():
@@ -1766,12 +1811,24 @@ def test_edgar_ownership_fetch_arms(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(edgar_mod, "get_current_filings", _f1004_89)
 
-    def _f1005_90(cik: object) -> object:
-        return None
-
-    monkeypatch.setattr(ec, "_resolve_issuer_ticker", _f1005_90)
     got = ec._fetch_recent_ownership_filings("SC 13D", 10)
     assert got["count"] == 1
+    filings = got["filings"]
+    assert isinstance(filings, list)
+    assert filings == [
+        {
+            "form": "SC 13D",
+            "filed": "2024-01-02",
+            "accession_no": "A1",
+            "filers": ["C1"],
+            "event_date": None,
+        }
+    ]
+    with pytest.raises(RuntimeError, match="^feed down$"):
+        ec._ownership_form_rows(["SC 13D", "SC 13G"])
+    assert ec._fetch_recent_ownership_filings("both", 10) == {
+        "error": "No data found: error retrieving recent BOTH filings: feed down"
+    }
     # ticker attach ValueError arm
     f3 = SimpleNamespace(
         form="SC 13D",
@@ -1799,9 +1856,30 @@ def test_edgar_ownership_fetch_arms(monkeypatch: pytest.MonkeyPatch) -> None:
         raise RuntimeError("down")
 
     monkeypatch.setattr(edgar_mod, "get_current_filings", _f1015_92)
-    # all variants fail -> empty payload (no raise)
+    with pytest.raises(RuntimeError, match="^down$"):
+        ec._ownership_form_rows(["SC 13D", "SC 13G"])
+    assert ec._fetch_recent_ownership_filings("both", 10) == {
+        "error": "No data found: error retrieving recent BOTH filings: down"
+    }
+
+    def _empty_feed(form: object, page_size: object) -> list[Filing]:
+        return []
+
+    monkeypatch.setattr(edgar_mod, "get_current_filings", _empty_feed)
+    assert ec._ownership_form_rows(["SC 13D", "SC 13G"]) == []
     got = ec._fetch_recent_ownership_filings("both", 10)
     assert got["count"] == 0
+    assert got["filings"] == []
+
+    def _unparseable_feed(form: object, page_size: object) -> list[Filing]:
+        return [_filing()]
+
+    monkeypatch.setattr(edgar_mod, "get_current_filings", _unparseable_feed)
+    with pytest.raises(RuntimeError, match="^no doc$"):
+        ec._ownership_form_rows(["SC 13D"])
+    assert ec._fetch_recent_ownership_filings("SC 13D", 10) == {
+        "error": "No data found: error retrieving recent SC 13D filings: no doc"
+    }
 
 
 def test_edgar_earnings_arms(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1960,7 +2038,8 @@ def test_edgar_statements_arms(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ec._statement_text(_stmt_df) == "DF"
     assert ec._statement_text(_stmt_str) == "S"
     assert ec._statement_text("RAW") == "RAW"
-    assert ec._statement_text(_stmt_boom) is not None
+    with pytest.raises(RuntimeError, match="^x$"):
+        ec._statement_text(_stmt_boom)
 
     def _f1112_110(t: object) -> _RealCompany:
         return _company(financials=fin)("T")
@@ -3215,7 +3294,6 @@ def test_oblig_get_obligations_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     assert out["ticker"] == "AAA"
 
 
-
 def test_oblig_asof_helpers() -> None:
     assert O._archive_filing_text("AAA", _f(), "", archive=True) is None
     O._annotate_archive([], "AAA", _f(), "text", archive=False)
@@ -3671,8 +3749,6 @@ def test_val_fy_and_drag_helpers():
     assert val._next_scenario_tier_label("default", "2028") == "Scenario FY2028 (counterparty default)"
     assert val._period_eps({}) is None
     assert val._period_eps({"eps_avg": 3.0}) == 3.0
-    assert val._live_price_gap.__code__.co_argcount == 1
-    assert val._cached_metrics.__code__.co_argcount == 1
     assert val._ttm_eps({"ttm_eps_diluted": 2.0}) == 2.0
     assert val._ttm_eps({}) is None
     assert val._shares_from_estimates({"shares_outstanding": 5}) == 5
@@ -4134,7 +4210,9 @@ def test_norm_finra_helpers():
     assert norm._finra_short_position({"currentShortPositionQuantity": -5}) is None
     assert norm._finra_short_position({"currentShortPositionQuantity": 5}) == 5.0
     assert norm._finra_short_position({}) is None
-    row = norm._finra_row("2026-08-14", "2026-08-10T12:00:00Z", None, "h" * 20, "u", "sr", {"issueName": " Alpha "}, "AAA")
+    row = norm._finra_row(
+        "2026-08-14", "2026-08-10T12:00:00Z", None, "h" * 20, "u", "sr", {"issueName": " Alpha "}, "AAA"
+    )
     assert row["known_at"] == "2026-08-10T12:00:00Z" and row["issue_name"] == "Alpha"
     row2 = norm._finra_row("2026-08-14", "2026-08-10T12:00:00Z", "2026-08-10T12:00:00Z", "h" * 20, "u", "sr", {}, "AAA")
     assert row2["known_at"] == "2026-08-10T12:00:00Z" and row2["issue_name"] is None
@@ -4159,7 +4237,6 @@ def test_norm_finra_helpers():
         source_record_id="r",
     )
     assert len(out["short_interest"]) == 1 and out["short_interest"][0]["short_position"] is None
-
 
 
 def test_cli_format_mandate_value_and_breaches(capsys: pytest.CaptureFixture[str]) -> None:

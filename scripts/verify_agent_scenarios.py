@@ -288,7 +288,7 @@ def _extract_evidence_ids(out: dict[str, object]) -> tuple[str, ...]:
 
 def _answer_from_final(final: object) -> str | None:
     if isinstance(final, dict) and isinstance(final.get("answer"), str):
-        return str(final.get("answer"))
+        return final.get("answer")
     return None
 
 
@@ -465,7 +465,7 @@ def _live_trace(
         "raw_evidence_ids": tuple(eid for eid in evidence_ids if eid in raw_rows),
         "navigation_evidence_ids": _ledger_ids(repo, sid, "discovery"),
         "waves": freeze_ids,
-        "committee_freeze_ids": tuple(str(run) for run in getattr(sess, "committee_runs", ()) if isinstance(run, str)),
+        "committee_freeze_ids": tuple(run for run in getattr(sess, "committee_runs", ()) if isinstance(run, str)),
         "roles_completed": _completed_roles(jobs),
     }
 
@@ -501,16 +501,12 @@ def evaluate_and_record(
 def _close_bootstrap_jobs(sid: str) -> None:
     """Cancel bootstrap source jobs left running; a scenario run must not leak them."""
     from app.research import service
-
     from app.research.repository import ResearchRepository
 
     repo = ResearchRepository()
     for job in repo.list_jobs(sid):
         if job.status in ("queued", "running"):
-            try:
-                service.cancel_job(job.job_id)
-            except Exception:  # noqa: BLE001 - best-effort cleanup, never aborts
-                pass
+            service.cancel_job(job.job_id)
 
 
 def _run_kernel_scenario(

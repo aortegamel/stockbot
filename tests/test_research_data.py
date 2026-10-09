@@ -24,12 +24,16 @@ from app.services import research_data
 from app.services.research_data import prepare_short_interest_data
 from app.storage import raw_archive
 
-TICKERS_PAYLOAD = {
+TICKERS_PAYLOAD: dict[str, object] = {
     "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc"},
     "1": {"cik_str": 2488, "ticker": "AMD", "title": "Advanced Micro Devices"},
 }
 
 SETTLEMENT = "2026-08-14"
+
+
+def _no_sleep(seconds: float) -> None:
+    return None
 
 
 def _facts_payload(cik: int, val: int) -> dict[str, object]:
@@ -104,7 +108,7 @@ def _install_mocks(
         fake_ingestion_post_query,
     )
     monkeypatch.setattr(research_data, "_gateway", lambda: _NullGateway())
-    monkeypatch.setattr(research_data.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(research_data.time, "sleep", _no_sleep)
     return get_calls
 
 
@@ -152,7 +156,7 @@ class _ScreenGateway:
         return [a for a in self._aliases if a.alias_value == ticker.strip().upper()]
 
     def company_facts(self, cik: int, as_of: str | None = None) -> dict[str, object]:
-        datasets = self._facts.get(int(cik), {})
+        datasets = self._facts.get(cik, {})
         out: dict[str, object] = {name: list(rows) for name, rows in datasets.items()}
         if as_of is not None:
             for name in ("financial_facts", "dividend_events"):
@@ -169,7 +173,7 @@ def _install_screen(
     tickers_payload: dict[str, object] | None = None,
 ) -> None:
     """Stub the screens seams: normalized FINRA rows plus a gateway double."""
-    raw = [
+    raw: list[dict[str, object]] = [
         {
             "symbolCode": symbol,
             "issueName": symbol,
@@ -187,11 +191,13 @@ def _install_screen(
         source_record_id=f"otcMarket/consolidatedShortInterest:{SETTLEMENT}",
     )["short_interest"]
     rows = [row for row in typed if isinstance(row, dict)]
-    monkeypatch.setattr(screens, "_fetch_settlement_rows", lambda settlement: rows)
-    monkeypatch.setattr(
-        screens, "_gateway", lambda: _ScreenGateway(tickers_payload or TICKERS_PAYLOAD, facts_by_cik)
-    )
-    monkeypatch.setattr(screens.time, "sleep", lambda seconds: None)
+
+    def _settlement_rows(settlement: str) -> list[dict[str, object]]:
+        return rows
+
+    monkeypatch.setattr(screens, "_fetch_settlement_rows", _settlement_rows)
+    monkeypatch.setattr(screens, "_gateway", lambda: _ScreenGateway(tickers_payload or TICKERS_PAYLOAD, facts_by_cik))
+    monkeypatch.setattr(screens.time, "sleep", _no_sleep)
 
 
 def test_refresh_data_offline_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -429,22 +435,18 @@ def test_coverage_counters_truthful_with_invalid_short_interest(
     assert "Leaderboard entries: ['AAPL', 'AMD']" in out
 
 
-def test_refresh_sec_tickers_archives_and_returns_inline_counts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    monkeypatch.setattr(
-        research_data, "_edgar_get", lambda url: json.dumps(TICKERS_PAYLOAD).encode()
-    )
+def test_refresh_sec_tickers_archives_and_returns_inline_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def _tickers_get(url: str) -> bytes:
+        return json.dumps(TICKERS_PAYLOAD).encode()
+
+    monkeypatch.setattr(research_data, "_edgar_get", _tickers_get)
 
     result = research_data.refresh_sec_tickers(data_root=tmp_path)
 
     assert result["ticker_ciks"] == {"AAPL": 320193, "AMD": 2488}
     assert result["written"] == 0
     assert result["normalized_rows"] == 4  # entities + aliases
-    assert (
-        raw_archive.find("sec", "company_tickers", "company_tickers", root=tmp_path / "raw")
-        is not None
-    )
+    assert raw_archive.find("sec", "company_tickers", "company_tickers", root=tmp_path / "raw") is not None
 
 
 def test_ticker_candidates_reads_snapshot_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -458,14 +460,22 @@ def test_ticker_candidates_reads_snapshot_history(tmp_path: Path, monkeypatch: p
     old = {"0": {"cik_str": 111, "ticker": "AAA", "title": "Old AAA"}}
     new = {"0": {"cik_str": 222, "ticker": "AAA", "title": "New AAA"}}
     raw_archive.archive(
-        "sec", "company_tickers", "company_tickers", json.dumps(old).encode(),
+        "sec",
+        "company_tickers",
+        "company_tickers",
+        json.dumps(old).encode(),
         url="https://www.sec.gov/files/company_tickers.json",
-        retrieved_at="2024-05-01T00:00:00Z", root=tmp_path / "raw",
+        retrieved_at="2024-05-01T00:00:00Z",
+        root=tmp_path / "raw",
     )
     raw_archive.archive(
-        "sec", "company_tickers", "company_tickers", json.dumps(new).encode(),
+        "sec",
+        "company_tickers",
+        "company_tickers",
+        json.dumps(new).encode(),
         url="https://www.sec.gov/files/company_tickers.json",
-        retrieved_at="2026-05-01T00:00:00Z", root=tmp_path / "raw",
+        retrieved_at="2026-05-01T00:00:00Z",
+        root=tmp_path / "raw",
     )
     mid = datetime(2025, 6, 1, tzinfo=UTC)
     aliases = _ds.SourceGateway().ticker_candidates("AAA", mid)
@@ -475,11 +485,14 @@ def test_ticker_candidates_reads_snapshot_history(tmp_path: Path, monkeypatch: p
     late = datetime(2026, 6, 1, tzinfo=UTC)
     assert [a.entity_id for a in _ds.SourceGateway().ticker_candidates("AAA", late)] == ["sec:cik:0000000222"]
 
-def test_refresh_sec_company_facts_archives_and_returns_inline_counts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+
+def test_refresh_sec_company_facts_archives_and_returns_inline_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     payload = json.dumps(_facts_payload(320193, 100)).encode()
-    monkeypatch.setattr(research_data, "_edgar_get", lambda url: payload)
+
+    def _facts_get(url: str) -> bytes:
+        return payload
+
+    monkeypatch.setattr(research_data, "_edgar_get", _facts_get)
     monkeypatch.setattr(research_data, "_gateway", lambda: _NullGateway())
 
     result = research_data.refresh_sec_company_facts(320193, data_root=tmp_path)
@@ -487,10 +500,7 @@ def test_refresh_sec_company_facts_archives_and_returns_inline_counts(
     assert result["cik"] == 320193
     assert result["written"] == 0
     assert result["normalized_rows"] == 3  # documents + financial_facts + securities
-    assert (
-        raw_archive.find("sec", "cik0000320193", "companyfacts", root=tmp_path / "raw")
-        is not None
-    )
+    assert raw_archive.find("sec", "cik0000320193", "companyfacts", root=tmp_path / "raw") is not None
 
 
 def test_refresh_finra_short_interest_archives_pages_and_returns_inline_counts(
@@ -505,7 +515,7 @@ def test_refresh_finra_short_interest_archives_pages_and_returns_inline_counts(
         return (content, rows, {"record-total": "2"})
 
     monkeypatch.setattr(research_data.finra_client, "ingestion_post_query", _fake_query)
-    monkeypatch.setattr(research_data.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(research_data.time, "sleep", _no_sleep)
 
     result = research_data.refresh_finra_short_interest(SETTLEMENT, data_root=tmp_path)
 
@@ -648,7 +658,7 @@ def test_replay_sec_facts_isolates_corrupt_payloads(tmp_path: Path):
     assert normalized_rows > 0  # the valid payload still processed
 
 
-def test_iter_archive_company_facts_skips_corrupt_payload(tmp_path: Path):
+def test_iter_archive_company_facts_propagates_corrupt_payload(tmp_path: Path):
     raw_archive.archive(
         "sec",
         "cik0000320193",
@@ -668,5 +678,5 @@ def test_iter_archive_company_facts_skips_corrupt_payload(tmp_path: Path):
         root=tmp_path / "raw",
     )
 
-    rows = research_data.iter_archive_company_facts(320193, data_root=tmp_path)
-    assert len(rows) == 3  # corrupt payload skipped, valid rows still returned
+    with pytest.raises(ValueError):
+        research_data.iter_archive_company_facts(320193, data_root=tmp_path)

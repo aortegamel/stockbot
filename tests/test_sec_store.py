@@ -1,5 +1,6 @@
 """Offline tests for the SEC live read seam (raw archive + typed filing reads)."""
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -39,7 +40,8 @@ def _filing(
 
 
 def _stub_live_list(filings: list[Filing]):
-    """app.sec.filings.list_sec_filings double: PIT-gate then limit (no warehouse)."""
+    """app.sec.filings.list_sec_filings double: PIT-gate then limit."""
+
     def _fake_list(
         cik: object,
         forms: object = None,
@@ -75,8 +77,9 @@ def test_rearchive_same_bytes_is_idempotent(tmp_path: Path) -> None:
     assert find_archived("0000000000-25-000001", "primary", root=tmp_path / "elsewhere") is None
 
 
-def test_unseeded_queries_are_empty(tmp_path: Path) -> None:
+def test_unseeded_queries_are_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """No persisted universe: unseeded live queries stay empty (providers authoritative)."""
+    monkeypatch.setattr("app.sec.filings.list_sec_filings", _stub_live_list([]))
     assert query_filings(root=tmp_path) == []
     assert query_filings(cik=1234567, forms=["10-K"], root=tmp_path) == []
 
@@ -92,9 +95,7 @@ def test_query_filings_gateway_pit_and_limit(tmp_path: Path, monkeypatch: pytest
         is_amendment=True,
         amendment_of="0000000000-25-000001",
     )
-    monkeypatch.setattr(
-        "app.sec.filings.list_sec_filings", _stub_live_list([original, amendment])
-    )
+    monkeypatch.setattr("app.sec.filings.list_sec_filings", _stub_live_list([original, amendment]))
 
     rows = query_filings(cik=1234567, root=tmp_path)
     assert [f.accession_no for f in rows] == ["0000000000-25-000001", "0000000000-25-000002"]
@@ -139,8 +140,6 @@ def test_archive_document_revisions_retained(tmp_path: Path) -> None:
     assert again.sha256 == second.sha256
 
 
-
-
 def test_coverage_reads_derive_from_jobs(tmp_path: Path) -> None:
     """Coverage derives from the job ledger; no persisted coverage table remains."""
     from app.sec.store import (
@@ -164,19 +163,13 @@ def test_coverage_reads_derive_from_jobs(tmp_path: Path) -> None:
 
 
 def test_backfill_jobs_idempotent_queue_and_resume(tmp_path: Path) -> None:
-    from app.sec.store import (
-        claim_job,
-        complete_job,
-        enqueue_backfill_job,
-        fail_job,
-        get_job,
-        list_jobs,
-        requeue_job,
-    )
+    from app.sec.store import enqueue_backfill_job, list_jobs
 
     first = enqueue_backfill_job("sec-global", "10-K", "2024-01-01", "2024-03-31", root=tmp_path)
     assert enqueue_backfill_job("sec-global", "10-K", "2024-01-01", "2024-03-31", root=tmp_path) == first
     assert [j["id"] for j in list_jobs(root=tmp_path)] == [first]
+
+
 def test_document_text_reads_need_accession(tmp_path: Path) -> None:
     """No persisted text index: reads need an accession; empty query rejected."""
     from app.sec.store import query_document_text, search_document_text
@@ -228,3 +221,184 @@ def test_query_filings_date_validation(tmp_path: Path, monkeypatch: pytest.Monke
         query_filings(cik=1234567, forms=forms, start_date="2024/01/01", root=tmp_path)
     with pytest.raises(ValueError):
         query_filings(cik=1234567, forms=forms, end_date="2024-13-01", root=tmp_path)
+
+
+def test_query_filings_propagates_provider_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec.store import query_filings
+
+    def _boom(*args: object, **kwargs: object) -> list[Filing]:
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr("app.sec.filings.list_sec_filings", _boom)
+    with pytest.raises(RuntimeError, match="provider down"):
+        query_filings(cik=1234567, root=tmp_path)
+
+
+def test_query_filings_accession_propagates_provider_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.data_sources import SourceGateway
+    from app.sec.store import query_filings
+
+    def _boom(self: object, accession: str, *, as_of: str | None = None) -> Filing:
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(SourceGateway, "get_filing", _boom)
+    with pytest.raises(RuntimeError, match="provider down"):
+        query_filings(accession="0000000000-25-000001", root=tmp_path)
+
+
+def test_query_filings_rejects_wrong_types(tmp_path: Path) -> None:
+    from app.sec.store import query_filings
+
+    query_untyped: Callable[..., object] = query_filings
+
+    with pytest.raises(TypeError):
+        query_untyped(cik=1234567, forms="10-K", root=tmp_path)
+    with pytest.raises(TypeError):
+        query_untyped(cik=1234567, forms=["10-K", 4], root=tmp_path)
+    with pytest.raises(TypeError):
+        query_untyped(cik=True, root=tmp_path)
+    with pytest.raises(TypeError):
+        query_untyped(accession=123, root=tmp_path)
+    with pytest.raises(ValueError):
+        query_filings(cik="nope", root=tmp_path)
+    with pytest.raises(TypeError):
+        query_untyped(cik=1234567, start_date=20240101, root=tmp_path)
+
+
+def test_query_document_text_propagates_provider_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec import documents as _documents
+    from app.sec.store import query_document_text
+
+    def _boom(accession: str, name: str | None = None, **kwargs: object) -> dict[str, object]:
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(_documents, "get_sec_document", _boom)
+    with pytest.raises(RuntimeError, match="provider down"):
+        query_document_text(accession="0000000000-25-000001", root=tmp_path)
+
+
+def test_query_document_text_rejects_wrong_types(tmp_path: Path) -> None:
+    from app.sec.store import query_document_text, search_document_text
+
+    query_untyped: Callable[..., object] = query_document_text
+    search_untyped: Callable[..., object] = search_document_text
+
+    with pytest.raises(TypeError):
+        query_untyped(accession=123, root=tmp_path)
+    with pytest.raises(TypeError):
+        query_untyped(accession="0000000000-25-000001", document_name=5, root=tmp_path)
+    with pytest.raises(TypeError):
+        search_untyped(123, root=tmp_path)
+    with pytest.raises(TypeError):
+        search_untyped("x", as_of=20240101, root=tmp_path)
+
+
+def test_search_document_text_propagates_hit_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from app.data_sources import SourceGateway
+    from app.sec.store import search_document_text
+
+    class _BadHit:
+        def to_dict(self) -> dict[str, object]:
+            raise RuntimeError("hit down")
+
+    def _fake_search(self: object, *, query: str, limit: int = 20, as_of: str | None = None) -> SimpleNamespace:
+        return SimpleNamespace(text_hits=(_BadHit(),))
+
+    monkeypatch.setattr(SourceGateway, "search_filings", _fake_search)
+    with pytest.raises(RuntimeError, match="hit down"):
+        search_document_text("revenue", root=tmp_path)
+
+
+def test_typed_queries_propagate_provider_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec import insider as _insider
+    from app.sec import ownership as _ownership
+    from app.sec import store as _store
+
+    filing = _filing("ACC-FAIL", form="4", filed_at="2024-04-01", known_at="2024-04-01T00:00:00Z")
+
+    def _meta(accession: str, as_of: str | None = None) -> Filing:
+        return filing
+
+    def _boom_load(accession_no: str) -> object:
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(_store, "_gateway_get_filing", _meta)
+    monkeypatch.setattr(_insider, "load_ownership", _boom_load)
+    monkeypatch.setattr(_ownership, "load_schedule", _boom_load)
+    with pytest.raises(RuntimeError, match="provider down"):
+        _store.query_insider_transactions(accession="ACC-FAIL", root=tmp_path)
+    with pytest.raises(RuntimeError, match="provider down"):
+        _store.query_beneficial_ownership(accession="ACC-FAIL", root=tmp_path)
+
+    holding = _filing("ACC-13F", form="13F-HR", filed_at="2024-05-15", known_at="2024-05-15T00:00:00Z")
+
+    def _holding_meta(accession: str, as_of: str | None = None) -> Filing:
+        return holding
+
+    def _boom_table(accession: str) -> object:
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(_store, "_gateway_get_filing", _holding_meta)
+    monkeypatch.setattr(_store, "_infotable_of", _boom_table)
+    with pytest.raises(RuntimeError, match="provider down"):
+        _store.query_13f_holdings(accession="ACC-13F", root=tmp_path)
+
+
+def test_typed_queries_reject_wrong_types(tmp_path: Path) -> None:
+    from app.sec import store as _store
+
+    holdings_untyped: Callable[..., object] = _store.query_13f_holdings
+    transactions_untyped: Callable[..., object] = _store.query_insider_transactions
+    ownership_untyped: Callable[..., object] = _store.query_beneficial_ownership
+
+    with pytest.raises(TypeError):
+        holdings_untyped(accession=123, root=tmp_path)
+    with pytest.raises(TypeError):
+        transactions_untyped(accession=123, root=tmp_path)
+    with pytest.raises(TypeError):
+        ownership_untyped(accession=123, root=tmp_path)
+    with pytest.raises(ValueError):
+        _store.query_13f_holdings(accession="", root=tmp_path)
+    with pytest.raises(TypeError):
+        holdings_untyped(accession="ACC-13F", limit="10", root=tmp_path)
+    with pytest.raises(TypeError):
+        holdings_untyped(accession="ACC-13F", as_of=20240101, root=tmp_path)
+
+
+def test_coverage_propagates_ledger_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec import store as _store
+
+    def _boom(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        raise RuntimeError("ledger down")
+
+    monkeypatch.setattr(_store, "list_jobs", _boom)
+    with pytest.raises(RuntimeError, match="ledger down"):
+        _store.query_coverage(source="sec-global", root=tmp_path)
+    with pytest.raises(RuntimeError, match="ledger down"):
+        _store.is_partition_covered("sec-global", "10-K", "2024-01-01:2024-03-31", root=tmp_path)
+
+
+def test_coverage_rejects_wrong_types(tmp_path: Path) -> None:
+    from app.sec import store as _store
+
+    query_untyped: Callable[..., object] = _store.query_coverage
+
+    with pytest.raises(TypeError):
+        query_untyped(limit="10", root=tmp_path)
+    with pytest.raises(TypeError):
+        query_untyped(root=123, source="sec-global")
+
+
+def test_typed_stub_row_rejects_bad_shapes() -> None:
+    from app.sec.store import _typed_stub_row
+
+    class _Bad:
+        def to_dict(self) -> object:
+            return ["not-a-dict"]
+
+    with pytest.raises(TypeError):
+        _typed_stub_row(object())
+    with pytest.raises(TypeError):
+        _typed_stub_row(_Bad())

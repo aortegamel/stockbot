@@ -1,40 +1,74 @@
 """Tool-catalog select: default two-step JEV path keeps payloads small."""
 
 import asyncio
-from typing import Any
+from collections.abc import Mapping, Sequence
+from types import SimpleNamespace
+from typing import override
 
+from app.decision_client import JevClient
 from app.research import scheduler
-from app.research.models import ToolDecision
+from app.research.models import DecisionRecord, JSONValue, ToolDecision
 from app.research.tool_catalogs import build_tool_catalogs, catalog_options, catalog_select_round
 
 
-class _Kernel:
-    def record_decision(self, sid: Any, dtype: Any, **kw: Any) -> None:
-        pass
+class _Kernel(scheduler._Kernel):
+    """Decision log only; catalog select persists through record_decision."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.recorded: list[tuple[str, object]] = []
+
+    @override
+    def record_decision(
+        self,
+        session_id: str,
+        decision_type: str,
+        candidates: Mapping[str, object],
+        probabilities: Mapping[str, object],
+        selected: object,
+        *,
+        node_id: str | None = None,
+        job_id: str | None = None,
+        confidence: float | None = None,
+        request: object = None,
+        response: object = None,
+    ) -> DecisionRecord:
+        self.recorded.append((decision_type, selected))
+        return DecisionRecord(
+            decision_id="dec-test",
+            session_id=session_id,
+            node_id=node_id,
+            job_id=job_id,
+            decision_type=decision_type,
+            candidates={},
+            probabilities={},
+            selected={},
+        )
 
 
-def _node(question: Any) -> Any:
-    from types import SimpleNamespace
-
+def _node(question: str) -> SimpleNamespace:
     return SimpleNamespace(node_id="n1", session_id="s1", question=question, why_it_matters="w")
 
 
-class _J:
+class _J(JevClient):
     """Catalog pick -> sec; subset select -> list_sec_filings."""
 
     def __init__(self) -> None:
-        self.calls: list[Any] = []
+        super().__init__()
+        self.calls: list[tuple[str, int]] = []
 
+    @override
     async def decide(
         self,
-        state: Any,
-        questions: Any,
-        decision_type: Any = "",
-        session_id: Any = "",
-        node_id: Any = None,
-        job_id: Any = None,
-        choice_options: Any = None,
-    ) -> Any:
+        state: object,
+        questions: Mapping[str, JSONValue],
+        *,
+        decision_type: str,
+        session_id: str,
+        node_id: str | None = None,
+        job_id: str | None = None,
+        choice_options: Mapping[str, Mapping[str, str]] | None = None,
+    ) -> dict[str, dict[str, JSONValue]]:
         qid = next(iter(questions))
         opts = (choice_options or {}).get(qid, {})
         self.calls.append((decision_type, len(opts)))
@@ -48,16 +82,18 @@ class _J:
             }
         }
 
+    @override
     async def select_tool(
         self,
-        objective: Any,
-        node: Any,
-        registry: Any = None,
-        evidence: Any = None,
-        attempts: Any = None,
-        session_id: Any = "",
-        job_id: Any = None,
-    ) -> Any:
+        objective: str,
+        node: object,
+        registry: Sequence[Mapping[str, JSONValue]] | None = None,
+        evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+        attempts: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+        *,
+        session_id: str,
+        job_id: str | None = None,
+    ) -> ToolDecision:
         reg = list(registry or [])
         self.calls.append(("tool_selection", len(reg)))
         assert len(reg) < len(scheduler.build_registry())
@@ -73,10 +109,11 @@ class _J:
 
 def test_catalog_pick_then_subset_select() -> None:
     reg = scheduler.build_registry()
+    kernel = _Kernel()
     act, dec = asyncio.run(
         catalog_select_round(
             _J(),
-            _Kernel(),
+            kernel,
             "s1",
             "n1",
             {"session_id": "s1", "objective": "List Apple's most recent 10-K and 10-Q filings."},
@@ -87,20 +124,23 @@ def test_catalog_pick_then_subset_select() -> None:
         )
     )
     assert (act, dec.tool_name) == ("invoke", "list_sec_filings")
+    assert kernel.recorded == [("tool_selection", "list_sec_filings")]
 
 
 def test_catalog_sentinel_short_circuits_subset() -> None:
     class _JSentinel(_J):
-        async def decide(  # type: ignore[override]
+        @override
+        async def decide(
             self,
-            state: Any,
-            questions: Any,
-            decision_type: Any = "",
-            session_id: Any = "",
-            node_id: Any = None,
-            job_id: Any = None,
-            choice_options: Any = None,
-        ) -> Any:
+            state: object,
+            questions: Mapping[str, JSONValue],
+            *,
+            decision_type: str,
+            session_id: str,
+            node_id: str | None = None,
+            job_id: str | None = None,
+            choice_options: Mapping[str, Mapping[str, str]] | None = None,
+        ) -> dict[str, dict[str, JSONValue]]:
             qid = next(iter(questions))
             opts = (choice_options or {}).get(qid, {})
             return {
@@ -112,10 +152,11 @@ def test_catalog_sentinel_short_circuits_subset() -> None:
             }
 
     reg = scheduler.build_registry()
+    kernel = _Kernel()
     act, dec = asyncio.run(
         catalog_select_round(
             _JSentinel(),
-            _Kernel(),
+            kernel,
             "s1",
             "n1",
             {"session_id": "s1", "objective": "q?"},
@@ -125,7 +166,9 @@ def test_catalog_sentinel_short_circuits_subset() -> None:
             [],
         )
     )
-    assert act == "reason" and dec["tool_name"] is None
+    assert act == "reason"
+    assert dec == ToolDecision(action="reason")
+    assert kernel.recorded == []
 
 
 def test_pick_state_trims_blobs_and_caps_items() -> None:
@@ -136,13 +179,17 @@ def test_pick_state_trims_blobs_and_caps_items() -> None:
     rows = _pick_state(items)
     assert len(rows) == 5
     assert all(isinstance(r, dict) for r in rows)
-    assert all(len(str(r.get("outcome_summary", ""))) <= 200 for r in rows)
+    assert all(isinstance(r, dict) and len(str(r.get("outcome_summary", ""))) <= 200 for r in rows)
     assert _pick_state("nope") == []
 
 
 def test_catalog_covers_registry_and_stays_small() -> None:
     reg = scheduler.build_registry()
     cats = build_tool_catalogs(reg)
-    covered = sorted(t for c in cats for t in c["tools"])
-    assert covered == sorted(e["name"] for e in reg)
+    covered: list[str] = []
+    for c in cats:
+        tools = c["tools"]
+        assert isinstance(tools, list)
+        covered.extend(str(t) for t in tools)
+    assert sorted(covered) == sorted(str(e["name"]) for e in reg)
     assert len(catalog_options(cats)) < len(reg)

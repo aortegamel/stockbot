@@ -233,7 +233,7 @@ def _load_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> types.Modul
             assert text
             return [0.1, 0.2, 0.3]
 
-    stub.Needle = _FakeNeedle  # type: ignore[attr-defined]
+    monkeypatch.setattr(stub, "Needle", _FakeNeedle, raising=False)
     monkeypatch.setitem(sys.modules, "needle", stub)
     catalog = [
         {
@@ -375,7 +375,9 @@ def test_handle_forwards_node_context_into_arguments_prompt(monkeypatch: pytest.
     def _spy(tool: object, schema: object, objective: object, node: object, context: object) -> str:
         seen["node"] = node
         seen["context"] = context
-        return orig(tool, schema, objective, node, context)  # type: ignore[arg-type]
+        prompt: object = orig(tool, schema, objective, node, context)
+        assert isinstance(prompt, str)
+        return prompt
 
     monkeypatch.setattr(srv, "_arguments_prompt", _spy)
     node = {"node_id": "n1"}
@@ -524,7 +526,10 @@ def test_handle_mismatch_error_carries_detail(monkeypatch: pytest.MonkeyPatch, t
         def close(self) -> None:
             pass
 
-    monkeypatch.setattr(srv, "_bound_agent", lambda tool, schema: _B())
+    def _bound(tool: str, schema: dict[str, object]) -> _B:
+        return _B()
+
+    monkeypatch.setattr(srv, "_bound_agent", _bound)
     line = _json.dumps({"id": "m1", "action": "arguments.generate", "tool": "search_sec_filings", "schema": {}})
     out = srv.handle(line)
     assert "error" in out
@@ -551,7 +556,10 @@ def test_handle_withheld_same_name_returns_tool(monkeypatch: pytest.MonkeyPatch,
         def close(self) -> None:
             pass
 
-    monkeypatch.setattr(srv, "_bound_agent", lambda tool, schema: _B())
+    def _bound(tool: str, schema: dict[str, object]) -> _B:
+        return _B()
+
+    monkeypatch.setattr(srv, "_bound_agent", _bound)
     line = _json.dumps({"id": "w1", "action": "arguments.generate", "tool": "search_sec_filings", "schema": {}})
     out = srv.handle(line)
     assert out["tool"] == "search_sec_filings" and out["withheld"] is True
@@ -587,9 +595,9 @@ def test_generate_withheld_accept_and_timeout(monkeypatch: pytest.MonkeyPatch) -
     _FakeProc.instances.clear()
     _FakeProc.behavior = "echo"
 
-    def _fake_readline(proc: object, timeout_s: float) -> str:
+    def _fake_readline(proc: _FakeProc, timeout_s: float) -> str:
         assert proc is _FakeProc.instances[-1]
-        raw: object = _json.loads(proc.written[-1])  # type: ignore[attr-defined]
+        raw: object = _json.loads(proc.written[-1])
         assert isinstance(raw, dict)
         if raw.get("action") == "ping":
             return _json.dumps({"id": raw.get("id"), "ready": True}) + "\n"
@@ -607,8 +615,8 @@ def test_generate_withheld_accept_and_timeout(monkeypatch: pytest.MonkeyPatch) -
     nc.close()
     _FakeProc.instances.clear()
 
-    def _slow(proc: object, timeout_s: float) -> str:
-        raw2: object = _json.loads(proc.written[-1])  # type: ignore[attr-defined]
+    def _slow(proc: _FakeProc, timeout_s: float) -> str:
+        raw2: object = _json.loads(proc.written[-1])
         assert isinstance(raw2, dict)
         if raw2.get("action") == "ping":
             assert timeout_s == nc._TIMEOUT_S

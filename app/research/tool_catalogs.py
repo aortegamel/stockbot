@@ -9,9 +9,13 @@ keeps the whole-registry select as an escape hatch.
 
 import logging
 from collections.abc import Mapping
-from typing import Protocol
+from typing import TYPE_CHECKING
 
-from app.research.models import JSONValue
+from app.decision_client import JevClient
+from app.research.models import JSONValue, ToolDecision
+
+if TYPE_CHECKING:
+    from app.research.scheduler import _Kernel
 
 _OTHER_DESCRIPTION = "Other tools outside named domains."
 
@@ -19,22 +23,6 @@ logger = logging.getLogger(__name__)
 
 # Catalog winner -> scheduler action (names mirror decision_client sentinels).
 _SENTINEL_ACTIONS = {"reasoning_required": "reason", "node_resolved": "resolved"}
-
-
-class _CatalogJev(Protocol):
-    """Decide surface the catalog pick needs (JevClient satisfies this)."""
-
-    async def decide(
-        self,
-        state: object,
-        questions: Mapping[str, JSONValue],
-        *,
-        decision_type: str,
-        session_id: str,
-        node_id: str | None = None,
-        job_id: str | None = None,
-        choice_options: Mapping[str, Mapping[str, str]] | None = None,
-    ) -> dict[str, dict[str, JSONValue]]: ...
 
 
 _PICK_STATE_ITEMS = 5
@@ -103,16 +91,16 @@ def catalog_options(catalogs: list[dict[str, JSONValue]]) -> dict[str, str]:
 
 
 async def catalog_select_round(
-    jev: _CatalogJev,
-    kernel: object,
+    jev: JevClient,
+    kernel: _Kernel,
     sid: str,
     nid: str,
-    session: dict[str, object],
+    session: Mapping[str, JSONValue],
     node: object,
     registry: list[dict[str, JSONValue]],
     ctx_evidence: list[JSONValue],
     attempts: list[dict[str, JSONValue]],
-) -> tuple[str, object]:
+) -> tuple[str, ToolDecision]:
     """Pick one catalog via jev.decide, then run the normal select over its tools."""
     from app.research import scheduler
 
@@ -139,10 +127,10 @@ async def catalog_select_round(
     criteria: dict[str, JSONValue] = {key: value for key, value in options.items()}
     inner: dict[str, JSONValue] = {"type": "choice", "instructions": instructions, "criteria": criteria}
     questions: dict[str, JSONValue] = {"catalog_selection": inner}
-    state: dict[str, object] = {
+    state: dict[str, JSONValue] = {
         "objective": objective,
         "question": question,
-        "catalogs": catalogs,
+        "catalogs": list[JSONValue](catalogs),
         "evidence": _pick_state(ctx_evidence),
         "attempts": _pick_state(attempts),
     }
@@ -175,15 +163,7 @@ async def catalog_select_round(
             winner,
             action,
         )
-        probs: dict[str, object] = {}
-        names: list[str] = []
-        return action, {
-            "action": action,
-            "tool_name": None,
-            "tool_names": names,
-            "probabilities": probs,
-            "confidence": None,
-        }
+        return action, ToolDecision(action=action)
     wanted: set[str] = set()
     for catalog in catalogs:
         if catalog.get("name") == winner:

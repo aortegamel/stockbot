@@ -40,11 +40,11 @@ class _Gateway:
         self.alias_rows: list[dict[str, object]] = []
         self.facts_by_cik: dict[int, dict[str, list[dict[str, object]]]] = {}
 
-    def ticker_candidates(self, ticker: str, as_of: object = None) -> list["TickerAlias"]:
+    def ticker_candidates(self, ticker: str, as_of: object = None) -> list[TickerAlias]:
         """All aliases for the ticker, unfiltered (PIT stays in resolve_ticker_aliases)."""
         del as_of
         want = str(ticker).strip().upper()
-        out: list["TickerAlias"] = []
+        out: list[TickerAlias] = []
         for row in self.alias_rows:
             if str(row.get("alias_value") or "").strip().upper() != want:
                 continue
@@ -75,9 +75,7 @@ class _Gateway:
         for name, rows in out.items():
             if isinstance(rows, list):
                 out[name] = [
-                    row
-                    for row in rows
-                    if isinstance(row, dict) and str(row.get("known_at") or "")[:10] <= as_of
+                    row for row in rows if isinstance(row, dict) and str(row.get("known_at") or "")[:10] <= as_of
                 ]
         return out
 
@@ -104,6 +102,7 @@ def _seed_ticker(gw: _Gateway, cik: int, ticker: str) -> None:
         content_hash=f"tickers-{cik}",
     )
     gw.alias_rows.extend(datasets.get("entity_aliases", []))
+
 
 def _qfact(val: float, start: str, end: str, fy: int, fp: str, filed: str, accn: str) -> dict[str, object]:
     return {"start": start, "end": end, "val": val, "accn": accn, "fy": fy, "fp": fp, "filed": filed}

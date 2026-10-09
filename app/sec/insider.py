@@ -52,10 +52,7 @@ def list_sec_filings(
 
 
 def classify_transaction(code: object) -> str:
-    try:
-        key = str(code).strip().upper()
-    except Exception:  # noqa: BLE001 - untrusted code coerces to other, never raises
-        return "other"
+    key = str(code).strip().upper()
     return TRANSACTION_KINDS.get(key, "other")
 
 
@@ -92,7 +89,7 @@ _TYPE_TO_ACQUIRED = {
 def _key_float(value: object) -> float | None:
     try:
         return float(str(value).strip().replace(",", "")) if value is not None else None
-    except (ValueError, TypeError, AttributeError):
+    except ValueError, TypeError, AttributeError:
         return None
 
 
@@ -120,17 +117,17 @@ def _table_rows_of(obj: object) -> list[tuple[str, dict[str, object]]]:
     """Non-derivative + derivative table rows as (side, dict); [] when unavailable."""
     out: list[tuple[str, dict[str, object]]] = []
     for table_name, side in (("non_derivative_table", "non-derivative"), ("derivative_table", "derivative")):
-        try:
-            table = getattr(obj, table_name, None)
-            data = getattr(getattr(table, "transactions", None), "data", None)
-            rows = list(data.iterrows()) if data is not None else []
-        except Exception:  # noqa: BLE001, S112 - table path degrades to [] on SDK shape change, never raises
+        table = getattr(obj, table_name, None)
+        if table is None:
             continue
+        data = getattr(getattr(table, "transactions", None), "data", None)
+        rows = list(data.iterrows()) if data is not None else []
         for _, row in rows:
-            try:
-                out.append((side, dict(row.to_dict()) if hasattr(row, "to_dict") else dict(row)))
-            except Exception:  # noqa: BLE001, S112 - malformed row is skipped, the scan continues
-                continue
+            to_dict = getattr(row, "to_dict", None)
+            mapped: object = to_dict() if callable(to_dict) else row
+            if not isinstance(mapped, dict):
+                raise TypeError(f"table row must be a mapping, got {type(mapped).__name__}")
+            out.append((side, dict(mapped)))
     return out
 
 
@@ -170,10 +167,7 @@ def _safe_float(value: object) -> float | None:
 
 def _first(obj: object, *names: str) -> object:
     for name in names:
-        try:
-            value: object = getattr(obj, name)
-        except Exception:  # noqa: BLE001, S112 - failed attr read tries the next name, never raises
-            continue
+        value: object = getattr(obj, name, None)
         if value is not None:
             return value
     return None
@@ -182,10 +176,7 @@ def _first(obj: object, *names: str) -> object:
 def _str_or_none(value: object) -> str | None:
     if value is None:
         return None
-    try:
-        text = str(value).strip()
-    except Exception:  # noqa: BLE001 - untrusted value coerces to None, never raises
-        return None
+    text = str(value).strip()
     return text or None
 
 
@@ -193,21 +184,15 @@ def _direct_cik_of(obj: object) -> str | None:
     cik = _first(obj, "insider_cik", "reporting_owner_cik", "owner_cik", "cik")
     if cik is None:
         return None
-    try:
-        return str(cik)
-    except Exception:  # noqa: BLE001 - untrusted value coerces to None, never raises
-        return None
+    return str(cik)
 
 
 def _owner_list_cik_of(obj: object) -> str | None:
-    try:
-        owners = getattr(obj, "reporting_owners", None) or []
-        for owner in list(owners):
-            cik = _first(owner, "cik", "owner_cik", "reporting_owner_cik")
-            if cik is not None:
-                return str(cik)
-    except Exception:  # noqa: BLE001 - owner scan degrades to None on malformed payload, never raises
-        return None
+    owners = getattr(obj, "reporting_owners", None) or []
+    for owner in list(owners):
+        cik = _first(owner, "cik", "owner_cik", "reporting_owner_cik")
+        if cik is not None:
+            return str(cik)
     return None
 
 
@@ -216,14 +201,11 @@ def _insider_cik(obj: object) -> str | None:
 
 
 def _owner_candidates_of(obj: object) -> list[object]:
-    try:
-        container = getattr(obj, "reporting_owners", None)
-        candidates = getattr(container, "owners", None) if container is not None else None
-        if candidates is None and isinstance(container, (list, tuple)):
-            candidates = container
-        return list(candidates) if candidates else []
-    except Exception:  # noqa: BLE001 - owner candidates degrade to empty on malformed payload, never raises
-        return []
+    container = getattr(obj, "reporting_owners", None)
+    candidates = getattr(container, "owners", None) if container is not None else None
+    if candidates is None and isinstance(container, (list, tuple)):
+        candidates = container
+    return list(candidates) if candidates else []
 
 
 def _owner_record_of(owner: object) -> dict[str, object]:
@@ -258,19 +240,13 @@ def _owners_of(
     """Reporting owners: structured list first, legacy attrs as one owner."""
     out: list[dict[str, object]] = []
     for owner in _owner_candidates_of(obj):
-        try:
-            out.append(_owner_record_of(owner))
-        except Exception:  # noqa: BLE001, S112 - malformed owner is skipped, the batch continues
-            continue
+        out.append(_owner_record_of(owner))
     return out or _fallback_owner_of(fallback_name, fallback_cik)
 
 
 def _issuer_of(obj: object) -> tuple[str | None, str | None, str | None]:
     """Authoritative issuer from structured ownership XML; never the filer."""
-    try:
-        issuer = getattr(obj, "issuer", None)
-    except Exception:  # noqa: BLE001 - issuer read degrades to unknown on malformed payload, never raises
-        return None, None, None
+    issuer = getattr(obj, "issuer", None)
     if issuer is None or isinstance(issuer, str):
         return None, None, None
     cik = _str_or_none(_first(issuer, "cik", "issuer_cik", "issuerCIK"))
@@ -284,10 +260,7 @@ def _bool_or_none(value: object) -> bool | None:
         return None
     if isinstance(value, bool):
         return value
-    try:
-        text = str(value).strip().lower()
-    except Exception:  # noqa: BLE001 - untrusted flag coerces to None, never raises
-        return None
+    text = str(value).strip().lower()
     if text in ("true", "1", "yes", "y"):
         return True
     if text in ("false", "0", "no", "n"):
@@ -295,41 +268,36 @@ def _bool_or_none(value: object) -> bool | None:
     return None
 
 
-def _fallback_identity_of(obj: object) -> tuple[str | None, str | None] | None:
-    try:
-        return (_str_or_none(_first(obj, "insider_name", "reporting_owner", "owner_name", "name")), _insider_cik(obj))
-    except Exception:  # noqa: BLE001 - fallback identity degrades to None on malformed payload, never raises
-        return None
+def _fallback_identity_of(obj: object) -> tuple[str | None, str | None]:
+    return (_str_or_none(_first(obj, "insider_name", "reporting_owner", "owner_name", "name")), _insider_cik(obj))
 
 
 def _activity_rows_of(obj: object) -> list[object] | None:
-    try:
-        get_activities = getattr(obj, "get_transaction_activities")  # noqa: B009 - edgar SDK has no stubs; getattr keeps the dynamic boundary instead of failing the checker
-        activities = get_activities()
-    except Exception:  # noqa: BLE001 - activity fetch degrades to None on SDK failure, never raises
+    get_activities = getattr(obj, "get_transaction_activities", None)
+    if get_activities is None:
         return None
+    if not callable(get_activities):
+        raise TypeError(f"get_transaction_activities must be callable, got {type(get_activities).__name__}")
+    activities = get_activities()
     if not activities:
         return None
-    try:
-        return list(activities)
-    except Exception:  # noqa: BLE001 - activity list coercion degrades to None on SDK failure, never raises
-        return None
+    if not isinstance(activities, Iterable):
+        raise TypeError(f"get_transaction_activities must return an iterable, got {type(activities).__name__}")
+    return list(activities) or None
 
 
 def _resolved_issuer_of(obj: object, issuer: str, issuer_cik: str | int | None) -> tuple[str, str | None]:
     info_cik, info_name, _ticker = _issuer_of(obj)
-    try:
-        explicit_cik = str(issuer_cik).strip() if issuer_cik is not None else None
-    except Exception:  # noqa: BLE001 - explicit CIK coerces to None, never raises
-        explicit_cik = None
+    explicit_cik = str(issuer_cik).strip() if issuer_cik is not None else None
     return info_name or issuer, explicit_cik or info_cik
 
 
 def _known_at_of(known_at: str | None, filed_at: str | None) -> str | None:
-    try:
-        return known_at if isinstance(known_at, str) else str(known_at) if known_at is not None else filed_at
-    except Exception:  # noqa: BLE001 - known_at coerces to the filed_at fallback, never raises
-        return filed_at
+    if isinstance(known_at, str):
+        return known_at
+    if known_at is not None:
+        return str(known_at)
+    return filed_at
 
 
 def _fallback_date_of(obj: object) -> str | None:
@@ -422,10 +390,8 @@ def normalize_ownership_filing(
     document_name: str | None = None,
     known_at: str | None = None,
 ) -> list[InsiderTransaction]:
-    """One InsiderTransaction per (owner, activity) row; never raises."""
+    """One InsiderTransaction per (owner, activity) row."""
     fallback = _fallback_identity_of(obj)
-    if fallback is None:
-        return []
     rows = _activity_rows_of(obj)
     if not rows:
         return []
@@ -438,24 +404,21 @@ def normalize_ownership_filing(
     for activity in rows:
         enriched = _enriched_of(activity, index)
         for owner in owners:
-            try:
-                out.append(
-                    _activity_record_of(
-                        activity,
-                        owner,
-                        issuer=resolved_issuer,
-                        form=form,
-                        filed_at=filed_at,
-                        accession_no=accession_no,
-                        issuer_cik=resolved_issuer_cik,
-                        document_name=document_name,
-                        known=known,
-                        enriched=enriched,
-                        fallback_date=fallback_date,
-                    )
+            out.append(
+                _activity_record_of(
+                    activity,
+                    owner,
+                    issuer=resolved_issuer,
+                    form=form,
+                    filed_at=filed_at,
+                    accession_no=accession_no,
+                    issuer_cik=resolved_issuer_cik,
+                    document_name=document_name,
+                    known=known,
+                    enriched=enriched,
+                    fallback_date=fallback_date,
                 )
-            except Exception:  # noqa: BLE001, S112 - malformed activity is skipped, the filing continues
-                continue
+            )
     return out
 
 
@@ -467,11 +430,8 @@ def load_ownership(accession_no: str) -> object:
 
 
 def _issuer_name_of(obj: object, fallback: str) -> str:
-    try:
-        _cik, _name, _t = _issuer_of(obj)
-        return _name or fallback
-    except Exception:  # noqa: BLE001 - issuer name falls back to the query issuer, never raises
-        return fallback
+    _cik, _name, _t = _issuer_of(obj)
+    return _name or fallback
 
 
 def _activity_records_of(filing: object, ticker_or_cik: str | int) -> list[InsiderTransaction]:
@@ -501,59 +461,49 @@ def get_insider_activity(
     filings = list_sec_filings(ticker_or_cik, forms=list(forms), as_of=as_of, limit=limit)
     out: list[InsiderTransaction] = []
     for filing in filings:
-        try:
-            out.extend(_activity_records_of(filing, ticker_or_cik))
-        except Exception:  # noqa: BLE001, S112 - failed filing is skipped, the batch continues
-            continue
+        out.extend(_activity_records_of(filing, ticker_or_cik))
     if limit is not None:
         out = out[:limit]
     return out
 
 
 def _columns_of(df: object) -> list[object]:
-    try:
-        return list(getattr(df, "columns", None) or [])
-    except Exception:  # noqa: BLE001 - frame columns degrade to empty on untrusted frame, never raises
-        return []
+    return list(getattr(df, "columns", None) or [])
 
 
 def _share_target_in(columns: list[object]) -> object:
-    return next((c for c in columns if "share" in str(c).lower()), None)
+    for column in columns:
+        if not isinstance(column, str):
+            raise TypeError(f"column name must be str, got {type(column).__name__}")
+        if "share" in column.lower():
+            return column
+    return None
 
 
 def _getitem_of(df: object) -> object:
-    try:
-        getitem = getattr(df, "__getitem__")  # noqa: B009 - pandas-like frame has no stubs; getattr keeps the dynamic boundary instead of failing the checker
-    except Exception:  # noqa: BLE001 - frame getitem read degrades to None on untrusted frame, never raises
-        return None
+    getitem = getattr(df, "__getitem__", None)
     return getitem if callable(getitem) else None
 
 
 def _call_getitem(getitem: object, target: object) -> object:
     if not callable(getitem):
         return None
-    try:
-        return getitem(target)
-    except Exception:  # noqa: BLE001 - frame cell read degrades to None on untrusted frame, never raises
-        return None
+    return getitem(target)
 
 
 def _column_cells(rows: list[object], target: object) -> list[object]:
     """Non-missing cells for one column target across fallback rows."""
     out: list[object] = []
     for row in rows:
-        try:
-            cell = (
-                row.get(target)
-                if isinstance(row, dict)
-                else (
-                    row[target]
-                    if isinstance(row, (list, tuple)) and isinstance(target, int) and 0 <= target < len(row)
-                    else None
-                )
+        cell = (
+            row.get(target)
+            if isinstance(row, dict)
+            else (
+                row[target]
+                if isinstance(row, (list, tuple)) and isinstance(target, int) and 0 <= target < len(row)
+                else None
             )
-        except Exception:  # noqa: BLE001, S112 - bad row is skipped, the scan continues
-            continue
+        )
         if cell is not None:
             out.append(cell)
     return out
@@ -566,20 +516,14 @@ def _values_by_column(df: object, target: object) -> object:
             return result
     if not isinstance(df, Iterable) or isinstance(target, bool) or not isinstance(target, (str, int)):
         return None
-    try:
-        rows: list[object] = list(df)
-    except Exception:  # noqa: BLE001 - frame row coercion degrades to None on untrusted frame, never raises
-        return None
+    rows: list[object] = list(df)
     return _column_cells(rows, target)
 
 
 def _values_of_rows(df: object) -> object:
     if not isinstance(df, Iterable):
         return None
-    try:
-        rows = list(df)
-    except Exception:  # noqa: BLE001 - frame iteration degrades to None on untrusted frame, never raises
-        return None
+    rows = list(df)
     if not rows:
         return None
     first = rows[0]
@@ -594,10 +538,7 @@ def _values_of_rows(df: object) -> object:
 def _total_of(values: object) -> int | None:
     total = 0
     found = False
-    try:
-        iterator = list(values) if isinstance(values, Iterable) else []
-    except Exception:  # noqa: BLE001 - share values degrade to None on untrusted frame, never raises
-        return None
+    iterator = list(values) if isinstance(values, Iterable) else []
     for value in iterator:
         parsed = _safe_int(value)
         if parsed is not None:
@@ -624,32 +565,15 @@ def _seller_identity_of(form144: object) -> tuple[str | None, str | None]:
 
 
 def _resolved_144_form(form144: object, form: str | None) -> str | None:
-    try:
-        embedded = str(getattr(form144, "form", "") or "").strip()
-        if embedded:
-            return form or embedded
-    except Exception:  # noqa: BLE001, S110 - missing embedded form keeps the caller form
-        pass
+    embedded = str(getattr(form144, "form", "") or "").strip()
+    if embedded:
+        return form or embedded
     return form
 
 
 def _proposed_shares_of(form144: object) -> int | None:
-    try:
-        df = getattr(form144, "securities_to_be_sold", None)
-    except Exception:  # noqa: BLE001 - missing securities table degrades to None, never raises
-        return None
+    df = getattr(form144, "securities_to_be_sold", None)
     return _sum_shares_column(df) if df is not None else None
-
-
-def _empty_144_sale(*, issuer: str, filed_at: str | None, accession_no: str) -> ProposedInsiderSale:
-    return ProposedInsiderSale(
-        seller_name=None,
-        seller_cik=None,
-        issuer=issuer,
-        filed_at=filed_at,
-        accession_no=accession_no,
-        shares_proposed=None,
-    )
 
 
 def _clean_issuer_cik(issuer_cik: str | int | None) -> str | None:
@@ -667,23 +591,20 @@ def normalize_144(
     document_name: str | None = None,
     known_at: str | None = None,
 ) -> ProposedInsiderSale:
-    """Build a ProposedInsiderSale; never raises."""
-    try:
-        seller, seller_cik = _seller_identity_of(form144)
-        return ProposedInsiderSale(
-            seller_name=seller,
-            seller_cik=seller_cik,
-            issuer=issuer,
-            filed_at=filed_at,
-            accession_no=accession_no,
-            shares_proposed=_proposed_shares_of(form144),
-            issuer_cik=_clean_issuer_cik(issuer_cik),
-            form=_resolved_144_form(form144, form),
-            document_name=document_name,
-            known_at=_known_at_of(known_at, filed_at),
-        )
-    except Exception:  # noqa: BLE001 - 144 normalization degrades to an empty sale, never raises
-        return _empty_144_sale(issuer=issuer, filed_at=filed_at, accession_no=accession_no)
+    """Build a ProposedInsiderSale."""
+    seller, seller_cik = _seller_identity_of(form144)
+    return ProposedInsiderSale(
+        seller_name=seller,
+        seller_cik=seller_cik,
+        issuer=issuer,
+        filed_at=filed_at,
+        accession_no=accession_no,
+        shares_proposed=_proposed_shares_of(form144),
+        issuer_cik=_clean_issuer_cik(issuer_cik),
+        form=_resolved_144_form(form144, form),
+        document_name=document_name,
+        known_at=_known_at_of(known_at, filed_at),
+    )
 
 
 def load_144(accession_no: str) -> object:
@@ -709,33 +630,31 @@ def get_planned_insider_sales(
     filings = list_sec_filings(ticker_or_cik, forms=list(forms), as_of=as_of, limit=limit)
     out: list[ProposedInsiderSale] = []
     for filing in filings:
-        try:
-            accession = getattr(filing, "accession_no", "")
-            filed_at = getattr(filing, "filed_at", None)
-            issuer = getattr(filing, "filer_name", None) or str(ticker_or_cik)
-            out.append(
-                normalize_144(
-                    load_144(accession),
-                    issuer=issuer,
-                    filed_at=filed_at,
-                    accession_no=accession,
-                    form=getattr(filing, "form", None),
-                    document_name=getattr(filing, "primary_document", None),
-                    known_at=getattr(filing, "known_at", None) or filed_at,
-                )
+        accession = getattr(filing, "accession_no", "")
+        filed_at = getattr(filing, "filed_at", None)
+        issuer = getattr(filing, "filer_name", None) or str(ticker_or_cik)
+        out.append(
+            normalize_144(
+                load_144(accession),
+                issuer=issuer,
+                filed_at=filed_at,
+                accession_no=accession,
+                form=getattr(filing, "form", None),
+                document_name=getattr(filing, "primary_document", None),
+                known_at=getattr(filing, "known_at", None) or filed_at,
             )
-        except Exception:  # noqa: BLE001, S112 - failed 144 load is skipped, the batch continues
-            continue
+        )
     if limit is not None:
         out = out[:limit]
     return out
 
 
 def _sale_rows_of(transactions: Iterable[InsiderTransaction] | None) -> list[InsiderTransaction]:
-    try:
-        return list(transactions or [])
-    except Exception:  # noqa: BLE001 - sale rows degrade to empty on malformed input, never raises
+    if transactions is None:
         return []
+    if isinstance(transactions, (str, bytes)):
+        raise TypeError(f"transactions must be an iterable of InsiderTransaction, got {type(transactions).__name__}")
+    return list(transactions)
 
 
 def _is_matching_sale(txn: InsiderTransaction, seller: str, filed_at: str | None) -> bool:
@@ -751,14 +670,11 @@ def _is_matching_sale(txn: InsiderTransaction, seller: str, filed_at: str | None
 def _executed_sale_shares(rows: list[InsiderTransaction], seller: str, filed_at: str | None) -> int:
     executed = 0
     for txn in rows:
-        try:
-            if not _is_matching_sale(txn, seller, filed_at):
-                continue
-            shares = getattr(txn, "shares", None)
-            if shares is not None:
-                executed += shares
-        except Exception:  # noqa: BLE001, S112 - malformed transaction is skipped, the match continues
+        if not _is_matching_sale(txn, seller, filed_at):
             continue
+        shares = getattr(txn, "shares", None)
+        if shares is not None:
+            executed += shares
     return executed
 
 
@@ -793,10 +709,7 @@ _FORMS_13F_NOTICE = ("13F-NT", "13F-NT/A")
 
 def is_13f_notice(form: object) -> bool:
     """True for 13F-NT notice filings: manager filing with no holdings."""
-    try:
-        return str(form or "").strip().upper() in _FORMS_13F_NOTICE
-    except Exception:  # noqa: BLE001 - form check coerces to False, never raises
-        return False
+    return str(form or "").strip().upper() in _FORMS_13F_NOTICE
 
 
 def _13f_security_id(cusip: str | None, isin: str | None) -> str | None:
@@ -812,21 +725,15 @@ def _13f_security_id(cusip: str | None, isin: str | None) -> str | None:
 def _voting_label(sole: int | None = None, shared: int | None = None, non: int | None = None) -> str | None:
     parts: list[str] = []
     for label, value in (("sole", sole), ("shared", shared), ("none", non)):
-        try:
-            if value is None:
-                continue
-            parts.append(f"{label}={value}")
-        except Exception:  # noqa: BLE001, S112 - unstringable part is skipped, the sid continues
+        if value is None:
             continue
+        parts.append(f"{label}={value}")
     return " ".join(parts) or None
 
 
 def _dict_lookup(row: object, name: str) -> object:
     if isinstance(row, dict):
-        try:
-            return row.get(name)
-        except Exception:  # noqa: BLE001 - untrusted row read coerces to None, never raises
-            return None
+        return row.get(name)
     return None
 
 
@@ -838,17 +745,11 @@ def _mapping_lookup(row: object, name: str) -> object:
     get = getattr(row, "get", None)
     if not callable(get):
         return None
-    try:
-        return get(name)
-    except Exception:  # noqa: BLE001 - untrusted row read coerces to None, never raises
-        return None
+    return get(name)
 
 
 def _cell_from_attr(row: object, name: str) -> object:
-    try:
-        value: object = getattr(row, name, None)
-    except Exception:  # noqa: BLE001 - untrusted row read coerces to None, never raises
-        return None
+    value: object = getattr(row, name, None)
     if value is None:
         return _mapping_lookup(row, name)
     narrowed: object = value
@@ -856,6 +757,8 @@ def _cell_from_attr(row: object, name: str) -> object:
 
 
 def _holding_cell(row: object, *names: str) -> object:
+    if row is None or isinstance(row, (str, bytes, int, float, bool)):
+        raise TypeError(f"holding row must be a mapping or attribute object, got {type(row).__name__}")
     for name in names:
         value = _cell_from_dict(row, name) if isinstance(row, dict) else _cell_from_attr(row, name)
         if value is not None and str(value).strip() != "":
@@ -940,10 +843,11 @@ def _holding_identity_of(
 
 
 def _holding_known_at(known_at: str | None, filed_at: str | None) -> str | None:
-    try:
-        return known_at if isinstance(known_at, str) else str(known_at) if known_at is not None else filed_at
-    except Exception:  # noqa: BLE001 - known_at coerces to the filed_at fallback, never raises
-        return filed_at
+    if isinstance(known_at, str):
+        return known_at
+    if known_at is not None:
+        return str(known_at)
+    return filed_at
 
 
 def _holding_row_to_record(
@@ -998,62 +902,23 @@ def _holding_row_to_record(
 
 
 def _rows_of_infotable(infotable: object) -> list[object] | None:
-    try:
-        to_dict = getattr(infotable, "to_dict", None)
-        if callable(to_dict):
-            raw_rows: object = to_dict(orient="records")
-            if isinstance(raw_rows, dict):
-                return [raw_rows]
-            if isinstance(raw_rows, list):
-                return list(raw_rows)
-            if isinstance(raw_rows, Iterable):
-                return list(raw_rows)
-            return []
-        if isinstance(infotable, Iterable):
-            return list(infotable)
+    to_dict = getattr(infotable, "to_dict", None)
+    if callable(to_dict):
+        raw_rows: object = to_dict(orient="records")
+        if isinstance(raw_rows, dict):
+            return [raw_rows]
+        if isinstance(raw_rows, list):
+            return list(raw_rows)
+        if isinstance(raw_rows, Iterable):
+            return list(raw_rows)
         return []
-    except Exception:  # noqa: BLE001 - infotable coercion degrades to None on malformed payload, never raises
-        return None
+    if isinstance(infotable, Iterable):
+        return list(infotable)
+    return []
 
 
 def _clean_manager_cik(manager_cik: str | int | None) -> str | None:
-    try:
-        return str(manager_cik).strip() if manager_cik is not None else None
-    except Exception:  # noqa: BLE001 - manager CIK coerces to None, never raises
-        return None
-
-
-def _append_holding_record(
-    out: list[InstitutionalHolding],
-    row: object,
-    *,
-    manager_name: str | None,
-    cik: str | None,
-    accession_no: str,
-    report_period: str | None,
-    filed_at: str | None,
-    document_name: str | None,
-    known_at: str | None,
-    source_url: str | None,
-    source_row: int,
-) -> None:
-    try:
-        out.append(
-            _holding_row_to_record(
-                row,
-                manager_name=manager_name,
-                manager_cik=cik,
-                accession_no=accession_no,
-                report_period=report_period,
-                filed_at=filed_at,
-                document_name=document_name,
-                known_at=known_at,
-                source_url=source_url,
-                source_row=source_row,
-            )
-        )
-    except Exception:  # noqa: BLE001, S110 - malformed holding row is skipped, the batch continues
-        pass
+    return str(manager_cik).strip() if manager_cik is not None else None
 
 
 def normalize_13f_holdings(
@@ -1069,7 +934,7 @@ def normalize_13f_holdings(
     known_at: str | None = None,
     source_url: str | None = None,
 ) -> list[InstitutionalHolding]:
-    """13F-HR/A information tables -> holdings; NT -> no holdings. Never raises."""
+    """13F-HR/A information tables -> holdings; NT -> no holdings."""
 
     if is_13f_notice(form):
         return []
@@ -1079,18 +944,19 @@ def normalize_13f_holdings(
     cik = _clean_manager_cik(manager_cik)
     out: list[InstitutionalHolding] = []
     for source_row, row in enumerate(rows, start=1):
-        _append_holding_record(
-            out,
-            row,
-            manager_name=manager_name,
-            cik=cik,
-            accession_no=accession_no,
-            report_period=report_period,
-            filed_at=filed_at,
-            document_name=document_name,
-            known_at=known_at,
-            source_url=source_url,
-            source_row=source_row,
+        out.append(
+            _holding_row_to_record(
+                row,
+                manager_name=manager_name,
+                manager_cik=cik,
+                accession_no=accession_no,
+                report_period=report_period,
+                filed_at=filed_at,
+                document_name=document_name,
+                known_at=known_at,
+                source_url=source_url,
+                source_row=source_row,
+            )
         )
     return out
 
@@ -1139,38 +1005,26 @@ def _manager_filings(manager_cik: int | str, *, as_of: str | None, limit: int | 
     from .documents import get_by_accession_number
     from .filings import list_sec_filings as _live_list
 
-    try:
-        filings = _live_list(manager_cik, forms=list(_HOLDING_FORMS), as_of=as_of, limit=limit)
-    except Exception:
-        return []
+    filings = _live_list(manager_cik, forms=list(_HOLDING_FORMS), as_of=as_of, limit=limit)
     out: list[InstitutionalHolding] = []
     for filing in filings:
-        try:
-            inner = get_by_accession_number(filing.accession_no).obj()  # type: ignore[union-attr]
-        except Exception:
-            continue
+        inner = get_by_accession_number(filing.accession_no).obj()
         table = None
         for attr in ("infotable", "information_table", "holdings", "info_table"):
-            try:
-                table = getattr(inner, attr, None)
-            except Exception:
-                table = None
+            table = getattr(inner, attr, None)
             if table is not None:
                 break
         if table is None:
             continue
-        try:
-            out.extend(
-                normalize_13f_holdings(
-                    table,
-                    manager_cik=str(manager_cik),
-                    accession_no=filing.accession_no,
-                    filed_at=getattr(filing, "filed_at", None),
-                    known_at=getattr(filing, "known_at", None),
-                )
+        out.extend(
+            normalize_13f_holdings(
+                table,
+                manager_cik=str(manager_cik),
+                accession_no=filing.accession_no,
+                filed_at=getattr(filing, "filed_at", None),
+                known_at=getattr(filing, "known_at", None),
             )
-        except Exception:
-            continue
+        )
     return [rec for rec in out if _known_as_of_record(rec, as_of)]
 
 
@@ -1180,10 +1034,7 @@ def query_issuer_insiders(
     """Issuer -> live ownership transactions normalized per filing (PIT in domain)."""
     del root
     bound = _check_as_of_opt(as_of)
-    try:
-        return _cap(get_insider_activity(issuer_cik, as_of=bound, limit=limit), limit)
-    except Exception:
-        return []
+    return _cap(get_insider_activity(issuer_cik, as_of=bound, limit=limit), limit)
 
 
 def query_person_transactions(
@@ -1193,10 +1044,7 @@ def query_person_transactions(
     del root
     bound = _check_as_of_opt(as_of)
     want = str(owner_cik).strip()
-    try:
-        txns = get_insider_activity(owner_cik, as_of=bound, limit=limit)
-    except Exception:
-        return []
+    txns = get_insider_activity(owner_cik, as_of=bound, limit=limit)
     out = [txn for txn in txns if str(getattr(txn, "owner_cik", "") or "").strip() in ("", want)]
     return _cap(out, limit)
 

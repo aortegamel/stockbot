@@ -238,11 +238,12 @@ def test_compare_144_unmatched():
     assert result["executed_sale_shares"] == 0
 
 
-def test_get_insider_activity_skips_failed_loads(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_insider_activity_propagates_failed_loads(monkeypatch: pytest.MonkeyPatch) -> None:
     filings = [
         SimpleNamespace(accession_no="g1", form="4", filed_at="2024-01-15", company="ACME"),
         SimpleNamespace(accession_no="bad", form="4", filed_at="2024-02-15", company="ACME"),
     ]
+    error = RuntimeError("boom")
 
     def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
         return filings
@@ -251,13 +252,21 @@ def test_get_insider_activity_skips_failed_loads(monkeypatch: pytest.MonkeyPatch
 
     def fake_load(accession_no: str) -> _Obj:
         if accession_no == "bad":
-            raise RuntimeError("boom")
+            raise error
         return _Obj([_Activity(code="P", shares=10)])
 
     monkeypatch.setattr(insider, "load_ownership", fake_load)
+    with pytest.raises(RuntimeError, match="^boom$") as exc:
+        insider.get_insider_activity("ACME")
+    assert exc.value is error
+
+    filings.pop()
     txns = insider.get_insider_activity("ACME")
     assert len(txns) == 1
     assert txns[0].transaction_kind == "open_market_purchase"
+    assert txns[0].shares == 10
+    filings.clear()
+    assert insider.get_insider_activity("ACME") == []
 
 
 def test_store_no_persist_and_live_insider_per_accession(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -386,24 +395,42 @@ def test_values_by_column_row_scan_fallbacks() -> None:
     assert insider._values_by_column(42, "shares") is None
 
 
-def test_values_by_column_row_errors_skip() -> None:
+def test_values_by_column_propagates_row_errors() -> None:
+    error = RuntimeError("boom")
+
     class _BadDict(dict[str, object]):
         @override
         def get(self, key: str, default: object = None) -> object:
-            raise RuntimeError("boom")
+            raise error
 
-    assert insider._values_by_column([_BadDict({"shares": 1})], "shares") == []
+    with pytest.raises(RuntimeError, match="^boom$") as exc:
+        insider._values_by_column([_BadDict({"shares": 1})], "shares")
+    assert exc.value is error
     assert insider._values_by_column([object()], "shares") == []
+    assert insider._values_by_column([], "shares") == []
 
 
-def test_values_by_column_row_coercion_failure_returns_none() -> None:
+def test_values_by_column_propagates_lookup_and_coercion_failures() -> None:
+    error = RuntimeError("boom")
+
     class _BadIter:
         columns: ClassVar[object] = ["shares"]
 
         def __getitem__(self, key: object) -> object:
-            raise RuntimeError("boom")
+            raise error
 
         def __iter__(self) -> object:
-            raise RuntimeError("boom")
+            raise error
 
-    assert insider._values_by_column(_BadIter(), "shares") is None
+    with pytest.raises(RuntimeError, match="^boom$") as exc:
+        insider._values_by_column(_BadIter(), "shares")
+    assert exc.value is error
+
+    class _BadRows(_BadIter):
+        @override
+        def __getitem__(self, key: object) -> object:
+            return None
+
+    with pytest.raises(RuntimeError, match="^boom$") as exc:
+        insider._values_by_column(_BadRows(), "shares")
+    assert exc.value is error

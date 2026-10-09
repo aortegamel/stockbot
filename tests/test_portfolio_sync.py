@@ -207,8 +207,6 @@ def _wing_alias(
     )
 
 
-
-
 def _run_sync(
     data_root: Path, payloads: dict[str, object] | None = None
 ) -> tuple[FakeClient, RobinhoodPortfolioProvider, PortfolioSnapshot]:
@@ -216,6 +214,7 @@ def _run_sync(
     provider = RobinhoodPortfolioProvider(client)
     snapshot = sync_robinhood_portfolio(provider, data_root=data_root, now=NOW)
     return client, provider, snapshot
+
 
 @pytest.fixture(autouse=True)
 def _wing_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -752,6 +751,7 @@ def test_resolve_security_alias_learned_after_as_of_unresolved(monkeypatch: pyte
     assert known.resolved is True
     assert known.resolution_method == "entity_alias"
     assert known.entity_id == "sec:cik:0000320193"
+
 
 def test_resolve_security_expired_alias_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_candidates(

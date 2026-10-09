@@ -29,6 +29,7 @@ from app.normalization import (
     normalize_sec_company_facts,
     normalize_sec_tickers,
 )
+
 SETTLEMENT = "2026-08-14"
 # Prior cycle on the FINRA calendar canvas: the change slice discovers cycles
 # by probing calendar candidates, so the prior seed must be a candidate for
@@ -134,9 +135,7 @@ def _seed_short_interest(
         source_record_id=f"otcMarket/consolidatedShortInterest:{settlement}",
     )
     normalized = datasets.get("short_interest", [])
-    seeds.short_interest.setdefault(settlement, []).append(
-        [row for row in normalized if isinstance(row, dict)]
-    )
+    seeds.short_interest.setdefault(settlement, []).append([row for row in normalized if isinstance(row, dict)])
 
 
 def _seed_cycle(
@@ -187,7 +186,7 @@ def _add_alias(seeds: _Seeds, alias_value: str, cik: int, known_at: str, retriev
 
 
 def _instant(value: object) -> float:
-    moment = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    moment = datetime.fromisoformat(str(value or ""))
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=UTC)
     return moment.timestamp()
@@ -217,8 +216,12 @@ class _FakeGateway:
             for sec in self._seeds.securities.get(cik, [])
             if as_of is None or str(sec.get("known_at") or "")[:10] <= as_of
         ]
+
         # Oldest first: the production join lets the newest knowable row win.
-        securities.sort(key=lambda sec: _instant(sec.get("known_at")))
+        def _known_at(sec: dict[str, object]) -> float:
+            return _instant(sec.get("known_at"))
+
+        securities.sort(key=_known_at)
         return {"securities": securities, "financial_facts": facts, "dividend_events": []}
 
 
@@ -226,14 +229,15 @@ def _install(monkeypatch: pytest.MonkeyPatch, seeds: _Seeds) -> None:
     """Serve seeded provider data through the screen's live seams."""
     gateway = _FakeGateway(seeds)
     monkeypatch.setattr(screens, "_gateway", lambda: gateway)
-    monkeypatch.setattr(
-        screens,
-        "_fetch_settlement_rows",
-        lambda settlement: [dict(row) for row in seeds.short_interest.get(settlement, [[]])[-1]],
-    )
-    monkeypatch.setattr(
-        screens, "_probe_published_rows", lambda candidate: 1 if candidate in seeds.short_interest else 0
-    )
+
+    def _fetch_settlement_rows(settlement: str) -> list[dict[str, object]]:
+        return [dict(row) for row in seeds.short_interest.get(settlement, [[]])[-1]]
+
+    def _probe_published_rows(candidate: str) -> int:
+        return 1 if candidate in seeds.short_interest else 0
+
+    monkeypatch.setattr(screens, "_fetch_settlement_rows", _fetch_settlement_rows)
+    monkeypatch.setattr(screens, "_probe_published_rows", _probe_published_rows)
 
 
 def _install_gateway(monkeypatch: pytest.MonkeyPatch, seeds: _Seeds) -> None:
@@ -702,9 +706,7 @@ def test_corrected_snapshot_newest_retrieved_wins_at_both_as_of(
     assert later_coverage["finra_rows"] == 3  # one version per symbol, not both
 
 
-def test_security_classification_is_consulted(
-    data_root: Path, seeds: _Seeds, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_security_classification_is_consulted(data_root: Path, seeds: _Seeds, monkeypatch: pytest.MonkeyPatch) -> None:
     """Eligibility comes from the securities classification, not a
     fact-presence proxy: reclassifying ETF (unknown type) excludes it even
     though a shares-outstanding fact exists."""
@@ -1043,6 +1045,7 @@ def test_live_leaderboard_explicit_date_fetches_exactly_that_date(
     first = filters[0]
     assert isinstance(first, dict)
     assert first["fieldValue"] == SETTLEMENT
+
 
 def test_historical_leaderboard_live_rows_stay_excluded_by_pit(
     data_root: Path, seeds: _Seeds, monkeypatch: pytest.MonkeyPatch

@@ -608,6 +608,9 @@ def test_bq_make_client_import_error_arm(monkeypatch: pytest.MonkeyPatch) -> Non
     import sys as _sys
 
     monkeypatch.setitem(_sys.modules, "google.cloud.bigquery", None)
+    parent = _sys.modules.get("google.cloud")
+    if parent is not None:
+        monkeypatch.delattr(parent, "bigquery", raising=False)
     err, _client, billing = bigquery_client._make_client(None, "proj")
     assert err is not None and billing is None
     assert err["error_type"] == "source_unavailable"

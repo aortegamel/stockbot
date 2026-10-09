@@ -147,6 +147,7 @@ def test_trends_api_terms_and_interval_validated(monkeypatch: pytest.MonkeyPatch
     err2 = trends_api.get_interest_over_time(terms=["x"], interval="fortnightly")
     assert err2["status"] == "error" and "interval" in str(err2["error"])
 
+
 def test_trends_api_pending_shape(monkeypatch: pytest.MonkeyPatch) -> None:
     _enable(monkeypatch)
     monkeypatch.setenv("GOOGLE_TRENDS_API_ENABLED", "true")
@@ -175,6 +176,7 @@ def test_youtube_quota_ledger_validated() -> None:
 
 
 # --- CLI arg validation --------------------------------------------------------
+
 
 def test_cli_google_data_bad_subcommand_exits() -> None:
     args = argparse.Namespace(

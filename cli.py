@@ -1207,12 +1207,8 @@ def _build_parser() -> argparse.ArgumentParser:
     refresh_parser.add_argument(
         "--cik", type=int, action="append", default=[], help="accepted and ignored (live reads need no enrichment)"
     )
-    refresh_parser.add_argument(
-        "--data-root", default=None, help="accepted and ignored (live reads need no data root)"
-    )
-    subparsers.add_parser(
-        "replay-sec-facts", help="removed: SEC facts read live via providers; no replay"
-    )
+    refresh_parser.add_argument("--data-root", default=None, help="accepted and ignored (live reads need no data root)")
+    subparsers.add_parser("replay-sec-facts", help="removed: SEC facts read live via providers; no replay")
     obligations_parser = subparsers.add_parser(
         "refresh-obligations", help="evaluate obligations for a ticker in memory (never persisted)"
     )

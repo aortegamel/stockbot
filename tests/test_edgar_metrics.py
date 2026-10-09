@@ -136,12 +136,6 @@ def _eps_facts() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-class _EpsFakeCompany(_FakeCompany):
-    @override
-    def get_facts(self) -> _EpsFakeFacts:
-        return _EpsFakeFacts(df=_eps_facts())
-
-
 class _EpsFakeFacts(_FakeFacts):
     def __init__(self, df: pd.DataFrame) -> None:
         self._df = df
@@ -149,6 +143,12 @@ class _EpsFakeFacts(_FakeFacts):
     @override
     def to_dataframe(self) -> pd.DataFrame:
         return self._df
+
+
+class _EpsFakeCompany(_FakeCompany):
+    @override
+    def get_facts(self) -> _EpsFakeFacts:
+        return _EpsFakeFacts(df=_eps_facts())
 
 
 def test_eps_ttm_uses_quarterly_facts_and_derives_q4(monkeypatch: pytest.MonkeyPatch):

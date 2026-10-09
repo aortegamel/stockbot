@@ -83,7 +83,7 @@ def _cik_from_entity(entity_id: str) -> int | None:
     try:
         digits = "".join(ch for ch in str(entity_id or "") if ch.isdigit())
         return int(digits) if digits else None
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 

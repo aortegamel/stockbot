@@ -1,1 +1,27 @@
-{"entry": ["decision/run.ts", "decision/**/*.test.ts"], "project": ["decision/**/*.ts"]}
+{
+  "$schema": "./node_modules/knip/schema.json",
+  "workspaces": {
+    ".": {
+      "entry": [
+        "decision/run.ts",
+        "decision/**/*.test.ts",
+        "decision/runtime.ts"
+      ],
+      "project": ["decision/**/*.ts"],
+      "stryker": {
+        "config": ["stryker.conf.json"]
+      },
+      "ignoreBinaries": [
+        "python3.14",
+        "poly-crap",
+        "gitleaks",
+        "osv-scanner",
+        "llama-server"
+      ]
+    },
+    "needle-harness": {
+      "entry": ["scripts/needle.ts"],
+      "project": ["**/*.{js,ts,tsx,css}"]
+    }
+  }
+}

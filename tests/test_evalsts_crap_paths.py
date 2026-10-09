@@ -894,11 +894,6 @@ def test_final_branches():
     assert override.answer == "draft"
 
 
-
-
-
-
-
 def test_opt_telemetry_rejects_bad_int_type() -> None:
     with pytest.raises(ValueError, match="telemetry.searches"):
         _reg._opt_telemetry({"telemetry": {"searches": "3"}})

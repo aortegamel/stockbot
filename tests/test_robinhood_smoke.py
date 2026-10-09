@@ -121,10 +121,7 @@ def test_robinhood_smoke_discovery_and_portfolio_sync(tmp_path: Path) -> None:
                     f"{table_name}.{column} is a forbidden column"
                 )
             cells = [
-                str(cell)
-                for row in conn.execute(f"SELECT * FROM {table_name}")
-                for cell in row
-                if cell is not None
+                str(cell) for row in conn.execute(f"SELECT * FROM {table_name}") for cell in row if cell is not None
             ]
             for account in accounts:
                 assert not any(account.account_id in cell for cell in cells), (

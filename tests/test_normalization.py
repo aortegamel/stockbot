@@ -520,6 +520,7 @@ def test_xbrl_lineage_over_gateway_shaped_rows(monkeypatch: pytest.MonkeyPatch):
             ]
         )
     )["financial_facts"]
+
     class _Gateway:
         def company_facts(self, cik: int, as_of: str | None = None) -> dict[str, object]:
             assert cik == 1
@@ -529,7 +530,6 @@ def test_xbrl_lineage_over_gateway_shaped_rows(monkeypatch: pytest.MonkeyPatch):
             return {"financial_facts": gated}
 
     monkeypatch.setattr("app.data_sources.SourceGateway", _Gateway)
-
 
     full = lineage.xbrl_lineage("sec:cik:0000000001", SHARES_OUTSTANDING_CONCEPT)
     assert [r["value"] for r in full] == [120.0, 100.0]  # newest period_end first

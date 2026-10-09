@@ -52,40 +52,31 @@ PARSER_VERSION = "1"
 
 _AS_OF_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+
 def _utcnow() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _validate_date(value: object, field: str) -> str:
-    text = str(value or "")
-    if not _AS_OF_RE.match(text):
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be YYYY-MM-DD, got {value!r}")
+    if not _AS_OF_RE.match(value):
         raise ValueError(f"{field} must be YYYY-MM-DD, got {value!r}")
     try:
-        date.fromisoformat(text)
+        date.fromisoformat(value)
     except ValueError:
         raise ValueError(f"{field} must be YYYY-MM-DD, got {value!r}") from None
-    return text
+    return value
 
 
-def _validate_as_of(as_of: str) -> str:
+def _validate_as_of(as_of: object) -> str:
     return _validate_date(as_of, "as_of")
 
 
-def _gateway() -> object:
-    from ..data_sources import SourceGateway
-
-    return SourceGateway()
-
-
-def _check_as_of_opt(as_of: str | None) -> str | None:
+def _check_as_of_opt(as_of: object) -> str | None:
     if as_of is None:
         return None
     return _validate_as_of(as_of)
-
-
-def _filing_day(filing: Filing) -> str:
-    value, _basis = pit_of(filing)
-    return value[:10] if value else (filing.filed_at or "")[:10]
 
 
 def _known_as_of_filing(filing: Filing, as_of: str | None) -> bool:
@@ -114,30 +105,39 @@ def query_filings(
         _validate_date(start_date, "start_date")
     if end_date is not None:
         _validate_date(end_date, "end_date")
+    if forms is not None:
+        if not isinstance(forms, list):
+            raise TypeError(f"forms must be a list of strings, got {forms!r}")
+        for entry in forms:
+            if not isinstance(entry, str):
+                raise TypeError(f"forms must be a list of strings, got {entry!r}")
     if accession is not None:
+        if not isinstance(accession, str):
+            raise TypeError(f"accession must be a string, got {accession!r}")
         from ..data_sources import SourceGateway as _Gateway
 
         try:
-            filing = _Gateway().get_filing(str(accession), as_of=bound)
-        except Exception:
-            return []
+            filing = _Gateway().get_filing(accession, as_of=bound)
+        except ValueError as exc:
+            if "not known as of" in str(exc):
+                return []
+            raise
         return [filing] if _known_as_of_filing(filing, bound) else []
     if cik is None:
         return []
+    if isinstance(cik, bool) or not isinstance(cik, (int, str)):
+        raise TypeError(f"cik must be int or str, got {cik!r}")
     from .filings import list_sec_filings as _live_list
 
     try:
         cik_int = int(str(cik).strip())
-    except (TypeError, ValueError):
-        return []
-    want = {f.strip().upper() for f in (forms or []) if isinstance(f, str) and f.strip()}
-    try:
-        filings = _live_list(cik_int, forms=list(want) or None, start_date=start_date, end_date=end_date, as_of=bound, limit=limit)
-    except Exception:
-        return []
+    except ValueError:
+        raise ValueError(f"invalid cik: {cik!r}") from None
+    want = {f.strip().upper() for f in (forms or []) if f.strip()}
+    filings = _live_list(
+        cik_int, forms=list(want) or None, start_date=start_date, end_date=end_date, as_of=bound, limit=limit
+    )
     return list(filings) if limit is None else list(filings)[:limit]
-
-
 
 
 def content_hash(data: bytes) -> str:
@@ -155,39 +155,30 @@ def ledger_hash(*parts: object) -> str:
     return hashlib.sha256("\n".join("" if p is None else str(p) for p in parts).encode()).hexdigest()
 
 
-def _ledger_rows(rows: Iterable[object], limit: int | None) -> list[object]:
-    out = [row for row in rows if row is not None]
-    return out if limit is None else out[:limit]
-
-
 def _typed_stub_row(row: object) -> dict[str, object]:
+    """Dict copy for dict rows; to_dict rows must also produce dicts."""
     if isinstance(row, dict):
         return dict(row)
     to_dict = getattr(row, "to_dict", None)
     if callable(to_dict):
-        try:
-            mapped = to_dict()
-            if isinstance(mapped, dict):
-                return dict(mapped)
-        except Exception:
-            pass
-    return {}
+        mapped = to_dict()
+        if isinstance(mapped, dict):
+            return dict(mapped)
+        raise TypeError(f"to_dict must return a dict, got {type(mapped).__name__}")
+    raise TypeError(f"row must be a dict or provide to_dict, got {type(row).__name__}")
 
 
-def _live_text_records(
-    accession: str, document_name: str | None, as_of: str | None
-) -> list[Mapping[str, object]]:
+def _live_text_records(accession: str, document_name: str | None, as_of: str | None) -> list[Mapping[str, object]]:
     from . import documents as _documents
 
-    try:
-        doc = _documents.get_sec_document(accession, document_name, as_of=as_of)
-    except Exception:
-        return []
+    doc = _documents.get_sec_document(accession, document_name, as_of=as_of)
     if not isinstance(doc, dict):
-        return []
+        raise TypeError(f"document must be a dict, got {type(doc).__name__}")
     text = doc.get("text")
-    if not isinstance(text, str) or not text:
+    if text is None or text == "":
         return []
+    if not isinstance(text, str):
+        raise TypeError(f"document text must be a string, got {type(text).__name__}")
     return [doc]
 
 
@@ -205,9 +196,13 @@ def query_document_text(
     _check_as_of_opt(as_of)
     if accession is None:
         return []
-    rows = _live_text_records(str(accession), document_name, as_of)
+    if not isinstance(accession, str):
+        raise TypeError(f"accession must be a string, got {accession!r}")
+    if document_name is not None and not isinstance(document_name, str):
+        raise TypeError(f"document_name must be a string, got {document_name!r}")
+    rows = _live_text_records(accession, document_name, as_of)
     out: list[dict[str, object]] = [dict(row) for row in rows if isinstance(row, dict)]
-    return _ledger_rows(out, limit)  # type: ignore[return-value]
+    return out if limit is None else out[:limit]
 
 
 def search_document_text(
@@ -221,22 +216,18 @@ def search_document_text(
     """Live text search delegates to provider full-text search (no local FTS)."""
     del literal, root
     bound = _check_as_of_opt(as_of)
-    text = (query or "").strip()
+    if not isinstance(query, str):
+        raise TypeError(f"query must be a non-empty string, got {query!r}")
+    text = query.strip()
     if not text:
         raise ValueError("query must be a non-empty string")
-    gateway = _gateway()
-    assert hasattr(gateway, "search_filings")
     from ..data_sources import SourceGateway as _Gateway
 
-    gateway_typed: _Gateway = gateway  # type: ignore[assignment]
-    result = gateway_typed.search_filings(query=text, limit=limit or 20, as_of=bound)
+    result = _Gateway().search_filings(query=text, limit=limit or 20, as_of=bound)
     hits = list(result.text_hits or ())
     out: list[dict[str, object]] = []
     for hit in hits:
-        try:
-            out.append(hit.to_dict())
-        except Exception:
-            continue
+        out.append(hit.to_dict())
     return out if limit is None else out[:limit]
 
 
@@ -257,35 +248,33 @@ def _typed_rows(records: Iterable[object], as_of: str | None, limit: int | None)
 
 
 def _gateway_get_filing(accession: str, as_of: str | None) -> Filing:
+    if not isinstance(accession, str):
+        raise TypeError(f"accession must be a string, got {accession!r}")
     from ..data_sources import SourceGateway as _Gateway
 
-    return _Gateway().get_filing(str(accession), as_of=as_of)
+    return _Gateway().get_filing(accession, as_of=as_of)
 
 
 def _filing_meta(accession: str, as_of: str | None) -> Filing | None:
-    """Live filing metadata for one accession (None when unknown or PIT-excluded)."""
+    """Live filing metadata for one accession (None when PIT-excluded)."""
     try:
         return _gateway_get_filing(accession, as_of)
-    except Exception:
-        return None
+    except ValueError as exc:
+        if "not known as of" in str(exc):
+            return None
+        raise
 
 
 def _infotable_of(accession: str) -> object | None:
-    """Live 13F information table for one accession (None when absent)."""
+    """Live 13F information table for one accession (None when the filing exposes none)."""
     from .documents import get_by_accession_number
 
-    try:
-        filing = get_by_accession_number(accession)
-    except Exception:
-        return None
+    filing = get_by_accession_number(accession)
     inner: object = filing.obj() if hasattr(filing, "obj") else filing
     if inner is None:
         inner = filing
     for attr in ("infotable", "information_table", "holdings", "info_table"):
-        try:
-            table: object = getattr(inner, attr, None)
-        except Exception:
-            table = None
+        table: object = getattr(inner, attr, None)
         if table is not None:
             return table
     return None
@@ -300,22 +289,19 @@ def _accession_holdings(accession: str, as_of: str | None) -> list[object]:
     table = _infotable_of(accession)
     if table is None:
         return []
-    try:
-        return list(
-            _insider.normalize_13f_holdings(
-                table,
-                manager_name=filing.filer_name,
-                manager_cik=filing.filer_cik,
-                accession_no=accession,
-                report_period=filing.report_period,
-                filed_at=filing.filed_at,
-                form=filing.form,
-                known_at=filing.known_at,
-                source_url=filing.source,
-            )
+    return list(
+        _insider.normalize_13f_holdings(
+            table,
+            manager_name=filing.filer_name,
+            manager_cik=filing.filer_cik,
+            accession_no=accession,
+            report_period=filing.report_period,
+            filed_at=filing.filed_at,
+            form=filing.form,
+            known_at=filing.known_at,
+            source_url=filing.source,
         )
-    except Exception:
-        return []
+    )
 
 
 def _accession_transactions(accession: str, as_of: str | None) -> list[object]:
@@ -324,77 +310,91 @@ def _accession_transactions(accession: str, as_of: str | None) -> list[object]:
     filing = _filing_meta(accession, as_of)
     if filing is None or filing.form.strip().upper() not in ("3", "3/A", "4", "4/A", "5", "5/A"):
         return []
-    try:
-        obj = _insider.load_ownership(accession)
-    except Exception:
-        return []
-    try:
-        return list(
-            _insider.normalize_ownership_filing(
-                obj,
-                issuer=filing.filer_name,
-                form=filing.form,
-                filed_at=filing.filed_at,
-                accession_no=accession,
-                issuer_cik=filing.filer_cik,
-                known_at=filing.known_at,
-            )
+    obj = _insider.load_ownership(accession)
+    return list(
+        _insider.normalize_ownership_filing(
+            obj,
+            issuer=filing.filer_name,
+            form=filing.form,
+            filed_at=filing.filed_at,
+            accession_no=accession,
+            issuer_cik=filing.filer_cik,
+            known_at=filing.known_at,
         )
-    except Exception:
-        return []
+    )
+
+
+def _check_query_limit(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"limit must be int or None, got {value!r}")
+    return value
+
+
+def _check_query_root(value: object) -> Path | str | None:
+    if value is None:
+        return None
+    if not isinstance(value, (str, Path)):
+        raise TypeError(f"root must be str, Path, or None, got {value!r}")
+    return value
 
 
 def query_beneficial_ownership(*args: object, **kwargs: object) -> list[dict[str, object]]:
     """Ownership rows resolve live per accession when given, else []."""
-    bound = _check_as_of_opt(kwargs.get("as_of") if isinstance(kwargs.get("as_of"), str) or kwargs.get("as_of") is None else None)
+    bound = _check_as_of_opt(kwargs.get("as_of"))
     accession = kwargs.get("accession")
-    limit = kwargs.get("limit")
-    cap = limit if isinstance(limit, int) or limit is None else 200
-    if not isinstance(accession, str) or not accession:
+    cap = _check_query_limit(kwargs.get("limit"))
+    if accession is None:
         return []
+    if not isinstance(accession, str):
+        raise TypeError(f"accession must be a string, got {accession!r}")
+    if not accession:
+        raise ValueError("accession must be a non-empty string")
     from . import ownership as _ownership
 
     filing = _filing_meta(accession, bound)
     if filing is None:
         return []
-    try:
-        schedule = _ownership.load_schedule(accession)
-        recs = _ownership.normalize_schedule(
-            schedule,
-            issuer=filing.filer_name,
-            form=filing.form,
-            filed_at=filing.filed_at,
-            accession_no=accession,
-            known_at=filing.known_at,
-            source_url=filing.source,
-        )
-    except Exception:
-        return []
+    schedule = _ownership.load_schedule(accession)
+    recs = _ownership.normalize_schedule(
+        schedule,
+        issuer=filing.filer_name,
+        form=filing.form,
+        filed_at=filing.filed_at,
+        accession_no=accession,
+        known_at=filing.known_at,
+        source_url=filing.source,
+    )
     rows = [rec.to_dict() for rec in (recs or [])]
     return _typed_rows(rows, bound, cap)
 
 
 def query_13f_holdings(*args: object, **kwargs: object) -> list[dict[str, object]]:
     """Holdings resolve live per accession when given, else []."""
-    raw_as_of = kwargs.get("as_of")
-    bound = _check_as_of_opt(raw_as_of if raw_as_of is None or isinstance(raw_as_of, str) else None)
+    bound = _check_as_of_opt(kwargs.get("as_of"))
     accession = kwargs.get("accession")
-    limit = kwargs.get("limit")
-    cap = limit if isinstance(limit, int) or limit is None else 200
-    if not isinstance(accession, str) or not accession:
+    cap = _check_query_limit(kwargs.get("limit"))
+    if accession is None:
         return []
+    if not isinstance(accession, str):
+        raise TypeError(f"accession must be a string, got {accession!r}")
+    if not accession:
+        raise ValueError("accession must be a non-empty string")
     return _typed_rows(_accession_holdings(accession, bound), bound, cap)
 
 
 def query_insider_transactions(*args: object, **kwargs: object) -> list[dict[str, object]]:
     """Insider rows resolve live per accession when given, else []."""
-    raw_as_of = kwargs.get("as_of")
-    bound = _check_as_of_opt(raw_as_of if raw_as_of is None or isinstance(raw_as_of, str) else None)
+    bound = _check_as_of_opt(kwargs.get("as_of"))
     accession = kwargs.get("accession")
-    limit = kwargs.get("limit")
-    cap = limit if isinstance(limit, int) or limit is None else 200
-    if not isinstance(accession, str) or not accession:
+    cap = _check_query_limit(kwargs.get("limit"))
+    if accession is None:
         return []
+    if not isinstance(accession, str):
+        raise TypeError(f"accession must be a string, got {accession!r}")
+    if not accession:
+        raise ValueError("accession must be a non-empty string")
     return _typed_rows(_accession_transactions(accession, bound), bound, cap)
 
 
@@ -403,42 +403,34 @@ def query_coverage(*args: object, **kwargs: object) -> list[dict[str, object]]:
     source = kwargs.get("source")
     form = kwargs.get("form")
     date_partition = kwargs.get("date_partition")
-    limit = kwargs.get("limit")
-    cap = limit if isinstance(limit, int) or limit is None else 200
+    cap = _check_query_limit(kwargs.get("limit"))
     rows: list[dict[str, object]] = []
-    root = kwargs.get("root")
-    root_arg = root if root is None or isinstance(root, (str, Path)) else None
-    try:
-        for job in list_jobs(status="complete", root=root_arg):
-            job_form = str(job.get("form") or "")
-            job_source = str(job.get("source") or "")
-            if isinstance(form, str) and job_form != form:
-                continue
-            if isinstance(source, str) and job_source != source:
-                continue
-            partition = f"{job.get('start_date')}:{job.get('end_date')}"
-            if isinstance(date_partition, str) and partition != date_partition:
-                continue
-            rows.append(
-                {
-                    "source": job_source,
-                    "form": job_form,
-                    "date_partition": partition,
-                    "status": "complete",
-                    "last_key": job.get("last_key"),
-                }
-            )
-    except Exception:
-        return []
+    root_arg = _check_query_root(kwargs.get("root"))
+    for job in list_jobs(status="complete", root=root_arg):
+        job_form = str(job.get("form") or "")
+        job_source = str(job.get("source") or "")
+        if isinstance(form, str) and job_form != form:
+            continue
+        if isinstance(source, str) and job_source != source:
+            continue
+        partition = f"{job.get('start_date')}:{job.get('end_date')}"
+        if isinstance(date_partition, str) and partition != date_partition:
+            continue
+        rows.append(
+            {
+                "source": job_source,
+                "form": job_form,
+                "date_partition": partition,
+                "status": "complete",
+                "last_key": job.get("last_key"),
+            }
+        )
     return rows if cap is None else rows[:cap]
 
 
 def is_partition_covered(source: str, form: str, date_partition: str, *, root: Path | str | None = None) -> bool:
     """True when a ``complete`` job covers the partition (job ledger is the coverage source)."""
-    try:
-        jobs = list_jobs(status="complete", root=root)
-    except Exception:
-        return False
+    jobs = list_jobs(status="complete", root=root)
     for job in jobs:
         start = str(job.get("start_date") or "")
         end = str(job.get("end_date") or "")
@@ -447,7 +439,6 @@ def is_partition_covered(source: str, form: str, date_partition: str, *, root: P
         if f"{start}:{end}" == date_partition or start == date_partition or end == date_partition:
             return True
     return False
-
 
 
 # Job ledger (SQLite ops ledger): coverage reads here; NOTE warehouse slots apart from this.
@@ -802,5 +793,3 @@ def recover_stale_jobs(*, root: Path | str | None = None) -> int:
             return cur.rowcount or 0
         finally:
             conn.close()
-
-

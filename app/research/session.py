@@ -87,7 +87,7 @@ def create_session(
     *,
     as_of: datetime | str | None = None,
     session_id: str | None = None,
-    policy: dict[str, JSONValue] | None = None,
+    policy: Mapping[str, object] | None = None,
     budget: dict[str, JSONValue] | None = None,
     temporal: str | None = None,
 ) -> ResearchSession:

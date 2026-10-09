@@ -3,38 +3,50 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import select
 import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Callable, Mapping
+from concurrent.futures import Executor
 from pathlib import Path
+from types import TracebackType
+from typing import Self, override
 
 import pytest
 
 from app.decision_client import JevClient
+from app.research.models import JSONValue
 
 
-class _FakeStdin:
+class _FakeStdin(io.StringIO):
     def __init__(self) -> None:
+        super().__init__()
         self.last = ""
         self.writes: list[dict[str, object]] = []
 
-    def write(self, s: str) -> None:
+    @override
+    def write(self, s: str, /) -> int:
         self.last = s
         self.writes.append(json.loads(s))
+        return len(s)
 
+    @override
     def flush(self) -> None:
         pass
 
 
-class _FakeStdout:
+class _FakeStdout(io.StringIO):
     def __init__(self, stdin: _FakeStdin, *, bad_ack: bool = False) -> None:
+        super().__init__()
         self._stdin = stdin
         self._bad_ack = bad_ack
 
-    def readline(self) -> str:
+    @override
+    def readline(self, size: int | None = -1, /) -> str:
         payload = json.loads(self._stdin.last)
         if self._bad_ack:
             return json.dumps({"id": "wrong", "ready": True}) + "\n"
@@ -46,17 +58,20 @@ class _FakeStdout:
         )
 
 
-class _FakeProc:
+class _FakeProc(subprocess.Popen[str]):
     def __init__(self, *, bad_ack: bool = False) -> None:
         self.stdin = _FakeStdin()
         self.stdout = _FakeStdout(self.stdin, bad_ack=bad_ack)
 
+    @override
     def poll(self) -> None:
         return None
 
+    @override
     def terminate(self) -> None:
         pass
 
+    @override
     def kill(self) -> None:
         pass
 
@@ -74,6 +89,7 @@ def test_start_pings_and_reuses_sidecar(tmp_path: Path, monkeypatch: pytest.Monk
     client.start()
     client.start()
     assert client._proc is proc
+    assert isinstance(proc.stdin, _FakeStdin)
     assert [w.get("op") for w in proc.stdin.writes] == ["ping", "ping"]
     assert proc.stdin.writes[0]["id"] != proc.stdin.writes[1]["id"]
 
@@ -131,7 +147,6 @@ def test_runtime_ping_over_bun() -> None:
 
 def test_tool_options_prompt_keeps_last_three_failures() -> None:
     from app.decision_client import _tool_options_prompt
-    from app.research.models import JSONValue
 
     reg: list[dict[str, JSONValue]] = [{"name": "a", "description": "A tool"}]
     node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
@@ -147,7 +162,7 @@ def test_tool_options_prompt_keeps_last_three_failures() -> None:
 
 def test_tool_options_prompt_stamp_idempotent() -> None:
     from app.decision_client import _tool_options_prompt
-    from app.research.models import JSONValue, query_with_today_utc
+    from app.research.models import query_with_today_utc
 
     reg: list[dict[str, JSONValue]] = [{"name": "a", "description": "A tool"}]
     node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
@@ -172,30 +187,36 @@ def test_outcome_dict_truncates_64k_content_keeps_error() -> None:
     assert out["error_type"] == "boom"
 
 
-class _HungStdout:
+class _HungStdout(io.StringIO):
     """readline blocks until terminate releases it, then reports EOF."""
 
     def __init__(self) -> None:
+        super().__init__()
         self._released = threading.Event()
 
-    def readline(self) -> str:
+    @override
+    def readline(self, size: int | None = -1, /) -> str:
         self._released.wait(timeout=30)
         return ""
 
 
-class _HungProc:
+class _HungProc(subprocess.Popen[str]):
     def __init__(self) -> None:
         self.stdin = _FakeStdin()
         self.stdout = _HungStdout()
         self.terminated = threading.Event()
 
+    @override
     def poll(self) -> None:
         return None
 
+    @override
     def terminate(self) -> None:
         self.terminated.set()
+        assert isinstance(self.stdout, _HungStdout)
         self.stdout._released.set()
 
+    @override
     def kill(self) -> None:
         self.terminate()
 
@@ -204,7 +225,7 @@ def test_hung_sidecar_timeout_keeps_loop_responsive(tmp_path: Path, monkeypatch:
     root = Path(__file__).resolve().parent.parent
     client = JevClient(data_root=tmp_path, runtime_path=root / "decision" / "runtime.ts", timeout_s=0.2)
     hung = _HungProc()
-    client._proc = hung  # type: ignore[assignment]
+    client._proc = hung
 
     def _noop(**kwargs: object) -> None:
         return None
@@ -234,10 +255,10 @@ def test_hung_sidecar_timeout_keeps_loop_responsive(tmp_path: Path, monkeypatch:
         time.sleep(0.01)
     assert not client._lock.locked()
 
-    async def _stub(state: object, questions: object) -> object:
+    async def _stub(state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         return {"answers": {"q": {"type": "noul", "noul": 0.7}}}
 
-    client._transport = _stub  # type: ignore[assignment]
+    client._transport = _stub
     out = asyncio.run(
         client.decide({"s": 1}, {"q": {"type": "noul", "instructions": "x"}}, decision_type="t", session_id="s")
     )
@@ -248,7 +269,7 @@ def test_outer_cancel_closes_hung_sidecar(tmp_path: Path, monkeypatch: pytest.Mo
     root = Path(__file__).resolve().parent.parent
     client = JevClient(data_root=tmp_path, runtime_path=root / "decision" / "runtime.ts", timeout_s=60)
     hung = _HungProc()
-    client._proc = hung  # type: ignore[assignment]
+    client._proc = hung
 
     def _noop(**kwargs: object) -> None:
         return None
@@ -286,14 +307,16 @@ def test_outer_cancel_closes_hung_sidecar(tmp_path: Path, monkeypatch: pytest.Mo
     client._lock.release()
 
 
-class _GateStdout:
+class _GateStdout(io.StringIO):
     """readline blocks until the gate opens, then answers the latest write."""
 
     def __init__(self, stdin: _FakeStdin, gate: threading.Event) -> None:
+        super().__init__()
         self._stdin = stdin
         self._gate = gate
 
-    def readline(self) -> str:
+    @override
+    def readline(self, size: int | None = -1, /) -> str:
         assert self._gate.wait(timeout=10), "sidecar gate never opened"
         payload = json.loads(self._stdin.last)
         return (
@@ -302,18 +325,21 @@ class _GateStdout:
         )
 
 
-class _GateProc:
+class _GateProc(subprocess.Popen[str]):
     def __init__(self, gate: threading.Event) -> None:
         self.stdin = _FakeStdin()
         self.stdout = _GateStdout(self.stdin, gate)
         self.terminated = threading.Event()
 
+    @override
     def poll(self) -> None:
         return None
 
+    @override
     def terminate(self) -> None:
         self.terminated.set()
 
+    @override
     def kill(self) -> None:
         self.terminate()
 
@@ -323,7 +349,7 @@ def test_outer_cancel_waiter_leaves_holder_sidecar_alive(tmp_path: Path, monkeyp
     client = JevClient(data_root=tmp_path, runtime_path=root / "decision" / "runtime.ts", timeout_s=30)
     gate = threading.Event()
     proc = _GateProc(gate)
-    client._proc = proc  # type: ignore[assignment]
+    client._proc = proc
 
     def _noop(**kwargs: object) -> None:
         return None
@@ -331,11 +357,10 @@ def test_outer_cancel_waiter_leaves_holder_sidecar_alive(tmp_path: Path, monkeyp
     monkeypatch.setattr(client, "_persist", _noop)
 
     async def _scenario() -> None:
-        kw: dict[str, str] = {"decision_type": "t", "session_id": "s"}
-        questions = {"q": {"type": "noul", "instructions": "x"}}
-        holder = asyncio.ensure_future(client.decide({"s": 1}, questions, **kw))  # type: ignore[arg-type]
+        questions: dict[str, JSONValue] = {"q": {"type": "noul", "instructions": "x"}}
+        holder = asyncio.ensure_future(client.decide({"s": 1}, questions, decision_type="t", session_id="s"))
         await asyncio.sleep(0.3)
-        waiter = asyncio.ensure_future(client.decide({"s": 1}, questions, **kw))  # type: ignore[arg-type]
+        waiter = asyncio.ensure_future(client.decide({"s": 1}, questions, decision_type="t", session_id="s"))
         await asyncio.sleep(0.3)
         waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -358,10 +383,12 @@ class _BlockingHttpResp:
         self._release = threading.Event()
         self.closed = threading.Event()
 
-    def __enter__(self) -> _BlockingHttpResp:  # noqa: PYI034 - test fake returns self
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None
+    ) -> None:
         return None
 
     def read(self) -> bytes:
@@ -389,17 +416,20 @@ def test_outer_cancel_stops_hung_http_fallback(tmp_path: Path, monkeypatch: pyte
     def _noop(**kwargs: object) -> None:
         return None
 
-    def _missing(payload: object) -> object:
+    def _missing(payload: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         raise _SidecarUnavailable("no sidecar")
+
+    def _urlopen(request: urllib.request.Request, *, timeout: float) -> _BlockingHttpResp:
+        return resp
 
     monkeypatch.setattr(client, "_persist", _noop)
     monkeypatch.setattr(client, "_sidecar_roundtrip", _missing)
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: resp)  # type: ignore[arg-type]
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
     monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
 
     async def _scenario() -> None:
         call = asyncio.ensure_future(
-            client.decide({"s": 1}, {"q": {"type": "noul", "instructions": "x"}}, decision_type="t", session_id="s")  # type: ignore[arg-type]
+            client.decide({"s": 1}, {"q": {"type": "noul", "instructions": "x"}}, decision_type="t", session_id="s")
         )
         assert await asyncio.to_thread(entered.wait, 3)
         await asyncio.sleep(0.2)
@@ -419,7 +449,7 @@ def test_cancelled_waiter_never_starts_after_lock(tmp_path: Path, monkeypatch: p
     client = JevClient(data_root=tmp_path, runtime_path=root / "decision" / "runtime.ts", timeout_s=30)
     gate = threading.Event()
     proc = _GateProc(gate)
-    client._proc = proc  # type: ignore[assignment]
+    client._proc = proc
 
     def _noop(**kwargs: object) -> None:
         return None
@@ -427,11 +457,10 @@ def test_cancelled_waiter_never_starts_after_lock(tmp_path: Path, monkeypatch: p
     monkeypatch.setattr(client, "_persist", _noop)
 
     async def _scenario() -> None:
-        kw: dict[str, str] = {"decision_type": "t", "session_id": "s"}
-        questions = {"q": {"type": "noul", "instructions": "x"}}
-        holder = asyncio.ensure_future(client.decide({"s": 1}, questions, **kw))  # type: ignore[arg-type]
+        questions: dict[str, JSONValue] = {"q": {"type": "noul", "instructions": "x"}}
+        holder = asyncio.ensure_future(client.decide({"s": 1}, questions, decision_type="t", session_id="s"))
         await asyncio.sleep(0.3)
-        waiter = asyncio.ensure_future(client.decide({"s": 1}, questions, **kw))  # type: ignore[arg-type]
+        waiter = asyncio.ensure_future(client.decide({"s": 1}, questions, decision_type="t", session_id="s"))
         await asyncio.sleep(0.3)
         waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -439,6 +468,7 @@ def test_cancelled_waiter_never_starts_after_lock(tmp_path: Path, monkeypatch: p
         gate.set()
         assert await asyncio.wait_for(holder, timeout=5) == {"q": {"kind": "noul", "probability": 0.5}}
         await asyncio.sleep(0.5)
+        assert isinstance(proc.stdin, _FakeStdin)
         assert len(proc.stdin.writes) == 1
 
     asyncio.run(_scenario())
@@ -459,20 +489,25 @@ def test_http_fallback_runs_on_client_pool(tmp_path: Path, monkeypatch: pytest.M
     def _noop(**kwargs: object) -> None:
         return None
 
-    def _missing(payload: object) -> object:
+    def _missing(payload: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         raise _SidecarUnavailable("no sidecar")
+
+    def _urlopen(request: urllib.request.Request, *, timeout: float) -> _BlockingHttpResp:
+        return resp
 
     async def _run_and_close() -> object:
         loop = asyncio.get_running_loop()
         orig = loop.run_in_executor
 
-        def _spy(executor: object, func: object, *args: object) -> object:
+        def _spy[*Args, Result](
+            executor: Executor | None, func: Callable[[*Args], Result], *args: *Args
+        ) -> asyncio.Future[Result]:
             seen["executor"] = executor
-            return orig(executor, func, *args)  # type: ignore[arg-type]
+            return orig(executor, func, *args)
 
         monkeypatch.setattr(loop, "run_in_executor", _spy)
         call = asyncio.ensure_future(
-            client.decide({"s": 1}, {"q": {"type": "noul", "instructions": "x"}}, decision_type="t", session_id="s")  # type: ignore[arg-type]
+            client.decide({"s": 1}, {"q": {"type": "noul", "instructions": "x"}}, decision_type="t", session_id="s")
         )
         assert await asyncio.to_thread(entered.wait, 3)
         call.cancel()
@@ -482,6 +517,6 @@ def test_http_fallback_runs_on_client_pool(tmp_path: Path, monkeypatch: pytest.M
 
     monkeypatch.setattr(client, "_persist", _noop)
     monkeypatch.setattr(client, "_sidecar_roundtrip", _missing)
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: resp)  # type: ignore[arg-type]
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
     monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
     assert asyncio.run(_run_and_close()) is client._http_pool

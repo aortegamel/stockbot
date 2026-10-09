@@ -13,8 +13,15 @@ company, accession, and record helpers, models.ToolDecision contract.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from operator import itemgetter
+from typing import TYPE_CHECKING
 
+from app.decision_client import JevClient
 from app.research.models import JSONValue, ToolDecision
+
+if TYPE_CHECKING:
+    from app.research.scheduler import _Kernel
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +133,7 @@ def _ranked(norm: str, toks: set[str], names: set[str]) -> list[tuple[int, str]]
         key = _BOUNDED.get(n, n)
         if s > best.get(key, -(10**9)):
             best[key] = s
-    return sorted(((s, n) for n, s in best.items()), key=lambda x: -x[0])
+    return sorted(((s, n) for n, s in best.items()), key=itemgetter(0), reverse=True)
 
 
 def _ambiguous(top: str, second: str, ranked: list[str]) -> bool:
@@ -254,45 +261,42 @@ def _SMALL_TALK(prompt: str) -> bool:
 
 
 def programmatic_route(prompt: object) -> str | None:
-    """Entry fast-path: research signals -> research_required, else None (JEV decides). Never raises."""
-    try:
-        from app.research.scheduler import _ACCESSION_TOKEN_RE, _objective_company, _objective_ticker
+    """Entry fast-path: research signals -> research_required, else None (JEV decides)."""
+    from app.research.scheduler import _ACCESSION_TOKEN_RE, _objective_company, _objective_ticker
 
-        if not isinstance(prompt, str) or not prompt.strip():
-            return "research_required"
-        if _SMALL_TALK(prompt):
-            return "no_session"
-        norm, toks = _signals(prompt)
-        if toks and toks <= _TIME_TOKS and not (toks & _RESEARCH_TOKS):
-            return "get_current_time"
-        if _ACCESSION_TOKEN_RE.search(prompt) is not None:
-            return "research_required"
-        if (
-            (("should" in toks and toks & _ADVICE_VERBS) or "good investment" in norm)
-            and (_objective_ticker(prompt) is not None or _objective_company(prompt) is not None)
-            and not (toks & _RESEARCH_TOKS)
-        ):
-            return "reasoning_required"
-        if _objective_ticker(prompt) is not None or _objective_company(prompt) is not None:
-            return "research_required"
-        if toks & _RESEARCH_TOKS or "reg sho" in norm or "betting against" in norm:
-            return "research_required"
-        return None
-    except Exception:  # noqa: BLE001 - fast-path never breaks routing; JEV decides on any failure
-        return None
+    if not isinstance(prompt, str) or not prompt.strip():
+        return "research_required"
+    if _SMALL_TALK(prompt):
+        return "no_session"
+    norm, toks = _signals(prompt)
+    if toks and toks <= _TIME_TOKS and not (toks & _RESEARCH_TOKS):
+        return "get_current_time"
+    if _ACCESSION_TOKEN_RE.search(prompt) is not None:
+        return "research_required"
+    if (
+        (("should" in toks and toks & _ADVICE_VERBS) or "good investment" in norm)
+        and (_objective_ticker(prompt) is not None or _objective_company(prompt) is not None)
+        and not (toks & _RESEARCH_TOKS)
+    ):
+        return "reasoning_required"
+    if _objective_ticker(prompt) is not None or _objective_company(prompt) is not None:
+        return "research_required"
+    if toks & _RESEARCH_TOKS or "reg sho" in norm or "betting against" in norm:
+        return "research_required"
+    return None
 
 
 async def programmatic_select_round(
-    jev: object,
-    kernel: object,
+    jev: JevClient,
+    kernel: _Kernel,
     sid: str,
     nid: str,
-    session: dict[str, object],
+    session: Mapping[str, JSONValue],
     node: object,
     registry: _Registry,
     ctx_evidence: list[JSONValue],
     attempts: _Attempts,
-) -> tuple[str, object]:
+) -> tuple[str, ToolDecision]:
     from app.research import scheduler as sched
 
     raw_objective = session.get("objective") or session.get("query") or ""
@@ -339,6 +343,4 @@ async def programmatic_select_round(
         action, decision = await sched._select_round(
             jev, kernel, sid, nid, session, node, registry, ctx_evidence, attempts
         )
-    if isinstance(decision, ToolDecision):
-        decision = _variant_decision(decision, norm, toks, names)
-    return action, decision
+    return action, _variant_decision(decision, norm, toks, names)

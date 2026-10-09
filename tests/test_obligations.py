@@ -664,7 +664,9 @@ def test_schedule_components_flag_and_legacy_backfill(monkeypatch: pytest.Monkey
     assert len([r for r in unflagged if r.get("schedule_component")]) == 6
     assert all(r["headline_type"] == "supply" for r in unflagged if r.get("schedule_component"))
     snapshot, _ = obligations._current_snapshot(unflagged)
-    assert sum(r["amount_billions"] for r in snapshot) == pytest.approx(13.3, abs=0.05)
+    amounts = [a for r in snapshot if isinstance(a := r["amount_billions"], (int, float))]
+    assert len(amounts) == len(snapshot)
+    assert sum(amounts) == pytest.approx(13.3, abs=0.05)
 
 
 def test_reconciliation_ambiguity_attaches_closest_and_warns():

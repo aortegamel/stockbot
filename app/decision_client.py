@@ -19,7 +19,6 @@ import inspect
 import json
 import logging
 import os
-import sqlite3
 import subprocess
 import threading
 import time
@@ -28,7 +27,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TypeGuard, runtime_checkable
 
 from app.config import get_data_root
 from app.research.models import (
@@ -41,7 +40,7 @@ from app.research.models import (
     validate_json_mapping,
     validate_json_value,
 )
-from app.research.repository import ResearchRepository, get_research_db_path
+from app.research.repository import ResearchRepository
 from app.storage.runs import get_current_recorder
 
 logger = logging.getLogger(__name__)
@@ -98,7 +97,7 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _is_prob(v: object) -> bool:
+def _is_prob(v: object) -> TypeGuard[int | float]:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0
 
 
@@ -187,7 +186,7 @@ def parse_decisions(
 ) -> dict[str, dict[str, JSONValue]]:
     """Validate a raw SystemOne payload into per-question decisions (mirrors askDecisions)."""
     if not isinstance(raw, dict) or not isinstance(raw.get("answers"), dict):
-        raise ValueError(f"{name}: malformed_typesafe_response")
+        raise TypeError(f"{name}: malformed_typesafe_response")
     answers: dict[str, JSONValue] = raw["answers"]
     if sorted(answers) != sorted(questions):
         raise ValueError(f"{name}: typesafe answers do not match questions")
@@ -227,21 +226,15 @@ def _node_dict(node: object) -> dict[str, JSONValue]:
     if isinstance(node, dict):
         raw = validate_json_mapping(node, "<node_dict>")
     elif isinstance(node, _HasToDict):
-        try:
-            got = node.to_dict()
-            raw = validate_json_mapping(got, "<node_dict>") if isinstance(got, dict) else {}
-        except Exception:
-            raw = {}
+        got = node.to_dict()
+        raw = validate_json_mapping(got, "<node_dict>") if isinstance(got, dict) else {}
     else:
         raw = {}
-        try:
-            from dataclasses import asdict, is_dataclass
+        from dataclasses import asdict, is_dataclass
 
-            if is_dataclass(node) and not isinstance(node, type):
-                candidate = asdict(node)
-                raw = validate_json_mapping(candidate, "<node_dict>") if isinstance(candidate, dict) else {}
-        except Exception:
-            raw = {}
+        if is_dataclass(node) and not isinstance(node, type):
+            candidate = asdict(node)
+            raw = validate_json_mapping(candidate, "<node_dict>") if isinstance(candidate, dict) else {}
         if not raw:
             for key in (
                 "node_id",
@@ -450,7 +443,7 @@ def _auto_registry() -> list[dict[str, JSONValue]]:
         reg = build_registry()
         if reg:
             return reg
-    except Exception:
+    except ImportError, AttributeError:
         pass
     from app.policy import Capability
     from app.security.action_policy import TOOL_DOMAINS
@@ -459,7 +452,7 @@ def _auto_registry() -> list[dict[str, JSONValue]]:
     try:  # scheduler import failed above; reuse its handle/blind lists when available
         from app.research.scheduler import _HANDLE_PARAMS as _HANDLES
         from app.research.scheduler import _PIT_BLIND_TOOLS as _BLIND
-    except Exception:
+    except ImportError, AttributeError:
         _HANDLES = frozenset()
         _BLIND = frozenset()
 
@@ -517,7 +510,7 @@ def _arm_atexit() -> None:
         for proc in list(_LIVE_PROCS):
             try:
                 proc.terminate()
-            except Exception:  # noqa: BLE001, S110 - best-effort teardown at exit
+            except OSError, RuntimeError:
                 pass
 
     atexit.register(_teardown)
@@ -528,7 +521,7 @@ def _trunc200(value: object) -> str:
     try:
         s = value if isinstance(value, str) else ("" if value is None else str(value))
         return " ".join(s.split())[:200]
-    except Exception:  # noqa: BLE001 - logging-only helper, never raises
+    except TypeError, ValueError, AttributeError:
         return "?"
 
 
@@ -550,12 +543,12 @@ def _choice_summary(decision: object) -> str:
         if isinstance(probs, dict):
             for k, v in probs.items():
                 if _is_prob(v):
-                    floats[str(k)] = float(v)  # type: ignore[arg-type]
+                    floats[str(k)] = float(v)
         ranked = sorted(floats.items(), key=_rank_prob, reverse=True)
         top = ",".join(f"{k}:{v:.2f}" for k, v in ranked[:3])
         margin = ranked[0][1] - ranked[1][1] if len(ranked) >= 2 else 0.0
         return f"winner={w} conf={c} top3=[{top}] margin={margin:.2f}"
-    except Exception:  # noqa: BLE001 - logging-only helper, never raises
+    except IndexError, TypeError, ValueError, AttributeError:
         return "winner=? conf=? top3=[] margin=?"
 
 
@@ -564,7 +557,7 @@ def _args_summary(args: Mapping[str, JSONValue]) -> str:
     try:
         size = len(json.dumps(dict(args), default=str))
         return f"argkeys=[{','.join(sorted(str(k) for k in args))}] argbytes={size}"
-    except Exception:  # noqa: BLE001 - logging-only helper, never raises
+    except TypeError, ValueError:
         return "argkeys=[] argbytes=?"
 
 
@@ -583,7 +576,7 @@ def _jev_usage(raw: object) -> tuple[int | None, int | None, str | None]:
         jev_in = in_raw if isinstance(in_raw, int) and not isinstance(in_raw, bool) else None
         jev_out = out_raw if isinstance(out_raw, int) and not isinstance(out_raw, bool) else None
         return jev_in, jev_out, model
-    except Exception:  # noqa: BLE001 - logging/persistence helper, never raises
+    except TypeError, ValueError, AttributeError:
         return None, None, None
 
 
@@ -609,8 +602,8 @@ class JevClient:
         self._lock = threading.Lock()
         self._proc: subprocess.Popen[str] | None = None
         self._cancel_guard = threading.Lock()
-        self._sidecar_owner: tuple[object, object] | None = None
-        self._http_live: dict[object, object] = {}
+        self._sidecar_owner: tuple[object, subprocess.Popen[str]] | None = None
+        self._http_live: dict[object, Callable[[], object]] = {}
         self._cancelled: set[object] = set()
         # ponytail: own HTTP pool, never the loop default executor, so a
         # cancelled asyncio.run never waits for a stuck urlopen thread.
@@ -626,11 +619,11 @@ class JevClient:
         if response.get("id") != payload["id"] or response.get("ready") is not True:
             raise RuntimeError(f"jev ping failed: unexpected sidecar ack for {payload['id']!r}")
 
-    def _terminate_proc(self, proc: object) -> None:
-        _LIVE_PROCS.discard(proc)  # type: ignore[arg-type]
+    def _terminate_proc(self, proc: subprocess.Popen[str]) -> None:
+        _LIVE_PROCS.discard(proc)
         try:
-            proc.terminate()  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001, S110 - best-effort close
+            proc.terminate()
+        except OSError, RuntimeError:
             pass
 
     def close(self) -> None:
@@ -654,21 +647,21 @@ class JevClient:
         # exit (skip-check or path finally); a cancel racing thread exit
         # leaks one tiny entry. Never prune here or in the invoke finally
         # on the cancel path: the waiter skip-check needs the entry later.
-        target: object | None = None
-        resp: object | None = None
+        target: subprocess.Popen[str] | None = None
+        close_resp: Callable[[], object] | None = None
         with self._cancel_guard:
             self._cancelled.add(token)
             if self._sidecar_owner is not None and self._sidecar_owner[0] is token:
                 _, target = self._sidecar_owner
                 self._sidecar_owner = None
-            resp = self._http_live.pop(token, None)
+            close_resp = self._http_live.pop(token, None)
         if target is not None and self._proc is target:
             self._proc = None
             self._terminate_proc(target)
-        if resp is not None:
+        if close_resp is not None:
             try:
-                resp.close()  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001, S110 - best-effort cancel
+                close_resp()
+            except OSError, RuntimeError:
                 pass
 
     def _ensure_proc(self) -> subprocess.Popen[str]:
@@ -704,10 +697,7 @@ class JevClient:
                     if token in self._cancelled:
                         self._cancelled.discard(token)
                         raise asyncio.CancelledError
-            try:
-                proc = self._ensure_proc()
-            except _SidecarUnavailable:
-                raise
+            proc = self._ensure_proc()
             if token is not None:
                 with self._cancel_guard:
                     self._sidecar_owner = (token, proc)
@@ -717,11 +707,11 @@ class JevClient:
                 proc.stdin.write(line)
                 proc.stdin.flush()
                 raw_line = proc.stdout.readline()
-            except (BrokenPipeError, OSError):
+            except BrokenPipeError, OSError:
                 _LIVE_PROCS.discard(proc)
                 try:
                     proc.kill()
-                except Exception:  # noqa: BLE001, S110 - best-effort restart
+                except OSError, RuntimeError:
                     pass
                 self._proc = None
                 proc = self._ensure_proc()
@@ -742,7 +732,7 @@ class JevClient:
                 _LIVE_PROCS.discard(proc)
                 try:
                     proc.kill()
-                except Exception:  # noqa: BLE001, S110 - best-effort restart
+                except OSError, RuntimeError:
                     pass
                 self._proc = None
                 raise _SidecarUnavailable("sidecar closed (EOF)")
@@ -751,7 +741,7 @@ class JevClient:
             except ValueError as exc:
                 raise RuntimeError(f"decide: malformed sidecar response: {exc}") from exc
             if not isinstance(response, dict):
-                raise RuntimeError("decide: malformed sidecar response")
+                raise TypeError("decide: malformed sidecar response")
             return validate_json_mapping(response, "<decision_client>: 'sidecar'")
 
     def _http_system_one(self, state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
@@ -778,9 +768,9 @@ class JevClient:
             with urllib.request.urlopen(req, timeout=self._timeout_s) as resp:
                 if token is not None:
                     with self._cancel_guard:
-                        self._http_live[token] = resp
+                        self._http_live[token] = resp.close
                 raw = json.loads(resp.read().decode())
-        except Exception as exc:
+        except (OSError, TimeoutError, ValueError) as exc:
             raise RuntimeError(f"decide: typesafe_request_failed: {exc}") from exc
         finally:
             if token is not None:
@@ -788,7 +778,7 @@ class JevClient:
                     self._http_live.pop(token, None)
                     self._cancelled.discard(token)
         if not isinstance(raw, dict):
-            raise ValueError("decide: malformed_typesafe_response")
+            raise TypeError("decide: malformed_typesafe_response")
         return validate_json_mapping(raw, "<decision_client>: 'http'")
 
     async def _invoke(
@@ -849,16 +839,16 @@ class JevClient:
                 with self._cancel_guard:
                     self._cancelled.discard(token)
         if not isinstance(response, dict) or response.get("id") != payload["id"]:
-            raise RuntimeError("decide: malformed sidecar response")
+            raise TypeError("decide: malformed sidecar response")
         if "error" in response:
             raise RuntimeError(f"decide: {response['error']}")
         decisions = response.get("decisions")
         if not isinstance(decisions, dict) or not decisions:
-            raise RuntimeError("decide: malformed sidecar response")
+            raise TypeError("decide: malformed sidecar response")
         typed: dict[str, dict[str, JSONValue]] = {}
         for qid, val in validate_json_mapping(decisions, "<decision_client>: 'decisions'").items():
             if not isinstance(val, dict):
-                raise RuntimeError("decide: malformed sidecar response")
+                raise TypeError("decide: malformed sidecar response")
             typed[qid] = validate_json_mapping(val, "<decision_client>: 'decision'")
         raw_out: object = response.get("raw")
         logger.debug(
@@ -887,21 +877,10 @@ class JevClient:
         try:
             json.dumps({"state": state, "questions": dict(questions), "options": choice_options})
         except TypeError as exc:
-            raise ValueError(f"decide: unserializable request: {exc}") from exc
+            raise TypeError(f"decide: unserializable request: {exc}") from exc
         started_at = _now()
         start = time.perf_counter()
-        try:
-            decisions, raw, via = await self._invoke(state, questions, choice_options)
-        except Exception as exc:
-            logger.warning(
-                "toolflow decide_defect sid=%s nid=%s type=%s err=%s: %s",
-                session_id,
-                node_id if isinstance(node_id, str) and node_id else "-",
-                decision_type,
-                type(exc).__name__,
-                str(exc)[:200],
-            )
-            raise
+        decisions, raw, via = await self._invoke(state, questions, choice_options)
         completed_at = _now()
         latency_ms = (time.perf_counter() - start) * 1000.0
         jev_in, jev_out, jev_model = _jev_usage(raw)
@@ -960,18 +939,7 @@ class JevClient:
         node_d = _node_dict(node)
         nid = node_d.get("node_id") or node_d.get("id")
         nid_s = nid if isinstance(nid, str) and nid else "-"
-        try:
-            options, prompt = _tool_options_prompt(reg, node_d, evidence, attempts)
-        except Exception as exc:
-            logger.warning(
-                "toolflow select_defect sid=%s nid=%s registry=%d err=%s: %s",
-                session_id,
-                nid_s,
-                len(reg),
-                type(exc).__name__,
-                str(exc)[:200],
-            )
-            raise
+        options, prompt = _tool_options_prompt(reg, node_d, evidence, attempts)
         logger.info(
             "toolflow select_entry sid=%s nid=%s registry=%d options=%d objective=%r",
             session_id,
@@ -1025,25 +993,16 @@ class JevClient:
             logger.warning("toolflow route_defect sid=- nid=- err=blank_prompt")
             raise ValueError("route_entry: blank prompt")
         reg = list(registry) if registry else _auto_registry()
-        try:
-            if not reg:
-                raise ValueError("route_entry: empty registry")
-            options: dict[str, str] = dict(_ENTRY_OPTIONS)
-            for entry in reg:
-                name = entry.get("name") if isinstance(entry, dict) else None
-                if not isinstance(name, str) or not name:
-                    raise ValueError("route_entry: registry entry needs a name")
-                if name in options:
-                    raise ValueError(f"route_entry: duplicate tool {name}")
-                options[name] = _manifest_line(entry)
-        except Exception as exc:
-            logger.warning(
-                "toolflow route_defect sid=- nid=- registry=%d err=%s: %s",
-                len(reg),
-                type(exc).__name__,
-                str(exc)[:200],
-            )
-            raise
+        if not reg:
+            raise ValueError("route_entry: empty registry")
+        options: dict[str, str] = dict(_ENTRY_OPTIONS)
+        for entry in reg:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if not isinstance(name, str) or not name:
+                raise ValueError("route_entry: registry entry needs a name")
+            if name in options:
+                raise ValueError(f"route_entry: duplicate tool {name}")
+            options[name] = _manifest_line(entry)
         logger.info(
             "toolflow route_entry sid=- nid=- registry=%d options=%d prompt=%r",
             len(reg),
@@ -1058,11 +1017,7 @@ class JevClient:
             }
         }
         start = time.perf_counter()
-        try:
-            decisions, raw, _via = await self._invoke({"prompt": text}, questions, {"entry": options})
-        except Exception as exc:
-            logger.warning("toolflow route_defect sid=- nid=- err=%s: %s", type(exc).__name__, str(exc)[:200])
-            raise
+        decisions, raw, _via = await self._invoke({"prompt": text}, questions, {"entry": options})
         latency_ms = (time.perf_counter() - start) * 1000.0
         d = decisions.get("entry")
         winner = d.get("choice") if isinstance(d, dict) else None
@@ -1110,32 +1065,22 @@ class JevClient:
             logger.warning("toolflow assess_defect sid=- nid=- err=tool_required")
             raise ValueError("assess_entry_tool: tool required")
         reg = _auto_registry()
-        try:
-            if not reg:
-                raise ValueError("assess_entry_tool: empty registry")
-            options: dict[str, str] = dict(_ENTRY_OPTIONS)
-            if RESOLVED_SENTINEL not in options:
-                options[RESOLVED_SENTINEL] = _SENTINEL_DESCRIPTIONS[RESOLVED_SENTINEL]
-            for entry in reg:
-                name = entry.get("name") if isinstance(entry, dict) else None
-                if not isinstance(name, str) or not name:
-                    raise ValueError("assess_entry_tool: registry entry needs a name")
-                if name in options:
-                    raise ValueError(f"assess_entry_tool: duplicate tool {name}")
-                options[name] = _manifest_line(entry)
-            args = validate_json_mapping(
-                dict(arguments) if isinstance(arguments, dict) else {}, "<decision_client>: 'arguments'"
-            )
-            res = validate_json_mapping(dict(result) if isinstance(result, dict) else {}, "<decision_client>: 'result'")
-        except Exception as exc:
-            logger.warning(
-                "toolflow assess_defect sid=- nid=- tool=%s registry=%d err=%s: %s",
-                tool,
-                len(reg),
-                type(exc).__name__,
-                str(exc)[:200],
-            )
-            raise
+        if not reg:
+            raise ValueError("assess_entry_tool: empty registry")
+        options: dict[str, str] = dict(_ENTRY_OPTIONS)
+        if RESOLVED_SENTINEL not in options:
+            options[RESOLVED_SENTINEL] = _SENTINEL_DESCRIPTIONS[RESOLVED_SENTINEL]
+        for entry in reg:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if not isinstance(name, str) or not name:
+                raise ValueError("assess_entry_tool: registry entry needs a name")
+            if name in options:
+                raise ValueError(f"assess_entry_tool: duplicate tool {name}")
+            options[name] = _manifest_line(entry)
+        args = validate_json_mapping(
+            dict(arguments) if isinstance(arguments, dict) else {}, "<decision_client>: 'arguments'"
+        )
+        res = validate_json_mapping(dict(result) if isinstance(result, dict) else {}, "<decision_client>: 'result'")
         ok = res.get("ok")
         content = res.get("content") if isinstance(res.get("content"), str) else ""
         error = res.get("error") if isinstance(res.get("error"), str) else ""
@@ -1159,26 +1104,17 @@ class JevClient:
                     + f"Arguments: {json.dumps(args, default=str)[:2000]} Outcome: {outcome} "
                     + "node_resolved when the result answers the prompt; reasoning_required when no "
                     + "further tool helps; research_required when a full session is needed; otherwise "
-                    + f"the one registry tool to run next. Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values.",
+                    + f"the one registry tool to run next. Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values."
                 ),
                 "criteria": validate_json_mapping(options, "<decision_client>: 'criteria'"),
             }
         }
         start = time.perf_counter()
-        try:
-            decisions, raw, _via = await self._invoke(
-                {"prompt": text, "tool": tool, "arguments": args, "outcome": outcome},
-                questions,
-                {"assess": options},
-            )
-        except Exception as exc:
-            logger.warning(
-                "toolflow assess_defect sid=- nid=- tool=%s err=%s: %s",
-                tool,
-                type(exc).__name__,
-                str(exc)[:200],
-            )
-            raise
+        decisions, raw, _via = await self._invoke(
+            {"prompt": text, "tool": tool, "arguments": args, "outcome": outcome},
+            questions,
+            {"assess": options},
+        )
         latency_ms = (time.perf_counter() - start) * 1000.0
         d = decisions.get("assess")
         winner = d.get("choice") if isinstance(d, dict) else None
@@ -1216,18 +1152,7 @@ class JevClient:
         node_d = _node_dict(node)
         nid = node_d.get("node_id") or node_d.get("id")
         nid_s = nid if isinstance(nid, str) and nid else "-"
-        try:
-            options, prompt = _tool_options_prompt(reg, node_d, None, None)
-        except Exception as exc:
-            logger.warning(
-                "toolflow adjudicate_defect sid=%s nid=%s registry=%d err=%s: %s",
-                session_id,
-                nid_s,
-                len(reg),
-                type(exc).__name__,
-                str(exc)[:200],
-            )
-            raise
+        options, prompt = _tool_options_prompt(reg, node_d, None, None)
         logger.info(
             "toolflow adjudicate_entry sid=%s nid=%s registry=%d options=%d question=%r",
             session_id,
@@ -1344,20 +1269,20 @@ class JevClient:
         nid_s = nid if isinstance(nid, str) and nid else "-"
         if not isinstance(decision, dict) or decision.get("kind") != "choice":
             logger.warning("toolflow %s_defect sid=%s nid=%s err=malformed_decision", event, sid_s, nid_s)
-            raise ValueError("decide: malformed tool_selection decision")
+            raise TypeError("decide: malformed tool_selection decision")
         winner = decision.get("choice")
         probs = decision.get("probabilities")
         conf = decision.get("confidence")
         if not isinstance(winner, str) or not isinstance(probs, dict):
             logger.warning("toolflow %s_defect sid=%s nid=%s err=malformed_decision", event, sid_s, nid_s)
-            raise ValueError("decide: malformed tool_selection decision")
+            raise TypeError("decide: malformed tool_selection decision")
         try:
             floats: dict[str, float] = {str(k): float(v) for k, v in probs.items()}
-        except Exception:
+        except (TypeError, ValueError) as exc:
             logger.warning(
                 "toolflow %s_defect sid=%s nid=%s winner=%r err=malformed_probabilities", event, sid_s, nid_s, winner
             )
-            raise
+            raise TypeError(f"decide: malformed tool_selection probabilities: {exc}") from exc
         probabilities = validate_json_mapping(floats, "<decision_client>: 'probabilities'")
         confidence = float(conf) if isinstance(conf, (int, float)) and not isinstance(conf, bool) else None
         if winner == REASON_SENTINEL:
@@ -1478,13 +1403,13 @@ class JevClient:
                 created_at=utcnow(),
             )
             record.validate("<decision_client>")
-        except Exception as exc:  # noqa: BLE001 - persistence never breaks a decision
+        except (TypeError, ValueError, AttributeError) as exc:
             logger.debug("jev persist: skipping record build (%s: %s)", type(exc).__name__, exc)
             return
         request: dict[str, JSONValue] = {"state": None, "questions": questions}
         try:
             self._persist_domain(record, request=request, response=raw, latency_ms=latency_ms)
-        except Exception as exc:  # noqa: BLE001 - persistence never breaks a decision
+        except (OSError, ValueError, RuntimeError, AttributeError) as exc:
             logger.debug("jev persist: domain skipped (%s: %s)", type(exc).__name__, exc)
         try:
             self._persist_runs(
@@ -1500,65 +1425,20 @@ class JevClient:
                 jev_out=jev_out,
                 jev_model=jev_model,
             )
-        except Exception as exc:  # noqa: BLE001 - persistence never breaks a decision
+        except (OSError, ValueError, RuntimeError, AttributeError) as exc:
             logger.debug("jev persist: runs skipped (%s: %s)", type(exc).__name__, exc)
 
     def _persist_domain(
         self, record: DecisionRecord, *, request: dict[str, JSONValue], response: object, latency_ms: float
     ) -> None:
-        try:
-            repo = ResearchRepository(data_root=self._data_root)
-            save = getattr(repo, "save_decision", None)
-            if callable(save):
-                try:
-                    save(
-                        record,
-                        request=request,
-                        response=response,
-                        provider=self._provider,
-                        latency_ms=latency_ms,
-                    )
-                except TypeError:
-                    save(record)
-                return
-        except Exception:
-            pass
-        # ponytail: local jev_decisions table until KernelPersistence's
-        # save_decision lands; then the duck-typed path above wins.
-        path = get_research_db_path(self._data_root)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        doc = record.to_dict()
-        with sqlite3.connect(str(path)) as conn:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS jev_decisions ("
-                " decision_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, node_id TEXT, job_id TEXT,"
-                " decision_type TEXT NOT NULL, candidates TEXT NOT NULL, probabilities TEXT NOT NULL,"
-                " selected TEXT NOT NULL, confidence REAL, created_at TEXT NOT NULL,"
-                " request TEXT NOT NULL, response TEXT NOT NULL, provider TEXT NOT NULL, latency_ms REAL NOT NULL)"
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO jev_decisions (decision_id, session_id, node_id, job_id,"
-                " decision_type, candidates, probabilities, selected, confidence, created_at,"
-                " request, response, provider, latency_ms)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    doc["decision_id"],
-                    doc["session_id"],
-                    doc["node_id"],
-                    doc["job_id"],
-                    doc["decision_type"],
-                    json.dumps(doc["candidates"], sort_keys=True),
-                    json.dumps(doc["probabilities"], sort_keys=True),
-                    json.dumps(doc["selected"], sort_keys=True),
-                    doc["confidence"],
-                    doc["created_at"],
-                    json.dumps(request, sort_keys=True, default=str),
-                    json.dumps(response, sort_keys=True, default=str),
-                    self._provider,
-                    latency_ms,
-                ),
-            )
-            conn.commit()
+        repo = ResearchRepository(data_root=self._data_root)
+        repo.save_decision(
+            record,
+            request=request,
+            response=response,
+            provider=self._provider,
+            latency_ms=latency_ms,
+        )
 
     def _persist_runs(
         self,
@@ -1619,5 +1499,5 @@ class JevClient:
                 },
                 tool_call_count=0,
             )
-        except Exception as exc:  # noqa: BLE001 - model-call row is best-effort, never breaks a decision
+        except (OSError, ValueError, RuntimeError, AttributeError) as exc:
             logger.debug("jev persist: model call skipped (%s: %s)", type(exc).__name__, exc)

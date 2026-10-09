@@ -54,14 +54,7 @@ from app.sec.models import (
     SECSearchRequest,
     SECTextHit,
 )
-from app.sec.store import (
-    canonical_json,
-    content_hash,
-    enqueue_backfill_job,
-    get_job,
-    ledger_hash,
-    query_13f_holdings,
-)
+from app.sec.store import enqueue_backfill_job, get_job
 from app.thesis import monitor as mon
 from app.thesis.intake import IntakeProposal
 from app.thesis.models import ExpressionRequirement, Thesis, ThesisStateSnapshot
@@ -321,8 +314,13 @@ def test_entity_backend_failure_partial(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
 
 def test_entity_invalid_query() -> None:
+    find_untyped: Callable[..., object] = disc.find_sec_entities
     with pytest.raises(ValueError):
         disc.find_sec_entities("   ")
+    with pytest.raises(TypeError):
+        find_untyped(None)
+    with pytest.raises(TypeError):
+        find_untyped(42)
 
 
 # --- backfill skip-complete + partial-retry ---
@@ -535,6 +533,25 @@ def test_expand_helpers_reject_bad_input() -> None:
     ):
         with pytest.raises(ValueError):
             fn(arg)
+    person_untyped: Callable[..., object] = disc._expand_person_queries
+    domain_untyped: Callable[..., object] = disc._expand_domain_queries
+    security_untyped: Callable[..., object] = disc._expand_security_queries
+    quarter_untyped: Callable[..., object] = disc._parse_quarter_date
+    accession_untyped: Callable[..., object] = disc.normalize_accession_no
+    with pytest.raises(TypeError):
+        person_untyped(None)
+    with pytest.raises(TypeError):
+        person_untyped(42)
+    with pytest.raises(TypeError):
+        domain_untyped(None)
+    with pytest.raises(TypeError):
+        security_untyped(None)
+    with pytest.raises(TypeError):
+        quarter_untyped(None, "start")
+    with pytest.raises(TypeError):
+        accession_untyped(None)
+    with pytest.raises(TypeError):
+        accession_untyped(42)
     assert disc._expand_security_queries("AAPL") == ["AAPL"]
     assert disc._expand_security_queries("aapl") == ["aapl", "AAPL"]
     assert disc._expand_person_queries("Dr John Q Adams") == ["Dr John Q Adams", "John Q Adams", "John Adams"]
@@ -798,6 +815,86 @@ def test_backfill_typed_partial_and_hydrate(tmp_path: Path, monkeypatch: pytest.
     assert (n, ok) == (0, 0)
 
 
+def test_discovery_provider_failures_propagate_or_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec import store
+
+    estate = disc._EntitySearchState("s", "1", None, "now")
+
+    def _meta_boom(cik: object) -> object:
+        raise ConnectionError("submissions down")
+
+    with pytest.raises(ConnectionError):
+        disc._record_verified_cik(estate, 1, _disc_cand(1), _meta_boom)
+    pstate = disc._EntitySearchState("s", "q", None, "now")
+    assert disc._fetch_pooled_meta(pstate, 7, _meta_boom) is None
+    assert pstate.meta_errors and pstate.errors
+    with pytest.raises(ConnectionError):
+        disc._push_entity_metadata(_disc_cand(1), lambda v: None, None, _meta_boom)
+
+    def _ledger_boom(*args: object, **kwargs: object) -> object:
+        raise ConnectionError("ledger down")
+
+    monkeypatch.setattr(store, "is_partition_covered", _ledger_boom)
+    with pytest.raises(ConnectionError):
+        disc._enqueue_partition_uncovered(store, [disc.BACKFILL_SOURCE], "10-K", 2024, 1, tmp_path)
+    with pytest.raises(ConnectionError):
+        disc._backfill_skip_current(store, "s", "10-K/2024-Q1", tmp_path)
+    with pytest.raises(ConnectionError):
+        disc._search_split_partitions(store, ["10-K"], [(2024, 1)], tmp_path)
+    with pytest.raises(ConnectionError):
+        monkeypatch.setattr(store, "fail_job", _ledger_boom)
+        disc._backfill_fail(
+            store, {"id": "j", "start_date": "a", "end_date": "b"}, "s", "f", RuntimeError("x"), tmp_path
+        )
+
+    def _edgar_boom(accession: str) -> object:
+        raise ConnectionError("edgar down")
+
+    with pytest.raises(ConnectionError):
+        disc._hydrate_transaction(
+            store,
+            _edgar_boom,
+            "A",
+            "4",
+            None,
+            None,
+            None,
+            None,
+            "2024-01-01",
+            None,
+            "http://x",
+            "F",
+            1,
+            None,
+            None,
+            "t",
+            tmp_path,
+        )
+    with pytest.raises(ConnectionError):
+        disc._offering_inputs(_edgar_boom, "A")
+    rstate = disc._RelState(None)
+
+    def _mention_boom(**kwargs: object) -> object:
+        raise ConnectionError("fts down")
+
+    monkeypatch.setattr(store, "search_document_text", _mention_boom)
+    disc._rel_mentions_route(rstate, store, ["1"], None, tmp_path, False, 50)
+    assert any(a["status"] == "failed" for a in rstate.attempts)
+    assert any("local-mentions failed" in e for e in rstate.errors)
+
+
+def test_discovery_rel_efts_failure_records_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = disc._RelState(None)
+
+    def _boom(*args: object, **kwargs: object) -> object:
+        raise ConnectionError("efts down")
+
+    monkeypatch.setattr("app.sec.client.search_sec_filings", _boom)
+    disc._rel_efts_route(state, ["1"], None, False, 50)
+    assert any(a["status"] == "failed" for a in state.attempts)
+    assert any("efts-mentions failed" in e for e in state.errors)
+
+
 def test_rel_routes_with_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from app.sec import store
 
@@ -872,12 +969,13 @@ def test_rel_workflow_row_branches(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 
 def test_backfill_write_typed_skipped_and_failed(tmp_path: Path) -> None:
+    from app.sec import store
+
     target = disc._BackfillTarget("2024-Q1", "4/2024-Q1", [], False, False, True)
     tracker: disc._BackfillTracker = {"last_key": None, "total": 0, "failed": False}
-    disc._backfill_write_typed(object(), target, "4", [], None, False, tracker, tmp_path)
+    disc._backfill_write_typed(store, target, "4", [], None, False, tracker, tmp_path)
     assert tracker["failed"] is False
     target2 = disc._BackfillTarget("2024-Q1", "4/2024-Q1", [], True, False, False)
-    from app.sec import store
 
     disc._backfill_write_typed(store, target2, "4", [], None, True, tracker, tmp_path)
 
@@ -996,7 +1094,8 @@ def test_sum_shares_df_columns_broken_getitem_iterable() -> None:
         def __getitem__(self, key: object) -> object:
             raise RuntimeError("boom")
 
-    assert insider._sum_shares_column(_BadGet()) is None
+    with pytest.raises(RuntimeError):
+        insider._sum_shares_column(_BadGet())
 
 
 def test_values_by_column_none_when_no_getitem() -> None:
@@ -1026,7 +1125,8 @@ def test_owner_list_cik_raises() -> None:
         def reporting_owners(self):
             raise RuntimeError("boom")
 
-    assert insider._owner_list_cik_of(_Boom()) is None
+    with pytest.raises(RuntimeError):
+        insider._owner_list_cik_of(_Boom())
 
 
 def test_owners_of_structured_and_fallback() -> None:
@@ -1069,7 +1169,8 @@ def test_rows_of_infotable_branches() -> None:
         def to_dict(self, orient: object = "records") -> object:
             raise RuntimeError("boom")
 
-    assert insider._rows_of_infotable(_BadDF()) is None
+    with pytest.raises(RuntimeError):
+        insider._rows_of_infotable(_BadDF())
 
 
 def test_rows_of_infotable_generator() -> None:
@@ -1130,9 +1231,8 @@ def test_get_planned_sales_skips_failures(monkeypatch: pytest.MonkeyPatch) -> No
         return SimpleNamespace(person_selling="S")
 
     monkeypatch.setattr(insider, "load_144", _load)
-    out = insider.get_planned_insider_sales("ACME")
-    assert [s.accession_no for s in out] == ["good"]
-    assert insider.get_planned_insider_sales("ACME", limit=None) is not None
+    with pytest.raises(RuntimeError):
+        insider.get_planned_insider_sales("ACME")
 
 
 def test_get_insider_activity_skips_bad(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1151,7 +1251,8 @@ def test_get_insider_activity_skips_bad(monkeypatch: pytest.MonkeyPatch) -> None
         raise RuntimeError("x")
 
     monkeypatch.setattr(insider, "load_ownership", _fake_57)
-    assert insider.get_insider_activity("ACME") == []
+    with pytest.raises(RuntimeError):
+        insider.get_insider_activity("ACME")
 
 
 def test_compare_144_bad_rows_and_note() -> None:
@@ -1159,30 +1260,50 @@ def test_compare_144_bad_rows_and_note() -> None:
     assert insider.compare_144_to_form4(proposed, None)["matched"] is False
     cmp_untyped: Callable[..., dict[str, object]] = insider.compare_144_to_form4
     bad_txns: object = object()
-    assert cmp_untyped(proposed, bad_txns)["matched"] is False
+    with pytest.raises(TypeError):
+        cmp_untyped(proposed, bad_txns)
 
 
 def test_holding_row_put_call_and_prn_types() -> None:
-    kw = {
-        "manager_name": "M",
-        "manager_cik": "1",
-        "accession_no": "A",
-        "report_period": "2024-03-31",
-        "filed_at": "2024-05-15",
-        "document_name": None,
-        "known_at": None,
-        "source_url": None,
-        "source_row": 1,
-    }
     r = insider._holding_row_to_record(
         {"Cusip": "037833100", "PutCall": "put", "Type": "PRN", "SoleVoting": 1, "SharedVoting": 2, "NonVoting": 3},
-        **kw,
+        manager_name="M",
+        manager_cik="1",
+        accession_no="A",
+        report_period="2024-03-31",
+        filed_at="2024-05-15",
+        document_name=None,
+        known_at=None,
+        source_url=None,
+        source_row=1,
     )
     assert r.put_call == "Put" and r.shares_prn_type == "PRN"
     assert r.voting == "sole=1 shared=2 none=3"
-    r2 = insider._holding_row_to_record({"Cusip": "037833100", "Type": "SH"}, **kw)
+    r2 = insider._holding_row_to_record(
+        {"Cusip": "037833100", "Type": "SH"},
+        manager_name="M",
+        manager_cik="1",
+        accession_no="A",
+        report_period="2024-03-31",
+        filed_at="2024-05-15",
+        document_name=None,
+        known_at=None,
+        source_url=None,
+        source_row=1,
+    )
     assert r2.shares_prn_type == "SH"
-    r3 = insider._holding_row_to_record({"Cusip": "037833100", "Type": "zzz"}, **kw)
+    r3 = insider._holding_row_to_record(
+        {"Cusip": "037833100", "Type": "zzz"},
+        manager_name="M",
+        manager_cik="1",
+        accession_no="A",
+        report_period="2024-03-31",
+        filed_at="2024-05-15",
+        document_name=None,
+        known_at=None,
+        source_url=None,
+        source_row=1,
+    )
     assert r3.shares_prn_type is None
 
 
@@ -1523,22 +1644,34 @@ def test_get_beneficial_ownership_skips_bad(monkeypatch: pytest.MonkeyPatch) -> 
 def test_diff_ownership_uncovered_lines() -> None:
     from app.sec.models import BeneficialOwnership
 
-    kw = {
-        "filer_name": "F",
-        "filer_cik": None,
-        "issuer": "I",
-        "form": "SC 13D",
-        "filed_at": "2024-01-01",
-        "accession_no": "a",
-        "shares": 10,
-        "percent": 1.0,
-        "sole_voting": 1,
-        "shared_voting": 2,
-        "sole_dispositive": 3,
-        "shared_dispositive": 4,
-    }
-    p = BeneficialOwnership(**kw)
-    c = BeneficialOwnership(**{**kw, "accession_no": "b", "shares": 15, "percent": 2.0, "sole_voting": 9})
+    p = BeneficialOwnership(
+        filer_name="F",
+        filer_cik=None,
+        issuer="I",
+        form="SC 13D",
+        filed_at="2024-01-01",
+        accession_no="a",
+        shares=10,
+        percent=1.0,
+        sole_voting=1,
+        shared_voting=2,
+        sole_dispositive=3,
+        shared_dispositive=4,
+    )
+    c = BeneficialOwnership(
+        filer_name="F",
+        filer_cik=None,
+        issuer="I",
+        form="SC 13D",
+        filed_at="2024-01-01",
+        accession_no="b",
+        shares=15,
+        percent=2.0,
+        sole_voting=9,
+        shared_voting=2,
+        sole_dispositive=3,
+        shared_dispositive=4,
+    )
     ev = ownership.diff_ownership(p, c)
     assert ev.share_change == 5 and ev.voting_changed is True
 
@@ -2102,14 +2235,10 @@ def test_clean_issuer_cik() -> None:
 
 
 def test_append_holding_record_appends_empty_row() -> None:
-    from app.sec.models import InstitutionalHolding as _IH
-
-    out: list[_IH] = []
-    insider._append_holding_record(
-        out,
+    rec = insider._holding_row_to_record(
         SimpleNamespace(),
         manager_name="M",
-        cik="1",
+        manager_cik="1",
         accession_no="A",
         report_period=None,
         filed_at=None,
@@ -2118,7 +2247,7 @@ def test_append_holding_record_appends_empty_row() -> None:
         source_url=None,
         source_row=1,
     )
-    assert len(out) == 1 and out[0].accession_no == "A"
+    assert rec.accession_no == "A"
 
 
 def test_cell_readers() -> None:
@@ -2213,7 +2342,8 @@ def test_holding_known_at() -> None:
             raise RuntimeError("x")
 
     known_untyped: Callable[..., object] = insider._holding_known_at
-    assert known_untyped(_Bad(), "fb") == "fb"
+    with pytest.raises(RuntimeError):
+        known_untyped(_Bad(), "fb")
 
 
 # --- from /tmp/secthesis_repo.py ---

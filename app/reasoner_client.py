@@ -82,7 +82,7 @@ def _str_list(stage: str, v: object, what: str) -> list[str]:
 def check_decompose_hints(stage: str, value: object) -> dict[str, object]:
     """Optional intake hints: tickers + corrected_query. Unknown fields still reject."""
     if not isinstance(value, dict):
-        raise ValueError(f"{stage}: malformed_opencode_json")
+        raise TypeError(f"{stage}: malformed_opencode_json")
     allowed = {"proposals", "tickers", "corrected_query"}
     actual = set(value.keys())
     if not actual <= allowed or "proposals" not in actual:
@@ -104,7 +104,7 @@ def check_decompose_hints(stage: str, value: object) -> dict[str, object]:
 def check_proposals(stage: str, value: object, objective_id: str, prior_ids: set[str]) -> list[Proposal]:
     """Validate non-authoritative proposal candidates (mirrors run.ts checkProposals)."""
     if not isinstance(value, list):
-        raise ValueError(f"{stage}: proposals must be an array")
+        raise TypeError(f"{stage}: proposals must be an array")
     ids: set[str] = set()
     items: list[Mapping[str, object]] = []
     for item in value:
@@ -157,7 +157,7 @@ def check_analyses(
 ) -> list[Analysis]:
     """Validate analysis candidates (mirrors run.ts checkAnalyses)."""
     if not isinstance(value, list):
-        raise ValueError(f"{stage}: analyses must be an array")
+        raise TypeError(f"{stage}: analyses must be an array")
     seen: set[str] = set()
     for item in value:
         if not _is_obj(item) or not isinstance(item, Mapping):
@@ -246,7 +246,7 @@ def check_analyses(
 def check_evidence_requests(stage: str, value: object, objective_id: str, node_ids: set[str]) -> list[EvidenceRequest]:
     """Validate evidence-request candidates (mirrors run.ts checkEvidenceRequests)."""
     if not isinstance(value, list):
-        raise ValueError(f"{stage}: evidenceRequests must be an array")
+        raise TypeError(f"{stage}: evidenceRequests must be an array")
     for item in value:
         if not _is_obj(item) or not isinstance(item, Mapping):
             raise ValueError(f"{stage}: evidenceRequest must be an object")
@@ -277,7 +277,7 @@ def _parse_opencode_output(
     """Extract concatenated output_text, parse JSON with required + optional keys (mirrors run.ts)."""
     output = raw.get("output") if isinstance(raw, dict) else None
     if not isinstance(output, list):
-        raise ValueError(f"{stage}: malformed_opencode_response")
+        raise TypeError(f"{stage}: malformed_opencode_response")
     text = ""
     for item in output:
         if not isinstance(item, dict) or item.get("type") != "message":
@@ -298,7 +298,7 @@ def _parse_opencode_output(
     except json.JSONDecodeError:
         raise ValueError(f"{stage}: malformed_opencode_json") from None
     if not isinstance(parsed, dict):
-        raise ValueError(f"{stage}: malformed_opencode_json")
+        raise TypeError(f"{stage}: malformed_opencode_json")
     allowed = set(keys) | set(optional or [])
     actual = set(parsed.keys())
     if not set(keys) <= actual <= allowed:
@@ -325,17 +325,18 @@ def _default_post(url: str, api_key: str, model: str, prompt: str, timeout_s: fl
         with _urlrequest.urlopen(req, timeout=timeout_s) as res:
             loaded = json.load(res)
     except _urlerror.HTTPError as e:
+        detail = ""
         try:
             detail = e.read().decode("utf-8", "ignore")
-        except Exception:
+        except OSError, ValueError, AttributeError:
             detail = ""
         if detail:
             raise RuntimeError(f"opencode_request_failed: {e.code} {detail[:300]}") from None
         raise RuntimeError(f"opencode_request_failed: {e.code}") from None
-    except Exception as e:
+    except (OSError, TimeoutError, ValueError) as e:
         raise RuntimeError(f"opencode_request_failed: {e}") from None
     if not isinstance(loaded, dict):
-        raise RuntimeError("opencode_request_failed: non-object response")
+        raise TypeError("opencode_request_failed: non-object response")
     return loaded
 
 
@@ -386,8 +387,8 @@ class ReasonerClient:
     def analyze(self, prompt: str) -> dict[str, list[dict[str, object]]]:
         """Propose interpretations + evidence requests; non-authoritative until JEV adjudicates."""
         out = self._call("analyze", prompt, ["analyses", "evidenceRequests"])
-        raw_analyses = out["analyses"] if isinstance(out["analyses"], list) else []
-        raw_requests = out["evidenceRequests"] if isinstance(out["evidenceRequests"], list) else []
+        raw_analyses: list[object] = out["analyses"] if isinstance(out["analyses"], list) else []
+        raw_requests: list[object] = out["evidenceRequests"] if isinstance(out["evidenceRequests"], list) else []
         return {
             "analyses": [a for a in raw_analyses if isinstance(a, dict)],
             "evidenceRequests": [r for r in raw_requests if isinstance(r, dict)],
@@ -397,7 +398,7 @@ class ReasonerClient:
         """Propose follow-ups + evidence requests; non-authoritative until JEV admits."""
         out = self._call("expand", prompt, ["evidenceRequests", "proposals"])
         proposals = check_proposals("expand", out["proposals"], objective_id, prior_ids or set())
-        raw_requests = out["evidenceRequests"] if isinstance(out["evidenceRequests"], list) else []
+        raw_requests: list[object] = out["evidenceRequests"] if isinstance(out["evidenceRequests"], list) else []
         checked: list[object] = [r for r in raw_requests if isinstance(r, dict)]
         return {"proposals": list(proposals), "evidenceRequests": checked}
 

@@ -32,11 +32,11 @@ class _Gateway:
         self.alias_rows: list[dict[str, object]] = []
         self.facts_by_cik: dict[int, dict[str, list[dict[str, object]]]] = {}
 
-    def ticker_candidates(self, ticker: str, as_of: object = None) -> list["TickerAlias"]:
+    def ticker_candidates(self, ticker: str, as_of: object = None) -> list[TickerAlias]:
         """All aliases for the ticker, unfiltered (PIT stays in resolve_ticker_aliases)."""
         del as_of
         want = str(ticker).strip().upper()
-        out: list["TickerAlias"] = []
+        out: list[TickerAlias] = []
         for row in self.alias_rows:
             if str(row.get("alias_value") or "").strip().upper() != want:
                 continue
@@ -67,9 +67,7 @@ class _Gateway:
         for name, rows in out.items():
             if isinstance(rows, list):
                 out[name] = [
-                    row
-                    for row in rows
-                    if isinstance(row, dict) and str(row.get("known_at") or "")[:10] <= as_of
+                    row for row in rows if isinstance(row, dict) and str(row.get("known_at") or "")[:10] <= as_of
                 ]
         return out
 
@@ -134,6 +132,7 @@ def _seed_quarters(gw: _Gateway) -> None:
         ],
     )
 
+
 def _event(
     cik: int,
     event_id: str,
@@ -179,6 +178,7 @@ def _seed_events(gw: _Gateway, rows: list[dict[str, object]]) -> None:
     merged = dict(gw.facts_by_cik.get(KO_CIK, {}))
     merged["dividend_events"] = list(merged.get("dividend_events", [])) + list(rows)
     gw.facts_by_cik[KO_CIK] = merged
+
 
 def _fail_on_price(monkeypatch: pytest.MonkeyPatch) -> None:
     def _boom(ticker: str) -> dict[str, object]:

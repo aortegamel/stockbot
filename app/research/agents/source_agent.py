@@ -679,16 +679,39 @@ def _take_new(candidates: Sequence[str], seen: set[str]) -> list[str]:
     return out
 
 
+def _rerank_queries(new_queries: list[str], reference: str | None) -> list[str]:
+    """Embedding order for a bounded candidate set; deterministic order otherwise."""
+    if not isinstance(reference, str) or not reference.strip() or len(new_queries) < 2:
+        return new_queries
+    try:
+        from app.needle_client import similarity_order
+    except ImportError:
+        return new_queries
+    try:
+        order = similarity_order(new_queries, reference)
+    except Exception:  # noqa: BLE001 - embedding is a tiebreak; failure keeps deterministic order
+        return new_queries
+    if order is None:
+        return new_queries
+    return [new_queries[i] for i in order]
+
+
 def expand_queries(
     queries: Sequence[str],
     finding_texts: Sequence[str],
     context: Mapping[str, object] | None = None,
+    *,
+    reference: str | None = None,
 ) -> list[str]:
-    """New material queries from filing findings, deduped against prior queries."""
+    """New material queries from filing findings, deduped against prior queries.
+
+    Deterministic order by default; a reference question embedding-reranks the
+    bounded candidate set, never adding or dropping queries.
+    """
     seen = {normalize_query(q) for q in (queries or []) if isinstance(q, str)}
     seen.discard("")
     candidates = [*_finding_candidates(finding_texts, seen), *_context_candidates(context, seen)]
-    return _take_new(candidates, seen)
+    return _rerank_queries(_take_new(candidates, seen), reference)
 
 
 def expansion_stop(

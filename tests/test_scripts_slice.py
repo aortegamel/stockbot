@@ -1159,45 +1159,60 @@ def test_collect_telemetry_tally_branches():
 
 
 # --- build_trace fallbacks ---
-def test_build_trace_bad_path_and_empty_db(tmp_path: Path):
+def test_build_trace_bad_path_and_empty_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("RESEARCH_DB_PATH", raising=False)
+    from app.research import session as _research_session
+
     sc = next(s for s in J.SCENARIOS if s["id"] == "nvda_eps")
     t = J.build_trace(Path("/nonexistent-dir-xyz/db.sqlite"), sc, "answer")
     assert t["terminal"] is False and t["final_answer"] == "answer"
-    db = tmp_path / "empty.db"
-    sqlite3.connect(str(db)).close()
-    t = J.build_trace(db, sc, "answer")
-    assert t["research_calls"] == []
-    # discovery rows skipped, private + capability enrichment run
-    db2 = tmp_path / "full.db"
-    conn = sqlite3.connect(str(db2))
-    conn.execute("CREATE TABLE agent_runs (run_id TEXT, status TEXT, started_at TEXT)")
-    conn.execute(
-        "CREATE TABLE tool_calls (tool_call_id TEXT, tool_name TEXT, status TEXT, error_type TEXT, source_names TEXT, truncated INT, error_message TEXT, arguments_json TEXT, result_row_count INT, run_id TEXT)"
+    empty_store = tmp_path / "empty_store"
+    empty_store.mkdir()
+    t = J.build_trace(empty_store, sc, "answer")
+    assert t["research_calls"] == [] and t["final_answer"] == "answer"
+    store = tmp_path / "store"
+    repo = ResearchRepository(data_root=store)
+    sess = _research_session.create_session("What is NVDA EPS?", "objective")
+    repo.save_session(sess)
+    J._walk_to_completed(repo, sess.session_id)
+    repo.save_evidence(
+        {
+            "evidence_id": "ev1",
+            "session_id": sess.session_id,
+            "wave_id": 1,
+            "record_kind": "evidence",
+            "tool_name": "get_fundamentals",
+            "content": "NVDA EPS $5.20 filed 2026-08-01",
+            "known_at": "2026-08-01T00:00:00+00:00",
+        }
     )
-    conn.execute("CREATE TABLE evidence (tool_call_id TEXT, rendered_text TEXT, run_id TEXT)")
-    conn.execute("CREATE TABLE security_events (verdict TEXT, decision TEXT, reason TEXT, run_id TEXT)")
-    conn.execute("INSERT INTO agent_runs VALUES ('r1', 'completed', '2026-01-01')")
-    conn.execute("INSERT INTO tool_calls VALUES ('d1', 'search_tools', 'completed', NULL, '', 0, '', '{}', 3, 'r1')")
-    conn.execute(
-        "INSERT INTO tool_calls VALUES ('t1', 'get_fundamentals', 'completed', NULL, 'sec', 0, '', '{}', NULL, 'r1')"
+    repo.save_evidence(
+        {
+            "evidence_id": "d1",
+            "session_id": sess.session_id,
+            "wave_id": 1,
+            "record_kind": "discovery",
+            "tool_name": "search_tools",
+            "content": "3 candidates found",
+        }
     )
-    conn.execute(
-        "INSERT INTO tool_calls VALUES ('t2', 'search_web', 'completed', NULL, '', 0, '', '{\"q\": \"my portfolio holdings\"}', NULL, 'r1')"
+    repo.save_tool_result(
+        {
+            "tool_result_id": "tr1",
+            "session_id": sess.session_id,
+            "job_id": "j1",
+            "tool_name": "get_valuation_metrics",
+            "result": {"pe": 30},
+        }
     )
-    conn.execute(
-        "INSERT INTO tool_calls VALUES ('t3', 'get_x', 'failed', 'capability denied', '', 0, 'denied', '{}', NULL, 'r1')"
-    )
-    conn.execute("INSERT INTO evidence VALUES ('d1', '3 candidates found', 'r1')")
-    conn.execute("INSERT INTO evidence VALUES ('t1', 'NVDA EPS $5.20 filed 2026-08-01 ' || 'x', 'r1')")
-    conn.execute("INSERT INTO security_events VALUES ('deny', 'blocked', 'policy deny', 'r1')")
-    conn.commit()
-    conn.close()
-    t = J.build_trace(db2, sc, "NVDA EPS is $5.20.")
-    assert t["terminal"] is True
+    t = J.build_trace(store, sc, "NVDA EPS is $5.20.")
+    assert t["terminal"] is True and t["final_answer"] == "NVDA EPS is $5.20."
     assert any(c["tool"] == "get_fundamentals" for c in t["research_calls"])
+    assert any(c.get("tool_call_id") == "ev1" and c.get("known_at") == "2026-08-01" for c in t["research_calls"])
+    assert any(c["tool"] == "get_valuation_metrics" for c in t["research_calls"])
     assert t["discovery_texts"] == ["3 candidates found"]
-    assert any("private data" in p for p in t["private_transmissions"])
-    assert len(t["capability_violations"]) >= 2
+    assert "NVDA EPS" in t["evidence_texts"]["ev1"]
+    assert "metric_snapshot" in t["evidence_kinds"]
 
 
 def test_truncate_and_limits():
@@ -1219,11 +1234,13 @@ def test_persist_answer_truncation_and_error(tmp_path: Path, monkeypatch: pytest
     assert J.persist_answer(tmp_path / "run.db", "r1", "nvda_eps", "hi") is None
 
 
-def test_run_attempts_seeded_error_and_read_run_id(tmp_path: Path):
+def test_run_attempts_seeded_error_and_read_run_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("RESEARCH_DB_PATH", raising=False)
     sc = next(s for s in J.SCENARIOS if s["id"] == "watch_vs_journal")
     out = J._seeded_prompt(sc, tmp_path, "prompt")
     assert isinstance(out[0], str)  # real seeder may succeed or fail; shape stable
     assert J._read_run_id(tmp_path / "nope.db") is None
+    assert J._read_session_id(tmp_path / "nope-store") is None
     ok, reason = J._evaluate_live(_scenario(id="x", evaluator="nope"), "a", tmp_path)
     assert not ok and "unknown evaluator" in reason
 
@@ -1789,8 +1806,8 @@ def _rep_true_s(sets: dict[str, set[str]]) -> bool:
     return True
 
 
-def _read_r1(db: Path) -> str | None:
-    return "r1"
+def _session_s1(store_dir: Path) -> str | None:
+    return "s1"
 
 
 def _sessions_2(db: Path) -> list[str]:
@@ -1817,8 +1834,8 @@ def test_judge_run_attempts_first_try_ok(tmp_path: Path):
     def run_pi(*a: object) -> tuple[int, bool, str, str, bool]:
         return (0, False, "out", "", True)
 
-    _db, timed_out, out, code = J._run_attempts(sc, tmp_path, tmp_path, 1, run_pi, _fake_dirs(tmp_path))
-    assert (timed_out, out, code) == (False, "out", 0)
+    _db, timed_out, out, err, code = J._run_attempts(sc, tmp_path, tmp_path, 1, run_pi, _fake_dirs(tmp_path))
+    assert (timed_out, out, err, code) == (False, "out", "", 0)
 
 
 def test_judge_run_attempts_retry_on_timeout(tmp_path: Path):
@@ -1828,12 +1845,23 @@ def test_judge_run_attempts_retry_on_timeout(tmp_path: Path):
     def run_pi(*a: object) -> tuple[int, bool, str, str, bool]:
         calls.append(a[0])
         if len(calls) == 1:
-            return (1, True, "", "", False)
+            return (1, True, "", "first timed out", False)
         return (0, False, "second", "", True)
 
-    _db, timed_out, out, code = J._run_attempts(sc, tmp_path, tmp_path, 1, run_pi, _fake_dirs(tmp_path))
+    _db, timed_out, out, err, code = J._run_attempts(sc, tmp_path, tmp_path, 1, run_pi, _fake_dirs(tmp_path))
     assert (timed_out, out, code) == (False, "second", 0)
+    assert err == ""
     assert len(calls) == 2
+
+
+def test_judge_run_attempts_err_passthrough(tmp_path: Path):
+    sc = _scenario(id="plain1", prompt="hello")
+
+    def run_pi(*a: object) -> tuple[int, bool, str, str, bool]:
+        return (2, False, "", "boom", False)
+
+    _db, timed_out, out, err, code = J._run_attempts(sc, tmp_path, tmp_path, 1, run_pi, _fake_dirs(tmp_path))
+    assert (timed_out, out, err, code) == (False, "", "boom", 2)
 
 
 def test_judge_run_attempts_seeded_ok(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -1845,7 +1873,7 @@ def test_judge_run_attempts_seeded_ok(monkeypatch: pytest.MonkeyPatch, tmp_path:
         seen.append(prompt)
         return (0, False, "o", "", True)
 
-    _, _, _, code = J._run_attempts(sc, tmp_path, tmp_path, 1, run_pi, _fake_dirs(tmp_path))
+    _, _, _, _, code = J._run_attempts(sc, tmp_path, tmp_path, 1, run_pi, _fake_dirs(tmp_path))
     assert code == 0 and seen == ["p ctx"]
 
 
@@ -1866,7 +1894,7 @@ def test_judge_run_attempts_seeded_error(monkeypatch: pytest.MonkeyPatch, tmp_pa
         return (prompt, err)
 
     monkeypatch.setattr(J, "_seeded_prompt", _seed_err)
-    db, timed_out, _out, code = J._run_attempts(
+    db, timed_out, _out, _err, code = J._run_attempts(
         sc,
         tmp_path,
         tmp_path,
@@ -1883,11 +1911,11 @@ def test_judge_run_attempts_seeded_error(monkeypatch: pytest.MonkeyPatch, tmp_pa
 def test_judge_run_scenario_live_ok(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     sc = _scenario(id="s1", prompt="p", evaluator="e")
 
-    def _attempts_ok_tmp(*a: object, **k: object) -> tuple[Path, bool, str, int | dict[str, object]]:
-        return (tmp_path / "db", False, " ans ", 0)
+    def _attempts_ok_tmp(*a: object, **k: object) -> tuple[Path, bool, str, str, int | dict[str, object]]:
+        return (tmp_path / "db", False, " ans ", "", 0)
 
     monkeypatch.setattr(J, "_run_attempts", _attempts_ok_tmp)
-    monkeypatch.setattr(J, "_read_run_id", _read_r1)
+    monkeypatch.setattr(J, "_read_session_id", _session_s1)
 
     def _persist_a_tmp(*a: object) -> Path | None:
         return tmp_path / "a.md"
@@ -1898,6 +1926,31 @@ def test_judge_run_scenario_live_ok(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert out["ok"] is True
     answer_file = out.get("answer_file")
     assert isinstance(answer_file, str) and answer_file.endswith("a.md")
+    assert "attempt_error" not in out
+
+
+def test_judge_run_scenario_live_attempt_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    sc = _scenario(id="s1", prompt="p", evaluator="e")
+
+    def _attempts_err_text(*a: object, **k: object) -> tuple[Path, bool, str, str, int | dict[str, object]]:
+        return (tmp_path / "db", False, " ans ", "boom", 1)
+
+    monkeypatch.setattr(J, "_run_attempts", _attempts_err_text)
+
+    def _persist_a_tmp(*a: object) -> Path | None:
+        return tmp_path / "a.md"
+
+    monkeypatch.setattr(J, "persist_answer", _persist_a_tmp)
+
+    def _eval_bad(scenario: J.Scenario, answer: str, store_dir: Path) -> tuple[bool, str]:
+        return (False, "bad reason")
+
+    monkeypatch.setattr(J, "_evaluate_live", _eval_bad)
+    out = J.run_scenario_live(sc, tmp_path, tmp_path, 1)
+    assert out["ok"] is False
+    assert out["attempt_error"] == "boom"
+    reason = out.get("reason")
+    assert isinstance(reason, str) and "attempt error: boom" in reason
 
 
 def test_judge_run_scenario_live_seed_dict(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -1913,8 +1966,8 @@ def test_judge_run_scenario_live_seed_dict(monkeypatch: pytest.MonkeyPatch, tmp_
         "duration_s": 0.0,
     }
 
-    def _attempts_err(*a: object, **k: object) -> tuple[str, bool, str, dict[str, object]]:
-        return ("d", False, "", err)
+    def _attempts_err(*a: object, **k: object) -> tuple[str, bool, str, str, dict[str, object]]:
+        return ("d", False, "", "", err)
 
     monkeypatch.setattr(J, "_run_attempts", _attempts_err)
     out = J.run_scenario_live(sc, tmp_path, tmp_path, 1)
@@ -2225,3 +2278,227 @@ def test_ledger_documents_keeps_row_order_without_duplicates():
     filings, documents = vas._ledger_documents(repo, "s")
     assert filings == ("0001", "0003")
     assert documents == ("0001|10-q.htm", "0001|8-k.htm")
+
+
+def test_kernel_calls_tool_and_discovery_branches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_kernel_calls pins provenance, default, discovery, and dedup branches."""
+    monkeypatch.delenv("RESEARCH_DB_PATH", raising=False)
+    from app.research import session as _research_session
+
+    repo = ResearchRepository(data_root=tmp_path / "kernel_calls_store")
+    sess = _research_session.create_session("q?", "o", session_id="s-kernel-calls")
+    repo.save_session(sess)
+    sid = sess.session_id
+    repo.save_evidence(
+        {
+            "evidence_id": "ev-prov-sec",
+            "session_id": sid,
+            "wave_id": 1,
+            "record_kind": "evidence",
+            "content": "prov sec content",
+            "provenance": {"kind": "sec_source", "tool_name": "get_fundamentals"},
+        }
+    )
+    repo.save_evidence(
+        {
+            "evidence_id": "ev-default",
+            "session_id": sid,
+            "wave_id": 1,
+            "record_kind": "evidence",
+            "content": "default content",
+        }
+    )
+    repo.save_evidence(
+        {
+            "evidence_id": "ev-toolkey",
+            "session_id": sid,
+            "wave_id": 1,
+            "record_kind": "evidence",
+            "tool": "get_fundamentals",
+            "content": "legacy tool key",
+        }
+    )
+    repo.save_evidence(
+        {
+            "evidence_id": "ev-prov-none",
+            "session_id": sid,
+            "wave_id": 1,
+            "record_kind": "evidence",
+            "content": "source provenance",
+            "provenance": {"kind": "none", "tool_name": "get_fundamentals"},
+        }
+    )
+    repo.save_evidence(
+        {
+            "evidence_id": "ev-disc-tool",
+            "session_id": sid,
+            "wave_id": 1,
+            "record_kind": "evidence",
+            "tool_name": "search_tools",
+            "content": "disc via tool",
+        }
+    )
+    repo.save_evidence(
+        {
+            "evidence_id": "ev-disc-kind",
+            "session_id": sid,
+            "wave_id": 1,
+            "record_kind": "discovery",
+            "tool_name": "get_fundamentals",
+            "content": "disc via kind",
+        }
+    )
+    repo.save_evidence(
+        {
+            "evidence_id": "ev-plain",
+            "session_id": sid,
+            "wave_id": 1,
+            "record_kind": "evidence",
+            "tool_name": "get_fundamentals",
+            "content": "plain content",
+        }
+    )
+    repo.save_tool_result(
+        {
+            "tool_result_id": "tr-dup",
+            "session_id": sid,
+            "job_id": "j1",
+            "tool_name": "get_fundamentals",
+            "result": {"x": 1},
+        }
+    )
+    repo.save_tool_result(
+        {
+            "tool_result_id": "tr-new",
+            "session_id": sid,
+            "job_id": "j1",
+            "tool_name": "get_valuation_metrics",
+            "result": {"pe": 30},
+        }
+    )
+    repo.save_tool_result(
+        {
+            "tool_result_id": "tr-disc",
+            "session_id": sid,
+            "job_id": "j1",
+            "tool_name": "search_tools",
+            "result": {"x": 2},
+        }
+    )
+    base_evidence: list[object] = list(repo.list_evidence(sid))
+    base_tools: list[object] = list(repo.list_tool_results(sid))
+
+    def _mixed_evidence(_sid: str) -> list[object]:
+        return ["junk", *base_evidence]
+
+    def _mixed_tools(_sid: str) -> list[object]:
+        return ["junk", {"tool_name": ""}, *base_tools]
+
+    monkeypatch.setattr(repo, "list_evidence", _mixed_evidence)
+    monkeypatch.setattr(repo, "list_tool_results", _mixed_tools)
+    ev_known: dict[str, list[str]] = {"ev-prov-sec": ["2026-08-02"], "tr-new": ["2026-08-03"]}
+    calls, discovery = J._kernel_calls(repo, sid, ev_known)
+    by_id = {(c.get("tool_call_id") or ""): c for c in calls}
+    assert set(by_id) == {"ev-prov-sec", "ev-default", "ev-toolkey", "ev-prov-none", "ev-plain", "tr-new"}
+    assert by_id["ev-prov-sec"]["tool"] == "get_fundamentals" and by_id["ev-prov-sec"]["domain"] == "SEC"
+    assert by_id["ev-prov-sec"]["known_at"] == "2026-08-02"
+    assert by_id["ev-default"]["tool"] == "evidence"
+    assert by_id["ev-toolkey"]["domain"] == "fundamentals"
+    assert by_id["ev-prov-none"]["tool"] == "get_fundamentals" and by_id["ev-prov-none"]["domain"] == "fundamentals"
+    assert by_id["tr-new"]["tool"] == "get_valuation_metrics" and by_id["tr-new"]["known_at"] == "2026-08-03"
+    assert by_id["tr-new"]["tool_call_id"] == "tr-new"
+    assert sorted(discovery) == ["disc via kind", "disc via tool"]
+
+
+def test_kernel_evidence_text_and_known_at_branches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_kernel_evidence pins non-dict, missing-id, collision, and known_at branches."""
+    monkeypatch.delenv("RESEARCH_DB_PATH", raising=False)
+    from app.research import session as _research_session
+
+    repo = ResearchRepository(data_root=tmp_path / "kernel_evidence_store")
+    sess = _research_session.create_session("q?", "o", session_id="s-kernel-evidence")
+    repo.save_session(sess)
+    sid = sess.session_id
+    repo.save_evidence(
+        {
+            "evidence_id": "ev-keep",
+            "session_id": sid,
+            "wave_id": 1,
+            "record_kind": "evidence",
+            "tool_name": "get_fundamentals",
+            "content": "keep content",
+            "known_at": "2026-08-01T00:00:00+00:00",
+        }
+    )
+    repo.save_evidence(
+        {
+            "evidence_id": "ev-nodate",
+            "session_id": sid,
+            "wave_id": 1,
+            "record_kind": "evidence",
+            "tool_name": "get_fundamentals",
+            "content": "plain content",
+        }
+    )
+    repo.save_tool_result(
+        {
+            "tool_result_id": "tr-keep",
+            "session_id": sid,
+            "job_id": "j1",
+            "tool_name": "get_valuation_metrics",
+            "result": {"pe": 30},
+            "known_at": "2026-08-04T00:00:00+00:00",
+        }
+    )
+    repo.save_tool_result(
+        {
+            "tool_result_id": "ev-keep",
+            "session_id": sid,
+            "job_id": "j1",
+            "tool_name": "get_valuation_metrics",
+            "result": {"pe": 99},
+        }
+    )
+    base_evidence: list[object] = list(repo.list_evidence(sid))
+    base_tools: list[object] = list(repo.list_tool_results(sid))
+
+    def _mixed_evidence(_sid: str) -> list[object]:
+        out: list[object] = ["junk", {"content": "no id"}]
+        out.extend(base_evidence)
+        return out
+
+    def _mixed_tools(_sid: str) -> list[object]:
+        out: list[object] = ["junk", {"tool_name": "get_fundamentals"}, {"tool_result_id": "", "tool_name": "x"}]
+        out.extend(base_tools)
+        return out
+
+    monkeypatch.setattr(repo, "list_evidence", _mixed_evidence)
+    monkeypatch.setattr(repo, "list_tool_results", _mixed_tools)
+    texts, known = J._kernel_evidence(repo, sid)
+    assert set(texts) == {"ev-keep", "ev-nodate", "tr-keep"}
+    assert "keep content" in texts["ev-keep"] and "99" not in texts["ev-keep"]
+    assert known["ev-keep"] == ["2026-08-01"] and known["tr-keep"] == ["2026-08-04"]
+    assert "ev-nodate" not in known
+
+
+def test_kernel_final_answer_branches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_kernel_final_answer pins missing, non-dict, non-string, and valid branches."""
+    monkeypatch.delenv("RESEARCH_DB_PATH", raising=False)
+    from dataclasses import replace
+
+    from app.research import session as _research_session
+
+    repo = ResearchRepository(data_root=tmp_path / "kernel_final_store")
+    sess = _research_session.create_session("q?", "o", session_id="s-kernel-final")
+    repo.save_session(sess)
+    assert J._kernel_final_answer(repo, "missing") == ""
+    repo.save_session(replace(sess, final_result={"answer": "done"}))
+    assert J._kernel_final_answer(repo, sess.session_id) == "done"
+    repo.save_session(replace(sess, final_result={"answer": 7}))
+    assert J._kernel_final_answer(repo, sess.session_id) == ""
+
+    def _nondict_session(_sid: str) -> SimpleNamespace:
+        return SimpleNamespace(final_result=["not-a-dict"])
+
+    monkeypatch.setattr(repo, "get_session", _nondict_session)
+    assert J._kernel_final_answer(repo, sess.session_id) == ""

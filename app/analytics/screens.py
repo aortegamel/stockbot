@@ -15,7 +15,8 @@ import hashlib
 import json
 import time
 from calendar import monthrange
-from datetime import UTC, date, datetime, time as dtime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as dtime
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
@@ -142,7 +143,9 @@ def _fetch_settlement_rows(settlement_date: str) -> list[dict[str, object]]:
         if total is not None and page_total != total:
             raise ValueError("FINRA Record-Total changed while paging the snapshot.")
         total = page_total
-        page_rows = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+        page_rows: list[dict[str, object]] = (
+            [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+        )
         if not page_rows and len(all_rows) < total:
             raise ValueError("FINRA pagination ended before the complete short-interest snapshot was retrieved.")
         all_rows.extend(page_rows)
@@ -174,11 +177,17 @@ def _snapshot_rows(settlement_date: str, as_of: str) -> list[dict[str, object]]:
     A single live fetch carries one source version per symbol, so there are
     no conflicting versions to exclude.
     """
-    rows = [
-        row for row in _fetch_settlement_rows(settlement_date) if str(row.get("known_at") or "")[:10] <= as_of
-    ]
-    rows.sort(key=lambda row: str(row.get("symbol_code") or ""))
+    rows = [row for row in _fetch_settlement_rows(settlement_date) if str(row.get("known_at") or "")[:10] <= as_of]
+    rows.sort(key=_symbol_code_key)
     return rows
+
+
+def _symbol_code_key(row: dict[str, object]) -> str:
+    return str(row.get("symbol_code") or "")
+
+
+def _shares_fact_key(fact: dict[str, object]) -> tuple[str, str, str]:
+    return (str(fact.get("filed_at") or ""), str(fact.get("period_end") or ""), str(fact.get("accession") or ""))
 
 
 def latest_settlement_date(as_of: str | None = None, data_root: Path | None = None) -> str:
@@ -190,7 +199,7 @@ def latest_settlement_date(as_of: str | None = None, data_root: Path | None = No
         try:
             if _probe_published_rows(candidate) > 0:
                 return candidate
-        except Exception:  # noqa: BLE001, S112 - intentional best-effort boundary, never aborts
+        except OSError, ValueError, RuntimeError:
             continue
     horizon = f" knowable on or before {resolved}" if as_of else ""
     raise ValueError(f"No FINRA short interest cycle is published{horizon}.")
@@ -238,35 +247,28 @@ def _screen_inputs(symbols: list[str], as_of: str, gateway: SourceGateway) -> _S
     security_types: dict[str, str] = {}
     facts_by_entity: dict[str, list[dict[str, object]]] = {}
     for entity_id in sorted(resolved_ids):
-        cik = _cik_of(str(entity_id))
+        cik = _cik_of(entity_id)
         if cik is None:
-            security_types[str(entity_id)] = "unknown"
-            facts_by_entity[str(entity_id)] = []
+            security_types[entity_id] = "unknown"
+            facts_by_entity[entity_id] = []
             continue
         try:
-            facts = gateway.company_facts(cik, as_of=as_of)
-        except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+            facts: dict[str, object] = gateway.company_facts(cik, as_of=as_of)
+        except OSError, ValueError, RuntimeError:
             facts = {}
         securities = facts.get("securities") if isinstance(facts, dict) else None
         if isinstance(securities, list):
             for sec in securities:
-                if isinstance(sec, dict) and str(sec.get("entity_id") or "") == str(entity_id):
-                    security_types[str(entity_id)] = str(sec.get("security_type") or "unknown")
+                if isinstance(sec, dict) and str(sec.get("entity_id") or "") == entity_id:
+                    security_types[entity_id] = str(sec.get("security_type") or "unknown")
         raw_facts = facts.get("financial_facts") if isinstance(facts, dict) else None
         entity_facts = [
             fact
             for fact in (raw_facts if isinstance(raw_facts, list) else [])
             if isinstance(fact, dict) and fact.get("concept") == _SHARES_CONCEPT
         ]
-        entity_facts.sort(
-            key=lambda fact: (
-                str(fact.get("filed_at") or ""),
-                str(fact.get("period_end") or ""),
-                str(fact.get("accession") or ""),
-            ),
-            reverse=True,
-        )
-        facts_by_entity[str(entity_id)] = entity_facts
+        entity_facts.sort(key=_shares_fact_key, reverse=True)
+        facts_by_entity[entity_id] = entity_facts
     return _ScreenInputs(resolutions, security_types, facts_by_entity)
 
 
@@ -404,7 +406,7 @@ def _unresolved_symbols(inputs: _ScreenInputs) -> list[str]:
     out: list[str] = []
     for symbol, res in inputs.resolutions.items():
         if not isinstance(res, SecurityResolution) or not res.resolved:
-            out.append(str(symbol))
+            out.append(symbol)
     return out
 
 
@@ -423,7 +425,7 @@ def _compute_leaderboard(settlement_date: str, as_of: str, limit: int | None) ->
     ranked = sorted(accum.candidates, key=_leaderboard_key)
     entries = ranked[:limit]
     try:
-        days = (date.today() - date.fromisoformat(settlement_date)).days  # noqa: DTZ011 - trading-calendar local date has no tz meaning
+        days = (datetime.now(UTC).date() - date.fromisoformat(settlement_date)).days
         freshness = "stale" if days > finra_client.STALE_AFTER_DAYS else "current"
     except TypeError, ValueError:
         freshness = "unknown"
@@ -575,7 +577,7 @@ def _discover_latest_published_settlement_date(today: date) -> str | None:
         try:
             if _probe_published_rows(candidate) > 0:
                 return candidate
-        except Exception:  # noqa: BLE001, S112 - intentional best-effort boundary, never aborts
+        except OSError, ValueError, RuntimeError:
             continue
     return None
 
@@ -607,7 +609,7 @@ def get_short_interest_leaderboard(
         resolved = _resolve_as_of(as_of)
         target = settlement_date if settlement_date is not None else _discover_target(resolved)
         return _compute_leaderboard(target, resolved, limit)
-    except Exception as exc:  # noqa: BLE001 - intentional best-effort boundary, never aborts
+    except (OSError, ValueError, RuntimeError) as exc:
         return {"error": f"Short-interest leaderboard is unavailable: {exc}"}
 
 
@@ -623,7 +625,7 @@ def _cycle_settlement_dates(as_of: str) -> list[str]:
         try:
             if _probe_published_rows(candidate) > 0:
                 found.append(candidate)
-        except Exception:  # noqa: BLE001, S112 - intentional best-effort boundary, never aborts
+        except OSError, ValueError, RuntimeError:
             continue
         if len(found) == 2:
             break
@@ -709,7 +711,7 @@ def short_interest_change_screen(
         return {"error": f"No FINRA short interest cycles knowable on or before {as_of}."}
     current_date, prior_date = dates[0], dates[1] if len(dates) > 1 else None
     current_rows = _snapshot_rows(current_date, as_of)
-    prior_rows = _snapshot_rows(prior_date, as_of) if prior_date else []
+    prior_rows: list[dict[str, object]] = _snapshot_rows(prior_date, as_of) if prior_date else []
     gateway = _gateway()
     symbols = sorted({str(row["symbol_code"]) for row in current_rows + prior_rows})
     inputs = _screen_inputs(symbols, as_of, gateway)

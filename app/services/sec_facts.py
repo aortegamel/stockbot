@@ -103,7 +103,7 @@ RevisionKey = tuple[str, str, str]
 
 
 def _today() -> _dt.date:
-    return _dt.date.today()  # noqa: DTZ011 - trading-calendar local date has no tz meaning
+    return _dt.datetime.now(_dt.UTC).date()
 
 
 def _validated_as_of(as_of: str | None) -> _dt.date | None:
@@ -111,7 +111,7 @@ def _validated_as_of(as_of: str | None) -> _dt.date | None:
     if as_of is None:
         return _today()
     try:
-        return _dt.datetime.strptime(as_of, "%Y-%m-%d").date()  # noqa: DTZ007 - strict YYYY-MM-DD format gate parses a date-only string
+        return _dt.datetime.strptime(as_of, "%Y-%m-%d").replace(tzinfo=_dt.UTC).date()
     except TypeError, ValueError:
         return None
 
@@ -175,6 +175,7 @@ def _validated_fact_row(row: Mapping[str, object]) -> FinancialFactRow | None:
         "source_url": _stored_opt_text(row.get("source_url")),
     }
 
+
 def _gateway() -> SourceGateway:
     """Per-call gateway: fetch-once-per-run cache never outlives the call."""
     return SourceGateway()
@@ -205,8 +206,12 @@ def _resolve_cik(entity_id: str) -> int | None:
     try:
         digits = "".join(ch for ch in str(entity_id or "") if ch.isdigit())
         return int(digits) if digits else None
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
+
+
+def _fact_order_key(fact: FinancialFactRow) -> tuple[str, str, str]:
+    return (fact["period_end"], fact.get("filed_at") or "", fact.get("accession") or "")
 
 
 def _live_fact_rows(entity_id: str, concepts: tuple[str, ...], as_of: _dt.date) -> list[FinancialFactRow]:
@@ -216,8 +221,8 @@ def _live_fact_rows(entity_id: str, concepts: tuple[str, ...], as_of: _dt.date) 
         return []
     try:
         facts = _gateway().company_facts(cik, as_of=as_of.isoformat())
-    except Exception:
-        return []
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"company facts unavailable for {entity_id}: {exc}") from exc
     rows = facts.get("financial_facts")
     if not isinstance(rows, list):
         return []
@@ -231,7 +236,7 @@ def _live_fact_rows(entity_id: str, concepts: tuple[str, ...], as_of: _dt.date) 
         fact = _validated_fact_row(row)
         if fact is not None:
             validated.append(fact)
-    validated.sort(key=lambda fact: (fact["period_end"], fact.get("filed_at") or "", fact.get("accession") or ""))
+    validated.sort(key=_fact_order_key)
     return validated
 
 
@@ -569,8 +574,8 @@ def _store_dividend_events(entity_id: str, as_of: _dt.date, data_root: Path | No
         return []
     try:
         facts = _gateway().company_facts(cik, as_of=as_of.isoformat())
-    except Exception:
-        return []
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"dividend events unavailable for {entity_id}: {exc}") from exc
     rows = facts.get("dividend_events")
     if not isinstance(rows, list):
         return []
@@ -1015,10 +1020,7 @@ def _safety_fcf_ratios(
 def _safety_cash_ratio(safety: dict[str, object], rows: Sequence[FinancialFactRow], ttm_div_paid: float | None) -> None:
     """Cash-to-annual-dividend multiple from the latest cash balance."""
     cash_row = _latest_concept_value(rows, _CASH_CONCEPT)
-    try:
-        cash = cash_row["value"] if cash_row is not None else None
-    except TypeError, ValueError:
-        cash = None
+    cash = cash_row["value"] if cash_row is not None else None
     if cash is None or ttm_div_paid is None:
         _safety_set(safety, "cash_to_annual_dividend", None, "missing cash balance or ttm dividends-paid")
     elif ttm_div_paid == 0:
@@ -1359,9 +1361,7 @@ def _dividend_fundamental(ticker: str, requested: _dt.date, explicit_as_of: bool
 
 def _eps_fundamental(ticker: str, requested: _dt.date, explicit_as_of: bool = False) -> dict[str, object]:
     entity_id = _resolve_entity(ticker, requested, None)
-    store_rows: list[FinancialFactRow] = (
-        _store_rows(entity_id, _EPS_CONCEPTS, requested, None) if entity_id else []
-    )
+    store_rows: list[FinancialFactRow] = _store_rows(entity_id, _EPS_CONCEPTS, requested, None) if entity_id else []
     payload: dict[str, object] | None = _assemble_eps_payload(ticker, store_rows) if store_rows else None
     if payload is not None:
         quarters_count = payload.get("quarterly_eps")
@@ -1423,9 +1423,7 @@ def _latest_shares_row(
     rows = _live_fact_rows(entity_id, (SHARES_OUTSTANDING_CONCEPT,), requested)
     if not rows:
         return None
-    latest = max(
-        rows, key=lambda row: (row["period_end"], row.get("filed_at") or "", row.get("accession") or "")
-    )
+    latest = max(rows, key=_fact_order_key)
     if not isinstance(latest["value"], (int, float)):
         return None
     return dict(latest), float(latest["value"])

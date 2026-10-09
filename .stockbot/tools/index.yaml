@@ -179,7 +179,7 @@ tools:
     time_mode: since_or_as_of
     summary: "Deterministic 8-K-derived recent event feed with accession citations for what changed since a date."
     version: 2
-    keywords: [accession, change, citation, company, date, derived, deterministic, event, feed, finding, get, material, recent, recently, retrieve, since]
+    keywords: [8k, accession, change, citation, company, date, derived, deterministic, event, feed, finding, get, material, recent, recently, retrieve, since]
   - name: get_recent_ownership_filings
     domain: events
     family: ownership-filings
@@ -335,7 +335,7 @@ tools:
     time_mode: latest
     summary: "Future cash obligations from 10-K/10-Q notes: amounts, horizons, certainty language."
     version: 2
-    keywords: [10, 10k, amount, cash, certainty, commitment, company, contract, future, get, horizon, including, language, note, obligated, obligation, one, pay, retrieve, ticker]
+    keywords: [10k, 10q, amount, cash, certainty, commitment, company, contract, future, get, horizon, including, language, note, obligated, obligation, one, pay, retrieve, ticker]
   - name: get_financial_statements
     domain: fundamentals
     family: statements
@@ -719,7 +719,7 @@ tools:
     time_mode: date_range_or_as_of
     summary: "General EDGAR full-text disclosure search across entity, EFTS, and 10-K/10-Q routes, with mentions."
     version: 2
-    keywords: [10, 10k, aapl, accession, acros, cik, company, disclosed, disclosure, domain, edgar, eft, entity, factor, filing, full, general, identifier, language, least, mention, name, no, number, one, person, query, required, risk, route, search, searching, sec, security, text, ticker, unknown]
+    keywords: [10k, 10q, aapl, accession, acros, cik, company, disclosed, disclosure, domain, edgar, eft, entity, factor, filing, full, general, identifier, language, least, mention, name, no, number, one, person, query, required, risk, route, search, searching, sec, security, text, ticker, unknown]
   - name: search_sec_filings_bounded
     domain: sec
     family: filing-search

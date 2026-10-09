@@ -20,11 +20,11 @@ import scripts.verify_agent_scenarios as vas
 import scripts.verify_judge as vj
 import scripts.verify_tool_health as vth
 import scripts.verify_type_escape_hatches as vte
+from app.domain.market.identity import resolve_ticker_aliases
+from app.domain.market.securities import TickerAlias
 from app.policy import Capability, RequestContext
 from app.research.evals.scenarios import Scenario, ScenarioFamily
 from app.research.stage import check_stage_tool, stage_for_session
-from app.domain.market.identity import resolve_ticker_aliases
-from app.domain.market.securities import TickerAlias
 
 # --- verify_judge: concurrency + as_of helpers ---
 

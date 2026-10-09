@@ -1,5 +1,6 @@
 """Offline tests for app/sec/ (no network; edgar faked via monkeypatch)."""
 
+from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -164,8 +165,8 @@ def test_documents_list_get_text_primary(monkeypatch: pytest.MonkeyPatch, tmp_pa
     monkeypatch.setattr("app.sec.store.query_document_text", _no_stored_text)
     roots = iter(["r-list", "r-primary", "r-filing-text", "r-exhibit", "r-missing"])
 
-    def _doc(accession: str, name: str | None = None, **kwargs: object) -> dict[str, object]:
-        return documents.get_sec_document(accession, name, data_root=tmp_path / next(roots), **kwargs)  # type: ignore[arg-type]
+    def _doc(accession: str, name: str | None = None) -> dict[str, object]:
+        return documents.get_sec_document(accession, name, data_root=tmp_path / next(roots))
 
     atts = [_FakeAttachment("primary.htm", text="hello"), _FakeAttachment("ex-99.htm", text="exhibit")]
     fake = _FakeFiling(accession="0003", attachments=atts)
@@ -1176,6 +1177,7 @@ def test_drain_budget_stops_between_pages(monkeypatch: pytest.MonkeyPatch) -> No
     from types import SimpleNamespace
 
     from app.sec import client
+    from app.sec.models import SearchAttempt, SECTextHit
 
     class _Hit:
         def __init__(self, **kwargs: object) -> None:
@@ -1200,8 +1202,8 @@ def test_drain_budget_stops_between_pages(monkeypatch: pytest.MonkeyPatch) -> No
     pages[2].next = lambda: pages[2]
     times = iter([1000.0, 1000.0, 1000.0 + client._DRAIN_BUDGET_S])
     monkeypatch.setattr(client.time, "monotonic", lambda: next(times))
-    attempts: list[object] = []
-    hits: list[object] = []
+    attempts: list[SearchAttempt] = []
+    hits: list[SECTextHit] = []
     warnings: list[str] = []
     page_num, _, _, _, _ = client._drain_pages(
         pages[0], "Acme", "s1", {}, None, 100, 100, attempts, hits, set(), warnings, []
@@ -1246,3 +1248,185 @@ def test_entity_selectors_overlap_wall_time(monkeypatch: pytest.MonkeyPatch) -> 
     assert out == []
     assert sorted(seen) == ["320193", "AAPL", "Apple"]
     assert took < 0.5
+
+
+# --- Insider failure contracts: provider/parser errors propagate (no live calls) ---
+
+
+def test_insider_activity_fetch_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from app.sec import insider
+
+    filings = [SimpleNamespace(accession_no="g1", form="4", filed_at="2024-01-15", filer_name="ACME")]
+
+    def _fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        return filings
+
+    def _boom(accession_no: str) -> object:
+        raise ConnectionError("ownership provider down")
+
+    monkeypatch.setattr(insider, "list_sec_filings", _fake_list)
+    monkeypatch.setattr(insider, "load_ownership", _boom)
+    with pytest.raises(ConnectionError, match="ownership provider down"):
+        insider.get_insider_activity("ACME")
+
+
+def test_insider_sdk_activity_failure_propagates() -> None:
+    from app.sec import insider
+
+    class _BadSDK:
+        def get_transaction_activities(self) -> object:
+            raise ConnectionError("sdk down")
+
+    with pytest.raises(ConnectionError):
+        insider.normalize_ownership_filing(
+            _BadSDK(), issuer="ACME", form="4", filed_at="2024-05-01", accession_no="x-sdk"
+        )
+
+
+def test_insider_noncallable_activities_raise_type_error() -> None:
+    from types import SimpleNamespace
+
+    from app.sec import insider
+
+    with pytest.raises(TypeError):
+        insider.normalize_ownership_filing(
+            SimpleNamespace(get_transaction_activities=42),
+            issuer="ACME",
+            form="4",
+            filed_at="2024-05-01",
+            accession_no="x-type",
+        )
+
+
+def test_insider_table_row_wrong_type_raises() -> None:
+    from types import SimpleNamespace
+
+    from app.sec import insider
+
+    class _Row:
+        def __init__(self, mapping: dict[str, object]) -> None:
+            self._mapping = mapping
+
+        def to_dict(self) -> dict[str, object]:
+            return dict(self._mapping)
+
+    class _Frame:
+        def __init__(self, rows: list[object]) -> None:
+            self._rows = rows
+
+        def iterrows(self) -> list[object]:
+            return list(enumerate(self._rows))
+
+    holder = SimpleNamespace(
+        non_derivative_table=SimpleNamespace(transactions=SimpleNamespace(data=_Frame([_Row({"a": 1}), 42])))
+    )
+    with pytest.raises(TypeError):
+        insider._table_rows_of(holder)
+
+
+def test_insider_144_frame_failure_propagates() -> None:
+    from types import SimpleNamespace
+
+    from app.sec import insider
+
+    class _BadFrame:
+        columns = ("shares",)
+
+        def __getitem__(self, key: object) -> object:
+            raise RuntimeError("frame boom")
+
+    form144 = SimpleNamespace(person_selling="Ann", securities_to_be_sold=_BadFrame())
+    with pytest.raises(RuntimeError):
+        insider.normalize_144(form144, issuer="ACME", filed_at=None, accession_no="a-boom")
+
+
+def test_insider_144_load_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from app.sec import insider
+
+    filings = [SimpleNamespace(accession_no="bad", form="144", filed_at="2024-01-02", filer_name="ACME")]
+
+    def _fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        return filings
+
+    def _boom(accession: str) -> object:
+        raise ConnectionError("144 provider down")
+
+    monkeypatch.setattr(insider, "list_sec_filings", _fake_list)
+    monkeypatch.setattr(insider, "load_144", _boom)
+    with pytest.raises(ConnectionError):
+        insider.get_planned_insider_sales("ACME")
+
+
+def test_insider_144_seller_property_failure_propagates() -> None:
+    from app.sec import insider
+
+    class _BoomSeller:
+        @property
+        def person_selling(self) -> object:
+            raise RuntimeError("seller boom")
+
+    with pytest.raises(RuntimeError):
+        insider.normalize_144(_BoomSeller(), issuer="ACME", filed_at=None, accession_no="a-seller")
+
+
+def test_insider_13f_infotable_failure_propagates() -> None:
+    from app.sec import insider
+
+    class _BadDF:
+        def to_dict(self, orient: object = "records") -> object:
+            raise RuntimeError("df boom")
+
+    with pytest.raises(RuntimeError):
+        insider.normalize_13f_holdings(_BadDF(), manager_name="M", accession_no="A")
+
+
+def test_insider_13f_primitive_row_raises_type_error() -> None:
+    from app.sec import insider
+
+    with pytest.raises(TypeError):
+        insider.normalize_13f_holdings([None], manager_name="M", accession_no="A", form="13F-HR")
+
+
+def test_insider_empty_contracts_preserved() -> None:
+    from app.sec import insider
+
+    assert (
+        insider.normalize_ownership_filing(
+            object(), issuer="ACME", form="4", filed_at="2024-05-01", accession_no="x-empty"
+        )
+        == []
+    )
+    assert insider.normalize_13f_holdings([], manager_name="M", accession_no="A", form="13F-HR") == []
+    assert insider.normalize_13f_holdings([], manager_name="M", accession_no="A", form="13F-NT") == []
+    assert (
+        insider.compare_144_to_form4(
+            insider.normalize_144(
+                SimpleNamespace(person_selling="Ann"), issuer="ACME", filed_at=None, accession_no="a-empty"
+            ),
+            None,
+        )["executed_sale_shares"]
+        == 0
+    )
+
+
+def test_insider_compare_wrong_transactions_type_raises() -> None:
+    from app.sec import insider
+
+    proposed = insider.normalize_144(
+        SimpleNamespace(person_selling="Ann"), issuer="ACME", filed_at=None, accession_no="a-type"
+    )
+    # The wrong-type argument sits outside the static signature on purpose; the loose alias keeps the checker green.
+    compare_untyped: Callable[..., object] = insider.compare_144_to_form4
+    with pytest.raises(TypeError):
+        compare_untyped(proposed, "nope")
+
+
+def test_insider_share_target_wrong_type_raises() -> None:
+    from app.sec import insider
+
+    with pytest.raises(TypeError):
+        insider._share_target_in(["price", 42])

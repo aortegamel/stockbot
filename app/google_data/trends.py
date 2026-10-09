@@ -938,9 +938,7 @@ def _normalize_staged(
             or metrics.get("dma_count") is not None
             or metrics.get("region_count") is not None
         )
-        norm = _normalize_row(
-            row, retrieved_at, features=_strip_diffusion(features) if aggregate else features
-        )
+        norm = _normalize_row(row, retrieved_at, features=_strip_diffusion(features) if aggregate else features)
         observations.append(norm)
     return observations
 

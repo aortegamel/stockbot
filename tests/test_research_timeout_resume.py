@@ -45,3 +45,39 @@ def test_timeout_closes_failed_and_resume_has_no_dup(tmp_path: Path, monkeypatch
     assert repo.resume(sid).session.status == "failed"
     assert repo.resume(sid).open_job_ids == []
     assert len(repo.list_jobs(sid)) == len(jobs)  # resume reopens and duplicates nothing
+
+
+def test_failed_run_bundle_still_writes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A session-fatal model failure persists state before the bundle write."""
+    from app.research.director import DirectorBudgets
+    from app.research.runner import _LiveRun
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "research.sqlite"))
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path / "data"))
+
+    def _timeout_model(_prompt: str) -> str:
+        raise subprocess.TimeoutExpired(cmd="pi", timeout=1)
+
+    def _noop(_name: str, _args: dict[str, object]) -> dict[str, object]:
+        return {}
+
+    with pytest.raises(LiveModelError) as excinfo:
+        run_live("timeout probe?", "probe", None, ["NVDA"], _noop, _timeout_model)
+    repo = ResearchRepository()
+    sid = excinfo.value.session_id
+    session = repo.get_session(sid)
+    assert session.status == "failed"
+    run = _LiveRun(
+        repo,
+        session.query,
+        session.objective,
+        None,
+        "",
+        ["NVDA"],
+        _noop,
+        _timeout_model,
+        DirectorBudgets(),
+    )
+    bundle = run.write_bundle(sid)
+    assert bundle.name == sid
+    assert (bundle / "request.json").exists()

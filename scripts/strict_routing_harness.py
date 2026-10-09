@@ -143,7 +143,7 @@ def _trace_rows(inner_names: list[str]) -> list[dict[str, str]]:
 def _decode_inner(raw: object) -> str | None:
     try:
         payload = json.loads(raw) if isinstance(raw, str) else None
-    except (json.JSONDecodeError, TypeError):
+    except json.JSONDecodeError, TypeError:
         return None
     inner = payload.get("name") if isinstance(payload, dict) else None
     return inner if isinstance(inner, str) and inner else None

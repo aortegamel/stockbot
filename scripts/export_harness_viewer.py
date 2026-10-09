@@ -251,8 +251,16 @@ def _collect_final(sess: object) -> dict[str, object] | None:
         "executiveSummary": str(final.get("executive_summary") or final.get("answer") or ""),
         "consensus": str(final.get("consensus") or ""),
         "baseCase": str(final.get("base_case") or ""),
-        "bullCase": str((final.get("bull_case") or {}).get("summary") if isinstance(final.get("bull_case"), dict) else final.get("bull_case") or ""),
-        "bearCase": str((final.get("bear_case") or {}).get("summary") if isinstance(final.get("bear_case"), dict) else final.get("bear_case") or ""),
+        "bullCase": str(
+            (final.get("bull_case") or {}).get("summary")
+            if isinstance(final.get("bull_case"), dict)
+            else final.get("bull_case") or ""
+        ),
+        "bearCase": str(
+            (final.get("bear_case") or {}).get("summary")
+            if isinstance(final.get("bear_case"), dict)
+            else final.get("bear_case") or ""
+        ),
         "disagreements": _clean_str_list(final.get("critical_disagreements") or final.get("disagreements")),
         "positioning": _clean_str_list(final.get("positioning")),
         "catalysts": _clean_str_list(final.get("catalysts")),
@@ -324,6 +332,7 @@ def _session_str_list(sess: object, name: str) -> list[object]:
     """Session list field; non-list reads as empty."""
     value = getattr(sess, name, None)
     return value if isinstance(value, list) else []
+
 
 def _session_row(
     sid: str,

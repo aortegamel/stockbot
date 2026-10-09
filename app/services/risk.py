@@ -45,8 +45,8 @@ def load_sector_map(positions: Iterable[Position]) -> dict[str, str]:
     """Entity -> sector from live SEC submissions.
 
     Entities without an SEC identity or without a provider sector stay
-    unmapped (unknown exposure, as before). A provider failure skips the
-    entity; evaluation still runs.
+    unmapped (unknown exposure, as before). A provider failure propagates;
+    evaluation requires the sector lookup to succeed.
     """
     sectors: dict[str, str] = {}
     seen: set[str] = set()
@@ -58,10 +58,7 @@ def load_sector_map(positions: Iterable[Position]) -> dict[str, str]:
         cik = _cik_of(entity_id)
         if cik is None:
             continue
-        try:
-            sector = _provider_sector(cik)
-        except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
-            continue
+        sector = _provider_sector(cik)
         if sector is not None:
             sectors[entity_id] = sector
     return sectors

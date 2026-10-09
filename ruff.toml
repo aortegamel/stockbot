@@ -5,7 +5,7 @@
 # are configured here: the 120-column style this codebase is written in, the
 # Python version it targets, and the trees that hold no source to lint.
 line-length = 120
-target-version = "py313"
+target-version = "py314"
 
 extend-exclude = [
     "data",       # local run artifacts and caches

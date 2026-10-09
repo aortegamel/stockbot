@@ -1,8 +1,15 @@
 """Programmatic router: 5 live questions route deterministically; JEV only on ambiguity."""
 
 import asyncio
+from collections.abc import Mapping, Sequence
+from types import SimpleNamespace
+from typing import override
 
+import pytest
+
+from app.decision_client import JevClient
 from app.research import scheduler
+from app.research.models import DecisionRecord, JSONValue, ToolDecision
 from app.research.programmatic_router import (
     _ranked,
     _registry_names,
@@ -13,23 +20,68 @@ from app.research.programmatic_router import (
 )
 
 
-class _Kernel:
-    def record_decision(self, sid, dtype, **kw):
-        pass
+class _Kernel(scheduler._Kernel):
+    """Decision log only; every select path persists through record_decision."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.recorded: list[tuple[str, object]] = []
+
+    @override
+    def record_decision(
+        self,
+        session_id: str,
+        decision_type: str,
+        candidates: Mapping[str, object],
+        probabilities: Mapping[str, object],
+        selected: object,
+        *,
+        node_id: str | None = None,
+        job_id: str | None = None,
+        confidence: float | None = None,
+        request: object = None,
+        response: object = None,
+    ) -> DecisionRecord:
+        self.recorded.append((decision_type, selected))
+        return DecisionRecord(
+            decision_id="dec-test",
+            session_id=session_id,
+            node_id=node_id,
+            job_id=job_id,
+            decision_type=decision_type,
+            candidates={},
+            probabilities={},
+            selected={},
+        )
 
 
-def _node(question):
-    from types import SimpleNamespace
-
+def _node(question: str) -> SimpleNamespace:
     return SimpleNamespace(node_id="n1", session_id="s1", question=question, why_it_matters="w")
 
 
-def _pick(objective):
+class _BoomJev(JevClient):
+    @override
+    async def select_tool(
+        self,
+        objective: str,
+        node: object,
+        registry: Sequence[Mapping[str, JSONValue]] | None = None,
+        evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+        attempts: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+        *,
+        session_id: str,
+        job_id: str | None = None,
+    ) -> ToolDecision:
+        raise AssertionError("router must not call JEV")
+
+
+def _pick(objective: str) -> tuple[str, str | None]:
     reg = scheduler.build_registry()
+    kernel = _Kernel()
     act, dec = asyncio.run(
         programmatic_select_round(
-            None,
-            _Kernel(),
+            _BoomJev(),
+            kernel,
             "s1",
             "n1",
             {"session_id": "s1", "objective": objective},
@@ -39,6 +91,7 @@ def _pick(objective):
             [],
         )
     )
+    assert kernel.recorded == [("tool_selection", dec.tool_name)]
     return act, dec.tool_name
 
 
@@ -47,14 +100,14 @@ def test_route_fast_path_marks_research():
     assert programmatic_route("hello") is None
 
 
-def test_route_clock_and_advice_fast_paths(monkeypatch: object) -> None:
+def test_route_clock_and_advice_fast_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     """Clock asks single-shot; pure advice answers direct; mixed/insider asks research."""
     import app.tools as _tools
 
     def _resolve(name: str) -> str | None:
         return {"NVDA": "NVDA"}.get(name)
 
-    monkeypatch.setattr(  # type: ignore[union-attr]
+    monkeypatch.setattr(
         _tools,
         "_resolve_company_to_ticker",
         _resolve,
@@ -89,13 +142,22 @@ def test_five_live_questions_first_hop():
 
 
 def test_ambiguous_falls_back_to_jev_subset():
-    from app.research.models import ToolDecision
+    seen: dict[str, int] = {}
 
-    seen = {}
-
-    class _J:
-        async def select_tool(self, objective, node, registry, evidence, attempts, session_id=None, job_id=None):
-            seen["n"] = len(registry)
+    class _J(JevClient):
+        @override
+        async def select_tool(
+            self,
+            objective: str,
+            node: object,
+            registry: Sequence[Mapping[str, JSONValue]] | None = None,
+            evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+            attempts: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+            *,
+            session_id: str,
+            job_id: str | None = None,
+        ) -> ToolDecision:
+            seen["n"] = len(registry or [])
             return ToolDecision(action="reason", probabilities={}, confidence=None)
 
     reg = scheduler.build_registry()
@@ -118,10 +180,6 @@ def test_ambiguous_falls_back_to_jev_subset():
 def test_mention_check_selects_bounded_without_jev() -> None:
     """One-mention ask resolves by rule 9; a JEV stub that fails must never run."""
 
-    class _BoomJev:
-        async def select_tool(self, *a: object, **k: object) -> object:
-            raise AssertionError("router must not call JEV")
-
     reg = scheduler.build_registry()
     names = _registry_names(reg)
     objective = "Which 10-K mentions Jensen Huang?"
@@ -138,6 +196,7 @@ def test_mention_check_selects_bounded_without_jev() -> None:
             [],
         )
     )
+    assert isinstance(dec, ToolDecision)
     assert (action, dec.tool_name) == ("invoke", "search_sec_filings_bounded")
     ranked = [n for _, n in _ranked(" ".join(objective.split()), {"10k", "mention"}, names)]
     assert not ({"search_sec_filings", "search_sec_filings_bounded"} <= set(ranked))
@@ -169,10 +228,20 @@ def test_variant_falls_back_to_registered_member() -> None:
 
 def test_jev_fallback_rewritten_to_coverage_variant() -> None:
     """JEV's bounded pick becomes exhaustive on a coverage ask."""
-    from app.research.models import ToolDecision
 
-    class _J:
-        async def select_tool(self, objective, node, registry, evidence, attempts, session_id=None, job_id=None):
+    class _J(JevClient):
+        @override
+        async def select_tool(
+            self,
+            objective: str,
+            node: object,
+            registry: Sequence[Mapping[str, JSONValue]] | None = None,
+            evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+            attempts: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+            *,
+            session_id: str,
+            job_id: str | None = None,
+        ) -> ToolDecision:
             return ToolDecision(
                 action="invoke",
                 tool_name="search_sec_filings_bounded",
@@ -203,18 +272,19 @@ def test_jev_fallback_rewritten_to_coverage_variant() -> None:
             [],
         )
     )
+    assert isinstance(dec, ToolDecision)
     assert (action, dec.tool_name) == ("invoke", "search_sec_filings")
     assert dec.tool_names == ("search_sec_filings",)
 
 
 def test_short_interest_beats_intake_accession() -> None:
     """Intake evidence with an 8-K accession never diverts a short ask to get_sec_filing."""
-    intake = [{"id": "ev:1", "content": "filed 8-K accession 0000320193-25-000079, see filing"}]
+    intake: list[JSONValue] = [{"id": "ev:1", "content": "filed 8-K accession 0000320193-25-000079, see filing"}]
     reg = scheduler.build_registry()
     objective = "What's AAPL's short interest?"
     action, dec = asyncio.run(
         programmatic_select_round(
-            None,
+            _BoomJev(),
             _Kernel(),
             "s1",
             "n1",
@@ -225,15 +295,12 @@ def test_short_interest_beats_intake_accession() -> None:
             [],
         )
     )
+    assert isinstance(dec, ToolDecision)
     assert (action, dec.tool_name) == ("invoke", "get_short_interest")
 
 
 def test_form_mentions_route_person_mention() -> None:
     """10-Q and 8-K mentions resolve by rule 5 without JEV."""
-
-    class _BoomJev:
-        async def select_tool(self, *a: object, **k: object) -> object:
-            raise AssertionError("router must not call JEV")
 
     reg = scheduler.build_registry()
     for objective in ("Which 10-Q mentions Jensen Huang?", "Which 8-K mentions Elon Musk?"):
@@ -250,17 +317,18 @@ def test_form_mentions_route_person_mention() -> None:
                 [],
             )
         )
+        assert isinstance(dec, ToolDecision)
         assert (action, dec.tool_name) == ("invoke", "search_sec_filings_bounded")
 
 
-def test_insider_verbs_stay_research_and_advice_stays_direct(monkeypatch: object) -> None:
+def test_insider_verbs_stay_research_and_advice_stays_direct(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bare sell/hold tokens route research; should+verb and good-investment route direct."""
     import app.tools as _tools
 
     def _resolve(name: str) -> str | None:
         return {"TSLA": "TSLA", "NVDA": "NVDA"}.get(name)
 
-    monkeypatch.setattr(  # type: ignore[union-attr]
+    monkeypatch.setattr(
         _tools,
         "_resolve_company_to_ticker",
         _resolve,

@@ -3357,9 +3357,14 @@ def _search_company_patents(args: dict[str, object], model: str) -> dict[str, ob
         return {"error": f"Tool 'search_company_patents' failed: {exc}", "soft": True, "source": "patents"}
 
 
+def _utc_now() -> datetime:
+    """Production clock seam: current UTC time."""
+    return datetime.now(UTC)
+
+
 def _get_current_time(args: dict[str, object], model: str) -> dict[str, object]:
     del args, model
-    return {"utc_now": datetime.now(UTC).isoformat(), "source": "system-clock"}
+    return {"utc_now": _utc_now().isoformat(), "source": "system-clock"}
 
 
 def _wrap_one(record: object) -> object:
@@ -5462,20 +5467,64 @@ def _document_matches(hits: list[dict[str, object]]) -> list[dict[str, object]]:
     return [{"accession": accession, "matching_passages": passages} for accession, passages in grouped.items()]
 
 
+def _hit_packet_labels(stored: dict[str, object]) -> dict[str, object]:
+    """Needle display labels verified against stored bytes; empty on any miss."""
+    try:
+        from .sec.discovery.service import packet_display_fields as _packet_labels
+    except ImportError:
+        return {}
+    try:
+        from .sec.models import SECTextHit as _Hit
+    except ImportError:
+        return {}
+    try:
+        row = _Hit(
+            search_id=str(stored.get("search_id") or ""),
+            attempt_id=str(stored.get("attempt_id") or ""),
+            query=str(stored.get("query") or ""),
+            accession_no=str(stored.get("accession_no") or ""),
+            form=str(stored.get("form") or ""),
+            filed_at=str(stored.get("filed_at") or ""),
+            filer_name=stored.get("filer_name") if isinstance(stored.get("filer_name"), str) else None,
+            matched_document=stored.get("matched_document")
+            if isinstance(stored.get("matched_document"), str)
+            else None,
+            file_type=stored.get("file_type") if isinstance(stored.get("file_type"), str) else None,
+            file_description=stored.get("file_description")
+            if isinstance(stored.get("file_description"), str)
+            else None,
+            snippet=stored.get("snippet") if isinstance(stored.get("snippet"), str) else None,
+        )
+    except TypeError:
+        return {}
+    try:
+        fields = _packet_labels(row)
+    except Exception:  # noqa: BLE001 - display labels only; any miss returns empty labels
+        return {}
+    labels = {key: fields.get(key) for key in ("section", "term", "snippet")}
+    return {key: value for key, value in labels.items() if isinstance(value, str) and value}
+
+
 def _hit_window(hit: dict[str, object]) -> dict[str, object]:
     """One compact top hit: identity, document, relevance, and remainder pointer."""
+    labels = _hit_packet_labels(hit)
+    # ponytail: deterministic section and snippet win; Needle labels can be grounded but worse
+    # (filer name vs Risk Factors, `8%` fragment vs the full stored snippet).
+    section = hit.get("file_description") or hit.get("file_type") or labels.get("section")
+    snippet = hit.get("snippet") or labels.get("snippet") or hit.get("file_description")
+    term = labels.get("term") or _passage_term(hit)
     return {
         "accession": hit.get("accession_no"),
         "form": hit.get("form"),
         "filed_at": hit.get("filed_at"),
         "document": hit.get("matched_document"),
-        "section": hit.get("file_description") or hit.get("file_type"),
-        "term": _passage_term(hit),
-        "window": hit.get("snippet") or hit.get("file_description"),
+        "section": section,
+        "term": term,
+        "window": snippet,
         "relevance_reason": list(hit.get("relevance_reason") or [])
         if isinstance(hit.get("relevance_reason"), (list, tuple))
         else [],
-        "snippet": hit.get("snippet") or hit.get("file_description"),
+        "snippet": snippet,
         "resource_uri": hit.get("resource_uri"),
     }
 
@@ -5764,6 +5813,7 @@ def _sec_accession_value(args: dict[str, object], tool: str) -> tuple[str | None
         return None, {
             "error": f"tool '{tool}': missing accession_no {raw!r}; {_SEC_ACCESSION_HINT}",
             "error_type": "invalid_tool_arguments",
+            "tool": tool,
         }
     try:
         sec.normalize_accession_no(raw)
@@ -5771,6 +5821,7 @@ def _sec_accession_value(args: dict[str, object], tool: str) -> tuple[str | None
         return None, {
             "error": f"tool '{tool}': invalid accession_no {raw!r}; {_SEC_ACCESSION_HINT}",
             "error_type": "invalid_tool_arguments",
+            "tool": tool,
         }
     return raw.strip(), None
 
@@ -5807,7 +5858,7 @@ def _get_sec_filing(args: dict[str, object], model: str) -> dict[str, object]:
     try:
         return sec.get_sec_filing(val, as_of=as_of).to_dict()
     except (KeyError, ValueError) as exc:
-        return {"error": str(exc), "error_type": "invalid_tool_arguments"}
+        return {"error": str(exc), "error_type": "invalid_tool_arguments", "tool": "get_sec_filing"}
 
 
 def _get_sec_document(args: dict[str, object], model: str) -> dict[str, object]:
@@ -5833,7 +5884,7 @@ def _get_sec_document(args: dict[str, object], model: str) -> dict[str, object]:
             **_doc_view_kwargs(args),
         )
     except (KeyError, ValueError) as exc:
-        return {"error": str(exc), "error_type": "invalid_tool_arguments"}
+        return {"error": str(exc), "error_type": "invalid_tool_arguments", "tool": "get_sec_document"}
 
 
 def _list_sec_documents(args: dict[str, object], model: str) -> dict[str, object]:
@@ -5853,7 +5904,7 @@ def _list_sec_documents(args: dict[str, object], model: str) -> dict[str, object
             "documents",
         )
     except (KeyError, ValueError) as exc:
-        return {"error": str(exc), "error_type": "invalid_tool_arguments"}
+        return {"error": str(exc), "error_type": "invalid_tool_arguments", "tool": "list_sec_documents"}
 
 
 _REL_PARTIAL_STATUSES = ("partial", "source_limited", "complete_within_source_limits", "retrying")
@@ -6520,7 +6571,7 @@ def _sho_number(value: object) -> float | None:
         return float(value)
     try:
         return float(str(value).replace(",", ""))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -7560,7 +7611,7 @@ def _start_as_of(arguments: dict[str, object]) -> str | None:
     return as_of if isinstance(as_of, str) and as_of else None
 
 
-def _start_policy(arguments: dict[str, object]) -> object:
+def _start_policy(arguments: dict[str, object]) -> dict[str, object] | None:
     """Optional session policy passthrough; None stays the SEC-only default."""
     policy = arguments.get("policy")
     if isinstance(policy, dict):
@@ -7608,11 +7659,11 @@ def _research_start(arguments: dict[str, object], context: RequestContext) -> di
     from app.research import service as research_service
 
     repo = _research_repo_for(context)
-    session_id = research_service.create_research(  # type: ignore[arg-type]
+    session_id = research_service.create_research(
         _start_question(arguments),
         _start_objective(arguments),
         as_of=_start_as_of(arguments),
-        policy=_start_policy(arguments),  # type: ignore[arg-type]
+        policy=_start_policy(arguments),
         repo=repo,
     )
     return _started_packet(research_service, repo, session_id)

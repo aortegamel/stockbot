@@ -299,7 +299,7 @@ def create_research(
     objective: str | None = None,
     *,
     as_of: str | None = None,
-    policy: dict[str, JSONValue] | None = None,
+    policy: Mapping[str, object] | None = None,
     repo: ResearchRepository | Path | str | None = None,
 ) -> str:
     """Create a session plus its first source_agent job; returns session_id."""
@@ -591,6 +591,18 @@ def _evidence_identity(
                 "record",
                 _norm_lower(provenance.get("tool_name")),
                 _norm_lower(provenance.get("record_identity")),
+                _norm_lower(subject),
+                _norm_lower(tail),
+            )
+        )
+    if kind == "sec_record":
+        return "|".join(
+            (
+                "sec",
+                "record",
+                _norm_lower(provenance.get("tool_name")),
+                _norm_lower(provenance.get("record_identity")),
+                _norm_lower(provenance.get("tool_result_id")),
                 _norm_lower(subject),
                 _norm_lower(tail),
             )
@@ -1225,7 +1237,7 @@ def _reload_handle_window(fields: _SecHandle, as_of: datetime | str | None) -> d
         return get_sec_document(
             fields.accession,
             fields.document,
-            as_of=as_of,  # type: ignore[arg-type] - filings._check_as_of accepts datetime
+            as_of=as_of,
             offset=fields.offset,
             max_chars=fields.max_chars,
             section=fields.section,
@@ -3835,7 +3847,7 @@ def _dispatch_unknown_job_detail(store: ResearchRepository, session_id: str, det
 
     try:
         live: list[str] = [j.job_id for j in store.list_jobs(session_id) if j.status in ("queued", "running")][:8]
-    except (sqlite3.Error, ValueError, KeyError, OSError):
+    except sqlite3.Error, ValueError, KeyError, OSError:
         live = []
     return f"{detail} hint: attempt job not persisted — check source_policy/source_domain on start_job live_jobs={live}"
 

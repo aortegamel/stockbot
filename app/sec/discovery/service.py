@@ -25,6 +25,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
+from types import ModuleType
 from typing import Literal, NamedTuple, Protocol, TypedDict, runtime_checkable
 
 from ...domain.market.ids import sec_entity_id
@@ -119,14 +120,14 @@ def _row_mapping(value: object) -> dict[str, object] | None:
     return value if isinstance(value, dict) else None
 
 
-def _store_rows(store: object, name: str, **kwargs: object) -> list[dict[str, object]]:
+def _store_rows(store: ModuleType, name: str, **kwargs: object) -> list[dict[str, object]]:
     # Live seam: SourceGateway + normalization + raw_archive + bundle writer; NOTE warehouse slots beside seam.
     fn: object = getattr(store, name, None)
     assert callable(fn)
     return _coerce_query_rows(fn(**kwargs))
 
 
-def _store_bool(store: object, name: str, **kwargs: object) -> bool:
+def _store_bool(store: ModuleType, name: str, **kwargs: object) -> bool:
     # Live seam: job-ledger coverage reads only; NOTE warehouse slots beside seam.
     fn: object = getattr(store, name, None)
     assert callable(fn)
@@ -211,7 +212,7 @@ def _utcnow() -> str:
 def normalize_accession_no(value: object) -> str:
     """Canonical dashed accession; accepts dashed or undashed input once."""
     if not isinstance(value, str):
-        raise ValueError(f"invalid accession number: {value!r}")  # noqa: TRY004 - single ValueError contract for invalid accession input, type or value
+        raise TypeError(f"invalid accession number: {value!r}")
     match = _ACCESSION_RE.match(value.strip())
     if not match:
         raise ValueError(f"invalid accession number: {value!r}")
@@ -672,10 +673,7 @@ def _record_verified_cik(
     state: _EntitySearchState, cik_int: int, candidate: EntityCandidate, get_meta: Callable[..., object]
 ) -> None:
     state.ranked.append((0, -1.0, cik_int, candidate))
-    try:
-        meta = get_meta(cik_int)
-    except Exception:  # noqa: BLE001 - entity meta fetch degrades to unranked on provider failure
-        meta = None
+    meta = get_meta(cik_int)
     row = _row_mapping(meta)
     if row is not None:
         state.metas[cik_int] = row
@@ -792,6 +790,7 @@ def _fetch_pooled_meta(
         return _meta_mapping(get_meta(cik_int))
     except Exception as exc:  # noqa: BLE001 - entity meta fetch records the error and degrades to None
         state.meta_errors.append(f"{cik_int}: {exc}")
+        state.errors.append(f"submissions metadata {cik_int} failed: {exc}")
         return None
 
 
@@ -1009,7 +1008,9 @@ def find_sec_entities(
         resolve_cik,
     )
 
-    if not isinstance(query, str) or not query.strip():
+    if not isinstance(query, str):
+        raise TypeError(f"invalid query: {query!r}")
+    if not query.strip():
         raise ValueError(f"invalid query: {query!r}")
     as_of = _check_as_of(as_of)
     query = query.strip()
@@ -1313,10 +1314,7 @@ def _push_entity_metadata(
     cik = getattr(entity, "cik", None)
     if cik is None:
         return
-    try:
-        meta = get_meta(cik)
-    except Exception:  # noqa: BLE001 - entity meta fetch degrades to skipped name on provider failure
-        meta = None
+    meta = get_meta(cik)
     if not isinstance(meta, dict):
         return
     push(meta.get("name") or "")
@@ -1341,11 +1339,7 @@ def _former_variant_entries(meta: Mapping[str, object], as_of: str | None) -> li
     for entry in _object_list(meta.get("former_names")):
         if not isinstance(entry, dict) or not str(entry.get("name") or "").strip():
             continue
-        try:
-            valid = _former_valid_at(entry, as_of)
-        except Exception:  # noqa: BLE001 - former-name validity defaults to included on parse failure
-            valid = True
-        if valid:
+        if _former_valid_at(entry, as_of):
             out.append(str(entry["name"]))
     return out
 
@@ -1356,7 +1350,9 @@ def _expand_person_queries(name: str) -> list[str]:
     Every variant stays a separate attempt with its own provenance; no
     nicknames, no suffix handling, no fuzzy variants.
     """
-    if not isinstance(name, str) or not name.strip():
+    if not isinstance(name, str):
+        raise TypeError(f"invalid person name: {name!r}")
+    if not name.strip():
         raise ValueError(f"invalid person name: {name!r}")
     exact = re.sub(r"\s+", " ", name.strip())
     variants = [exact]
@@ -1385,7 +1381,9 @@ def _strip_middle_initials(variants: list[str]) -> None:
 
 def _expand_domain_queries(domain: str) -> list[str]:
     """Lowercase hostname plus bare/``www.``/literal-``@`` text variants."""
-    if not isinstance(domain, str) or not domain.strip():
+    if not isinstance(domain, str):
+        raise TypeError(f"invalid domain: {domain!r}")
+    if not domain.strip():
         raise ValueError(f"invalid domain: {domain!r}")
     raw = _normalize_domain_host(domain)
     if not raw or "." not in raw or re.search(r"\s", raw):
@@ -1410,7 +1408,9 @@ def _expand_security_queries(identifier: str) -> list[str]:
     its issuer ``Entity``, so expansion yields only case variants and the
     service creates no entity candidate from them.
     """
-    if not isinstance(identifier, str) or not identifier.strip():
+    if not isinstance(identifier, str):
+        raise TypeError(f"invalid security identifier: {identifier!r}")
+    if not identifier.strip():
         raise ValueError(f"invalid security identifier: {identifier!r}")
     exact = re.sub(r"\s+", " ", identifier.strip())
     upper = exact.upper()
@@ -1444,7 +1444,9 @@ def _quarters_for_range(
 
 
 def _parse_quarter_date(value: object, label: str) -> tuple[int, int]:
-    if not isinstance(value, str) or not _DATE_RE.match(value):
+    if not isinstance(value, str):
+        raise TypeError(f"invalid {label} date: {value!r} (expected YYYY-MM-DD)")
+    if not _DATE_RE.match(value):
         raise ValueError(f"invalid {label} date: {value!r} (expected YYYY-MM-DD)")
     try:
         parsed = date.fromisoformat(value)
@@ -1558,7 +1560,7 @@ def _live_filing_batch(
         year_qs, year_qe = int(qs[:4]), int(qe[:4])
         years = list(range(min(year_qs, year_qe), max(year_qs, year_qe) + 1)) or None
         filings = get_global_filings(years, form=[form] if form.endswith("/A") else [form, f"{form}/A"])
-    except Exception as exc:
+    except (ConnectionError, TimeoutError, OSError) as exc:
         return [], False, str(exc)
     out: list[Filing] = []
     for filing in filings or []:
@@ -1593,7 +1595,7 @@ def _needs_typed_hydration(value: object) -> bool:
 
 
 def _enqueue_or_requeue(
-    store: object, source: str, form: str, qs: str, qe: str, *, batch_size: int, root: Path | str | None = None
+    store: ModuleType, source: str, form: str, qs: str, qe: str, *, batch_size: int, root: Path | str | None = None
 ) -> str:
     """Enqueue a quarterly job; reset finished-but-uncovered ones for resume."""
     # Live seam: coverage/checkpoint state lives on the job ledger.
@@ -1627,25 +1629,22 @@ def _enqueue_wanted_sources(source: str, form: str) -> list[str]:
 
 
 def _enqueue_partition_uncovered(
-    store: object, wanted: list[str], form: str, year: int, quarter: int, root: Path | str | None
+    store: ModuleType, wanted: list[str], form: str, year: int, quarter: int, root: Path | str | None
 ) -> bool:
     # Live seam: coverage probe reads the job ledger; NOTE warehouse slots beside seam.
     for src in wanted:
-        try:
-            covered = store.is_partition_covered(
-                source=src,
-                form=form,
-                date_partition=_partition_for_quarter(year, quarter),
-                root=root,
-            )
-        except Exception:  # noqa: BLE001 - coverage probe defaults to uncovered on storage failure
-            covered = False
+        covered = store.is_partition_covered(
+            source=src,
+            form=form,
+            date_partition=_partition_for_quarter(year, quarter),
+            root=root,
+        )
         if not covered:
             return True
     return False
 
 
-def _enqueue_needs_resume(store: object, source: str, form: str, qs: str, qe: str, root: Path | str | None) -> bool:
+def _enqueue_needs_resume(store: ModuleType, source: str, form: str, qs: str, qe: str, root: Path | str | None) -> bool:
     past = _enqueue_past_quarters(qs, qe)
     if not past:
         return False
@@ -1771,7 +1770,7 @@ def _edgar_obj(filing: object) -> object | None:
 
 
 def _hydrate_schedule(
-    _store: object,
+    _store: ModuleType,
     accession: str,
     form_raw: str,
     doc_name: str | None,
@@ -1804,7 +1803,7 @@ def _hydrate_schedule(
 
 
 def _hydrate_ownership(
-    _store: object,
+    _store: ModuleType,
     accession: str,
     form_raw: str,
     doc_name: str | None,
@@ -1853,7 +1852,7 @@ def _hydrate_infotable(get_by_accession_number: Callable[..., object], accession
 
 
 def _hydrate_13f(
-    _store: object,
+    _store: ModuleType,
     get_by_accession_number: Callable[..., object],
     accession: str,
     form_raw: str,
@@ -1890,7 +1889,7 @@ def _hydrate_13f(
 
 
 def _store_13f_rows(
-    store: object,
+    store: ModuleType,
     recs: list[InstitutionalHolding],
     raw_path: Path | str | None,
     retrieved_at: str | None,
@@ -1905,7 +1904,7 @@ def _store_13f_rows(
 
 
 def _hydrate_transaction(
-    _store: object,
+    _store: ModuleType,
     get_by_accession_number: Callable[..., object],
     accession: str,
     form_raw: str,
@@ -1925,10 +1924,7 @@ def _hydrate_transaction(
 ) -> tuple[int, bool, str | None]:
     from ..transactions import normalize_transaction
 
-    try:
-        obj = _edgar_obj(get_by_accession_number(accession))
-    except Exception:  # noqa: BLE001 - live edgar fetch degrades to untyped parse on failure
-        obj = None
+    obj = _edgar_obj(get_by_accession_number(accession))
     rec = normalize_transaction(
         accession,
         form_raw,
@@ -1951,7 +1947,7 @@ def _hydrate_transaction(
 
 
 def _hydrate_offering(
-    _store: object,
+    _store: ModuleType,
     get_by_accession_number: Callable[..., object],
     accession: str,
     form_raw: str,
@@ -1997,14 +1993,8 @@ def _offering_inputs(
 ) -> tuple[object, dict[str, object]]:
     from ..offerings import load_terms
 
-    try:
-        obj: object = _edgar_obj(get_by_accession_number(accession))
-    except Exception:  # noqa: BLE001 - live edgar fetch degrades to terms-only parse on failure
-        obj = None
-    try:
-        terms: dict[str, object] = load_terms(accession)
-    except Exception:  # noqa: BLE001 - offerings terms degrade to empty on load failure
-        terms = {}
+    obj: object = _edgar_obj(get_by_accession_number(accession))
+    terms: dict[str, object] = load_terms(accession)
     return obj, terms
 
 
@@ -2047,7 +2037,7 @@ def _hydrate_unpack(ctx: _HydrateContext, fields: _DocFields) -> _HydrateUnpacke
 
 
 def _hydrate_dispatch(
-    store: object,
+    store: ModuleType,
     get_by_accession_number: Callable[..., object],
     filing: Filing,
     unpacked: _HydrateUnpacked,
@@ -2063,7 +2053,7 @@ def _hydrate_dispatch(
 
 
 def _hydrate_deal_forms(
-    store: object,
+    store: ModuleType,
     get_by_accession_number: Callable[..., object],
     unpacked: _HydrateUnpacked,
     data_root: Path | str | None,
@@ -2110,7 +2100,7 @@ def _hydrate_deal_forms(
 
 
 def _hydrate_equity_forms(
-    store: object,
+    store: ModuleType,
     get_by_accession_number: Callable[..., object],
     filing: Filing,
     unpacked: _HydrateUnpacked,
@@ -2151,7 +2141,7 @@ def _hydrate_equity_forms(
 
 
 def _hydrate_holdings_forms(
-    store: object,
+    store: ModuleType,
     get_by_accession_number: Callable[..., object],
     filing: Filing,
     unpacked: _HydrateUnpacked,
@@ -2179,7 +2169,7 @@ def _hydrate_holdings_forms(
 
 
 class _HydrateFetched(NamedTuple):
-    store: object
+    store: ModuleType
     get_by_accession_number: Callable[[str], object]
     filing: Filing
     unpacked: _HydrateUnpacked
@@ -2257,21 +2247,18 @@ def _backfill_head(job: dict[str, object]) -> tuple[str, str, str, int, list[tup
     return (str(job["source"]), str(job["form"]), str(job["id"]), _backfill_batch_size(job), *_backfill_window(job))
 
 
-def _backfill_skip_current(_store: object, source: str, key: str, data_root: Path | str | None) -> bool:
+def _backfill_skip_current(_store: ModuleType, source: str, key: str, data_root: Path | str | None) -> bool:
     # Live seam: checkpoint state lives on the job ledger; NOTE warehouse slots beside seam.
     _ = (source, key)
-    try:
-        return bool(
-            _store.is_partition_covered(
-                source=source, form=key.split("/")[0], date_partition=key.split("/", 1)[1], root=data_root
-            )
+    return bool(
+        _store.is_partition_covered(
+            source=source, form=key.split("/")[0], date_partition=key.split("/", 1)[1], root=data_root
         )
-    except Exception:
-        return False
+    )
 
 
 def _backfill_resume_filing(
-    _store: object,
+    _store: ModuleType,
     source: str,
     key: str,
     form: str,
@@ -2291,7 +2278,9 @@ def _backfill_resume_filing(
     return _batch, False
 
 
-def _backfill_archive_one(_archive: object, _store: object, filing: Filing, data_root: Path | str | None) -> str | None:
+def _backfill_archive_one(
+    _archive: ModuleType, _store: ModuleType, filing: Filing, data_root: Path | str | None
+) -> str | None:
     """Backfill = search-filings -> archive -> Filing (no warehouse filing rows)."""
     _ = (_store, data_root)
     # Live seam: filing stage writes straight to <root>/raw via raw_archive.
@@ -2307,8 +2296,8 @@ def _backfill_archive_one(_archive: object, _store: object, filing: Filing, data
 
 
 def _backfill_archive_batch(
-    _archive: object,
-    _store: object,
+    _archive: ModuleType,
+    _store: ModuleType,
     batch: list[Filing],
     filing_skip: bool,
     last_key: str | None,
@@ -2324,7 +2313,7 @@ def _backfill_archive_batch(
 
 
 def _backfill_write_filing_stage(
-    _store: object,
+    _store: ModuleType,
     source: str,
     form: str,
     key: str,
@@ -2341,7 +2330,7 @@ def _backfill_write_filing_stage(
 
 
 def _backfill_ensure_coverage(
-    _store: object,
+    _store: ModuleType,
     sources: list[str],
     form: str,
     partition: str,
@@ -2375,7 +2364,7 @@ def _hydrate_one(filing: Filing, data_root: Path | str | None) -> tuple[int, boo
 
 
 def _backfill_write_typed_stage(
-    _store: object,
+    _store: ModuleType,
     form: str,
     key: str,
     partition: str,
@@ -2405,14 +2394,11 @@ def _typed_stage_status(doc_bad: int, typed_errors: list[str], feed_snapshot: bo
 
 
 def _backfill_fail(
-    _store: object, job: dict[str, object], source: str, form: str, exc: Exception, data_root: Path | str | None
+    _store: ModuleType, job: dict[str, object], source: str, form: str, exc: Exception, data_root: Path | str | None
 ) -> bool:
     # Live seam: failure state lives on the job ledger; NOTE warehouse slots beside seam.
     _ = (source, form)
-    try:
-        _store.fail_job(str(job["id"]), str(exc), root=data_root)
-    except Exception:  # noqa: BLE001, S110 - best-effort failure bookkeeping, the failure path never raises
-        pass
+    _store.fail_job(str(job["id"]), str(exc), root=data_root)
     return False
 
 
@@ -2480,7 +2466,7 @@ class _BackfillTarget(NamedTuple):
 
 
 def _backfill_current_target(
-    store: object,
+    store: ModuleType,
     get_current_filings: object,
     current: tuple[int, int],
     source: str,
@@ -2499,7 +2485,7 @@ def _backfill_current_target(
 
 
 def _backfill_quarter_target(
-    store: object,
+    store: ModuleType,
     get_global_filings: object,
     target: tuple[int, int],
     source: str,
@@ -2529,7 +2515,7 @@ def _backfill_quarter_target(
 
 
 def _backfill_stage_flags(
-    store: object, source: str, key: str, needs_typed: bool, data_root: Path | str | None
+    store: ModuleType, source: str, key: str, needs_typed: bool, data_root: Path | str | None
 ) -> tuple[bool, bool, bool]:
     # Live seam: checkpoint state lives on the job ledger; completion derives from covered partitions.
     # NOTE: a future warehouse slots in beside this seam, never inside providers.
@@ -2547,7 +2533,7 @@ def _backfill_stage_flags(
 
 
 def _backfill_all_done(
-    store: object,
+    store: ModuleType,
     source: str,
     key: str,
     form: str,
@@ -2571,7 +2557,7 @@ def _backfill_all_done(
 
 
 def _backfill_resumed_target(
-    store: object,
+    store: ModuleType,
     source: str,
     key: str,
     form: str,
@@ -2592,8 +2578,8 @@ def _backfill_resumed_target(
 
 
 def _backfill_target(
-    archive: object,
-    store: object,
+    archive: ModuleType,
+    store: ModuleType,
     get_current_filings: object,
     get_global_filings: object,
     target: tuple[int, int] | None,
@@ -2629,7 +2615,7 @@ def _backfill_target(
 
 
 def _backfill_write_typed(
-    store: object,
+    store: ModuleType,
     resolved: _BackfillTarget,
     form: str,
     batch: list[Filing],
@@ -2659,7 +2645,7 @@ def _backfill_write_typed(
 
 
 def _backfill_resolve(
-    store: object,
+    store: ModuleType,
     get_current_filings: object,
     get_global_filings: object,
     target: tuple[int, int] | None,
@@ -2680,8 +2666,8 @@ def _backfill_resolve(
 
 
 def _backfill_write_filing(
-    archive: object,
-    store: object,
+    archive: ModuleType,
+    store: ModuleType,
     resolved: _BackfillTarget,
     source: str,
     form: str,
@@ -2748,16 +2734,10 @@ def ensure_backfill_worker(data_root: Path | str | None = None) -> threading.Thr
 
         def _drain() -> None:
             while True:
-                try:
-                    job = _store.claim_job(root=data_root)
-                except Exception:  # noqa: BLE001 - claim failure ends the worker drain, never raises
-                    return
+                job = _store.claim_job(root=data_root)
                 if job is None:
                     return
-                try:
-                    run_backfill_job(job, data_root)
-                except Exception:  # noqa: BLE001, S112 - failed backfill job is skipped, the worker drain continues
-                    continue
+                run_backfill_job(job, data_root)
 
         # ponytail: one daemon thread per process; later enqueues restart it.
         _WORKER_THREAD = threading.Thread(target=_drain, name="sec-backfill", daemon=True)
@@ -2788,6 +2768,7 @@ def rank_hits(
     recency never outranks substance. Nothing is discarded (low-ranked
     structured results stay queryable, the packet alone is bounded); each hit
     carries why it ranked in ``relevance_reason``.
+    Embedding similarity reorders only equal-rank ties on bounded sets; Needle failure keeps this order.
     """
     ciks, names, forms = _rank_sets(verified_ciks, verified_names, relevant_forms)
     key = _RankKey(
@@ -2799,7 +2780,55 @@ def rank_hits(
         _norm_query(query),
     )
     by_recency = sorted(hits or (), key=_hit_recency_key, reverse=True)
-    return tuple(key.tag(hit) for hit in sorted(by_recency, key=key))
+    ranked = tuple(key.tag(hit) for hit in sorted(by_recency, key=key))
+    return _embedding_tiebreak(ranked, key, query)
+
+
+_EMBED_TIEBREAK_MAX_CHARS = 1000
+
+
+def _hit_embed_text(hit: SECTextHit) -> str:
+    """Bounded hit text for the embedding tiebreak (metadata only, never evidence).
+
+    Snippet first, semantic fields only: filer, form and document name are
+    near-constant inside an equal-rank run and dilute the query signal.
+    """
+    return " ".join(
+        part
+        for part in (
+            hit.snippet or "",
+            hit.file_description or "",
+            " ".join(hit.items or ()),
+        )
+        if part
+    )[:_EMBED_TIEBREAK_MAX_CHARS]
+
+
+def _embedding_tiebreak(ranked: tuple[SECTextHit, ...], key: _RankKey, query: str | None) -> tuple[SECTextHit, ...]:
+    """Embedding order within equal deterministic ranks; input order on any failure."""
+    if not isinstance(query, str) or not query.strip() or len(ranked) < 2:
+        return ranked
+    try:
+        from ...needle_client import similarity_order
+    except ImportError:
+        return ranked
+    keys = [key(hit) for hit in ranked]
+    out = list(ranked)
+    start = 0
+    while start < len(out):
+        end = start + 1
+        while end < len(out) and keys[end] == keys[start]:
+            end += 1
+        if end - start > 1:
+            run = out[start:end]
+            try:
+                order = similarity_order([_hit_embed_text(hit) for hit in run], query)
+            except Exception:  # noqa: BLE001 - embedding is a tiebreak; failure keeps deterministic order
+                order = None
+            if order is not None:
+                out[start:end] = [run[i] for i in order]
+        start = end
+    return tuple(out)
 
 
 class _RankKey:
@@ -3036,6 +3065,79 @@ def build_evidence_packet(
     return packet.ids
 
 
+_PACKET_DISPLAY_MAX_CHARS = 2000
+
+
+_PACKET_DISPLAY_RECORD: dict[str, object] = {
+    "name": "packet_hit_display",
+    "description": "Display labels for one SEC search hit, copied from the stored hit text.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "section": {"type": "string", "description": "Filing section label from the stored hit text."},
+            "term": {"type": "string", "description": "Exposure term from the stored hit text."},
+            "snippet": {
+                "type": "string",
+                "description": "Verbatim quote of the stored hit text, never a paraphrase.",
+            },
+        },
+    },
+}
+
+
+def _packet_display_text(hit: SECTextHit) -> str:
+    """Stored hit text behind one packet row (EFTS metadata + snippet, never live bytes)."""
+    return " ".join(
+        part
+        for part in (
+            hit.filer_name or "",
+            hit.form or "",
+            hit.file_type or "",
+            hit.file_description or "",
+            " ".join(hit.items or ()),
+            hit.snippet or "",
+        )
+        if part
+    )[:_PACKET_DISPLAY_MAX_CHARS]
+
+
+def _grounded_display_value(value: object, stored: str) -> str | None:
+    """Needle string only when it reproduces stored bytes verbatim, else None."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    return text if text in stored else None
+
+
+def packet_display_fields(hit: SECTextHit) -> dict[str, str | None]:
+    """Needle display labels for one stored hit; ungrounded output drops to None.
+
+    IDs, rank, and provenance stay untouched: this fills only the display
+    labels (section/term/snippet) the packet window shows, verified against
+    stored hit bytes. Strict extract raises on ungrounded values, so any
+    Needle failure keeps the deterministic fallbacks the caller already uses.
+    """
+    stored = _packet_display_text(hit)
+    if not stored.strip():
+        return {"section": None, "term": None, "snippet": None}
+    try:
+        from ...needle_client import extract_fields
+    except ImportError:
+        return {"section": None, "term": None, "snippet": None}
+    try:
+        out = extract_fields(_PACKET_DISPLAY_RECORD, stored, strict=True)
+    except Exception:  # noqa: BLE001 - display labels only; Needle failure keeps None fallbacks
+        return {"section": None, "term": None, "snippet": None}
+    fields = out.get("fields")
+    if not isinstance(fields, dict):
+        return {"section": None, "term": None, "snippet": None}
+    return {
+        "section": _grounded_display_value(fields.get("section"), stored),
+        "term": _grounded_display_value(fields.get("term"), stored),
+        "snippet": _grounded_display_value(fields.get("snippet"), stored),
+    }
+
+
 class _EvidencePacket:
     """Bounded packet accumulator with flat ~120-char weight per item."""
 
@@ -3247,26 +3349,23 @@ class _SearchState:
     def add_party(
         self, accession: object, cik_value: object, name: object, role: str, source: str, known_at: object
     ) -> None:
-        try:
-            label = _party_label(accession, role, known_at, cik_value, name)
-            if label is None:
-                return
-            cik = _parse_party_cik(cik_value)
-            # Phase 7 owns transaction/offering roles; keep Phase 6
-            # projection to ownership/insider/13F evidence only.
-            party = FilingParty(
-                accession_no=str(accession),
-                entity_id=_party_entity_id(cik),
-                cik=cik,
-                name=label,
-                role=role,
-                source=source,
-                known_at=str(known_at),
-                parser_version=PARSER_VERSION,
-            )
-            self.relationships.setdefault((party.accession_no, party.role, party.cik, party.name), party)
-        except Exception:  # noqa: BLE001 - relationship accumulate skips the malformed party, never raises
+        label = _party_label(accession, role, known_at, cik_value, name)
+        if label is None:
             return
+        cik = _parse_party_cik(cik_value)
+        # Phase 7 owns transaction/offering roles; keep Phase 6
+        # projection to ownership/insider/13F evidence only.
+        party = FilingParty(
+            accession_no=str(accession),
+            entity_id=_party_entity_id(cik),
+            cik=cik,
+            name=label,
+            role=role,
+            source=source,
+            known_at=str(known_at),
+            parser_version=PARSER_VERSION,
+        )
+        self.relationships.setdefault((party.accession_no, party.role, party.cik, party.name), party)
 
 
 def _party_has_keys(accession: object, role: str, known_at: object) -> bool:
@@ -3290,16 +3389,15 @@ def _party_text(cik_value: object, name: object) -> str | None:
 def _party_entity_id(cik: int | None) -> str | None:
     if cik is None:
         return None
-    try:
-        return sec_entity_id(cik)
-    except Exception:  # noqa: BLE001 - entity id coercion degrades to None on malformed CIK
-        return None
+    return sec_entity_id(cik)
 
 
 def _parse_party_cik(value: object) -> int | None:
+    if value is None:
+        return None
     try:
         return int(str(value).strip())
-    except Exception:  # noqa: BLE001 - party CIK parse degrades to None on malformed value
+    except TypeError, ValueError, AttributeError:
         return None
 
 
@@ -3894,7 +3992,7 @@ def _search_dedup_forms(request: SECSearchRequest) -> list[str]:
 
 
 def _search_split_partitions(
-    backfill_store: object, ordered_forms: list[str], quarters: list[tuple[int, int]], data_root: Path | str | None
+    backfill_store: ModuleType, ordered_forms: list[str], quarters: list[tuple[int, int]], data_root: Path | str | None
 ) -> tuple[list[tuple[str, int, int]], list[tuple[str, int, int]]]:
     missing: list[tuple[str, int, int]] = []
     covered: list[tuple[str, int, int]] = []
@@ -3902,15 +4000,12 @@ def _search_split_partitions(
     for form in ordered_forms:
         for year, quarter in quarters:
             partition = _partition_for_quarter(year, quarter)
-            try:
-                is_covered = backfill_store.is_partition_covered(
-                    source=BACKFILL_SOURCE,
-                    form=form,
-                    date_partition=partition,
-                    root=data_root,
-                )
-            except Exception:  # noqa: BLE001 - coverage probe defaults to uncovered on storage failure
-                is_covered = False
+            is_covered = backfill_store.is_partition_covered(
+                source=BACKFILL_SOURCE,
+                form=form,
+                date_partition=partition,
+                root=data_root,
+            )
             (covered if is_covered else missing).append((form, year, quarter))
     return missing, covered
 
@@ -3933,7 +4028,7 @@ def _search_add_capped_quarters(
 
 def _search_enqueue_missing(
     state: _SearchState,
-    backfill_store: object,
+    backfill_store: ModuleType,
     missing: list[tuple[str, int, int]],
     batch_size: int,
     data_root: Path | str | None,
@@ -3953,7 +4048,7 @@ def _search_enqueue_missing(
 
 def _search_enqueue_partition(
     state: _SearchState,
-    backfill_store: object,
+    backfill_store: ModuleType,
     form: str,
     year: int,
     quarter: int,
@@ -4026,7 +4121,7 @@ def _search_record_covered(
 
 def _search_covered_partition(
     state: _SearchState,
-    backfill_store: object,
+    backfill_store: ModuleType,
     form: str,
     year: int,
     quarter: int,
@@ -4047,7 +4142,7 @@ def _search_covered_partition(
 
 def _fetch_covered_rows(
     state: _SearchState,
-    backfill_store: object,
+    backfill_store: ModuleType,
     form: str,
     partition: str,
     qs: str,
@@ -4063,7 +4158,7 @@ def _fetch_covered_rows(
             raise RuntimeError(error)
         probe = rows if result_limit is None else rows[: result_limit + 1]
         return probe
-    except Exception as exc:
+    except (ConnectionError, TimeoutError, OSError, RuntimeError) as exc:
         state.record(
             "live-filings",
             f"{form} {partition}",
@@ -4257,7 +4352,7 @@ def _search_range_note(state: _SearchState, request: SECSearchRequest, quarters:
 def _search_quarter_partitions(
     state: _SearchState,
     request: SECSearchRequest,
-    backfill_store: object,
+    backfill_store: ModuleType,
     get_current_filings: Callable[..., object],
     global_forms: list[str],
     as_of: str | None,
@@ -4372,7 +4467,7 @@ def _search_rel_ciks(state: _SearchState, request: SECSearchRequest, verified: l
 
 
 def _search_queue_local_backfill(
-    state: _SearchState, request: SECSearchRequest, rel_store: object, data_root: Path | str | None
+    state: _SearchState, request: SECSearchRequest, rel_store: ModuleType, data_root: Path | str | None
 ) -> None:
     # Missing partitions become bounded backfill jobs when the
     # request carries a date range; unbounded requests query the
@@ -4397,16 +4492,13 @@ def _search_queue_local_backfill(
 
 
 def _search_queue_local_partition(
-    state: _SearchState, rel_store: object, form: str, year: int, quarter: int, data_root: Path | str | None
+    state: _SearchState, rel_store: ModuleType, form: str, year: int, quarter: int, data_root: Path | str | None
 ) -> None:
     # Live seam: coverage reads from the job ledger; NOTE warehouse slots beside seam.
     partition = _partition_for_quarter(year, quarter)
-    try:
-        is_covered = rel_store.is_partition_covered(
-            source=TYPED_SOURCE, form=form, date_partition=partition, root=data_root
-        )
-    except Exception:  # noqa: BLE001 - coverage probe defaults to uncovered on storage failure
-        is_covered = False
+    is_covered = rel_store.is_partition_covered(
+        source=TYPED_SOURCE, form=form, date_partition=partition, root=data_root
+    )
     if is_covered:
         return
     qs, qe = _quarter_dates(year, quarter)
@@ -4440,7 +4532,7 @@ def _search_queue_local_partition(
 
 
 def _search_add_ownership_rows(
-    state: _SearchState, rel_store: object, cik: str, as_of: str | None, data_root: Path | str | None
+    state: _SearchState, rel_store: ModuleType, cik: str, as_of: str | None, data_root: Path | str | None
 ) -> int:
     # Live seam: no persisted cik-scanned ownership index; accession-scoped live queries answer per filing.
     # NOTE: a future warehouse slots in beside this seam, never inside providers.
@@ -4449,7 +4541,7 @@ def _search_add_ownership_rows(
 
 
 def _search_add_insider_rows(
-    state: _SearchState, rel_store: object, cik: str, as_of: str | None, data_root: Path | str | None
+    state: _SearchState, rel_store: ModuleType, cik: str, as_of: str | None, data_root: Path | str | None
 ) -> int:
     # Live seam: no persisted cik-scanned insider index; accession-scoped live queries answer per filing.
     # NOTE: a future warehouse slots in beside this seam, never inside providers.
@@ -4458,7 +4550,7 @@ def _search_add_insider_rows(
 
 
 def _search_add_13f_rows(
-    state: _SearchState, rel_store: object, cik: str, as_of: str | None, data_root: Path | str | None
+    state: _SearchState, rel_store: ModuleType, cik: str, as_of: str | None, data_root: Path | str | None
 ) -> int:
     # Live seam: no persisted cik-scanned 13F index; accession-scoped live queries answer per filing.
     # NOTE: a future warehouse slots in beside this seam, never inside providers.
@@ -4469,7 +4561,7 @@ def _search_add_13f_rows(
 def _search_local_relationships(
     state: _SearchState,
     request: SECSearchRequest,
-    rel_store: object,
+    rel_store: ModuleType,
     rel_ciks: list[str],
     unbounded_rel: bool,
     as_of: str | None,
@@ -4488,7 +4580,7 @@ def _search_local_relationships(
 def _run_local_relationships(
     state: _SearchState,
     request: SECSearchRequest,
-    rel_store: object,
+    rel_store: ModuleType,
     rel_ciks: list[str],
     unbounded_rel: bool,
     as_of: str | None,
@@ -4502,7 +4594,7 @@ def _run_local_relationships(
 
 
 def _search_local_cik(
-    state: _SearchState, rel_store: object, cik: str, as_of: str | None, data_root: Path | str | None
+    state: _SearchState, rel_store: ModuleType, cik: str, as_of: str | None, data_root: Path | str | None
 ) -> int:
     found = 0
     found += _search_add_ownership_rows(state, rel_store, cik, as_of, data_root)
@@ -4512,7 +4604,7 @@ def _search_local_cik(
 
 
 def _accumulate_local_ciks(
-    state: _SearchState, rel_store: object, rel_ciks: list[str], as_of: str | None, data_root: Path | str | None
+    state: _SearchState, rel_store: ModuleType, rel_ciks: list[str], as_of: str | None, data_root: Path | str | None
 ) -> int:
     rel_found = 0
     for cik in rel_ciks:
@@ -4553,7 +4645,11 @@ def _local_rel_status(state: _SearchState, unbounded_rel: bool, rel_mark: tuple[
 
 
 def _search_local_securities(
-    state: _SearchState, request: SECSearchRequest, rel_store: object, as_of: str | None, data_root: Path | str | None
+    state: _SearchState,
+    request: SECSearchRequest,
+    rel_store: ModuleType,
+    as_of: str | None,
+    data_root: Path | str | None,
 ) -> None:
     if request.security_identifier is None:
         state.record("local-securities", "no security_identifier", "not_applicable")
@@ -4583,7 +4679,11 @@ def _search_local_securities(
 
 
 def _fetch_local_securities(
-    state: _SearchState, rel_store: object, request: SECSearchRequest, as_of: str | None, data_root: Path | str | None
+    state: _SearchState,
+    rel_store: ModuleType,
+    request: SECSearchRequest,
+    as_of: str | None,
+    data_root: Path | str | None,
 ) -> tuple[list[dict[str, object]], bool, int] | None:
     # Live seam: no persisted security-scanned 13F index; accession-scoped live queries answer per filing.
     # NOTE: a future warehouse slots in beside this seam, never inside providers.
@@ -4593,7 +4693,7 @@ def _fetch_local_securities(
 
 
 def _search_add_transaction_rows(
-    state: _SearchState, rel_store: object, cik: str, as_of: str | None, data_root: Path | str | None
+    state: _SearchState, rel_store: ModuleType, cik: str, as_of: str | None, data_root: Path | str | None
 ) -> int:
     # Live seam: no persisted transaction index; live resolution happens per filing.
     # NOTE: a future warehouse slots in beside this seam, never inside providers.
@@ -4602,7 +4702,7 @@ def _search_add_transaction_rows(
 
 
 def _search_add_offering_rows(
-    state: _SearchState, rel_store: object, cik: str, as_of: str | None, data_root: Path | str | None
+    state: _SearchState, rel_store: ModuleType, cik: str, as_of: str | None, data_root: Path | str | None
 ) -> int:
     # Live seam: no persisted offering index; live resolution happens per filing.
     # NOTE: a future warehouse slots in beside this seam, never inside providers.
@@ -4611,7 +4711,7 @@ def _search_add_offering_rows(
 
 
 def _search_local_transactions(
-    state: _SearchState, rel_store: object, rel_ciks: list[str], as_of: str | None, data_root: Path | str | None
+    state: _SearchState, rel_store: ModuleType, rel_ciks: list[str], as_of: str | None, data_root: Path | str | None
 ) -> None:
     # Phase 7: local transaction/offering indexes over stored rows.
     # Missing partitions are queued by the global-filings route when
@@ -4629,7 +4729,7 @@ def _search_local_transactions(
 
 
 def _run_local_transactions(
-    state: _SearchState, rel_store: object, rel_ciks: list[str], as_of: str | None, data_root: Path | str | None
+    state: _SearchState, rel_store: ModuleType, rel_ciks: list[str], as_of: str | None, data_root: Path | str | None
 ) -> None:
     txn_mark = (state.rel_pages[0], state.rel_open[0])
     txn_found = _accumulate_txn_ciks(state, rel_store, rel_ciks, as_of, data_root)
@@ -4646,7 +4746,7 @@ def _run_local_transactions(
 
 
 def _accumulate_txn_ciks(
-    state: _SearchState, rel_store: object, rel_ciks: list[str], as_of: str | None, data_root: Path | str | None
+    state: _SearchState, rel_store: ModuleType, rel_ciks: list[str], as_of: str | None, data_root: Path | str | None
 ) -> int:
     txn_found = 0
     for cik in rel_ciks:
@@ -4773,7 +4873,7 @@ def _search_local_enabled(
 def _search_local_typed(
     state: _SearchState,
     request: SECSearchRequest,
-    rel_store: object,
+    rel_store: ModuleType,
     rel_ciks: list[str],
     as_of: str | None,
     data_root: Path | str | None,
@@ -5407,14 +5507,16 @@ def _rel_unresolved_tail(state: _RelState, resolution: str, resolution_err: Exce
     state.record("efts-mentions", "not_applicable", reason="no cik context")
 
 
-def _rel_typed_cik(state: _RelState, store: object, cik: str, as_of: str | None, data_root: Path | str | None) -> None:
+def _rel_typed_cik(
+    state: _RelState, store: ModuleType, cik: str, as_of: str | None, data_root: Path | str | None
+) -> None:
     # Live seam: stub cik/index scans are gone; accession-scoped live queries answer per filing.
     # NOTE: a future warehouse slots in beside this seam, never inside providers.
     _ = (state, store, cik, as_of, data_root)
 
 
 def _rel_typed_route(
-    state: _RelState, store: object, ciks: list[str], as_of: str | None, data_root: Path | str | None
+    state: _RelState, store: ModuleType, ciks: list[str], as_of: str | None, data_root: Path | str | None
 ) -> None:
     # Route 1: typed ownership / holdings / insider indexes, both directions.
     if not ciks:
@@ -5436,7 +5538,7 @@ def _rel_typed_route(
 
 
 def _rel_inverse_cik(
-    state: _RelState, store: object, cik: str, as_of: str | None, data_root: Path | str | None
+    state: _RelState, store: ModuleType, cik: str, as_of: str | None, data_root: Path | str | None
 ) -> None:
     # Live seam: no persisted issuer map remains; live resolution happens per filing.
     # NOTE: a future warehouse slots in beside this seam, never inside providers.
@@ -5471,7 +5573,7 @@ def _rel_record_inverse(state: _RelState, cik: str, held: list[dict[str, object]
 
 
 def _rel_inverse_route(
-    state: _RelState, store: object, ciks: list[str], as_of: str | None, data_root: Path | str | None
+    state: _RelState, store: ModuleType, ciks: list[str], as_of: str | None, data_root: Path | str | None
 ) -> None:
     # Inverse 13F: verified issuer/entity CIK -> governed CUSIP/ISIN mapping
     # -> holdings -> manager CIKs. Unmapped issuers stay partial; holdings
@@ -5489,7 +5591,7 @@ def _rel_inverse_route(
 
 def _rel_workflow_evidence(
     state: _RelState,
-    store: object,
+    store: ModuleType,
     ciks: list[str],
     as_of: str | None,
     data_root: Path | str | None,
@@ -5503,7 +5605,7 @@ def _rel_workflow_evidence(
 
 
 def _rel_workflow_row(
-    state: _RelState, store: object, rid: str, ev_rows: list[dict[str, object]], data_root: Path | str | None
+    state: _RelState, store: ModuleType, rid: str, ev_rows: list[dict[str, object]], data_root: Path | str | None
 ) -> bool:
     # Live seam: no persisted evidence/revision ledger remains; per-session bundles own workflow rows.
     # NOTE: a future warehouse slots in beside this seam, never inside providers.
@@ -5513,7 +5615,7 @@ def _rel_workflow_row(
 
 def _rel_workflow_route(
     state: _RelState,
-    store: object,
+    store: ModuleType,
     ciks: list[str],
     as_of: str | None,
     data_root: Path | str | None,
@@ -5544,7 +5646,7 @@ def _rel_workflow_route(
 
 def _rel_mentions_route(
     state: _RelState,
-    store: object,
+    store: ModuleType,
     ciks: list[str],
     as_of: str | None,
     data_root: Path | str | None,
@@ -5559,14 +5661,14 @@ def _rel_mentions_route(
         for cik in ciks:
             _rel_collect_mentions(state, store, cik, as_of, data_root, exhaustive, limit)
         _rel_record_mentions(state, exhaustive)
-    except Exception as exc:  # noqa: BLE001 - mentions stage failure degrades to a warning, never raises
+    except Exception as exc:  # noqa: BLE001 - stage failure records an attempt and continues with partial state
         state.record("local-mentions", "failed", error=str(exc))
-        state.warnings.append(f"local mentions unavailable: {exc}")
+        state.errors.append(f"local-mentions failed: {exc}")
 
 
 def _rel_collect_mentions(
     state: _RelState,
-    store: object,
+    store: ModuleType,
     cik: str,
     as_of: str | None,
     data_root: Path | str | None,
@@ -5667,9 +5769,9 @@ def _rel_efts_route(state: _RelState, ciks: list[str], as_of: str | None, exhaus
         for cik in ciks:
             _rel_efts_cik(state, search_sec_filings, cik, as_of, exhaustive, limit, flags)
         _rel_record_efts(state, flags)
-    except Exception as exc:  # noqa: BLE001 - efts stage failure degrades to a warning, never raises
+    except Exception as exc:  # noqa: BLE001 - stage failure records an attempt and continues with partial state
         state.record("efts-mentions", "failed", error=str(exc))
-        state.warnings.append(f"efts mentions unavailable: {exc}")
+        state.errors.append(f"efts-mentions failed: {exc}")
 
 
 def _rel_apply_ontology(state: _RelState, data_root: Path | str | None) -> None:
@@ -5847,7 +5949,7 @@ def evaluate_and_persist_type(
     # Live seam: no persisted evaluation ledger remains; every type stays unevaluated.
     # NOTE: a future warehouse slots in beside this seam, never inside providers.
     _ = (_store, actor, known_at, data_root)
-    decision, new_state, _note = _eval_decision(outcome, "unevaluated", None, reason)
+    _decision, new_state, _note = _eval_decision(outcome, "unevaluated", None, reason)
     outcome.update(inputs_hash=inputs_hash, prev_state="unevaluated", new_state=new_state, rows_written=0)
     return outcome
 
@@ -5972,7 +6074,7 @@ def get_sec_search_coverage(
 
 
 def _coverage_ledger(
-    store: object, source: str | None, form: str | None, limit: int, data_root: Path | str | None
+    store: ModuleType, source: str | None, form: str | None, limit: int, data_root: Path | str | None
 ) -> tuple[list[dict[str, object]], str | None]:
     try:
         return (_store_rows(store, "query_coverage", source=source, form=form, limit=limit, root=data_root), None)
@@ -5981,7 +6083,7 @@ def _coverage_ledger(
 
 
 def _coverage_jobs(
-    store: object, limit: int, data_root: Path | str | None
+    store: ModuleType, limit: int, data_root: Path | str | None
 ) -> tuple[list[dict[str, object]], str | None]:
     try:
         return (_store_rows(store, "list_jobs", limit=limit, root=data_root), None)
@@ -5989,7 +6091,9 @@ def _coverage_jobs(
         return [], str(exc)
 
 
-def _coverage_search(store: object, search_id: str | None, data_root: Path | str | None) -> dict[str, object] | None:
+def _coverage_search(
+    store: ModuleType, search_id: str | None, data_root: Path | str | None
+) -> dict[str, object] | None:
     # Live seam: no persisted search ledger remains; per-session bundles own search ledgers.
     # NOTE: a future warehouse slots in beside this seam, never inside providers.
     _ = (store, search_id, data_root)

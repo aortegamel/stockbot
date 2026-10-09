@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from typing import override
 
 import pytest
 
@@ -21,6 +22,7 @@ from app.services.portfolio_research import (
     PortfolioResearchPosition,
     enrich_portfolio_research,
 )
+
 ENTITY_ID = "sec:cik:0000320193"
 SECURITY_ID = "sec:equity:0000320193"
 RETRIEVED_AT = "2026-08-25T12:00:00Z"
@@ -38,18 +40,16 @@ class _Gateway(SourceGateway):
         self.facts: list[dict[str, object]] = []
         self.shorts: list[dict[str, object]] = []
 
-    def company_facts(  # type: ignore[override]
-        self, cik: int, as_of: str | None = None
-    ) -> dict[str, object]:
+    @override
+    def company_facts(self, cik: int, *, as_of: str | None = None) -> dict[str, object]:
         assert cik == 320193
         rows = [dict(row) for row in self.facts]
         if as_of is not None:
             rows = [row for row in rows if str(row.get("known_at") or "")[:10] <= as_of]
         return {"financial_facts": rows}
 
-    def short_interest(  # type: ignore[override]
-        self, symbol: str, as_of: str | None = None
-    ) -> list[dict[str, object]]:
+    @override
+    def short_interest(self, symbol: str, *, as_of: str | None = None) -> list[dict[str, object]]:
         rows = [row for row in self.shorts if row.get("symbol_code") == symbol.strip().upper()]
         if as_of is not None:
             rows = [row for row in rows if str(row.get("settlement_date") or "")[:10] <= as_of]
@@ -59,8 +59,6 @@ class _Gateway(SourceGateway):
 @pytest.fixture
 def gateway() -> _Gateway:
     return _Gateway()
-
-
 
 
 def _seed_fact(
@@ -437,9 +435,7 @@ def test_missing_values_are_none_never_zero(gateway: _Gateway) -> None:
         retrieved_at="2026-08-20T12:00:00Z",
     )
 
-    finra = enrich_portfolio_research(_snapshot([_position(entity_id=None)]), gateway=gateway)[
-        0
-    ].latest_finra_metrics
+    finra = enrich_portfolio_research(_snapshot([_position(entity_id=None)]), gateway=gateway)[0].latest_finra_metrics
 
     assert finra["short_position"] == Decimal(1150000)
     assert finra["prev_position"] is None
@@ -458,9 +454,7 @@ def test_change_pct_is_none_when_prev_is_zero(gateway: _Gateway) -> None:
         retrieved_at="2026-08-20T12:00:00Z",
     )
 
-    finra = enrich_portfolio_research(_snapshot([_position(entity_id=None)]), gateway=gateway)[
-        0
-    ].latest_finra_metrics
+    finra = enrich_portfolio_research(_snapshot([_position(entity_id=None)]), gateway=gateway)[0].latest_finra_metrics
 
     assert finra["short_interest_change"] == Decimal(100)
     assert finra["short_interest_change_pct"] is None

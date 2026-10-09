@@ -20,6 +20,7 @@ from app.data_sources import SourceGateway
 from app.domain.market.identity import resolve_ticker_aliases
 from app.domain.market.securities import TickerAlias
 from app.services.portfolio_sync import resolve_security
+
 AMD_ENTITY = "sec:cik:0000320193"
 AMD_SECURITY = "sec:equity:0000320193"
 
@@ -151,7 +152,7 @@ def test_default_as_of_is_today_and_resolves() -> None:
 
 def test_same_instant_z_and_offset_visible() -> None:
     _seed_amd(known_at="2026-08-25T12:00:00Z")
-    resolution = resolve_security("AMD", as_of=datetime(2026, 8, 25, 12, 0, tzinfo=UTC))
+    resolve_security("AMD", as_of=datetime(2026, 8, 25, 12, 0, tzinfo=UTC))
 
 
 def test_record_one_microsecond_after_as_of_invisible() -> None:
@@ -194,9 +195,7 @@ def test_newest_alias_wins_chronologically_not_lexically() -> None:
 def test_same_instant_conflicting_securities_are_ambiguous() -> None:
     _seed_aliases(
         _alias_row(known_at="2026-08-25T12:00:00Z", security_id=AMD_SECURITY),
-        _alias_row(
-            known_at="2026-08-25T12:00:00Z", security_id="sec:equity:0000999999", source="control"
-        ),
+        _alias_row(known_at="2026-08-25T12:00:00Z", security_id="sec:equity:0000999999", source="control"),
     )
     resolution = resolve_security("AMD", as_of=datetime(2026, 8, 26, 0, 0, tzinfo=UTC))
     assert resolution.resolved is False

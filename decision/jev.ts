@@ -81,7 +81,7 @@ export function parseChoiceAnswer(
 ): ChoiceDecision {
   const bad = (): Error => new Error(`${name}: malformed_typesafe_answer for ${id}`);
   if (!isObj(ans) || ans.type !== "choice") throw bad();
-  if (typeof ans.choice !== "string" || !(ans.choice in options)) throw bad();
+  if (typeof ans.choice !== "string" || !Object.hasOwn(options, ans.choice)) throw bad();
   if (!isObj(ans.probabilities) || typeof ans.confidence !== "number") throw bad();
   if (!isProb(ans.confidence)) throw bad();
   const want = Object.keys(options).sort();
@@ -91,7 +91,9 @@ export function parseChoiceAnswer(
   for (const k of want) {
     const v = (ans.probabilities as Record<string, unknown>)[k];
     if (!isProb(v)) throw bad();
-    probabilities[k] = v;
+    Object.defineProperty(probabilities, k, {
+      value: v, enumerable: true, writable: true, configurable: true,
+    });
   }
   return { kind: "choice", choice: ans.choice as string, probabilities, confidence: ans.confidence as number };
 }

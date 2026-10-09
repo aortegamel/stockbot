@@ -17,12 +17,12 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
+from typing import TYPE_CHECKING
 
 from app.research import freeze as _freeze
 from app.research import jobs as _jobs
@@ -2344,40 +2344,28 @@ class _LiveRun:
 
     def _bundle_root(self) -> Path:
         """Per-session bundle root under the data root; Path, never a warehouse DB."""
-        from pathlib import Path as _Path
-
         from app.config import get_data_root as _gdr
 
-        try:
-            root = _gdr()
-        except Exception:
-            root = _Path("data")
-        return root / "bundles"
+        return _gdr() / "bundles"
 
     def _write_bundle_file(self, run_dir: Path, name: str, payload: object) -> None:
-        """Write one JSON bundle file; best-effort, never breaks the run."""
+        """Write one JSON bundle file; raises on IO failure."""
         import json as _json
 
-        try:
-            path = run_dir / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(_json.dumps(payload, sort_keys=True, indent=2, default=str) + "\n")
-        except Exception:
-            pass
+        path = run_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps(payload, sort_keys=True, indent=2, default=str) + "\n")
 
     def _bundle_evidence_entries(self, session_id: str) -> tuple[list[object], list[str]]:
         """Bundle evidence entries + selective artifact names for substantive rows only."""
         from app.research.evidence import evidence_bundle_entry as _entry
         from app.research.evidence import evidence_from_dict as _from_dict
+        from app.storage import raw_archive as _artifacts
 
         entries: list[object] = []
         artifacts: list[str] = []
         seen: set[str] = set()
-        rows: list[object] = []
-        try:
-            rows = list(self.store.list_evidence(session_id))
-        except Exception:
-            rows = []
+        rows = list(self.store.list_evidence(session_id))
         ledger_rows = _ledger_evidence(self.ledger, session_id)
         by_id = {rec.evidence_id: rec for rec in ledger_rows}
         for row in rows:
@@ -2388,42 +2376,25 @@ class _LiveRun:
                 continue
             rec = by_id.get(eid)
             if rec is None:
-                try:
-                    rec = _from_dict(row)
-                except Exception:
-                    continue
+                rec = _from_dict(row)
             if rec.record_kind != "evidence":
                 continue
-            try:
-                entries.append(_entry(rec))
-            except Exception:
-                continue
+            entries.append(_entry(rec))
             seen.add(eid)
             artifacts.append(f"sha256_{rec.content_hash}")
-            try:
-                from app.storage import raw_archive as _artifacts
-
-                _artifacts.store_evidence_artifact(
-                    rec.content.encode("utf-8"),
-                    url=rec.source_uri or "",
-                    metadata={"evidence_id": eid, "session_id": session_id},
-                )
-            except Exception:
-                pass
+            _artifacts.store_evidence_artifact(
+                rec.content.encode("utf-8"),
+                url=rec.source_uri or "",
+                metadata={"evidence_id": eid, "session_id": session_id},
+            )
         return entries, artifacts
 
     def _bundle_tool_calls(self, session_id: str) -> list[object]:
         """Tool-call rows for the bundle: tool-carrying journal events in sequence order."""
         out: list[object] = []
-        try:
-            events = self.store.list_events(session_id)
-        except Exception:
-            return out
+        events = self.store.list_events(session_id)
         for event in events:
-            try:
-                row = event.to_dict()
-            except Exception:
-                continue
+            row = event.to_dict()
             event_type = str(row.get("event_type", ""))
             payload = row.get("payload")
             text = f"{event_type} {payload}".lower()
@@ -2434,10 +2405,7 @@ class _LiveRun:
     def _bundle_agents(self, session_id: str) -> dict[str, object]:
         """Committee agent payloads for the bundle: completed trio job results keyed by role."""
         agents: dict[str, object] = {}
-        try:
-            jobs = self.store.list_jobs(session_id)
-        except Exception:
-            return agents
+        jobs = self.store.list_jobs(session_id)
         for job in jobs:
             if job.job_type not in ("stockbot", "bullbot", "bearbot") or job.status != "completed":
                 continue
@@ -2456,61 +2424,45 @@ class _LiveRun:
         ``bundles/``). Selective artifacts: substantive evidence rows only
         (content-addressed sha256 names, no per-run copies); search lists,
         unused opens, and PDFs stay trace-metadata-only.
+
+        Raises on missing session or IO failure; callers let it propagate
+        after state is persisted so a bundle failure never hides as partial files.
         """
         import json as _json
 
         run_dir = self._bundle_root() / str(session_id)
-        try:
-            session = self.store.get_session(session_id)
-            question = session.query
-            as_of = session.as_of.isoformat() if session.as_of is not None else None
-            final = dict(session.final_result) if session.final_result is not None else {}
-            policy = dict(session.policy)
-        except Exception:
-            question, as_of, final, policy = self.question, self.as_of_str or None, {}, {}
+        session = self.store.get_session(session_id)
+        question = session.query
+        as_of = session.as_of.isoformat() if session.as_of is not None else None
+        final: dict[str, JSONValue] = dict(session.final_result) if session.final_result is not None else {}
+        policy: dict[str, JSONValue] = dict(session.policy)
         entries, artifacts = self._bundle_evidence_entries(session_id)
         tool_calls = self._bundle_tool_calls(session_id)
         agents = self._bundle_agents(session_id)
         answer = final.get("answer", "") if isinstance(final, dict) else ""
         self._write_bundle_file(run_dir, "request.json", {"question": question, "as_of": as_of})
         self._write_bundle_file(run_dir, "config.json", policy)
-        try:
-            calls_path = run_dir / "tool_calls.jsonl"
-            calls_path.parent.mkdir(parents=True, exist_ok=True)
-            with calls_path.open("w", encoding="utf-8") as handle:
-                for row in tool_calls:
-                    handle.write(_json.dumps(row, sort_keys=True, default=str) + "\n")
-        except Exception:
-            pass
-        try:
-            evidence_dir = run_dir / "evidence"
-            evidence_dir.mkdir(parents=True, exist_ok=True)
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                eid = entry.get("evidence_id")
-                if not isinstance(eid, str) or not eid:
-                    continue
-                safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in eid)
-                (evidence_dir / f"{safe}.json").write_text(
-                    _json.dumps(entry, sort_keys=True, indent=2, default=str) + "\n"
-                )
-        except Exception:
-            pass
-        try:
-            (run_dir / "artifacts").mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-        try:
-            agents_dir = run_dir / "agents"
-            agents_dir.mkdir(parents=True, exist_ok=True)
-            for role, payload in agents.items():
-                safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in role)
-                (agents_dir / f"{safe}.json").write_text(
-                    _json.dumps(payload, sort_keys=True, indent=2, default=str) + "\n"
-                )
-        except Exception:
-            pass
+        calls_path = run_dir / "tool_calls.jsonl"
+        calls_path.parent.mkdir(parents=True, exist_ok=True)
+        with calls_path.open("w", encoding="utf-8") as handle:
+            for row in tool_calls:
+                handle.write(_json.dumps(row, sort_keys=True, default=str) + "\n")
+        evidence_dir = run_dir / "evidence"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            eid = entry.get("evidence_id")
+            if not isinstance(eid, str) or not eid:
+                continue
+            safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in eid)
+            (evidence_dir / f"{safe}.json").write_text(_json.dumps(entry, sort_keys=True, indent=2, default=str) + "\n")
+        (run_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+        agents_dir = run_dir / "agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        for role, payload in agents.items():
+            safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in role)
+            (agents_dir / f"{safe}.json").write_text(_json.dumps(payload, sort_keys=True, indent=2, default=str) + "\n")
         self._write_bundle_file(run_dir, "answer.json", {"answer": answer, "final_result": final})
         self._write_bundle_file(run_dir, "eval.json", {"session_id": session_id, "artifacts": artifacts})
         return run_dir
@@ -2720,10 +2672,7 @@ class _LiveRun:
             self._store_final(result.session_id, synth.freeze_id, synth.answer, synth.claims)
         self._emit(result.session_id, "wave.stopped", {"reason": reason})
         self._close_trace(synth.answer if synth is not None else None, reason)
-        try:
-            bundle_dir = self.write_bundle(result.session_id)
-        except Exception:
-            bundle_dir = None
+        bundle_dir = self.write_bundle(result.session_id)
         return {
             "session_id": result.session_id,
             "wave_id": result.wave_id,
@@ -2738,7 +2687,7 @@ class _LiveRun:
             "wave_decision": gate,
             "novelty": dict(result.novelty),
             "waves": [_wave_summary(w) for w in waves],
-            "bundle_dir": str(bundle_dir) if bundle_dir is not None else None,
+            "bundle_dir": str(bundle_dir),
         }
 
     def _finish_completed(self, result: Wave1Result, did_out: str) -> dict[str, object]:
@@ -2892,14 +2841,11 @@ def _close_wave1_result(
             "stop_reason": f"interrupted:{interrupt_after}",
         }
     run._store_empty_terminal(result.session_id)
-    try:
-        bundle_dir = run.write_bundle(result.session_id)
-    except Exception:
-        bundle_dir = None
+    bundle_dir = run.write_bundle(result.session_id)
     out = _empty_terminal_result(
         result.session_id, result.wave_id, list(result.evidence_ids), did_out, "complete:empty-with-limitations"
     )
-    out["bundle_dir"] = str(bundle_dir) if bundle_dir is not None else None
+    out["bundle_dir"] = str(bundle_dir)
     return out
 
 
@@ -3342,13 +3288,10 @@ def resume_live(
     if not eids:
         run._record_stop(session_id, "complete:empty-with-limitations")
         run._store_empty_terminal(session_id)
-        try:
-            bundle_dir = run.write_bundle(session_id)
-        except Exception:
-            bundle_dir = None
+        bundle_dir = run.write_bundle(session_id)
         empty_out = _empty_terminal_result(
             session_id, wave, eids, _first_dossier_id(run), "complete:empty-with-limitations"
         )
-        empty_out["bundle_dir"] = str(bundle_dir) if bundle_dir is not None else None
+        empty_out["bundle_dir"] = str(bundle_dir)
         return empty_out
     return _close_resumed_wave(run, store, session_id, wave, eids)

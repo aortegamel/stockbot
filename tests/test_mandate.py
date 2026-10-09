@@ -507,9 +507,7 @@ def _sector(monkeypatch: pytest.MonkeyPatch, sector: str | None = "semiconductor
 
 def test_load_sector_map_live_provider_sector(monkeypatch: pytest.MonkeyPatch):
     _sector(monkeypatch)
-    assert risk_service.load_sector_map(_positions("sec:cik:0000320193")) == {
-        "sec:cik:0000320193": "semiconductors"
-    }
+    assert risk_service.load_sector_map(_positions("sec:cik:0000320193")) == {"sec:cik:0000320193": "semiconductors"}
 
 
 def test_load_sector_map_unknown_and_provider_failure(monkeypatch: pytest.MonkeyPatch):
@@ -519,7 +517,8 @@ def test_load_sector_map_unknown_and_provider_failure(monkeypatch: pytest.Monkey
         raise RuntimeError("provider down")
 
     monkeypatch.setattr(risk_service, "_provider_sector", _boom)
-    assert risk_service.load_sector_map(_positions("sec:cik:0000320193")) == {}
+    with pytest.raises(RuntimeError, match="provider down"):
+        risk_service.load_sector_map(_positions("sec:cik:0000320193"))
 
 
 def test_load_sector_map_dedups_entity(monkeypatch: pytest.MonkeyPatch):
@@ -533,6 +532,7 @@ def test_load_sector_map_dedups_entity(monkeypatch: pytest.MonkeyPatch):
     positions = _positions("sec:cik:0000320193") + _positions("sec:cik:0000320193")
     assert risk_service.load_sector_map(positions) == {"sec:cik:0000320193": "aero"}
     assert seen == [320193]
+
 
 # ---------------------------------------------------------------------------
 # CLI command

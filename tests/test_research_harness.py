@@ -5840,6 +5840,52 @@ def test_hf_replay_admits_finra_record(tmp_path: Path, monkeypatch: pytest.Monke
     assert out["known_at"] == "2025-06-20T00:00:00+00:00"
 
 
+def test_hf_sec_record_identity_keys_on_record_and_tool_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SEC replay dedupe keys on record_identity + tool_result_id, never subject/claim alone.
+
+    Regression: claim-less SEC replay rows under one subject collided on a blank
+    accession/document key, so a later distinct record deduped onto the first.
+    """
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo)
+    sec = str(_svc.start_job(sid, "source_agent", source="SEC", repo=repo, wave_id=1)["job_id"])
+    payload: dict[str, object] = {
+        "filings": ["NVDA Form 4 accession 0001045810-25-000001", "NVDA 10-Q accession 0001045810-25-000002"],
+        "filed_at": "2025-06-01",
+    }
+    rid_a = str(
+        _svc.persist_tool_result(sid, sec, "list_sec_filings", f"{sid}:tr:a", payload, repo=repo)["tool_result_id"]
+    )
+    rid_b = str(
+        _svc.persist_tool_result(sid, sec, "list_sec_filings", f"{sid}:tr:b", payload, repo=repo)["tool_result_id"]
+    )
+
+    def _cite(eid: str, rid: str, passage: str) -> dict[str, JSONValue]:
+        # No claim_text/subject: the scheduler path supplies content only.
+        item: dict[str, object] = {
+            "evidence_id": f"{sid}:ev:{eid}",
+            "content": passage,
+            "source_name": "SEC",
+            "tool_result_id": rid,
+            "matching_passage": passage,
+        }
+        return _svc.record_evidence(sid, sec, item, repo=repo)
+
+    form4 = "NVDA Form 4 accession 0001045810-25-000001"
+    first = _cite("a-form4", rid_a, form4)
+    other_record = _cite("a-10q", rid_a, "NVDA 10-Q accession 0001045810-25-000002")
+    other_result = _cite("b-form4", rid_b, form4)
+    repeat = _cite("a-form4-again", rid_a, form4)
+    assert _hf_prov(first, "kind") == "sec_record"
+    assert "duplicate_of" not in other_record and other_record["evidence_id"] == f"{sid}:ev:a-10q"
+    assert "duplicate_of" not in other_result and other_result["evidence_id"] == f"{sid}:ev:b-form4"
+    assert repeat == {"evidence_id": f"{sid}:ev:a-form4", "accepted": False, "duplicate_of": f"{sid}:ev:a-form4"}
+    assert repo.list_evidence_ids(sid) == [f"{sid}:ev:a-form4", f"{sid}:ev:a-10q", f"{sid}:ev:b-form4"]
+
+
 def test_hf_replay_admits_web_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """WEB job + tool_result_id replay admits web_source provenance (url/excerpt/title/domain)."""
     from app.research import service as _svc
@@ -6499,3 +6545,53 @@ def test_evidence_insert_and_session_link_commit_together(tmp_path: Path, monkey
     _svc.record_evidence(sid, src, _svc_item(eid), repo=repo)
     assert eid in repo.get_session(sid).evidence_ids
     assert repo.get_evidence(eid)["evidence_id"] == eid
+
+
+def test_write_bundle_propagates_store_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing session raises instead of writing a fallback bundle."""
+    from app.research.director import DirectorBudgets
+    from app.research.runner import _LiveRun
+
+    def _ok(prompt: str) -> str:
+        assert prompt
+        return _grounded(prompt)
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    run = _LiveRun(repo, "q?", "o", None, "", ["NVDA"], _fake_dispatch(), _ok, DirectorBudgets())
+    with pytest.raises(KeyError):
+        run.write_bundle("no-such-session")
+
+
+def test_write_bundle_propagates_evidence_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Corrupt persisted evidence raises instead of skipping the row."""
+    from app.research.director import DirectorBudgets
+    from app.research.runner import _LiveRun
+
+    def _ok(prompt: str) -> str:
+        assert prompt
+        return _grounded(prompt)
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path / "data"))
+    repo = ResearchRepository()
+    out = run_live(
+        question="NVDA demand?",
+        objective="o",
+        as_of="2025-06-30T00:00:00+00:00",
+        tickers=["NVDA"],
+        dispatch=_fake_dispatch(),
+        model=_ok,
+        repo=repo,
+        budgets=None,
+    )
+    sid = out["session_id"]
+    assert isinstance(sid, str)
+    run = _LiveRun(repo, "q?", "o", None, "", ["NVDA"], _fake_dispatch(), _ok, DirectorBudgets())
+
+    def _corrupt(_row: object) -> object:
+        raise ValueError("corrupt row")
+
+    monkeypatch.setattr("app.research.evidence.evidence_from_dict", _corrupt)
+    with pytest.raises(ValueError, match="corrupt row"):
+        run._bundle_evidence_entries(sid)

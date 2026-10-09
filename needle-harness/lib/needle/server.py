@@ -1,13 +1,16 @@
 import json
+import logging
 import os
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 os.environ["NEEDLE_TELEMETRY"] = "0"
 os.environ["DO_NOT_TRACK"] = "1"
 
-import needle  # noqa: E402
+import needle
+
+logger = logging.getLogger(__name__)
 
 
 def _strip_descriptions(node):
@@ -33,8 +36,8 @@ def load_catalog():
     try:
         with open(path) as f:
             tools = json.load(f)
-    except Exception as e:
-        sys.stderr.write(f"needle server: cannot load tool catalog at {path}: {e}\n")
+    except Exception:
+        logger.exception("needle server: cannot load tool catalog at %s", path)
         sys.exit(1)
     if not isinstance(tools, list) or not tools:
         sys.stderr.write(f"needle server: tool catalog at {path} is empty or invalid\n")
@@ -78,7 +81,7 @@ def resolve_weights():
 
 def _today():
     """UTC date fact, computed per request so long-lived servers never go stale."""
-    return datetime.now(timezone.utc).strftime("%a %Y-%m-%d")
+    return datetime.now(UTC).strftime("%a %Y-%m-%d")
 
 
 def _legacy_system():
@@ -91,7 +94,7 @@ def _legacy_system():
 
 
 def _bound_system():
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = datetime.now(UTC).date().isoformat()
     return f"date: {_today()} UTC; locale: en-US; Today UTC is {today}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week' or 'today' or 'last quarter' as arg values."
 
 
@@ -127,14 +130,11 @@ def _tool_entry(tool, schema):
     """Single-tool binding for one arguments.generate call: grammar admits exactly this tool."""
     params = schema if isinstance(schema, dict) else {}
     full = None
-    try:
-        with open(_catalog_path()) as f:
-            for t in json.load(f):
-                if isinstance(t, dict) and t.get("name") == tool:
-                    full = t
-                    break
-    except Exception:
-        full = None
+    with open(_catalog_path()) as f:
+        for t in json.load(f):
+            if isinstance(t, dict) and t.get("name") == tool:
+                full = t
+                break
     full = full if isinstance(full, dict) else {}
     raw_desc = full.get("description")
     desc = raw_desc if isinstance(raw_desc, str) and raw_desc.strip() else tool
@@ -168,7 +168,9 @@ def _bound_agent(tool, schema):
 
 def _extract_agent(record, system=None):
     """Fresh Needle bound to exactly one record shape (extraction is one-tool calling)."""
-    if not isinstance(record, dict) or not isinstance(record.get("name"), str) or not record["name"]:
+    if not isinstance(record, dict):
+        raise TypeError("bad record")
+    if not isinstance(record.get("name"), str) or not record["name"]:
         raise ValueError("bad record")
     bound_kwargs = dict(kwargs)
     bound_kwargs["tools"] = [record]
@@ -200,7 +202,7 @@ def _extract_decision(record_name, r, strict=True):
         raise ValueError(f"extract record mismatch: declared {record_name!r}, engine emitted {name!r}")
     args = call.get("arguments") or {}
     if not isinstance(args, dict):
-        raise ValueError("extract fields must be a mapping")
+        raise TypeError("extract fields must be a mapping")
     if strict:
         validation = r.get("validation") or {}
         flagged = list(validation.get("ungrounded") or [])
@@ -263,7 +265,7 @@ def validate_needle_tool(jev_tool, needle_tool):
     Never silently substitute.
     """
     if not isinstance(jev_tool, str) or not jev_tool:
-        raise ValueError("jev_tool must be a nonempty tool name")
+        raise TypeError("jev_tool must be a nonempty tool name")
     if needle_tool != jev_tool:
         raise ValueError(f"needle tool mismatch: jev selected {jev_tool!r}, needle emitted {needle_tool!r}")
     return needle_tool
@@ -282,7 +284,7 @@ def _arguments_prompt(tool, schema, objective, node, context):
                 "query words — when the symbol is unstated pass company_name instead and omit ticker; "
                 "dataset must be canonical group/name. as_of only from an explicit YYYY-MM-DD date or relative wording "
                 "in the query/objective, never memory or priors: no date wording means omit as_of entirely (latest-available). Today UTC is "
-                f"{datetime.now(timezone.utc).date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week' or 'today' or 'last quarter' as arg values. On insufficient grounding raise/return an error, never fabricate, never stay silent. "
+                f"{datetime.now(UTC).date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week' or 'today' or 'last quarter' as arg values. On insufficient grounding raise/return an error, never fabricate, never stay silent. "
                 "For get_sec_document on a revenue-quarter question always include query 'revenue increased'; "
             ),
             "tool": tool,
@@ -303,8 +305,9 @@ def handle(line):
         rid = req["id"]
         action = req.get("action", "")
         if not isinstance(rid, str):
-            raise ValueError("bad types")
+            raise TypeError("bad types")
     except Exception:
+        logger.exception("needle server: bad request")
         return {"id": "?", "error": "bad_request"}
     try:
         # Ping-only gate: answers after imports load weights; never touches the model.
@@ -314,7 +317,7 @@ def handle(line):
         if action == "start":
             prompt = req["prompt"]
             if not isinstance(prompt, str):
-                raise ValueError("bad prompt")
+                raise TypeError("bad prompt")
             with _agent_lock:
                 agent.reset()
                 r = agent.complete(prompt, max_new_tokens=256)
@@ -327,7 +330,7 @@ def handle(line):
             # sufficiency judgment. start/step (old Needle-owned loop) intact.
             tool = req.get("tool")
             if not isinstance(tool, str) or not tool:
-                raise ValueError("bad tool")
+                raise TypeError("bad tool")
             import time as _t
 
             _gen_t0 = _t.perf_counter()
@@ -347,16 +350,15 @@ def handle(line):
                 )
                 r = bound.complete(prompt, max_new_tokens=512)
             finally:
-                try:
-                    bound.close()
-                except Exception:
-                    pass
+                bound.close()
             _gen_ms = (_t.perf_counter() - _gen_t0) * 1000.0
             sys.stderr.write(f"needle timing tool={tool} init_ms={_init_ms:.1f} generate_ms={_gen_ms:.1f}\n")
             sys.stderr.flush()
             decision = _decision(r, tool)
             try:
                 validate_needle_tool(tool, decision["tool"])
+            except TypeError:
+                raise
             except ValueError:
                 if decision["tool"] is None:
                     raise ValueError(
@@ -369,22 +371,19 @@ def handle(line):
             record = req.get("record")
             passage = req.get("passage")
             if not isinstance(record, dict) or not record.get("name"):
-                raise ValueError("bad record")
+                raise TypeError("bad record")
             if not isinstance(passage, str) or not passage.strip():
-                raise ValueError("bad passage")
+                raise TypeError("bad passage")
             max_tokens = req.get("max_new_tokens", 512)
             if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or not 1 <= max_tokens <= 4096:
-                raise ValueError("bad max_new_tokens")
+                raise TypeError("bad max_new_tokens")
             strict = req.get("strict", True)
             strict = strict if isinstance(strict, bool) else True
             bound = _extract_agent(record, req.get("system"))
             try:
                 r = bound.complete(passage, max_new_tokens=max_tokens)
             finally:
-                try:
-                    bound.close()
-                except Exception:
-                    pass
+                bound.close()
             out = {"id": rid}
             out.update(_extract_decision(str(record["name"]), r, strict))
             return out
@@ -392,14 +391,12 @@ def handle(line):
             # Retrieval embedding off the shared agent; serial like start/step.
             text = req.get("text", "")
             if not isinstance(text, str) or not text.strip():
-                raise ValueError("bad text")
+                raise TypeError("bad text")
             with _agent_lock:
                 vec = agent.embed(text)
-            if (
-                not isinstance(vec, list)
-                or not vec
-                or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vec)
-            ):
+            if not isinstance(vec, list):
+                raise TypeError("bad embedding")
+            if not vec or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vec):
                 raise ValueError("bad embedding")
             return {"id": rid, "embedding": vec}
         else:
@@ -408,6 +405,7 @@ def handle(line):
         out.update(decision if action == "arguments.generate" else _decision(r))
         return out
     except Exception as e:
+        logger.exception("needle server: request failed id=%s", rid)
         return {"id": rid, "error": str(e)}
 
 

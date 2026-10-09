@@ -17,13 +17,13 @@ export type Proposal = {
   whyItMatters: string;
 };
 
-export type AnalysisNumber = {
+type AnalysisNumber = {
   value: string;
   evidenceId: string;
   quote: string;
 };
 
-export type AnalysisAssumption = {
+type AnalysisAssumption = {
   assumptionId: string;
   text: string;
 };

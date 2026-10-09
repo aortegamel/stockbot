@@ -478,7 +478,9 @@ def _expand(
     from .source_agent import expand_queries
 
     while True:
-        novel = expand_queries(list(store.seen_queries), _passage_texts(store))
+        novel = expand_queries(
+            list(store.seen_queries), _passage_texts(store), reference=store.assignment.question
+        )
         if not novel:
             return
         _run_queries(store, guarded_call, novel)

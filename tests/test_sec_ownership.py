@@ -196,6 +196,7 @@ def test_live_ownership_per_accession(tmp_path: Path, monkeypatch: pytest.Monkey
     # Filer and subject never share a fallback identity.
     assert rows[0]["filer_cik"] != rows[0]["subject_cik"]
 
+
 def test_13f_cusip_normalizes_live_per_accession(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from app.sec import insider as _ins
     from app.sec.models import Filing
@@ -334,8 +335,6 @@ def test_13f_shared_filing_rows_normalize_distinctly() -> None:
         known_at="2024-05-15T00:00:00Z",
     )
     assert [h.holding_id for h in repeat] == holding_ids
-
-
 
 
 @pytest.mark.parametrize(

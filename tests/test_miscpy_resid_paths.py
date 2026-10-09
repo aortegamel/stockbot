@@ -288,11 +288,11 @@ def test_miscpy_thesis_show_live_branch(tmp_path: Path) -> None:
 
 
 def test_miscpy_resolve_subject_blank_and_miss():
-    from datetime import datetime, timezone
+    from datetime import UTC, datetime
 
     import app.services.evidence_resolution as er
 
-    as_of = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    as_of = datetime(2026, 1, 1, tzinfo=UTC)
     blank = er.resolve_subject(
         ticker=None, name="   ", aliases_by_ticker=lambda t: [], name_to_ticker=lambda n: None, as_of=as_of
     )

@@ -27,7 +27,7 @@ const VENV_PYTHON = `${homedir()}/.cache/needle-harness/.needle/bin/python`;
 // Stockbot kernel needs repo deps (dotenv, app.*); the needle-only venv lacks them.
 const REPO_PYTHON = join(ROOT, "venv/bin/python");
 
-export type KernelEvidence = {
+type KernelEvidence = {
   id: string;
   content: string;
   source?: string;
@@ -36,7 +36,7 @@ export type KernelEvidence = {
   retrievedAt?: string;
 };
 
-export type KernelNeedleDecision = {
+type KernelNeedleDecision = {
   step: number;
   tool: string | null;
   arguments: Record<string, unknown>;
@@ -44,7 +44,7 @@ export type KernelNeedleDecision = {
   reasoning?: string;
 };
 
-export type KernelToolCall = {
+type KernelToolCall = {
   tool: string;
   ok: boolean;
   evidenceId?: string;
@@ -52,14 +52,14 @@ export type KernelToolCall = {
   category?: FailureCategory;
 };
 
-export type KernelGraphNode = {
+type KernelGraphNode = {
   node_id: string;
   question: string;
   status: string;
   depends_on: string[];
 };
 
-export type KernelReasonInput = {
+type KernelReasonInput = {
   prompt: string;
   evidence: Evidence[];
   escalated: boolean;
@@ -109,8 +109,8 @@ export type KernelChild = {
 
 export type KernelSpawn = (cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => KernelChild;
 
-export type KernelReasonResult = { text: string; usage: MuseUsage; missingEvidence?: string };
-export type KernelReasonFn = (opts: KernelReasonInput) => Promise<KernelReasonResult>;
+type KernelReasonResult = { text: string; usage: MuseUsage; missingEvidence?: string };
+type KernelReasonFn = (opts: KernelReasonInput) => Promise<KernelReasonResult>;
 export type RunKernelDeps = {
   spawnFn?: KernelSpawn;
   reason?: KernelReasonFn;
