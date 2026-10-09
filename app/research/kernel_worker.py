@@ -1,6 +1,6 @@
 """Kernel worker: stdin-JSONL bridge from the TS route to the Python scheduler.
 
-Request:  {"id", "op": "run", "prompt", "asOf"?, "deadlineMs"?}
+Request:  {"id", "op": "run", "prompt", "asOf"?, "deadlineAt"? (epoch ms), "sessionId"?, "gap"?}
 Response: {"id", "objective", "evidence": [{id, content}],
            "nodes": [{node_id, question, status, depends_on}],
            "decisions": [...persisted JEV records...], "unresolved": [node_ids],
@@ -1523,12 +1523,13 @@ def _run(
     as_of = raw_as_of if isinstance(raw_as_of, str) else None
     objective = prompt.strip()
     client = jev if jev is not None else _shared_jev()
-    # One wall budget: setup stops at _SETUP_S so the scheduler keeps the rest.
+    # One wall budget: request-level absolute deadline shared across passes, capped at _RUN_WALL_S.
     _t0 = time.perf_counter()
     run_wall = _RUN_WALL_S
-    raw_deadline = req.get("deadlineMs")
+    raw_deadline = req.get("deadlineAt")
     if isinstance(raw_deadline, (int, float)) and not isinstance(raw_deadline, bool) and raw_deadline > 0:
-        run_wall = min(_RUN_WALL_S, raw_deadline / 1000.0)
+        remaining_s = raw_deadline / 1000.0 - time.time()
+        run_wall = min(_RUN_WALL_S, remaining_s)
     setup_deadline = _t0 + min(_SETUP_S, run_wall - _FINALIZE_S - _SCHEDULER_MIN_S)
     run_deadline = _t0 + run_wall - _FINALIZE_S
     raw_session = req.get("sessionId")

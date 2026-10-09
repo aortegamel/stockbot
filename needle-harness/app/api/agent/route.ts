@@ -1,5 +1,5 @@
 import { reason } from "@/lib/muse/client";
-import { kernelRouter, runKernelAgent } from "@/lib/agent/kernel";
+import { kernelRouter, REQUEST_WALL_MS, runKernelAgent } from "@/lib/agent/kernel";
 import { tools } from "@/lib/tools";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
 import { redactArgs, type AgentEvent, type Evidence, type FailureCategory } from "@/lib/agent/types";
@@ -9,6 +9,7 @@ function requiredEnv(name: string): string {
   return value;
 }
 export async function POST(req: Request): Promise<Response> {
+  const deadlineAt = Date.now() + REQUEST_WALL_MS;
   let prompt: unknown;
   try {
     ({ prompt } = await req.json());
@@ -183,7 +184,7 @@ export async function POST(req: Request): Promise<Response> {
         // Route unavailable — fail open to research below.
       }
       try {
-        await runKernelAgent(prompt, send, { signal: req.signal, seedEvidence: singleShotEvidence });
+        await runKernelAgent(prompt, send, { signal: req.signal, seedEvidence: singleShotEvidence, deadlineAt });
       } catch (err) {
         console.error(`[web] [agent-api] runKernelAgent error: ${err instanceof Error ? err.message : String(err)}`);
         send({ type: "error", message: err instanceof Error ? err.message : String(err) });

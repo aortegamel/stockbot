@@ -19,6 +19,7 @@ const ended: string[] = [];
 
 let emitProgress = false;
 mock.module("@/lib/agent/kernel", () => ({
+  REQUEST_WALL_MS: 120_000,
   kernelRouter: {
     call: async (body: KernelCall) => {
       kernelCalls.push(body);

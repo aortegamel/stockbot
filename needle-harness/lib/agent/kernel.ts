@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { GENERATE_TIMEOUT_MS } from "../needle/client";
 import { reason, type MuseUsage } from "../muse/client";
 import { redactArgs } from "./types";
 import type { AgentEvent, Evidence, FailureCategory, Metrics } from "./types";
@@ -13,6 +14,10 @@ function requiredEnv(name: string): string {
   return value;
 }
 const WORKER_TIMEOUT_MS = 10 * 60 * 1000;
+// whole user request, both passes, from route entry.
+export const REQUEST_WALL_MS = 120_000;
+// ponytail: worker finalize/muse-write reserve (20s, mirrors kernel_worker _FINALIZE_S) plus one Needle generation.
+const PASS2_MIN_MS = 20_000 + GENERATE_TIMEOUT_MS;
 const PREWARM_TIMEOUT_MS = 30_000;
 
 // next dev runs with cwd=needle-harness; the repo root is its parent.
@@ -111,7 +116,6 @@ export type RunKernelDeps = {
   reason?: KernelReasonFn;
   python?: string;
   workerPath?: string;
-  timeoutMs?: number;
 };
 
 function defaultSpawn(cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv }): KernelChild {
@@ -412,12 +416,12 @@ function graphProjection(input: {
 export async function runKernelAgent(
   prompt: string,
   emit: (e: AgentEvent) => void,
-  opts?: { signal?: AbortSignal; deadlineMs?: number; deps?: RunKernelDeps; seedEvidence?: Evidence[] },
+  opts?: { signal?: AbortSignal; deadlineAt?: number; deps?: RunKernelDeps; seedEvidence?: Evidence[] },
 ): Promise<void> {
   const t0 = performance.now();
   const deps = opts?.deps ?? {};
   const reasonFn = deps.reason ?? reason;
-  const timeoutMs = deps.timeoutMs ?? opts?.deadlineMs ?? WORKER_TIMEOUT_MS;
+  const deadlineAt = opts?.deadlineAt ?? Date.now() + REQUEST_WALL_MS;
   const hasWorkerDeps = deps.spawnFn !== undefined || deps.python !== undefined || deps.workerPath !== undefined;
   const router = hasWorkerDeps
     ? new KernelRouter({
@@ -452,7 +456,7 @@ export async function runKernelAgent(
   let res: KernelResponse;
   const workerStart = performance.now();
   try {
-    res = await router.call({ op: "run", prompt, deadlineMs: timeoutMs }, { signal: opts?.signal, timeoutMs, onProgress: (stage, detail) => emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage }) });
+    res = await router.call({ op: "run", prompt, deadlineAt }, { signal: opts?.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1), onProgress: (stage, detail) => emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage }) });
   } catch (err) {
     // ponytail: needle-down shape — worker failure still ends at done, never throws to the route.
     const msg = err instanceof Error ? err.message : String(err);
@@ -602,7 +606,7 @@ export async function runKernelAgent(
     }
     museCalls += 1;
     museMs += performance.now() - tm;
-    if (gap === undefined || pass >= 2) {
+    if (gap === undefined || pass >= 2 || deadlineAt - Date.now() < PASS2_MIN_MS) {
       if (gap !== undefined) {
         countFailure("incomplete_evidence");
         emit({ type: "tool_failed", tool: "muse", category: "incomplete_evidence", preview: gap.slice(0, 160) });
@@ -622,10 +626,10 @@ export async function runKernelAgent(
     // legacy full-prompt call.
     const followBody: Record<string, unknown> =
       typeof res.sessionId === "string" && res.sessionId
-        ? { op: "run", prompt, sessionId: res.sessionId, gap, deadlineMs: timeoutMs }
-        : { op: "run", prompt: `${prompt}\nStill missing: ${gap}`, deadlineMs: timeoutMs };
+        ? { op: "run", prompt, sessionId: res.sessionId, gap, deadlineAt }
+        : { op: "run", prompt: `${prompt}\nStill missing: ${gap}`, deadlineAt };
     try {
-      follow = await router.call(followBody, { signal: opts?.signal, timeoutMs, onProgress: (stage, detail) => emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage }) });
+      follow = await router.call(followBody, { signal: opts?.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1), onProgress: (stage, detail) => emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage }) });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       countFailure("provider_error");

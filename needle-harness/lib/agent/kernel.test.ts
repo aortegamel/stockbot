@@ -390,4 +390,74 @@ describe("runKernelAgent evidence loop", () => {
     expect(finalReason.nodes.length).toBe(2);
     expect(events.map((e) => e.type).at(-1)).toBe("done");
   });
+
+  test("near deadline skips pass 2 with incomplete_evidence", async () => {
+    const written: string[] = [];
+    const spawn: KernelSpawn = (): KernelChild => {
+      const c = new FakeChild();
+      const origWrite = c.stdin.write;
+      c.stdin.write = (data: string, cb?: (err?: Error | null) => void): void => {
+        written.push(data);
+        origWrite.call(c.stdin, data, cb);
+      };
+      c.reply = graphReply;
+      queueMicrotask(() => c.emitStdout('{"type":"ready"}\n'));
+      return c;
+    };
+    const events: Array<{ type: string; category?: string }> = [];
+    await runKernelAgent("q", (e) => void events.push(e as { type: string }), {
+      deadlineAt: Date.now() + 5_000,
+      deps: {
+        python: "py",
+        workerPath: "w",
+        spawnFn: spawn,
+        reason: async (o) => {
+          o.onDelta("text");
+          return { text: "t", usage: {}, missingEvidence: "need doc X" };
+        },
+      },
+    });
+    expect(written.filter((w) => (JSON.parse(w) as Record<string, unknown>).op === "run").length).toBe(1);
+    const types = events.map((e) => e.type);
+    expect(types.at(-2)).toBe("failed");
+    expect(events.find((e) => e.type === "failed")?.category).toBe("incomplete_evidence");
+    expect(types.at(-1)).toBe("done");
+  });
+
+  test("pass-2 bodies carry the shared deadlineAt, never deadlineMs", async () => {
+    const deadlineAt = Date.now() + 600_000;
+    const written: string[] = [];
+    const spawn: KernelSpawn = (): KernelChild => {
+      const c = new FakeChild();
+      const origWrite = c.stdin.write;
+      c.stdin.write = (data: string, cb?: (err?: Error | null) => void): void => {
+        written.push(data);
+        origWrite.call(c.stdin, data, cb);
+      };
+      c.reply = graphReply;
+      queueMicrotask(() => c.emitStdout('{"type":"ready"}\n'));
+      return c;
+    };
+    let writes = 0;
+    await runKernelAgent("q", () => { }, {
+      deadlineAt,
+      deps: {
+        python: "py",
+        workerPath: "w",
+        spawnFn: spawn,
+        reason: async (o) => {
+          writes += 1;
+          o.onDelta("text");
+          return writes === 1 ? { text: "t", usage: {}, missingEvidence: "need doc X" } : { text: "t2", usage: {} };
+        },
+      },
+    });
+    expect(writes).toBe(2);
+    const runs = written.map((w) => JSON.parse(w) as Record<string, unknown>).filter((b) => b.op === "run");
+    expect(runs.length).toBe(2);
+    for (const b of runs) {
+      expect(b.deadlineAt).toBe(deadlineAt);
+      expect("deadlineMs" in b).toBe(false);
+    }
+  });
 });

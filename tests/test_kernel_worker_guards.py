@@ -346,6 +346,34 @@ def test_run_scheduler_deadline_honors_shared_budget(monkeypatch: pytest.MonkeyP
     assert abs(seen["deadline_at"] - (t0 + kw._RUN_WALL_S - kw._FINALIZE_S)) < 5.0
 
 
+def test_run_scheduler_deadline_honors_absolute_deadline_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    """deadlineAt (epoch ms) shrinks the run; bool/str values fall back to _RUN_WALL_S."""
+    import time as _time
+
+    seen: dict[str, object] = {}
+
+    def _fake_graph(prompt: str, as_of: object = None, **k: object) -> str:
+        return "s1"
+
+    async def _fake_sched(sid: str, **hooks: object) -> dict[str, object]:
+        seen["deadline_at"] = hooks.get("deadline_at")
+        return {"status": "complete", "nodes": [], "incomplete_guard": False}
+
+    monkeypatch.setattr(kw, "run_graph_prompt", _fake_graph)
+    monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", lambda sid: None)
+    t0 = _time.perf_counter()
+    kw._run(
+        {"id": "r2", "op": "run", "prompt": "hello?", "deadlineAt": _time.time() * 1000 + 60_000},
+        jev=object(),  # type: ignore[arg-type]
+    )
+    assert isinstance(seen["deadline_at"], float)
+    assert abs(float(seen["deadline_at"]) - (t0 + 60 - kw._FINALIZE_S)) < 5.0
+    for bad in (True, "soon"):
+        kw._run({"id": "r3", "op": "run", "prompt": "hello?", "deadlineAt": bad}, jev=object())  # type: ignore[arg-type]
+        assert abs(float(seen["deadline_at"]) - (t0 + kw._RUN_WALL_S - kw._FINALIZE_S)) < 5.0
+
+
 def test_round2_skipped_for_corrected_query_only(monkeypatch: pytest.MonkeyPatch) -> None:
     """Round 2 runs only for new tickers; a corrected query alone never earns it."""
     import asyncio
