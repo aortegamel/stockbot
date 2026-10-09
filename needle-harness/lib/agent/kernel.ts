@@ -4,8 +4,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { GENERATE_TIMEOUT_MS } from "../needle/client";
 import { reason, type MuseUsage } from "../muse/client";
-import { redactArgs } from "./types";
-import type { AgentEvent, Evidence, FailureCategory, Metrics } from "./types";
+import { FINAL_PERSONAS, redactArgs } from "./types";
+import type { AgentEvent, Evidence, FailureCategory, Metrics, Persona } from "./types";
 
 // ponytail: persistent worker bridge (spawn-once, ready-gated); spawn/exit/stderr handling mirrors lib/needle/client.ts.
 function requiredEnv(name: string): string {
@@ -69,6 +69,9 @@ export type KernelReasonInput = {
   decisions: Record<string, unknown>[];
   unresolved: string[];
   incompleteGuard: boolean;
+  persona: Persona;
+  signal?: AbortSignal;
+  deadlineAt: number;
   onDelta: (text: string) => void;
 };
 
@@ -89,6 +92,7 @@ export type KernelResponse = {
   escalations: number;
   escalated: boolean;
   route?: string;
+  personas?: Persona[] | null;
   tool?: string;
   arguments?: Record<string, unknown>;
   confidence?: number | null;
@@ -416,7 +420,7 @@ function graphProjection(input: {
 export async function runKernelAgent(
   prompt: string,
   emit: (e: AgentEvent) => void,
-  opts?: { signal?: AbortSignal; deadlineAt?: number; deps?: RunKernelDeps; seedEvidence?: Evidence[] },
+  opts?: { signal?: AbortSignal; deadlineAt?: number; deps?: RunKernelDeps; seedEvidence?: Evidence[]; personas?: readonly Persona[] },
 ): Promise<void> {
   const t0 = performance.now();
   const deps = opts?.deps ?? {};
@@ -542,26 +546,14 @@ export async function runKernelAgent(
     return;
   }
 
-  if (evidence.length === 0 && decisions.length === 0 && calls.length === 0 && unresolved.length === 0 && !incompleteGuard) {
-    // ponytail: empty graph never closes silent — answer direct via Muse.
-    emit({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
-    const tm0 = performance.now();
-    try {
-      const r0 = await reasonFn({ prompt, evidence, escalated: false, direct: true, objective, nodes, decisions: persisted, unresolved, incompleteGuard, onDelta: (text) => emit({ type: "answer_delta", text }) });
-      emit({ type: "done", metrics: buildMetrics(0, 0, evidence, workerMs, res.escalations ?? 0, failures, { calls: 1, totalMs: performance.now() - tm0, ...r0.usage }) });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      countFailure("provider_error");
-      emit({ type: "tool_failed", tool: "muse", category: "provider_error", preview: msg.slice(0, 160) });
-      emit({ type: "failed", category: "provider_error", message: msg.slice(0, 160) });
-      emit({ type: "done", metrics: buildMetrics(0, 0, evidence, workerMs, (res.escalations ?? 0) + 1, failures, { calls: 0, totalMs: 0 }) });
-    }
-    return;
-  }
-
-  // Fail-closed evidence loop: a Missing-Evidence line means the graph is
-  // partial — run one follow-up pass with the gap as the objective, merge,
-  // and rewrite. A second gap fails the report instead of shipping partial.
+  // Fail-closed evidence loop: every selected persona reasons concurrently over
+  // one shared snapshot; drafts stay buffered. Any Missing-Evidence line means
+  // the graph is partial — combine the gaps, run one shared follow-up pass,
+  // merge, and regenerate every persona. A second gap or any failed persona
+  // fails the report; labeled prose emits only when all succeed gap-free.
+  const personas = opts?.personas ?? FINAL_PERSONAS;
+  // ponytail: empty graph never closes silent — first pass answers direct.
+  let direct = evidence.length === 0 && decisions.length === 0 && calls.length === 0 && unresolved.length === 0 && !incompleteGuard;
   let pass = 1;
   const mergedEvidence = evidence;
   let mergedNodes = nodes;
@@ -575,49 +567,74 @@ export async function runKernelAgent(
   let totalEscalations = res.escalations ?? 0;
   let museCalls = 0;
   let museMs = 0;
-  let usage: MuseUsage = {};
+  const usage: MuseUsage = {};
   for (; ;) {
     emit({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
     const tm = performance.now();
-    let gap: string | undefined;
-    try {
-      const projection = graphProjection({ objective, nodes: mergedNodes, decisions: mergedDecisions, unresolved: mergedUnresolved, incompleteGuard: mergedGuard, escalated: mergedEscalated });
-      const r = await reasonFn({
-        prompt: `${prompt}\n\n${projection}`,
-        evidence: mergedEvidence,
-        escalated: mergedEscalated,
-        direct: mergedEscalated && mergedEvidence.length === 0,
-        objective,
-        nodes: mergedNodes,
-        decisions: mergedDecisions,
-        unresolved: mergedUnresolved,
-        incompleteGuard: mergedGuard,
-        onDelta: (text) => emit({ type: "answer_delta", text }),
-      });
-      usage = { ...usage, ...r.usage };
-      gap = r.missingEvidence?.trim() || undefined;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+    const input = {
+      prompt: direct ? prompt : `${prompt}\n\n${graphProjection({ objective, nodes: mergedNodes, decisions: mergedDecisions, unresolved: mergedUnresolved, incompleteGuard: mergedGuard, escalated: mergedEscalated })}`,
+      evidence: mergedEvidence,
+      escalated: direct ? false : mergedEscalated,
+      direct: direct || (mergedEscalated && mergedEvidence.length === 0),
+      objective,
+      nodes: mergedNodes,
+      decisions: mergedDecisions,
+      unresolved: mergedUnresolved,
+      incompleteGuard: mergedGuard,
+      deadlineAt,
+      ...(opts?.signal ? { signal: opts.signal } : {}),
+      onDelta: () => { },
+    };
+    museCalls += personas.length;
+    // ponytail: every persona settles before the verdict, so one failure waits out its siblings; abort them early if final-stage latency matters.
+    const results = await Promise.all(
+      personas.map((persona) => reasonFn({ ...input, persona }).then((r) => ({ persona, r }), (err: unknown) => ({ persona, err }))),
+    );
+    museMs += performance.now() - tm;
+    const texts: string[] = [];
+    const gaps: string[] = [];
+    let failure: string | undefined;
+    for (const x of results) {
+      if ("err" in x) {
+        failure ??= `${x.persona}: ${x.err instanceof Error ? x.err.message : String(x.err)}`;
+        continue;
+      }
+      for (const k of ["inputTokens", "outputTokens", "cachedTokens"] as const) {
+        const n = x.r.usage[k];
+        if (typeof n === "number") usage[k] = (usage[k] ?? 0) + n;
+      }
+      const text = x.r.text.trim();
+      // Every selected persona must contribute prose; an empty draft fails the report.
+      if (!text) {
+        failure ??= `${x.persona}: empty response`;
+        continue;
+      }
+      texts.push(`── ${x.persona.charAt(0).toUpperCase()}${x.persona.slice(1)} ──\n${text}`);
+      const g = x.r.missingEvidence?.trim();
+      if (g && !gaps.includes(g)) gaps.push(g);
+    }
+    if (failure !== undefined) {
       countFailure("provider_error");
-      emit({ type: "tool_failed", tool: "muse", category: "provider_error", preview: msg.slice(0, 160) });
-      emit({ type: "failed", category: "provider_error", message: msg.slice(0, 160) });
-      emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations + 1, failures, { calls: museCalls, totalMs: museMs }) });
+      emit({ type: "tool_failed", tool: "muse", category: "provider_error", preview: failure.slice(0, 160) });
+      emit({ type: "failed", category: "provider_error", message: failure.slice(0, 160) });
+      emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations + 1, failures, { calls: museCalls, totalMs: museMs, ...usage }) });
       return;
     }
-    museCalls += 1;
-    museMs += performance.now() - tm;
-    if (gap === undefined || pass >= 2 || deadlineAt - Date.now() < PASS2_MIN_MS) {
-      if (gap !== undefined) {
-        countFailure("incomplete_evidence");
-        emit({ type: "tool_failed", tool: "muse", category: "incomplete_evidence", preview: gap.slice(0, 160) });
-        emit({ type: "failed", category: "incomplete_evidence", message: gap.slice(0, 160) });
-        emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations + 1, failures, { calls: museCalls, totalMs: museMs, ...usage }) });
-        return;
-      }
+    const gap = gaps.length > 0 ? gaps.join("; ") : undefined;
+    if (gap === undefined) {
+      emit({ type: "answer_delta", text: texts.join("\n\n") });
       emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations, failures, { calls: museCalls, totalMs: museMs, ...usage }) });
       return;
     }
+    if (pass >= 2 || deadlineAt - Date.now() < PASS2_MIN_MS) {
+      countFailure("incomplete_evidence");
+      emit({ type: "tool_failed", tool: "muse", category: "incomplete_evidence", preview: gap.slice(0, 160) });
+      emit({ type: "failed", category: "incomplete_evidence", message: gap.slice(0, 160) });
+      emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations + 1, failures, { calls: museCalls, totalMs: museMs, ...usage }) });
+      return;
+    }
     pass += 1;
+    direct = false;
     emit({ type: "progress", stage: "evidence_gap", detail: { missing: gap.slice(0, 300) } });
     const followStart = performance.now();
     let follow: KernelResponse;

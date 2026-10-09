@@ -1,12 +1,20 @@
 import { reason } from "@/lib/muse/client";
-import { kernelRouter, REQUEST_WALL_MS, runKernelAgent } from "@/lib/agent/kernel";
+import { kernelRouter, REQUEST_WALL_MS, runKernelAgent, type KernelResponse } from "@/lib/agent/kernel";
 import { tools } from "@/lib/tools";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
-import { redactArgs, type AgentEvent, type Evidence, type FailureCategory } from "@/lib/agent/types";
+import { FINAL_PERSONAS, redactArgs, type AgentEvent, type Evidence, type FailureCategory, type Persona } from "@/lib/agent/types";
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
   return value;
+}
+// Worker output is untrusted: null means no explicit selection; a list must be
+// nonempty, unique, canonical, and in fixed order. Anything else is undefined (invalid).
+function parsePersonas(v: unknown): Persona[] | null | undefined {
+  if (v === null) return null;
+  if (!Array.isArray(v)) return undefined;
+  const canonical = FINAL_PERSONAS.filter((p) => v.includes(p));
+  return v.length > 0 && v.length === canonical.length && canonical.every((p, i) => v[i] === p) ? canonical : undefined;
 }
 export async function POST(req: Request): Promise<Response> {
   const deadlineAt = Date.now() + REQUEST_WALL_MS;
@@ -159,32 +167,46 @@ export async function POST(req: Request): Promise<Response> {
         // Cap reached with another tool pending — research owns the longer chain.
         return false;
       };
+      // ponytail: JEV-first entry — one route round selects the route and any explicit personas.
+      let routed: KernelResponse | undefined;
+      let routeError = "route_invalid: malformed route selection";
       try {
-        // ponytail: JEV-first entry — one route round; reason/research/tool winners branch here.
-        const routed = await kernelRouter.call({ op: "route", prompt }, { signal: req.signal });
-        const winner = typeof routed.route === "string" ? routed.route : "research_required";
-        if (winner === "no_session") {
-          await answerDirect();
-          controller.close();
-          return;
-        }
-        if (winner === "reasoning_required") {
-          await answerDirect();
-          controller.close();
-          return;
-        }
-        // ponytail: worker output is untrusted — only identifier-shaped names single-shot; anything else researches.
-        if (winner !== "research_required" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(winner)) {
-          if (await answerSingleShot(winner)) {
+        routed = await kernelRouter.call({ op: "route", prompt }, { signal: req.signal });
+        if (typeof routed.error === "string" && routed.error) routeError = routed.error;
+      } catch (err) {
+        routeError = err instanceof Error ? err.message : String(err);
+      }
+      const personas = parsePersonas(routed?.personas);
+      if (!routed || (typeof routed.error === "string" && routed.error) || typeof routed.route !== "string" || personas === undefined) {
+        // Selection is unknown: fail rather than guess personas or a route.
+        send({ type: "agent_start", prompt });
+        send({ type: "failed", category: "provider_error", message: routeError.slice(0, 160) });
+        send({ type: "error", message: routeError });
+        controller.close();
+        return;
+      }
+      // Explicit personas skip direct and single-tool answers: research owns their evidence lifecycle.
+      if (personas === null) {
+        const winner = routed.route;
+        try {
+          if (winner === "no_session" || winner === "reasoning_required") {
+            await answerDirect();
             controller.close();
             return;
           }
+          // ponytail: worker output is untrusted — only identifier-shaped names single-shot; anything else researches.
+          if (winner !== "research_required" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(winner)) {
+            if (await answerSingleShot(winner)) {
+              controller.close();
+              return;
+            }
+          }
+        } catch {
+          // Direct or single-tool answer failed to start — fail open to research below.
         }
-      } catch {
-        // Route unavailable — fail open to research below.
       }
       try {
-        await runKernelAgent(prompt, send, { signal: req.signal, seedEvidence: singleShotEvidence, deadlineAt });
+        await runKernelAgent(prompt, send, { signal: req.signal, seedEvidence: singleShotEvidence, deadlineAt, ...(personas ? { personas } : {}) });
       } catch (err) {
         console.error(`[web] [agent-api] runKernelAgent error: ${err instanceof Error ? err.message : String(err)}`);
         send({ type: "error", message: err instanceof Error ? err.message : String(err) });

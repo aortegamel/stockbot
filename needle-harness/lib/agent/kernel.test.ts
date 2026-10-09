@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { KernelRouter, runKernelAgent, type KernelChild, type KernelSpawn } from "./kernel";
+import { KernelRouter, runKernelAgent, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
+import { FINAL_PERSONAS, type AgentEvent, type Metrics, type Persona } from "./types";
 
 class FakeChild implements KernelChild {
   exitCode: number | null = null;
@@ -227,237 +228,310 @@ describe("KernelRouter", () => {
   });
 });
 
-describe("runKernelAgent evidence loop", () => {
+describe("runKernelAgent final personas", () => {
   const graphReply = (id: string): string =>
     `${JSON.stringify({ id, objective: "q", evidence: [{ id: "ev:1", content: "fact" }], nodes: [{ node_id: "n1", question: "q", status: "blocked", depends_on: [] }], decisions: [], unresolved: ["n1"], incomplete_guard: true, toolExecutions: [], toolCalls: [], failures: {}, escalations: 1, escalated: true })}\n`;
-  const graphSpawn = (): KernelChild => {
-    const c = new FakeChild();
-    c.reply = graphReply;
-    queueMicrotask(() => c.emitStdout('{"type":"ready"}\n'));
-    return c;
-  };
-  test("gap triggers one follow-up pass, clean second write ends done", async () => {
-    process.env.OPENCODE_MODEL = "test-model";
-    const events: Array<{ type: string; stage?: string }> = [];
-    let writes = 0;
-    await runKernelAgent("q", (e) => void events.push(e), {
-      deps: {
-        python: "py",
-        workerPath: "w",
-        spawnFn: graphSpawn,
-        reason: async (o) => {
-          writes += 1;
-          o.onDelta("text");
-          return writes === 1
-            ? { text: "t", usage: {}, missingEvidence: "need doc X" }
-            : { text: "t2", usage: {} };
+  const sessionReply = (pass2: boolean, id: string): string =>
+    `${JSON.stringify(
+      pass2
+        ? {
+          id,
+          objective: "q",
+          sessionId: "s1",
+          evidence: [{ id: "ev:1", content: "fact" }, { id: "ev:2", content: "gap filled" }],
+          nodes: [
+            { node_id: "n1", question: "q", status: "blocked", depends_on: [] },
+            { node_id: "n2", question: "gap", status: "resolved", depends_on: [] },
+          ],
+          decisions: [{ decision_id: "d2" }],
+          unresolved: [],
+          incomplete_guard: false,
+          toolExecutions: [],
+          toolCalls: [],
+          failures: {},
+          escalations: 0,
+          escalated: false,
+        }
+        : {
+          id,
+          objective: "q",
+          sessionId: "s1",
+          evidence: [{ id: "ev:1", content: "fact" }],
+          nodes: [{ node_id: "n1", question: "q", status: "blocked", depends_on: [] }],
+          decisions: [{ decision_id: "d1" }],
+          unresolved: ["n1"],
+          incomplete_guard: true,
+          toolExecutions: [],
+          toolCalls: [],
+          failures: {},
+          escalations: 1,
+          escalated: true,
         },
-      },
-    });
-    const types = events.map((e) => e.type);
-    expect(types.filter((t) => t === "reasoning_start").length).toBe(2);
-    expect(events.some((e) => e.type === "progress" && e.stage === "evidence_gap")).toBe(true);
-    expect(types.at(-1)).toBe("done");
-    expect(writes).toBe(2);
-  });
-
-  test("pass-2 unresolved gates the second write, clean list ends done", async () => {
-    const seen: string[][] = [];
-    const spawn = (): KernelChild => {
+    )}\n`;
+  const emptyReply = (id: string): string =>
+    `${JSON.stringify({ id, objective: "q", evidence: [], nodes: [], decisions: [], unresolved: [], incomplete_guard: false, toolExecutions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false })}\n`;
+  // Records every worker body; reply sees whether this is the second run body.
+  const recordingSpawn = (reply: (pass2: boolean, id: string) => string): { spawn: KernelSpawn; bodies: Record<string, unknown>[] } => {
+    const bodies: Record<string, unknown>[] = [];
+    const spawn: KernelSpawn = (): KernelChild => {
       const c = new FakeChild();
-      let calls = 0;
-      c.reply = (id: string): string => {
-        calls += 1;
-        const unresolved = calls === 1 ? ["n1"] : [];
-        return `${JSON.stringify({ id, objective: "q", evidence: [{ id: "ev:1", content: "fact" }], nodes: [{ node_id: "n1", question: "q", status: "blocked", depends_on: [] }], decisions: [], unresolved, incomplete_guard: unresolved.length > 0, toolExecutions: [], toolCalls: [], failures: {}, escalations: unresolved.length, escalated: unresolved.length > 0 })}\n`;
+      const origWrite = c.stdin.write;
+      c.stdin.write = (data: string, cb?: (err?: Error | null) => void): void => {
+        bodies.push(JSON.parse(data) as Record<string, unknown>);
+        origWrite.call(c.stdin, data, cb);
       };
+      c.reply = (id: string): string => reply(bodies.length > 1, id);
       queueMicrotask(() => c.emitStdout('{"type":"ready"}\n'));
       return c;
     };
-    const events: Array<{ type: string; category?: string }> = [];
-    let writes = 0;
-    await runKernelAgent("q", (e) => void events.push(e as { type: string; category?: string }), {
-      deps: {
-        python: "py",
-        workerPath: "w",
-        spawnFn: spawn,
-        reason: async (o) => {
-          writes += 1;
-          seen.push([...o.unresolved]);
-          o.onDelta("text");
-          return writes === 1 ? { text: "t", usage: {}, missingEvidence: "need doc X" } : { text: "t2", usage: {} };
+    return { spawn, bodies };
+  };
+  type Outcome = { text?: string; missingEvidence?: string; usage?: KernelReasonResult["usage"] } | Error;
+  type Call = { pass: number; input: KernelReasonInput };
+  // Drives runKernelAgent with a scripted reasoner. Stockbot settles last, so
+  // output order never follows completion order; every call emits a draft delta.
+  async function runFinal(opts: {
+    reply?: (pass2: boolean, id: string) => string;
+    decide?: (persona: Persona, pass: number) => Outcome;
+    personas?: readonly Persona[];
+    deadlineAt?: number;
+    signal?: AbortSignal;
+  }): Promise<{ events: AgentEvent[]; calls: Call[]; bodies: Record<string, unknown>[]; maxInFlight: number }> {
+    process.env.OPENCODE_MODEL = "test-model";
+    const { spawn, bodies } = recordingSpawn(opts.reply ?? ((_p, id) => graphReply(id)));
+    const events: AgentEvent[] = [];
+    const calls: Call[] = [];
+    let pass = 0;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    await runKernelAgent(
+      "q",
+      (e) => {
+        if (e.type === "reasoning_start") pass += 1;
+        events.push(e);
+      },
+      {
+        ...(opts.deadlineAt !== undefined ? { deadlineAt: opts.deadlineAt } : {}),
+        ...(opts.personas ? { personas: opts.personas } : {}),
+        ...(opts.signal ? { signal: opts.signal } : {}),
+        deps: {
+          python: "py",
+          workerPath: "w",
+          spawnFn: spawn,
+          reason: async (o) => {
+            calls.push({ pass, input: o });
+            inFlight += 1;
+            maxInFlight = Math.max(maxInFlight, inFlight);
+            o.onDelta(`draft-${o.persona}`);
+            for (let i = FINAL_PERSONAS.indexOf(o.persona); i < FINAL_PERSONAS.length; i++) await Promise.resolve();
+            inFlight -= 1;
+            const d: Outcome = opts.decide?.(o.persona, pass) ?? {};
+            if (d instanceof Error) throw d;
+            return { text: d.text ?? `${o.persona} p${pass}`, usage: d.usage ?? {}, ...(d.missingEvidence ? { missingEvidence: d.missingEvidence } : {}) };
+          },
         },
       },
+    );
+    return { events, calls, bodies, maxInFlight };
+  }
+  const answers = (events: AgentEvent[]): string[] => events.flatMap((e) => (e.type === "answer_delta" ? [e.text] : []));
+  const doneMetrics = (events: AgentEvent[]): Metrics => {
+    const last = events.at(-1);
+    if (last?.type !== "done") throw new Error("expected done last");
+    return last.metrics;
+  };
+  const failedCategory = (events: AgentEvent[]): string | undefined => {
+    const f = events.find((e) => e.type === "failed");
+    return f?.type === "failed" ? f.category : undefined;
+  };
+  const runBodies = (bodies: Record<string, unknown>[]): Record<string, unknown>[] => bodies.filter((b) => b.op === "run");
+  const label = (p: Persona): string => `── ${p.charAt(0).toUpperCase()}${p.slice(1)} ──`;
+
+  test("default trio reasons concurrently on one snapshot and streams only labeled final prose", async () => {
+    const { events, calls, maxInFlight } = await runFinal({});
+    expect(calls.map((c) => c.input.persona)).toEqual([...FINAL_PERSONAS]);
+    expect(maxInFlight).toBe(3);
+    const first = calls[0]?.input;
+    if (!first) throw new Error("expected reasoner calls");
+    for (const c of calls) {
+      expect(c.input.evidence).toBe(first.evidence);
+      expect(c.input.prompt).toBe(first.prompt);
+      expect(c.input.nodes).toBe(first.nodes);
+      expect(c.input.decisions).toBe(first.decisions);
+      expect(c.input.unresolved).toBe(first.unresolved);
+      expect(c.input.incompleteGuard).toBe(true);
+    }
+    expect(first.prompt).toContain("OBJECTIVE");
+    expect(answers(events)).toEqual([`${label("stockbot")}\nstockbot p1\n\n${label("bearbot")}\nbearbot p1\n\n${label("bullbot")}\nbullbot p1`]);
+    expect(events.filter((e) => e.type === "reasoning_start").length).toBe(1);
+    expect(events.some((e) => e.type === "failed")).toBe(false);
+    expect(doneMetrics(events).muse.calls).toBe(3);
+  });
+
+  test("every explicit subset calls only its personas and labels them in fixed order", async () => {
+    for (let mask = 1; mask < 1 << FINAL_PERSONAS.length; mask++) {
+      const subset = FINAL_PERSONAS.filter((_, i) => (mask >> i) & 1);
+      const { events, calls } = await runFinal({ personas: subset });
+      expect(calls.map((c) => c.input.persona)).toEqual(subset);
+      expect(answers(events)).toEqual([subset.map((p) => `${label(p)}\n${p} p1`).join("\n\n")]);
+      expect(doneMetrics(events).muse.calls).toBe(subset.length);
+    }
+  });
+
+  test("any persona gap triggers exactly one shared follow-up with combined, deduplicated gaps", async () => {
+    const gapText: Record<Persona, string> = { stockbot: "doc A", bearbot: "doc A", bullbot: "doc B" };
+    for (let mask = 0; mask < 1 << FINAL_PERSONAS.length; mask++) {
+      const gapping = FINAL_PERSONAS.filter((_, i) => (mask >> i) & 1);
+      const { events, calls, bodies } = await runFinal({
+        decide: (p, pass) => (pass === 1 && gapping.includes(p) ? { missingEvidence: gapText[p] } : {}),
+      });
+      const expected = [...new Set(gapping.map((p) => gapText[p]))].join("; ");
+      const runs = runBodies(bodies);
+      expect(runs.length).toBe(gapping.length > 0 ? 2 : 1);
+      if (gapping.length > 0) expect(runs[1]?.prompt).toBe(`q\nStill missing: ${expected}`);
+      expect(events.filter((e) => e.type === "progress" && e.stage === "evidence_gap").length).toBe(gapping.length > 0 ? 1 : 0);
+      const finalPass = gapping.length > 0 ? 2 : 1;
+      expect(calls.filter((c) => c.pass === finalPass).map((c) => c.input.persona)).toEqual([...FINAL_PERSONAS]);
+      expect(answers(events)).toEqual([FINAL_PERSONAS.map((p) => `${label(p)}\n${p} p${finalPass}`).join("\n\n")]);
+    }
+  });
+
+  test("shared follow-up reuses the session, regenerates the trio on merged evidence, and sums metrics", async () => {
+    const usage = { inputTokens: 10, outputTokens: 2, cachedTokens: 1 };
+    const { events, calls, bodies } = await runFinal({
+      reply: sessionReply,
+      decide: (p, pass) => (pass === 1 && p === "bearbot" ? { missingEvidence: "need doc X", usage } : { usage }),
     });
-    expect(seen).toEqual([["n1"], []]);
-    expect(events.map((e) => e.type).at(-1)).toBe("done");
+    const runs = runBodies(bodies);
+    expect(runs.length).toBe(2);
+    expect(runs[1]?.sessionId).toBe("s1");
+    expect(runs[1]?.gap).toBe("need doc X");
+    const second = calls.filter((c) => c.pass === 2);
+    expect(second.map((c) => c.input.persona)).toEqual([...FINAL_PERSONAS]);
+    for (const c of second) {
+      expect(c.input.evidence.map((e) => e.id)).toEqual(["ev:1", "ev:2"]);
+      expect(c.input.unresolved).toEqual([]);
+      expect(c.input.nodes.length).toBe(2);
+    }
+    expect(answers(events)).toEqual([FINAL_PERSONAS.map((p) => `${label(p)}\n${p} p2`).join("\n\n")]);
+    const m = doneMetrics(events);
+    expect(m.muse.calls).toBe(6);
+    expect(m.muse.inputTokens).toBe(60);
+    expect(m.muse.outputTokens).toBe(12);
+    expect(m.muse.cachedTokens).toBe(6);
+    expect(m.evidence.count).toBe(2);
+  });
+
+  test("pass-2 unresolved list reaches every regenerated persona", async () => {
+    const { calls, events } = await runFinal({
+      reply: (pass2, id) =>
+        `${JSON.stringify({ id, objective: "q", evidence: [{ id: "ev:1", content: "fact" }], nodes: [{ node_id: "n1", question: "q", status: "blocked", depends_on: [] }], decisions: [], unresolved: pass2 ? [] : ["n1"], incomplete_guard: !pass2, toolExecutions: [], toolCalls: [], failures: {}, escalations: pass2 ? 0 : 1, escalated: !pass2 })}\n`,
+      decide: (p, pass) => (pass === 1 && p === "stockbot" ? { missingEvidence: "need doc X" } : {}),
+    });
+    expect(calls.map((c) => [c.pass, c.input.unresolved])).toEqual([
+      [1, ["n1"]],
+      [1, ["n1"]],
+      [1, ["n1"]],
+      [2, []],
+      [2, []],
+      [2, []],
+    ]);
     expect(events.some((e) => e.type === "failed")).toBe(false);
   });
 
-  test("second gap fails the report with incomplete_evidence", async () => {
-    const events: Array<{ type: string; category?: string }> = [];
-    await runKernelAgent("q", (e) => void events.push(e as { type: string }), {
-      deps: {
-        python: "py",
-        workerPath: "w",
-        spawnFn: graphSpawn,
-        reason: async (o) => {
-          o.onDelta("text");
-          return { text: "t", usage: {}, missingEvidence: "still need doc X" };
+  test("a failed persona on either pass fails the report with no prose", async () => {
+    for (const failPass of [1, 2]) {
+      const { events, bodies } = await runFinal({
+        decide: (p, pass) => {
+          if (pass === 1 && failPass === 2 && p === "stockbot") return { missingEvidence: "need doc X" };
+          return pass === failPass && p === "bearbot" ? new Error("muse down") : {};
         },
-      },
-    });
-    const types = events.map((e) => e.type);
-    expect(types.filter((t) => t === "reasoning_start").length).toBe(2);
-    expect(types).toContain("failed");
-    expect(events.find((e) => e.type === "failed")?.category).toBe("incomplete_evidence");
-    expect(types.at(-1)).toBe("done");
+      });
+      expect(answers(events)).toEqual([]);
+      expect(failedCategory(events)).toBe("provider_error");
+      const failed = events.find((e) => e.type === "failed");
+      expect(failed?.type === "failed" ? failed.message : "").toBe("bearbot: muse down");
+      expect(runBodies(bodies).length).toBe(failPass);
+      const m = doneMetrics(events);
+      expect(m.muse.calls).toBe(3 * failPass);
+      expect(m.failures.provider_error).toBe(1);
+    }
   });
 
-  test("pass 2 reuses the pass-1 session and replaces full lists", async () => {
-    const events: Array<{ type: string }> = [];
-    const seenReasons: Array<Record<string, unknown>> = [];
-    const written: string[] = [];
-    const spawn: KernelSpawn = (): KernelChild => {
-      const c = new FakeChild();
-      const origWrite = c.stdin.write;
-      c.stdin.write = (data: string, cb?: (err?: Error | null) => void): void => {
-        written.push(data);
-        origWrite.call(c.stdin, data, cb);
-      };
-      c.reply = (id: string): string => {
-        const pass2 = written.length > 1;
-        return `${JSON.stringify(
-          pass2
-            ? {
-              id,
-              objective: "q",
-              sessionId: "s1",
-              evidence: [{ id: "ev:1", content: "fact" }, { id: "ev:2", content: "gap filled" }],
-              nodes: [
-                { node_id: "n1", question: "q", status: "blocked", depends_on: [] },
-                { node_id: "n2", question: "gap", status: "resolved", depends_on: [] },
-              ],
-              decisions: [{ decision_id: "d2" }],
-              unresolved: [],
-              incomplete_guard: false,
-              toolExecutions: [],
-              toolCalls: [],
-              failures: {},
-              escalations: 0,
-              escalated: false,
-            }
-            : {
-              id,
-              objective: "q",
-              sessionId: "s1",
-              evidence: [{ id: "ev:1", content: "fact" }],
-              nodes: [{ node_id: "n1", question: "q", status: "blocked", depends_on: [] }],
-              decisions: [{ decision_id: "d1" }],
-              unresolved: ["n1"],
-              incomplete_guard: true,
-              toolExecutions: [],
-              toolCalls: [],
-              failures: {},
-              escalations: 1,
-              escalated: true,
-            },
-        )}\n`;
-      };
-      queueMicrotask(() => c.emitStdout('{"type":"ready"}\n'));
-      return c;
-    };
-    let writes = 0;
-    await runKernelAgent("q", (e) => void events.push(e as { type: string }), {
-      deps: {
-        python: "py",
-        workerPath: "w",
-        spawnFn: spawn,
-        reason: async (o) => {
-          writes += 1;
-          seenReasons.push({ unresolved: o.unresolved, nodes: o.nodes });
-          o.onDelta("text");
-          return writes === 1 ? { text: "t", usage: {}, missingEvidence: "need doc X" } : { text: "t2", usage: {} };
-        },
-      },
-    });
-    expect(written.length).toBe(2);
-    const second = JSON.parse(written[1] ?? "{}") as Record<string, unknown>;
-    expect(second.sessionId).toBe("s1");
-    expect(second.gap).toBe("need doc X");
-    const finalReason = seenReasons[1] as { unresolved: string[]; nodes: unknown[] };
-    expect(finalReason.unresolved).toEqual([]);
-    expect(finalReason.nodes.length).toBe(2);
-    expect(events.map((e) => e.type).at(-1)).toBe("done");
+  test("an empty or whitespace persona draft fails the report with no prose, usage kept", async () => {
+    const usage = { inputTokens: 5, outputTokens: 1 };
+    for (const blank of ["", "  \n\t "]) {
+      const { events, bodies } = await runFinal({
+        personas: ["stockbot", "bearbot"],
+        decide: (p) => (p === "bearbot" ? { text: blank, usage } : { usage }),
+      });
+      expect(answers(events)).toEqual([]);
+      expect(failedCategory(events)).toBe("provider_error");
+      const failed = events.find((e) => e.type === "failed");
+      expect(failed?.type === "failed" ? failed.message : "").toBe("bearbot: empty response");
+      expect(runBodies(bodies).length).toBe(1);
+      const m = doneMetrics(events);
+      expect(m.muse.calls).toBe(2);
+      expect(m.muse.inputTokens).toBe(10);
+      expect(m.muse.outputTokens).toBe(2);
+      expect(m.failures.provider_error).toBe(1);
+    }
   });
 
-  test("near deadline skips pass 2 with incomplete_evidence", async () => {
-    const written: string[] = [];
-    const spawn: KernelSpawn = (): KernelChild => {
-      const c = new FakeChild();
-      const origWrite = c.stdin.write;
-      c.stdin.write = (data: string, cb?: (err?: Error | null) => void): void => {
-        written.push(data);
-        origWrite.call(c.stdin, data, cb);
-      };
-      c.reply = graphReply;
-      queueMicrotask(() => c.emitStdout('{"type":"ready"}\n'));
-      return c;
-    };
-    const events: Array<{ type: string; category?: string }> = [];
-    await runKernelAgent("q", (e) => void events.push(e as { type: string }), {
+  test("an unresolved second gap fails with incomplete_evidence and no prose", async () => {
+    const { events, calls, bodies } = await runFinal({
+      decide: (p) => (p === "bullbot" ? { missingEvidence: "still need doc X" } : {}),
+    });
+    expect(answers(events)).toEqual([]);
+    expect(events.filter((e) => e.type === "reasoning_start").length).toBe(2);
+    expect(calls.length).toBe(6);
+    expect(runBodies(bodies).length).toBe(2);
+    expect(failedCategory(events)).toBe("incomplete_evidence");
+    expect(doneMetrics(events).muse.calls).toBe(6);
+  });
+
+  test("near deadline skips the follow-up and fails with incomplete_evidence", async () => {
+    const { events, bodies } = await runFinal({
       deadlineAt: Date.now() + 5_000,
-      deps: {
-        python: "py",
-        workerPath: "w",
-        spawnFn: spawn,
-        reason: async (o) => {
-          o.onDelta("text");
-          return { text: "t", usage: {}, missingEvidence: "need doc X" };
-        },
-      },
+      decide: (p) => (p === "bearbot" ? { missingEvidence: "need doc X" } : {}),
     });
-    expect(written.filter((w) => (JSON.parse(w) as Record<string, unknown>).op === "run").length).toBe(1);
-    const types = events.map((e) => e.type);
-    expect(types.at(-2)).toBe("failed");
-    expect(events.find((e) => e.type === "failed")?.category).toBe("incomplete_evidence");
-    expect(types.at(-1)).toBe("done");
+    expect(runBodies(bodies).length).toBe(1);
+    expect(answers(events)).toEqual([]);
+    expect(events.at(-2)?.type).toBe("failed");
+    expect(failedCategory(events)).toBe("incomplete_evidence");
   });
 
-  test("pass-2 bodies carry the shared deadlineAt, never deadlineMs", async () => {
+  test("every persona call and pass-2 body carries the shared deadlineAt and request signal", async () => {
     const deadlineAt = Date.now() + 600_000;
-    const written: string[] = [];
-    const spawn: KernelSpawn = (): KernelChild => {
-      const c = new FakeChild();
-      const origWrite = c.stdin.write;
-      c.stdin.write = (data: string, cb?: (err?: Error | null) => void): void => {
-        written.push(data);
-        origWrite.call(c.stdin, data, cb);
-      };
-      c.reply = graphReply;
-      queueMicrotask(() => c.emitStdout('{"type":"ready"}\n'));
-      return c;
-    };
-    let writes = 0;
-    await runKernelAgent("q", () => { }, {
+    const signal = new AbortController().signal;
+    const { calls, bodies } = await runFinal({
       deadlineAt,
-      deps: {
-        python: "py",
-        workerPath: "w",
-        spawnFn: spawn,
-        reason: async (o) => {
-          writes += 1;
-          o.onDelta("text");
-          return writes === 1 ? { text: "t", usage: {}, missingEvidence: "need doc X" } : { text: "t2", usage: {} };
-        },
-      },
+      signal,
+      decide: (p, pass) => (pass === 1 && p === "bullbot" ? { missingEvidence: "need doc X" } : {}),
     });
-    expect(writes).toBe(2);
-    const runs = written.map((w) => JSON.parse(w) as Record<string, unknown>).filter((b) => b.op === "run");
+    expect(calls.length).toBe(6);
+    for (const c of calls) {
+      expect(c.input.deadlineAt).toBe(deadlineAt);
+      expect(c.input.signal).toBe(signal);
+    }
+    const runs = runBodies(bodies);
     expect(runs.length).toBe(2);
     for (const b of runs) {
       expect(b.deadlineAt).toBe(deadlineAt);
       expect("deadlineMs" in b).toBe(false);
     }
+  });
+
+  test("empty graph answers direct through every selected persona", async () => {
+    const { events, calls } = await runFinal({ reply: (_p, id) => emptyReply(id), personas: ["stockbot", "bullbot"] });
+    expect(calls.map((c) => c.input.persona)).toEqual(["stockbot", "bullbot"]);
+    for (const c of calls) {
+      expect(c.input.direct).toBe(true);
+      expect(c.input.escalated).toBe(false);
+      expect(c.input.prompt).toBe("q");
+      expect(c.input.evidence).toEqual([]);
+    }
+    expect(answers(events)).toEqual([`${label("stockbot")}\nstockbot p1\n\n${label("bullbot")}\nbullbot p1`]);
+    expect(doneMetrics(events).muse.calls).toBe(2);
   });
 });

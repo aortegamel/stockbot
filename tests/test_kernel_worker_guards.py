@@ -5,11 +5,19 @@ simulated by passing a failing ``jev`` directly. If further injection params
 land, extend — do not replace — these tests.
 """
 
+import asyncio
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import cast
 from unittest import mock
 
 import pytest
+from hypothesis import assume, given, settings
+from hypothesis import strategies as st
 
+from app.decision_client import _PERSONA_OPTIONS, JevClient
 from app.research import kernel_worker as kw
+from app.research.models import JSONValue
 
 
 def test_registry_failure_raises_not_empty() -> None:
@@ -84,36 +92,54 @@ def test_graph_prompt_registry_failure_is_terminal() -> None:
 
 
 class _JevRoute:
-    def __init__(self, choice: str | None = None, fail: bool = False) -> None:
+    def __init__(self, choice: str | None = None, personas: list[str] | None = None, fail: bool = False) -> None:
         self.choice = choice
+        self.personas = personas
         self.fail = fail
-        self.seen: list[object] = []
+        self.seen: list[tuple[str, str | None]] = []
 
-    async def route_entry(self, prompt: str, registry: object | None = None) -> str:
+    async def route_entry(
+        self, prompt: str, registry: object | None = None, route_hint: str | None = None
+    ) -> dict[str, object]:
         if self.fail:
             raise RuntimeError("jev down")
-        self.seen.append((prompt, registry))
-        return self.choice or "research_required"
+        self.seen.append((prompt, route_hint))
+        return {"route": route_hint or self.choice or "research_required", "personas": self.personas}
+
+
+@pytest.mark.parametrize("rid", [None, 7, False, [], {}])
+def test_route_invalid_request_id_uses_protocol_placeholder(rid: JSONValue) -> None:
+    out = kw._route({"id": rid, "prompt": "hello"}, jev=cast(JevClient, _JevRoute("reasoning_required")))
+    assert out == {"id": "?", "route": "reasoning_required", "personas": None}
 
 
 def test_route_reasoning_choice_returns_fast_path() -> None:
     out = kw._route({"id": "r1", "op": "route", "prompt": "hello"}, jev=_JevRoute("reasoning_required"))  # type: ignore[arg-type]
-    assert out == {"id": "r1", "route": "reasoning_required"}
+    assert out == {"id": "r1", "route": "reasoning_required", "personas": None}
 
 
-def test_route_outage_fails_open_to_research() -> None:
+def test_route_selector_outage_is_error_not_assumed_personas() -> None:
     out = kw._route({"id": "r1", "op": "route", "prompt": "hello"}, jev=_JevRoute(fail=True))  # type: ignore[arg-type]
-    assert out == {"id": "r1", "route": "research_required"}
+    assert out == {"id": "r1", "error": "jev down"}
 
 
 def test_route_blank_prompt_needs_no_jev() -> None:
-    out = kw._route({"id": "r1", "op": "route", "prompt": "  "}, jev=_JevRoute("reasoning_required"))  # type: ignore[arg-type]
-    assert out == {"id": "r1", "route": "research_required"}
+    jev = _JevRoute("reasoning_required")
+    out = kw._route({"id": "r1", "op": "route", "prompt": "  "}, jev=jev)  # type: ignore[arg-type]
+    assert out == {"id": "r1", "route": "research_required", "personas": None}
+    assert jev.seen == []
 
 
 def test_route_tool_winner_returns_exact_tool() -> None:
     out = kw._route({"id": "r1", "op": "route", "prompt": "what time is it?"}, jev=_JevRoute("get_current_time"))  # type: ignore[arg-type]
-    assert out == {"id": "r1", "route": "get_current_time"}
+    assert out == {"id": "r1", "route": "get_current_time", "personas": None}
+
+
+def test_route_fast_path_keeps_programmatic_route_and_jev_personas() -> None:
+    jev = _JevRoute("research_required", personas=["bearbot"])
+    out = kw._route({"id": "r1", "op": "route", "prompt": "what time is it?"}, jev=jev)  # type: ignore[arg-type]
+    assert out == {"id": "r1", "route": "get_current_time", "personas": ["bearbot"]}
+    assert [hint for _, hint in jev.seen] == ["get_current_time"]
 
 
 class _FailGenerate:
@@ -147,15 +173,15 @@ def test_arguments_uses_shared_needle_and_schema_fallback(monkeypatch: pytest.Mo
 
 
 def test_kernel_worker_stamps_route_assess_and_node() -> None:
-    # Clock asks short-circuit in programmatic_route, so JEV never sees them;
-    # the stamp check uses an unroutable prompt that still reaches JEV.
-    jev = _JevRoute("get_current_time")
+    # Clock asks short-circuit in programmatic_route; JEV only selects personas for them.
+    jev = _JevRoute("research_required")
     out = kw._route({"id": "r1", "op": "route", "prompt": "what time is it?"}, jev=jev)  # type: ignore[arg-type]
-    assert out == {"id": "r1", "route": "get_current_time"}
-    assert jev.seen == []
+    assert out == {"id": "r1", "route": "get_current_time", "personas": None}
+    assert jev.seen[0][1] == "get_current_time"
     jev2 = _JevRoute("research_required")
     out2 = kw._route({"id": "r2", "op": "route", "prompt": "halp money stuff?"}, jev=jev2)  # type: ignore[arg-type]
-    assert out2 == {"id": "r2", "route": "research_required"}
+    assert out2 == {"id": "r2", "route": "research_required", "personas": None}
+    assert jev2.seen[0][1] is None
     assert isinstance(jev2.seen[0][0], str) and jev2.seen[0][0].startswith("[Today UTC ")
     assess = _JevAssess("node_resolved")
     kw._assess_entry({"id": "s1", "prompt": "risk?", "tool": "t", "result": {}}, jev=assess)  # type: ignore[arg-type]
@@ -275,46 +301,180 @@ def test_assess_entry_outage_and_blank_fail_open_to_research() -> None:
     assert out == {"id": "s3", "verdict": "research_required"}
 
 
-def test_entry_prompts_carry_temporal_decoding() -> None:
-    import asyncio
-
-    from app.decision_client import JevClient
-
-    seen: dict[str, object] = {}
+def _choice_stub(picks: dict[str, str], seen: dict[str, object]) -> Callable[[object, object], Awaitable[object]]:
+    """Transport stub: answers every choice question with picks[qid] (else its first option)."""
 
     async def _stub(state: object, questions: object) -> object:
         seen["questions"] = questions
         assert isinstance(questions, dict)
-        qid = next(iter(questions))
-        opts = questions[qid]["criteria"] if isinstance(questions[qid], dict) else {}
-        assert isinstance(opts, dict)
-        winner = "reasoning_required" if "reasoning_required" in opts else next(iter(opts))
-        return {
-            "answers": {
-                qid: {
-                    "type": "choice",
-                    "choice": winner,
-                    "probabilities": dict.fromkeys(opts, 0.0) | {winner: 1.0},
-                    "confidence": 1.0,
-                }
-            }
-        }
+        answers: dict[str, object] = {}
+        for qid, q in questions.items():
+            opts = q["criteria"]
+            pick = picks.get(qid) or next(iter(opts))
+            probs: dict[str, float] = dict.fromkeys(opts, 0.0)
+            if pick in opts:
+                probs[pick] = 1.0
+            answers[qid] = {"type": "choice", "choice": pick, "probabilities": probs, "confidence": 1.0}
+        return {"answers": answers}
 
-    client = JevClient(transport=_stub, data_root=__import__("pathlib").Path("/tmp"))
-    client._persist = lambda **kwargs: None  # type: ignore[method-assign]
-    out = asyncio.run(client.route_entry("hello"))
-    assert out == "reasoning_required"
-    entry_q = seen["questions"]
-    assert isinstance(entry_q, dict)
-    entry_text = str(next(iter(entry_q.values()))["instructions"])
-    assert "Today UTC is" in entry_text and "decode relative dates before choosing" in entry_text
-    seen.clear()
-    verdict = asyncio.run(client.assess_entry_tool("risk?", "search_sec_filings", {}, {"ok": True}))
-    assert verdict in ("reasoning_required", "research_required", "node_resolved") or isinstance(verdict, str)
-    assess_q = seen["questions"]
-    assert isinstance(assess_q, dict)
-    assess_text = str(next(iter(assess_q.values()))["instructions"])
-    assert "Today UTC is" in assess_text and "decode relative dates before choosing" in assess_text
+    return _stub
+
+
+_ROUTE_REG: list[dict[str, JSONValue]] = [{"name": "get_current_time", "description": "Current time."}]
+
+
+def _route_entry(
+    prompt: str, picks: dict[str, str], route_hint: str | None = None
+) -> tuple[dict[str, JSONValue], dict[str, object]]:
+    seen: dict[str, object] = {}
+    client = JevClient(transport=_choice_stub(picks, seen), data_root=Path("/tmp"))
+    return asyncio.run(client.route_entry(prompt, _ROUTE_REG, route_hint=route_hint)), seen
+
+
+@pytest.mark.parametrize("prompt", [None, 7, "", " \t\n"])
+def test_route_entry_rejects_invalid_prompt(prompt: JSONValue) -> None:
+    with pytest.raises(ValueError, match="blank prompt"):
+        _route_entry(cast(str, prompt), {"entry": "research_required"})
+
+
+@pytest.mark.parametrize("hint", ["", " \t\n"])
+def test_route_entry_rejects_blank_hint(hint: str) -> None:
+    with pytest.raises(ValueError, match="blank route_hint"):
+        _route_entry("NVDA?", {"personas": "bearbot"}, route_hint=hint)
+
+
+@pytest.mark.parametrize(
+    ("registry", "error"),
+    [
+        ([{}], "registry entry needs a name"),
+        ([{"name": ""}], "registry entry needs a name"),
+        ([{"name": 7}], "registry entry needs a name"),
+        ([{"name": "research_required"}], "duplicate tool"),
+        (_ROUTE_REG * 2, "duplicate tool"),
+    ],
+)
+def test_route_entry_rejects_defective_registry(registry: list[dict[str, JSONValue]], error: str) -> None:
+    client = JevClient(transport=_choice_stub({"entry": "research_required"}, {}), data_root=Path("/tmp"))
+    with pytest.raises(ValueError, match=error):
+        asyncio.run(client.route_entry("NVDA?", registry))
+
+
+def test_route_entry_rejects_empty_installed_registry() -> None:
+    client = JevClient(transport=_choice_stub({"entry": "research_required"}, {}), data_root=Path("/tmp"))
+    with (
+        mock.patch("app.decision_client._auto_registry", return_value=[]),
+        pytest.raises(ValueError, match="empty registry"),
+    ):
+        asyncio.run(client.route_entry("NVDA?"))
+
+
+@pytest.mark.parametrize("mode", ["catalog", "full", "whole", "direct"])
+def test_route_catalog_modes_use_selector_instead_of_programmatic_hint(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    monkeypatch.setenv("STOCKBOT_TOOLFLOW", mode)
+    client = JevClient(
+        transport=_choice_stub({"entry": "reasoning_required", "personas": "bearbot"}, {}), data_root=Path("/tmp")
+    )
+    monkeypatch.setattr("app.decision_client._auto_registry", lambda: _ROUTE_REG)
+    monkeypatch.setattr(kw, "_shared_jev", lambda: client)
+    out = kw._route({"id": "catalog-request", "prompt": "what time is it?"})
+    assert out == {"id": "catalog-request", "route": "reasoning_required", "personas": ["bearbot"]}
+
+
+@pytest.mark.parametrize(("message", "error"), [("", "route selection failed"), ("x" * 501, "x" * 500)])
+def test_route_selector_error_is_nonempty_and_bounded(message: str, error: str) -> None:
+    async def _down(state: object, questions: object) -> object:
+        raise RuntimeError(message)
+
+    client = JevClient(transport=_down, data_root=Path("/tmp"))
+    assert kw._route({"id": "failed-request", "prompt": "NVDA?"}, jev=client) == {
+        "id": "failed-request",
+        "error": error,
+    }
+
+
+def test_route_entry_defaults_to_no_explicit_personas() -> None:
+    out, _ = _route_entry("Build the NVDA thesis", {"entry": "research_required"})
+    assert out == {"route": "research_required", "personas": None}
+
+
+def test_route_entry_explicit_subset_is_canonical() -> None:
+    out, _ = _route_entry("Stockbot and Bullbot: NVDA?", {"entry": "research_required", "personas": "stockbot_bullbot"})
+    assert out == {"route": "research_required", "personas": ["stockbot", "bullbot"]}
+
+
+@pytest.mark.parametrize("pick", ["bullbot_stockbot", "stockbot_stockbot", "all"])
+def test_route_entry_rejects_malformed_persona_choice(pick: str) -> None:
+    with pytest.raises(ValueError, match="malformed_typesafe_answer for personas"):
+        _route_entry("NVDA?", {"entry": "research_required", "personas": pick})
+
+
+def test_route_entry_no_personas_remaining_raises() -> None:
+    with pytest.raises(ValueError, match="no personas remain"):
+        _route_entry("NVDA?", {"entry": "research_required", "personas": "no_personas_remaining"})
+
+
+@settings(max_examples=50, derandomize=True)
+@given(st.text(max_size=40))
+def test_route_entry_rejects_arbitrary_invalid_persona_label(label: str) -> None:
+    assume(label)
+    assume(label not in _PERSONA_OPTIONS)
+    with pytest.raises(ValueError, match="malformed_typesafe_answer for personas"):
+        _route_entry("NVDA?", {"entry": "research_required", "personas": label})
+
+
+@pytest.mark.parametrize(
+    "decisions",
+    [
+        {"entry": {"choice": "research_required"}, "personas": {"choice": "everyone"}},
+        {"entry": {"choice": "research_required"}},
+    ],
+)
+def test_route_entry_rejects_sidecar_persona_outside_options(
+    monkeypatch: pytest.MonkeyPatch, decisions: dict[str, JSONValue]
+) -> None:
+    client = JevClient(data_root=Path("/tmp"))
+
+    def _sidecar(payload: dict[str, JSONValue]) -> dict[str, JSONValue]:
+        return {"id": payload["id"], "decisions": decisions, "raw": {}}
+
+    monkeypatch.setattr(client, "_sidecar_roundtrip", _sidecar)
+    with pytest.raises(ValueError, match="persona choice"):
+        asyncio.run(client.route_entry("NVDA?", _ROUTE_REG))
+
+
+@pytest.mark.parametrize("entry", [None, {}, {"choice": "unknown_tool"}, {"choice": []}])
+def test_route_entry_rejects_missing_or_invalid_sidecar_route(
+    monkeypatch: pytest.MonkeyPatch, entry: JSONValue
+) -> None:
+    client = JevClient(data_root=Path("/tmp"))
+    decisions: dict[str, JSONValue] = {"personas": {"choice": "bearbot"}}
+    if entry is not None:
+        decisions["entry"] = entry
+
+    def _sidecar(payload: dict[str, JSONValue]) -> dict[str, JSONValue]:
+        return {"id": payload["id"], "decisions": decisions, "raw": {}}
+
+    monkeypatch.setattr(client, "_sidecar_roundtrip", _sidecar)
+    with pytest.raises(ValueError, match="winner .* not in options"):
+        asyncio.run(client.route_entry("NVDA?", _ROUTE_REG))
+
+
+def test_route_entry_hint_keeps_route_and_asks_only_personas() -> None:
+    out, seen = _route_entry("what time is it?", {"personas": "bearbot_bullbot"}, route_hint="get_current_time")
+    assert out == {"route": "get_current_time", "personas": ["bearbot", "bullbot"]}
+    questions = seen["questions"]
+    assert isinstance(questions, dict) and list(questions) == ["personas"]
+
+
+def test_route_entry_selector_unavailable_raises() -> None:
+    async def _down(state: object, questions: object) -> object:
+        raise RuntimeError("jev down")
+
+    client = JevClient(transport=_down, data_root=Path("/tmp"))
+    with pytest.raises(RuntimeError, match="jev down"):
+        asyncio.run(client.route_entry("NVDA?", _ROUTE_REG))
 
 
 def test_run_scheduler_deadline_honors_shared_budget(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
-import type { Evidence } from "@/lib/agent/types";
+import { FINAL_PERSONAS, type Evidence } from "@/lib/agent/types";
 
 // Mutable stubs reconfigured per test; route.ts is imported dynamically after
 // mock.module setup because static imports would bind the real kernel/muse
@@ -9,6 +9,9 @@ let routeDown = false;
 let argsDown = false;
 let reasonDown = false;
 let verdicts: string[] = ["node_resolved"];
+let personas: unknown = null;
+// Replaces the whole op:route reply when set (selector errors, malformed shapes).
+let routeReply: Record<string, unknown> | null = null;
 const runCalls: unknown[][] = [];
 type ReasonCall = { prompt: string; evidence: Evidence[]; onDelta?: (t: string) => void };
 const reasonCalls: ReasonCall[] = [];
@@ -32,7 +35,7 @@ mock.module("@/lib/agent/kernel", () => ({
         const verdict = verdicts.length > 1 ? verdicts.shift()! : verdicts[0];
         return { verdict };
       }
-      return { route: winner };
+      return routeReply ?? { route: winner, personas };
     },
   },
   runKernelAgent: async (...args: unknown[]) => {
@@ -71,6 +74,8 @@ function reset(): void {
   reasonDown = false;
   emitProgress = false;
   verdicts = ["node_resolved"];
+  personas = null;
+  routeReply = null;
   runCalls.length = 0;
   reasonCalls.length = 0;
   kernelCalls.length = 0;
@@ -219,11 +224,72 @@ describe("agent entry route", () => {
     expect(reasonCalls.length).toBe(0);
   });
 
-  test("route outage fails open to research", async () => {
+  test("route outage fails without research or an answer", async () => {
     reset();
     routeDown = true;
-    await eventsFor("hello");
+    const events = await eventsFor("hello");
+    expect(events.map((e) => e.type)).toEqual(["agent_start", "failed", "error"]);
+    expect(runCalls.length).toBe(0);
+    expect(reasonCalls.length).toBe(0);
+  });
+
+  test("selector error reply fails without guessing personas", async () => {
+    reset();
+    routeReply = { error: "persona selector failed" };
+    const events = await eventsFor("Bearbot and Stockbot on NVDA");
+    expect(events.map((e) => e.type)).toEqual(["agent_start", "failed", "error"]);
+    expect(String(events.find((e) => e.type === "failed")?.message)).toBe("persona selector failed");
+    expect(runCalls.length).toBe(0);
+    expect(reasonCalls.length).toBe(0);
+  });
+
+  test("malformed route or persona selection fails rather than defaulting", async () => {
+    const bad: Record<string, unknown>[] = [
+      { route: "research_required" },
+      { personas: null },
+      { route: 7, personas: null },
+      { route: "research_required", personas: [] },
+      { route: "research_required", personas: ["stockbot", "stockbot"] },
+      { route: "research_required", personas: ["bullbot", "stockbot"] },
+      { route: "research_required", personas: ["Stockbot"] },
+      { route: "research_required", personas: ["stockbot", "chartbot"] },
+      { route: "research_required", personas: "stockbot" },
+      { route: "reasoning_required", personas: [1] },
+    ];
+    for (const reply of bad) {
+      reset();
+      routeReply = reply;
+      const events = await eventsFor("hello");
+      expect(events.map((e) => e.type)).toEqual(["agent_start", "failed", "error"]);
+      expect(runCalls.length).toBe(0);
+      expect(reasonCalls.length).toBe(0);
+      expect(kernelCalls.filter((c) => c.op === "arguments").length).toBe(0);
+    }
+  });
+
+  test("every explicit persona subset enters research with that selection", async () => {
+    for (let mask = 1; mask < 1 << FINAL_PERSONAS.length; mask++) {
+      const subset = FINAL_PERSONAS.filter((_, i) => (mask >> i) & 1);
+      for (const route of ["reasoning_required", "no_session", "get_current_time", "research_required"]) {
+        reset();
+        winner = route;
+        personas = subset;
+        await eventsFor("Bearbot and Stockbot views on NVDA");
+        expect(runCalls.length).toBe(1);
+        expect((runCalls[0]?.[2] as { personas?: unknown }).personas).toEqual(subset);
+        expect(reasonCalls.length).toBe(0);
+        expect(kernelCalls.filter((c) => c.op === "arguments").length).toBe(0);
+        expect(invoked.length).toBe(0);
+      }
+    }
+  });
+
+  test("no explicit selection researches with the default personas", async () => {
+    reset();
+    winner = "research_required";
+    await eventsFor("What drove NVDA revenue?");
     expect(runCalls.length).toBe(1);
+    expect("personas" in (runCalls[0]?.[2] as object)).toBe(false);
   });
 
   test("direct-answer failure ends the stream with a terminal event", async () => {

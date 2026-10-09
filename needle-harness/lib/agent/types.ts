@@ -62,6 +62,10 @@ export type Evidence = {
   sourceRefs?: Record<string, unknown>;
 };
 
+// Final-answer personas in fixed output order; each runs as its own Muse call.
+export const FINAL_PERSONAS = ["stockbot", "bearbot", "bullbot"] as const;
+export type Persona = (typeof FINAL_PERSONAS)[number];
+
 export type ToolResult = { ok: true; evidence: Evidence } | { ok: false; error: string; category: FailureCategory; retryable: boolean };
 
 export type Tool = {

@@ -19,6 +19,29 @@ Progress lines (`session`, `intake_start`, `intake_done`, `reasoner_*`,
 `tool_start`, `tool_done`) stream as `progress` events; prod forwards a
 stripped `working` stage to keep the UI stall watchdog fed.
 
+Entry and final personas: `route.ts` first sends one `op:route` call. JEV
+returns `{route, personas}`. `personas: null` means the request neither
+selected nor excluded any persona. An explicit list is nonempty, unique, and
+canonical, in the fixed order Stockbot, Bearbot, Bullbot. Positive selections
+drop any excluded personas; exclusion-only requests use the remaining
+personas. A route outage, a selector error, a malformed selection, or no
+remaining persona (`no_personas_remaining`) fails the request with `failed` +
+`error`. The route never guesses a default. Without a selection, direct and
+single-tool answers stay single-call Stockbot, and research uses all three
+personas. An explicit selection always enters research, so the final layer
+owns the evidence lifecycle. In research, every selected persona runs as its
+own concurrent Muse call over the same graph projection, evidence, decisions,
+unresolved items, and authority limits. An empty graph keeps the direct no-evidence
+prompt. Drafts stay buffered and never stream. If any persona reports
+`Missing-Evidence`, the kernel combines the unique gaps into one shared
+follow-up pass in the same session. Then it regenerates every selected
+persona. A failed persona, an empty or whitespace-only persona response, a
+second gap, or too little time before the request deadline fails the report
+with no prose. Only when every selected persona returns prose without a gap
+does one `answer_delta` emit the labeled sections (`── Stockbot ──`, …) in
+fixed order. Metrics count every attempted persona call, sum token usage over
+calls and passes, and report final-stage wall time.
+
 Architecture: the kernel scheduler owns the agent loop (JEV selects over
 the whole registry every round, Needle fills arguments only, tools execute
 via `app/tool_runtime.py` against canonical `app/tools.py`). Thesis

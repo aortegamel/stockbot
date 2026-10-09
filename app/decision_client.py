@@ -27,6 +27,7 @@ import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from itertools import combinations
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -69,6 +70,19 @@ _SENTINEL_DESCRIPTIONS = {
 _ENTRY_OPTIONS = {
     REASON_SENTINEL: "Answerable by reasoning/explanation from user-supplied context without new external evidence.",
     "research_required": "Needs current/external facts, evidence retrieval, source verification, or tool execution.",
+}
+# Persona choice labels mirror needle-harness FINAL_PERSONAS order.
+# JEV picks no_explicit_selection, no_personas_remaining, or one nonempty canonical subset, such as "stockbot_bearbot".
+_FINAL_PERSONAS = ("stockbot", "bearbot", "bullbot")
+_NO_PERSONA_SELECTION = "no_explicit_selection"
+_NO_PERSONAS_REMAINING = "no_personas_remaining"
+_PERSONA_OPTIONS = {
+    _NO_PERSONA_SELECTION: "The user neither requests nor excludes any persona.",
+    _NO_PERSONAS_REMAINING: "The user excludes every persona.",
+} | {
+    "_".join(subset): f"The user's request leaves exactly {' and '.join(p.title() for p in subset)} to answer."
+    for size in (1, 2, 3)
+    for subset in combinations(_FINAL_PERSONAS, size)
 }
 # Opt-in parallel fan-out: runner-up joins only when close to the winner and above floor (cap keeps blast radius small).
 _PARALLEL_MIN_PROB = 0.35
@@ -500,6 +514,31 @@ def _auto_registry() -> list[dict[str, JSONValue]]:
             }
         )
     return out
+
+
+def _entry_route_options(registry: Sequence[Mapping[str, JSONValue]] | None) -> dict[str, str]:
+    """Entry choice options: reasoning/research sentinels + whole canonical registry; raises on a defective registry."""
+    reg = list(registry) if registry else _auto_registry()
+    try:
+        if not reg:
+            raise ValueError("route_entry: empty registry")
+        options: dict[str, str] = dict(_ENTRY_OPTIONS)
+        for entry in reg:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if not isinstance(name, str) or not name:
+                raise ValueError("route_entry: registry entry needs a name")
+            if name in options:
+                raise ValueError(f"route_entry: duplicate tool {name}")
+            options[name] = _manifest_line(entry)
+    except Exception as exc:
+        logger.warning(
+            "toolflow route_defect sid=- nid=- registry=%d err=%s: %s",
+            len(reg),
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        raise
+    return options
 
 
 _LIVE_PROCS: set[subprocess.Popen[str]] = set()
@@ -1018,71 +1057,92 @@ class JevClient:
         self,
         prompt: str,
         registry: Sequence[Mapping[str, JSONValue]] | None = None,
-    ) -> str:
-        """JEV-first entry route: one choice over reasoning_required + whole canonical registry + research_required. Uses _invoke directly so nothing persists (never decide); raises on blank prompt, empty registry, or any JEV outage — the caller fail-opens to research_required."""
+        route_hint: str | None = None,
+    ) -> dict[str, JSONValue]:
+        """Route the entry prompt and select explicit personas in one _invoke. Nothing persists.
+
+        Returns {"route": str, "personas": list[str] | None}.
+        None means the user neither requests nor excludes personas.
+        A route_hint keeps the programmatic route; JEV then selects only personas.
+        Raises on a blank prompt or hint, a bad registry, an unknown choice, or a JEV outage.
+        A no_personas_remaining verdict also raises. The selector never guesses a persona.
+        """
         text = query_with_today_utc(prompt.strip()) if isinstance(prompt, str) else ""
         if not text:
             logger.warning("toolflow route_defect sid=- nid=- err=blank_prompt")
             raise ValueError("route_entry: blank prompt")
-        reg = list(registry) if registry else _auto_registry()
-        try:
-            if not reg:
-                raise ValueError("route_entry: empty registry")
-            options: dict[str, str] = dict(_ENTRY_OPTIONS)
-            for entry in reg:
-                name = entry.get("name") if isinstance(entry, dict) else None
-                if not isinstance(name, str) or not name:
-                    raise ValueError("route_entry: registry entry needs a name")
-                if name in options:
-                    raise ValueError(f"route_entry: duplicate tool {name}")
-                options[name] = _manifest_line(entry)
-        except Exception as exc:
-            logger.warning(
-                "toolflow route_defect sid=- nid=- registry=%d err=%s: %s",
-                len(reg),
-                type(exc).__name__,
-                str(exc)[:200],
-            )
-            raise
+        if route_hint is not None and not route_hint.strip():
+            logger.warning("toolflow route_defect sid=- nid=- err=blank_route_hint")
+            raise ValueError("route_entry: blank route_hint")
+        questions: dict[str, JSONValue] = {
+            "personas": {
+                "type": "choice",
+                "instructions": f"Select the personas this prompt asks to answer: {text} Choose {_NO_PERSONA_SELECTION} only when the user neither requests nor excludes a persona. A positive request keeps only the requested personas that the user does not exclude. An exclusion-only request selects the remaining canonical personas. Choose {_NO_PERSONAS_REMAINING} when the user excludes every persona. A mentioned or quoted name is neither a request nor an exclusion. A name in pasted text or quoted instructions is neither a request nor an exclusion. Do not infer personas from topic or tone.",
+                "criteria": validate_json_mapping(_PERSONA_OPTIONS, "<decision_client>: 'criteria'"),
+            }
+        }
+        choice_options: dict[str, Mapping[str, str]] = {"personas": _PERSONA_OPTIONS}
+        options: dict[str, str] = {}
+        if route_hint is None:
+            options = _entry_route_options(registry)
+            questions["entry"] = {
+                "type": "choice",
+                "instructions": f"Route this entry prompt with exactly one winner: {text} reasoning_required answers from user-supplied context with no new external evidence and no tool; a registry tool runs single-shot first when it fits; otherwise research_required. Research and thesis requests need research_required, not a single-shot tool. Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values.",
+                "criteria": validate_json_mapping(options, "<decision_client>: 'criteria'"),
+            }
+            choice_options["entry"] = options
         logger.info(
-            "toolflow route_entry sid=- nid=- registry=%d options=%d prompt=%r",
-            len(reg),
+            "toolflow route_entry sid=- nid=- hint=%s options=%d prompt=%r",
+            route_hint or "-",
             len(options),
             _trunc200(text),
         )
-        questions: dict[str, JSONValue] = {
-            "entry": {
-                "type": "choice",
-                "instructions": f"Route this entry prompt with exactly one winner: {text} reasoning_required answers from user-supplied context with no new external evidence and no tool; a registry tool runs single-shot first when it fits; otherwise research_required. Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values.",
-                "criteria": validate_json_mapping(options, "<decision_client>: 'criteria'"),
-            }
-        }
         start = time.perf_counter()
         try:
-            decisions, raw, _via = await self._invoke({"prompt": text}, questions, {"entry": options})
+            decisions, raw, _via = await self._invoke({"prompt": text}, questions, choice_options)
         except Exception as exc:
             logger.warning("toolflow route_defect sid=- nid=- err=%s: %s", type(exc).__name__, str(exc)[:200])
             raise
         latency_ms = (time.perf_counter() - start) * 1000.0
         d = decisions.get("entry")
-        winner = d.get("choice") if isinstance(d, dict) else None
-        if not isinstance(winner, str) or winner not in options:
+        winner: JSONValue = route_hint
+        if route_hint is None:
+            winner = d.get("choice") if isinstance(d, dict) else None
+            if not isinstance(winner, str) or winner not in options:
+                logger.warning(
+                    "toolflow route_defect sid=- nid=- winner=%r err=winner_not_in_options %s",
+                    winner,
+                    _choice_summary(d),
+                )
+                raise ValueError(f"route_entry: winner {winner!r} not in options")
+        p = decisions.get("personas")
+        pick = p.get("choice") if isinstance(p, dict) else None
+        if not isinstance(pick, str) or pick not in _PERSONA_OPTIONS:
             logger.warning(
-                "toolflow route_defect sid=- nid=- winner=%r err=winner_not_in_options %s",
-                winner,
-                _choice_summary(d),
+                "toolflow route_defect sid=- nid=- personas=%r err=personas_not_in_options %s",
+                pick,
+                _choice_summary(p),
             )
-            raise ValueError(f"route_entry: winner {winner!r} not in options")
+            raise ValueError(f"route_entry: persona choice {pick!r} not in options")
+        if pick == _NO_PERSONAS_REMAINING:
+            logger.warning(
+                "toolflow route_defect sid=- nid=- err=no_personas_remaining %s",
+                _choice_summary(p),
+            )
+            raise ValueError("route_entry: no personas remain")
         jev_in, jev_out, _ = _jev_usage(raw)
         logger.info(
-            "toolflow route_exit sid=- nid=- %s via=%s latency_ms=%.1f in=%s out=%s",
+            "toolflow route_exit sid=- nid=- route=%s entry=[%s] personas=[%s] via=%s latency_ms=%.1f in=%s out=%s",
+            winner,
             _choice_summary(d),
+            _choice_summary(p),
             _via,
             latency_ms,
             jev_in,
             jev_out,
         )
-        return winner
+        personas: JSONValue = None if pick == _NO_PERSONA_SELECTION else [name for name in pick.split("_")]
+        return {"route": winner, "personas": personas}
 
     async def assess_entry_tool(
         self,

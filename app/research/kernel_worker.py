@@ -1272,29 +1272,37 @@ def _toolflow() -> str:
 
 
 def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
-    """Programmatic-fast entry route: code signals -> research_required, else JEV decides. Fail-open to research; zero session/DB."""
+    """Entry route + JEV persona selection; zero session/DB.
+
+    Programmatic fast routes ride as route_hint (JEV still selects personas). Returns
+    {"id", "route", "personas"}; any selector/JEV failure returns {"id", "error"}, never an assumed persona set.
+    """
     raw_id = req.get("id")
     rid = raw_id if isinstance(raw_id, str) else "?"
     prompt = req.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         logger.info("toolflow route rid=%s route=research_required reason=blank-prompt", rid)
-        return {"id": rid, "route": "research_required"}
+        return {"id": rid, "route": "research_required", "personas": None}
+    hint: str | None = None
     if _toolflow() not in ("catalog", "full", "whole", "direct"):
         from app.research.programmatic_router import programmatic_route
 
-        fast = programmatic_route(prompt.strip())
-        if fast is not None:
-            logger.info("toolflow route rid=%s route=%s via=programmatic", rid, fast)
-            return {"id": rid, "route": fast}
-    logger.debug("toolflow route_entry rid=%s prompt=%.200s", rid, prompt.strip())
+        hint = programmatic_route(prompt.strip())
+    logger.debug("toolflow route_entry rid=%s hint=%s prompt=%.200s", rid, hint or "-", prompt.strip())
     try:
         client = jev if jev is not None else _shared_jev()
-        winner = asyncio.run(client.route_entry(query_with_today_utc(prompt.strip())))
-        logger.info("toolflow route rid=%s route=%s", rid, winner)
-        return {"id": rid, "route": winner}
+        routed = asyncio.run(client.route_entry(query_with_today_utc(prompt.strip()), route_hint=hint))
     except Exception as exc:
-        logger.warning("toolflow route_fail_open rid=%s route=research_required err_type=%s", rid, type(exc).__name__)
-        return {"id": rid, "route": "research_required"}
+        logger.warning("toolflow route_fail rid=%s err_type=%s", rid, type(exc).__name__)
+        return {"id": rid, "error": str(exc)[:500] or "route selection failed"}
+    logger.info(
+        "toolflow route rid=%s route=%s personas=%s via=%s",
+        rid,
+        routed.get("route"),
+        routed.get("personas"),
+        "programmatic" if hint is not None else "jev",
+    )
+    return {"id": rid, "route": routed.get("route"), "personas": routed.get("personas")}
 
 
 def _arguments(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:

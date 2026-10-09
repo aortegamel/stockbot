@@ -279,7 +279,7 @@ def test_route_served_while_run_in_flight(monkeypatch: pytest.MonkeyPatch) -> No
     def _fast_route(req: object, **kwargs: object) -> dict[str, object]:
         assert isinstance(req, dict)
         raw = req.get("id")
-        return {"id": raw if isinstance(raw, str) else "?", "route": "research_required"}
+        return {"id": raw if isinstance(raw, str) else "?", "route": "research_required", "personas": None}
 
     monkeypatch.setattr(kw, "_startup", lambda: fake)
     monkeypatch.setattr(kw, "_run", _blocked_run)
