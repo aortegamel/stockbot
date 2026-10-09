@@ -284,3 +284,129 @@ def test_outer_cancel_closes_hung_sidecar(tmp_path: Path, monkeypatch: pytest.Mo
     assert not client._lock.locked()
     assert client._lock.acquire(blocking=False)
     client._lock.release()
+
+
+class _GateStdout:
+    """readline blocks until the gate opens, then answers the latest write."""
+
+    def __init__(self, stdin: _FakeStdin, gate: threading.Event) -> None:
+        self._stdin = stdin
+        self._gate = gate
+
+    def readline(self) -> str:
+        assert self._gate.wait(timeout=10), "sidecar gate never opened"
+        payload = json.loads(self._stdin.last)
+        return (
+            json.dumps({"id": payload["id"], "raw": {}, "decisions": {"q": {"kind": "noul", "probability": 0.5}}})
+            + "\n"
+        )
+
+
+class _GateProc:
+    def __init__(self, gate: threading.Event) -> None:
+        self.stdin = _FakeStdin()
+        self.stdout = _GateStdout(self.stdin, gate)
+        self.terminated = threading.Event()
+
+    def poll(self) -> None:
+        return None
+
+    def terminate(self) -> None:
+        self.terminated.set()
+
+    def kill(self) -> None:
+        self.terminate()
+
+
+def test_outer_cancel_waiter_leaves_holder_sidecar_alive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = Path(__file__).resolve().parent.parent
+    client = JevClient(data_root=tmp_path, runtime_path=root / "decision" / "runtime.ts", timeout_s=30)
+    gate = threading.Event()
+    proc = _GateProc(gate)
+    client._proc = proc  # type: ignore[assignment]
+
+    def _noop(**kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_persist", _noop)
+
+    async def _scenario() -> None:
+        kw: dict[str, str] = {"decision_type": "t", "session_id": "s"}
+        questions = {"q": {"type": "noul", "instructions": "x"}}
+        holder = asyncio.ensure_future(client.decide({"s": 1}, questions, **kw))  # type: ignore[arg-type]
+        await asyncio.sleep(0.3)
+        waiter = asyncio.ensure_future(client.decide({"s": 1}, questions, **kw))  # type: ignore[arg-type]
+        await asyncio.sleep(0.3)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        await asyncio.sleep(0.2)
+        assert not proc.terminated.is_set()
+        gate.set()
+        assert await asyncio.wait_for(holder, timeout=5) == {"q": {"kind": "noul", "probability": 0.5}}
+        assert not proc.terminated.is_set()
+        assert client._proc is proc
+
+    asyncio.run(_scenario())
+
+
+class _BlockingHttpResp:
+    """urlopen response whose read blocks until close releases it."""
+
+    def __init__(self, entered: threading.Event) -> None:
+        self._entered = entered
+        self._release = threading.Event()
+        self.closed = threading.Event()
+
+    def __enter__(self) -> _BlockingHttpResp:  # noqa: PYI034 - test fake returns self
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        self._entered.set()
+        assert self._release.wait(timeout=10), "http release never set"
+        if self.closed.is_set():
+            raise OSError("closed")
+        return b'{"answers": {"q": {"type": "noul", "noul": 0.5}}}'
+
+    def close(self) -> None:
+        self.closed.set()
+        self._release.set()
+
+
+def test_outer_cancel_stops_hung_http_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import urllib.request
+
+    from app.decision_client import _SidecarUnavailable
+
+    root = Path(__file__).resolve().parent.parent
+    client = JevClient(data_root=tmp_path, runtime_path=root / "decision" / "runtime.ts", timeout_s=30)
+    entered = threading.Event()
+    resp = _BlockingHttpResp(entered)
+
+    def _noop(**kwargs: object) -> None:
+        return None
+
+    def _missing(payload: object) -> object:
+        raise _SidecarUnavailable("no sidecar")
+
+    monkeypatch.setattr(client, "_persist", _noop)
+    monkeypatch.setattr(client, "_sidecar_roundtrip", _missing)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: resp)  # type: ignore[arg-type]
+
+    async def _scenario() -> None:
+        call = asyncio.ensure_future(
+            client.decide({"s": 1}, {"q": {"type": "noul", "instructions": "x"}}, decision_type="t", session_id="s")  # type: ignore[arg-type]
+        )
+        assert await asyncio.to_thread(entered.wait, 3)
+        await asyncio.sleep(0.2)
+        start = time.monotonic()
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        assert time.monotonic() - start < 3
+        assert resp.closed.is_set()
+
+    asyncio.run(_scenario())

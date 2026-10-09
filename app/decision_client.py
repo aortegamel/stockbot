@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextvars
 import inspect
 import json
 import logging
@@ -501,6 +502,7 @@ def _auto_registry() -> list[dict[str, JSONValue]]:
 
 _LIVE_PROCS: set[subprocess.Popen[str]] = set()
 _ATEXIT_ARMED = False
+_INVOKE_TOKEN: contextvars.ContextVar[object | None] = contextvars.ContextVar("jev_invoke_token", default=None)
 
 
 def _arm_atexit() -> None:
@@ -604,6 +606,9 @@ class JevClient:
         # ponytail: single-flight lock; pipeline if sidecar throughput matters.
         self._lock = threading.Lock()
         self._proc: subprocess.Popen[str] | None = None
+        self._cancel_guard = threading.Lock()
+        self._sidecar_owner: tuple[object, object] | None = None
+        self._http_live: dict[object, object] = {}
         root = Path(__file__).resolve().parent.parent
         self._runtime_ts = Path(runtime_path) if runtime_path is not None else root / "decision" / "runtime.ts"
         self._repo_root = root
@@ -614,6 +619,13 @@ class JevClient:
         response = self._sidecar_roundtrip(payload)
         if response.get("id") != payload["id"] or response.get("ready") is not True:
             raise RuntimeError(f"jev ping failed: unexpected sidecar ack for {payload['id']!r}")
+
+    def _terminate_proc(self, proc: object) -> None:
+        _LIVE_PROCS.discard(proc)  # type: ignore[arg-type]
+        try:
+            proc.terminate()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001, S110 - best-effort close
+            pass
 
     def close(self) -> None:
         if self._lock.acquire(blocking=False):
@@ -629,10 +641,23 @@ class JevClient:
             # restarts via _ensure_proc.
             proc = self._proc
         if proc is not None:
-            _LIVE_PROCS.discard(proc)
+            self._terminate_proc(proc)
+
+    def _cancel_owned(self, token: object) -> None:
+        target: object | None = None
+        resp: object | None = None
+        with self._cancel_guard:
+            if self._sidecar_owner is not None and self._sidecar_owner[0] is token:
+                _, target = self._sidecar_owner
+                self._sidecar_owner = None
+            resp = self._http_live.pop(token, None)
+        if target is not None and self._proc is target:
+            self._proc = None
+            self._terminate_proc(target)
+        if resp is not None:
             try:
-                proc.terminate()
-            except Exception:  # noqa: BLE001, S110 - best-effort close
+                resp.close()  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001, S110 - best-effort cancel
                 pass
 
     def _ensure_proc(self) -> subprocess.Popen[str]:
@@ -661,11 +686,15 @@ class JevClient:
         return proc
 
     def _sidecar_roundtrip(self, payload: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        token = _INVOKE_TOKEN.get()
         with self._lock:
             try:
                 proc = self._ensure_proc()
             except _SidecarUnavailable:
                 raise
+            if token is not None:
+                with self._cancel_guard:
+                    self._sidecar_owner = (token, proc)
             line = json.dumps(payload) + "\n"
             try:
                 assert proc.stdin is not None and proc.stdout is not None
@@ -680,10 +709,18 @@ class JevClient:
                     pass
                 self._proc = None
                 proc = self._ensure_proc()
+                if token is not None:
+                    with self._cancel_guard:
+                        self._sidecar_owner = (token, proc)
                 assert proc.stdin is not None and proc.stdout is not None
                 proc.stdin.write(line)
                 proc.stdin.flush()
                 raw_line = proc.stdout.readline()
+            finally:
+                if token is not None:
+                    with self._cancel_guard:
+                        if self._sidecar_owner is not None and self._sidecar_owner[0] is token:
+                            self._sidecar_owner = None
             if not raw_line:
                 _LIVE_PROCS.discard(proc)
                 try:
@@ -719,11 +756,19 @@ class JevClient:
             },
             method="POST",
         )
+        token = _INVOKE_TOKEN.get()
         try:
             with urllib.request.urlopen(req, timeout=self._timeout_s) as resp:
+                if token is not None:
+                    with self._cancel_guard:
+                        self._http_live[token] = resp
                 raw = json.loads(resp.read().decode())
         except Exception as exc:
             raise RuntimeError(f"decide: typesafe_request_failed: {exc}") from exc
+        finally:
+            if token is not None:
+                with self._cancel_guard:
+                    self._http_live.pop(token, None)
         if not isinstance(raw, dict):
             raise ValueError("decide: malformed_typesafe_response")
         return validate_json_mapping(raw, "<decision_client>: 'http'")
@@ -750,6 +795,8 @@ class JevClient:
         }
         if choice_options:
             payload["choiceOptions"] = {k: dict(v) for k, v in choice_options.items()}
+        token = object()
+        reset = _INVOKE_TOKEN.set(token)
         try:
             try:
                 response = await asyncio.wait_for(
@@ -767,8 +814,10 @@ class JevClient:
                 self.close()
                 raise RuntimeError(f"decide: typesafe timeout after {self._timeout_s}s") from exc
         except asyncio.CancelledError:
-            self.close()
+            self._cancel_owned(token)
             raise
+        finally:
+            _INVOKE_TOKEN.reset(reset)
         if not isinstance(response, dict) or response.get("id") != payload["id"]:
             raise RuntimeError("decide: malformed sidecar response")
         if "error" in response:

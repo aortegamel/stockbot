@@ -557,7 +557,7 @@ def test_reasoner_retry_hang_capped_by_deadline(monkeypatch: pytest.MonkeyPatch)
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("429 too many requests")
-        _t.sleep(60)
+        _t.sleep(3)
         return {"proposals": []}
 
     monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", fake_decompose)
