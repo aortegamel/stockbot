@@ -292,7 +292,7 @@ describe("runKernelAgent final personas", () => {
   // output order never follows completion order; every call emits a draft delta.
   async function runFinal(opts: {
     reply?: (pass2: boolean, id: string) => string;
-    decide?: (persona: Persona, pass: number) => Outcome;
+    decide?: (persona: Persona, pass: number, attempt: number) => Outcome;
     personas?: readonly Persona[];
     deadlineAt?: number;
     signal?: AbortSignal;
@@ -304,6 +304,7 @@ describe("runKernelAgent final personas", () => {
     let pass = 0;
     let inFlight = 0;
     let maxInFlight = 0;
+    const attempts: Record<string, number> = {};
     await runKernelAgent(
       "q",
       (e) => {
@@ -319,13 +320,16 @@ describe("runKernelAgent final personas", () => {
           workerPath: "w",
           spawnFn: spawn,
           reason: async (o) => {
+            const key = `${pass}:${o.persona}`;
+            const attempt = (attempts[key] ?? 0) + 1;
+            attempts[key] = attempt;
             calls.push({ pass, input: o });
             inFlight += 1;
             maxInFlight = Math.max(maxInFlight, inFlight);
             o.onDelta(`draft-${o.persona}`);
             for (let i = FINAL_PERSONAS.indexOf(o.persona); i < FINAL_PERSONAS.length; i++) await Promise.resolve();
             inFlight -= 1;
-            const d: Outcome = opts.decide?.(o.persona, pass) ?? {};
+            const d: Outcome = opts.decide?.(o.persona, pass, attempt) ?? {};
             if (d instanceof Error) throw d;
             return { text: d.text ?? `${o.persona} p${pass}`, usage: d.usage ?? {}, ...(d.missingEvidence ? { missingEvidence: d.missingEvidence } : {}) };
           },
@@ -346,11 +350,15 @@ describe("runKernelAgent final personas", () => {
   };
   const runBodies = (bodies: Record<string, unknown>[]): Record<string, unknown>[] => bodies.filter((b) => b.op === "run");
   const label = (p: Persona): string => `── ${p.charAt(0).toUpperCase()}${p.slice(1)} ──`;
+  // Trio answer: visible Bear and Bull drafts, then the Stockbot synthesis verdict.
+  const trioAnswer = (pass: number): string =>
+    (["bearbot", "bullbot", "stockbot"] as const).map((p) => `${label(p)}\n${p} p${pass}`).join("\n\n");
 
-  test("default trio reasons concurrently on one snapshot and streams only labeled final prose", async () => {
+  test("default trio drafts bear+bull concurrently then synthesizes stockbot with both drafts", async () => {
     const { events, calls, maxInFlight } = await runFinal({});
-    expect(calls.map((c) => c.input.persona)).toEqual([...FINAL_PERSONAS]);
-    expect(maxInFlight).toBe(3);
+    // Drafts first (concurrent), synthesis last with both drafts attached.
+    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bullbot", "stockbot"]);
+    expect(maxInFlight).toBe(2);
     const first = calls[0]?.input;
     if (!first) throw new Error("expected reasoner calls");
     for (const c of calls) {
@@ -362,37 +370,133 @@ describe("runKernelAgent final personas", () => {
       expect(c.input.incompleteGuard).toBe(true);
     }
     expect(first.prompt).toContain("OBJECTIVE");
-    expect(answers(events)).toEqual([`${label("stockbot")}\nstockbot p1\n\n${label("bearbot")}\nbearbot p1\n\n${label("bullbot")}\nbullbot p1`]);
+    const synth = calls.at(-1)?.input;
+    expect(synth?.drafts).toEqual([
+      { persona: "bearbot", text: "bearbot p1" },
+      { persona: "bullbot", text: "bullbot p1" },
+    ]);
+    expect(answers(events)).toEqual([trioAnswer(1)]);
     expect(events.filter((e) => e.type === "reasoning_start").length).toBe(1);
     expect(events.some((e) => e.type === "failed")).toBe(false);
     expect(doneMetrics(events).muse.calls).toBe(3);
   });
 
-  test("every explicit subset calls only its personas and labels them in fixed order", async () => {
+  test("trio retries exactly one failed draft once, then synthesizes with both drafts", async () => {
+    const usage = { inputTokens: 5, outputTokens: 1 };
+    const { events, calls } = await runFinal({
+      decide: (p, _pass, attempt) => (p === "bearbot" && attempt === 1 ? new Error("muse down") : { usage }),
+    });
+    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bullbot", "bearbot", "stockbot"]);
+    expect(calls.at(-1)?.input.drafts).toEqual([
+      { persona: "bearbot", text: "bearbot p1" },
+      { persona: "bullbot", text: "bullbot p1" },
+    ]);
+    expect(answers(events)).toEqual([trioAnswer(1)]);
+    const m = doneMetrics(events);
+    expect(m.muse.calls).toBe(4);
+    expect(m.muse.inputTokens).toBe(15);
+    expect(m.muse.outputTokens).toBe(3);
+  });
+
+  test("trio retry exhausted fails closed with no prose", async () => {
+    for (const blank of [false, true]) {
+      const { events, calls } = await runFinal({
+        decide: (p) => (p === "bullbot" ? (blank ? { text: "  \n " } : new Error("muse down")) : {}),
+      });
+      // Two drafts plus one retry, no synthesis call.
+      expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bullbot", "bullbot"]);
+      expect(answers(events)).toEqual([]);
+      expect(failedCategory(events)).toBe("provider_error");
+      const failed = events.find((e) => e.type === "failed");
+      expect(failed?.type === "failed" ? failed.message : "").toBe(blank ? "bullbot: empty response" : "bullbot: muse down");
+      expect(doneMetrics(events).muse.calls).toBe(3);
+    }
+  });
+
+  test("trio synthesis failure or empty fails closed with no prose", async () => {
+    for (const synthOutcome of [new Error("muse down"), { text: "  " }]) {
+      const { events, calls } = await runFinal({
+        decide: (p) => (p === "stockbot" ? synthOutcome : { text: `${p} draft` }),
+      });
+      expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bullbot", "stockbot"]);
+      expect(calls.at(-1)?.input.drafts).toEqual([
+        { persona: "bearbot", text: "bearbot draft" },
+        { persona: "bullbot", text: "bullbot draft" },
+      ]);
+      expect(answers(events)).toEqual([]);
+      expect(failedCategory(events)).toBe("provider_error");
+      const failed = events.find((e) => e.type === "failed");
+      expect(failed?.type === "failed" ? failed.message : "").toBe(
+        synthOutcome instanceof Error ? "stockbot: muse down" : "stockbot: empty response",
+      );
+      expect(doneMetrics(events).muse.calls).toBe(3);
+    }
+  });
+
+  test("trio gap regenerates per the same synthesis rule after one shared follow-up", async () => {
+    for (const gapping of ["bearbot", "stockbot"] as const) {
+      const { events, calls, bodies } = await runFinal({
+        decide: (p, pass) => (pass === 1 && p === gapping ? { missingEvidence: "need doc X" } : { text: `${p} p${pass}` }),
+      });
+      const runs = runBodies(bodies);
+      expect(runs.length).toBe(2);
+      expect(JSON.stringify(runs[1])).toContain("need doc X");
+      expect(calls.filter((c) => c.pass === 2).map((c) => c.input.persona)).toEqual(["bearbot", "bullbot", "stockbot"]);
+      expect(calls.at(-1)?.input.drafts).toEqual([
+        { persona: "bearbot", text: "bearbot p2" },
+        { persona: "bullbot", text: "bullbot p2" },
+      ]);
+      expect(answers(events)).toEqual([trioAnswer(2)]);
+      expect(doneMetrics(events).muse.calls).toBe(6);
+    }
+  });
+
+  test("partial subsets never retry a failed persona", async () => {
+    for (let mask = 1; mask < (1 << FINAL_PERSONAS.length) - 1; mask++) {
+      const subset = FINAL_PERSONAS.filter((_, i) => (mask >> i) & 1);
+      const first = subset[0];
+      if (!first) continue;
+      const { events, calls } = await runFinal({
+        personas: subset,
+        decide: (p) => (p === first ? new Error("muse down") : {}),
+      });
+      expect(calls.map((c) => c.input.persona)).toEqual(subset);
+      for (const c of calls) expect(c.input.drafts).toBeUndefined();
+      expect(answers(events)).toEqual([]);
+      expect(doneMetrics(events).muse.calls).toBe(subset.length);
+    }
+  });
+
+  test("every partial subset calls only its personas with no synthesis and no retry", async () => {
     for (let mask = 1; mask < 1 << FINAL_PERSONAS.length; mask++) {
       const subset = FINAL_PERSONAS.filter((_, i) => (mask >> i) & 1);
+      if (subset.length === FINAL_PERSONAS.length) continue;
       const { events, calls } = await runFinal({ personas: subset });
       expect(calls.map((c) => c.input.persona)).toEqual(subset);
+      for (const c of calls) expect(c.input.drafts).toBeUndefined();
       expect(answers(events)).toEqual([subset.map((p) => `${label(p)}\n${p} p1`).join("\n\n")]);
       expect(doneMetrics(events).muse.calls).toBe(subset.length);
     }
   });
 
-  test("any persona gap triggers exactly one shared follow-up with combined, deduplicated gaps", async () => {
+  test("partial gap triggers exactly one shared follow-up with combined, deduplicated gaps", async () => {
     const gapText: Record<Persona, string> = { stockbot: "doc A", bearbot: "doc A", bullbot: "doc B" };
-    for (let mask = 0; mask < 1 << FINAL_PERSONAS.length; mask++) {
-      const gapping = FINAL_PERSONAS.filter((_, i) => (mask >> i) & 1);
+    const subset: Persona[] = ["stockbot", "bearbot"];
+    for (let mask = 0; mask < 1 << subset.length; mask++) {
+      const gapping = subset.filter((_, i) => (mask >> i) & 1);
       const { events, calls, bodies } = await runFinal({
+        personas: subset,
         decide: (p, pass) => (pass === 1 && gapping.includes(p) ? { missingEvidence: gapText[p] } : {}),
       });
-      const expected = [...new Set(gapping.map((p) => gapText[p]))].join("; ");
+      const seen: Record<string, true> = {};
+      const expected = gapping.map((p) => gapText[p]).filter((g) => (seen[g] ? false : (seen[g] = true))).join("; ");
       const runs = runBodies(bodies);
       expect(runs.length).toBe(gapping.length > 0 ? 2 : 1);
       if (gapping.length > 0) expect(runs[1]?.prompt).toBe(`q\nStill missing: ${expected}`);
       expect(events.filter((e) => e.type === "progress" && e.stage === "evidence_gap").length).toBe(gapping.length > 0 ? 1 : 0);
       const finalPass = gapping.length > 0 ? 2 : 1;
-      expect(calls.filter((c) => c.pass === finalPass).map((c) => c.input.persona)).toEqual([...FINAL_PERSONAS]);
-      expect(answers(events)).toEqual([FINAL_PERSONAS.map((p) => `${label(p)}\n${p} p${finalPass}`).join("\n\n")]);
+      expect(calls.filter((c) => c.pass === finalPass).map((c) => c.input.persona)).toEqual(subset);
+      expect(answers(events)).toEqual([subset.map((p) => `${label(p)}\n${p} p${finalPass}`).join("\n\n")]);
     }
   });
 
@@ -407,13 +511,17 @@ describe("runKernelAgent final personas", () => {
     expect(runs[1]?.sessionId).toBe("s1");
     expect(runs[1]?.gap).toBe("need doc X");
     const second = calls.filter((c) => c.pass === 2);
-    expect(second.map((c) => c.input.persona)).toEqual([...FINAL_PERSONAS]);
+    expect(second.map((c) => c.input.persona)).toEqual(["bearbot", "bullbot", "stockbot"]);
     for (const c of second) {
       expect(c.input.evidence.map((e) => e.id)).toEqual(["ev:1", "ev:2"]);
       expect(c.input.unresolved).toEqual([]);
       expect(c.input.nodes.length).toBe(2);
     }
-    expect(answers(events)).toEqual([FINAL_PERSONAS.map((p) => `${label(p)}\n${p} p2`).join("\n\n")]);
+    expect(second.at(-1)?.input.drafts).toEqual([
+      { persona: "bearbot", text: "bearbot p2" },
+      { persona: "bullbot", text: "bullbot p2" },
+    ]);
+    expect(answers(events)).toEqual([trioAnswer(2)]);
     const m = doneMetrics(events);
     expect(m.muse.calls).toBe(6);
     expect(m.muse.inputTokens).toBe(60);

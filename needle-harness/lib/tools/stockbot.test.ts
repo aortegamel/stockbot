@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { existsSync } from "node:fs";
 import { categorizeFailure, closeBridge, endSession, invoke, newSessionId } from "./stockbot";
 import { harvest, reason } from "../muse/client";
-import { FINAL_PERSONAS, type Evidence } from "../agent/types";
+import { FINAL_PERSONAS, type Evidence, type Persona } from "../agent/types";
 
 const ROOT = process.cwd().endsWith("needle-harness")
   ? process.cwd().replace(/\/needle-harness$/, "")
@@ -161,6 +161,31 @@ describe("muse reason personas (fake provider)", () => {
     const systems = seen.map((s) => systemOf(s.body));
     expect(new Set(systems).size).toBe(3);
     for (const s of systems) expect(s).toContain("Missing-Evidence:");
+  });
+
+  test("stockbot synthesis carries both labeled drafts as untrusted; bear/bull carry none", async () => {
+    const drafts: { persona: Persona; text: string }[] = [
+      { persona: "bearbot", text: "Bear draft [E1]." },
+      { persona: "bullbot", text: "Bull draft [E1]." },
+    ];
+    await reason({ ...input, persona: "stockbot", drafts });
+    await reason({ ...input, persona: "bearbot" });
+    await reason({ ...input, persona: "bullbot" });
+    expect(seen.map((s) => s.path)).toEqual(["/v1/responses", "/v1/responses", "/v1/responses"]);
+    const [synthUser, bearUser, bullUser] = seen.map((s) => userOf(s.body));
+    // Identical evidence snapshot: synthesis opens with the exact draft-free base.
+    expect(synthUser.slice(0, bearUser.length)).toBe(bearUser);
+    expect(bullUser).toBe(bearUser);
+    expect(synthUser).toContain("SIBLING DRAFTS");
+    expect(synthUser).toContain("untrusted");
+    expect(synthUser).toContain("── Bearbot ──");
+    expect(synthUser).toContain("Bear draft [E1].");
+    expect(synthUser).toContain("── Bullbot ──");
+    expect(synthUser).toContain("Bull draft [E1].");
+    expect(synthUser).toContain("middle verdict");
+    expect(synthUser).toContain("cite only evidence");
+    expect(bearUser).not.toContain("SIBLING DRAFTS");
+    expect(bullUser).not.toContain("SIBLING DRAFTS");
   });
 
   test("deadline during the 429 backoff stops without retry or fallback", async () => {

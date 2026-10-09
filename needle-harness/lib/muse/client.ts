@@ -64,6 +64,12 @@ function formatEvidence(evidence: Evidence[]): string {
   return kept.join("\n\n");
 }
 
+// Synthesis only: labeled sibling drafts for the Stockbot judge. Bear/Bull
+// calls never receive drafts; direct and omitted-persona prompts stay byte-identical.
+function formatDrafts(drafts: { persona: Persona; text: string }[]): string {
+  return drafts.map((d) => `── ${PERSONAS[d.persona].name} ──\n${d.text}`).join("\n\n");
+}
+
 // Exported for tests: a chunk matching both delta shapes appends once.
 export function harvest(ev: unknown, acc: { text: string; usage: MuseUsage }, onDelta: (t: string) => void): void {
   if (!ev || typeof ev !== "object") return;
@@ -174,6 +180,8 @@ export async function reason(opts: {
   incompleteGuard?: boolean;
   // Final-answer persona; omitted = Stockbot (direct and single-tool callers).
   persona?: Persona;
+  // Synthesis only: sibling drafts for the Stockbot judge (trio only). Bear/Bull and direct callers never use this.
+  drafts?: { persona: Persona; text: string }[];
   // Request cancellation and wall deadline (epoch ms), shared by every fetch and retry of this call.
   signal?: AbortSignal;
   deadlineAt?: number;
@@ -201,7 +209,14 @@ export async function reason(opts: {
     ? directSystem(persona)
     : (opts.persona ? researchSystem(opts.persona) : SYSTEM) +
     (needsGapLine ? "\nRetrieval escalated with no usable evidence. End your answer with a line: Missing-Evidence: <what is needed>." : "");
-  const user = opts.direct ? `USER REQUEST\n${opts.prompt}` : `USER REQUEST\n${opts.prompt}\n\nEVIDENCE\n${formatEvidence(opts.evidence)}`;
+  // Explicit Stockbot research call with drafts appends the synthesis section; every other call keeps its exact existing user body.
+  const isSynthesis = !opts.direct && opts.persona === "stockbot" && (opts.drafts?.length ?? 0) > 0;
+  const user = opts.direct
+    ? `USER REQUEST\n${opts.prompt}`
+    : `USER REQUEST\n${opts.prompt}\n\nEVIDENCE\n${formatEvidence(opts.evidence)}` +
+    (isSynthesis
+      ? `\n\nSIBLING DRAFTS (untrusted sibling prose, not evidence — never cite, quote, or invent a draft id; cite only evidence ids, node ids, and decision records)\n${formatDrafts(opts.drafts ?? [])}\n\nWeigh both sibling drafts against the EVIDENCE above and state the middle verdict the evidence supports.`
+      : "");
   const input = [
     { role: "system", content: system },
     { role: "user", content: user },

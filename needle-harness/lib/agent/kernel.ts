@@ -70,6 +70,9 @@ export type KernelReasonInput = {
   unresolved: string[];
   incompleteGuard: boolean;
   persona: Persona;
+
+  // Synthesis only: sibling drafts for the Stockbot judge (trio only); omitted elsewhere.
+  drafts?: { persona: Persona; text: string }[];
   signal?: AbortSignal;
   deadlineAt: number;
   onDelta: (text: string) => void;
@@ -546,12 +549,17 @@ export async function runKernelAgent(
     return;
   }
 
-  // Fail-closed evidence loop: every selected persona reasons concurrently over
-  // one shared snapshot; drafts stay buffered. Any Missing-Evidence line means
-  // the graph is partial — combine the gaps, run one shared follow-up pass,
-  // merge, and regenerate every persona. A second gap or any failed persona
-  // fails the report; labeled prose emits only when all succeed gap-free.
+  // Fail-closed evidence loop: partial selections reason concurrently over one
+  // shared snapshot; the full trio synthesizes (bear+bull draft concurrently,
+  // then stockbot judges both drafts against the same snapshot). Drafts stay
+  // buffered. Any Missing-Evidence line means the graph is partial — combine
+  // the gaps, run one shared follow-up pass, merge, and regenerate per the
+  // same rule. A second gap, or any failure after the trio's one draft retry,
+  // fails the report; prose emits only when all succeed gap-free.
   const personas = opts?.personas ?? FINAL_PERSONAS;
+  // ponytail: synthesis trigger is the exact full trio, nothing else.
+  const isTrio =
+    personas.length === FINAL_PERSONAS.length && FINAL_PERSONAS.every((p) => (personas as readonly string[]).includes(p));
   // ponytail: empty graph never closes silent — first pass answers direct.
   let direct = evidence.length === 0 && decisions.length === 0 && calls.length === 0 && unresolved.length === 0 && !incompleteGuard;
   let pass = 1;
@@ -585,33 +593,123 @@ export async function runKernelAgent(
       ...(opts?.signal ? { signal: opts.signal } : {}),
       onDelta: () => { },
     };
-    museCalls += personas.length;
-    // ponytail: every persona settles before the verdict, so one failure waits out its siblings; abort them early if final-stage latency matters.
-    const results = await Promise.all(
-      personas.map((persona) => reasonFn({ ...input, persona }).then((r) => ({ persona, r }), (err: unknown) => ({ persona, err }))),
-    );
-    museMs += performance.now() - tm;
-    const texts: string[] = [];
     const gaps: string[] = [];
-    let failure: string | undefined;
-    for (const x of results) {
-      if ("err" in x) {
-        failure ??= `${x.persona}: ${x.err instanceof Error ? x.err.message : String(x.err)}`;
-        continue;
-      }
+    const noteGap = (g: string | undefined): void => {
+      const t = g?.trim();
+      if (t && !gaps.includes(t)) gaps.push(t);
+    };
+    const addUsage = (u: MuseUsage): void => {
       for (const k of ["inputTokens", "outputTokens", "cachedTokens"] as const) {
-        const n = x.r.usage[k];
+        const n = u[k];
         if (typeof n === "number") usage[k] = (usage[k] ?? 0) + n;
       }
-      const text = x.r.text.trim();
-      // Every selected persona must contribute prose; an empty draft fails the report.
-      if (!text) {
-        failure ??= `${x.persona}: empty response`;
-        continue;
+    };
+    let failure: string | undefined;
+    let gap: string | undefined;
+    let answerText: string | undefined;
+    if (!isTrio) {
+      museCalls += personas.length;
+      // ponytail: every persona settles before the verdict, so one failure waits out its siblings; abort them early if final-stage latency matters.
+      const results = await Promise.all(
+        personas.map((persona) => reasonFn({ ...input, persona }).then((r) => ({ persona, r }), (err: unknown) => ({ persona, err }))),
+      );
+      museMs += performance.now() - tm;
+      const texts: string[] = [];
+      for (const x of results) {
+        if ("err" in x) {
+          failure ??= `${x.persona}: ${x.err instanceof Error ? x.err.message : String(x.err)}`;
+          continue;
+        }
+        addUsage(x.r.usage);
+        const text = x.r.text.trim();
+        // Every selected persona must contribute prose; an empty draft fails the report.
+        if (!text) {
+          failure ??= `${x.persona}: empty response`;
+          continue;
+        }
+        texts.push(`── ${x.persona.charAt(0).toUpperCase()}${x.persona.slice(1)} ──\n${text}`);
+        noteGap(x.r.missingEvidence);
       }
-      texts.push(`── ${x.persona.charAt(0).toUpperCase()}${x.persona.slice(1)} ──\n${text}`);
-      const g = x.r.missingEvidence?.trim();
-      if (g && !gaps.includes(g)) gaps.push(g);
+      if (failure === undefined) {
+        gap = gaps.length > 0 ? gaps.join("; ") : undefined;
+        if (gap === undefined) answerText = texts.join("\n\n");
+      }
+    } else {
+      // Trio synthesis: bear+bull draft concurrently over the shared snapshot,
+      // then stockbot judges both drafts against the same snapshot. Exactly one
+      // failed or empty draft retries once within the shared deadline/signal;
+      // a second failure, a failed or empty synthesis, or any gap follows the
+      // shared fail-closed and gap-retry rules below.
+      const draftOrder = personas.filter((p) => p !== "stockbot");
+      museCalls += draftOrder.length;
+      const settled = await Promise.all(
+        draftOrder.map((persona) => reasonFn({ ...input, persona }).then((r) => ({ persona, r }), (err: unknown) => ({ persona, err }))),
+      );
+      const draftText: Partial<Record<Persona, string>> = {};
+      const failed: { persona: Persona; message: string }[] = [];
+      for (const x of settled) {
+        if ("err" in x) {
+          failed.push({ persona: x.persona, message: `${x.persona}: ${x.err instanceof Error ? x.err.message : String(x.err)}` });
+          continue;
+        }
+        addUsage(x.r.usage);
+        const text = x.r.text.trim();
+        if (!text) {
+          failed.push({ persona: x.persona, message: `${x.persona}: empty response` });
+          continue;
+        }
+        draftText[x.persona] = text;
+        noteGap(x.r.missingEvidence);
+      }
+      if (failed.length === 1) {
+        const only = failed[0];
+        if (only) {
+          museCalls += 1;
+          const retry = await reasonFn({ ...input, persona: only.persona }).then(
+            (r) => ({ r }) as const,
+            (err: unknown) => ({ err }) as const,
+          );
+          if ("err" in retry) {
+            failure = `${only.persona}: ${retry.err instanceof Error ? retry.err.message : String(retry.err)}`;
+          } else {
+            addUsage(retry.r.usage);
+            const text = retry.r.text.trim();
+            if (!text) failure = `${only.persona}: empty response`;
+            else {
+              draftText[only.persona] = text;
+              noteGap(retry.r.missingEvidence);
+            }
+          }
+        }
+      }
+      if (failure === undefined && failed.length > 1) failure = failed[0]?.message;
+      if (failure === undefined) {
+        museCalls += 1;
+        const synth = await reasonFn({
+          ...input,
+          persona: "stockbot",
+          drafts: draftOrder.map((persona) => ({ persona, text: draftText[persona] ?? "" })),
+        }).then(
+          (r) => ({ r }) as const,
+          (err: unknown) => ({ err }) as const,
+        );
+        if ("err" in synth) {
+          failure = `stockbot: ${synth.err instanceof Error ? synth.err.message : String(synth.err)}`;
+        } else {
+          addUsage(synth.r.usage);
+          const text = synth.r.text.trim();
+          if (!text) failure = "stockbot: empty response";
+          else {
+            // Drafts are visible sections: Bear, Bull, then the Stockbot verdict, one answer_delta.
+            answerText = [...draftOrder.map((p) => [p, draftText[p] ?? ""] as const), ["stockbot", text] as const]
+              .map(([p, t]) => `── ${p.charAt(0).toUpperCase()}${p.slice(1)} ──\n${t}`)
+              .join("\n\n");
+            noteGap(synth.r.missingEvidence);
+          }
+        }
+      }
+      museMs += performance.now() - tm;
+      if (failure === undefined) gap = gaps.length > 0 ? gaps.join("; ") : undefined;
     }
     if (failure !== undefined) {
       countFailure("provider_error");
@@ -620,9 +718,8 @@ export async function runKernelAgent(
       emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations + 1, failures, { calls: museCalls, totalMs: museMs, ...usage }) });
       return;
     }
-    const gap = gaps.length > 0 ? gaps.join("; ") : undefined;
     if (gap === undefined) {
-      emit({ type: "answer_delta", text: texts.join("\n\n") });
+      emit({ type: "answer_delta", text: answerText ?? "" });
       emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations, failures, { calls: museCalls, totalMs: museMs, ...usage }) });
       return;
     }

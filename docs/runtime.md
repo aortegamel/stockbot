@@ -29,18 +29,26 @@ remaining persona (`no_personas_remaining`) fails the request with `failed` +
 `error`. The route never guesses a default. Without a selection, direct and
 single-tool answers stay single-call Stockbot, and research uses all three
 personas. An explicit selection always enters research, so the final layer
-owns the evidence lifecycle. In research, every selected persona runs as its
-own concurrent Muse call over the same graph projection, evidence, decisions,
-unresolved items, and authority limits. An empty graph keeps the direct no-evidence
-prompt. Drafts stay buffered and never stream. If any persona reports
-`Missing-Evidence`, the kernel combines the unique gaps into one shared
-follow-up pass in the same session. Then it regenerates every selected
-persona. A failed persona, an empty or whitespace-only persona response, a
-second gap, or too little time before the request deadline fails the report
-with no prose. Only when every selected persona returns prose without a gap
-does one `answer_delta` emit the labeled sections (`── Stockbot ──`, …) in
-fixed order. Metrics count every attempted persona call, sum token usage over
-calls and passes, and report final-stage wall time.
+owns the evidence lifecycle. In research, partial selections run each selected
+persona as its own concurrent Muse call over the same graph projection,
+evidence, decisions, unresolved items, and authority limits, with no synthesis
+and no retry. The full trio synthesizes: Bearbot and Bullbot draft
+concurrently over the shared snapshot (buffered, never streamed), then
+Stockbot judges both drafts against the same snapshot and writes the middle
+verdict. An empty graph keeps the direct no-evidence prompt. Drafts stay
+buffered and never stream. Exactly one failed or empty draft retries once
+within the shared deadline; a second failure, a failed or empty synthesis, or
+any failure after the retry fails the report with no prose. If any draft or
+the synthesis reports `Missing-Evidence`, the kernel combines the unique gaps
+into one shared follow-up pass in the same session. Then it regenerates per
+the same synthesis rule. A second gap, or too little time before the request
+deadline, fails the report with no prose. Only when the drafts and the
+synthesis return prose without a gap does one `answer_delta` emit the labeled
+sections: the full trio emits `── Bearbot ──` and `── Bullbot ──` drafts, then
+the `── Stockbot ──` middle verdict; partial selections emit their labeled
+sections (`── Stockbot ──`, …) in fixed order. Metrics count every attempted
+call including the retry, sum token usage over calls and passes, and report
+final-stage wall time.
 
 Architecture: the kernel scheduler owns the agent loop (JEV selects over
 the whole registry every round, Needle fills arguments only, tools execute
