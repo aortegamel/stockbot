@@ -545,10 +545,23 @@ def test_discovery_current_feed_page_is_partial(tmp_path: Path, monkeypatch: pyt
 
 def test_discovery_filer_submissions_probe_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import app.sec.filings as _filings
+    from app.sec import client
     from app.sec.discovery.service import SECDiscoveryService
-    from app.sec.models import Filing, SECSearchRequest
+    from app.sec.models import Filing, SearchCoverage, SECSearchRequest, SECSearchResult
 
     seen: dict[str, int | None] = {}
+    empty = SECSearchResult(
+        search_id="s", request=SECSearchRequest(query="123"), coverage=SearchCoverage(status="complete")
+    )
+
+    def _fake_efts(query: str, **kwargs: object) -> SECSearchResult:
+        return empty
+
+    def _metadata(cik: int | str) -> dict[str, object]:
+        return {"cik": cik, "name": "Acme", "tickers": [], "exchanges": [], "sic": None, "former_names": []}
+
+    def _empty_current(form: str, page_size: int | None = 40, owner: str = "include") -> list[Filing]:
+        return []
 
     def _fake_list(
         cik: int | str,
@@ -579,6 +592,9 @@ def test_discovery_filer_submissions_probe_is_bounded(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr(_filings, "list_sec_filings", _fake_list)
     monkeypatch.setattr("app.sec.discovery.service.find_sec_entities", _stub_find_sec_entities)
+    monkeypatch.setattr(client, "get_submissions_metadata", _metadata)
+    monkeypatch.setattr(client, "search_sec_filings", _fake_efts)
+    monkeypatch.setattr(client, "get_current_filings", _empty_current)
     svc = SECDiscoveryService(data_root=tmp_path)
     result = svc.search(SECSearchRequest(query="123", forms=("10-K",), max_results=20, search_relationships=False))
     assert seen["limit"] is not None and seen["limit"] <= 21
@@ -663,9 +679,18 @@ def test_exhaustive_filer_and_current_pass_none_and_complete(tmp_path: Path, mon
     import app.sec.filings as _filings
     from app.sec import client
     from app.sec.discovery.service import SECDiscoveryService
-    from app.sec.models import Filing, SECSearchRequest
+    from app.sec.models import Filing, SearchCoverage, SECSearchRequest, SECSearchResult
 
     seen: dict[str, int | None] = {}
+    empty = SECSearchResult(
+        search_id="s", request=SECSearchRequest(query="123"), coverage=SearchCoverage(status="complete")
+    )
+
+    def _fake_efts(query: str, **kwargs: object) -> SECSearchResult:
+        return empty
+
+    def _metadata(cik: int | str) -> dict[str, object]:
+        return {"cik": cik, "name": "Acme", "tickers": [], "exchanges": [], "sic": None, "former_names": []}
 
     def _fake_list(
         cik: int | str,
@@ -717,6 +742,8 @@ def test_exhaustive_filer_and_current_pass_none_and_complete(tmp_path: Path, mon
     monkeypatch.setattr(_filings, "list_sec_filings", _fake_list)
     monkeypatch.setattr(client, "get_current_filings", _fake_current)
     monkeypatch.setattr("app.sec.discovery.service.find_sec_entities", _stub_find_sec_entities)
+    monkeypatch.setattr(client, "get_submissions_metadata", _metadata)
+    monkeypatch.setattr(client, "search_sec_filings", _fake_efts)
     svc = SECDiscoveryService(data_root=tmp_path)
     result = svc.search(
         SECSearchRequest(query="123", forms=("10-K",), exhaustive=True, max_results=None, search_relationships=False)

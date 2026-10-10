@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
-import { homedir, networkInterfaces } from "node:os";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fingerprintKey, loadDotenvAuthoritative } from "../lib/env";
@@ -32,10 +32,7 @@ const CATALOG = process.env.NEEDLE_CATALOG ?? join(HARNESS_DIR, ".needle-catalog
 
 // Next owns its subtree; the supervisor only marks an unhealthy web child.
 const WEB_UNHEALTHY_MARKER = join(HARNESS_DIR, ".needle-web-unhealthy");
-process.stdout.write(`needle [web]: harness ${HARNESS_DIR} → http://localhost:${PORT} (cwd ${process.cwd()})\n`);
-for (const n of Object.values(networkInterfaces()).flat()) {
-  if (n?.family === "IPv4" && !n.internal) process.stdout.write(`needle [web]: LAN   http://${n.address}:${PORT}\n`);
-}
+process.stdout.write(`needle [web]: harness ${HARNESS_DIR} → http://127.0.0.1:${PORT} (cwd ${process.cwd()})\n`);
 process.stdout.write(dotenvLoaded ? `needle [web]: env loaded ${DOTENV}\n` : `needle [web]: no .env at ${DOTENV}, using shell env\n`);
 
 function fail(msg: string): never {

@@ -407,8 +407,12 @@ def test_list_sec_filings_ticker_like_passthrough(monkeypatch: pytest.MonkeyPatc
         calls.append(name)
         return "ZZZ"
 
+    def _resolve_aapl_cik(value: str | int) -> int | None:
+        return 320193 if value == "AAPL" else None
+
     monkeypatch.setattr(tools.sec, "list_sec_filings", _fake_list)
     monkeypatch.setattr(tools, "_resolve_company_to_ticker", _boom)
+    monkeypatch.setattr("app.sec.client.resolve_cik", _resolve_aapl_cik)
     result = tools.execute_tool("list_sec_filings", {"identifier": "AAPL"}, "test", context=_research_context())
     assert result["subject"] == "AAPL"
     assert seen["identifier"] == "AAPL"

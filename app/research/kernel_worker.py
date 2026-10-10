@@ -195,18 +195,6 @@ def _evidence_id(rec: Mapping[str, JSONValue], fallback: str) -> str:
     return fallback
 
 
-def _fallback_single(objective: str, objective_id: str) -> list[dict[str, object]]:
-    return [
-        {
-            "id": f"{objective_id}-q1",
-            "objectiveId": objective_id,
-            "question": objective,
-            "dependsOn": [],
-            "whyItMatters": "Route question.",
-        }
-    ]
-
-
 _INTAKE_SEC_FORMS = ("8-K", "10-Q", "10-K", "4")
 _INTAKE_SEC_LIMIT = 5
 _INTAKE_DIGEST_CHARS = 6000
@@ -526,15 +514,18 @@ def _is_quota_error(exc: BaseException, msg: str) -> bool:
 
 
 def _close_bootstrap_job(sid: str) -> None:
-    """Cancel the create_research bootstrap source job when still open; errors propagate."""
-    from app.research import service as _svc
-    from app.research.repository import ResearchRepository as _Repo
+    """Cancel one open bootstrap source job. Log cleanup errors without replacing the run outcome."""
+    try:
+        from app.research import service as _svc
+        from app.research.repository import ResearchRepository as _Repo
 
-    repo = _Repo()
-    for job in repo.list_jobs(sid):
-        if job.job_type == "source_agent" and job.status in ("queued", "running"):
-            _svc.cancel_job(job.job_id)
-            break
+        repo = _Repo()
+        for job in repo.list_jobs(sid):
+            if job.job_type == "source_agent" and job.status in ("queued", "running"):
+                _svc.cancel_job(job.job_id)
+                break
+    except Exception:
+        logger.exception("kernel bootstrap cleanup failed sid=%s", sid)
 
 
 def _reasoner_decompose_with_retry(
@@ -770,7 +761,6 @@ async def _intake_round(
     ms_total = sum(taken for _, _, _, taken in flat)
     raw: list[dict[str, object]] = []
     settle_ms = 0.0
-    settle_errors = 0
     outcomes: dict[str, int] = {"admitted": 0, "duplicate": 0, "not_citable": 0, "error": 0, "timeout": 0}
     admitted_ids: list[str] = []
     for (tool, args), (record, _taken) in zip(calls, timed):
@@ -832,7 +822,6 @@ async def _intake_round(
             "ms": ms_total,
             "wall_ms": wall_ms,
             "settle_ms": settle_ms,
-            "settle_errors": settle_errors,
             "per_source": per_source,
         },
     )
@@ -844,7 +833,6 @@ async def _intake_round(
         "ms": ms_total,
         "wall_ms": wall_ms,
         "settle_ms": settle_ms,
-        "settle_errors": settle_errors,
         "per_source": per_source,
         "sec_ms": sec_ms,
         "web_ms": web_ms,
@@ -1149,23 +1137,27 @@ def run_graph_prompt(
     sid = service.create_research(
         objective, objective, as_of=as_of, policy={"research_sources": {"mode": "all", "sources": []}}
     )
-    _notify(progress, "session", {"session_id": sid})
-    client = jev if jev is not None else _shared_jev()
-    registry: list[dict[str, JSONValue]] = scheduler.build_registry()
-    kernel = scheduler._default_kernel()
-    session = scheduler._load_session(sid, kernel)
-    session.setdefault("session_id", sid)
-    proposals: list[dict[str, object]] = asyncio.run(
-        _graph_intake(objective, as_of, sid, session, registry, client, kernel, progress, setup_deadline)
-    )
-    # ponytail: 4 concrete questions max; cap BEFORE JEV so disposition never judges
-    # proposals that can't become nodes, and dropped deps never silently vanish.
-    capped: list[dict[str, object]] = proposals[:4] if proposals else []
-    admitted: list[dict[str, object]] = (
-        _jev_admit(sid, objective, capped, jev=client, setup_deadline=setup_deadline) if capped else []
-    )
-    _create_nodes_topological(sid, stamped, admitted if admitted else [])
-    return sid
+    try:
+        _notify(progress, "session", {"session_id": sid})
+        client = jev if jev is not None else _shared_jev()
+        registry: list[dict[str, JSONValue]] = scheduler.build_registry()
+        kernel = scheduler._default_kernel()
+        session = scheduler._load_session(sid, kernel)
+        session.setdefault("session_id", sid)
+        proposals: list[dict[str, object]] = asyncio.run(
+            _graph_intake(objective, as_of, sid, session, registry, client, kernel, progress, setup_deadline)
+        )
+        # ponytail: 4 concrete questions max; cap BEFORE JEV so disposition never judges
+        # proposals that can't become nodes, and dropped deps never silently vanish.
+        capped: list[dict[str, object]] = proposals[:4] if proposals else []
+        admitted: list[dict[str, object]] = (
+            _jev_admit(sid, objective, capped, jev=client, setup_deadline=setup_deadline) if capped else []
+        )
+        _create_nodes_topological(sid, stamped, admitted if admitted else [])
+        return sid
+    except Exception:
+        _close_bootstrap_job(sid)
+        raise
 
 
 def _create_nodes_topological(sid: str, objective: str, admitted: list[dict[str, object]]) -> None:

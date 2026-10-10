@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from types import ModuleType
@@ -667,37 +668,55 @@ def test_startup_needle_failure_stays_live(monkeypatch: pytest.MonkeyPatch) -> N
     assert kw._startup() is jev
 
 
-def test_close_bootstrap_job_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.research import service as _svc
+@pytest.mark.parametrize("stage", ["repository", "list", "cancel"])
+def test_close_bootstrap_job_failure_logs(
+    stage: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from app.research import service
     from app.research.models import Job
 
-    list_failure = RuntimeError("db down")
-    cancel_failure = RuntimeError("cancel down")
-
-    def _boom_list(self: ResearchRepository, sid: str) -> list[Job]:
-        raise list_failure
-
-    monkeypatch.setattr(ResearchRepository, "list_jobs", _boom_list)
-    with pytest.raises(RuntimeError, match="db down") as raised:
-        kw._close_bootstrap_job("rs:x")
-    assert raised.value is list_failure
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    failure = RuntimeError(f"{stage} down")
+    job = Job(job_id="j1", session_id="rs:x", wave_id=1, parent_job_id=None, job_type="source_agent", owner="k")
 
     def _one_job(self: ResearchRepository, sid: str) -> list[Job]:
-        return [Job(job_id="j1", session_id=sid, wave_id=1, parent_job_id=None, job_type="source_agent", owner="k")]
+        return [job]
 
-    monkeypatch.setattr(ResearchRepository, "list_jobs", _one_job)
-
-    def _boom_cancel(job_id: str) -> None:
-        raise cancel_failure
-
-    monkeypatch.setattr(_svc, "cancel_job", _boom_cancel)
-    with pytest.raises(RuntimeError, match="cancel down") as raised:
+    if stage == "repository":
+        target = "app.research.repository.ResearchRepository"
+    elif stage == "list":
+        target = "app.research.repository.ResearchRepository.list_jobs"
+    else:
+        monkeypatch.setattr(ResearchRepository, "list_jobs", _one_job)
+        target = "app.research.service.cancel_job"
+    with mock.patch(target, side_effect=failure) as cleanup:
         kw._close_bootstrap_job("rs:x")
-    assert raised.value is cancel_failure
+    assert cleanup.call_count == 1
+    records = [record for record in caplog.records if "bootstrap cleanup failed" in record.message]
+    assert len(records) == 1
+    assert "sid=rs:x" in records[0].message
+    assert records[0].exc_info is not None and records[0].exc_info[1] is failure
+
+    if stage == "cancel":
+        done_source = replace(job, job_id="j0", status="completed")
+        open_other = replace(job, job_id="j2", job_type="stockbot")
+        with (
+            mock.patch.object(ResearchRepository, "list_jobs", return_value=[open_other, done_source, job]),
+            mock.patch.object(service, "cancel_job") as cancel,
+        ):
+            kw._close_bootstrap_job("rs:x")
+        cancel.assert_called_once_with("j1")
 
 
-def test_run_bootstrap_cleanup_failure_propagates_with_worker_error_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Cleanup errors escape _run but the JSONL worker emits a provider_error terminal."""
+@pytest.mark.parametrize("scheduler_error", [False, True])
+def test_run_bootstrap_cleanup_failure_preserves_outcome(
+    scheduler_error: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The worker keeps the scheduler outcome when bootstrap cleanup fails."""
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     failure = RuntimeError("jobs down")
     jev = JevClient()
 
@@ -705,19 +724,37 @@ def test_run_bootstrap_cleanup_failure_propagates_with_worker_error_envelope(mon
         return "s1"
 
     async def _fake_sched(sid: str, **hooks: object) -> dict[str, object]:
+        if scheduler_error:
+            raise RuntimeError("scheduler down")
         return {"status": "complete", "nodes": [], "incomplete_guard": False}
 
     def _boom_jobs(self: ResearchRepository, sid: str) -> list[object]:
         raise failure
 
+    def _needle_stub(**kwargs: object) -> dict[str, object]:
+        return {}
+
     monkeypatch.setattr(kw, "run_graph_prompt", _fake_graph)
+    monkeypatch.setattr(kw, "_shared_needle_generate", lambda: _needle_stub)
     monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
     monkeypatch.setattr(ResearchRepository, "list_jobs", _boom_jobs)
     _empty_repo(monkeypatch)
     request: dict[str, JSONValue] = {"id": "rc", "op": "run", "prompt": "hello?"}
-    with pytest.raises(RuntimeError, match="jobs down") as raised:
-        kw._run(request, jev=jev)
-    assert raised.value is failure
+    out = kw._run(request, jev=jev)
+    assert out["id"] == "rc"
+    if scheduler_error:
+        assert out["error"] == "kernel run failed: scheduler down"
+        assert out["terminal"] == {"category": "provider_error", "message": out["error"]}
+        assert out["failures"] == {"provider_error": 1}
+    else:
+        assert out["sessionId"] == "s1"
+        assert out["objective"] == "hello?"
+        assert out["failures"] == {}
+        assert out["escalated"] is False
+        assert "error" not in out and "terminal" not in out
+    cleanup_records = [record for record in caplog.records if "bootstrap cleanup failed" in record.message]
+    assert len(cleanup_records) == 1
+    assert cleanup_records[0].exc_info is not None and cleanup_records[0].exc_info[1] is failure
 
     stdout = StringIO()
     monkeypatch.setattr(kw, "_startup", lambda: jev)
@@ -728,19 +765,69 @@ def test_run_bootstrap_cleanup_failure_propagates_with_worker_error_envelope(mon
         kw.main()
 
     responses: list[object] = [json.loads(line) for line in stdout.getvalue().splitlines()]
-    assert len(responses) == 2
-    assert responses[0] == {"type": "ready"}
-    out = responses[1]
-    assert isinstance(out, dict)
-    assert out["id"] == "rc"
-    terminal = out["terminal"]
-    assert isinstance(terminal, dict)
-    assert terminal["category"] == "provider_error"
-    assert out["error"] == "worker failed: jobs down"
-    assert terminal["message"] == out["error"]
-    assert out["failures"] == {"provider_error": 1}
-    assert out["escalated"] is True
+    assert responses == [{"type": "ready"}, out]
     assert out["evidence"] == []
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_failed_intake_closes_bootstrap_without_replacing_setup_error(
+    cleanup_fails: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from app.research import service
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+
+    def _no_ticker(objective: str) -> None:
+        return None
+
+    monkeypatch.setattr(sched, "build_registry", list)
+    monkeypatch.setattr(sched, "_objective_subject_ticker", _no_ticker)
+    repo = ResearchRepository()
+    failure = RuntimeError("intake down")
+    cleanup_failure = RuntimeError("cancel down")
+    sessions: list[str] = []
+    cancellations: list[str] = []
+    original_cancel = service.cancel_job
+
+    def _session(stage: str, detail: dict[str, object]) -> None:
+        if stage == "session":
+            sid = detail["session_id"]
+            assert isinstance(sid, str)
+            sessions.append(sid)
+            assert [job.status for job in repo.list_jobs(sid)] == ["running"]
+
+    async def _failed_intake(*args: object, **kwargs: object) -> object:
+        raise failure
+
+    def _cancel(job_id: str) -> dict[str, JSONValue]:
+        cancellations.append(job_id)
+        if cleanup_fails:
+            raise cleanup_failure
+        return original_cancel(job_id)
+
+    monkeypatch.setattr(kw, "_intake_round", _failed_intake)
+    monkeypatch.setattr(service, "cancel_job", _cancel)
+    with pytest.raises(RuntimeError, match="intake down") as raised:
+        kw.run_graph_prompt("q?", jev=JevClient(), progress=_session)
+    assert raised.value is failure
+    assert len(sessions) == 1
+    sid = sessions[0]
+    session = repo.get_session(sid)
+    assert session.query == "q?"
+    jobs = repo.list_jobs(sid)
+    assert len(jobs) == 1
+    assert cancellations == [jobs[0].job_id]
+    assert jobs[0].status == ("running" if cleanup_fails else "cancelled")
+    if not cleanup_fails:
+        assert not [job for job in jobs if job.status in ("queued", "running")]
+    cleanup_records = [record for record in caplog.records if "bootstrap cleanup failed" in record.message]
+    assert len(cleanup_records) == int(cleanup_fails)
+    if cleanup_fails:
+        assert cleanup_records[0].exc_info is not None
+        assert cleanup_records[0].exc_info[1] is cleanup_failure
 
 
 def test_graph_intake_reasoner_crash_propagates(monkeypatch: pytest.MonkeyPatch) -> None:

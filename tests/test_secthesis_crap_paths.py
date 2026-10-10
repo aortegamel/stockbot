@@ -437,7 +437,18 @@ def test_search_pit_gap_warning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 def test_search_quarter_cap_warning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec.models import SECSearchResult
+
     svc = disc.SECDiscoveryService(data_root=tmp_path)
+    empty = SECSearchResult(
+        search_id="s", request=SECSearchRequest(query="Acme"), coverage=SearchCoverage(status="complete")
+    )
+
+    def _empty_search(*a: object, **k: object) -> SECSearchResult:
+        return empty
+
+    monkeypatch.setattr(disc, "find_sec_entities", _empty_search)
+    monkeypatch.setattr(client, "search_sec_filings", _empty_search)
 
     def _fake_85(*a: object, **k: object) -> object:
         return ([(2020, 1)], True)
@@ -454,8 +465,7 @@ def test_search_quarter_cap_warning(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         out: list[object] = []
         return out
 
-    monkeypatch.setattr(store, "query_filings", _fake_83)
-    from app.sec import client
+    monkeypatch.setattr(client, "get_global_filings", _fake_83)
 
     def _fake_82(*a: object, **k: object) -> object:
         out: list[object] = []
@@ -725,16 +735,16 @@ def test_search_filer_record_partial_and_unknown(tmp_path: Path) -> None:
 
 
 def test_search_covered_and_parse_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.sec import store
+    from app.sec import client, store
 
     state = disc._SearchState("s", None, "2024-01-01T00:00:00Z")
 
     def _boom(*a: object, **k: object) -> object:
         raise RuntimeError("down")
 
-    monkeypatch.setattr(store, "query_filings", _boom)
+    monkeypatch.setattr(client, "get_global_filings", _boom)
     disc._search_covered_partition(state, store, "4", 2024, 1, None, 10, tmp_path)
-    assert any(a.backend == "live-filings" for a in state.attempts)
+    assert any(a.backend == "live-filings" and a.status == "failed" for a in state.attempts)
     assert (
         disc._search_parse_covered_row(
             _disc_filing(accession="A1", filed_at="2024-02-15T00:00:00Z", known_at="2024-02-15T00:00:00Z"),

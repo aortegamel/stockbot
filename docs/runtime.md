@@ -104,3 +104,19 @@ in the result record.
 
 Root TypeScript uses the classic 5.x compiler. The Stryker checker requires
 its classic API. The `mutation:ts` script runs the mutation gate.
+
+## Failure cleanup and terminal reads
+
+If graph setup fails after session creation, the worker cancels the open
+bootstrap source job. The worker keeps the session record. Cleanup errors
+appear in the worker log and do not replace the original result or error.
+
+The terminal clears its snapshot, journal, and sequence when the selected
+session changes. It ignores responses from the previous session.
+
+The research API uses an asynchronous Python subprocess with a 15-second
+timeout. Unknown sessions return HTTP 404. Import, database, execution, and
+bridge response errors return HTTP 502.
+
+The harness binds development and production servers to `127.0.0.1`.
+It does not advertise LAN access or provide authentication for remote use.

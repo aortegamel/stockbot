@@ -135,10 +135,10 @@ export default function Terminal() {
 
   // Snapshot + journal poll for the selected research session (durable state + logs).
   useEffect(() => {
+    setSnapshot(null);
+    setJournal(null);
+    setSeq(0);
     if (sessionId === null) {
-      setSnapshot(null);
-      setJournal(null);
-      setSeq(0);
       return;
     }
     const current = sessionId;
@@ -177,7 +177,9 @@ export default function Terminal() {
           setJournal((prev) => prev ?? page);
         }
       } catch {
-        setJournal((prev) => prev ?? { error: "journal unavailable" });
+        if (alive) {
+          setJournal((prev) => prev ?? { error: "journal unavailable" });
+        }
       }
     }
     void poll();
@@ -249,7 +251,7 @@ export default function Terminal() {
             } else if (ev.type === "tool_result") {
               setChat((c) => [...c, { role: "ai", text: `├─ ${ev.tool} — ${ev.preview.slice(0, 160)}` }]);
             } else if (ev.type === "tool_failed" || ev.type === "failed" || ev.type === "error") {
-              const msg = ev.type === "error" ? ev.message : `${ev.type === "failed" ? ev.category : ev.category}: ${ev.type === "failed" ? ev.message : ev.preview}`;
+              const msg = ev.type === "error" ? ev.message : `${ev.category}: ${ev.type === "failed" ? ev.message : ev.preview}`;
               setChat((c) => [...c, { role: "ai", text: `✗ ${msg.slice(0, 300)}` }]);
               terminal = terminal || ev.type === "failed" || ev.type === "error";
             } else if (ev.type === "done") {
