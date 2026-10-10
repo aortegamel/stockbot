@@ -1819,8 +1819,9 @@ def test_edgar_ranking_embedding_tiebreak_reorders_only_and_falls_back(
     monkeypatch.setattr(needle, "embed", _boom)
     assert _rank() == base
 
+
 def test_packet_display_fields_grounded_and_ungrounded_drops(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Needle display labels verify against stored bytes; ungrounded output drops to None."""
+    """Needle sees only stored content (never identity metadata); ungrounded output drops to None."""
     from app.sec.discovery import service as disc
 
     hit = SECTextHit(
@@ -1841,38 +1842,118 @@ def test_packet_display_fields_grounded_and_ungrounded_drops(monkeypatch: pytest
 
     def _grounded(record: dict[str, object], passage: str, *, strict: bool = True) -> dict[str, object]:
         assert strict is True
-        assert "concentration with OpenAI counterparties" in passage
+        assert passage == "concentration with OpenAI counterparties"
         assert isinstance(record.get("name"), str) and record["name"]
-        return {
-            "record": record["name"],
-            "fields": {
-                "section": "Risk Factors",
-                "term": "concentration",
-                "snippet": "concentration with OpenAI counterparties",
-            },
-        }
+        return {"record": record["name"], "fields": {"term": "concentration"}}
 
     import app.needle_client as _needle
 
     monkeypatch.setattr(_needle, "extract_fields", _grounded)
-    got = disc.packet_display_fields(hit)
-    assert got == {
-        "section": "Risk Factors",
-        "term": "concentration",
-        "snippet": "concentration with OpenAI counterparties",
-    }
+    assert disc.packet_display_fields(hit) == {"term": "concentration"}
 
     def _ungrounded(record: dict[str, object], passage: str, *, strict: bool = True) -> dict[str, object]:
         assert strict is True
-        return {"record": record["name"], "fields": {"section": "Invented Section", "term": 42, "snippet": ""}}
+        return {"record": record["name"], "fields": {"term": "Microsoft Corp"}}
+
     monkeypatch.setattr(_needle, "extract_fields", _ungrounded)
-    assert disc.packet_display_fields(hit) == {"section": None, "term": None, "snippet": None}
+    assert disc.packet_display_fields(hit) == {"term": None}
 
     def _boom(record: dict[str, object], passage: str, *, strict: bool = True) -> dict[str, object]:
         raise RuntimeError("needle down")
 
     monkeypatch.setattr(_needle, "extract_fields", _boom)
-    assert disc.packet_display_fields(hit) == {"section": None, "term": None, "snippet": None}
+    assert disc.packet_display_fields(hit) == {"term": None}
+
+
+def test_hit_window_term_grounded_word_bounded_never_section(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Display term: one stored field, word-bounded, never the section, never a query echo."""
+    from app.sec.discovery import service as disc
+
+    def _echo_description(hit: SECTextHit) -> dict[str, str | None]:
+        return {"term": hit.file_description}
+
+    monkeypatch.setattr(disc, "packet_display_fields", _echo_description)
+    base: dict[str, object] = {
+        "accession_no": "0001-26-000001",
+        "form": "8-K",
+        "filer_name": "Acme Corp",
+        "query": "AI",
+    }
+    no_snippet = tools._hit_window({**base, "file_description": "Material Contracts"})
+    assert no_snippet["section"] == no_snippet["window"] == "Material Contracts"
+    assert no_snippet["term"] == "Contracts"
+    trap = tools._hit_window({**base, "snippet": "certain subcontractor reinvestment terms"})
+    assert trap["section"] == "8-K" and trap["term"] is None
+    filer_named = tools._hit_window({**base, "snippet": "Acme Corp concentration with one vendor. Sales rose."})
+    assert filer_named["term"] == "concentration with one vendor"
+    case_mismatched = tools._hit_window(
+        {**base, "filer_name": "Apple Inc", "snippet": "APPLE INC concentration with one vendor grew."}
+    )
+    assert case_mismatched["term"] == "concentration with one vendor grew"
+    form_only = tools._hit_window(base)
+    assert (form_only["section"], form_only["window"], form_only["term"]) == ("8-K", "8-K", None)
+    assert tools._passage_row(base)["section"] == "8-K"
+
+
+def test_passage_term_keeps_whole_amounts_clause_meaning_and_no_heading_echo() -> None:
+    """Amounts keep scale and qualifiers; negations stay; other clauses never lead; headings never echo the query."""
+
+    def term(snippet: str | None = None, **hit: object) -> str | None:
+        got = tools._passage_term({"form": "10-K", "snippet": snippet, **hit})
+        assert got is None or got in str(snippet or hit.get("file_description") or ""), got
+        return got
+
+    kept = {
+        "Purchase commitments of approximately $4.2 billion remain outstanding at year end.": "approximately $4.2 billion",
+        "The company recorded a $300M charge tied to supplier contracts.": "$300M charge",
+        "receita de R$3,1 milhões no trimestre": "R$3,1 milhões",
+        "The company may borrow up to $500 million under its credit facility.": "up to $500 million",
+        "In fiscal 2025, no single customer exceeded 10% of revenue.": "no single customer exceeded 10%",
+        "Revenue concentration in U.S. markets increased.": "U.S.",
+    }
+    for snippet, part in kept.items():
+        assert part in (term(snippet) or ""), snippet
+    late = term(
+        "Management met four times during the year. The company recorded impairment charges of $312.5 million.",
+        query="impairment",
+    )
+    assert "impairment charges of $312.5 million" in (late or "") and "Management" not in (late or "")
+    share = term(
+        "Net sales increased 5% compared to the prior year, while revenue concentration with our largest customer rose."
+    )
+    assert "revenue concentration" in (share or "") and "5%" not in (share or "")
+    a1, b2 = (
+        term(f"Sales to {n} accounted for a significant concentration of our revenue") or "" for n in ("A1", "B2")
+    )
+    assert "A1" in a1 and "B2" in b2
+    assert term(file_description="Item 1A. Risk Factors", query="risk factors") is None
+    assert "Risk Factors" in (term("Exposure to Risk Factors grew.", query="risk factors") or "")
+    description = "APPLE INC SUPPLY AGREEMENT WITH HON HAI PRECISION INDUSTRY"
+    agreement = term(file_description=description, filer_name="Apple Inc") or ""
+    assert agreement and agreement == agreement.upper()
+    assert not {"APPLE", "INC"} & set(agreement.split())
+    assert (
+        term(
+            "We do not in light of all available quarterly information expect concentration problems.",
+            query="concentration",
+        )
+        is None
+    )
+    backlog = term("We do not disclose vendor backlog figures at year end.", query="vendor backlog") or ""
+    assert "not" in backlog.split() and backlog != "vendor backlog"
+    assert (
+        term(
+            "We do not in light of all available quarterly information disclose vendor backlog figures at year end.",
+            query="vendor backlog",
+        )
+        is None
+    )
+    assert term("no concentration", file_description="no concentration", query="concentration") is None
+    assert (
+        term("We do not disclose APPLE INC vendor backlog figures", filer_name="Apple Inc", query="vendor backlog")
+        is None
+    )
+    assert term(file_description="SUBSIDIARIES OF THE REGISTRANT", query="subsidiaries") == "SUBSIDIARIES"
 
 
 def test_edgar_alias_expansion_validated_keeps_provenance_no_false_identity(

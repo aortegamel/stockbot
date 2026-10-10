@@ -3070,35 +3070,26 @@ _PACKET_DISPLAY_MAX_CHARS = 2000
 
 _PACKET_DISPLAY_RECORD: dict[str, object] = {
     "name": "packet_hit_display",
-    "description": "Display labels for one SEC search hit, copied from the stored hit text.",
+    "description": "Display term for one SEC search hit, copied from the stored hit text.",
     "parameters": {
         "type": "object",
         "properties": {
-            "section": {"type": "string", "description": "Filing section label from the stored hit text."},
             "term": {"type": "string", "description": "Exposure term from the stored hit text."},
-            "snippet": {
-                "type": "string",
-                "description": "Verbatim quote of the stored hit text, never a paraphrase.",
-            },
         },
     },
 }
 
 
 def _packet_display_text(hit: SECTextHit) -> str:
-    """Stored hit text behind one packet row (EFTS metadata + snippet, never live bytes)."""
-    return " ".join(
-        part
-        for part in (
-            hit.filer_name or "",
-            hit.form or "",
-            hit.file_type or "",
-            hit.file_description or "",
-            " ".join(hit.items or ()),
-            hit.snippet or "",
-        )
-        if part
-    )[:_PACKET_DISPLAY_MAX_CHARS]
+    """Stored snippet behind one packet row; empty when the hit carries none.
+
+    Identity metadata (filer, form, file type, items) stays out, so a term
+    can neither copy it nor span two fields. The file description stays out
+    too: it is the section heading, and a Needle span of it is a heading
+    fragment, not content. EFTS hits carry no snippet today (client.py), so
+    those rows skip the engine and keep the caller's deterministic term.
+    """
+    return (hit.snippet or "")[:_PACKET_DISPLAY_MAX_CHARS]
 
 
 def _grounded_display_value(value: object, stored: str) -> str | None:
@@ -3110,32 +3101,28 @@ def _grounded_display_value(value: object, stored: str) -> str | None:
 
 
 def packet_display_fields(hit: SECTextHit) -> dict[str, str | None]:
-    """Needle display labels for one stored hit; ungrounded output drops to None.
+    """Needle display term for one stored hit; ungrounded output drops to None.
 
     IDs, rank, and provenance stay untouched: this fills only the display
-    labels (section/term/snippet) the packet window shows, verified against
-    stored hit bytes. Strict extract raises on ungrounded values, so any
-    Needle failure keeps the deterministic fallbacks the caller already uses.
+    term the packet window shows, verified against the stored hit content.
+    Section and window stay deterministic stored fields in the caller. A hit
+    without a snippet, or any Needle failure, keeps the caller's deterministic term.
     """
     stored = _packet_display_text(hit)
     if not stored.strip():
-        return {"section": None, "term": None, "snippet": None}
+        return {"term": None}
     try:
         from ...needle_client import extract_fields
     except ImportError:
-        return {"section": None, "term": None, "snippet": None}
+        return {"term": None}
     try:
         out = extract_fields(_PACKET_DISPLAY_RECORD, stored, strict=True)
     except Exception:  # noqa: BLE001 - display labels only; Needle failure keeps None fallbacks
-        return {"section": None, "term": None, "snippet": None}
+        return {"term": None}
     fields = out.get("fields")
     if not isinstance(fields, dict):
-        return {"section": None, "term": None, "snippet": None}
-    return {
-        "section": _grounded_display_value(fields.get("section"), stored),
-        "term": _grounded_display_value(fields.get("term"), stored),
-        "snippet": _grounded_display_value(fields.get("snippet"), stored),
-    }
+        return {"term": None}
+    return {"term": _grounded_display_value(fields.get("term"), stored)}
 
 
 class _EvidencePacket:

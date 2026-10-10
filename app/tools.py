@@ -5440,21 +5440,178 @@ def _passage_row(hit: dict[str, object]) -> dict[str, object]:
         "document": hit.get("matched_document"),
         "query": hit.get("query"),
         "score": float(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else 0.0,
-        "section": hit.get("file_description") or hit.get("file_type"),
+        "section": _hit_section(hit),
         "term": _passage_term(hit),
     }
 
 
-def _passage_term(hit: dict[str, object]) -> str | None:
-    """First exposure term in the hit description, else the query topic."""
-    import re as _re
+def _hit_section(hit: dict[str, object]) -> str | None:
+    """Stored section label: description, else file type, else form; never a Needle span."""
+    value = hit.get("file_description") or hit.get("file_type") or hit.get("form")
+    return value if isinstance(value, str) and value else None
 
-    text = str(hit.get("file_description") or "")
-    match = _re.search(r"contract|concentration|investments?|commitments?|counterpart\w*|openai", text, _re.IGNORECASE)
-    if match:
-        return match.group(0).lower()
+
+_EXPOSURE_RE = re.compile(
+    r"\b(?:contracts?|concentrations?|investments?|commitments?|counterpart(?:y|ies)|agreements?|leases?"
+    r"|guarantees?|obligations?|debt|loans?|facilit(?:y|ies)|partnerships?|subsidiar(?:y|ies))\b",
+    re.IGNORECASE,
+)
+_AMOUNT_SCALE = r"(?:thousand|million|billion|trillion|milhões|milhão|bilhões|bilhão|mil)"
+# Qualifiers belong to the amount: "up to $500 million" never shrinks to "$500 million".
+_AMOUNT_QUALIFIER = (
+    r"(?:\b(?:up\s+to|approximately|about|around|nearly|almost|roughly|over|under|below|above"
+    r"|at\s+(?:least|most)|(?:no\s+)?(?:more|less|fewer)\s+than|in\s+excess\s+of)\s+)?"
+)
+_AMOUNT_RE = re.compile(
+    rf"{_AMOUNT_QUALIFIER}(?:(?:\b[A-Z]{{1,2}})?[$€£]\s?|\b(?:USD|EUR|GBP|BRL)\s?)"
+    rf"\d(?:[\d,.]*\d)?(?:mm|[kmb]n?|\s+{_AMOUNT_SCALE})?(?!\w)"
+    rf"|{_AMOUNT_QUALIFIER}(?<![\w.,])\d(?:[\d,.]*\d)?(?:\s?%|\s+percent\b|(?:\s+{_AMOUNT_SCALE})?\s+shares\b)",
+    re.IGNORECASE,
+)
+# A period after one capital letter ends an abbreviation (U.S.), not a clause; neither does
+# the comma before a year ("March 3, 2025").
+_CLAUSE_BREAK_RE = re.compile(r"(?<!\b[A-Z])\.(?=\s|$)|[;:!?](?=\s|$)|,(?=\s|$)(?!\s\d{4}\b)|\s[—–-]\s")
+_WORD_RE = re.compile(r"\S+")
+_TERM_EDGE_WORDS = frozenset(
+    {
+        *("a", "an", "and", "or", "the", "this", "that", "these", "those", "which", "while"),
+        *("our", "its", "their", "as", "than", "per", "about", "after", "before", "between"),
+        *("across", "at", "by", "during", "for", "from", "in", "into", "of", "on", "over"),
+        *("through", "to", "under", "via", "with", "dated"),
+    }
+)
+_NEGATION_RE = re.compile(r"\b(?:no|not|never|none|neither|nor|without|nothing)\b|\b\w+n['’]t\b", re.IGNORECASE)
+_MONTHS = frozenset(
+    name[:size]
+    for name in ("january", "february", "march", "april", "may", "june", "july")
+    + ("august", "september", "october", "november", "december")
+    for size in (3, len(name))
+)
+_TERM_MAX_WORDS = 8
+
+
+def _term_window(text: str, start: int, end: int, filer: str, modifier: bool) -> tuple[str, ...]:
+    """Whole-word windows of at most eight words around ``text[start:end]`` inside one clause, widest first.
+
+    An amount is one unit, so a window never splits it. Filer words bound the window.
+    A negation in the clause joins the core; when it does not fit, there is no window.
+    Exposure words (``modifier``) also take one leading modifier and the nearest capitalized
+    name. The narrow window extends right, the wide one then extends left, and shorter
+    right ends follow for headings that equal the section. Edge stopwords and mid-phrase
+    cuts (``with two``) drop unless they carry a name.
+
+    ponytail: word-window noun phrase, not a parser; swap for a chunker if labels need more.
+    """
+    left = max((m.end() for m in _CLAUSE_BREAK_RE.finditer(text, 0, start)), default=0)
+    stop = _CLAUSE_BREAK_RE.search(text, end)
+    if stop and stop.group(0) == "," and not text[left:start].strip() and not text[end : stop.start()].strip():
+        stop = _CLAUSE_BREAK_RE.search(text, stop.end())  # a lone first word before a comma heads a list
+    right = stop.start() if stop else len(text)
+    amounts = list(_AMOUNT_RE.finditer(text, left, right))
+    units: list[list[int]] = []  # [start, end, word count]
+    for w in _WORD_RE.finditer(text, left, right):
+        if units and any(a.start() < units[-1][1] and a.end() > w.start() for a in amounts):
+            units[-1][1:] = [w.end(), units[-1][2] + 1]
+        else:
+            units.append([w.start(), w.end(), 1])
+    a = next((k for k, u in enumerate(units) if u[1] > start), None)
+    b = next((k for k, u in enumerate(units) if u[1] >= end), None)
+    if a is None or b is None:
+        return ()
+    words = [text[s:e].strip("\"'“”‘’()[],.;:") for s, e, _ in units]
+    filer_words = {w.strip(",.").casefold() for w in filer.split() if w.lower() not in _TERM_EDGE_WORDS}
+    free = [w.casefold() not in filer_words for w in words]
+    edge = [w.lower() in _TERM_EDGE_WORDS for w in words]
+    named = [w[:1].isupper() and not e and w.lower() not in _MONTHS for w, e in zip(words, edge, strict=True)]
+    negated = [bool(_NEGATION_RE.search(w)) for w in words]
+    n = len(units)
+
+    def size(i: int, j: int) -> int:
+        return sum(u[2] for u in units[i : j + 1])
+
+    i, j = a, b
+    if modifier:
+        if i and free[i - 1] and not edge[i - 1] and words[i - 1].isalpha():
+            i -= 1
+        for k in range(i - 1, 0, -1):  # the clause's first word is sentence case, not a name
+            if not free[k]:
+                break
+            if named[k]:
+                i = k if size(k, j) <= _TERM_MAX_WORDS else i
+                break
+    i = next((k for k in range(i) if negated[k]), i)
+    j = next((k for k in range(n - 1, j, -1) if negated[k]), j)
+    if size(i, j) > _TERM_MAX_WORDS or not all(free[i : j + 1]):
+        return ()
+    lo, hi = i, j
+
+    def cut(i: int, j: int) -> tuple[int, int]:
+        while i < lo and edge[i]:
+            i += 1
+        while j > hi and edge[j]:
+            j -= 1
+        if j + 1 < n and free[j + 1] and not edge[j + 1]:
+            k = max((k for k in range(hi + 1, j + 1) if edge[k]), default=None)
+            if k is not None and not any(named[k : j + 1]):
+                j = k - 1
+                while j > hi and edge[j]:
+                    j -= 1
+        if i and free[i - 1] and not edge[i - 1]:
+            k = min((k for k in range(i, lo) if edge[k]), default=None)
+            if k is not None and not any(named[i : k + 1]):
+                i = k + 1
+                while i < lo and edge[i]:
+                    i += 1
+        return i, j
+
+    while j + 1 < n and free[j + 1] and size(i, j + 1) <= _TERM_MAX_WORDS:
+        j += 1
+    i, j = cut(i, j)
+    shorter = [cut(i, k) for k in range(j - 1, hi - 1, -1)]
+    narrow = (i, j)
+    while i and free[i - 1] and size(i - 1, j) <= _TERM_MAX_WORDS:
+        i -= 1
+    return tuple(text[units[s][0] : units[e][1]] for s, e in (cut(i, j), narrow, *shorter))
+
+
+def _passage_term(hit: dict[str, object], extracted: str | None = None) -> str | None:
+    """Clause window around the first exposure word or amount, else the extracted term, else the quoted query.
+
+    Content is the snippet, else the description. Every candidate is a whole-word
+    slice of one clause in that field. The term never invents text, never splits an
+    amount, keeps clause negations and amount qualifiers, never repeats the section
+    label, and never carries the filer name. The query counts only when the snippet
+    quotes it, never from a description heading.
+    """
+    snippet = str(hit.get("snippet") or "")
+    text = snippet or str(hit.get("file_description") or "")
     query = str(hit.get("query") or "").strip()
-    return query or None
+    filer = str(hit.get("filer_name") or "")
+    exposure = _EXPOSURE_RE.search(text)
+    amount = _AMOUNT_RE.search(text)
+    found = text.find(extracted) if extracted else -1
+    phrase = _term_window(text, exposure.start(), exposure.end(), filer, True) if exposure else ()
+    money = _term_window(text, amount.start(), amount.end(), filer, False) if amount else ()
+    needle = _term_window(text, found, found + len(extracted or ""), filer, False) if found >= 0 else ()
+    # ponytail: reading order inside one clause picks between the two grounded spans; no salience model.
+    money_first = amount is not None and (
+        exposure is None
+        or (amount.start() < exposure.start() and not _CLAUSE_BREAK_RE.search(text, amount.end(), exposure.start()))
+    )
+    lead, trail = (money, phrase) if money_first else (phrase, money)
+    quoted = re.search(rf"(?<!\w){re.escape(query)}(?!\w)", snippet, re.IGNORECASE) if query else None
+    query_windows = _term_window(text, quoted.start(), quoted.end(), filer, False) if quoted else ()
+    candidates = (
+        *lead,
+        exposure.group(0) if exposure and phrase and not _NEGATION_RE.search(phrase[0]) else None,
+        *needle,
+        *trail,
+        *query_windows,
+    )
+    section = _hit_section(hit)
+    return next(
+        (c for c in candidates if c and c != section and not (filer and filer.casefold() in c.casefold())), None
+    )
 
 
 def _document_matches(hits: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -5467,16 +5624,16 @@ def _document_matches(hits: list[dict[str, object]]) -> list[dict[str, object]]:
     return [{"accession": accession, "matching_passages": passages} for accession, passages in grouped.items()]
 
 
-def _hit_packet_labels(stored: dict[str, object]) -> dict[str, object]:
-    """Needle display labels verified against stored bytes; empty on any miss."""
+def _hit_packet_term(stored: dict[str, object]) -> str | None:
+    """Needle display term verified against stored content; None on any miss."""
     try:
         from .sec.discovery.service import packet_display_fields as _packet_labels
     except ImportError:
-        return {}
+        return None
     try:
         from .sec.models import SECTextHit as _Hit
     except ImportError:
-        return {}
+        return None
     try:
         row = _Hit(
             search_id=str(stored.get("search_id") or ""),
@@ -5496,23 +5653,19 @@ def _hit_packet_labels(stored: dict[str, object]) -> dict[str, object]:
             snippet=stored.get("snippet") if isinstance(stored.get("snippet"), str) else None,
         )
     except TypeError:
-        return {}
+        return None
     try:
-        fields = _packet_labels(row)
-    except Exception:  # noqa: BLE001 - display labels only; any miss returns empty labels
-        return {}
-    labels = {key: fields.get(key) for key in ("section", "term", "snippet")}
-    return {key: value for key, value in labels.items() if isinstance(value, str) and value}
+        term = _packet_labels(row).get("term")
+    except Exception:  # noqa: BLE001 - display labels only; any miss returns no term
+        return None
+    return term if isinstance(term, str) and term else None
 
 
 def _hit_window(hit: dict[str, object]) -> dict[str, object]:
     """One compact top hit: identity, document, relevance, and remainder pointer."""
-    labels = _hit_packet_labels(hit)
-    # ponytail: deterministic section and snippet win; Needle labels can be grounded but worse
-    # (filer name vs Risk Factors, `8%` fragment vs the full stored snippet).
-    section = hit.get("file_description") or hit.get("file_type") or labels.get("section")
-    snippet = hit.get("snippet") or labels.get("snippet") or hit.get("file_description")
-    term = labels.get("term") or _passage_term(hit)
+    section = _hit_section(hit)
+    snippet = hit.get("snippet") or section
+    term = _passage_term(hit, _hit_packet_term(hit))
     return {
         "accession": hit.get("accession_no"),
         "form": hit.get("form"),

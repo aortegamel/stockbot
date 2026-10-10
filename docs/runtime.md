@@ -20,7 +20,7 @@ Progress lines (`session`, `intake_start`, `intake_done`, `reasoner_*`,
 stripped `working` stage to keep the UI stall watchdog fed.
 
 Architecture: the kernel scheduler owns the agent loop (JEV selects over
-the whole registry every round, Needle fills arguments only, tools execute
+the whole registry every round, Needle fills tool arguments, tools execute
 via `app/tool_runtime.py` against canonical `app/tools.py`). Thesis
 monitoring runs the same scheduler in-process via
 `app/thesis/runner.py run_trigger` (injectable `_RUN_KERNEL` seam; the
@@ -46,6 +46,19 @@ golden scenario through the production kernel path with real SEC/FINRA/Exa
 credentials (`HEDGEFUND_LIVE=1`, `SEC_EDGAR_IDENTITY`, `FINRA_CLIENT_ID` /
 `FINRA_CLIENT_SECRET`, `EXA_ENABLED=1` + `EXA_API_KEY`) and re-exports the
 read-only harness-viewer projection. Without the opt-in flag it exits 2.
+
+## SEC discovery labels
+
+The stored description supplies the section label. The file type or form supplies the fallback.
+The stored snippet supplies the display window. Without a snippet, the section supplies the window.
+Needle extracts only a candidate term from the snippet. Identity metadata and section headings never enter that extraction passage.
+Description-only hits skip Needle. The shared term helper can extract financial subjects from their descriptions.
+
+Terms quote one stored field in its original case. The helper excludes filer names regardless of case.
+The helper preserves complete amounts, scale words, qualifiers, and clause negation.
+Terms contain at most eight words. If that limit cannot preserve essential meaning, the helper returns `None`.
+The helper never invents a term from an absent query. Empty source fields remain absent.
+These labels aid navigation. They do not replace raw filing evidence.
 
 ## Typed runtime contracts
 
