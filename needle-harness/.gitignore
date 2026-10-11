@@ -46,5 +46,6 @@ next-env.d.ts
 tsconfig.tsbuildinfo
 # bun coverage output (never committed)
 /coverage-ts/
+/coverage-harness/
 # packaged PDF.js assets copied at dev/build time (never committed)
 /public/pdfjs/
