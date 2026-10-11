@@ -63,6 +63,7 @@ local/
 coverage-python.lcov
 coverage-ts/
 coverage-rust.lcov
+reports/
 
 # mutmut working tree (full source copy; never commit)
 mutants/
