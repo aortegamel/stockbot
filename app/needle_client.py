@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import select
+import signal
 import subprocess
 import sys
 import threading
@@ -42,6 +43,7 @@ _STDERR_TAIL_CHARS = 2000
 # ponytail: 10s generation ceiling; a timeout kills + restarts the child (slow
 # tail, not queue wait — the clock starts at write/flush inside _exchange_locked).
 _GENERATE_TIMEOUT_S = 10.0
+_REAP_TIMEOUT_S = 2.0
 
 # ponytail: single-flight lock; per-request lanes if Needle throughput matters.
 _LOCK = threading.Lock()
@@ -49,6 +51,12 @@ _TAIL_LOCK = threading.Lock()
 _PROC: subprocess.Popen[str] | None = None
 _STDERR_TAIL = ""
 _ATEXIT_ARMED = False
+# Real Popen captured at import: test doubles swapped in later never count as owned groups.
+_REAL_POPEN = subprocess.Popen
+
+
+class _StartupTimeout(RuntimeError, TimeoutError):
+    """Startup/ping silence inside the 120s budget; distinct from the 10s generation ceiling."""
 
 
 def validate_needle_tool(jev_tool: str, needle_tool: object) -> str:
@@ -119,11 +127,42 @@ def _drain_stderr(proc: subprocess.Popen[str]) -> None:
         pass
 
 
+def _owned_pgid(proc: subprocess.Popen[str]) -> int | None:
+    """Owned group id: a real, unreaped child that leads its own session; None otherwise."""
+    # ponytail: an already-reaped leader skips the group kill (its pid may be reused);
+    # descendants of a self-crashed leader can outlive it. Track pgid at spawn if that matters.
+    if not isinstance(proc, _REAL_POPEN) or proc.returncode is not None:
+        return None
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        return None
+    return pgid if pgid == proc.pid else None
+
+
+def _destroy_proc(proc: subprocess.Popen[str]) -> None:
+    """SIGKILL the owned tree then reap; never raises, never blocks past reap budget."""
+    pgid = _owned_pgid(proc)
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=_REAP_TIMEOUT_S)
+    except OSError, subprocess.TimeoutExpired:
+        pass
+
+
 def _teardown() -> None:
     try:
         proc = _PROC
         if proc is not None:
-            proc.terminate()
+            _destroy_proc(proc)
     except OSError:
         pass
 
@@ -139,23 +178,35 @@ def _arm_atexit() -> None:
 def _spawn_locked() -> subprocess.Popen[str]:
     """Spawn the worker; caller holds _LOCK. Raises RuntimeError when spawning fails."""
     global _PROC
-    try:
-        proc: subprocess.Popen[str] = subprocess.Popen(
-            [_python(), str(_server())],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            env={**os.environ, "NEEDLE_TELEMETRY": "0", "DO_NOT_TRACK": "1"},
-        )
-    except OSError as exc:
-        raise RuntimeError(f"needle spawn failed: {exc}") from exc
-    if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+    if sys.platform != "win32":
         try:
-            proc.kill()
-        except OSError:
-            pass
+            proc: subprocess.Popen[str] = subprocess.Popen(
+                [_python(), str(_server())],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env={**os.environ, "NEEDLE_TELEMETRY": "0", "DO_NOT_TRACK": "1"},
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise RuntimeError(f"needle spawn failed: {exc}") from exc
+    else:
+        try:
+            proc = subprocess.Popen(
+                [_python(), str(_server())],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env={**os.environ, "NEEDLE_TELEMETRY": "0", "DO_NOT_TRACK": "1"},
+            )
+        except OSError as exc:
+            raise RuntimeError(f"needle spawn failed: {exc}") from exc
+    if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+        _destroy_proc(proc)
         raise RuntimeError("needle spawn failed: missing pipes")
     _PROC = proc
     _arm_atexit()
@@ -164,15 +215,12 @@ def _spawn_locked() -> subprocess.Popen[str]:
 
 
 def _kill_locked() -> None:
-    """Kill and forget the child; caller holds _LOCK. Next use respawns."""
+    """Kill the owned tree and reap; caller holds _LOCK. Next use respawns."""
     global _PROC
     proc, _PROC = _PROC, None
     if proc is None:
         return
-    try:
-        proc.kill()
-    except OSError:
-        pass
+    _destroy_proc(proc)
 
 
 def _readable_selected(stream: IO[str], timeout_s: float) -> list[IO[str]] | None:
@@ -228,7 +276,13 @@ def _ensure_locked() -> subprocess.Popen[str]:
         return proc
     _kill_locked()
     proc = _spawn_locked()
-    _ping_locked(proc)
+    try:
+        _ping_locked(proc)
+    except TimeoutError as exc:
+        _kill_locked()
+        raise _StartupTimeout(
+            f"needle startup timed out after {_TIMEOUT_S:g}s; stderr tail: {_tail_text() or '(empty)'}"
+        ) from exc
     return proc
 
 
@@ -331,6 +385,11 @@ def start() -> None:
         proc = _spawn_locked()
         try:
             _ping_locked(proc)
+        except TimeoutError as exc:
+            _kill_locked()
+            raise _StartupTimeout(
+                f"needle startup timed out after {_TIMEOUT_S:g}s; stderr tail: {_tail_text() or '(empty)'}"
+            ) from exc
         except OSError as exc:
             _kill_locked()
             raise RuntimeError(f"needle ping failed: {exc}") from exc
@@ -340,15 +399,9 @@ def start() -> None:
 
 
 def close() -> None:
-    """Idempotent shutdown: terminate the child; the next call respawns."""
-    global _PROC
+    """Idempotent shutdown: kill the owned tree and reap; the next call respawns."""
     with _LOCK:
-        proc, _PROC = _PROC, None
-    if proc is not None:
-        try:
-            proc.terminate()
-        except OSError:
-            pass
+        _kill_locked()
 
 
 def generate_arguments(*args: object, **kwargs: object) -> dict[str, JSONValue]:
@@ -394,7 +447,14 @@ def generate_arguments(*args: object, **kwargs: object) -> dict[str, JSONValue]:
         attempt = 0
         while True:
             try:
-                out = _exchange_locked(_ensure_locked(), tool, payload)
+                proc = _ensure_locked()
+                out = _exchange_locked(proc, tool, payload)
+            except _StartupTimeout as exc:
+                logger.warning("toolflow needle_gen_error sid=%s tool=%s err_type=StartupTimeout", sid_hint, tool)
+                raise RuntimeError(
+                    f"needle arguments.generate startup timed out after {_TIMEOUT_S:g}s for {tool!r}; "
+                    f"stderr tail: {_tail_text() or '(empty)'}"
+                ) from exc
             except TimeoutError as exc:
                 _kill_locked()
                 logger.warning("toolflow needle_gen_error sid=%s tool=%s err_type=TimeoutError", sid_hint, tool)
@@ -441,6 +501,8 @@ def _restartable_dict(
     while True:
         try:
             return exchange(_ensure_locked())
+        except _StartupTimeout:
+            raise
         except TimeoutError as exc:
             _kill_locked()
             raise RuntimeError(
@@ -459,6 +521,8 @@ def _restartable_vec(label: str, exchange: Callable[[subprocess.Popen[str]], lis
     while True:
         try:
             return exchange(_ensure_locked())
+        except _StartupTimeout:
+            raise
         except TimeoutError as exc:
             _kill_locked()
             raise RuntimeError(
