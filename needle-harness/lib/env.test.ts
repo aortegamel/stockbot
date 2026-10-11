@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { rmSync, writeFileSync } from "node:fs";
-import { fingerprintKey, loadDotenvAuthoritative, parseDotenv, redactKey } from "./env";
+import { createServer } from "node:net";
+import { firstFreePort, fingerprintKey, loadDotenvAuthoritative, parseDotenv, redactKey } from "./env";
 
 describe("parseDotenv", () => {
   test("quoted, unquoted, export, comments", () => {
@@ -36,5 +37,25 @@ describe("key identity helpers", () => {
     expect(fingerprintKey("oc_sk_74aaa")).not.toBe(fingerprintKey("oc_sk_f49aaa"));
     expect(redactKey("oc_sk_74abcdef")).toBe("oc_sk_74abc…");
     expect(redactKey("oc_sk_74abcdef")).not.toContain("abcdef");
+  });
+});
+
+describe("firstFreePort", () => {
+  test("returns the desired port when free, else the next free one", async () => {
+    const busy = createServer();
+    await new Promise<void>((resolve) => busy.listen(0, "127.0.0.1", resolve));
+    const address = busy.address();
+    if (!address || typeof address === "string") throw new Error("expected a bound TCP port");
+    const taken = address.port;
+    try {
+      expect(await firstFreePort(taken, "127.0.0.1", 10)).toBeGreaterThan(taken);
+    } finally {
+      await new Promise<void>((resolve) => busy.close(() => resolve()));
+    }
+    expect(await firstFreePort(taken, "127.0.0.1", 10)).toBe(taken);
+  });
+
+  test("fails closed when the range is exhausted", async () => {
+    await expect(firstFreePort(1, "127.0.0.1", 1)).rejects.toThrow("no free port");
   });
 });

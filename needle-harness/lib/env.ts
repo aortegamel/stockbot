@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { createServer } from "node:net";
 
 // ponytail: .env is authoritative — process.loadEnvFile never overrides inherited
 // exports, so a stale parent env (daemon broker, shell export) silently won. Parse
@@ -61,4 +62,17 @@ export function loadDotenvAuthoritative(dotenvPath: string): { loaded: boolean; 
     }
   }
   return { loaded: true, overridden };
+}
+
+// ponytail: scan upward from the desired port; first free bind wins.
+export async function firstFreePort(want: number, host = "127.0.0.1", attempts = 100): Promise<number> {
+  for (let port = want; port < want + attempts; port++) {
+    const free = await new Promise<boolean>((resolve) => {
+      const probe = createServer();
+      probe.once("error", () => resolve(false));
+      probe.listen(port, host, () => probe.close(() => resolve(true)));
+    });
+    if (free) return port;
+  }
+  throw new Error(`no free port in ${want}..${want + attempts - 1}`);
 }

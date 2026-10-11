@@ -4,7 +4,7 @@ import { rm, writeFile } from "node:fs/promises";
 import { homedir, networkInterfaces } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { fingerprintKey, loadDotenvAuthoritative } from "../lib/env";
+import { fingerprintKey, firstFreePort, loadDotenvAuthoritative } from "../lib/env";
 
 const HARNESS_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 const ROOT_DIR = dirname(HARNESS_DIR);
@@ -27,8 +27,10 @@ if (process.env.OPENCODE_API_KEY) {
 
 const VENV_PYTHON = `${homedir()}/.cache/needle-harness/.needle/bin/python`;
 const WARMUP_TIMEOUT_MS = 120_000;
-const PORT = process.env.PORT ?? "3000";
+const wantPort = Number(process.env.PORT ?? "3000");
+const PORT = String(Number.isInteger(wantPort) && wantPort > 0 ? await firstFreePort(wantPort) : await firstFreePort(3000));
 const CATALOG = process.env.NEEDLE_CATALOG ?? join(HARNESS_DIR, ".needle-catalog.json");
+if (PORT !== String(wantPort)) process.stdout.write(`needle [web]: port ${wantPort} busy, using ${PORT}\n`);
 
 // Next owns its subtree; the supervisor only marks an unhealthy web child.
 const WEB_UNHEALTHY_MARKER = join(HARNESS_DIR, ".needle-web-unhealthy");
