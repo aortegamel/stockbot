@@ -422,7 +422,14 @@ def test_gs_arch_facts_inference_split() -> None:
         parse_grounded_claims,
     )
 
-    assert tuple(CLAIM_TYPES) == ("observed_fact", "inference", "unknown", "contradicted")
+    assert tuple(CLAIM_TYPES) == (
+        "observed_fact",
+        "inference",
+        "unknown",
+        "contradicted",
+        "conditional_risk",
+        "attributed_report",
+    )
     # A cited claim that declares nothing stays inference: a citation never promotes it to fact.
     undeclared = parse_grounded_claims(
         _json.dumps([{"text": "GS revenue grew", "evidence_ids": ["EV-1"]}]), frozen=["EV-1"]
@@ -439,6 +446,40 @@ def test_gs_arch_facts_inference_split() -> None:
         frozen=["EV-1"],
     )
     assert unknown[0].claim_type == "unknown"  # unknown may cite nothing
+    risk = parse_grounded_claims(
+        _json.dumps(
+            [{"text": "A default could impair the marks", "claim_type": "conditional_risk", "evidence_ids": ["EV-1"]}]
+        ),
+        frozen=["EV-1"],
+    )
+    assert risk[0].claim_type == "conditional_risk"
+    reported = parse_grounded_claims(
+        _json.dumps(
+            [
+                {
+                    "text": "The filing reports management said exposure is capped",
+                    "claim_type": "attributed_report",
+                    "evidence_ids": ["EV-1"],
+                }
+            ]
+        ),
+        frozen=["EV-1"],
+    )
+    assert reported[0].claim_type == "attributed_report"
+    with pytest.raises(ModelOutputFailure):
+        parse_grounded_claims(
+            _json.dumps(
+                [{"text": "A default could impair the marks", "claim_type": "conditional_risk", "evidence_ids": []}]
+            ),
+            frozen=["EV-1"],
+        )
+    with pytest.raises(ModelOutputFailure):
+        parse_grounded_claims(
+            _json.dumps(
+                [{"text": "Management said exposure is capped", "claim_type": "attributed_report", "evidence_ids": []}]
+            ),
+            frozen=["EV-1"],
+        )
     with pytest.raises(ModelOutputFailure):
         parse_grounded_claims(
             _json.dumps([{"text": "GS revenue grew", "claim_type": "fact-ish", "evidence_ids": ["EV-1"]}]),
@@ -449,6 +490,17 @@ def test_gs_arch_facts_inference_split() -> None:
             _json.dumps([{"text": "GS revenue grew", "claim_type": "observed_fact", "evidence_ids": []}]),
             frozen=["EV-1"],
         )
+    from app.research.agents import conservative_claim_type
+    from app.research.synthesis.final import _CLAIM_SEVERITY, _split_effects
+
+    assert conservative_claim_type(["observed_fact", "conditional_risk"]) == "conditional_risk"
+    assert conservative_claim_type(["inference", "attributed_report"]) == "attributed_report"
+    assert conservative_claim_type(["conditional_risk", "attributed_report"]) == "conditional_risk"
+    assert _CLAIM_SEVERITY["conditional_risk"] == "conditional"
+    assert _CLAIM_SEVERITY["attributed_report"] == "attributed"
+    _first, second = _split_effects([risk[0], reported[0]])
+    assert _first == []
+    assert [row["claim_type"] for row in second] == ["conditional_risk", "attributed_report"]
 
 
 def test_gs_arch_claim_type_render_gate() -> None:
@@ -468,7 +520,14 @@ def test_gs_arch_claim_type_render_gate() -> None:
         evidence_ids=("EV-1",),
         requires_evidence=True,
         claims=(("GS marks fell", "inference", "inference"),),
-        claims_by_type={"observed_fact": 1, "inference": 1, "unknown": 0, "contradicted": 0},
+        claims_by_type={
+            "observed_fact": 1,
+            "inference": 1,
+            "unknown": 0,
+            "contradicted": 0,
+            "conditional_risk": 0,
+            "attributed_report": 0,
+        },
     )
     assert evaluate(honest).passed
     untyped = _In(
@@ -519,7 +578,14 @@ def test_gs_arch_material_claims_trace_to_raw(tmp_path: Path, monkeypatch: pytes
     assert isinstance(claims, list) and claims
     for claim in claims:
         assert isinstance(claim, dict)
-        assert claim.get("claim_type") in ("observed_fact", "inference", "unknown", "contradicted")
+        assert claim.get("claim_type") in (
+            "observed_fact",
+            "inference",
+            "unknown",
+            "contradicted",
+            "conditional_risk",
+            "attributed_report",
+        )
         refs = claim.get("evidence_ids", [])
         assert isinstance(refs, list)
         if claim.get("claim_type") != "unknown":  # only unknown may cite nothing
@@ -566,7 +632,14 @@ def _msft_trace(
                 "rendered_as": "inference",
             },
         ],
-        "claims_by_type": {"observed_fact": 1, "inference": 1, "unknown": 0, "contradicted": 0},
+        "claims_by_type": {
+            "observed_fact": 1,
+            "inference": 1,
+            "unknown": 0,
+            "contradicted": 0,
+            "conditional_risk": 0,
+            "attributed_report": 0,
+        },
         "waves": [freeze],
         "searches": ["sec-search:msft:1"],
         "committee_freeze_ids": [freeze] * 3,

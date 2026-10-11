@@ -3284,7 +3284,7 @@ def test_reg_evidence_record_kind_split(tmp_path: Path, monkeypatch: pytest.Monk
 
 def test_reg_evidence_claim_labels() -> None:
     """Claim type is declared, never inferred from wording: absent type stays inference, and
-    observed_fact/contradicted need at least one freeze id (unknown may cite none)."""
+    observed_fact/contradicted/conditional_risk/attributed_report need at least one freeze id (unknown may cite none)."""
     from app.research.agents import (
         CLAIM_TYPES,
         GroundedClaim,
@@ -3292,7 +3292,14 @@ def test_reg_evidence_claim_labels() -> None:
         parse_grounded_claims,
     )
 
-    assert tuple(CLAIM_TYPES) == ("observed_fact", "inference", "unknown", "contradicted")
+    assert tuple(CLAIM_TYPES) == (
+        "observed_fact",
+        "inference",
+        "unknown",
+        "contradicted",
+        "conditional_risk",
+        "attributed_report",
+    )
     assert GroundedClaim(text="GS revenue grew", evidence_ids=["EV-1"]).claim_type == "inference"
     declared = parse_grounded_claims(
         '[{"text": "GS revenue grew", "claim_type": "observed_fact", "evidence_ids": ["EV-1"]}]', frozen=["EV-1"]
@@ -3306,6 +3313,16 @@ def test_reg_evidence_claim_labels() -> None:
     with pytest.raises(ModelOutputFailure):
         parse_grounded_claims(
             '[{"text": "GS revenue grew", "claim_type": "observed_fact", "evidence_ids": []}]', frozen=["EV-1"]
+        )
+    with pytest.raises(ModelOutputFailure):
+        parse_grounded_claims(
+            '[{"text": "A default could impair the marks", "claim_type": "conditional_risk", "evidence_ids": []}]',
+            frozen=["EV-1"],
+        )
+    with pytest.raises(ModelOutputFailure):
+        parse_grounded_claims(
+            '[{"text": "Management said exposure is capped", "claim_type": "attributed_report", "evidence_ids": []}]',
+            frozen=["EV-1"],
         )
     with pytest.raises(ModelOutputFailure):
         parse_grounded_claims('[{"text": "unclear", "claim_type": "shrug", "evidence_ids": ["EV-1"]}]', frozen=["EV-1"])
@@ -4275,7 +4292,7 @@ def test_invariant_claims_only_envelope_is_incomplete(tmp_path: Path, monkeypatc
 
 
 def test_invariant_claim_type_is_declared_never_promoted() -> None:
-    """Absent type stays inference; observed_fact/contradicted need a freeze id; citations never upgrade."""
+    """Absent type stays inference; observed_fact/contradicted/conditional_risk/attributed_report need a freeze id; citations never upgrade."""
     from app.research.agents import ModelOutputFailure
     from app.research.agents.stockbot import run_stockbot
 
@@ -4302,6 +4319,29 @@ def test_invariant_claim_type_is_declared_never_promoted() -> None:
         )
     )
     assert [c.claim_type for c in declared.claims] == ["observed_fact"]
+    qualified = _run(
+        lambda prompt: _committee_output(
+            [
+                {
+                    "text": "A default could impair the marks.",
+                    "claim_type": "conditional_risk",
+                    "evidence_ids": ["EV-1"],
+                },
+                {
+                    "text": "Management said exposure is capped.",
+                    "claim_type": "attributed_report",
+                    "evidence_ids": ["EV-1"],
+                },
+            ]
+        )
+    )
+    assert [c.claim_type for c in qualified.claims] == ["conditional_risk", "attributed_report"]
+    with pytest.raises(ModelOutputFailure, match="uncited"):
+        _run(
+            lambda prompt: _committee_output(
+                [{"text": "A default could impair the marks.", "claim_type": "conditional_risk", "evidence_ids": []}]
+            )
+        )
     with pytest.raises(ModelOutputFailure, match="uncited"):
         _run(
             lambda prompt: _committee_output(
@@ -5838,6 +5878,69 @@ def test_hf_replay_admits_finra_record(tmp_path: Path, monkeypatch: pytest.Monke
     assert _hf_prov(out, "tool_name") == "query_finra"
     assert _hf_prov(out, "known_at") == "2025-06-20"
     assert out["known_at"] == "2025-06-20T00:00:00+00:00"
+
+
+def test_hf_replay_sec_records_distinct_and_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Distinct SEC catalog records remain distinct. Exact replay returns the original evidence."""
+    import json
+
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC")
+    sec = str(_svc.start_job(sid, "source_agent", source="SEC", repo=repo, wave_id=1)["job_id"])
+    items: list[dict[str, object]] = []
+    records = (
+        {"form": "4", "accession_no": "0001045810-25-000001", "filed_at": "2025-06-01"},
+        {"form": "10-Q", "accession_no": "0001045810-25-000002", "filed_at": "2025-06-02"},
+    )
+    for index, row in enumerate(records):
+        rid = str(
+            _svc.persist_tool_result(
+                sid,
+                sec,
+                "list_sec_filings",
+                f"{sid}:tr:sec-{index}",
+                {"subject": "NVDA", "filings": [row], "source": "SEC EDGAR"},
+                repo=repo,
+            )["tool_result_id"]
+        )
+        passage = json.dumps(row, sort_keys=True)
+        item: dict[str, object] = {
+            "evidence_id": f"{sid}:ev:sec-{index}",
+            "content": passage,
+            "claim_text": "SEC catalog lists an NVDA filing.",
+            "subject": "NVDA",
+            "observation_type": "objective",
+            "source_name": "SEC",
+            "known_at": row["filed_at"],
+            "tool_result_id": rid,
+            "matching_passage": passage,
+        }
+        items.append(item)
+        out = _svc.record_evidence(sid, sec, item, repo=repo)
+        assert out["evidence_id"] == item["evidence_id"]
+        assert _hf_prov(out, "kind") == "sec_record"
+        assert _hf_prov(out, "record_identity") == passage
+
+    stored = repo.list_evidence(sid)
+    assert len(stored) == 2
+    keys: list[str] = []
+    for record in stored:
+        metadata = record["metadata"]
+        assert isinstance(metadata, dict)
+        keys.append(str(metadata["identity_key"]))
+    assert len(set(keys)) == 2
+    assert all(key.startswith("sec|record|list_sec_filings|") for key in keys)
+    for index, item in enumerate(items):
+        replay = _svc.record_evidence(sid, sec, {**item, "evidence_id": f"{sid}:ev:replay-{index}"}, repo=repo)
+        assert replay == {
+            "evidence_id": item["evidence_id"],
+            "accepted": False,
+            "duplicate_of": item["evidence_id"],
+        }
+    assert len(repo.list_evidence(sid)) == 2
 
 
 def test_hf_replay_admits_web_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
