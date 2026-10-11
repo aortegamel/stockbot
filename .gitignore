@@ -64,6 +64,9 @@ coverage-python.lcov
 coverage-ts/
 coverage-rust.lcov
 
+# Generated verification reports (Stryker mutation output; never commit)
+reports/
+
 # mutmut working tree (full source copy; never commit)
 mutants/
 .needle/
