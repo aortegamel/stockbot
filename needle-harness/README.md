@@ -62,6 +62,9 @@ Each capture carries one explicit kind label:
 The viewer marks only an exact quote. Matching ignores whitespace and nothing else. It never makes fuzzy matches.
 SEC HTML matching runs against the server's rendered canonical text.
 The viewer maps preserved table cells onto that basis before it trusts stored coordinates.
+Exa highlights may contain provider HTML. The viewer tries the stored quote first. If that fails, it projects
+provider HTML through the same sanitizer and retries the exact match against the rendered characters.
+An exact literal match, even an ambiguous one, always wins over the projection.
 Stored full-document coordinates or prefix and suffix context select one occurrence of a repeated quote.
 If more than one match remains, the viewer reports an ambiguous quote and marks no passage.
 If no match exists, the viewer reports an unresolved quote and marks no passage.

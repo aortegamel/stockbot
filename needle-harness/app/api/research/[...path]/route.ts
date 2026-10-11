@@ -140,8 +140,13 @@ export async function GET(req: Request): Promise<Response> {
     const r = runBridge({ kind: "sessions", limit });
     return Response.json(r.body, { status: r.status, headers: { "Cache-Control": "no-store" } });
   }
-  const sessionId = parts[2] ?? "";
-  if (!sessionId || !/^[A-Za-z0-9:_-]{1,128}$/.test(sessionId)) {
+  let sessionId: string;
+  try {
+    sessionId = decodeURIComponent(parts[2] ?? "");
+  } catch {
+    return Response.json({ error: "bad session_id" }, { status: 400 });
+  }
+  if (!/^[A-Za-z0-9:_-]{1,128}$/.test(sessionId)) {
     return Response.json({ error: "bad session_id" }, { status: 400 });
   }
   if (parts.length === 4 && parts[3] === "journal") {

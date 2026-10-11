@@ -491,8 +491,9 @@ def _intake_reasoner_prompt(objective_id: str, objective: str, as_of: str | None
         "Output exactly one JSON object and nothing else:\n"
         '{"proposals": [{"id","objectiveId","question","dependsOn","whyItMatters"}],\n'
         ' "tickers"?: string[], "corrected_query"?: string}\n'
-        f'Proposal ids start with "{objective_id}-". dependsOn may reference only ids you\n'
-        "propose in this same output. "
+        f'Proposal ids start with "{objective_id}-". Every "objectiveId" must equal\n'
+        f'"{objective_id}" exactly. dependsOn may reference only ids you propose in this\n'
+        "same output. "
         f"Today is {utcnow().date().isoformat()} UTC; decode relative dates against it.\n"
     )
 

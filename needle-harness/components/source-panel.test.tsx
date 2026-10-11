@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import { act } from "react";
 import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
+import fc from "fast-check";
 import type { Root } from "react-dom/client";
 import { JSDOM } from "jsdom";
 import { AgentConsole } from "./agent-console";
@@ -105,6 +106,36 @@ async function click(root: HTMLElement, label: string): Promise<void> {
 
 const resolved = (root: HTMLElement) => () => root.textContent?.includes("The quote matches the captured source.") ?? false;
 
+async function open(source: SourceDocument): Promise<HTMLElement> {
+  serve({ body: source });
+  const root = await mount(panel(source.id));
+  await until(() => /The quote matches|Ambiguous quote|does not resolve/u.test(root.textContent ?? ""));
+  return root;
+}
+
+async function close(): Promise<void> {
+  await act(async () => mounted?.unmount());
+  mounted = null;
+}
+
+const shownQuote = (root: HTMLElement) => root.querySelector("blockquote p")?.textContent;
+const originalHref = (root: HTMLElement) => [...root.querySelectorAll("a")].find((anchor) => anchor.textContent === "Open original")?.getAttribute("href");
+const markTexts = (root: HTMLElement) => [...root.querySelectorAll('[aria-label="Captured source content"] mark')].map((mark) => mark.textContent);
+const fragment = (url: string, quote: string) => `${url}#:~:text=${encodeURIComponent(quote)}`;
+
+const EXA: SourceDocument = {
+  ...TEXT,
+  id: "evidence:panel:exa",
+  title: "Nvidia results",
+  url: "https://news.example/article",
+  publisher: "Exa",
+  contentHash: "sha256-of-raw-exa-body",
+  representation: "html",
+  captureKind: "provider_extraction",
+  content: `<h1>Chip results</h1><p>Nvidia&#39;s <strong>sales <em>soared</em></strong> &amp; margins held.</p><figure><p>Getty Images</p></figure><p>Revenue doubled.</p>`,
+  quote: `Nvidia&#39;s <strong>sales <em>soared</em></strong> &amp; margins held.</p><figure><p>Getty Images</p></figure><p>Revenue dou`,
+};
+
 describe("SourcePanel", () => {
   test("renders text captures with metadata and marks the exact quote", async () => {
     const requests = serve({ body: TEXT });
@@ -184,6 +215,113 @@ describe("SourcePanel", () => {
     expect([...root.querySelectorAll("button")].some((entry) => entry.textContent === "Go to quote")).toBe(false);
     expect(root.querySelector('[aria-label="Captured source content"]')?.textContent).toBe("RevenueRevenue");
   });
+
+  test("projects an Exa HTML quote to rendered text for the marks, the display, and the original link", async () => {
+    const requests = serve({ body: EXA });
+    const root = await mount(panel(EXA.id));
+    await until(resolved(root));
+    const projected = "Nvidia's sales soared & margins held.\nGetty Images\nRevenue dou";
+    expect(requests).toEqual(["/api/research/sources/evidence%3Apanel%3Aexa"]);
+    expect(shownQuote(root)).toBe(projected);
+    expect(markTexts(root)).toEqual(["Nvidia's ", "sales ", "soared", " & margins held.", "Getty Images", "Revenue dou"]);
+    expect(root.querySelector('[aria-label="Captured source content"] strong em mark')?.textContent).toBe("soared");
+    expect(originalHref(root)).toBe(fragment(EXA.url ?? "", "Nvidia's sales soared & margins held. Getty Images Revenue dou"));
+    expect(root.textContent).toContain("sha256-of-raw-exa-body");
+    expect(root.textContent).toContain("Provider extraction — not the original document");
+  });
+
+  test("a literal angle-bracket match wins over the projected markup", async () => {
+    const root = await open({
+      ...EXA,
+      content: "<p>Template &lt;b&gt;Revenue&lt;/b&gt; stays literal.</p><p>Bold <b>Revenue</b> elsewhere.</p>",
+      quote: "<b>Revenue</b>",
+    });
+    expect(root.textContent).toContain("The quote matches the captured source.");
+    expect(markTexts(root)).toEqual(["<b>Revenue</b>"]);
+    expect(root.querySelector('[aria-label="Captured source content"] b mark')).toBeNull();
+    expect(shownQuote(root)).toBe("<b>Revenue</b>");
+    expect(originalHref(root)).toBe(fragment(EXA.url ?? "", "<b>Revenue</b>"));
+  });
+
+  test("an ambiguous literal match stays ambiguous even when the projection is unique", async () => {
+    const root = await open({
+      ...EXA,
+      captureKind: "search_excerpt",
+      content: "<p>a &lt;i&gt;b</p><p>a &lt;i&gt;b</p><p>a <i>b</i> c</p>",
+      quote: "a <i>b",
+    });
+    expect(root.textContent).toContain("Ambiguous quote: 2 matches remain. No passage is selected.");
+    expect(markTexts(root)).toEqual([]);
+    expect(shownQuote(root)).toBe("a <i>b");
+    expect(originalHref(root)).toBe(EXA.url);
+  });
+  test("a search excerpt resolves through the same rendered-quote projection", async () => {
+    const root = await open({
+      ...EXA,
+      captureKind: "search_excerpt",
+      content: "<p>Sales <em>rose</em> in May.</p>",
+      quote: "Sales <em>rose</em>",
+    });
+    expect(root.textContent).toContain("The quote matches the captured source.");
+    expect(markTexts(root)).toEqual(["Sales ", "rose"]);
+    expect(shownQuote(root)).toBe("Sales rose");
+    expect(originalHref(root)).toBe(fragment(EXA.url ?? "", "Sales rose"));
+  });
+
+
+  test("a projected quote with two rendered occurrences stays ambiguous", async () => {
+    const root = await open({ ...EXA, content: "<p>Sales <em>rose</em> in May.</p><p>Sales <b>rose</b> in June.</p>", quote: "Sales <em>rose</em>" });
+    expect(root.textContent).toContain("Ambiguous quote: 2 matches remain. No passage is selected.");
+    expect(markTexts(root)).toEqual([]);
+    expect([...root.querySelectorAll("button")].some((entry) => entry.textContent === "Go to quote")).toBe(false);
+    expect(shownQuote(root)).toBe("Sales rose");
+    expect(originalHref(root)).toBe(EXA.url);
+  });
+
+  test("truncated markup or entities that cannot match stay unresolved with the stored quote", async () => {
+    for (const quote of ["Tom &am", "Jerry</p><p>Spike <em cla"]) {
+      const root = await open({ ...EXA, content: "<p>Tom &amp; Jerry</p>", quote });
+      expect(root.textContent).toContain("The quote does not resolve in the rendered source. No passage is selected.");
+      expect(markTexts(root)).toEqual([]);
+      expect(shownQuote(root)).toBe(quote);
+      expect(originalHref(root)).toBe(EXA.url);
+      await close();
+    }
+  });
+
+  test("original HTML and text captures never project markup quotes", async () => {
+    for (const source of [
+      { ...EXA, captureKind: "original" as const, content: "<p><em>Revenue</em> grew</p>" },
+      { ...EXA, representation: "text" as const, content: "Revenue grew" },
+    ]) {
+      const root = await open({ ...source, quote: "<em>Revenue</em> grew" });
+      expect(root.textContent).toContain("The quote does not resolve in the rendered source. No passage is selected.");
+      expect(markTexts(root)).toEqual([]);
+      expect(shownQuote(root)).toBe("<em>Revenue</em> grew");
+      await close();
+    }
+  });
+
+  test("inline markup and entities project to the exact rendered sentence", async () => {
+    const word = fc.oneof(fc.stringMatching(/^[a-z]{1,6}$/), fc.constant("&"));
+    const tag = fc.constantFrom("", "em", "strong", "b", "i");
+    await fc.assert(
+      fc.asyncProperty(fc.array(fc.tuple(word, tag), { minLength: 2, maxLength: 6 }), async (words) => {
+        const plain = words.map(([text]) => text).join(" ");
+        const html = words.map(([text, name]) => {
+          const escaped = text === "&" ? "&amp;" : text;
+          return name ? `<${name}>${escaped}</${name}>` : escaped;
+        }).join(" ");
+        const root = await open({ ...EXA, content: `<p>0000 ${html} 1111</p><p>2222</p>`, quote: html });
+        expect(root.textContent).toContain("The quote matches the captured source.");
+        expect(shownQuote(root)).toBe(plain);
+        expect(markTexts(root).join("").replace(/\s/gu, "")).toBe(plain.replace(/\s/gu, ""));
+        expect(originalHref(root)).toBe(fragment(EXA.url ?? "", plain));
+        await close();
+      }),
+      { seed: 20261010, numRuns: 25 },
+    );
+  }, 20_000);
 
   test("shows the source error, then recovers the capture through Retry source", async () => {
     const requests = serve({ body: { error: "source capture not found" }, status: 404 }, { body: TEXT });

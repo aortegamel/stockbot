@@ -179,9 +179,11 @@ describe("existing research routes", () => {
     const body = { marker: "unchanged" };
     result.stdout = JSON.stringify({ ok: true, data: body });
     for (const [path, expected] of [
+      ["/api/research/sessions", { kind: "sessions", limit: 20 }],
       ["/api/research/sessions?limit=999", { kind: "sessions", limit: 100 }],
       ["/api/research/sessions?limit=invalid", { kind: "sessions", limit: 20 }],
       ["/api/research/session_1", { kind: "snapshot", session_id: "session_1" }],
+      ["/api/research/session_1/journal", { kind: "journal", session_id: "session_1", after_seq: 0 }],
       ["/api/research/session_1/journal?after_seq=5", { kind: "journal", session_id: "session_1", after_seq: 5 }],
       ["/api/research/session_1/journal?after=-3", { kind: "journal", session_id: "session_1", after_seq: 0 }],
     ] as const) {
@@ -200,5 +202,85 @@ describe("existing research routes", () => {
     const response = await read("/api/research/missing");
     expect(response.status).toBe(404);
     expect(await response.json()).toEqual({ error: "unknown session: missing" });
+  });
+  test("maps non-source bridge failures without leaking process output", async () => {
+    const cases: { failure: Partial<SpawnSyncReturns<string>>; status: number; error: string }[] = [
+      { failure: { error: new Error("spawn /private/venv/bin/python ENOENT") }, status: 502, error: "bridge spawn failed: spawn /private/venv/bin/python ENOENT" },
+      { failure: { status: 1, stdout: JSON.stringify({ ok: false, error: "unknown session: missing" }) }, status: 404, error: "unknown session: missing" },
+      { failure: { status: 1, stdout: "Traceback: /private/data", stderr: "Traceback: /private/journal" }, status: 404, error: "Traceback: /private/journal" },
+      { failure: { status: 2, stdout: "Traceback: /private/data", stderr: "" }, status: 502, error: "research read failed" },
+      { failure: { status: 0, stdout: "Traceback: /private/data" }, status: 502, error: "research bridge bad json" },
+      { failure: { status: 0, stdout: JSON.stringify({ ok: true }) }, status: 502, error: "research bridge bad json" },
+    ];
+    for (const { failure, status, error } of cases) {
+      result = { pid: 1, output: [], stdout: "", stderr: "", status: 0, signal: null, ...failure };
+      const response = await read("/api/research/session_1");
+      expect(response.status).toBe(status);
+      expect(await response.json()).toEqual({ error });
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+    }
+  });
+
+
+  const sessionId = "rs:4d6534bd-0c1e-4b8a-9f2d-3a5b6c7d8e9f";
+  function sessionPath(id: string, suffix = ""): string {
+    return `/api/research/${encodeURIComponent(id)}${suffix}`;
+  }
+
+  test("decodes encoded and literal session IDs once for snapshots and journals", async () => {
+    const maxId = `rs:${"a".repeat(125)}`;
+    for (const [path, expected] of [
+      [sessionPath(sessionId), { kind: "snapshot", session_id: sessionId }],
+      [sessionPath(sessionId, "/journal?after_seq=5"), { kind: "journal", session_id: sessionId, after_seq: 5 }],
+      [`/api/research/${sessionId}`, { kind: "snapshot", session_id: sessionId }],
+      [`/api/research/${sessionId}/journal?after=-3`, { kind: "journal", session_id: sessionId, after_seq: 0 }],
+      [sessionPath(maxId), { kind: "snapshot", session_id: maxId }],
+      ["/api/research/%73essions", { kind: "snapshot", session_id: "sessions" }],
+    ] as const) {
+      calls.length = 0;
+      const response = await read(path);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+      expect(payload()).toEqual(expected);
+    }
+  });
+
+  test("rejects malformed encodings and invalid decoded session IDs without the bridge", async () => {
+    const invalidIds = [
+      "rs/../x",
+      "rs/x",
+      "rs\0x",
+      "rs x",
+      "rs\nx",
+      "..",
+      `rs:${"a".repeat(126)}`,
+      encodeURIComponent(sessionId),
+    ];
+    const malformed = ["%ZZ", "rs%ZZ", `${encodeURIComponent(sessionId)}%`, "%E0%A4%A", "%C0%AF", "%FF"];
+    for (const path of [
+      ...invalidIds.flatMap((id) => [sessionPath(id), sessionPath(id, "/journal")]),
+      ...malformed.flatMap((segment) => [`/api/research/${segment}`, `/api/research/${segment}/journal`]),
+      "/api/research/",
+      "/api/research",
+    ]) {
+      const response = await read(path);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: "bad session_id" });
+    }
+    expect(calls.length).toBe(0);
+  });
+
+  test("keeps unknown session path shapes as not found without the bridge", async () => {
+    for (const path of [sessionPath(sessionId, "/raw"), sessionPath(sessionId, "/journal/extra"), "/api/research/rs/4d6534bd"]) {
+      const response = await read(path);
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: "unknown research path" });
+    }
+    expect(calls.length).toBe(0);
+  });
+  test("treats a collapsed empty segment as a literal journal identifier", async () => {
+    const response = await read("/api/research//journal");
+    expect(response.status).toBe(200);
+    expect(payload()).toEqual({ kind: "snapshot", session_id: "journal" });
   });
 });

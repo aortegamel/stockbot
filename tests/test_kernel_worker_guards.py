@@ -610,10 +610,17 @@ def test_notify_progress_failure_propagates_with_setup_error_envelope(monkeypatc
 
 
 def test_normalize_proposals_malformed_raises_typeerror() -> None:
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="proposal must be an object"):
         kw._normalize_proposals([object()], "s")
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="empty proposals"):
         kw._normalize_proposals("not-a-list", "s")
+    with pytest.raises(TypeError, match="empty proposals"):
+        kw._normalize_proposals([], "s")
+
+
+def test_normalize_proposals_ignores_non_list_dependencies() -> None:
+    proposal = {"id": "s-q1", "objectiveId": "s", "question": "q?", "dependsOn": "s-q2", "whyItMatters": "w"}
+    assert kw._normalize_proposals([proposal], "s") == [{**proposal, "dependsOn": []}]
 
 
 def test_create_nodes_topological_cycle_rejects(monkeypatch: pytest.MonkeyPatch) -> None:
