@@ -2,15 +2,17 @@
 
 import asyncio
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import override
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from app.decision_client import JevClient
-from app.reasoner_client import ReasonerClient, check_decompose_hints
+from app.reasoner_client import ReasonerClient, check_decompose_hints, check_proposals
 from app.research import kernel_worker as kw
 from app.research import scheduler as sched
 from app.research.models import DecisionRecord, JSONValue, ResearchNode, ToolDecision, new_decision_id
@@ -686,3 +688,148 @@ def test_quota_like_transient_still_retries(monkeypatch: pytest.MonkeyPatch) -> 
     proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
     assert calls["n"] == 2 and [p["id"] for p in proposals] == ["rs:t-q1"]
     assert "fallback" not in hints
+
+
+def _good_proposal(oid: str = "rs:t") -> dict[str, object]:
+    return {"id": f"{oid}-q1", "objectiveId": oid, "question": "Q?", "dependsOn": [], "whyItMatters": "W"}
+
+
+def _fake_reasoner_transport(monkeypatch: pytest.MonkeyPatch, reply: Callable[[int, str], str]) -> list[str]:
+    """Real ReasonerClient parse/validate behind a fake _default_post; no network, fixed clock."""
+    import datetime as _dt
+
+    prompts: list[str] = []
+
+    def fake_post(url: str, api_key: str, model: str, prompt: str, timeout_s: float = 120.0) -> dict[str, object]:
+        prompts.append(prompt)
+        text = reply(len(prompts), prompt)
+        return {"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]}
+
+    monkeypatch.setenv("OPENCODE_API_KEY", "k")
+    monkeypatch.setenv("OPENCODE_URL", "http://reasoner.invalid")
+    monkeypatch.setenv("OPENCODE_MODEL", "m")
+    monkeypatch.setattr("app.reasoner_client._default_post", fake_post)
+    monkeypatch.setattr(kw, "utcnow", lambda: _dt.datetime(2026, 1, 2, tzinfo=_dt.UTC))
+    return prompts
+
+
+def test_model_copying_prompt_example_passes_real_validator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prompt's example is valid JSON carrying the exact objectiveId, even with quotes in the id."""
+    oid = 'rs:"q"\\x'
+
+    def copy_example(n: int, prompt: str) -> str:
+        return next(line for line in prompt.splitlines() if line.startswith('{"proposals"'))
+
+    prompts = _fake_reasoner_transport(monkeypatch, copy_example)
+    proposals, _ = kw._reasoner_decompose_with_retry("how will orcl's manjure affect AAPL?", None, oid, "DIGEST")
+    assert len(prompts) == 1
+    assert [(p["id"], p["objectiveId"]) for p in proposals] == [(f"{oid}-q1", oid)]
+
+
+@settings(max_examples=200, derandomize=True)
+@given(st.text(min_size=1, max_size=40))
+def test_prop_prompt_example_passes_real_validator(oid: str) -> None:
+    """Any objective id (quotes, escapes, Unicode, line breaks): the example is valid JSON the validator admits."""
+    prompt = kw._intake_reasoner_prompt(oid, "q?", None, "")
+    lines = [line for line in prompt.splitlines() if line.startswith('{"proposals"')]
+    assert len(lines) == 1
+    hints = check_decompose_hints("decompose", json.loads(lines[0]))
+    proposals = check_proposals("decompose", hints["proposals"], oid, set())
+    assert [(p["id"], p["objectiveId"]) for p in proposals] == [(f"{oid}-q1", oid)]
+
+
+_CROSS_OBJECTIVE = {"proposals": [{**_good_proposal(), "objectiveId": "rs:other"}], "tickers": ["STALE"]}
+_QUOTA_LIKE_ID = {"proposals": [{**_good_proposal("rs:t-429-free-usage-subscribe"), "objectiveId": "rs:x"}]}
+_CONFIG_LIKE_ID = {
+    "proposals": [{**_good_proposal("rs:t-opencode_unavailable-missing opencode"), "objectiveId": "rs:x"}]
+}
+_CYCLE = {
+    "proposals": [
+        {**_good_proposal(), "dependsOn": ["rs:t-q2"]},
+        {**_good_proposal(), "id": "rs:t-q2", "dependsOn": ["rs:t-q1"]},
+    ],
+    "tickers": ["STALE"],
+}
+
+
+@pytest.mark.parametrize(
+    ("first_reply", "error"),
+    [
+        (json.dumps(_CROSS_OBJECTIVE), "decompose: proposal rs:t-q1 references wrong objective"),
+        # 429 / free-usage / subscribe / config markers inside a model id are validation,
+        # never rate, quota, or config.
+        (
+            json.dumps(_QUOTA_LIKE_ID),
+            "decompose: proposal rs:t-429-free-usage-subscribe-q1 references wrong objective",
+        ),
+        (
+            json.dumps(_CONFIG_LIKE_ID),
+            "decompose: proposal rs:t-opencode_unavailable-missing opencode-q1 references wrong objective",
+        ),
+        ("not json", "decompose: malformed_opencode_json"),
+        (json.dumps({"proposals": [], "tickers": ["STALE"]}), "decompose: empty proposals"),
+        (json.dumps(_CYCLE), "decompose: cyclic dependency involving rs:t-q1"),
+    ],
+)
+def test_invalid_reply_repaired_with_validator_feedback(
+    monkeypatch: pytest.MonkeyPatch, first_reply: str, error: str
+) -> None:
+    """Attempt 2 fixes the reply only when it sees the validator error and the exact required objectiveId."""
+    good = json.dumps({"proposals": [_good_proposal()], "corrected_query": "fixed"})
+    first_prompt: list[str] = []
+
+    def model(n: int, prompt: str) -> str:
+        if n == 1:
+            first_prompt.append(prompt)
+            return first_reply
+        feedback = prompt.removeprefix(first_prompt[0])
+        repaired = prompt.startswith(first_prompt[0]) and error in feedback and '"rs:t"' in feedback
+        return good if repaired else first_reply
+
+    prompts = _fake_reasoner_transport(monkeypatch, model)
+    proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
+    assert len(prompts) == 2
+    assert proposals == [_good_proposal()]
+    assert hints == {"corrected_query": "fixed"}  # no STALE tickers from the rejected reply
+
+
+@pytest.mark.parametrize(
+    ("second_reply", "match"),
+    [
+        (_CROSS_OBJECTIVE, "references wrong objective"),
+        ({"proposals": [{**_good_proposal(), "whyItMatters": ""}]}, "whyItMatters must be a nonempty string"),
+    ],
+)
+def test_repeated_invalid_reply_raises_after_two_calls(
+    monkeypatch: pytest.MonkeyPatch, second_reply: dict[str, object], match: str
+) -> None:
+    """Feedback never relaxes validation: a second invalid reply raises its own error, no third call."""
+    replies = [json.dumps(_CROSS_OBJECTIVE), json.dumps(second_reply)]
+    prompts = _fake_reasoner_transport(monkeypatch, lambda n, prompt: replies[n - 1])
+    with pytest.raises(ValueError, match=match):
+        kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
+    assert len(prompts) == 2
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        RuntimeError("opencode_request_failed: connection reset"),
+        TypeError("opencode_request_failed: non-object response"),
+    ],
+)
+def test_transport_error_resends_without_validator_feedback(
+    monkeypatch: pytest.MonkeyPatch, transport_error: Exception
+) -> None:
+    """Transport failures keep the plain resend: attempt 2 gets the unchanged prompt."""
+    good = json.dumps({"proposals": [_good_proposal()]})
+
+    def model(n: int, prompt: str) -> str:
+        if n == 1:
+            raise transport_error
+        return good
+
+    prompts = _fake_reasoner_transport(monkeypatch, model)
+    proposals, _ = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
+    assert len(prompts) == 2 and prompts[1] == prompts[0]
+    assert proposals == [_good_proposal()]
