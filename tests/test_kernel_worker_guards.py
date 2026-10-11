@@ -734,6 +734,55 @@ def test_followup_links_new_evidence_not_pass1(monkeypatch: pytest.MonkeyPatch) 
     assert "ev-pass1" in ids and new_eid in ids
 
 
+def test_wire_evidence_sends_full_sec_document_observation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stored SEC document text reaches personas whole; other rows and textless rows keep the 2000 cap."""
+    import asyncio
+    import tempfile
+    from pathlib import Path
+
+    from app.research import service
+    from app.research.repository import ResearchRepository
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
+    sid = service.create_research("q?", "q?")
+    service.create_node(sid, "q1?", "w")
+    fact = "Total revenue $46,743 million"
+    window = "Item 2. MD&A | 25\n" * 112 + fact + "x" * 9000  # fact starts at char 2016 of an ~11k window
+    assert window.index(fact) > 2000
+    sec_prov = {"kind": "sec_source", "accession_no": "0001045810-26-000075", "document_name": "nvda.htm"}
+    store = ResearchRepository()
+    store.save_evidence({"evidence_id": "ev-sec", "session_id": sid, "content": window, "provenance": sec_prov})
+    store.save_evidence(
+        {"evidence_id": "ev-web", "session_id": sid, "content": window, "provenance": {"kind": "web_source"}}
+    )
+    store.save_evidence(
+        {"evidence_id": "ev-rec", "session_id": sid, "content": window, "provenance": {"kind": "sec_record"}}
+    )
+    store.save_evidence(
+        {
+            "evidence_id": "ev-sec-blank",
+            "session_id": sid,
+            "content": "  ",
+            "provenance": {**sec_prov, "passage": window},
+        }
+    )
+
+    async def _fake_sched(run_sid: str, **hooks: object) -> dict[str, object]:
+        for n in service.ready_nodes(run_sid):
+            service.resolve_node(run_sid, n.node_id)
+        return {"status": "complete", "nodes": [], "incomplete_guard": False}
+
+    monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", lambda s: None)
+    out = asyncio.run(asyncio.to_thread(kw._run, {"id": "r6", "prompt": "q?", "sessionId": sid, "gap": "revenue"}))
+    rows = {e["id"]: e["content"] for e in out["evidence"] if isinstance(e, dict)}
+    assert rows["ev-sec"] == window
+    assert rows["ev-web"] == window[:2000] and rows["ev-rec"] == window[:2000]
+    # No stored text: the row never gets the full SEC projection (clipped record JSON, no fact).
+    blank = rows["ev-sec-blank"]
+    assert isinstance(blank, str) and len(blank) == 2000 and fact not in blank
+
+
 def test_setup_keyerror_is_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A KeyError inside run_graph_prompt reports provider_error, not invalid_params."""
     import tempfile

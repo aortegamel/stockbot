@@ -65,11 +65,13 @@ def test_settle_continuation_false_never_resolves() -> None:
     class _JevResolve:
         async def assess_result(self, *a: Any, **k: Any) -> dict[str, Any]:
             return {
-                "probabilities": {},
+                "probabilities": {"topical_relevance": 0.9, "resolution_support": 0.9},
                 "confidence": 1.0,
                 "continuation": "resolve_node",
                 "evidence_state": "sufficient_support",
                 "decision": "sufficient_support",
+                "topical_relevance_answer": "yes",
+                "resolution_support_answer": "yes",
             }
 
     record = {
@@ -596,3 +598,59 @@ def test_quota_like_transient_still_retries(monkeypatch: pytest.MonkeyPatch) -> 
     proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
     assert calls["n"] == 2 and [p["id"] for p in proposals] == ["rs:t-q1"]
     assert "fallback" not in hints
+
+
+def test_partially_relevant_tentative_report_admits() -> None:
+    admitted: list[dict[str, Any]] = []
+
+    class _K:
+        def record_decision(self, sid: str, dtype: str, **f: Any) -> None:
+            pass
+
+        def admit_evidence(self, sid: str, jid: str, cand: dict[str, Any]) -> dict[str, str]:
+            admitted.append(cand)
+            return {"evidence_id": "ev-1"}
+
+        def complete_job(self, jid: str, out: Any = None) -> None:
+            pass
+
+        def resolve_node(self, sid: str, nid: str) -> None:
+            pass
+
+    class _JevPartial:
+        async def assess_result(self, *a: Any, **k: Any) -> dict[str, Any]:
+            return {
+                "probabilities": {"topical_relevance": 0.85, "resolution_support": 0.55},
+                "confidence": 0.6,
+                "continuation": "continue_research",
+                "evidence_state": "conflicted",
+                "decision": "conflicted",
+                "topical_relevance_answer": "yes",
+                "resolution_support_answer": "unsure",
+            }
+
+    record = {
+        "tool": "search_sec_filings",
+        "arguments": {},
+        "outcome": SimpleNamespace(content="company warns cancellation may occur", error=None),
+        "outcome_summary": "company warns cancellation may occur",
+        "error": None,
+        "result": {"tool_result_id": "s1:tr:x", "source_handle": {"tool_result_id": "s1:tr:x"}, "text": "risk text"},
+        "job_id": "job-1",
+    }
+    out = asyncio.run(
+        sched._settle_round(
+            [record],
+            _JevPartial(),
+            _K(),
+            SimpleNamespace(nid="n1"),
+            [],
+            [],
+            "s1",
+            "n1",
+            {"tool_name": "t"},
+            0,
+            continuation=True,
+        )
+    )
+    assert out["terminal"] is None and admitted != []

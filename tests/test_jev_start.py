@@ -143,6 +143,17 @@ def test_tool_options_prompt_keeps_last_three_failures() -> None:
     assert "Today UTC is" in prompt and "decode relative dates before choosing" in prompt
     assert "page with research_read_search beyond display_limit" in prompt
     assert "[Today UTC " in prompt and "q?" in prompt
+    for question, wanted, absent in (
+        (
+            "What did NVDA's latest 10-Q disclose about revenue?",
+            "get_sec_document section reads (Item 1, Item 2, Item 1A)",
+            "with a revenue query",
+        ),
+        ("What drove NVDA revenue last quarter?", "get_sec_document with a revenue query", "section reads"),
+    ):
+        _, revenue_prompt = _tool_options_prompt(reg, {"node_id": "n1", "question": question}, [], [])
+        assert wanted in revenue_prompt and absent not in revenue_prompt
+    assert "open the 10-Q accession" not in prompt
 
 
 def test_tool_options_prompt_stamp_idempotent() -> None:
@@ -170,6 +181,29 @@ def test_outcome_dict_truncates_64k_content_keeps_error() -> None:
     assert isinstance(out["content"], str) and len(out["content"]) <= 2000
     assert out["error"] == err
     assert out["error_type"] == "boom"
+    assert "candidate" not in out
+
+
+def test_outcome_dict_passes_candidate_unclipped_content_stays_capped() -> None:
+    from app.decision_client import _outcome_dict
+
+    big = "x" * 65536
+    window = "y" * 32000
+    cand: dict[str, object] = {"source_handle": {"accession_no": "a"}, "content": window, "matching_passage": window}
+    out = _outcome_dict({"tool": "get_sec_document", "content": big}, cand)
+    assert isinstance(out["content"], str) and len(out["content"]) == 2000
+    assert out["candidate"] == cand
+    got = out["candidate"]
+    assert isinstance(got, dict) and got["content"] == window
+
+
+def test_outcome_dict_drops_unserializable_candidate_content_stays_capped() -> None:
+    from app.decision_client import _outcome_dict
+
+    big = "x" * 65536
+    out = _outcome_dict({"tool": "t", "content": big}, object())
+    assert isinstance(out["content"], str) and len(out["content"]) == 2000
+    assert "candidate" not in out
 
 
 class _HungStdout:
@@ -485,3 +519,158 @@ def test_http_fallback_runs_on_client_pool(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: resp)  # type: ignore[arg-type]
     monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
     assert asyncio.run(_run_and_close()) is client._http_pool
+
+
+def _final_stub(prob: float, state: str) -> object:
+    async def _run(state_arg: object, questions: dict[str, object]) -> object:
+        assert sorted(questions.keys()) == ["evidence_state", "support"]
+        return {
+            "answers": {
+                "support": {"type": "noul", "noul": prob},
+                "evidence_state": {
+                    "type": "choice",
+                    "choice": state,
+                    "probabilities": {
+                        "sufficient_support": 0.8 if state == "sufficient_support" else 0.05,
+                        "sufficient_contradiction": 0.8 if state == "sufficient_contradiction" else 0.05,
+                        "conflicted": 0.8 if state == "conflicted" else 0.05,
+                        "insufficient": 0.8 if state == "insufficient" else 0.05,
+                    },
+                    "confidence": 0.9,
+                },
+            }
+        }
+
+    return _run  # type: ignore[return-value]
+
+
+def _final_client(tmp_path: Path, prob: float, state: str) -> JevClient:
+    from collections.abc import Mapping
+
+    from app.research.models import JSONValue
+
+    root = Path(__file__).resolve().parent.parent
+    stub = _final_stub(prob, state)
+    client = JevClient(data_root=tmp_path, runtime_path=root / "decision" / "runtime.ts", transport=stub)  # type: ignore[arg-type]
+    seen: list[tuple[str, dict[str, object]]] = []
+    orig = client.decide
+
+    async def _spy(
+        state_arg: object, questions: Mapping[str, JSONValue], **kw: object
+    ) -> dict[str, dict[str, JSONValue]]:
+        seen.append((str(kw.get("decision_type")), dict(questions)))
+        out = await orig(state_arg, questions, **kw)  # type: ignore[arg-type]
+        client.decide_types = seen  # type: ignore[attr-defined]
+        return out
+
+    client.decide = _spy  # type: ignore[method-assign]
+    return client
+
+
+def test_assess_final_response_supported(tmp_path: Path) -> None:
+    client = _final_client(tmp_path, 0.85, "sufficient_support")
+    out = asyncio.run(
+        client.assess_final_response(
+            "Revenue grew per the filing.",
+            [{"id": "ev-1", "content": "10-Q shows revenue grew."}],
+            session_id="s1",
+            confidence=0.7,
+        )
+    )
+    assert out["support"] == 0.85 and out["support_answer"] == "yes"
+    assert out["evidence_state"] == "sufficient_support" and out["confidence"] == 0.7
+    assert client.decide_types[0][0] == "final_response_assessment"  # type: ignore[attr-defined]
+    instructions = client.decide_types[0][1]["support"]["instructions"]  # type: ignore[attr-defined]
+    assert "lacks inventory or cited support" in instructions
+
+
+def test_assess_final_response_conflicted(tmp_path: Path) -> None:
+    client = _final_client(tmp_path, 0.55, "conflicted")
+    out = asyncio.run(client.assess_final_response("Growth maybe.", [], session_id="s1"))
+    assert out["support_answer"] == "unsure" and out["evidence_state"] == "conflicted"
+    assert out["confidence"] is None
+
+
+def test_assess_final_claim_attributed(tmp_path: Path) -> None:
+    client = _final_client(tmp_path, 0.9, "sufficient_support")
+    out = asyncio.run(
+        client.assess_final_claim(
+            "WSJ reported the CEO resigned.",
+            "attributed_report",
+            [{"id": "ev-2", "content": "WSJ: CEO resigned."}],
+            session_id="s1",
+        )
+    )
+    assert out["support_answer"] == "yes" and out["evidence_state"] == "sufficient_support"
+    assert client.decide_types[0][0] == "final_claim_assessment"  # type: ignore[attr-defined]
+
+
+def test_assess_final_claim_conditional_and_missing(tmp_path: Path) -> None:
+    client = _final_client(tmp_path, 0.2, "insufficient")
+    out = asyncio.run(
+        client.assess_final_claim("If tariffs rise, margins may fall.", "conditional_risk", [], session_id="s1")
+    )
+    assert out["support_answer"] == "no" and out["evidence_state"] == "insufficient"
+    with pytest.raises(ValueError):
+        asyncio.run(client.assess_final_claim("  ", "inference", [], session_id="s1"))
+    with pytest.raises(ValueError):
+        asyncio.run(client.assess_final_claim("x", "  ", [], session_id="s1"))
+
+
+def test_assess_final_ops_fail_closed() -> None:
+    import app.research.kernel_worker as kw
+
+    blank = kw._assess_final_response({"id": "r1", "op": "assess_final_response", "text": "  "})
+    assert blank["support"] is None and blank["support_answer"] is None and blank["evidence_state"] == "insufficient"
+    assert blank["error"] == "text required"
+    noclaim = kw._assess_final_claim({"id": "c1", "op": "assess_final_claim", "claim": {"text": "x"}})
+    assert noclaim["support"] is None and noclaim["evidence_state"] == "insufficient"
+
+    class _Boom:
+        async def assess_final_response(self, *a: object, **k: object) -> object:
+            raise RuntimeError("jev down")
+
+        async def assess_final_claim(self, *a: object, **k: object) -> object:
+            raise RuntimeError("jev down")
+
+    down_r = kw._assess_final_response({"id": "r2", "text": "x", "evidence": []}, jev=_Boom())  # type: ignore[arg-type]
+    assert down_r["support"] is None and down_r["support_answer"] is None and down_r["evidence_state"] == "insufficient"
+    down_c = kw._assess_final_claim(
+        {"id": "c2", "claim": {"text": "x", "claim_type": "inference", "evidence_ids": []}, "evidence": []},
+        jev=_Boom(),  # type: ignore[arg-type]
+    )
+    assert down_c["support"] is None and down_c["evidence_state"] == "insufficient"
+
+
+def test_assess_final_ops_shape_and_alias(tmp_path: Path) -> None:
+    import app.research.kernel_worker as kw
+
+    client = _final_client(tmp_path, 0.8, "sufficient_support")
+    resp = kw._assess_final_response(
+        {
+            "id": "r3",
+            "op": "assess_final_response",
+            "text": "WSJ reported X; if Y then Z.",
+            "claims": [
+                {"text": "WSJ reported X.", "claim_type": "attributed_report", "evidence_ids": ["ev-1"]},
+                {"text": "If Y then Z.", "claim_type": "conditional_risk", "evidence_ids": ["ev-2"], "confidence": 0.6},
+            ],
+            "evidence": [{"id": "ev-1", "content": "WSJ: X."}, {"id": "ev-2", "content": "Y risk."}, {"id": "x"}],
+            "sessionId": "sess-9",
+            "confidence": 0.75,
+        },
+        jev=client,  # type: ignore[arg-type]
+    )
+    assert resp["id"] == "r3" and resp["support_answer"] == "yes" and "error" not in resp
+    assert client.decide_types[0][0] == "final_response_assessment"  # type: ignore[attr-defined]
+    claim = kw._assess_final_claim(
+        {
+            "id": "c3",
+            "op": "assess_final_claim",
+            "claim": {"text": "WSJ reported X.", "claim_type": "attributed_report", "evidence_ids": ["ev-1"]},
+            "evidence": [{"id": "ev-1", "content": "WSJ: X."}],
+            "session_id": "sess-9",
+        },
+        jev=client,  # type: ignore[arg-type]
+    )
+    assert claim["id"] == "c3" and claim["support_answer"] == "yes" and "error" not in claim

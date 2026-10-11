@@ -19,6 +19,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import threading
@@ -114,6 +115,20 @@ def _now() -> str:
 
 def _is_prob(v: object) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0
+
+
+def _classify_probability(value: object) -> str | None:
+    """Approved noul policy: yes >=.70, unsure >=.50, no below .50; None fail-closed."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    prob = float(value)
+    if not 0.0 <= prob <= 1.0:
+        return None
+    if prob >= 0.70:
+        return "yes"
+    if prob >= 0.50:
+        return "unsure"
+    return "no"
 
 
 def _parse_noul(name: str, qid: str, ans: object) -> dict[str, JSONValue]:
@@ -297,18 +312,25 @@ _MAX_PRIOR_FAILURES = 3
 _MAX_OUTCOME_CONTENT = 2000
 
 
-def _outcome_dict(outcome: object) -> dict[str, JSONValue]:
+def _outcome_dict(outcome: object, candidate: object = None) -> dict[str, JSONValue]:
     def text(value: object) -> str | None:
         return value if isinstance(value, str) else (None if value is None else str(value))
 
     content = text(_field(outcome, "content"))
-    return {
+    out: dict[str, JSONValue] = {
         "tool": _field(outcome, "tool_name", "tool"),
         "content": content[:_MAX_OUTCOME_CONTENT] if isinstance(content, str) else content,
         "error": text(_field(outcome, "error")),
         "error_type": text(_field(outcome, "error_type")),
         "tool_result_id": text(_field(outcome, "tool_result_id", "tool_result_ref")),
     }
+    cand = candidate if candidate is not None else _field(outcome, "candidate")
+    if cand is not None:
+        try:
+            out["candidate"] = validate_json_value(cand, "<decision_client>: 'candidate'")
+        except ValueError:
+            pass
+    return out
 
 
 def _evidence_ids(evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None) -> list[str]:
@@ -452,7 +474,10 @@ def _tool_options_prompt(
     prompt += f" Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values."
     prompt += " Search packets list candidates only — page with research_read_search beyond display_limit and open each accession via get_sec_filing/get_sec_document until answered or guard trips."
     _qtext = stamped if isinstance(stamped, str) else (question if isinstance(question, str) else "")
-    if "revenue" in _qtext.lower() and "quarter" in _qtext.lower():
+    _qlow = _qtext.lower()
+    if "revenue" in _qlow and re.search(r"\b10-?\s?q\b", _qlow) and re.search(r"\b(?:latest|most recent)\b", _qlow):
+        prompt += " Latest-10-Q revenue answers come from the 10-Q, not the 8-K: after the filing list, open the 10-Q accession via get_sec_document section reads (Item 1, Item 2, Item 1A) before re-reading any 8-K."
+    elif "revenue" in _qlow and "quarter" in _qlow:
         prompt += " Revenue-quarter answers come from the 10-Q (MD&A/segment revenue), not the 8-K: after the filing list, open the 10-Q accession via get_sec_document with a revenue query before re-reading any 8-K."
     return options, prompt
 
@@ -1336,13 +1361,28 @@ class JevClient:
         *,
         session_id: str,
         job_id: str | None = None,
+        candidate: object = None,
     ) -> dict[str, JSONValue]:
-        """Post-tool assessment: relevance noul + evidence-state choice + continue choice."""
+        """Post-tool assessment: topical relevance + resolution support + state + continue."""
         node_d = _node_dict(node)
         nid = node_d.get("node_id") or node_d.get("id")
         question = node_d.get("question") or ""
         questions: dict[str, JSONValue] = {
-            "relevance": {"type": "noul", "instructions": f"Do the available facts support resolving: {question}"},
+            "topical_relevance": {
+                "type": "noul",
+                "instructions": (
+                    f"Is this outcome topically about the node question, even when it cannot prove or resolve it: {question} "
+                    + "A risk disclosure is relevant to that risk. An attributed report is relevant without proving the event. "
+                    + "Contradictory material stays relevant."
+                ),
+            },
+            "resolution_support": {
+                "type": "noul",
+                "instructions": (
+                    f"Does the combined evidence resolve the node question, not merely mention it: {question} "
+                    + "Tentative reports and contradictions do not resolve. Conflicted or insufficient evidence never resolves."
+                ),
+            },
             "evidence_state": {
                 "type": "choice",
                 "instructions": "What best characterizes the evidence state for this node?",
@@ -1354,7 +1394,7 @@ class JevClient:
                 "criteria": dict(CONTINUE_OPTIONS),
             },
         }
-        state = {"node": node_d, "outcome": _outcome_dict(outcome), "evidence": evidence or []}
+        state = {"node": node_d, "outcome": _outcome_dict(outcome, candidate), "evidence": evidence or []}
         decisions = await self.decide(
             state,
             questions,
@@ -1364,12 +1404,15 @@ class JevClient:
             job_id=job_id,
             choice_options={"evidence_state": dict(EVIDENCE_STATE_OPTIONS), "continue": dict(CONTINUE_OPTIONS)},
         )
-        relevance = decisions.get("relevance") or {}
+        topical = decisions.get("topical_relevance") or {}
+        support = decisions.get("resolution_support") or {}
         ev_state = decisions.get("evidence_state") or {}
         cont = decisions.get("continue") or {}
         probs: dict[str, JSONValue] = {}
-        if isinstance(relevance.get("probability"), (int, float)):
-            probs["relevance"] = relevance["probability"]
+        if isinstance(topical.get("probability"), (int, float)):
+            probs["topical_relevance"] = topical["probability"]
+        if isinstance(support.get("probability"), (int, float)):
+            probs["resolution_support"] = support["probability"]
         if isinstance(ev_state.get("probabilities"), dict):
             probs.update(ev_state["probabilities"])
         if isinstance(cont.get("probabilities"), dict):
@@ -1387,7 +1430,159 @@ class JevClient:
             "admit": None,
             "evidence_state": ev_choice,
             "decision": ev_choice,
-            "relevance": relevance.get("probability"),
+            "topical_relevance": topical.get("probability"),
+            "resolution_support": support.get("probability"),
+            "topical_relevance_answer": _classify_probability(topical.get("probability")),
+            "resolution_support_answer": _classify_probability(support.get("probability")),
+        }
+
+    async def assess_final_response(
+        self,
+        text: str,
+        evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+        *,
+        session_id: str,
+        job_id: str | None = None,
+        confidence: float | None = None,
+        claims: Sequence[JSONValue] | None = None,
+    ) -> dict[str, JSONValue]:
+        """Whole-response gate: does cited evidence support the qualified wording as written."""
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("assess_final_response: text required")
+        excerpt = " ".join(text.split())[:2000]
+        count = len(evidence) if isinstance(evidence, list) else 0
+        ids = _evidence_ids(evidence)
+        suffix = f" [{','.join(ids)}]" if ids else ""
+        declared: list[JSONValue] = list(claims) if isinstance(claims, list) else []
+        types = sorted(
+            {
+                str(c.get("claim_type"))
+                for c in declared
+                if isinstance(c, dict) and isinstance(c.get("claim_type"), str) and c.get("claim_type")
+            }
+        )
+        scope = f" Declared claims: {len(declared)}" + (f" (types: {','.join(types)})" if types else "") + "."
+        carried = (
+            float(confidence)
+            if isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and 0.0 <= float(confidence) <= 1.0
+            else None
+        )
+        questions: dict[str, JSONValue] = {
+            "support": {
+                "type": "noul",
+                "instructions": (
+                    f"Does the cited evidence support the qualified wording as written, including any attribution or qualification, not the underlying event itself: {excerpt} "
+                    + f"Cited evidence: {count} item(s){suffix}.{scope} "
+                    + "The whole response rejects when any prose claim lacks inventory or cited support. "
+                    + "An attributed report is supported when the evidence shows the report was made as attributed, even when the event is unproven. "
+                    + "A conditional risk is supported when the evidence shows the condition and consequence as qualified, not that the consequence will occur. "
+                    + "Contradicted or missing evidence never supports."
+                ),
+            },
+            "evidence_state": {
+                "type": "choice",
+                "instructions": "What best characterizes the evidence state for this qualified wording as written?",
+                "criteria": dict(EVIDENCE_STATE_OPTIONS),
+            },
+        }
+        state = {"text": text.strip(), "claims": declared, "evidence": evidence or [], "confidence": carried}
+        decisions = await self.decide(
+            state,
+            questions,
+            decision_type="final_response_assessment",
+            session_id=session_id,
+            job_id=job_id,
+            choice_options={"evidence_state": dict(EVIDENCE_STATE_OPTIONS)},
+        )
+        support_d = decisions.get("support") or {}
+        ev_state = decisions.get("evidence_state") or {}
+        prob = support_d.get("probability")
+        probs: dict[str, JSONValue] = {}
+        if isinstance(prob, (int, float)):
+            probs["support"] = prob
+        if isinstance(ev_state.get("probabilities"), dict):
+            probs.update(ev_state["probabilities"])
+        ev_choice = ev_state.get("choice") if isinstance(ev_state.get("choice"), str) else None
+        return {
+            "probabilities": probs,
+            "confidence": carried,
+            "support": prob,
+            "support_answer": _classify_probability(prob),
+            "evidence_state": ev_choice,
+            "decision": ev_choice,
+        }
+
+    async def assess_final_claim(
+        self,
+        text: str,
+        claim_type: str,
+        evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+        *,
+        session_id: str,
+        job_id: str | None = None,
+        confidence: float | None = None,
+    ) -> dict[str, JSONValue]:
+        """Per-claim gate: does cited evidence support one qualified claim as written."""
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("assess_final_claim: text required")
+        if not isinstance(claim_type, str) or not claim_type.strip():
+            raise ValueError("assess_final_claim: claim_type required")
+        ctype = claim_type.strip()
+        excerpt = " ".join(text.split())[:2000]
+        count = len(evidence) if isinstance(evidence, list) else 0
+        ids = _evidence_ids(evidence)
+        suffix = f" [{','.join(ids)}]" if ids else ""
+        carried = (
+            float(confidence)
+            if isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and 0.0 <= float(confidence) <= 1.0
+            else None
+        )
+        questions: dict[str, JSONValue] = {
+            "support": {
+                "type": "noul",
+                "instructions": (
+                    f"Claim type {ctype}: does the cited evidence support the qualified wording as written, including any attribution or qualification, not the underlying event itself: {excerpt} "
+                    + f"Cited evidence: {count} item(s){suffix}. "
+                    + "An attributed report is supported when the evidence shows the report was made as attributed, even when the event is unproven. "
+                    + "A conditional risk is supported when the evidence shows the condition and consequence as qualified, not that the consequence will occur. "
+                    + "Contradicted or missing evidence never supports."
+                ),
+            },
+            "evidence_state": {
+                "type": "choice",
+                "instructions": "What best characterizes the evidence state for this qualified wording as written?",
+                "criteria": dict(EVIDENCE_STATE_OPTIONS),
+            },
+        }
+        state = {"text": text.strip(), "claim_type": ctype, "evidence": evidence or [], "confidence": carried}
+        decisions = await self.decide(
+            state,
+            questions,
+            decision_type="final_claim_assessment",
+            session_id=session_id,
+            job_id=job_id,
+            choice_options={"evidence_state": dict(EVIDENCE_STATE_OPTIONS)},
+        )
+        support_d = decisions.get("support") or {}
+        ev_state = decisions.get("evidence_state") or {}
+        prob = support_d.get("probability")
+        probs: dict[str, JSONValue] = {}
+        if isinstance(prob, (int, float)):
+            probs["support"] = prob
+        if isinstance(ev_state.get("probabilities"), dict):
+            probs.update(ev_state["probabilities"])
+        ev_choice = ev_state.get("choice") if isinstance(ev_state.get("choice"), str) else None
+        return {
+            "probabilities": probs,
+            "confidence": carried,
+            "support": prob,
+            "support_answer": _classify_probability(prob),
+            "evidence_state": ev_choice,
+            "decision": ev_choice,
         }
 
     @staticmethod
