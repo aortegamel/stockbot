@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fingerprintKey, loadDotenvAuthoritative } from "../lib/env";
+import { pickFreePort } from "../lib/port";
 
 const HARNESS_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 const ROOT_DIR = dirname(HARNESS_DIR);
@@ -27,7 +28,7 @@ if (process.env.OPENCODE_API_KEY) {
 
 const VENV_PYTHON = `${homedir()}/.cache/needle-harness/.needle/bin/python`;
 const WARMUP_TIMEOUT_MS = 120_000;
-const PORT = process.env.PORT ?? "3000";
+const PORT = String(await pickFreePort(Number(process.env.PORT ?? "3000")));
 const CATALOG = process.env.NEEDLE_CATALOG ?? join(HARNESS_DIR, ".needle-catalog.json");
 
 // Next owns its subtree; the supervisor only marks an unhealthy web child.
