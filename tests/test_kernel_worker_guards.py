@@ -611,10 +611,17 @@ def test_notify_progress_failure_propagates_with_setup_error_envelope(monkeypatc
 
 
 def test_normalize_proposals_malformed_raises_typeerror() -> None:
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="proposal must be an object"):
         kw._normalize_proposals([object()], "s")
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="empty proposals"):
         kw._normalize_proposals("not-a-list", "s")
+    with pytest.raises(TypeError, match="empty proposals"):
+        kw._normalize_proposals([], "s")
+
+
+def test_normalize_proposals_ignores_non_list_dependencies() -> None:
+    proposal = {"id": "s-q1", "objectiveId": "s", "question": "q?", "dependsOn": "s-q2", "whyItMatters": "w"}
+    assert kw._normalize_proposals([proposal], "s") == [{**proposal, "dependsOn": []}]
 
 
 def test_create_nodes_topological_cycle_rejects(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -978,6 +985,14 @@ def test_followup_links_only_explicit_known_evidence(monkeypatch: pytest.MonkeyP
     store = ResearchRepository()
     store.save_evidence({"evidence_id": "ev-pass1", "session_id": sid, "content": "pass-1 fact"})
 
+    def _refs(record: Mapping[str, object]) -> list[dict[str, str]]:
+        assert record.get("session_id") == sid
+        if record.get("evidence_id") == "ev-pass1":
+            return [{"id": "evidence:ev-pass1", "title": "Prior capture", "url": "https://www.sec.gov/prior"}]
+        return []
+
+    monkeypatch.setattr("app.research.sources.source_references", _refs)
+
     async def _fake_sched(run_sid: str, **hooks: object) -> dict[str, object]:
         assert run_sid == sid
         for n in service.ready_nodes(run_sid):
@@ -1014,6 +1029,11 @@ def test_followup_links_only_explicit_known_evidence(monkeypatch: pytest.MonkeyP
     assert isinstance(evidence, list)
     ids = [e["id"] for e in evidence if isinstance(e, dict)]
     assert "ev-pass1" in ids and "ev-pass2" in ids
+    by_id = {e["id"]: e for e in evidence if isinstance(e, dict)}
+    assert by_id["ev-pass1"]["sources"] == [
+        {"id": "evidence:ev-pass1", "title": "Prior capture", "url": "https://www.sec.gov/prior"}
+    ]
+    assert "sources" not in by_id["ev-pass2"]
 
 
 def test_setup_keyerror_is_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -246,3 +246,213 @@ def inspect_research(session_id):
     }
   });
 });
+
+// Fake venv/bin/python: echoes the bridge payload (argv[3] after "-c script") inside the given envelope.
+function echoPython(envelope: string, exit = 0): string {
+  return `#!/usr/bin/env python3
+import json, sys
+payload = json.loads(sys.argv[3])
+print(json.dumps(${envelope}))
+sys.exit(${exit})
+`;
+}
+
+async function readRaw(directory: string, path: string): Promise<{ status: number; headers: Record<string, string | null>; bytes: string; text: string }> {
+  const [result] = (await runChild(directory, `
+    import { GET } from ${JSON.stringify(route)};
+    const response = await GET(new Request("http://localhost" + ${JSON.stringify(path)}));
+    const buffer = Buffer.from(await response.arrayBuffer());
+    console.log(JSON.stringify([{
+      status: response.status,
+      headers: { cache: response.headers.get("Cache-Control"), nosniff: response.headers.get("X-Content-Type-Options"), type: response.headers.get("Content-Type") },
+      bytes: buffer.toString("base64"),
+      text: buffer.toString("utf8"),
+    }]));
+  `)) as unknown as { status: number; headers: Record<string, string | null>; bytes: string; text: string }[];
+  return result;
+}
+
+const captureId = `capture:${"a".repeat(64)}`;
+function sourcePath(id: string, suffix = ""): string {
+  return `/api/research/sources/${encodeURIComponent(id)}${suffix}`;
+}
+
+describe("research source route", () => {
+  test("returns the stored source document for the requested capture", async () => {
+    const directory = await fixture(false, echoPython(`{"ok": True, "data": {"title": "Filing", "payload": payload}}`));
+    try {
+      const response = await readRaw(directory, sourcePath(captureId));
+      expect(response.status).toBe(200);
+      expect(response.headers).toMatchObject({ cache: "no-store", nosniff: "nosniff" });
+      expect(JSON.parse(response.text)).toEqual({ title: "Filing", payload: { kind: "source", source_id: captureId } });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("returns only the PDF bytes from the bridge", async () => {
+    const directory = await fixture(false, echoPython(`{"ok": True, "data": {"pdf_base64": "JVBERg==", "kind": payload["kind"]}}`));
+    try {
+      const response = await readRaw(directory, sourcePath(captureId, "/pdf"));
+      expect(response.status).toBe(200);
+      expect(response.headers).toMatchObject({ cache: "no-store", nosniff: "nosniff", type: "application/pdf" });
+      expect(response.bytes).toBe("JVBERg==");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts encoded evidence IDs at the length boundary", async () => {
+    const directory = await fixture(false, echoPython(`{"ok": True, "data": payload}`));
+    try {
+      for (const id of ["evidence:a:b_c-1", `evidence:${"a".repeat(256)}`]) {
+        const response = await readRaw(directory, sourcePath(id));
+        expect(response.status).toBe(200);
+        expect(JSON.parse(response.text)).toEqual({ kind: "source", source_id: id });
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects URLs, paths, invalid IDs, bad encoding, and extra segments without the bridge", async () => {
+    // A bridge call would answer 200; every case must stop before it.
+    const directory = await fixture(false, echoPython(`{"ok": True, "data": {}}`));
+    try {
+      const invalid = [
+        "https://example.com/file.pdf",
+        "/etc/passwd",
+        "../capture",
+        "evidence:../../secret",
+        "capture:not-a-hash",
+        `capture:${"A".repeat(64)}`,
+        `capture:${"a".repeat(63)}`,
+        `capture:${"a".repeat(65)}`,
+        "evidence:",
+        `evidence:${"a".repeat(257)}`,
+        "evidence:with space",
+        "evidence:a\n",
+        `${captureId}\n`,
+      ];
+      for (const path of [...invalid.map((id) => sourcePath(id)), "/api/research/sources/%ZZ"]) {
+        const response = await readRaw(directory, path);
+        expect(response.status).toBe(400);
+        expect(JSON.parse(response.text)).toEqual({ error: "bad source_id" });
+        expect(response.headers).toMatchObject({ cache: "no-store", nosniff: "nosniff" });
+      }
+      for (const path of [
+        "/api/research/sources",
+        "/api/research/sources/",
+        sourcePath(captureId, "/"),
+        sourcePath(captureId, "/raw"),
+        sourcePath(captureId, "/pdf/extra"),
+        `/api/research/sources//${captureId}`,
+      ]) {
+        const response = await readRaw(directory, path);
+        expect(response.status).toBeGreaterThanOrEqual(400);
+        expect(typeof JSON.parse(response.text).error).toBe("string");
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("maps missing, corrupt, and unreadable captures to fixed messages", async () => {
+    for (const [status, error] of [
+      [404, "source capture not found"],
+      [409, "invalid source capture"],
+      [502, "source read failed"],
+    ] as const) {
+      const directory = await fixture(
+        false,
+        echoPython(`{"ok": False, "status": ${status}, "error": "Traceback: /private/data/capture.pdf"}`, 1),
+      );
+      try {
+        for (const suffix of ["", "/pdf"]) {
+          const response = await readRaw(directory, sourcePath(captureId, suffix));
+          expect(response.status).toBe(status);
+          expect(JSON.parse(response.text)).toEqual({ error });
+        }
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("hides tracebacks and unrecognized bridge failures", async () => {
+    for (const python of [
+      "#!/bin/sh\necho 'Traceback: /private/data/capture.pdf' >&2\nexit 1\n",
+      echoPython(`{"ok": False, "error": "missing /private/data/capture.pdf"}`, 2),
+      echoPython(`{"ok": False, "status": 200, "error": "Traceback"}`, 1),
+      "#!/bin/sh\nprintf 'Traceback: /private/data'\n",
+      echoPython(`{"ok": True}`),
+    ]) {
+      const directory = await fixture(false, python);
+      try {
+        const response = await readRaw(directory, sourcePath(captureId));
+        expect(response.status).toBe(502);
+        expect(JSON.parse(response.text)).toEqual({ error: "source read failed" });
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("rejects malformed PDF bridge responses", async () => {
+    for (const data of ["None", "{}", `{"pdf_base64": 42}`, `{"pdf_base64": ""}`, `{"pdf_base64": "not base64!"}`, `{"pdf_base64": "JVBERg==\\n"}`]) {
+      const directory = await fixture(false, echoPython(`{"ok": True, "data": ${data}}`));
+      try {
+        const response = await readRaw(directory, sourcePath(captureId, "/pdf"));
+        expect(response.status).toBe(502);
+        expect(JSON.parse(response.text)).toEqual({ error: "invalid source PDF response" });
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  });
+});
+
+describe("research session id decoding", () => {
+  const sessionId = "rs:4d6534bd-0c1e-4b8a-9f2d-3a5b6c7d8e9f";
+
+  test("decodes encoded and literal session IDs once for snapshots and journals", async () => {
+    const directory = await fixture(false, echoPython(`{"ok": True, "data": payload}`));
+    try {
+      const paths = [
+        `/api/research/${encodeURIComponent(sessionId)}`,
+        `/api/research/${encodeURIComponent(sessionId)}/journal?after_seq=5`,
+        `/api/research/${sessionId}`,
+        "/api/research/%73essions",
+      ];
+      const responses = await readRoutes(directory, paths);
+      expect(responses.map((r) => r.body)).toEqual([
+        { kind: "snapshot", session_id: sessionId },
+        { kind: "journal", session_id: sessionId, after_seq: 5 },
+        { kind: "snapshot", session_id: sessionId },
+        { kind: "snapshot", session_id: "sessions" },
+      ]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects malformed encodings and invalid decoded IDs", async () => {
+    const directory = await fixture(false, echoPython(`{"ok": True, "data": {}}`));
+    try {
+      const paths = [
+        ...["rs/../x", "rs x", "rs\nx", `rs:${"a".repeat(126)}`, encodeURIComponent(sessionId)].map(
+          (id) => `/api/research/${encodeURIComponent(id)}`,
+        ),
+        "/api/research/%ZZ",
+        "/api/research/%ZZ/journal",
+        "/api/research/%C0%AF",
+      ];
+      for (const response of await readRoutes(directory, paths)) {
+        expect(response.status).toBe(400);
+        expect(response.body).toEqual({ error: "bad session_id" });
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});

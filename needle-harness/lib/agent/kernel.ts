@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { GENERATE_TIMEOUT_MS } from "../needle/client";
 import { reason, type MuseUsage } from "../muse/client";
-import { redactArgs } from "./types";
+import { redactArgs, sourceReferences } from "./types";
 import type { AgentEvent, Evidence, FailureCategory, Metrics } from "./types";
 
 // ponytail: persistent worker bridge (spawn-once, ready-gated); spawn/exit/stderr handling mirrors lib/needle/client.ts.
@@ -34,6 +34,7 @@ type KernelEvidence = {
   title?: string;
   url?: string;
   retrievedAt?: string;
+  sources?: unknown;
 };
 
 type KernelNeedleDecision = {
@@ -450,6 +451,8 @@ export async function runKernelAgent(
   });
 
   emit({ type: "agent_start", prompt });
+  const seed = Array.isArray(opts?.seedEvidence) ? opts.seedEvidence : [];
+  if (seed.length) emit({ type: "evidence", evidence: seed.map((e) => ({ ...e, sources: sourceReferences(e.sources) })) });
 
   // ponytail: entry routing lives in route.ts (op:route fast-path there);
   // runKernelAgent stays research-only so agent_start emits exactly once.
@@ -482,7 +485,6 @@ export async function runKernelAgent(
   const unresolved: string[] = Array.isArray(res.unresolved) ? res.unresolved.map(String) : [];
   const incompleteGuard = res.incompleteGuard ?? res.incomplete_guard ?? false;
   const objective = typeof res.objective === "string" && res.objective ? res.objective : prompt;
-  const seed = Array.isArray(opts?.seedEvidence) ? opts.seedEvidence : [];
   const evidence: Evidence[] = [...seed, ...(Array.isArray(res.evidence) ? res.evidence : []).map((e) => ({
     id: String(e.id),
     source: e.source ?? "kernel",
@@ -490,9 +492,21 @@ export async function runKernelAgent(
     ...(e.url !== undefined ? { url: e.url } : {}),
     retrievedAt: e.retrievedAt ?? new Date().toISOString(),
     content: String(e.content ?? ""),
+    sources: sourceReferences(e.sources),
   }))];
   const byId: Record<string, Evidence> = {};
-  for (const e of evidence) byId[e.id] = e;
+  const ordered: Evidence[] = [];
+  for (const e of evidence) {
+    const previous = byId[e.id];
+    if (previous) previous.sources = sourceReferences([...(previous.sources ?? []), ...(e.sources ?? [])]);
+    else {
+      byId[e.id] = e;
+      ordered.push(e);
+    }
+  }
+  evidence.length = 0;
+  evidence.push(...ordered);
+  if (evidence.length) emit({ type: "evidence", evidence: evidence.map((e) => ({ ...e })), ...(res.sessionId ? { sessionId: res.sessionId } : {}) });
   const failures: Partial<Record<FailureCategory, number>> = {};
   if (res.failures && typeof res.failures === "object") {
     for (const [k, v] of Object.entries(res.failures)) if (typeof v === "number") failures[k as FailureCategory] = v;
@@ -646,12 +660,19 @@ export async function runKernelAgent(
       ...(e.url !== undefined ? { url: e.url } : {}),
       retrievedAt: e.retrievedAt ?? new Date().toISOString(),
       content: String(e.content ?? ""),
+      sources: sourceReferences(e.sources),
     }));
-    const seen = new Set(mergedEvidence.map((e) => e.id));
-    for (const e of followEvidence) if (!seen.has(e.id)) {
-      seen.add(e.id);
-      mergedEvidence.push(e);
+    const existingById: Record<string, Evidence> = {};
+    for (const e of mergedEvidence) existingById[e.id] = e;
+    for (const e of followEvidence) {
+      const existing = existingById[e.id];
+      if (existing) existing.sources = sourceReferences([...(existing.sources ?? []), ...(e.sources ?? [])]);
+      else {
+        existingById[e.id] = e;
+        mergedEvidence.push(e);
+      }
     }
+    if (mergedEvidence.length) emit({ type: "evidence", evidence: mergedEvidence.map((e) => ({ ...e })), ...(follow.sessionId ? { sessionId: follow.sessionId } : {}) });
     const followNodes: KernelGraphNode[] = (Array.isArray(follow.nodes) ? follow.nodes : [])
       .filter((n) => n && typeof n.node_id === "string")
       .map((n) => ({ node_id: String(n.node_id), question: String(n.question ?? ""), status: String(n.status ?? ""), depends_on: Array.isArray(n.depends_on) ? n.depends_on.map(String) : [] }));

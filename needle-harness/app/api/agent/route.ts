@@ -2,7 +2,7 @@ import { reason } from "@/lib/muse/client";
 import { kernelRouter, REQUEST_WALL_MS, runKernelAgent } from "@/lib/agent/kernel";
 import { tools } from "@/lib/tools";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
-import { redactArgs, type AgentEvent, type Evidence, type FailureCategory } from "@/lib/agent/types";
+import { redactArgs, sourceReferences, type AgentEvent, type Evidence, type FailureCategory } from "@/lib/agent/types";
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
@@ -39,6 +39,21 @@ export async function POST(req: Request): Promise<Response> {
             case "tool_result":
             case "tool_failed":
               return;
+            case "evidence":
+              out = {
+                type: "evidence",
+                ...(e.sessionId ? { sessionId: e.sessionId } : {}),
+                evidence: e.evidence.map((ev) => ({
+                  id: ev.id,
+                  source: ev.source,
+                  retrievedAt: ev.retrievedAt,
+                  content: "",
+                  ...(ev.title !== undefined ? { title: ev.title } : {}),
+                  ...(ev.url !== undefined ? { url: ev.url } : {}),
+                  sources: sourceReferences(ev.sources),
+                })),
+              };
+              break;
             case "progress":
               out = { type: "progress", stage: "working" };
               break;
@@ -115,6 +130,7 @@ export async function POST(req: Request): Promise<Response> {
               evidence.push(res.evidence);
               singleShotEvidence.push(res.evidence);
               send({ type: "tool_result", tool, evidenceId: res.evidence.id, preview: res.evidence.content.slice(0, 160) });
+              send({ type: "evidence", evidence: [...evidence] });
               outcome = { ok: true, content: res.evidence.content.slice(0, 1500) };
             } else {
               failures[res.category] = (failures[res.category] ?? 0) + 1;

@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.policy import Capability
+from app.research.sources import capture_scope
 from app.tool_runtime import AgentToolSession, execute_agent_tool
 from app.tools import tools_for_capabilities
 
@@ -78,15 +79,21 @@ def _invoke(request: Mapping[str, object], protocol_id: str) -> dict[str, object
     as_of = raw_as_of if isinstance(raw_as_of, str) and raw_as_of else None
 
     try:
-        result = execute_agent_tool(
-            name,
-            arguments,
-            _get_session(session_id),
-            tool_call_id=tool_call_id,
-            protocol_id=protocol_id,
-            data_root=data_root,
-            as_of=as_of,
-        )
+        with capture_scope(data_root) as sources:
+            result = execute_agent_tool(
+                name,
+                arguments,
+                _get_session(session_id),
+                tool_call_id=tool_call_id,
+                protocol_id=protocol_id,
+                data_root=data_root,
+                as_of=as_of,
+            )
+        if isinstance(result, dict) and sources and not result.get("error"):
+            result = {
+                **result,
+                "meta": {**(result.get("meta") if isinstance(result.get("meta"), dict) else {}), "sources": sources},
+            }
         return {"id": protocol_id, "result": result}
     except Exception:
         logger.exception("tool bridge failed id=%s tool=%s", protocol_id, name)

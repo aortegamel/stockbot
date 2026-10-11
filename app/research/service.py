@@ -1016,12 +1016,12 @@ def _sec_record_provenance(
     )
 
 
-def _web_result_texts(result: Mapping[str, object]) -> list[tuple[str, str, str, str, str, str]]:
-    """(url, domain, title, published_at, retrieved_at, highlight) of persisted web results."""
+def _web_result_texts(result: Mapping[str, object]) -> list[tuple[str, str, str, str, str, str, str, str]]:
+    """(url, domain, title, published_at, retrieved_at, highlight, content, representation) of web results."""
     payload = result.get("result")
     payload = payload if isinstance(payload, Mapping) else result
     rows = payload.get("evidence")
-    out: list[tuple[str, str, str, str, str, str]] = []
+    out: list[tuple[str, str, str, str, str, str, str, str]] = []
     if isinstance(rows, list):
         for row in rows:
             if not isinstance(row, Mapping):
@@ -1030,6 +1030,8 @@ def _web_result_texts(result: Mapping[str, object]) -> list[tuple[str, str, str,
             highlight = row.get("highlight")
             if not (isinstance(url, str) and url.strip() and isinstance(highlight, str) and highlight.strip()):
                 continue
+            content = row.get("source_content")
+            representation = row.get("source_representation")
             out.append(
                 (
                     url.strip(),
@@ -1038,6 +1040,8 @@ def _web_result_texts(result: Mapping[str, object]) -> list[tuple[str, str, str,
                     str(row.get("published_at") or "").strip(),
                     str(row.get("retrieved_at") or "").strip(),
                     highlight.strip(),
+                    content.strip() if isinstance(content, str) else "",
+                    representation.strip() if isinstance(representation, str) else "",
                 )
             )
     return out
@@ -1085,7 +1089,7 @@ def _web_provenance(
             )
     rows = _web_result_texts(result)
     url = data.get("source_record_id") or data.get("url") or data.get("source_uri")
-    for row_url, domain, title, published_at, retrieved_at, highlight in rows:
+    for row_url, domain, title, published_at, retrieved_at, highlight, content, representation in rows:
         if url is not None and url != row_url:
             continue
         norm = _normalize_record_text(highlight)
@@ -1098,6 +1102,8 @@ def _web_provenance(
                 published_at=published_at or None,
                 retrieved_at=retrieved_at or None,
                 tool_result_id=ref_id,
+                source_content=content or None,
+                source_representation=representation or None,
             )
     raise ValueError(
         "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE (the cited excerpt does not appear "
@@ -1642,7 +1648,14 @@ def _persist_evidence_record(
     _archive_materialized_source(session_id, record.evidence_id, record.retrieved_at, source)
     stored = evidence_to_dict(record)
     stored_meta = stored.get("metadata")
-    stored["metadata"] = {**(stored_meta if isinstance(stored_meta, dict) else {}), "source_bytes": "archived"}
+    attested = {
+        **(stored_meta if isinstance(stored_meta, dict) else {}),
+        **(
+            {"source_content_hash": source.source_content_hash} if record.provenance.get("kind") == "sec_source" else {}
+        ),
+        "source_bytes": "archived",
+    }
+    stored["metadata"] = attested
     updated_found = (
         found
         if record.evidence_id in found.evidence_ids

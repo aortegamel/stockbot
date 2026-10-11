@@ -291,6 +291,67 @@ def test_retry_hints_come_from_winning_response_only(monkeypatch: pytest.MonkeyP
     assert hints == {}
 
 
+def _proposal(pid: str, objective_id: str) -> dict[str, object]:
+    deps: list[str] = []
+    return {"id": pid, "objectiveId": objective_id, "question": "Q?", "dependsOn": deps, "whyItMatters": "W"}
+
+
+def _fake_opencode(monkeypatch: pytest.MonkeyPatch, bodies: Sequence[object]) -> list[str]:
+    """Fake only the external OpenCode POST; the real client and validator run on each body in order."""
+    monkeypatch.setenv("OPENCODE_API_KEY", "k")
+    monkeypatch.setenv("OPENCODE_URL", "http://opencode.invalid")
+    monkeypatch.setenv("OPENCODE_MODEL", "m")
+    prompts: list[str] = []
+
+    def post(url: str, api_key: str, model: str, prompt: str, timeout_s: float = 120.0) -> dict[str, object]:
+        prompts.append(prompt)
+        text = json.dumps(bodies[len(prompts) - 1])
+        return {"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]}
+
+    monkeypatch.setattr("app.reasoner_client._default_post", post)
+    return prompts
+
+
+def test_decompose_rejects_prefix_valid_id_with_wrong_objective_id() -> None:
+    body = {"proposals": [_proposal("rs:t-q1", "rs:other")]}  # prefix-valid id, wrong objectiveId
+
+    def post(prompt: str, model: str) -> dict[str, object]:
+        return {"output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(body)}]}]}
+
+    with pytest.raises(ValueError, match="proposal rs:t-q1 references wrong objective"):
+        ReasonerClient(api_key="x", model="m", url="u", post=post).decompose("prompt", "rs:t")
+
+
+def test_wrong_objective_id_retries_and_winner_owns_proposals_and_hints(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Attempt 1 is rejected whole; nothing from it reaches the accepted attempt-2 result."""
+    bad = {"proposals": [_proposal("rs:t-stale", "rs:other")], "tickers": ["STALE"], "corrected_query": "stale"}
+    good_body = {
+        "proposals": [{**_proposal("rs:t-q1", "rs:t"), "dependsOn": ["rs:t-q2"]}, _proposal("rs:t-q2", "rs:t")],
+        "tickers": ["NVDA"],
+        "corrected_query": "NVIDIA",
+    }
+    prompts = _fake_opencode(monkeypatch, [bad, good_body])
+    stages: list[str] = []
+
+    def progress(stage: str, detail: dict[str, object] | None = None) -> None:
+        stages.append(stage)
+
+    proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "", progress=progress)
+    assert proposals == [{**_proposal("rs:t-q1", "rs:t"), "dependsOn": ["rs:t-q2"]}, _proposal("rs:t-q2", "rs:t")]
+    assert hints == {"tickers": ["NVDA"], "corrected_query": "NVIDIA"}
+    assert len(prompts) == 2
+    assert stages.count("reasoner_retry") == 1 and stages[-1] == "reasoner_done"
+
+
+def test_wrong_objective_id_twice_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two invalid responses raise; no proposal is repaired to the session objective."""
+    bad = {"proposals": [_proposal("rs:t-q1", "rs:other")]}
+    prompts = _fake_opencode(monkeypatch, [bad, bad])
+    with pytest.raises(ValueError, match="references wrong objective"):
+        kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
+    assert len(prompts) == 2
+
+
 def test_run_emits_progress_before_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     stages: list[str] = []
 

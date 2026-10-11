@@ -14,6 +14,8 @@ const eslintConfig = defineConfig([
     "next-env.d.ts",
     ".needle/**",
     "benchmarks/**",
+    // Generated local PDF.js assets; installed package files copied by copy-pdfjs-assets.ts.
+    "public/pdfjs/**",
   ]),
 ]);
 

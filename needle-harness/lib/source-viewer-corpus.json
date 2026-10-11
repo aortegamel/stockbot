@@ -1,0 +1,10 @@
+[
+  {"name":"table cells", "html":"<table><tr><td>Revenue</td><td>10</td></tr></table>", "text":"Revenue | 10"},
+  {"name":"inline cell whitespace", "html":"<table><tr><td>  Net\t<strong>income</strong>  </td><td>  10  </td></tr></table>", "text":"Net income | 10"},
+  {"name":"empty cells", "html":"<table><tr><td></td><td>Revenue</td><td> \t </td><td>10</td></tr></table>", "text":"Revenue | 10"},
+  {"name":"literal pipe", "html":"<p>A | B</p><table><tr><td>R|D</td><td>10</td></tr></table>", "text":"A | B\nR|D | 10"},
+  {"name":"blocks and Unicode", "html":"<h2>Item 1</h2><p>😀 <b>café</b></p><p>Revenue<br>10</p>", "text":"Item 1\n😀 café\nRevenue\n10"},
+  {"name":"cell newlines", "html":"<table><tr><td>Revenue\nnet</td><td>10</td></tr></table>", "text":"Revenue\nnet | 10"},
+  {"name":"nonbreaking space", "html":"<table><tr><td>&nbsp;Net&nbsp;income&nbsp;</td><td>10</td></tr></table>", "text":"Net income | 10"},
+  {"name":"noise and title", "html":"<!doctype html><html><head><title>Filing</title><style>p { color:red }</style></head><body><p>Revenue<!-- removed --><ix:note><span>ignored</span></ix:note>10</p><script>alert(1)</script></body></html>", "text":"Filing\nRevenue10"}
+]

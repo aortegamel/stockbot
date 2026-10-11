@@ -1452,6 +1452,7 @@ def _run(
 ) -> dict[str, JSONValue]:
     from app.research import scheduler
     from app.research.repository import ResearchRepository
+    from app.research.sources import source_references
 
     # Programmatic default (code first, JEV only on ambiguity); "catalog" restores
     # two-step JEV; "full"/"whole"/"direct" keep the whole-registry JEV escape hatch.
@@ -1557,6 +1558,9 @@ def _run(
             continue
         row_id = _evidence_id(rec, f"ev-{i}")
         row: dict[str, JSONValue] = {"id": row_id, "content": text}
+        refs: list[JSONValue] = [{**ref} for ref in source_references(rec)]
+        if refs:
+            row["sources"] = refs
         evidence.append(row)
         known_ids.add(row_id)
     tool_executions: list[JSONValue] = []

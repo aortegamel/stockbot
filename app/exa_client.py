@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 EXA_TIMEOUT_SECONDS = 20
 EXA_HIGHLIGHT_MAX_CHARS = 600
+EXA_SEARCH_TEXT_MAX_CHARS = 12_000
 EXA_DEFAULT_LIMIT = 5
 EXA_MAX_LIMIT = 25
 _APPROVED_SEARCH_TYPES = frozenset({"auto", "fast", "deep-lite"})
@@ -128,7 +129,10 @@ def _build_search_payload(
     payload: dict[str, object] = {
         "query": query,
         "numResults": limit,
-        "contents": {"highlights": True},
+        "contents": {
+            "highlights": True,
+            "text": {"maxCharacters": EXA_SEARCH_TEXT_MAX_CHARS, "includeHtmlTags": True},
+        },
     }
     if category is not None:
         payload["category"] = category
@@ -170,6 +174,13 @@ def _parse_search_results(
                 "retrieved_at": retrieved_at,
                 "highlight": _first_highlight(item),
                 "category": category,
+                "source_content": item["text"][:EXA_SEARCH_TEXT_MAX_CHARS] if isinstance(item.get("text"), str) else "",
+                "source_representation": "html",
+                "highlights": [
+                    text[:EXA_HIGHLIGHT_MAX_CHARS] for text in item.get("highlights", []) if isinstance(text, str)
+                ]
+                if isinstance(item.get("highlights"), list)
+                else [],
             }
         )
     return evidence, max(0, len(raw_results) - len(evidence))

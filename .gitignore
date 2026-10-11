@@ -63,6 +63,8 @@ local/
 coverage-python.lcov
 coverage-ts/
 coverage-rust.lcov
+coverage-harness/
+reports/
 
 # Generated verification reports (Stryker mutation output; never commit)
 reports/

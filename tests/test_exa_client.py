@@ -169,7 +169,10 @@ def test_limit_clamp(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
         assert isinstance(payload, dict)
         assert payload["numResults"] == expected
         assert payload["query"] == "AMD news"
-        assert payload["contents"] == {"highlights": True}
+        assert payload["contents"] == {
+            "highlights": True,
+            "text": {"maxCharacters": exa_client.EXA_SEARCH_TEXT_MAX_CHARS, "includeHtmlTags": True},
+        }
 
 
 def test_normalization_from_fixture(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -192,6 +195,7 @@ def test_normalization_from_fixture(enabled: None, monkeypatch: pytest.MonkeyPat
     assert first["retrieved_at"] == result["retrieved_at"]
     assert first["highlight"].startswith("AMD unveiled its MI400 accelerator")
     assert first["category"] is None
+    assert first["source_content"] == ""
     # Item without publishedDate: published_at None.
     assert second["published_at"] is None
     assert second["url"].startswith("https://www.reuters.com")
@@ -208,12 +212,15 @@ def test_highlight_truncated_to_max_chars(enabled: None, monkeypatch: pytest.Mon
                 "url": "https://example.com/x",
                 "publishedDate": "2026-08-01T10:00:00.000Z",
                 "highlights": [long_highlight],
+                "text": "y" * (exa_client.EXA_SEARCH_TEXT_MAX_CHARS + 10),
             }
         ]
     }
     _patch_session(monkeypatch, FakeSession(_response(payload)))
     result = exa_client.search("AMD news")
-    assert len(_as_seq(result["evidence"])[0]["highlight"]) == exa_client.EXA_HIGHLIGHT_MAX_CHARS
+    row = _as_seq(result["evidence"])[0]
+    assert len(row["highlight"]) == exa_client.EXA_HIGHLIGHT_MAX_CHARS
+    assert len(row["source_content"]) == exa_client.EXA_SEARCH_TEXT_MAX_CHARS
 
 
 def test_company_category_rejects_dates_and_exclude_domains(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
