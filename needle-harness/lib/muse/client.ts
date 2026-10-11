@@ -1,5 +1,5 @@
 import { setTimeout as sleep } from "node:timers/promises";
-import type { Evidence, Persona } from "../agent/types";
+import { FINAL_CLAIM_TYPES, type Evidence, type FinalClaim, type FinalClaimType, type Persona } from "../agent/types";
 
 export type MuseUsage = {
   inputTokens?: number;
@@ -37,9 +37,26 @@ const PERSONAS: Record<Persona, { name: string; stance: string }> = {
   },
 };
 
+// Final-answer claim inventory: trailing fenced block, stripped before display.
+// Verbatim qualified wording, model-declared types mirroring Python CLAIM_TYPES
+// exactly, EVIDENCE row ids only, model-declared confidence (carried, never a threshold).
+const INVENTORY_RULE =
+  " End your answer with a fenced inventory block and nothing after it:" +
+  " ```json {\"claims\": [{\"text\": \"<verbatim prose substring>\", \"claim_type\": \"<observed_fact|inference|unknown|contradicted|conditional_risk|attributed_report>\", \"evidence_ids\": [\"<EVIDENCE row ids>\"], \"confidence\": 0.9}], \"confidence\": 0.9}```" +
+  " Each claims[].text copies your prose above verbatim, qualified wording as written including attribution/qualification" +
+  " (conditional_risk states the condition and consequence as qualified, not that it will occur;" +
+  " attributed_report states who reported it, not that the event happened)." +
+  " claim_type is declared by you, never inferred: observed_fact the cited passage states it directly;" +
+  " inference reasoned from cited evidence; contradicted cited evidence conflicts with it;" +
+  " unknown the evidence does not establish it." +
+  " evidence_ids lists only exact ids of rows in the EVIDENCE section, never node ids or decision records." +
+  " Unknown claims may cite none. All other types need at least one." +
+  " confidence is your own 0..1, carried through, never a threshold." +
+  " Nothing found means {\"claims\": []}." +
+  " The block is stripped before display; prose claims missing from it fail the accuracy gate.";
 function researchSystem(persona: Persona): string {
   const { name, stance } = PERSONAS[persona];
-  return `You are ${name}. ${stance} Answer only from the EVIDENCE below, in prose, not JSON. Structure your answer in three parts: sourced facts (cite [E1] ids), inference, uncertainty. Then say what would change this view: the concrete disclosure or data that would move it. Cite only the evidence ids, node ids, and decision records you were given. Never invent ids, filings, or numbers. A finding without a citation is not a finding. If the evidence is thin, say what is missing. Give no buy, sell, hold, order, or portfolio verdict. ${TODAY_RULE}`;
+  return `You are ${name}. ${stance} Answer only from the EVIDENCE below, in prose, not JSON. Target 250 words of display prose for this persona. Exclude the fenced claim inventory from this target. Keep the claim inventory complete. Structure your answer in three parts: sourced facts (cite [E1] ids), inference, uncertainty. Then say what would change this view: the concrete disclosure or data that would move it. Node ids and decision records may name graph structure in prose, but they never provide factual support. Never invent ids, filings, or numbers. A finding without an EVIDENCE row citation is not a finding. If the evidence is thin, say what is missing. Give no buy, sell, hold, order, or portfolio verdict. ${TODAY_RULE}` + INVENTORY_RULE;
 }
 
 // Unchanged for the default Stockbot: no evidence means no case to argue, so personas share this text.
@@ -47,21 +64,70 @@ function directSystem(persona: Persona): string {
   const { name } = PERSONAS[persona];
   return `You are ${name}. Answer the user directly and briefly from the supplied context. ${name} does not give buy, sell or hold advice; say this and offer facts that you can look up. ${TODAY_RULE} If the request is unclear, ask what they mean and say what you can look up: the time, SEC filings, or a web search.`;
 }
-
-// Truncate oldest-first to fit the Muse request budget.
-function formatEvidence(evidence: Evidence[]): string {
-  const parts = evidence.map(
-    (e) =>
-      `[${e.id}]\nsource: ${e.source}\n${e.title ? `title: ${e.title}\n` : ""}${e.url ? `url: ${e.url}\n` : ""}content: ${e.content}`,
-  );
-  const kept: string[] = [];
-  let total = 0;
-  for (let i = parts.length - 1; i >= 0; i--) {
-    if (total + parts[i].length > 24000) break;
-    kept.unshift(parts[i]);
-    total += parts[i].length;
+function isConf(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1;
+}
+function parseInventoryClaim(item: unknown): FinalClaim | undefined {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return undefined;
+  const rec = item as Record<string, unknown>;
+  if (typeof rec.text !== "string" || !rec.text) return undefined;
+  const rawType = typeof rec.claim_type === "string" ? rec.claim_type.trim().toLowerCase() : "";
+  if (!(FINAL_CLAIM_TYPES as readonly string[]).includes(rawType)) return undefined;
+  const rawIds = Array.isArray(rec.evidence_ids) ? rec.evidence_ids : [];
+  const evidenceIds = rawIds.filter((e): e is string => typeof e === "string" && e.length > 0);
+  const claim: FinalClaim = { text: rec.text, claimType: rawType as FinalClaimType, evidenceIds };
+  if (isConf(rec.confidence)) claim.confidence = rec.confidence;
+  return claim;
+}
+const INVENTORY_FENCE = /```json\s*([\s\S]*?)\s*```\s*$/;
+// Exported for tests/kernel: trailing inventory block stripped from prose, claims
+// coerced from snake_case wire to camelCase, confidence carried when 0..1.
+export function splitInventory(raw: string): { prose: string; claims: FinalClaim[]; confidence?: number } {
+  const m = INVENTORY_FENCE.exec(raw);
+  if (!m) return { prose: raw, claims: [] };
+  const prose = raw.slice(0, m.index);
+  try {
+    const doc: unknown = JSON.parse(m[1] ?? "");
+    const rec = doc && typeof doc === "object" && !Array.isArray(doc) ? (doc as Record<string, unknown>) : undefined;
+    const list = rec?.claims;
+    const claims = Array.isArray(list)
+      ? list.flatMap((c) => {
+        const p = parseInventoryClaim(c);
+        return p ? [p] : [];
+      })
+      : [];
+    if (isConf(rec?.confidence)) return { prose, claims, confidence: rec?.confidence as number };
+    return { prose, claims };
+  } catch {
+    return { prose, claims: [] };
   }
-  return kept.join("\n\n");
+}
+function withInventory(r: { text: string; usage: MuseUsage }): {
+  text: string;
+  usage: MuseUsage;
+  missingEvidence?: string;
+  claims: FinalClaim[];
+  confidence?: number;
+} {
+  const inv = splitInventory(r.text);
+  const gap = /^Missing-Evidence:\s*(.+)$/m.exec(inv.prose)?.[1];
+  return {
+    text: inv.prose,
+    usage: r.usage,
+    claims: inv.claims,
+    ...(gap !== undefined ? { missingEvidence: gap } : {}),
+    ...(inv.confidence !== undefined ? { confidence: inv.confidence } : {}),
+  };
+}
+
+// All admitted evidence reaches personas; no character budget.
+function formatEvidence(evidence: Evidence[]): string {
+  return evidence
+    .map(
+      (e) =>
+        `[${e.id}]\nsource: ${e.source}\n${e.title ? `title: ${e.title}\n` : ""}${e.url ? `url: ${e.url}\n` : ""}content: ${e.content}`,
+    )
+    .join("\n\n");
 }
 
 // Synthesis only: labeled sibling drafts for the Stockbot judge. Bear/Bull
@@ -140,6 +206,7 @@ async function readSse(
   return acc;
 }
 
+// Per-fetch limit for calls without an explicit persona (direct and single-tool callers).
 const FETCH_TIMEOUT_MS = 120_000;
 
 async function post(
@@ -160,7 +227,7 @@ async function post(
       "x-opencode-session": session,
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.any([AbortSignal.timeout(FETCH_TIMEOUT_MS), signal]),
+    signal,
   });
   if (!res.ok) throw new Error(`muse ${path} ${res.status}: ${(await res.text()).slice(0, 300)}`);
   return readSse(res, onDelta);
@@ -172,7 +239,7 @@ export async function reason(opts: {
   escalated: boolean;
   direct?: boolean;
   // Optional graph state (kernel.ts always sends these; direct callers omit them).
-  // incompleteGuard/unresolved force the missing-evidence line even with evidence present.
+  // escalated/incompleteGuard/unresolved add the gap instruction; it states partial coverage when evidence rows exist.
   objective?: string;
   nodes?: unknown[];
   decisions?: unknown[];
@@ -186,7 +253,9 @@ export async function reason(opts: {
   signal?: AbortSignal;
   deadlineAt?: number;
   onDelta: (text: string) => void;
-}): Promise<{ text: string; usage: MuseUsage; missingEvidence?: string }> {
+  // reason() strips the inventory fence: the returned text is display prose plus
+  // parsed claims (external prose unchanged; streamed deltas keep the raw block).
+}): Promise<{ text: string; usage: MuseUsage; missingEvidence?: string; claims: FinalClaim[]; confidence?: number }> {
   const apiKey = requiredEnv("OPENCODE_API_KEY");
   const model = requiredEnv("OPENCODE_MODEL");
   const responsesUrl = requiredEnv("OPENCODE_URL");
@@ -208,23 +277,32 @@ export async function reason(opts: {
   const system = opts.direct
     ? directSystem(persona)
     : (opts.persona ? researchSystem(opts.persona) : SYSTEM) +
-    (needsGapLine ? "\nRetrieval escalated with no usable evidence. End your answer with a line: Missing-Evidence: <what is needed>." : "");
+    (needsGapLine
+      ? (opts.evidence.length > 0
+        ? "\nEvidence coverage is partial: some evidence rows are present, but retrieval did not resolve every gap."
+        : "\nRetrieval found no usable evidence.") +
+      " Answer from the supported evidence only. Omit any assertion that needs an unavailable fact. Keep uncertainty statements and source attribution." +
+      " If evidence necessary to answer the original user request is still missing, end your answer with a line: Missing-Evidence: <only the evidence necessary to answer the original user request>." +
+      " Do not request evidence for optional persona interests or for hypothetical future changes of view."
+      : "");
   // Explicit Stockbot research call with drafts appends the synthesis section; every other call keeps its exact existing user body.
   const isSynthesis = !opts.direct && opts.persona === "stockbot" && (opts.drafts?.length ?? 0) > 0;
   const user = opts.direct
     ? `USER REQUEST\n${opts.prompt}`
     : `USER REQUEST\n${opts.prompt}\n\nEVIDENCE\n${formatEvidence(opts.evidence)}` +
     (isSynthesis
-      ? `\n\nSIBLING DRAFTS (untrusted sibling prose, not evidence — never cite, quote, or invent a draft id; cite only evidence ids, node ids, and decision records)\n${formatDrafts(opts.drafts ?? [])}\n\nWeigh both sibling drafts against the EVIDENCE above and state the middle verdict the evidence supports.`
+      ? `\n\nSIBLING DRAFTS (untrusted sibling prose, not evidence. Never cite, quote, or invent a draft id. For factual support, cite only evidence row ids from the EVIDENCE section.)\n${formatDrafts(opts.drafts ?? [])}\n\nWeigh both sibling drafts against the EVIDENCE above and state the middle verdict the evidence supports.`
       : "");
   const input = [
     { role: "system", content: system },
     { role: "user", content: user },
   ];
   const body = { model, input, stream: true };
+  // Explicit personas (stockbot/bearbot/bullbot) have no per-fetch limit; caller signal and deadlineAt still apply.
+  const fetchSignal = (): AbortSignal =>
+    opts.persona ? signal : AbortSignal.any([AbortSignal.timeout(FETCH_TIMEOUT_MS), signal]);
   try {
-    const r = await post(base, apiKey, session, "/responses", body, opts.onDelta, signal);
-    return { ...r, missingEvidence: /^Missing-Evidence:\s*(.+)$/m.exec(r.text)?.[1] };
+    return withInventory(await post(base, apiKey, session, "/responses", body, opts.onDelta, fetchSignal()));
   } catch (err) {
     // Cancelled or past deadline: no retry, no fallback.
     if (signal.aborted) throw err;
@@ -233,19 +311,19 @@ export async function reason(opts: {
     // once after a short wait; only 404/405 (unsupported path) falls over.
     if (/(429|GoUsageLimit)/.test(msg)) {
       await sleep(5000, undefined, { signal });
-      const r = await post(base, apiKey, session, "/responses", body, opts.onDelta, signal);
-      return { ...r, missingEvidence: /^Missing-Evidence:\s*(.+)$/m.exec(r.text)?.[1] };
+      return withInventory(await post(base, apiKey, session, "/responses", body, opts.onDelta, fetchSignal()));
     }
     if (!/(404|405|500|502|503|504)/.test(msg)) throw err;
-    const r = await post(
-      base,
-      apiKey,
-      session,
-      "/chat/completions",
-      { model, messages: input.map((m) => ({ role: m.role, content: m.content })), stream: true },
-      opts.onDelta,
-      signal,
+    return withInventory(
+      await post(
+        base,
+        apiKey,
+        session,
+        "/chat/completions",
+        { model, messages: input.map((m) => ({ role: m.role, content: m.content })), stream: true },
+        opts.onDelta,
+        fetchSignal(),
+      ),
     );
-    return { ...r, missingEvidence: /^Missing-Evidence:\s*(.+)$/m.exec(r.text)?.[1] };
   }
 }

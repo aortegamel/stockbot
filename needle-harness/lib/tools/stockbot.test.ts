@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { categorizeFailure, closeBridge, endSession, invoke, newSessionId } from "./stockbot";
 import { harvest, reason } from "../muse/client";
@@ -225,5 +225,85 @@ describe("muse reason personas (fake provider)", () => {
     expect(seen.map((s) => s.path)).toEqual(["/v1/responses", "/v1/chat/completions"]);
     expect(seen[1].session).toBe(seen[0].session);
     expect(seen[1].body.messages).toEqual(seen[0].body.input);
+  });
+
+  describe("controlled clock past 120s", () => {
+    // Fake AbortSignal.timeout: advance() fires every timer due by the fake clock.
+    const realTimeout = AbortSignal.timeout;
+    let now = 0;
+    let timers: { due: number; ac: AbortController }[] = [];
+    let release = (): void => { };
+    let released = Promise.resolve();
+    const advance = (ms: number): void => {
+      now += ms;
+      for (const t of timers) if (t.due <= now) t.ac.abort(new DOMException("The operation timed out.", "TimeoutError"));
+    };
+    const enc = new TextEncoder();
+    const chunk = (delta: string): Uint8Array =>
+      enc.encode(`data: ${JSON.stringify({ type: "response.output_text.delta", delta })}\n\n`);
+    // One draft delta now; the rest only after the test calls release().
+    const gated = (_path: string, b: Body): Response =>
+      new Response(
+        new ReadableStream({
+          async start(c) {
+            c.enqueue(chunk(`${/^You are (\w+)\./.exec(systemOf(b))?.[1] ?? "Muse"} `));
+            await released;
+            c.enqueue(chunk("late."));
+            c.enqueue(enc.encode("data: [DONE]\n\n"));
+            c.close();
+          },
+        }),
+        { headers: { "Content-Type": "text/event-stream" } },
+      );
+    // Starts a call and resolves `streaming` at its first delta.
+    const start = (opts: Partial<Parameters<typeof reason>[0]>) => {
+      let first = (): void => { };
+      const streaming = new Promise<void>((r) => (first = r));
+      return { streaming, result: reason({ ...input, ...opts, onDelta: () => first() }) };
+    };
+
+    beforeEach(() => {
+      now = 0;
+      timers = [];
+      released = new Promise<void>((r) => (release = r));
+      respond = gated;
+      AbortSignal.timeout = (ms: number): AbortSignal => {
+        const ac = new AbortController();
+        timers.push({ due: now + ms, ac });
+        return ac.signal;
+      };
+    });
+
+    afterEach(() => {
+      AbortSignal.timeout = realTimeout;
+    });
+
+    test("all three explicit personas keep generating past 120s", async () => {
+      const calls = FINAL_PERSONAS.map((persona) => start({ persona }));
+      await Promise.all(calls.map((c) => c.streaming));
+      advance(121_000);
+      release();
+      const results = await Promise.all(calls.map((c) => c.result));
+      expect(results.map((r) => r.text)).toEqual(["Stockbot late.", "Bearbot late.", "Bullbot late."]);
+      expect(seen.map((s) => s.path)).toEqual(["/v1/responses", "/v1/responses", "/v1/responses"]);
+    });
+
+    test("omitted persona keeps the 120s fetch limit without fallback", async () => {
+      const call = start({});
+      await call.streaming;
+      advance(120_000);
+      await expect(call.result).rejects.toThrow();
+      expect(seen.map((s) => s.path)).toEqual(["/v1/responses"]);
+    });
+
+    test("caller cancel aborts a persona generation past 120s without fallback", async () => {
+      const ac = new AbortController();
+      const call = start({ persona: "bearbot", signal: ac.signal });
+      await call.streaming;
+      advance(121_000);
+      ac.abort();
+      await expect(call.result).rejects.toThrow();
+      expect(seen.map((s) => s.path)).toEqual(["/v1/responses"]);
+    });
   });
 });
