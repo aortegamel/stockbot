@@ -7,7 +7,14 @@ Every source here is keyless:
 - Yahoo search v1: ticker validation / search-as-you-type (same session).
 - SEC company_tickers via data_sources.SourceGateway: full ticker -> CIK
   universe (10k+ entries) with the repo's own normalization + PIT archive.
-- Google News RSS: per-ticker headlines (cache.db TTL).
+- News: multi-source RSS merge — Google News per-ticker search, Yahoo
+  Finance per-ticker headlines, Seeking Alpha per-ticker feed, CNBC top
+  news + MarketWatch top stories (topic-level, ticker-filtered), plus an
+  optional newsquant enrichment pass (quality_score/dedup/full-text, slow,
+  gated behind STOCKBOT_NEWSQUANT=1). Feed URLs mirror the fin-news
+  (PyPI fin-news 0.1.2) maps; all fetches use this module's own
+  ``_http_bytes`` transport — never fin-news' parser/fake-useragent stack
+  (its UA bootstrap 403s). Items merge under one cache key, newest-first.
 - SEC EDGAR Atom: per-company filings (needs CIK + contact User-Agent).
 - Quote via valuation.get_live_quote: Yahoo quoteSummary with its own
   5-minute price TTL in cache.db.
@@ -16,12 +23,17 @@ All fetches are best-effort: transport failure returns a structured
 ``{"error": ...}`` envelope, never raises into the request handler.
 Yahoo 429s back off (Retry-After honored, 60s negative cache) instead of
 hammering — first paint during a throttle shows "unavailable", never mocks.
+Exa stays out of this module: it remains the optional paid agent research
+path (app/exa_client.search, EXA_ENABLED + key), never the keyless UI feed.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
+import re
+import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -37,6 +49,13 @@ logger = logging.getLogger(__name__)
 
 _YAHOO_SEARCH_BASE = "https://query2.finance.yahoo.com"
 _GNEWS_URL = "https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US%3Aen"
+# Per-ticker heads: Yahoo headlines (?s=SYM) + Seeking Alpha combined ticker
+# feed. Topic-level tails (CNBC top news, MarketWatch top stories) carry no
+# ticker — filtered by headline/company mention at merge time.
+_YAHOO_HEADLINES_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
+_SEEKING_ALPHA_TICKER_URL = "https://seekingalpha.com/api/sa/combined/{ticker}.xml"
+_CNBC_TOP_NEWS_URL = "https://www.cnbc.com/id/100003114/device/rss/rss.html"
+_MARKETWATCH_TOP_URL = "http://feeds.marketwatch.com/marketwatch/topstories/"
 _SEC_ATOM_URL = (
     "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}"
     "&type=&dateb=&owner=include&count={n}&output=atom"
@@ -47,6 +66,9 @@ _TTL_UNIVERSE = 24 * 3600
 _TTL_NEWS = 900
 _TTL_FILINGS = 3600
 _NEG_TTL = 60
+# newsquant fetch() runs trafilatura over every item (~120s/ticker in probe):
+# never on the request hot path — daemon thread + join timeout, partial wins.
+_NEWSQUANT_TIMEOUT = 25.0
 
 _GATEWAY: object | None = None
 
@@ -94,6 +116,24 @@ def _http_bytes(url: str, headers: dict[str, str] | None = None) -> bytes:
 
 def _universe_sort_key(entry: dict[str, object]) -> str:
     return str(entry["sym"])
+
+
+def _news_sort_key(item: dict[str, object]) -> float:
+    """Epoch seconds of a news item's date; unparseable sorts oldest."""
+    from email.utils import parsedate_to_datetime
+
+    raw = item.get("published")
+    if not isinstance(raw, str) or not raw:
+        return 0.0
+    try:
+        return parsedate_to_datetime(raw).timestamp()
+    except (TypeError, ValueError):
+        pass
+    try:
+        iso = raw.replace("Z", "+00:00") if raw.endswith(("Z", "z")) else raw
+        return datetime.fromisoformat(iso).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _neg(key: str, message: str) -> dict[str, object]:
@@ -285,8 +325,96 @@ def cik_for_ticker(sym: str) -> int | None:
     return None
 
 
+def _rss_items(raw: bytes, source: str) -> list[dict[str, object]]:
+    """RSS <item> rows -> canonical news items; bad XML yields []."""
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return []
+    items: list[dict[str, object]] = []
+    for row in root.iter("item"):
+        title = (row.findtext("title") or "").strip()
+        if not title:
+            continue
+        items.append(
+            {
+                "title": title,
+                "link": (row.findtext("link") or "").strip(),
+                "published": (row.findtext("pubDate") or "").strip(),
+                "source": (row.findtext("source") or "").strip() or source,
+            }
+        )
+    return items
+
+
+def _mentions_ticker(title: str, ticker: str) -> bool:
+    """Topic-level filter: keep CNBC/MarketWatch items naming the ticker (word match)."""
+    hay = title.upper()
+    names = (ticker, "NVIDIA") if ticker == "NVDA" else (ticker,)
+    return any(re.search(rf"\b{re.escape(name)}\b", hay) for name in names)
+
+
+def _fetch_feed(url: str, source: str) -> list[dict[str, object]]:
+    """One RSS fetch -> items; transport failure yields [] (merge continues)."""
+    try:
+        return _rss_items(_http_bytes(url), source)
+    except Exception as e:  # noqa: BLE001 - best-effort boundary, one feed never kills the merge
+        logger.warning("news feed %s failed: %s", source, e)
+        return []
+
+
+def _newsquant_items(ticker: str) -> list[dict[str, object]]:
+    """newsquant enrichment (quality_score/dedup/full-text) in a daemon thread.
+
+    Probe: full fetch() runs ~30-120s (trafilatura per item + spacy/ticker
+    extraction). The daemon thread never blocks process exit; the join
+    timeout bounds request latency — partial result wins, timeout yields [].
+    Gated behind STOCKBOT_NEWSQUANT=1 and a lazy import (dep stays optional).
+    """
+    import os
+
+    if os.getenv("STOCKBOT_NEWSQUANT") != "1":
+        return []
+    try:
+        from newsquant import Scraper
+    except ImportError:
+        return []
+    holder: list[list[dict[str, object]]] = []
+
+    def run() -> None:
+        try:
+            arts = Scraper(sources=["yahoofinance", "cnbc"]).fetch(tickers=[ticker], days_back=3, limit=12)
+            holder.append(
+                [
+                    {
+                        "title": a.title,
+                        "link": a.url,
+                        "published": a.published_at.isoformat() if a.published_at else "",
+                        "source": f"{a.source_name} · q={a.quality_score:.2f}",
+                    }
+                    for a in arts
+                    if not a.is_duplicate and not a.is_near_duplicate
+                ]
+            )
+        except Exception as e:  # noqa: BLE001 - enrichment is optional, Google RSS stands alone
+            logger.warning("newsquant enrichment failed for %s: %s", ticker, e)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout=_NEWSQUANT_TIMEOUT)
+    return holder[0] if holder else []
+
+
 def get_news(sym: str, limit: int = 12) -> dict[str, object]:
-    """Per-ticker headlines from Google News RSS (keyless)."""
+    """Per-ticker headlines merged newest-first: Google + Yahoo + SA + CNBC/MW + newsquant.
+
+    Per-ticker heads (Google search, Yahoo ?s=SYM, Seeking Alpha ticker feed)
+    merge with ticker-filtered topic tails (CNBC top news, MarketWatch top
+    stories). Dedup by link, newest-first sort, single ``news:{ticker}`` cache
+    key. newsquant enrichment appends only when STOCKBOT_NEWSQUANT=1 (else the
+    keyless merge stands alone). Exa is intentionally absent here — paid
+    research path only (app/exa_client.search).
+    """
     ticker = sym.strip().upper()
     if not ticker:
         return {"sym": "", "items": []}
@@ -294,31 +422,35 @@ def get_news(sym: str, limit: int = 12) -> dict[str, object]:
     hit = cache.get(key, ttl=_TTL_NEWS)
     if isinstance(hit, dict):
         return hit
-    try:
-        q = urllib.parse.quote(f"{ticker} stock")
-        raw = _http_bytes(_GNEWS_URL.format(q=q))
-        root = ET.fromstring(raw)
-        items: list[dict[str, object]] = []
-        for item in root.iter("item"):
-            title = (item.findtext("title") or "").strip()
-            if not title:
-                continue
-            items.append(
-                {
-                    "title": title,
-                    "link": (item.findtext("link") or "").strip(),
-                    "published": (item.findtext("pubDate") or "").strip(),
-                    "source": (item.findtext("source") or "").strip(),
-                }
-            )
-            if len(items) >= limit:
-                break
-        out: dict[str, object] = {"sym": ticker, "items": items}
-        cache.set(key, out)
-        return out
-    except Exception as e:  # noqa: BLE001 - best-effort boundary
-        logger.warning("news failed for %s: %s", ticker, e)
-        return {"sym": ticker, "items": [], "error": f"news unavailable: {e}"}
+    q = urllib.parse.quote(f"{ticker} stock")
+    feeds = [
+        (_GNEWS_URL.format(q=q), "Google News", False),
+        (_YAHOO_HEADLINES_URL.format(ticker=ticker), "Yahoo Finance", True),
+        (_SEEKING_ALPHA_TICKER_URL.format(ticker=ticker), "Seeking Alpha", False),
+        (_CNBC_TOP_NEWS_URL, "CNBC", True),
+        (_MARKETWATCH_TOP_URL, "MarketWatch", True),
+    ]
+    merged: list[dict[str, object]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(feeds)) as pool:
+        results = pool.map(_fetch_feed, [u for u, _s, _t in feeds], [s for _u, s, _t in feeds])
+        for (_url, _source, topic_level), items in zip(feeds, results):
+            if topic_level:
+                items = [i for i in items if _mentions_ticker(str(i.get("title", "")), ticker)]
+            merged.extend(items)
+    merged.extend(_newsquant_items(ticker))
+    seen: set[str] = set()
+    unique: list[dict[str, object]] = []
+    for item in merged:
+        link = str(item.get("link") or item.get("title"))
+        if link in seen:
+            continue
+        seen.add(link)
+        unique.append(item)
+    # Feed order is relevance/pub-ranked, not chronological — newest first.
+    unique.sort(key=_news_sort_key, reverse=True)
+    out: dict[str, object] = {"sym": ticker, "items": unique[:limit]}
+    cache.set(key, out)
+    return out
 
 
 def get_filings(sym: str, limit: int = 10) -> dict[str, object]:
@@ -411,7 +543,7 @@ def get_viewer_context(sym: str) -> dict[str, object]:
         "sources": {
             "quote": "valuation.get_live_quote (Yahoo quoteSummary)",
             "candles": "Yahoo chart v8, delayed",
-            "news": "Google News RSS",
+            "news": "Google News + Yahoo Finance + Seeking Alpha + CNBC/MarketWatch RSS (newsquant when STOCKBOT_NEWSQUANT=1)",
             "filings": "SEC EDGAR Atom",
         },
         "errors": {

@@ -18,3 +18,12 @@ mutmut==3.8.0
 hypothesis==6.168.0
 fastapi>=0.115
 uvicorn>=0.30
+# News providers (api/market_providers.py, lazy imports + keyless RSS fallback).
+# newsquant fetch() is the slow enrichment pass (trafilatura/spacy per item),
+# gated behind STOCKBOT_NEWSQUANT=1 with a daemon-thread timeout — never required.
+newsquant==0.1.1
+simhash==2.1.2
+# fin-news is NOT a dependency: feed URLs mirror its maps (PyPI fin-news 0.1.2),
+# fetched with this module's own transport — its fake-useragent stack 403s,
+# so no runtime import and no pin. newsquant transitives resolve via pip;
+# only simhash is pinned (newsquant 0.1.1 omits it and crashes without it).

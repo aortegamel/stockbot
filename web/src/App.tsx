@@ -243,7 +243,7 @@ export default function App() {
       <footer
         style={{ position: "relative", zIndex: 1, fontSize: 13, padding: "4px 12px", display: "flex", justifyContent: "space-between", color: "rgba(235,235,245,0.78)" }}
       >
-        <span>delayed feed · Yahoo + SEC + Google News RSS · agent context: /api/viewer-context (unwired)</span>
+        <span>delayed feed · Yahoo OHLCV + SEC EDGAR + multi-source news (Google/Yahoo/SA/CNBC/MW) · agent context: /api/viewer-context (unwired)</span>
         <span>{selected}</span>
       </footer>
     </main>

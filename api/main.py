@@ -7,8 +7,7 @@ Routes:
 - GET /api/search?q=nvda — any-ticker validation (Yahoo search).
 - GET /api/universe — SEC ticker -> CIK + name universe.
 - GET /api/identity?sym=NVDA — SEC entity/security via SourceGateway.
-- GET /api/news?sym=NVDA — Google News RSS headlines.
-- GET /api/filings?sym=NVDA — SEC EDGAR Atom filings.
+- GET /api/news?sym=NVDA — merged keyless RSS (Google + Yahoo + Seeking Alpha + CNBC/MarketWatch; newsquant only when STOCKBOT_NEWSQUANT=1).
 - GET /api/viewer-context?sym=NVDA — read-only agent context aggregate.
   Contract: one JSON object with the viewed symbol, rendered payloads,
   and retrieval instants. The future agent loop re-fetches it on demand

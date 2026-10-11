@@ -204,7 +204,7 @@ export default function Home() {
           justifyContent: "space-between",
         }}
       >
-        <span>delayed feed · Yahoo + SEC + Google News RSS · agent context: /api/viewer-context (unwired)</span>
+        <span>delayed feed · Yahoo OHLCV + SEC EDGAR + multi-source news (Google/Yahoo/SA/CNBC/MW) · agent context: /api/viewer-context (unwired)</span>
         <span>{selected}</span>
       </footer>
     </main>
