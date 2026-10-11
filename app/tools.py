@@ -6010,6 +6010,8 @@ def _date_like_form(value: object) -> bool:
         return True
     if _FINRA_DATE_RE.match(text):
         return True
+    if text.isdigit() and len(text) == 4:
+        return True
     return "/" in text and re.search(r"\d{4}", text) is not None
 
 

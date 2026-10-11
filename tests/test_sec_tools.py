@@ -1990,6 +1990,11 @@ def test_list_sec_filings_rejects_date_like_forms_before_provider(monkeypatch: p
     assert result["error_type"] == "invalid_tool_arguments"
     assert "2025-01-01" in str(result["error"])
     assert "10-K" in str(result["error"])
+    years = tools.execute_tool(
+        "list_sec_filings", {"identifier": "NVDA", "forms": ["2020", "2021"]}, "test", context=_research_context()
+    )
+    assert years["error_type"] == "invalid_tool_arguments"
+    assert "2020" in str(years["error"])
 
 
 def test_diff_sec_filings_rejects_date_like_forms_before_provider(monkeypatch: pytest.MonkeyPatch) -> None:

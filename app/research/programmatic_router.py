@@ -13,6 +13,7 @@ company, accession, and record helpers, models.ToolDecision contract.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 
 from app.research.models import JSONValue, ToolDecision
 
@@ -154,7 +155,7 @@ def _short_tool(toks: set[str], norm: str, names: set[str]) -> str | None:
     return "get_short_interest" if "get_short_interest" in names else None
 
 
-def _has_accession(packets: list[JSONValue]) -> bool:
+def _has_accession(packets: Sequence[JSONValue]) -> bool:
     """Any accession-like token across attempts/ctx packets (scheduler scanner)."""
     from app.research.scheduler import _scan_packet_accession
 
@@ -179,10 +180,29 @@ def _router_pick(
     ctx_evidence: list[JSONValue],
 ) -> tuple[str, str] | None:
     """(tool, reason) or None when JEV must decide. Membership-gated: never picks outside the live registry."""
-    from app.research.scheduler import _ACCESSION_CARRY_TOOLS, _objective_company, _objective_ticker
+    from app.research.scheduler import (
+        _ACCESSION_CARRY_TOOLS,
+        _carry_packet_accession,
+        _objective_company,
+        _objective_ticker,
+    )
+
+    revenue_quarter = bool("revenue" in toks and toks & {"quarter", "10q"})
+    if revenue_quarter and any(a.get("tool") == "get_sec_document" and a.get("error") is not None for a in attempts):
+        return None  # JEV receives the rejected call through existing attempt feedback.
+    listed_10q = (
+        _carry_packet_accession("get_sec_document", {}, [], attempts, text)
+        if revenue_quarter and "10q" in toks
+        else None
+    )
 
     # 1. Carry-only registry (force-open narrowed): open the packet accession.
-    if names and names <= set(_ACCESSION_CARRY_TOOLS) and _has_accession([*attempts, *ctx_evidence]):
+    if (
+        names
+        and names <= set(_ACCESSION_CARRY_TOOLS)
+        and _has_accession([*attempts, *ctx_evidence])
+        and (not revenue_quarter or "10q" not in toks or listed_10q is not None)
+    ):
         if "get_sec_document" in names and toks & _READ_TOKS:
             return "get_sec_document", "carry:packet-doc"
         if "get_sec_filing" in names:
@@ -211,9 +231,16 @@ def _router_pick(
         (("filing" in toks or _FORM) and "mention" in norm) or "who filed" in norm or "who actually filed" in norm
     ):
         return _pick_variant("search_sec_filings", norm, toks, names), "person-mention"
-    # 6. Quarterly revenue always starts from the filing list.
-    if "revenue" in toks and "quarter" in toks and "list_sec_filings" in names:
-        return "list_sec_filings", "revenue-quarter"
+    # 6. Quarterly/10-Q revenue starts from the filing list, then reads the document
+    # the node's own listing names (carry picks its 10-Q; intake accessions never skip
+    # the list, same as force-open). After one read, later rules/JEV decide.
+    if revenue_quarter and not any(
+        isinstance(a, dict) and a.get("tool") == "get_sec_document" and a.get("error") is None for a in attempts
+    ):
+        if "get_sec_document" in names and (listed_10q is not None if "10q" in toks else _has_accession(attempts)):
+            return "get_sec_document", "revenue-quarter:doc"
+        if "list_sec_filings" in names:
+            return "list_sec_filings", "revenue-quarter"
     # 7. Filing list for a resolved ticker/company.
     if (
         "filing" in toks
@@ -292,7 +319,7 @@ async def programmatic_select_round(
     registry: _Registry,
     ctx_evidence: list[JSONValue],
     attempts: _Attempts,
-) -> tuple[str, object]:
+) -> tuple[str, object, str | None]:
     from app.research import scheduler as sched
 
     raw_objective = session.get("objective") or session.get("query") or ""
@@ -322,8 +349,15 @@ async def programmatic_select_round(
             confidence=None,
         )
         logger.info("toolflow programmatic sid=%s nid=%s tool=%s reason=%s", sid, nid, tool, reason)
-        return "invoke", decision
-    subset = _router_subset(ranked, registry, names)
+        return "invoke", decision, None
+    # Keep the eligible registry available when JEV must recover from a rejected document read.
+    subset = (
+        None
+        if "revenue" in toks
+        and toks & {"quarter", "10q"}
+        and any(a.get("tool") == "get_sec_document" and a.get("error") is not None for a in attempts or [])
+        else _router_subset(ranked, registry, names)
+    )
     if subset is not None:
         logger.info(
             "toolflow programmatic_fallback sid=%s nid=%s subset=%s/%s",
@@ -332,13 +366,13 @@ async def programmatic_select_round(
             len(subset),
             len(registry),
         )
-        action, decision = await sched._select_round(
+        action, decision, selection_digest = await sched._select_round(
             jev, kernel, sid, nid, session, node, subset, ctx_evidence, attempts
         )
     else:
-        action, decision = await sched._select_round(
+        action, decision, selection_digest = await sched._select_round(
             jev, kernel, sid, nid, session, node, registry, ctx_evidence, attempts
         )
     if isinstance(decision, ToolDecision):
         decision = _variant_decision(decision, norm, toks, names)
-    return action, decision
+    return action, decision, selection_digest

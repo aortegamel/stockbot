@@ -73,7 +73,7 @@ class _J:
 
 def test_catalog_pick_then_subset_select() -> None:
     reg = scheduler.build_registry()
-    act, dec = asyncio.run(
+    act, dec, _digest = asyncio.run(
         catalog_select_round(
             _J(),
             _Kernel(),
@@ -112,7 +112,7 @@ def test_catalog_sentinel_short_circuits_subset() -> None:
             }
 
     reg = scheduler.build_registry()
-    act, dec = asyncio.run(
+    act, dec, _digest = asyncio.run(
         catalog_select_round(
             _JSentinel(),
             _Kernel(),

@@ -112,7 +112,7 @@ async def catalog_select_round(
     registry: list[dict[str, JSONValue]],
     ctx_evidence: list[JSONValue],
     attempts: list[dict[str, JSONValue]],
-) -> tuple[str, object]:
+) -> tuple[str, object, str | None]:
     """Pick one catalog via jev.decide, then run the normal select over its tools."""
     from app.research import scheduler
 
@@ -177,13 +177,17 @@ async def catalog_select_round(
         )
         probs: dict[str, object] = {}
         names: list[str] = []
-        return action, {
-            "action": action,
-            "tool_name": None,
-            "tool_names": names,
-            "probabilities": probs,
-            "confidence": None,
-        }
+        return (
+            action,
+            {
+                "action": action,
+                "tool_name": None,
+                "tool_names": names,
+                "probabilities": probs,
+                "confidence": None,
+            },
+            None,
+        )
     wanted: set[str] = set()
     for catalog in catalogs:
         if catalog.get("name") == winner:
