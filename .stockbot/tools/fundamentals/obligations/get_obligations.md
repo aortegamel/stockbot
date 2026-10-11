@@ -17,6 +17,7 @@ Future cash obligations from 10-K/10-Q notes: amounts, horizons, certainty langu
 ## Reject when
 
 - Do NOT use for valuation multiples (get_valuation_metrics).
+- Do not resolve a ticker first. A company_name alone works (the server maps the name).
 
 ## Conflicts with
 

@@ -174,3 +174,53 @@ def test_registry_version_covers_routing_metadata():
     object.__setattr__(probe["get_short_interest"], "intent", "mutated_intent")
     fp = json.dumps({n: [m.domain, m.family, m.intent] for n, m in sorted(probe.items())}, sort_keys=True)
     assert hashlib.sha256((json.dumps(mod.TOOLS, sort_keys=True) + fp).encode()).hexdigest()[:12] != v1
+
+
+# Description-only selection rules moved into reject_when; JEV option lines drop descriptions.
+_JEV_RESTRICTIONS = {
+    "search_web": (
+        "exact financial facts",
+        "portfolio state",
+        "point-in-time history",
+        "market-wide screening",
+        "account, portfolio, or personal identifiers",
+        "search_company_patents",
+    ),
+    "search_sec_filings": ("never subject identity or citable evidence",),
+    "research_read_search": ("navigation artifacts",),
+    "research_add_evidence": ("source_handle", "never citable evidence"),
+    "research_read": ("never citable as raw evidence",),
+    "search_sec_relationships": ("Transaction status stays unknown",),
+    "get_transaction_status": ("Does not determine deal status",),
+    "get_finra_datapoints": ("describe_finra_dataset first",),
+    "query_finra": ("next_offset", "never current market data"),
+    "list_finra_datasets": ("dataset ID is known",),
+    "get_macro_context": ("explicit geography and variable IDs",),
+    "search_company_patents": ("never search_web", "assignee"),
+    "list_sec_documents": ("list_sec_filings first",),
+    "get_valuation_metrics": ("Not a historical point-in-time valuation",),
+    "get_short_interest_leaderboard": ("public float",),
+    "find_alternative_signals": ("PIT-valid",),
+}
+
+
+def test_jev_option_lines_keep_selection_restrictions_without_descriptions():
+    from app.decision_client import _manifest_line
+    from app.policy import Capability
+    from app.research.scheduler import _JEV_REGISTRY_EXCLUDED, build_registry
+
+    registry = build_registry()
+    names = [str(entry["name"]) for entry in registry]
+    canonical: set[str] = set()
+    for tool in tools.tools_for_capabilities(frozenset({Capability.RESEARCH})):
+        fn = tool.get("function")
+        assert isinstance(fn, dict)
+        canonical.add(str(fn.get("name")))
+    assert sorted(names) == sorted(canonical - _JEV_REGISTRY_EXCLUDED)
+    lines = {str(entry["name"]): _manifest_line(entry) for entry in registry}
+    for name, phrases in _JEV_RESTRICTIONS.items():
+        for phrase in phrases:
+            assert phrase in lines[name], (name, phrase)
+    descriptions = {name: str(fn.get("description", "")) for name, fn in _schema_functions().items()}
+    for name, line in lines.items():
+        assert descriptions[name] not in line, name

@@ -17,6 +17,7 @@ Enrichment of one social-arbitrage candidate with corroboration and exposure gap
 ## Reject when
 
 - Not for broad signal discovery.
+- Never establishes causality and never trades.
 
 ## Conflicts with
 

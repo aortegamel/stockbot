@@ -3528,6 +3528,7 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         reject_when=(
             "Not for evidence on one known trend.",
             "Not for a dated, geography-specific trend question.",
+            "Candidates only, never materiality or investment claims. Features stay null unless exactly one PIT-valid scope matches.",
         ),
         conflicts_with=(),
         related_tools=(
@@ -3549,6 +3550,7 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         reject_when=(
             "Unneeded when the exact ticker or CIK is already known.",
             "Not for the quick bounded lookup (find_sec_entities_bounded).",
+            "Ties and fuzzy-only matches stay ambiguous. Verify identity before list_sec_filings.",
         ),
         conflicts_with=("find_sec_entities_bounded",),
         related_tools=(
@@ -3616,7 +3618,8 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         reject_when=(
             "Not for stake changes over time (get_ownership_changes).",
             "Not for relationship links in either direction (search_sec_relationships).",
-            "Answer from these records; do not open filings or pull changes unless asked.",
+            "Answer from these deterministic records, never web prose. Do not open filings or pull changes unless asked.",
+            "Do not resolve a ticker first. A company_name alone works (the server maps the name).",
         ),
         conflicts_with=(
             "get_ownership_changes",
@@ -3680,6 +3683,7 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         reject_when=(
             "Do NOT use for analyzed briefings or trends (query_finra).",
             "Do NOT use for one ticker's current short position (get_short_interest).",
+            "Needs explicit fields plus a ticker, date, or filter. For friendly labels, call describe_finra_dataset first for exact field names.",
         ),
         conflicts_with=(
             "get_short_interest",
@@ -3709,6 +3713,7 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
             "Do NOT use for XBRL facts by concept (get_xbrl_facts).",
             "Do NOT use for cheap-vs-expensive multiples (get_valuation_metrics).",
             "Do NOT use for forward consensus (get_analyst_estimates).",
+            "Not for public float: shares_outstanding is SEC-reported shares outstanding. Undeclared dividend estimates are never included.",
         ),
         conflicts_with=(
             "get_analyst_estimates",
@@ -3749,7 +3754,10 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         time_mode="latest_or_as_of",
         summary="Executed insider buys/sells for one ticker: actual purchases and sales from Forms 3/4/5.",
         choose_when=("One ticker's executed insider sales (buys/sells) by executives and directors (Forms 3/4/5).",),
-        reject_when=("Do NOT use for planned but unexecuted Form 144 sales (get_planned_insider_sales).",),
+        reject_when=(
+            "Do NOT use for planned but unexecuted Form 144 sales (get_planned_insider_sales).",
+            "Do not resolve a ticker first. A company_name alone works (the server maps the name).",
+        ),
         conflicts_with=("get_planned_insider_sales",),
         related_tools=(
             "get_planned_insider_sales",
@@ -3770,6 +3778,7 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         reject_when=(
             "Not for company-specific facts.",
             "Do NOT use for outside news, commentary, or why a stock moved (search_web).",
+            "Needs explicit geography and variable IDs.",
         ),
         conflicts_with=("search_web",),
         related_tools=("search_web",),
@@ -3789,6 +3798,7 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
             "Does not cover market reaction or news commentary.",
             "Answer from the event feed; do not open filing documents unless the question needs document text.",
             "Do NOT use for a full filing list by ticker or form (list_sec_filings).",
+            "Do not resolve a ticker first. A company_name alone works (the server maps the name).",
         ),
         conflicts_with=("list_sec_filings",),
         related_tools=(
@@ -3811,7 +3821,10 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         choose_when=(
             "What a company is obligated to pay in the future for one ticker, including contracts and commitments.",
         ),
-        reject_when=("Do NOT use for valuation multiples (get_valuation_metrics).",),
+        reject_when=(
+            "Do NOT use for valuation multiples (get_valuation_metrics).",
+            "Do not resolve a ticker first. A company_name alone works (the server maps the name).",
+        ),
         conflicts_with=(),
         related_tools=(
             "get_valuation_metrics",
@@ -3887,7 +3900,10 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         choose_when=(
             "Finding the latest market-wide SC 13D/G filings when no ticker is given; what just came out, newly filed.",
         ),
-        reject_when=("Not for one company's current holders.",),
+        reject_when=(
+            "Not for one company's current holders.",
+            "Not proof that a filing caused a price move. Do not drill into get_beneficial_ownership unless asked.",
+        ),
         conflicts_with=(),
         related_tools=(
             "get_beneficial_ownership",
@@ -3908,6 +3924,7 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         reject_when=(
             "Do NOT use for biweekly short interest positions (get_short_interest).",
             "Do NOT call describe_finra_dataset or get_finra_datapoints; dataset and fields resolve internally.",
+            "Do not resolve a ticker first. A company_name alone works (the server maps the name).",
         ),
         conflicts_with=("get_short_interest",),
         related_tools=(
@@ -3934,6 +3951,7 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
             "Do NOT use for filing metadata by accession (get_sec_filing).",
             "Do NOT use to list a filing's documents or exhibits (list_sec_documents).",
             "Not for what-changed questions.",
+            "Load only the document relevant to the question, never full filing history.",
         ),
         conflicts_with=(
             "get_sec_filing",
@@ -3983,7 +4001,10 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         time_mode="current",
         summary="Persisted SEC ingestion coverage and backfill-job status for a form, source, or date partition.",
         choose_when=("Checking whether a form or date partition is covered or still queued before searching.",),
-        reject_when=("Does not retrieve filing content.",),
+        reject_when=(
+            "Does not retrieve filing content.",
+            "Never infers completeness from result rows. Reads persisted coverage and backfill jobs only.",
+        ),
         conflicts_with=(),
         related_tools=("search_sec_filings",),
         prerequisites=(),
@@ -4031,7 +4052,10 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         time_mode="latest_or_as_of",
         summary="Market-wide most-shorted screen: ranked stocks by short interest as a percent of SEC shares.",
         choose_when=("Screening which stocks are the most shorted across the market.",),
-        reject_when=("Do NOT use for one ticker's short interest (get_short_interest).",),
+        reject_when=(
+            "Do NOT use for one ticker's short interest (get_short_interest).",
+            "Not percent of public float and not real-time. Excludes funds, ETFs, preferreds, and unmapped symbols.",
+        ),
         conflicts_with=("get_short_interest",),
         related_tools=("get_short_interest",),
         prerequisites=(),
@@ -4049,6 +4073,7 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         reject_when=(
             "Do NOT use for biweekly short position alone (get_short_interest).",
             "Do NOT use for daily short-sale volume (get_reg_sho_volume).",
+            "Not for manipulation or causation questions. Describes positioning only.",
         ),
         conflicts_with=("get_short_interest",),
         related_tools=(
@@ -4098,7 +4123,10 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         time_mode="latest_or_as_of",
         summary="M&A filing context: tender offers, 14D-9 recommendations, S-4s, and merger proxies.",
         choose_when=("Checking merger, acquisition, or tender-offer filing context for a ticker.",),
-        reject_when=("Not for governance or proxy votes.",),
+        reject_when=(
+            "Not for governance or proxy votes.",
+            "Does not determine deal status (unknown until parsers land). Read filing text via get_sec_document.",
+        ),
         conflicts_with=(),
         related_tools=(
             "get_governance_events",
@@ -4116,7 +4144,10 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         time_mode="date_range",
         summary="Evidence for one known trend: search interest, rising queries, and geography.",
         choose_when=("Backing a known trend claim with dated, geography-specific search-interest evidence.",),
-        reject_when=("Not for discovering new signals.",),
+        reject_when=(
+            "Not for discovering new signals.",
+            "Not for search-volume claims. Returns top/rising list membership only.",
+        ),
         conflicts_with=(),
         related_tools=("find_alternative_signals",),
         prerequisites=(),
@@ -4134,6 +4165,7 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         reject_when=(
             "Do NOT use for reported EPS alone (get_fundamentals).",
             "Do NOT use for forward consensus alone (get_analyst_estimates).",
+            "Anchored to the live price at query time. Not a historical point-in-time valuation.",
         ),
         conflicts_with=(
             "get_analyst_estimates",
@@ -4180,7 +4212,10 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         time_mode="latest_or_as_of",
         summary="Enrichment of one social-arbitrage candidate with corroboration and exposure gap. Social signals vetting.",
         choose_when=("Testing whether online attention around one candidate corresponds to real demand.",),
-        reject_when=("Not for broad signal discovery.",),
+        reject_when=(
+            "Not for broad signal discovery.",
+            "Never establishes causality and never trades.",
+        ),
         conflicts_with=(),
         related_tools=(
             "find_alternative_signals",
@@ -4198,7 +4233,10 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         time_mode="current",
         summary="Catalog of public FINRA datasets with canonical ids, groups, and ticker/date support.",
         choose_when=("Finding which FINRA dataset covers a question before querying.",),
-        reject_when=("Does not return dataset fields or schemas (describe_finra_dataset).",),
+        reject_when=(
+            "Does not return dataset fields or schemas (describe_finra_dataset).",
+            "Unneeded when the dataset ID is known. Call the analysis tool directly.",
+        ),
         conflicts_with=("describe_finra_dataset",),
         related_tools=("describe_finra_dataset",),
         prerequisites=(),
@@ -4216,6 +4254,7 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         reject_when=(
             "Do NOT use for document text windows (get_sec_document).",
             "Do NOT use for filing metadata records (get_sec_filing).",
+            "Does not discover filings. Find an unknown accession with list_sec_filings first.",
         ),
         conflicts_with=(
             "get_sec_document",
@@ -4271,6 +4310,9 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         reject_when=(
             "Do NOT use for exact source values (get_finra_datapoints).",
             "Do NOT use for one ticker's current short position (get_short_interest).",
+            "Do NOT use when get_reg_sho_volume or get_threshold_securities answers the specific question.",
+            "Not a fresh query for more records. Page with offset from the returned next_offset.",
+            "Data older than 90 days is historical, never current market data.",
         ),
         conflicts_with=(
             "get_finra_datapoints",
@@ -4298,7 +4340,8 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         ),
         reject_when=(
             "Not for financial or filing questions.",
-            "Answer from patent records.",
+            "Answer from patent records, never search_web. Counts are publications, never inventions or bullish signals.",
+            "Needs documented assignee names for the company.",
         ),
         conflicts_with=(),
         related_tools=(),
@@ -4324,6 +4367,7 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
             "Do NOT use for full-filing diffs between accessions (diff_sec_filings).",
             "Do NOT use for one filing metadata record by accession (get_sec_filing).",
             "Not for the quick bounded lookup (search_sec_filings_bounded).",
+            "Hits are text mentions naming the filer and matched document, never subject identity or citable evidence.",
         ),
         conflicts_with=(
             "diff_risk_factors",
@@ -4378,6 +4422,8 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         reject_when=(
             "Not for current 5%+ stake sizes (get_beneficial_ownership).",
             "Not for consecutive-filing stake diffs (get_ownership_changes).",
+            "Mentions never become verified links. Transaction status stays unknown without closing evidence.",
+            "Do not resolve a ticker first. A company_name alone works (the server maps the name).",
         ),
         conflicts_with=(
             "get_beneficial_ownership",
@@ -4403,6 +4449,10 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         reject_when=(
             "Not for FINRA short data.",
             "Do NOT use for bounded geography statistics like population or rates (get_macro_context).",
+            "Not for exact financial facts, portfolio state, point-in-time history, mandate math, or deterministic screens.",
+            "Never for market-wide screening or historical completeness claims. The published_at date differs from retrieved_at.",
+            "Not for patent records (search_company_patents).",
+            "Never put account, portfolio, or personal identifiers in the query.",
         ),
         conflicts_with=("get_macro_context",),
         related_tools=(
@@ -4422,7 +4472,10 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         time_mode="current",
         summary="Start a new investment thesis proposal with scope, claims, and open questions.",
         choose_when=("Creating a new investment thesis to track and test.",),
-        reject_when=("Not for reading an existing thesis.",),
+        reject_when=(
+            "Not for reading an existing thesis.",
+            "Not for changing an existing thesis ID (thesis_refine).",
+        ),
         conflicts_with=(),
         related_tools=(
             "thesis_show",
@@ -4444,6 +4497,7 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         reject_when=(
             "Not for revising thesis claims or deltas (thesis_refine).",
             "Not for setting alerts (thesis_watch).",
+            "Active theses only.",
         ),
         conflicts_with=(
             "thesis_watch",
@@ -4482,7 +4536,10 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         time_mode="current",
         summary="Update a thesis with clarifications and deltas. Pass the thesis ID as thesis:<uuid>.",
         choose_when=("Revising a thesis after new evidence or feedback.",),
-        reject_when=("Not for routine operator notes without changing claims (thesis_journal).",),
+        reject_when=(
+            "Not for routine operator notes without changing claims (thesis_journal).",
+            "Refuses paused or closed theses.",
+        ),
         conflicts_with=("thesis_journal",),
         related_tools=(
             "thesis_show",
@@ -4529,6 +4586,7 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         reject_when=(
             "Not for logging notes (thesis_journal).",
             "Not for reading thesis status and assessment (thesis_show).",
+            "Never modifies existing watch rules.",
         ),
         conflicts_with=(
             "thesis_journal",
@@ -4639,7 +4697,10 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         time_mode="latest_or_as_of",
         summary="Read one persisted research resource: evidence, freeze, dossier, job, or session record.",
         choose_when=("Reading a single evidence, freeze, dossier, job, or session record.",),
-        reject_when=("Not for session state overviews (research_status).",),
+        reject_when=(
+            "Not for session state overviews (research_status).",
+            "Coverage artifacts are inspection only, never citable as raw evidence.",
+        ),
         conflicts_with=(),
         related_tools=("research_status",),
         prerequisites=(),
@@ -4658,7 +4719,10 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
             "Reading hits beyond the compact top_hits/additional_hits packet of a search_sec_filings result.",
             "Paging a large search to exhaustion instead of rerunning the search with a higher limit.",
         ),
-        reject_when=("Not for running a new SEC search (search_sec_filings).",),
+        reject_when=(
+            "Not for running a new SEC search (search_sec_filings).",
+            "Hits are navigation artifacts, not evidence. Open the filing and cite a raw passage first.",
+        ),
         conflicts_with=(),
         related_tools=(
             "research_read",
@@ -4677,7 +4741,11 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         time_mode="current",
         summary="Record one finding on a research job; provenance, point-in-time, and IDs are kernel-validated.",
         choose_when=("Recording a finding from a dispatched research job.",),
-        reject_when=("Not for session state overviews (research_status).",),
+        reject_when=(
+            "Not for session state overviews (research_status).",
+            "observed_fact needs the get_sec_document source_handle plus the cited passage. Search hits fail ERR_RAW_SOURCE_REQUIRED.",
+            "absence_observation needs search_id, query, and coverage. It is stored as coverage, never citable evidence.",
+        ),
         conflicts_with=(),
         related_tools=("research_status",),
         prerequisites=(),

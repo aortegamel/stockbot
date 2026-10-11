@@ -17,6 +17,7 @@ Evidence for one known trend: search interest, rising queries, and geography.
 ## Reject when
 
 - Not for discovering new signals.
+- Not for search-volume claims. Returns top/rising list membership only.
 
 ## Conflicts with
 

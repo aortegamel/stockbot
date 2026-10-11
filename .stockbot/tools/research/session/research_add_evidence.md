@@ -17,6 +17,8 @@ Record one finding on a research job; provenance, point-in-time, and IDs are ker
 ## Reject when
 
 - Not for session state overviews (research_status).
+- observed_fact needs the get_sec_document source_handle plus the cited passage. Search hits fail ERR_RAW_SOURCE_REQUIRED.
+- absence_observation needs search_id, query, and coverage. It is stored as coverage, never citable evidence.
 
 ## Conflicts with
 

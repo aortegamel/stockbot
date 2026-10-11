@@ -18,6 +18,9 @@ Analyzed FINRA briefing with trends and metrics over any named dataset, no raw r
 
 - Do NOT use for exact source values (get_finra_datapoints).
 - Do NOT use for one ticker's current short position (get_short_interest).
+- Do NOT use when get_reg_sho_volume or get_threshold_securities answers the specific question.
+- Not a fresh query for more records. Page with offset from the returned next_offset.
+- Data older than 90 days is historical, never current market data.
 
 ## Conflicts with
 

@@ -20,6 +20,7 @@ Single reported fundamental for one ticker: EPS, dividends, balance-sheet item, 
 - Do NOT use for XBRL facts by concept (get_xbrl_facts).
 - Do NOT use for cheap-vs-expensive multiples (get_valuation_metrics).
 - Do NOT use for forward consensus (get_analyst_estimates).
+- Not for public float: shares_outstanding is SEC-reported shares outstanding. Undeclared dividend estimates are never included.
 
 ## Conflicts with
 

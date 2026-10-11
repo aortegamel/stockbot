@@ -18,6 +18,7 @@ Self-contained daily short-sale volume by venue for one ticker: FINRA Reg SHO vo
 
 - Do NOT use for biweekly short interest positions (get_short_interest).
 - Do NOT call describe_finra_dataset or get_finra_datapoints; dataset and fields resolve internally.
+- Do not resolve a ticker first. A company_name alone works (the server maps the name).
 
 ## Conflicts with
 

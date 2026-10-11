@@ -18,6 +18,7 @@ Index of documents and exhibits attached to one filing, looked up by accession n
 
 - Do NOT use for document text windows (get_sec_document).
 - Do NOT use for filing metadata records (get_sec_filing).
+- Does not discover filings. Find an unknown accession with list_sec_filings first.
 
 ## Conflicts with
 

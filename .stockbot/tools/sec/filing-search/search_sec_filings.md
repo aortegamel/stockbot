@@ -23,6 +23,7 @@ General EDGAR full-text disclosure search across entity, EFTS, and 10-K/10-Q rou
 - Do NOT use for full-filing diffs between accessions (diff_sec_filings).
 - Do NOT use for one filing metadata record by accession (get_sec_filing).
 - Not for the quick bounded lookup (search_sec_filings_bounded).
+- Hits are text mentions naming the filer and matched document, never subject identity or citable evidence.
 
 ## Conflicts with
 

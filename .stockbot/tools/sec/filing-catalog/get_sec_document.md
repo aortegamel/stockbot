@@ -21,6 +21,7 @@ Bounded text window of one filing document by accession number (Required: access
 - Do NOT use for filing metadata by accession (get_sec_filing).
 - Do NOT use to list a filing's documents or exhibits (list_sec_documents).
 - Not for what-changed questions.
+- Load only the document relevant to the question, never full filing history.
 
 ## Conflicts with
 

@@ -18,6 +18,7 @@ Macro statistics for a geography such as California: population (how many people
 
 - Not for company-specific facts.
 - Do NOT use for outside news, commentary, or why a stock moved (search_web).
+- Needs explicit geography and variable IDs.
 
 ## Conflicts with
 

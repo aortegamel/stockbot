@@ -17,6 +17,7 @@ Catalog of public FINRA datasets with canonical ids, groups, and ticker/date sup
 ## Reject when
 
 - Does not return dataset fields or schemas (describe_finra_dataset).
+- Unneeded when the dataset ID is known. Call the analysis tool directly.
 
 ## Conflicts with
 

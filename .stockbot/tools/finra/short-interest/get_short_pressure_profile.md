@@ -18,6 +18,7 @@ Short pressure vs shares outstanding for one ticker: FINRA positioning plus SEC 
 
 - Do NOT use for biweekly short position alone (get_short_interest).
 - Do NOT use for daily short-sale volume (get_reg_sho_volume).
+- Not for manipulation or causation questions. Describes positioning only.
 
 ## Conflicts with
 

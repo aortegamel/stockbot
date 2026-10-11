@@ -18,6 +18,8 @@ Ownership and transaction relationship links for an entity: 13D/G owners, 13F ho
 
 - Not for current 5%+ stake sizes (get_beneficial_ownership).
 - Not for consecutive-filing stake diffs (get_ownership_changes).
+- Mentions never become verified links. Transaction status stays unknown without closing evidence.
+- Do not resolve a ticker first. A company_name alone works (the server maps the name).
 
 ## Conflicts with
 

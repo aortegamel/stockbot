@@ -17,6 +17,7 @@ Start a new investment thesis proposal with scope, claims, and open questions.
 ## Reject when
 
 - Not for reading an existing thesis.
+- Not for changing an existing thesis ID (thesis_refine).
 
 ## Conflicts with
 

@@ -17,6 +17,7 @@ Executed insider buys/sells for one ticker: actual purchases and sales from Form
 ## Reject when
 
 - Do NOT use for planned but unexecuted Form 144 sales (get_planned_insider_sales).
+- Do not resolve a ticker first. A company_name alone works (the server maps the name).
 
 ## Conflicts with
 

@@ -17,6 +17,7 @@ Market-wide feed of the most recent SC 13D/13G filings from roughly the last 24 
 ## Reject when
 
 - Not for one company's current holders.
+- Not proof that a filing caused a price move. Do not drill into get_beneficial_ownership unless asked.
 
 ## Conflicts with
 

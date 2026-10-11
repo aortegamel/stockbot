@@ -18,7 +18,8 @@ Current 5%+ beneficial-ownership stakes (SC 13D/G): holder, shares, percent, vot
 
 - Not for stake changes over time (get_ownership_changes).
 - Not for relationship links in either direction (search_sec_relationships).
-- Answer from these records; do not open filings or pull changes unless asked.
+- Answer from these deterministic records, never web prose. Do not open filings or pull changes unless asked.
+- Do not resolve a ticker first. A company_name alone works (the server maps the name).
 
 ## Conflicts with
 

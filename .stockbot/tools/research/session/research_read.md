@@ -17,6 +17,7 @@ Read one persisted research resource: evidence, freeze, dossier, job, or session
 ## Reject when
 
 - Not for session state overviews (research_status).
+- Coverage artifacts are inspection only, never citable as raw evidence.
 
 ## Conflicts with
 

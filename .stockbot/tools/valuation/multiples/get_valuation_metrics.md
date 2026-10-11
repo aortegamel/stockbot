@@ -18,6 +18,7 @@ Cheap-vs-expensive earnings multiples at live price: trailing plus forward P/E.
 
 - Do NOT use for reported EPS alone (get_fundamentals).
 - Do NOT use for forward consensus alone (get_analyst_estimates).
+- Anchored to the live price at query time. Not a historical point-in-time valuation.
 
 ## Conflicts with
 

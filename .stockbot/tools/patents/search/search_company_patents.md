@@ -17,7 +17,8 @@ Company patent search: publications, assignees, counts, and classifications.
 ## Reject when
 
 - Not for financial or filing questions.
-- Answer from patent records.
+- Answer from patent records, never search_web. Counts are publications, never inventions or bullish signals.
+- Needs documented assignee names for the company.
 
 ## Conflicts with
 

@@ -17,6 +17,7 @@ Persisted SEC ingestion coverage and backfill-job status for a form, source, or 
 ## Reject when
 
 - Does not retrieve filing content.
+- Never infers completeness from result rows. Reads persisted coverage and backfill jobs only.
 
 ## Conflicts with
 

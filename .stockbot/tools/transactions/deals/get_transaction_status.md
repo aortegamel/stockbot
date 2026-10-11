@@ -17,6 +17,7 @@ M&A filing context: tender offers, 14D-9 recommendations, S-4s, and merger proxi
 ## Reject when
 
 - Not for governance or proxy votes.
+- Does not determine deal status (unknown until parsers land). Read filing text via get_sec_document.
 
 ## Conflicts with
 

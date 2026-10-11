@@ -17,6 +17,7 @@ Update a thesis with clarifications and deltas. Pass the thesis ID as thesis:<uu
 ## Reject when
 
 - Not for routine operator notes without changing claims (thesis_journal).
+- Refuses paused or closed theses.
 
 ## Conflicts with
 

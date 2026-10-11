@@ -18,6 +18,10 @@ External web news and commentary for price moves, headlines, and industry develo
 
 - Not for FINRA short data.
 - Do NOT use for bounded geography statistics like population or rates (get_macro_context).
+- Not for exact financial facts, portfolio state, point-in-time history, mandate math, or deterministic screens.
+- Never for market-wide screening or historical completeness claims. The published_at date differs from retrieved_at.
+- Not for patent records (search_company_patents).
+- Never put account, portfolio, or personal identifiers in the query.
 
 ## Conflicts with
 

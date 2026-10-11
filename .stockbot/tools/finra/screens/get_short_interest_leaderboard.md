@@ -17,6 +17,7 @@ Market-wide most-shorted screen: ranked stocks by short interest as a percent of
 ## Reject when
 
 - Do NOT use for one ticker's short interest (get_short_interest).
+- Not percent of public float and not real-time. Excludes funds, ETFs, preferreds, and unmapped symbols.
 
 ## Conflicts with
 

@@ -18,6 +18,7 @@ Exact raw rows from any named FINRA dataset: only the requested fields, up to 25
 
 - Do NOT use for analyzed briefings or trends (query_finra).
 - Do NOT use for one ticker's current short position (get_short_interest).
+- Needs explicit fields plus a ticker, date, or filter. For friendly labels, call describe_finra_dataset first for exact field names.
 
 ## Conflicts with
 

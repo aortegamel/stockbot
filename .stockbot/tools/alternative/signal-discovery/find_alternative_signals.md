@@ -18,6 +18,7 @@ Discovery scan for rising search-term and diffusion signals worth investigating.
 
 - Not for evidence on one known trend.
 - Not for a dated, geography-specific trend question.
+- Candidates only, never materiality or investment claims. Features stay null unless exactly one PIT-valid scope matches.
 
 ## Conflicts with
 

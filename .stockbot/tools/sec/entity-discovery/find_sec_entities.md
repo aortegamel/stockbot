@@ -18,6 +18,7 @@ Resolve a company name, ticker, or CIK to verified SEC entity candidates with CI
 
 - Unneeded when the exact ticker or CIK is already known.
 - Not for the quick bounded lookup (find_sec_entities_bounded).
+- Ties and fuzzy-only matches stay ambiguous. Verify identity before list_sec_filings.
 
 ## Conflicts with
 

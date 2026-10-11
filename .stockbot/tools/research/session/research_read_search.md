@@ -18,6 +18,7 @@ Page the persisted ranked hit universe of one SEC search, with retrieval truth.
 ## Reject when
 
 - Not for running a new SEC search (search_sec_filings).
+- Hits are navigation artifacts, not evidence. Open the filing and cite a raw passage first.
 
 ## Conflicts with
 

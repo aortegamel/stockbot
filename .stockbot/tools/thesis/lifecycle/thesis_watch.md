@@ -18,6 +18,7 @@ List existing watch rules, or add a validated monitoring rule that alerts when a
 
 - Not for logging notes (thesis_journal).
 - Not for reading thesis status and assessment (thesis_show).
+- Never modifies existing watch rules.
 
 ## Conflicts with
 
