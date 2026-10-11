@@ -273,7 +273,7 @@ def _arguments_prompt(tool, schema, objective, node, context):
     """Single-shot constrained prompt: exactly one tool, grounded args only."""
     return json.dumps(
         {
-            "instruction": (
+            "directive": (
                 f"You must call exactly the tool {tool!r} once with valid grounded arguments, "
                 "or return an error (must-call-or-error). Never call another tool, never chain "
                 "tools, never judge sufficiency or completion. Ground every argument: "
@@ -283,7 +283,12 @@ def _arguments_prompt(tool, schema, objective, node, context):
                 "dataset must be canonical group/name. as_of only from an explicit YYYY-MM-DD date or relative wording "
                 "in the query/objective, never memory or priors: no date wording means omit as_of entirely (latest-available). Today UTC is "
                 f"{datetime.now(timezone.utc).date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week' or 'today' or 'last quarter' as arg values. On insufficient grounding raise/return an error, never fabricate, never stay silent. "
-                "For get_sec_document on a revenue-quarter question always include query 'revenue increased'; "
+                "For get_sec_document on a revenue-quarter question, use query 'revenue'. "
+                "For a latest 10-Q request, list only form 10-Q. "
+                "Omit start_date and end_date unless the user supplies date bounds. "
+                "Select the accession from the latest listed row whose form is 10-Q. "
+                "Use the prior attempts as rejection feedback. "
+                "Do not repeat a rejected call with identical arguments. "
             ),
             "tool": tool,
             "schema": schema,

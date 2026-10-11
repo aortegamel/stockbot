@@ -20,7 +20,7 @@ export type NeedleExtractResult = {
 };
 
 export const TOOL_TIMEOUT_MS = 120_000;
-export const GENERATE_TIMEOUT_MS = 10_000;
+export const GENERATE_TIMEOUT_MS = 20_000;
 // Runtime gate mirroring server.py validate_needle_tool: Needle output must
 // invoke the exact JEV-selected tool. JEV owns selection; Needle never
 // selects, chains, or judges sufficiency. Throws on mismatch (incl. null).

@@ -320,7 +320,7 @@ def test_arguments_prompt_states_grounding_rules(monkeypatch: pytest.MonkeyPatch
     srv = _load_server(monkeypatch, tmp_path)
     decoded: object = json.loads(srv._arguments_prompt("get_sec_filing", {}, "o", "n", {}))
     assert isinstance(decoded, dict)
-    instruction = str(decoded["instruction"])
+    directive = str(decoded["directive"])
     for needle in (
         "must-call-or-error",
         "never chain",
@@ -336,8 +336,13 @@ def test_arguments_prompt_states_grounding_rules(monkeypatch: pytest.MonkeyPatch
         "Today UTC is",
         "decode relative dates before choosing",
         "Monday-now NYC range",
+        "use query 'revenue'",
+        "For a latest 10-Q request, list only form 10-Q",
+        "Omit start_date and end_date unless the user supplies date bounds",
+        "Do not repeat a rejected call with identical arguments",
     ):
-        assert needle in instruction
+        assert needle in directive
+    assert "revenue increased" not in directive
     assert str(decoded["objective"]) == "o"
 
 
@@ -402,9 +407,9 @@ def test_arguments_prompt_omits_as_of_without_dates(monkeypatch: pytest.MonkeyPa
     srv = _load_server(monkeypatch, tmp_path)
     decoded: object = json.loads(srv._arguments_prompt("get_sec_filing", {}, "o", "n", {}))
     assert isinstance(decoded, dict)
-    instruction = str(decoded["instruction"])
-    assert "as_of only from an explicit YYYY-MM-DD date" in instruction
-    assert "omit as_of entirely (latest-available)" in instruction
+    directive = str(decoded["directive"])
+    assert "as_of only from an explicit YYYY-MM-DD date" in directive
+    assert "omit as_of entirely (latest-available)" in directive
 
 
 def test_extract_agent_binds_single_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -600,7 +605,7 @@ def test_generate_withheld_accept_and_timeout(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(subprocess, "Popen", _FakeProc)
     monkeypatch.setattr(nc, "_ensure_weights", lambda: None)
     monkeypatch.setattr(nc, "_readline", _fake_readline)
-    assert nc._GENERATE_TIMEOUT_S == 10.0
+    assert nc._GENERATE_TIMEOUT_S == 20.0
     out = nc.generate_arguments(tool="search_sec_filings")
     assert out["withheld"] is True
     assert out["tool"] == "search_sec_filings"
@@ -617,7 +622,7 @@ def test_generate_withheld_accept_and_timeout(monkeypatch: pytest.MonkeyPatch) -
         raise TimeoutError("slow")
 
     monkeypatch.setattr(nc, "_readline", _slow)
-    with pytest.raises(RuntimeError, match="timed out after 10s"):
+    with pytest.raises(RuntimeError, match="timed out after 20s"):
         nc.generate_arguments(tool="search_sec_filings")
     nc.close()
     _FakeProc.instances.clear()

@@ -10,6 +10,7 @@ on realistic prompts). Missing server/weights raise; never stub.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
 import logging
 import os
@@ -17,8 +18,9 @@ import select
 import subprocess
 import sys
 import threading
+import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import IO
 
@@ -30,9 +32,9 @@ __all__ = ["close", "embed", "extract_fields", "generate_arguments", "start", "v
 
 _TIMEOUT_S = 120.0
 _STDERR_TAIL_CHARS = 2000
-# ponytail: 10s generation ceiling; a timeout kills + restarts the child (slow
+# ponytail: 20s generation ceiling; a timeout kills + restarts the child (slow
 # tail, not queue wait — the clock starts at write/flush inside _exchange_locked).
-_GENERATE_TIMEOUT_S = 10.0
+_GENERATE_TIMEOUT_S = 20.0
 
 # ponytail: single-flight lock; per-request lanes if Needle throughput matters.
 _LOCK = threading.Lock()
@@ -194,7 +196,25 @@ def _readline(proc: subprocess.Popen[str], timeout_s: float) -> str:
     return line
 
 
-def _ping_locked(proc: subprocess.Popen[str]) -> None:
+def _left(timeout_s: float, stop_at: float | None) -> float:
+    """Read timeout capped by an optional caller deadline (time.perf_counter seconds)."""
+    return timeout_s if stop_at is None else max(0.0, min(timeout_s, stop_at - time.perf_counter()))
+
+
+@contextlib.contextmanager
+def _held(stop_at: float | None) -> Generator[None]:
+    """Hold _LOCK. A stop_at caller stops waiting at its deadline and never starts a call after it."""
+    if not _LOCK.acquire(timeout=-1 if stop_at is None else max(0.0, stop_at - time.perf_counter())):
+        raise RuntimeError("needle caller deadline spent waiting for the worker")
+    try:
+        if stop_at is not None and time.perf_counter() >= stop_at:
+            raise RuntimeError("needle caller deadline spent")
+        yield
+    finally:
+        _LOCK.release()
+
+
+def _ping_locked(proc: subprocess.Popen[str], stop_at: float | None = None) -> None:
     """Gate one child: it must echo our ping id with ready:true. Fail closed."""
     rid = f"needle:{uuid.uuid4().hex[:12]}"
     payload: dict[str, JSONValue] = {"id": rid, "action": "ping"}
@@ -203,7 +223,7 @@ def _ping_locked(proc: subprocess.Popen[str]) -> None:
         raise RuntimeError("needle ping failed: server stdin missing")
     inp.write(json.dumps(payload) + "\n")
     inp.flush()
-    raw_line = _readline(proc, _TIMEOUT_S)
+    raw_line = _readline(proc, _left(_TIMEOUT_S, stop_at))
     try:
         decoded: object = json.loads(raw_line)
     except ValueError as exc:
@@ -212,14 +232,14 @@ def _ping_locked(proc: subprocess.Popen[str]) -> None:
         raise RuntimeError("needle ping failed: bad ack")
 
 
-def _ensure_locked() -> subprocess.Popen[str]:
+def _ensure_locked(stop_at: float | None = None) -> subprocess.Popen[str]:
     """Live child, spawn + ping-gating a fresh one only when needed. Caller holds _LOCK."""
     proc = _PROC
     if proc is not None and proc.poll() is None:
         return proc
     _kill_locked()
     proc = _spawn_locked()
-    _ping_locked(proc)
+    _ping_locked(proc, stop_at)
     return proc
 
 
@@ -254,7 +274,7 @@ def _exchange_locked(proc: subprocess.Popen[str], tool: str, payload: dict[str, 
 
 
 def _exchange_extract_locked(
-    proc: subprocess.Popen[str], record_name: str, payload: dict[str, JSONValue]
+    proc: subprocess.Popen[str], record_name: str, payload: dict[str, JSONValue], stop_at: float | None
 ) -> dict[str, JSONValue]:
     """One extract round trip; record mismatch or ungrounded values raise."""
     inp = proc.stdin
@@ -262,7 +282,7 @@ def _exchange_extract_locked(
         raise RuntimeError(f"needle extract failed for {record_name!r}: server stdin missing")
     inp.write(json.dumps(payload) + "\n")
     inp.flush()
-    raw_line = _readline(proc, _TIMEOUT_S)
+    raw_line = _readline(proc, _left(_TIMEOUT_S, stop_at))
     try:
         decoded: object = json.loads(raw_line)
     except ValueError as exc:
@@ -285,14 +305,16 @@ def _exchange_extract_locked(
     }
 
 
-def _exchange_embed_locked(proc: subprocess.Popen[str], payload: dict[str, JSONValue]) -> list[float]:
+def _exchange_embed_locked(
+    proc: subprocess.Popen[str], payload: dict[str, JSONValue], stop_at: float | None
+) -> list[float]:
     """One embed round trip; malformed vectors raise."""
     inp = proc.stdin
     if inp is None:
         raise RuntimeError("needle embed failed: server stdin missing")
     inp.write(json.dumps(payload) + "\n")
     inp.flush()
-    raw_line = _readline(proc, _TIMEOUT_S)
+    raw_line = _readline(proc, _left(_TIMEOUT_S, stop_at))
     try:
         decoded: object = json.loads(raw_line)
     except ValueError as exc:
@@ -425,18 +447,17 @@ def generate_arguments(*args: object, **kwargs: object) -> dict[str, JSONValue]:
 
 
 def _restartable_dict(
-    label: str, exchange: Callable[[subprocess.Popen[str]], dict[str, JSONValue]]
+    label: str, exchange: Callable[[subprocess.Popen[str]], dict[str, JSONValue]], stop_at: float | None
 ) -> dict[str, JSONValue]:
     """One dict exchange with a single bounded restart on BrokenPipe/EOF."""
     attempt = 0
     while True:
         try:
-            return exchange(_ensure_locked())
+            return exchange(_ensure_locked(stop_at))
         except TimeoutError as exc:
             _kill_locked()
-            raise RuntimeError(
-                f"needle {label} timed out after {_TIMEOUT_S:g}s; stderr tail: {_tail_text() or '(empty)'}"
-            ) from exc
+            limit = f"after {_TIMEOUT_S:g}s" if stop_at is None else "at the caller deadline"
+            raise RuntimeError(f"needle {label} timed out {limit}; stderr tail: {_tail_text() or '(empty)'}") from exc
         except OSError as exc:
             _kill_locked()
             if attempt >= 1:
@@ -444,17 +465,18 @@ def _restartable_dict(
             attempt += 1
 
 
-def _restartable_vec(label: str, exchange: Callable[[subprocess.Popen[str]], list[float]]) -> list[float]:
+def _restartable_vec(
+    label: str, exchange: Callable[[subprocess.Popen[str]], list[float]], stop_at: float | None
+) -> list[float]:
     """One vector exchange with a single bounded restart on BrokenPipe/EOF."""
     attempt = 0
     while True:
         try:
-            return exchange(_ensure_locked())
+            return exchange(_ensure_locked(stop_at))
         except TimeoutError as exc:
             _kill_locked()
-            raise RuntimeError(
-                f"needle {label} timed out after {_TIMEOUT_S:g}s; stderr tail: {_tail_text() or '(empty)'}"
-            ) from exc
+            limit = f"after {_TIMEOUT_S:g}s" if stop_at is None else "at the caller deadline"
+            raise RuntimeError(f"needle {label} timed out {limit}; stderr tail: {_tail_text() or '(empty)'}") from exc
         except OSError as exc:
             _kill_locked()
             if attempt >= 1:
@@ -469,12 +491,14 @@ def extract_fields(
     system: str | None = None,
     max_new_tokens: int = 512,
     strict: bool = True,
+    stop_at: float | None = None,
 ) -> dict[str, JSONValue]:
     """Extract typed fields for one record shape from messy text.
 
     Single-record binding only — never the full registry. Grammar guarantees
     the parse; ungrounded values raise. JEV owns what to extract and whether
-    the fields suffice; this returns bytes only.
+    the fields suffice; this returns bytes only. A stop_at (time.perf_counter)
+    caller never holds the worker past it: a read still open then kills the child.
     """
     if not isinstance(record, dict) or not isinstance(record.get("name"), str) or not record["name"]:
         raise ValueError("extract_fields: record must carry a nonempty name")
@@ -500,16 +524,16 @@ def extract_fields(
         "max_new_tokens": max_new_tokens,
         "strict": strict,
     }
-    with _LOCK:
+    with _held(stop_at):
 
         def _run_extract(proc: subprocess.Popen[str]) -> dict[str, JSONValue]:
-            return _exchange_extract_locked(proc, record_name, payload)
+            return _exchange_extract_locked(proc, record_name, payload, stop_at)
 
-        return _restartable_dict(f"extract for {record_name!r}", _run_extract)
+        return _restartable_dict(f"extract for {record_name!r}", _run_extract, stop_at)
 
 
-def embed(text: str) -> list[float]:
-    """One retrieval vector off the shared agent (serial like arguments.generate)."""
+def embed(text: str, *, stop_at: float | None = None) -> list[float]:
+    """One retrieval vector off the shared agent (serial like arguments.generate; stop_at as in extract_fields)."""
     if not isinstance(text, str) or not text.strip():
         raise ValueError("embed: text must be a nonempty string")
     if not _server().exists():
@@ -518,7 +542,7 @@ def embed(text: str) -> list[float]:
     payload: dict[str, JSONValue] = {"id": f"needle:{uuid.uuid4().hex[:12]}", "action": "embed", "text": text}
 
     def _run_embed(proc: subprocess.Popen[str]) -> list[float]:
-        return _exchange_embed_locked(proc, payload)
+        return _exchange_embed_locked(proc, payload, stop_at)
 
-    with _LOCK:
-        return _restartable_vec("embed", _run_embed)
+    with _held(stop_at):
+        return _restartable_vec("embed", _run_embed, stop_at)
