@@ -1,7 +1,37 @@
-import type { AgentEvent } from "@/lib/agent/types";
+import { useState } from "react";
+import type { AgentEvent, Evidence } from "@/lib/agent/types";
 import { AgentEventView } from "./agent-event";
+import { SourcePanel } from "./source-panel";
 
+// ponytail: citations are exact Evidence.ids in brackets, never a parsed link scheme.
+function splitAnswer(answer: string, known: Map<string, Evidence>): { text: string; citation?: Evidence }[] {
+  const entries = [...known.keys()];
+  if (entries.length === 0) return [{ text: answer }];
+  const parts: { text: string; citation?: Evidence }[] = [];
+  const pattern = new RegExp(`\\[(${entries.map((id) => id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\]`, "g");
+  let last = 0;
+  answer.replace(pattern, (match, id, offset) => {
+    if (offset > last) parts.push({ text: answer.slice(last, offset) });
+    parts.push({ text: match, citation: known.get(id) });
+    last = offset + match.length;
+    return match;
+  });
+  if (last < answer.length) parts.push({ text: answer.slice(last) });
+  return parts;
+}
+
+function evidenceById(events: AgentEvent[]): Map<string, Evidence> {
+  // Each evidence event carries the full merged list, so the last one wins.
+  const evidence = events.findLast((e) => e.type === "evidence")?.evidence ?? [];
+  return new Map(evidence.map((entry) => [entry.id, entry]));
+}
+
+// ponytail: selection keeps evidence id + index so follow-up merges refresh the panel instead of a stale snapshot.
 export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[]; reasoning: boolean; debug: boolean }) {
+  const [selected, setSelected] = useState<{ evidenceId: string; position: number } | null>(null);
+  const known = evidenceById(events);
+  const sourceControls = [...known.values()].filter((entry) => entry.sources?.length);
+  const sources = (selected && known.get(selected.evidenceId)?.sources) || [];
   if (events.length === 0) {
     return (
       <div className="flex-1 space-y-3 overflow-y-auto px-4 py-4 text-sm">
@@ -26,19 +56,34 @@ export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[
   }
   const answer = events.filter((e) => e.type === "answer_delta").map((e) => e.text).join("");
   // Prod hides internal work rows; debug (.env STOCKBOT_DEBUG=1) shows all.
+  // The evidence event stays out of prod rows: citations + source controls read it directly.
   const visible = debug ? events : events.filter((e) => e.type === "agent_start" || e.type === "answer_delta" || e.type === "reasoning_start" || e.type === "done" || e.type === "error" || e.type === "failed");
   const head = visible.filter(
-    (e) => e.type !== "answer_delta" && e.type !== "done" && e.type !== "error" && e.type !== "failed" && e.type !== "reasoning_start",
+    (e) => e.type !== "answer_delta" && e.type !== "done" && e.type !== "error" && e.type !== "failed" && e.type !== "reasoning_start" && e.type !== "evidence",
   );
   const tail = visible.filter((e) => e.type === "done" || e.type === "error" || e.type === "failed");
   const streaming = reasoning && tail.length === 0;
+  const position = selected && sources.length ? selected.position % sources.length : 0;
   return (
     <div className="flex-1 space-y-2 overflow-y-auto px-4 py-4 text-sm">
       {head.map((e, i) => (
         <AgentEventView key={i} event={e} />
       ))}
       {streaming && <AgentEventView event={{ type: "reasoning_start", model: "stockbot" }} />}
-      {answer && <div className="whitespace-pre-wrap pt-2 text-zinc-100">{answer}</div>}
+      {answer && <div className="whitespace-pre-wrap pt-2 text-zinc-100">{splitAnswer(answer, known).map((part, i) => {
+        const citation = part.citation;
+        return citation?.sources?.length
+          ? <button key={i} type="button" onClick={() => setSelected({ evidenceId: citation.id, position: 0 })} aria-label={`Open source for ${citation.id}`} className="rounded border border-blue-800 px-1 text-blue-300 underline decoration-dotted hover:bg-blue-950">{part.text}</button>
+          : <span key={i}>{part.text}</span>;
+      })}</div>}
+      {sourceControls.length > 0 && <div className="flex flex-wrap gap-2 pt-2" role="group" aria-label="Captured sources">
+        {sourceControls.map((entry) => (
+          <button key={entry.id} type="button" onClick={() => setSelected({ evidenceId: entry.id, position: 0 })} className="rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:border-zinc-400" aria-label={`Open captured sources for ${entry.id}`}>
+            Sources: {entry.id}
+          </button>
+        ))}
+      </div>}
+      {selected && sources.length > 0 && <SourcePanel key={sources[position].id} reference={sources[position]} position={position} count={sources.length} onNavigate={(direction) => setSelected((current) => current && { evidenceId: current.evidenceId, position: (current.position + direction + sources.length) % sources.length })} onClose={() => setSelected(null)} />}
       {tail.map((e, i) => (
         <AgentEventView key={`tail-${i}`} event={e} />
       ))}

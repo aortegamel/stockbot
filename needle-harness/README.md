@@ -41,6 +41,54 @@ Next.js streams AgentEvents as SSE to the terminal UI.
 
 Needle routes, Bun orchestrates, tools retrieve, Muse reasons, Next.js displays.
 
+### Captured evidence
+
+Citation buttons open an immutable source capture beside the answer.
+The server creates every source ID. The browser never builds one.
+
+- `capture:<sha256>` names a capture that the bridge archived after the runtime accepted a tool result.
+- `evidence:<id>` names a stored evidence row. The server resolves it from archived SEC bytes or the recorded tool result.
+
+The viewer requests only `/api/research/sources/<id>` and its `/pdf` path.
+The viewer does not retrieve arbitrary source URLs.
+
+Each capture carries one explicit kind label:
+
+- **Provider extraction**: Exa returned page text for a `search_web` row. It is not the original document.
+- **Search excerpt**: Exa returned only a highlight for the row. The viewer shows only that excerpt.
+- **Structured record**: A FINRA or SEC tool returned a record. The viewer shows it as JSON.
+- **Original document**: `get_sec_document` retrieved SEC bytes. The archive keeps those exact bytes.
+
+The viewer marks only an exact quote. Matching ignores whitespace and nothing else. It never makes fuzzy matches.
+SEC HTML matching runs against the server's rendered canonical text.
+The viewer maps preserved table cells onto that basis before it trusts stored coordinates.
+Stored full-document coordinates or prefix and suffix context select one occurrence of a repeated quote.
+If more than one match remains, the viewer reports an ambiguous quote and marks no passage.
+If no match exists, the viewer reports an unresolved quote and marks no passage.
+
+The read-only source API checks archive hashes before it returns content or PDF bytes.
+If a capture is missing or corrupt, the viewer shows an error instead of fetching a replacement.
+The original link can show a newer document.
+
+If archiving raises an exception, the tool call fails with `source_capture_failed`.
+The runtime records no successful evidence for that call.
+The tool returns no partial source references.
+
+A successful SEC result requires a pinned original archive.
+The call fails when its original bytes or hash cannot be archived or verified.
+A legacy web row can resolve to a search excerpt without page text.
+A legacy row without a matching archive or excerpt shows an error.
+
+The viewer sanitizes captured HTML with DOMPurify.
+PDF.js renders only original SEC PDF captures, with selectable text and quote highlights.
+The client rejects a PDF with any other capture kind.
+`predev`, `prebuild`, and `prestart` run `copy-pdfjs`.
+That script copies the packaged PDF.js worker, fonts, character maps, WebAssembly, and ICC assets to `public/pdfjs`.
+The viewer loads these assets from the same origin. It uses no CDN.
+
+The navigation helpers adapt [Magellan](https://github.com/magellan-extension/magellan) under the MIT license.
+`lib/source-viewer.ts` includes its copyright and license notice.
+
 ## 6. Benchmarks
 
 With `BENCHMARK=1`, each run writes `benchmarks/<YYYYMMDD-HHmmss>-<6rand>.json`

@@ -891,6 +891,14 @@ def test_followup_links_only_explicit_known_evidence(monkeypatch: pytest.MonkeyP
     store = ResearchRepository()
     store.save_evidence({"evidence_id": "ev-pass1", "session_id": sid, "content": "pass-1 fact"})
 
+    def _refs(record: Mapping[str, object]) -> list[dict[str, str]]:
+        assert record.get("session_id") == sid
+        if record.get("evidence_id") == "ev-pass1":
+            return [{"id": "evidence:ev-pass1", "title": "Prior capture", "url": "https://www.sec.gov/prior"}]
+        return []
+
+    monkeypatch.setattr("app.research.sources.source_references", _refs)
+
     async def _fake_sched(run_sid: str, **hooks: object) -> dict[str, object]:
         assert run_sid == sid
         for n in service.ready_nodes(run_sid):
@@ -927,6 +935,11 @@ def test_followup_links_only_explicit_known_evidence(monkeypatch: pytest.MonkeyP
     assert isinstance(evidence, list)
     ids = [e["id"] for e in evidence if isinstance(e, dict)]
     assert "ev-pass1" in ids and "ev-pass2" in ids
+    by_id = {e["id"]: e for e in evidence if isinstance(e, dict)}
+    assert by_id["ev-pass1"]["sources"] == [
+        {"id": "evidence:ev-pass1", "title": "Prior capture", "url": "https://www.sec.gov/prior"}
+    ]
+    assert "sources" not in by_id["ev-pass2"]
 
 
 def test_setup_keyerror_is_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:

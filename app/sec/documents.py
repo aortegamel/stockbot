@@ -1014,9 +1014,25 @@ def _persist_live_document(
     source_url: str | None,
     data_root: Path | str | None,
 ) -> tuple[str | None, str | None, list[str]]:
-    """Fetch-time lookup only: no archiving here (selective retention)."""
-    _ = (accession_no, doc_name, source_bytes, representation, meta, source_url, data_root)
-    _ = (normalized, content_hash, source_content_hash)
+    """Fetch-time lookup: normal kernel calls archive nothing (selective retention).
+
+    A bridge single-shot scope retains the exact supplied bytes so the runtime
+    can archive them once it accepts the result. Failed reads never reach here.
+    """
+    from ..research.sources import retain_sec_bytes
+
+    retain_sec_bytes(
+        accession_no,
+        doc_name,
+        source_bytes,
+        {
+            "representation": representation,
+            "source_content_hash": source_content_hash,
+            "content_hash": content_hash,
+            "source_url": source_url,
+            "retrieved_at": _utcnow(),
+        },
+    )
     return None, None, []
 
 

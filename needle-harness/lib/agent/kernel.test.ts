@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { KernelRouter, runKernelAgent, type KernelChild, type KernelSpawn } from "./kernel";
+import type { AgentEvent, Evidence } from "./types";
 
 class FakeChild implements KernelChild {
   exitCode: number | null = null;
@@ -236,6 +237,84 @@ describe("runKernelAgent evidence loop", () => {
     queueMicrotask(() => c.emitStdout('{"type":"ready"}\n'));
     return c;
   };
+  test("seed and follow-up evidence retain captures before each answer without changing model content", async () => {
+    process.env.OPENCODE_MODEL = "test-model";
+    const events: AgentEvent[] = [];
+    const firstSource = { id: `capture:${"a".repeat(64)}` };
+    const kernelSource = { id: "evidence:rs:test:ev:1" };
+    const followSource = { id: "evidence:rs:test:ev:2" };
+    const seed: Evidence = { id: "ev:1", source: "seed", retrievedAt: "2026-01-01Z", content: "seed fact", sources: [firstSource] };
+    let replies = 0;
+    let writes = 0;
+    const seen: string[][] = [];
+    const spawnFn = (): KernelChild => {
+      const child = new FakeChild();
+      child.reply = (id) => {
+        replies += 1;
+        return `${JSON.stringify({
+          id, sessionId: "rs:test",
+          evidence: replies === 1
+            ? [{ id: "ev:1", content: "kernel fact", sources: [kernelSource] }, { id: "ev:bad", content: "uncaptured", sources: [{ id: "/raw/path" }] }]
+            : [{ id: "ev:1", content: "changed duplicate", sources: [kernelSource, followSource] }, { id: "ev:2", content: "second fact", sources: [followSource] }, { id: "ev:2", content: "duplicate", sources: [] }],
+          nodes: [], decisions: [], unresolved: [], needleDecisions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false,
+        })}\n`;
+      };
+      queueMicrotask(() => child.emitStdout('{"type":"ready"}\n'));
+      return child;
+    };
+    await runKernelAgent("q", (e) => { events.push(e); }, {
+      seedEvidence: [seed],
+      deps: {
+        python: "py", workerPath: "w", spawnFn, reason: async (o) => {
+          writes += 1;
+          seen.push(o.evidence.map((e) => e.content));
+          o.onDelta(`answer ${writes}`);
+          return writes === 1 ? { text: "", usage: {}, missingEvidence: "missing" } : { text: "", usage: {} };
+        }
+      },
+    });
+    const delivered = events.filter((e): e is Extract<AgentEvent, { type: "evidence" }> => e.type === "evidence");
+    expect(delivered).toHaveLength(3);
+    const seedDelivered = delivered[0];
+    const researchDelivered = delivered[1];
+    const followDelivered = delivered[2];
+    if (!seedDelivered || !researchDelivered || !followDelivered) throw new Error("expected three evidence events");
+    expect(seedDelivered.evidence[0]?.sources).toEqual([firstSource]);
+    expect(researchDelivered.sessionId).toBe("rs:test");
+    expect(researchDelivered.evidence.map((e) => e.id)).toEqual(["ev:1", "ev:bad"]);
+    expect(researchDelivered.evidence[0]?.content).toBe("seed fact");
+    expect(researchDelivered.evidence[0]?.sources).toEqual([firstSource, kernelSource]);
+    expect(researchDelivered.evidence[1]?.sources).toEqual([]);
+    expect(followDelivered.evidence.filter((e) => e.id === "ev:1")).toHaveLength(1);
+    expect(followDelivered.evidence.filter((e) => e.id === "ev:1").map((e) => e.sources)).toEqual([[firstSource, kernelSource, followSource]]);
+    expect(followDelivered.evidence.filter((e) => e.id === "ev:2")).toHaveLength(1);
+    expect(followDelivered.evidence.find((e) => e.id === "ev:2")?.content).toBe("second fact");
+    expect(followDelivered.evidence.find((e) => e.id === "ev:2")?.sources).toEqual([followSource]);
+    expect(seen).toEqual([["seed fact", "uncaptured"], ["seed fact", "uncaptured", "second fact"]]);
+    expect(events.filter((e) => e.type === "evidence" || e.type === "answer_delta").map((e) => e.type)).toEqual(["evidence", "evidence", "answer_delta", "evidence", "answer_delta"]);
+  });
+
+  test("empty research answers never fabricate source references", async () => {
+    process.env.OPENCODE_MODEL = "test-model";
+    const events: AgentEvent[] = [];
+    const spawnFn = (): KernelChild => {
+      const child = new FakeChild();
+      child.reply = (id) => `${JSON.stringify({ id, evidence: [], nodes: [], unresolved: [], toolCalls: [], needleDecisions: [] })}\n`;
+      queueMicrotask(() => child.emitStdout('{"type":"ready"}\n'));
+      return child;
+    };
+    await runKernelAgent("hello", (e) => { events.push(e); }, {
+      deps: {
+        python: "py", workerPath: "w", spawnFn, reason: async (o) => {
+          expect(o.evidence).toEqual([]);
+          expect(o.direct).toBe(true);
+          o.onDelta("hello");
+          return { text: "hello", usage: {} };
+        },
+      }
+    });
+    expect(events.map((e) => e.type)).toEqual(["agent_start", "reasoning_start", "answer_delta", "done"]);
+  });
   test("gap triggers one follow-up pass, clean second write ends done", async () => {
     process.env.OPENCODE_MODEL = "test-model";
     const events: Array<{ type: string; stage?: string }> = [];

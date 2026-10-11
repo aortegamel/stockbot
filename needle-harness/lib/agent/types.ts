@@ -36,6 +36,9 @@ type JSONSchema = {
   [k: string]: unknown;
 };
 
+// Server-created reference to an immutable capture; id never holds a filesystem path.
+export type SourceReference = { id: string; title?: string; url?: string };
+
 // ponytail: interim worker buffer (§11/§12: navigation result, not kernel evidence). Durable evidence requires kernel admission with source identity/hash/session/job/wave + PIT/provenance/identity gates; promotion via research.evidence.add lands with job/evidence wiring.
 export type Evidence = {
   id: string;
@@ -46,7 +49,30 @@ export type Evidence = {
   content: string;
   sourceHandle?: Record<string, unknown>;
   sourceRefs?: Record<string, unknown>;
+  sources?: SourceReference[];
 };
+
+// Match the source endpoint. References never contain paths or live URLs.
+const SOURCE_ID_RE = /^(?:capture:[a-f0-9]{64}|evidence:[A-Za-z0-9:_-]{1,256})$/;
+
+// Trust boundary: keep only well-formed server references; anything else is dropped, never repaired.
+export function sourceReferences(raw: unknown): SourceReference[] {
+  if (!Array.isArray(raw)) return [];
+  const out: SourceReference[] = [];
+  const seen = new Set<string>();
+  for (const r of raw) {
+    if (r === null || typeof r !== "object") continue;
+    const { id, title, url } = r as Record<string, unknown>;
+    if (typeof id !== "string" || !SOURCE_ID_RE.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      ...(typeof title === "string" && title ? { title: title.slice(0, 300) } : {}),
+      ...(typeof url === "string" && /^https?:\/\//i.test(url) ? { url: url.slice(0, 2000) } : {}),
+    });
+  }
+  return out;
+}
 
 export type ToolResult = { ok: true; evidence: Evidence } | { ok: false; error: string; category: FailureCategory; retryable: boolean };
 
@@ -61,6 +87,7 @@ export type AgentEvent =
   | { type: "needle_decision"; step: number; tool: string | null; arguments: Record<string, unknown>; confidence: number | null }
   | { type: "tool_start"; tool: string }
   | { type: "tool_result"; tool: string; evidenceId?: string; preview: string }
+  | { type: "evidence"; evidence: Evidence[]; sessionId?: string }
   | { type: "progress"; stage: string; detail?: Record<string, unknown> }
   | { type: "reasoning_start"; model: string }
   | { type: "answer_delta"; text: string }

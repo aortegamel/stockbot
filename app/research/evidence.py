@@ -285,6 +285,8 @@ def web_source_ref(
     published_at: object = None,
     retrieved_at: object = None,
     tool_result_id: object = None,
+    source_content: object = None,
+    source_representation: object = None,
 ) -> dict[str, JSONValue]:
     """WebSourceRef: one persisted search_web result an observed fact is read off.
 
@@ -292,6 +294,7 @@ def web_source_ref(
     The kernel, never the model, reloads that persisted result and stores its
     bytes; a model-authored URL/quote never qualifies.
     ``tool_result_id`` is the persisted kernel tool result this ref replays (None for legacy rows).
+    ``source_content`` is the bounded provider extraction behind the row (absent on excerpt-only rows).
     """
     link = url.strip() if isinstance(url, str) else ""
     quote = excerpt.strip() if isinstance(excerpt, str) else ""
@@ -308,6 +311,15 @@ def web_source_ref(
         text = _provenance_opt({key: value}, key)
         if text is not None:
             ref[key] = text
+    content = source_content.strip() if isinstance(source_content, str) and source_content.strip() else None
+    if content is not None:
+        ref["source_content"] = content[:12000]
+        representation = (
+            source_representation.strip()
+            if isinstance(source_representation, str) and source_representation.strip()
+            else "text"
+        )
+        ref["source_representation"] = representation
     return ref
 
 
@@ -376,6 +388,8 @@ def validate_provenance(value: object, where: str = "<evidence>: 'provenance'") 
             published_at=value.get("published_at"),
             retrieved_at=value.get("retrieved_at"),
             tool_result_id=value.get("tool_result_id"),
+            source_content=value.get("source_content"),
+            source_representation=value.get("source_representation"),
         )
     return _sec_source_provenance(value, where)
 

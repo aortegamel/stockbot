@@ -29,7 +29,7 @@ describe("AgentConsole answer rendering", () => {
     ];
     const out = html(events);
     expect(out).toContain("Hello world");
-    expect(out).toContain('<div class="whitespace-pre-wrap pt-2 text-zinc-100">Hello world</div>');
+    expect(out).toContain('<div class="whitespace-pre-wrap pt-2 text-zinc-100"><span>Hello world</span></div>');
   });
 
   test("prod mode renders the answer even though deltas are hidden work rows", () => {
@@ -41,7 +41,7 @@ describe("AgentConsole answer rendering", () => {
     ];
     const out = html(events, true, false);
     expect(out).toContain("hi there");
-    expect(out).toContain('<div class="whitespace-pre-wrap pt-2 text-zinc-100">hi there</div>');
+    expect(out).toContain('<div class="whitespace-pre-wrap pt-2 text-zinc-100"><span>hi there</span></div>');
   });
 
   test("streaming answer renders before done arrives", () => {
@@ -52,7 +52,7 @@ describe("AgentConsole answer rendering", () => {
     ];
     const out = html(events);
     expect(out).toContain("partial");
-    expect(out).toContain('<div class="whitespace-pre-wrap pt-2 text-zinc-100">partial</div>');
+    expect(out).toContain('<div class="whitespace-pre-wrap pt-2 text-zinc-100"><span>partial</span></div>');
   });
 
   test("no deltas renders no answer block", () => {

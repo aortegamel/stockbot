@@ -13,15 +13,32 @@ type BridgeOut = { ok: boolean; status: number; body: unknown };
 
 function runBridge(payload: Record<string, unknown>): BridgeOut {
   const py = join(ROOT, "venv/bin/python");
+  const isSource = payload.kind === "source" || payload.kind === "source_pdf";
   const script = `
-import json, sys
+import base64, json, sys
 sys.path.insert(0, ${JSON.stringify(ROOT)})
 from app.research import service as svc
 from app.research.repository import ResearchRepository
 req = json.loads(sys.argv[1])
 kind = req.get("kind")
 try:
-    if kind == "snapshot":
+    if kind in ("source", "source_pdf"):
+        try:
+            from app.research.sources import read_source_document, read_source_pdf
+            if kind == "source":
+                out = read_source_document(req["source_id"])
+            else:
+                out = {"pdf_base64": base64.b64encode(read_source_pdf(req["source_id"])).decode("ascii")}
+        except (KeyError, FileNotFoundError):
+            print(json.dumps({"ok": False, "status": 404, "error": "source capture not found"}))
+            sys.exit(1)
+        except ValueError:
+            print(json.dumps({"ok": False, "status": 409, "error": "invalid source capture"}))
+            sys.exit(1)
+        except OSError:
+            print(json.dumps({"ok": False, "status": 502, "error": "source read failed"}))
+            sys.exit(1)
+    elif kind == "snapshot":
         out = svc.inspect_research(req["session_id"])
     elif kind == "journal":
         store = ResearchRepository()
@@ -39,33 +56,48 @@ except KeyError as e:
     print(json.dumps({"ok": False, "error": f"unknown session: {e}"}))
     sys.exit(1)
 except Exception as e:
-    print(json.dumps({"ok": False, "error": str(e)[:300]}))
+    if kind in ("source", "source_pdf"):
+        print(json.dumps({"ok": False, "status": 502, "error": "source read failed"}))
+    else:
+        print(json.dumps({"ok": False, "error": str(e)[:300]}))
     sys.exit(1)
 `;
-  const r = spawnSync(py, ["-c", script, JSON.stringify(payload)], { encoding: "utf8", timeout: 15_000 });
+  const r = spawnSync(py, ["-c", script, JSON.stringify(payload)], {
+    encoding: "utf8",
+    timeout: 15_000,
+    maxBuffer: 32 * 1024 * 1024,
+  });
   if (r.error) {
+    if (isSource) return { ok: false, status: 502, body: { error: "source read failed" } };
     return { ok: false, status: 502, body: { error: `bridge spawn failed: ${String(r.error.message).slice(0, 200)}` } };
   }
   if (r.status !== 0) {
-    let parsed: { error?: string } = {};
+    let parsed: { error?: string; status?: number } = {};
     try {
       const raw: unknown = JSON.parse(r.stdout || "{}");
       if (raw && typeof raw === "object" && "error" in raw) {
         const msg = raw.error;
         parsed = typeof msg === "string" ? { error: msg } : {};
+        if (isSource && "status" in raw && [404, 409, 502].includes(Number(raw.status))) {
+          parsed.status = Number(raw.status);
+        }
       }
     } catch {
-      parsed = { error: (r.stderr || "research read failed").slice(0, 300) };
+      parsed = { error: isSource ? "source read failed" : (r.stderr || "research read failed").slice(0, 300) };
+    }
+    if (isSource) {
+      const status = parsed.status ?? 502;
+      const error = status === 404 ? "source capture not found" : status === 409 ? "invalid source capture" : "source read failed";
+      return { ok: false, status, body: { error } };
     }
     return { ok: false, status: r.status === 1 ? 404 : 502, body: { error: parsed.error ?? "research read failed" } };
   }
   try {
     const raw: unknown = JSON.parse(r.stdout || "{}");
-    if (!raw || typeof raw !== "object" || !("data" in raw)) {
-      return { ok: false, status: 502, body: { error: "research bridge bad shape" } };
-    }
+    if (!raw || typeof raw !== "object" || !("data" in raw)) throw new Error("bad shape");
     return { ok: true, status: 200, body: raw.data };
   } catch {
+    if (isSource) return { ok: false, status: 502, body: { error: "source read failed" } };
     return { ok: false, status: 502, body: { error: "research bridge bad json" } };
   }
 }
@@ -73,6 +105,33 @@ except Exception as e:
 export async function GET(req: Request): Promise<Response> {
   const u = new URL(req.url);
   const parts = u.pathname.split("/").filter(Boolean);
+  if (parts[2] === "sources") {
+    const headers = { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" };
+    const sourceParts = u.pathname.split("/");
+    if ((sourceParts.length !== 5 && sourceParts.length !== 6) || (sourceParts.length === 6 && sourceParts[5] !== "pdf")) {
+      return Response.json({ error: "unknown source path" }, { status: 404, headers });
+    }
+    let sourceId: string;
+    try {
+      sourceId = decodeURIComponent(sourceParts[4]);
+    } catch {
+      return Response.json({ error: "bad source_id" }, { status: 400, headers });
+    }
+    if (/^(?:capture:[a-f0-9]{64}|evidence:[A-Za-z0-9:_-]{1,256})$/.exec(sourceId)?.[0] !== sourceId) {
+      return Response.json({ error: "bad source_id" }, { status: 400, headers });
+    }
+    const isPdf = sourceParts.length === 6;
+    const r = runBridge({ kind: isPdf ? "source_pdf" : "source", source_id: sourceId });
+    if (!isPdf || !r.ok) return Response.json(r.body, { status: r.status, headers });
+    const body = r.body;
+    if (!body || typeof body !== "object" || !("pdf_base64" in body) || typeof body.pdf_base64 !== "string"
+      || !body.pdf_base64 || /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.exec(body.pdf_base64)?.[0] !== body.pdf_base64) {
+      return Response.json({ error: "invalid source PDF response" }, { status: 502, headers });
+    }
+    return new Response(Buffer.from(body.pdf_base64, "base64"), {
+      headers: { ...headers, "Content-Type": "application/pdf" },
+    });
+  }
   // /api/research/sessions | /api/research/:id | /api/research/:id/journal
   if (parts.length === 3 && parts[2] === "sessions") {
     const limitRaw = u.searchParams.get("limit") ?? "20";

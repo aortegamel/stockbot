@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "copy-pdfjs": "bun scripts/copy-pdfjs-assets.ts",
+    "predev": "bun run copy-pdfjs",
+    "prebuild": "bun run copy-pdfjs",
+    "prestart": "bun run copy-pdfjs",
     "dev": "next dev -H 0.0.0.0",
     "build": "next build",
     "start": "next start",
@@ -11,19 +15,24 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "dompurify": "^3.4.16",
     "next": "16.3.5",
+    "pdfjs-dist": "^6.4.299",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "recharts": "^3.10.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/jsdom": "27.0.0",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "bun-types": "^1.4.2",
     "eslint": "^9",
     "eslint-config-next": "16.3.5",
+    "fast-check": "4.10.0",
+    "jsdom": "27.4.0",
     "tailwindcss": "^4",
     "typescript": "^5"
   },

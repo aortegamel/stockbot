@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 import app.tool_runtime as rt
@@ -75,3 +77,18 @@ def test_outcome_retryable_only_transient() -> None:
     assert outcome_from_result("t", {"error": "x", "error_type": "tool_error"}).retryable is True
     assert outcome_from_result("t", {"error": "x", "error_type": "intent_denied"}).retryable is False
     assert outcome_from_result("t", {"error": "x", "error_type": "run_budget_exceeded"}).retryable is False
+
+
+def test_accepted_result_without_capture_scope_keeps_shape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _web(name: str, arguments: dict[str, object], model: str, context: object = None) -> dict[str, object]:
+        row = {"title": "T", "url": "https://example.com/a", "highlight": "quoted passage"}
+        return {"query": arguments.get("query"), "evidence": [row], "source": "exa"}
+
+    monkeypatch.setattr(rt, "execute_tool", _web)
+    out = execute_agent_tool(
+        "search_web", {"query": "NVDA demand"}, RuntimeToolSession(session_id="s1"), data_root=tmp_path
+    )
+    assert set(out) == {"content", "meta"}, out
+    meta = out["meta"]
+    assert isinstance(meta, dict) and "sources" not in meta
+    assert not (tmp_path / "raw").exists()

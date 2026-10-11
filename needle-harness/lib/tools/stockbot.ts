@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { makeEvidence } from "../agent/evidence";
+import { sourceReferences } from "../agent/types";
 import type { FailureCategory, ToolResult } from "../agent/types";
 
 const ROOT = process.cwd().endsWith("needle-harness")
@@ -9,7 +10,7 @@ const ROOT = process.cwd().endsWith("needle-harness")
 const BRIDGE_CMD = `${ROOT}/venv/bin/python`;
 const BRIDGE_ARGS = [`${ROOT}/scripts/tool_bridge.py`];
 
-type BridgeResultMeta = { source_handle?: unknown; source_refs?: unknown };
+type BridgeResultMeta = { source_handle?: unknown; source_refs?: unknown; sources?: unknown };
 type BridgeReply = {
   id?: unknown;
   result?: { content?: unknown; error?: unknown; error_type?: unknown; meta?: BridgeResultMeta };
@@ -180,13 +181,16 @@ export async function invoke(name: string, args: Record<string, unknown>, sessio
   const meta = result.meta;
   const rawHandle = meta != null && typeof meta === "object" && "source_handle" in meta ? (meta as BridgeResultMeta).source_handle : undefined;
   const rawRefs = meta != null && typeof meta === "object" && "source_refs" in meta ? (meta as BridgeResultMeta).source_refs : undefined;
+  const rawSources = meta != null && typeof meta === "object" ? (meta as BridgeResultMeta).sources : undefined;
   const sourceHandle = rawHandle !== null && typeof rawHandle === "object" && !Array.isArray(rawHandle) ? (rawHandle as Record<string, unknown>) : undefined;
   const sourceRefs = rawRefs !== null && typeof rawRefs === "object" && !Array.isArray(rawRefs) ? (rawRefs as Record<string, unknown>) : undefined;
+  const sources = sourceReferences(rawSources);
   const evidence = makeEvidence(name, content, {
     title: name,
     ...(sourceHandle !== undefined ? { sourceHandle } : {}),
     ...(sourceRefs !== undefined ? { sourceRefs } : {}),
   });
+  if (sources.length) evidence.sources = sources;
   return { ok: true, evidence };
 }
 

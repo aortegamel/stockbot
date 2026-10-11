@@ -18,6 +18,13 @@ const invoked: unknown[][] = [];
 const ended: string[] = [];
 
 let emitProgress = false;
+let emitEvidence = false;
+const capturedSource = { id: `capture:${"a".repeat(64)}`, title: "Captured filing", url: "https://www.sec.gov/filing" };
+const bridgeEvidence: Evidence = {
+  id: "ev:bridge", source: "bridge", retrievedAt: "2026-01-01T00:00:00Z", content: "internal tool output",
+  title: "get_sec_document", url: "https://www.sec.gov/tool-output",
+  sourceHandle: { raw_archive_path: "/private/raw" }, sourceRefs: { internal: "log" }, sources: [capturedSource],
+};
 mock.module("@/lib/agent/kernel", () => ({
   REQUEST_WALL_MS: 120_000,
   kernelRouter: {
@@ -41,6 +48,11 @@ mock.module("@/lib/agent/kernel", () => ({
       const emit = args[1] as (e: Record<string, unknown>) => void;
       emit({ type: "progress", stage: "intake_done", detail: { calls: 3 } });
     }
+    if (emitEvidence) {
+      const emit = args[1] as (e: Record<string, unknown>) => void;
+      emit({ type: "evidence", evidence: [bridgeEvidence], sessionId: "rs:test" });
+      emit({ type: "answer_delta", text: "A fact [ev:bridge]" });
+    }
   },
 }));
 
@@ -56,7 +68,7 @@ mock.module("@/lib/muse/client", () => ({
 mock.module("@/lib/tools/stockbot", () => ({
   invoke: async (name: string, args: unknown, sessionId: string) => {
     invoked.push([name, args, sessionId]);
-    return { ok: true, evidence: { id: "ev:bridge", source: name, retrievedAt: new Date().toISOString(), content: "bridged" } };
+    return { ok: true, evidence: { ...bridgeEvidence, source: name } };
   },
   newSessionId: () => "sess-test",
   endSession: async (id: string) => {
@@ -70,6 +82,7 @@ function reset(): void {
   argsDown = false;
   reasonDown = false;
   emitProgress = false;
+  emitEvidence = false;
   verdicts = ["node_resolved"];
   runCalls.length = 0;
   reasonCalls.length = 0;
@@ -152,7 +165,7 @@ describe("agent entry route", () => {
     winner = "get_current_time";
     const events = await eventsFor("what time is it?");
     const types = events.map((e) => e.type);
-    expect(types).toEqual(["agent_start", "needle_decision", "tool_start", "tool_result", "reasoning_start", "answer_delta", "done"]);
+    expect(types).toEqual(["agent_start", "needle_decision", "tool_start", "tool_result", "evidence", "reasoning_start", "answer_delta", "done"]);
     expect(events.filter((e) => e.type === "tool_start").length).toBe(1);
     expect(runCalls.length).toBe(0);
     expect(kernelCalls.filter((c) => c.op === "arguments").map((c) => c.tool)).toEqual(["get_current_time"]);
@@ -252,7 +265,7 @@ describe("agent entry route", () => {
     delete process.env.STOCKBOT_DEBUG;
     winner = "get_current_time";
     const prod = await eventsFor("what time is it?");
-    expect(prod.map((e) => e.type)).toEqual(["agent_start", "reasoning_start", "answer_delta", "done"]);
+    expect(prod.map((e) => e.type)).toEqual(["agent_start", "evidence", "reasoning_start", "answer_delta", "done"]);
     reset();
     winner = "get_current_time";
     const debug = await eventsFor("what time is it?");
@@ -261,6 +274,7 @@ describe("agent entry route", () => {
       "needle_decision",
       "tool_start",
       "tool_result",
+      "evidence",
       "reasoning_start",
       "answer_delta",
       "done",
@@ -276,5 +290,40 @@ describe("agent entry route", () => {
     expect(progress.length).toBe(1);
     expect(progress[0].stage).toBe("working");
     expect("detail" in progress[0] ? progress[0].detail : undefined).toBeUndefined();
+  });
+  test("production single-shot delivers archived sources before the answer without internal logs", async () => {
+    reset();
+    delete process.env.STOCKBOT_DEBUG;
+    winner = "get_sec_document";
+    const events = await eventsFor("filing facts?");
+    const delivered = events.find((e) => e.type === "evidence");
+    expect(delivered?.evidence).toEqual([{ id: "ev:bridge", source: "get_sec_document", title: "get_sec_document", url: "https://www.sec.gov/tool-output", retrievedAt: bridgeEvidence.retrievedAt, content: "", sources: [capturedSource] }]);
+    expect(events.findIndex((e) => e.type === "evidence")).toBeLessThan(events.findIndex((e) => e.type === "answer_delta"));
+    expect(reasonCalls[0].evidence[0].content).toBe("internal tool output");
+    expect(JSON.stringify(events)).not.toContain("/private/raw");
+    expect(JSON.stringify(events)).not.toContain("internal tool output");
+  });
+
+  test("production research retains evidence events without internal logs", async () => {
+    reset();
+    delete process.env.STOCKBOT_DEBUG;
+    winner = "research_required";
+    emitEvidence = true;
+    const events = await eventsFor("filing facts?");
+    expect(events.map((e) => e.type)).toEqual(["evidence", "answer_delta"]);
+    expect(events[0].sessionId).toBe("rs:test");
+    expect(events[0].evidence).toEqual([{ id: "ev:bridge", source: "bridge", title: "get_sec_document", url: "https://www.sec.gov/tool-output", retrievedAt: bridgeEvidence.retrievedAt, content: "", sources: [capturedSource] }]);
+  });
+
+  test("single-shot fallback retains archived references in the research seed", async () => {
+    reset();
+    delete process.env.STOCKBOT_DEBUG;
+    winner = "get_sec_document";
+    verdicts = ["research_required"];
+    const events = await eventsFor("filing facts?");
+    const options = runCalls[0][2] as { seedEvidence: Evidence[] };
+    expect(options.seedEvidence[0].sources).toEqual([capturedSource]);
+    expect(options.seedEvidence[0].content).toBe(bridgeEvidence.content);
+    expect(events.find((e) => e.type === "evidence")?.evidence).toEqual([{ id: "ev:bridge", source: "get_sec_document", title: "get_sec_document", url: "https://www.sec.gov/tool-output", retrievedAt: bridgeEvidence.retrievedAt, content: "", sources: [capturedSource] }]);
   });
 });

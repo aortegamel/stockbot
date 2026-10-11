@@ -62,6 +62,7 @@ from .tools import (
 
 if TYPE_CHECKING:
     from app.research.repository import ResearchRepository
+from app.research.sources import capture_result
 from app.research.stage import (
     CONTROL_TOOLS,
     DISCOVERY_TOOLS,
@@ -1325,6 +1326,16 @@ def _finalize_success(
         return {
             "error": f"Runtime evidence-token budget exceeded (used {_used}/{_maximum} tokens); narrow the question or window.",
             "error_type": "evidence_budget_exceeded",
+        }
+    # Viewer capture archives the accepted raw result, only inside a bridge capture_scope.
+    # It must succeed before the runtime records evidence or returns content.
+    try:
+        capture_result(name, result)
+    except Exception:
+        logger.exception("toolflow source capture failed tool=%s", name)
+        return {
+            "error": f"Source capture failed for tool '{name}'; the result was not accepted.",
+            "error_type": "source_capture_failed",
         }
     if recorder is not None:
         evidence_id = f"{run_id}:evid:{recorder.next_evidence_seq():04d}"
