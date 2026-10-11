@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import logging
 import os
@@ -63,6 +64,29 @@ def load_catalog():
 TOOLS = load_catalog()
 
 
+def _grounding_formatter():
+    """Shared grounded formatter, loaded directly so the worker avoids app imports."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.normpath(os.path.join(here, "..", "..", "..", "app", "research", "grounding.py"))
+    try:
+        spec = importlib.util.spec_from_file_location("needle_grounding", path)
+        if spec is None or spec.loader is None:
+            raise ValueError("missing loader")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        formatter = module.format_grounded_block
+    except Exception:
+        logger.exception("needle server: cannot load grounded formatter at %s", path)
+        sys.exit(1)
+    if not callable(formatter):
+        sys.stderr.write(f"needle server: grounded formatter at {path} is invalid\n")
+        sys.exit(1)
+    return formatter
+
+
+format_grounded_block = _grounding_formatter()
+
+
 def resolve_weights():
     # Mirror of needle-harness/scripts/needle.ts:44-48: relative pins resolve
     # against HARNESS_DIR, absolute pins pass through.
@@ -101,7 +125,7 @@ def _bound_system():
 weights = resolve_weights()
 kwargs = {
     "tools": TOOLS,
-    # Binding args-only rule lives per-request in _arguments_prompt (kernel path); shared system stays legacy until loop.ts cutover removes start/step.
+    # Kernel arguments path binds its own facts-only system per request (_arguments_facts); shared system stays legacy until loop.ts cutover removes start/step.
     "system": _legacy_system(),
     "buffer_size": 65536,
 }
@@ -115,19 +139,8 @@ _agent_lock = threading.Lock()
 MAX_LINE_CHARS = 1_000_000
 
 
-def _tool_triggers(tool):
-    """Trigger gate: data tools must call; control tools must withhold when ungrounded."""
-    # ponytail: universal [".+"] forces a call on any input — proven to
-    # fabricate session_id from question text for research_resume
-    # ({"session_id": "NVDA revenue last quarter"}). Control/session tools
-    # carry caller sid via kernel_worker shortcut; Needle must withhold here.
-    if tool.startswith(("research_", "thesis_")):
-        return []
-    return [".+"]
-
-
 def _tool_entry(tool, schema):
-    """Single-tool binding for one arguments.generate call: grammar admits exactly this tool."""
+    """Single-tool binding for one arguments.generate call: original full metadata, no triggers."""
     params = schema if isinstance(schema, dict) else {}
     full = None
     with open(_catalog_path()) as f:
@@ -148,21 +161,77 @@ def _tool_entry(tool, schema):
         "description": desc,
         "parameters": bound_params if bound_params else {"type": "object"},
     }
-    triggers = _tool_triggers(tool)
-    if triggers:
-        entry["triggers"] = triggers
     return entry
 
 
-def _bound_agent(tool, schema):
+# Wrapper instructions, not facts: the SDK system carries facts only (docs: "facts, never instructions").
+_INSTRUCTION_KEYS = frozenset({"grounding_hint"})
+
+
+def _fact(value):
+    """One fact value verbatim: strings raw, structures as full JSON (never clipped)."""
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
+_GROUNDED_FIELDS = frozenset({"content", "content_hash", "evidence_id", "provenance"})
+
+
+def _evidence_fact(index, record):
+    """One admitted record: shared block first, then every remaining field as JSON."""
+    extras = {k: v for k, v in record.items() if k not in _GROUNDED_FIELDS}
+    text = format_grounded_block(record)
+    if extras:
+        text += f" evidence[{index}] extra: {json.dumps(extras, ensure_ascii=False)}"
+    return text
+
+
+def _evidence_facts(records):
+    """Admitted records in order; malformed or observation entries keep current JSON."""
+    facts = []
+    for index, record in enumerate(records):
+        if isinstance(record, dict) and isinstance(record.get("evidence_id"), str) and record["evidence_id"]:
+            facts.append(_evidence_fact(index, record))
+        else:
+            facts.append(_fact(record))
+    return facts
+
+
+def _context_facts(key, value):
+    """One context entry: evidence lists reuse the grounded renderer, others use JSON."""
+    if key == "evidence" and isinstance(value, list):
+        return _evidence_facts(value)
+    return [f"{key}: {_fact(value)}"]
+
+
+def _arguments_facts(objective, node, context):
+    """SDK system facts: UTC date, objective, node metadata, context (evidence, attempts, temporal anchors)."""
+    facts = [f"date: {datetime.now(UTC).strftime('%Y-%m-%d %a %H:%M')} UTC", "locale: en-US"]
+    if isinstance(objective, str) and objective.strip():
+        facts.append(f"objective: {objective}")
+    if isinstance(node, dict):
+        # The question is the request text itself, not a fact.
+        facts.extend(f"node {k}: {_fact(v)}" for k, v in node.items() if k != "question")
+    if isinstance(context, dict):
+        for k, v in context.items():
+            if k not in _INSTRUCTION_KEYS:
+                facts.extend(_context_facts(k, v))
+    return "; ".join(facts)
+
+
+def _request_text(node, objective):
+    """Raw node question, else raw objective; no real request text fails."""
+    question = node.get("question") if isinstance(node, dict) else None
+    for text in (question, objective):
+        if isinstance(text, str) and text.strip():
+            return text
+    raise ValueError("arguments.generate needs a node question or objective")
+
+
+def _bound_agent(tool, schema, facts):
     """Fresh Needle bound to exactly the JEV-selected tool (docs: one tool per action)."""
     bound_kwargs = dict(kwargs)
     bound_kwargs["tools"] = [_tool_entry(tool, schema)]
-    # ponytail: bound call is args-only — facts-only system. Instructions
-    # ("route retrieval only", chain preferences, "no call when evidence
-    # suffices") withhold the call on multi-hop objectives (docs: system =
-    # facts never instructions). Shared agent keeps legacy system for start/step.
-    bound_kwargs["system"] = _bound_system()
+    bound_kwargs["system"] = facts
     return needle.Needle(**bound_kwargs)
 
 
@@ -179,6 +248,15 @@ def _extract_agent(record, system=None):
     else:
         bound_kwargs["system"] = _bound_system()
     return needle.Needle(**bound_kwargs)
+
+
+def _grounding_flags(r):
+    """SDK grounding flags (ungrounded fields, negated request), sorted; empty list when clean."""
+    validation = r.get("validation") or {}
+    flagged = [str(f) for f in validation.get("ungrounded") or []]
+    if validation.get("negation"):
+        flagged.append("negated request")
+    return sorted(flagged)
 
 
 def _extract_decision(record_name, r, strict=True):
@@ -203,14 +281,9 @@ def _extract_decision(record_name, r, strict=True):
     args = call.get("arguments") or {}
     if not isinstance(args, dict):
         raise TypeError("extract fields must be a mapping")
-    if strict:
-        validation = r.get("validation") or {}
-        flagged = list(validation.get("ungrounded") or [])
-        if validation.get("negation"):
-            flagged.append("negated request")
-        if flagged:
-            detail = ", ".join(sorted(str(f) for f in flagged))
-            raise ValueError(f"extraction returned values not grounded in the input: {detail}")
+    flagged = _grounding_flags(r) if strict else []
+    if flagged:
+        raise ValueError(f"extraction returned values not grounded in the input: {', '.join(flagged)}")
     return {
         "record": record_name,
         "fields": args,
@@ -271,31 +344,6 @@ def validate_needle_tool(jev_tool, needle_tool):
     return needle_tool
 
 
-def _arguments_prompt(tool, schema, objective, node, context):
-    """Single-shot constrained prompt: exactly one tool, grounded args only."""
-    return json.dumps(
-        {
-            "instruction": (
-                f"You must call exactly the tool {tool!r} once with valid grounded arguments, "
-                "or return an error (must-call-or-error). Never call another tool, never chain "
-                "tools, never judge sufficiency or completion. Ground every argument: "
-                "accession_no only from a prior search_sec_filings packet, never invented from "
-                "tickers or names; ticker is a stock symbol like AAPL, never FINRA/SEC/org or "
-                "query words — when the symbol is unstated pass company_name instead and omit ticker; "
-                "dataset must be canonical group/name. as_of only from an explicit YYYY-MM-DD date or relative wording "
-                "in the query/objective, never memory or priors: no date wording means omit as_of entirely (latest-available). Today UTC is "
-                f"{datetime.now(UTC).date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week' or 'today' or 'last quarter' as arg values. On insufficient grounding raise/return an error, never fabricate, never stay silent. "
-                "For get_sec_document on a revenue-quarter question always include query 'revenue increased'; "
-            ),
-            "tool": tool,
-            "schema": schema,
-            "objective": objective,
-            "node": node,
-            "context": context,
-        }
-    )
-
-
 def handle(line):
     # Bound stdin memory: a huge prompt never reaches json/model work.
     if len(line) > MAX_LINE_CHARS:
@@ -335,25 +383,20 @@ def handle(line):
 
             _gen_t0 = _t.perf_counter()
             _init_ms = 0.0
-            bound = _bound_agent(tool, req.get("schema"))
+            node = req.get("node")
+            objective = req.get("objective")
+            text = _request_text(node, objective)
+            bound = _bound_agent(tool, req.get("schema"), _arguments_facts(objective, node, req.get("context")))
             _init_ms = (_t.perf_counter() - _gen_t0) * 1000.0
             try:
-                objective = req.get("objective")
-                prompt = _arguments_prompt(
-                    tool,
-                    req.get("schema"),
-                    objective
-                    if isinstance(objective, str) and objective.strip()
-                    else json.dumps({"tool": tool, "schema": req.get("schema")}),
-                    req.get("node"),
-                    req.get("context"),
-                )
-                r = bound.complete(prompt, max_new_tokens=512)
+                r = bound.complete(text, max_new_tokens=512)
             finally:
                 bound.close()
             _gen_ms = (_t.perf_counter() - _gen_t0) * 1000.0
             sys.stderr.write(f"needle timing tool={tool} init_ms={_init_ms:.1f} generate_ms={_gen_ms:.1f}\n")
             sys.stderr.flush()
+            if r.get("type") == "error" or r.get("success") is False or r.get("error"):
+                raise ValueError(f"needle engine failed for {tool!r}: {r.get('error') or r.get('type')}")
             decision = _decision(r, tool)
             try:
                 validate_needle_tool(tool, decision["tool"])
@@ -365,6 +408,9 @@ def handle(line):
                         f"needle tool mismatch: jev selected {tool!r}, needle emitted None ({_noncall_detail(r)})"
                     ) from None
                 raise
+            flagged = _grounding_flags(r)
+            if flagged:
+                raise ValueError(f"needle arguments for {tool!r} not grounded in the request: {', '.join(flagged)}")
         elif action == "extract":
             # Structured extraction: one record shape in, typed fields out.
             # Never hands the full registry — the grammar admits exactly this record.

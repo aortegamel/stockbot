@@ -62,18 +62,6 @@ const META_EXCLUDED: Record<string, true> = { call_tool: true, browse_tools: tru
 
 type DescribeEntry = { function?: { name?: unknown; description?: unknown; parameters?: unknown } };
 
-function stripDescriptions(node: unknown): unknown {
-  if (Array.isArray(node)) return node.map(stripDescriptions);
-  if (node && typeof node === "object") {
-    return Object.fromEntries(
-      Object.entries(node as Record<string, unknown>)
-        .filter(([k]) => k !== "description")
-        .map(([k, v]) => [k, stripDescriptions(v)]),
-    );
-  }
-  return node;
-}
-
 async function fetchCatalog(): Promise<void> {
   process.stdout.write("needle [ai]: fetching tool catalog via tool_bridge describe…\n");
   const bridge = spawn(`${ROOT_DIR}/venv/bin/python`, [`${ROOT_DIR}/scripts/tool_bridge.py`], {
@@ -135,9 +123,8 @@ async function fetchCatalog(): Promise<void> {
     const rawDesc = typeof fn.description === "string" && fn.description.trim() ? fn.description : fn.name;
     catalog.push({
       name: fn.name,
-      // Slim by design: full describe text (~58KB catalog) exceeds the Needle init budget; truncated top-level descriptions ground routing (name-only misroutes), stripped params fit.
-      description: rawDesc.slice(0, 150),
-      parameters: fn.parameters && typeof fn.parameters === "object" ? stripDescriptions(fn.parameters) : { type: "object" },
+      description: rawDesc,
+      parameters: fn.parameters && typeof fn.parameters === "object" ? fn.parameters : { type: "object" },
     });
   }
   if (catalog.length === 0) {

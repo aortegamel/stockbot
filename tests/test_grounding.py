@@ -1,5 +1,6 @@
 """Grounded hypothetical reasoning: refs, numbers, assumptions, prompt bytes."""
 
+import json
 from collections.abc import Callable, Mapping, Sequence
 from types import SimpleNamespace
 from typing import override
@@ -268,3 +269,22 @@ def test_verbatim_bytes_in_prompt_context():
     assert grounding.check_grounded_analysis(fake, grounded_ids) is fake
     out = check_analyses("analyze", [fake], "s1", {"n1"}, grounded_ids)
     assert out[0]["evidenceRefs"] == ["ev-nvda-10k"]
+
+
+def test_grounded_block_keeps_content_past_2000_chars_for_citation():
+    """GROUNDED prompt entries carry full stored bytes, so a value cited near the end still validates."""
+    tail = "Total OpenAI-linked revenue: 12.5%\u00a0of FY26 — see Note 9."
+    content = "Item 7.  MD&A\n\t" + "segment detail; " * 200 + tail
+    assert len(content) > 2000
+    record: JSONValue = {"evidence_id": "ev-long", "content": content, "content_hash": "h2", "provenance": "SEC"}
+    prompt = _analyze_prompt(_session(), _node(), [record], [])
+    ctx = json.loads(prompt.split("\nCONTEXT: ", 1)[1])
+    block = ctx["GROUNDED"][0]
+    assert block.endswith(f"content={content}")
+    # The model cites what the GROUNDED block shows; that quote must match stored bytes.
+    quote = block[block.index("Total OpenAI") :]
+    cited: dict[str, object] = {
+        "evidenceRefs": ["ev-long"],
+        "numbers": [{"value": "12.5%", "evidenceId": "ev-long", "quote": quote}],
+    }
+    assert check_grounded_analysis(cited, {"ev-long"}, [record]) is cited

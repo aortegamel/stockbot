@@ -16,7 +16,6 @@ import re
 from collections.abc import Mapping
 
 __all__ = [
-    "GROUNDED_CONTENT_MAX",
     "attach_scenario_impact",
     "check_grounded_analysis",
     "compute_scenario_impact",
@@ -24,10 +23,6 @@ __all__ = [
     "parse_percent",
     "split_grounded_context",
 ]
-
-# ponytail: fixed ceiling; callers needing full bytes already hold the record.
-GROUNDED_CONTENT_MAX = 2000
-"""Verbatim content chars per grounded block; overflow takes a truncation marker."""
 
 
 def _field(record: object, name: str, default: object = None) -> object:
@@ -101,14 +96,12 @@ def _evidence_texts(evidence: object) -> dict[str, str]:
 
 
 def format_grounded_block(record: object) -> str:
-    """One compact block: evidence id plus verbatim content plus hash/provenance."""
+    """One compact block: evidence id plus complete verbatim content plus hash/provenance."""
     eid = _field(record, "evidence_id", "")
     content = _field(record, "content", "")
     if not isinstance(content, str):
         content = str(content)
     # Verbatim: never collapse whitespace — numbers[].quote must match stored bytes exactly.
-    if len(content) > GROUNDED_CONTENT_MAX:
-        content = content[:GROUNDED_CONTENT_MAX] + f"...[truncated at {GROUNDED_CONTENT_MAX} chars]"
     return (
         f"[GROUNDED evidence_id={eid}] "
         f"content_hash={_field(record, 'content_hash')} provenance={_field(record, 'provenance')} "

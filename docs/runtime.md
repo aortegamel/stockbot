@@ -19,6 +19,17 @@ Progress lines (`session`, `intake_start`, `intake_done`, `reasoner_*`,
 `tool_start`, `tool_done`) stream as `progress` events; prod forwards a
 stripped `working` stage to keep the UI stall watchdog fed.
 
+The live Reasoner prompt states the exact required `objectiveId`.
+Its JSON example uses that value and an objective-scoped proposal ID.
+The validator rejects proposals that belong to another objective.
+
+The worker gives the existing second attempt the validation error from a rejected response.
+It quotes that error as JSON data, not instructions.
+It states the required contract separately.
+Both attempts use the remaining setup budget.
+The worker retains hints only from a valid response.
+This repair does not change transport, quota, configuration, or deadline rules.
+
 Architecture: the kernel scheduler owns the agent loop (JEV selects over
 the whole registry every round, Needle fills tool arguments, tools execute
 via `app/tool_runtime.py` against canonical `app/tools.py`). Thesis
@@ -35,6 +46,53 @@ remain separate. Existing sessions retain their stored identity keys.
 Duplicate admissions retain their evidence IDs but do not count as new
 evidence or scheduler progress. The harness links a tool call only to its
 explicit evidence ID in the session. Calls without an ID receive no link.
+
+JEV receives compact, deterministic context. No LLM summarizes evidence.
+Each admitted evidence record carries four fields: `evidence_id`,
+`source_name`, `subject`, and `claim_text`. Only `claim_text` is clipped, to
+200 characters. Bounded unadmitted observations and do-not-repeat guidance
+remain in the context.
+
+Attempt history keeps the tool, its arguments, and its IDs. Summaries and
+errors are clipped to 200 characters. Attempt reasoning and metrics are not
+sent to JEV.
+
+The JEV client accepts sequences of records, including lists and tuples.
+It rejects dictionary inputs with a `TypeError` before it requests a
+decision.
+
+Tool options render six fields: name, purpose, useWhen, avoidWhen,
+Needs(prerequisites), and PIT(pitSupport). Compact metadata retains the
+safety restrictions that descriptions once carried. JEV sees every
+registry tool. Needle keeps the full descriptions and parameter schemas.
+
+The argument worker calls native `Needle.complete()` with the raw node question.
+It binds exactly the tool that JEV selects.
+The catalog preserves the original description and parameter schema.
+
+The SDK receives every admitted evidence record without clipping.
+The SDK facts reuse the shared grounded formatter, `format_grounded_block`.
+Each SDK fact block carries the evidence ID, content hash, provenance, complete stored content, and all remaining record fields.
+The formatter does not clip SDK facts or Reasoner prompts.
+Each Reasoner block carries the evidence ID, content hash, provenance, and complete stored content.
+Complete stored content is not complete source text.
+
+Source text that intake clipped before storage stays clipped.
+Wrapper instructions such as `grounding_hint` do not enter the SDK facts.
+
+The worker rejects explicit engine failures, SDK-reported ungrounded fields, and negated requests.
+The emitted tool must match JEV's selected tool.
+
+The process supervisor retains the 120-second startup budget and 10-second generation deadline.
+SDK `close()` cannot interrupt a blocked inference call.
+Complete evidence can exceed the deadline or exhaust the SDK token budget.
+
+Tool selection receives compact session evidence. Result assessment
+receives admitted evidence only from the current node's jobs: the current
+job and the jobs in its attempt history. It also receives any evidence row
+that the node's attempts reference by ID, such as a duplicate winner stored
+under another job. Other intake and other-node evidence never support the
+node. The raw current outcome stays capped at 2000 characters.
 
 `app/research/runner.py` is a deterministic eval harness only (retired live
 loop kept as a test helper): the scheduler owns orchestration, the kernel
