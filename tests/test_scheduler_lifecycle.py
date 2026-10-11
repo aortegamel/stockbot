@@ -331,6 +331,57 @@ def test_duplicate_admission_signals_no_progress() -> None:
     assert (dup["admitted"], dup["progressed"], dup["evidence_id"]) == (0, False, "ev-winner")
 
 
+def test_assessment_evidence_is_scoped_to_current_node_jobs() -> None:
+    """Assessment sees this node's jobs, explicitly referenced duplicates, and observations.
+
+    Unrelated rows from another node or intake never reach it, even from the duplicate winner's job.
+    """
+    seen: list[object] = []
+
+    class _J(_JevAdmit):
+        @override
+        async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
+            seen.append(a[2])
+            base = await super().assess_result(*a, **k)
+            return {**base, "continuation": "continue_research", "continue": "continue_research"}
+
+    kernel = _Kernel()
+    result: dict[str, JSONValue] = {
+        "tool_result_id": "s1:tr:abc",
+        "records": [{"settlementDate": "2024-01-01", "symbolCode": "XYZ", "currentShortPositionQuantity": 1}],
+    }
+    kernel.tool_results["s1:tr:abc"] = result
+    evidence: list[dict[str, JSONValue]] = [
+        {"evidence_id": "ev-prev", "job_id": "job-1"},
+        {"evidence_id": "ev-cur", "job_id": "job-3"},
+        {"evidence_id": "ev-winner", "job_id": "job-other-node"},
+        {"evidence_id": "ev-other", "job_id": "job-other-node"},
+        {"evidence_id": "ev-intake", "job_id": "job-intake"},
+    ]
+    attempts: list[dict[str, JSONValue]] = [
+        {"tool": "query_finra", "job_id": "job-1", "evidence_id": "ev-prev", "outcome_summary": "admitted"},
+        {"tool": "query_finra", "job_id": "job-2", "evidence_id": None, "outcome_summary": "unadmitted obs"},
+        {"tool": "query_finra", "job_id": "job-4", "evidence_id": "ev-winner", "outcome_summary": "duplicate"},
+        {"tool": None, "job_id": None, "evidence_id": None, "outcome_summary": "", "error": "select failed"},
+    ]
+    record: dict[str, object] = {
+        "tool": "query_finra",
+        "arguments": {},
+        "outcome": _outcome(),
+        "outcome_summary": "record values here",
+        "error": None,
+        "result": result,
+        "job_id": "job-3",
+    }
+    asyncio.run(
+        sched._settle_round([record], _J(), kernel, _node(), evidence, attempts, "s1", "n1", _invoke("query_finra"), 0)
+    )
+    (ctx,) = seen
+    assert isinstance(ctx, list)
+    assert [c.get("evidence_id") for c in ctx if c.get("evidence_id")] == ["ev-prev", "ev-cur", "ev-winner"]
+    assert [c.get("outcome_summary") for c in ctx if "outcome_summary" in c] == ["unadmitted obs"]
+
+
 def test_pure_stall_is_guard_false_with_stall_reason() -> None:
     class _KS(_Kernel):
         @override
@@ -2342,3 +2393,149 @@ def test_run_one_node_passes_session_id_and_kernel(tmp_path: Path, monkeypatch: 
     out = asyncio.run(go())
     assert out["node_id"] == "n9" and out["status"] == "failed"
     assert [kind for kind, _ in kernel.decisions] == ["node_failure"]
+
+
+def test_sync_kwargs_generate_does_not_freeze_deadline() -> None:
+    """Blocking sync kwargs generate leaves the loop free; cancel fails the job."""
+    import threading
+    import time as _time
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def sync_gen(**kw: object) -> dict[str, JSONValue]:
+        entered.set()
+        release.wait(timeout=5.0)
+        return {"tool": "search_web", "arguments": {"query": "q"}, "reasoning": "r"}
+
+    def _never_invoke(*a: object, **k: object) -> dict[str, JSONValue]:
+        raise AssertionError("invoke must not run while generation is blocked")
+
+    kernel = _Kernel()
+
+    async def _main() -> None:
+        await asyncio.wait_for(
+            sched._attempt_tool(
+                tool_name="search_web",
+                node=_node(),
+                session={"session_id": "s1", "objective": "q"},
+                registry=[{"name": "search_web", "parameters": {}}],
+                evidence=[],
+                attempts=[],
+                kernel=kernel,
+                needle_generate=sync_gen,
+                invoke=_never_invoke,
+                to_outcome=_to_outcome,
+                tool_session=_tool_session(),
+                as_of=None,
+            ),
+            timeout=0.2,
+        )
+
+    t0 = _time.perf_counter()
+    try:
+        with pytest.raises(TimeoutError):
+            asyncio.run(_main())
+        assert _time.perf_counter() - t0 < 1.0
+        assert entered.is_set()
+        assert ("fail", "job-0", "timeout") in kernel.calls
+    finally:
+        release.set()
+
+
+def test_sync_dict_generate_does_not_freeze_deadline() -> None:
+    """Blocking sync single-dict generate leaves the loop free; cancel fails the job."""
+    import threading
+    import time as _time
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def sync_gen(request: object) -> dict[str, JSONValue]:
+        assert isinstance(request, dict)
+        entered.set()
+        release.wait(timeout=5.0)
+        return {"tool": "search_web", "arguments": {"query": "q"}, "reasoning": "r"}
+
+    def _never_invoke(*a: object, **k: object) -> dict[str, JSONValue]:
+        raise AssertionError("invoke must not run while generation is blocked")
+
+    kernel = _Kernel()
+
+    async def _main() -> None:
+        await asyncio.wait_for(
+            sched._attempt_tool(
+                tool_name="search_web",
+                node=_node(),
+                session={"session_id": "s1", "objective": "q"},
+                registry=[{"name": "search_web", "parameters": {}}],
+                evidence=[],
+                attempts=[],
+                kernel=kernel,
+                needle_generate=sync_gen,
+                invoke=_never_invoke,
+                to_outcome=_to_outcome,
+                tool_session=_tool_session(),
+                as_of=None,
+            ),
+            timeout=0.2,
+        )
+
+    t0 = _time.perf_counter()
+    try:
+        with pytest.raises(TimeoutError):
+            asyncio.run(_main())
+        assert _time.perf_counter() - t0 < 1.0
+        assert entered.is_set()
+        assert ("fail", "job-0", "timeout") in kernel.calls
+    finally:
+        release.set()
+
+
+def test_async_dict_generate_stays_supported() -> None:
+    """Async single-dict generate still returns grounded args."""
+
+    async def async_gen(request: object) -> dict[str, JSONValue]:
+        assert isinstance(request, dict)
+        assert request.get("tool") == "search_web"
+        return {"tool": "search_web", "arguments": {"query": "q"}, "reasoning": "r"}
+
+    args, reasoning, withheld = asyncio.run(
+        sched._generate_tool_arguments(
+            async_gen,
+            "search_web",
+            [{"name": "search_web", "parameters": {}}],
+            {"session_id": "s1", "objective": "q"},
+            _node(),
+            [],
+            [],
+            None,
+        )
+    )
+    assert args.get("query") == "q"
+    assert reasoning == "r" and withheld is False
+
+
+def test_sync_wrapper_returning_coroutine_stays_supported() -> None:
+    """Sync kwargs wrapper returning a coroutine still resolves to grounded args."""
+
+    async def _impl(**kw: object) -> dict[str, JSONValue]:
+        return {"tool": "search_web", "arguments": {"query": "q"}, "reasoning": "r"}
+
+    def wrapper(**kw: object) -> object:
+        return _impl(**kw)
+
+    args, reasoning, _ = asyncio.run(
+        sched._generate_tool_arguments(
+            wrapper,
+            "search_web",
+            [{"name": "search_web", "parameters": {}}],
+            {"session_id": "s1", "objective": "q"},
+            _node(),
+            [],
+            [],
+            None,
+        )
+    )
+    assert args.get("query") == "q"
+    assert reasoning == "r"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import io
 import json
 import select
@@ -10,13 +11,15 @@ import shutil
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Executor
 from pathlib import Path
 from types import TracebackType
-from typing import Self, override
+from typing import Self, cast, override
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from app.decision_client import JevClient
 from app.research.models import JSONValue
@@ -520,3 +523,322 @@ def test_http_fallback_runs_on_client_pool(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
     monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
     assert asyncio.run(_run_and_close()) is client._http_pool
+
+
+def _answers(questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+    """Stub SystemOne answers: first sorted option wins each choice. Noul 0.5."""
+    out: dict[str, JSONValue] = {}
+    for qid, q in questions.items():
+        criteria = q.get("criteria") if isinstance(q, dict) else None
+        if isinstance(criteria, dict):
+            names = sorted(criteria)
+            probs: dict[str, JSONValue] = {n: 0.5 for n in names}
+            out[qid] = {"type": "choice", "choice": names[0], "probabilities": probs, "confidence": 0.5}
+        else:
+            out[qid] = {"type": "noul", "noul": 0.5}
+    return {"answers": out}
+
+
+def _capturing_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[JevClient, list[tuple[object, dict[str, JSONValue]]]]:
+    """Client whose transport records the exact (state, questions) JEV receives."""
+    seen: list[tuple[object, dict[str, JSONValue]]] = []
+
+    def _transport(state: object, questions: dict[str, JSONValue]) -> dict[str, JSONValue]:
+        seen.append((state, questions))
+        return _answers(questions)
+
+    client = JevClient(transport=_transport, data_root=tmp_path)
+
+    def _noop(**kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(client, "_persist", _noop)
+    return client, seen
+
+
+_MARKERS = ("RAW_CONTENT_MARKER", "PROVENANCE_MARKER", "META_MARKER", "REASONING_MARKER", "INTAKE_MARKER")
+_GUIDANCE_LINE = "Do not repeat a tool call with identical arguments to an earlier attempt."
+
+
+def _raw_context() -> tuple[list[JSONValue], list[JSONValue]]:
+    """Scheduler-shaped ctx (non-record, admitted row, 12 observations, guidance) plus one attempt with raw payload."""
+    admitted: dict[str, JSONValue] = {
+        "evidence_id": "ev-1",
+        "session_id": "s",
+        "wave_id": 1,
+        "source_name": "SEC",
+        "subject": "AAPL",
+        "claim_text": "c" * 201,
+        "content": "RAW_CONTENT_MARKER " * 400,
+        "provenance": {"kind": "sec_source", "accession_no": "PROVENANCE_MARKER"},
+        "metadata": {"identity_key": "META_MARKER"},
+        "job_id": "j-admit",
+    }
+    observations: list[JSONValue] = [
+        {
+            "tool": f"t{i}",
+            "job_id": f"j{i}",
+            "outcome_summary": "s" * 2000,
+            "error": "e" * 500 if i == 11 else None,
+            "error_type": "tool_error" if i == 11 else None,
+            "tool_result_ref": f"r{i}",
+        }
+        for i in range(12)
+    ]
+    guidance: dict[str, JSONValue] = {
+        "type": "selection_guidance",
+        "intake_evidence": ["ev-1: INTAKE_MARKER"],
+        "instruction": _GUIDANCE_LINE,
+        "prior_calls": [f"p{i}" for i in range(12)],
+    }
+    attempts: list[JSONValue] = [
+        {
+            "tool": "a",
+            "arguments": {"q": "x"},
+            "outcome_summary": "o" * 200,
+            "error": "f" * 201,
+            "error_type": "tool_error",
+            "reasoning": "REASONING_MARKER",
+            "confidence": 0.9,
+            "job_id": "j9",
+            "evidence_id": "ev-9",
+            "tool_result_ref": "r9",
+            "generate_ms": 1.0,
+            "tool_ms": 2.0,
+            "assess_ms": 3.0,
+        }
+    ]
+    return ["NOT_A_RECORD", admitted, *observations, guidance], attempts
+
+
+def _compact_evidence_expected(with_guidance: bool) -> list[JSONValue]:
+    observed: list[JSONValue] = [
+        {
+            "tool": f"t{i}",
+            "job_id": f"j{i}",
+            "tool_result_ref": f"r{i}",
+            "outcome_summary": "s" * 200,
+            "error": "e" * 200 if i == 11 else None,
+            "error_type": "tool_error" if i == 11 else None,
+        }
+        for i in range(2, 12)
+    ]
+    guidance: list[JSONValue] = [
+        {"type": "selection_guidance", "instruction": _GUIDANCE_LINE, "prior_calls": [f"p{i}" for i in range(2, 12)]}
+    ]
+    admitted: JSONValue = {"evidence_id": "ev-1", "source_name": "SEC", "subject": "AAPL", "claim_text": "c" * 200}
+    return [admitted, *observed, *(guidance if with_guidance else [])]
+
+
+def test_select_tool_sends_only_compact_state_and_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """JEV select request: 4-field evidence, bounded observations, compact attempts, compact options."""
+    client, seen = _capturing_client(tmp_path, monkeypatch)
+    registry: list[dict[str, JSONValue]] = [
+        {
+            "name": "a",
+            "description": "DESCRIPTION_MARKER " * 50,
+            "domain": "SEC",
+            "purpose": "Read  filings",
+            "intent": "INTENT_MARKER",
+            "keyInputs": "req(x)",
+            "outputKind": "rows",
+            "useWhen": "need text",
+            "avoidWhen": "no accession",
+            "prerequisites": "needs search_id",
+            "pitSupport": "PIT-scoped",
+            "conflicts": "b",
+            "nextTools": "c",
+            "parameters": {"type": "object"},
+        }
+    ]
+    evidence, attempts = _raw_context()
+    before = copy.deepcopy((registry, evidence, attempts))
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
+
+    decision = asyncio.run(client.select_tool("obj", node, registry, evidence, attempts, session_id="s"))
+
+    assert decision.tool_name == "a"
+    assert (registry, evidence, attempts) == before
+    state, questions = seen[0]
+    assert isinstance(state, dict)
+    assert state["evidence"] == _compact_evidence_expected(with_guidance=True)
+    assert state["attempts"] == [
+        {
+            "tool": "a",
+            "arguments": {"q": "x"},
+            "job_id": "j9",
+            "evidence_id": "ev-9",
+            "tool_result_ref": "r9",
+            "outcome_summary": "o" * 200,
+            "error": "f" * 200,
+            "error_type": "tool_error",
+        }
+    ]
+    wire = json.dumps({"state": state, "questions": questions})
+    for marker in (*_MARKERS, "DESCRIPTION_MARKER", "INTENT_MARKER"):
+        assert marker not in wire
+    sel = questions["tool_selection"]
+    assert isinstance(sel, dict)
+    criteria = sel["criteria"]
+    assert isinstance(criteria, dict)
+    assert (
+        criteria["a"]
+        == "a Purpose: Read filings. Use: need text. Avoid: no accession. Needs: needs search_id. PIT: PIT-scoped."
+    )
+    assert {"reasoning_required", "node_resolved"} <= set(criteria)
+    prompt = sel["instructions"]
+    assert isinstance(prompt, str)
+    assert "Evidence on hand: 15 item(s) [ev-1,j0," in prompt
+    assert f"Observed t3 ref=r3: {'s' * 200}." in prompt
+    assert f"Prior attempt a failed: {'f' * 200}." in prompt
+
+
+def test_select_tool_compacts_tuple_evidence_and_attempts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tuple inputs (valid Sequence) reach JEV compacted, never dropped."""
+    client, seen = _capturing_client(tmp_path, monkeypatch)
+    evidence, attempts = _raw_context()
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
+    registry: list[dict[str, JSONValue]] = [{"name": "a"}]
+
+    asyncio.run(client.select_tool("obj", node, registry, tuple(evidence), tuple(attempts), session_id="s"))
+
+    state, _questions = seen[0]
+    assert isinstance(state, dict)
+    assert state["evidence"] == _compact_evidence_expected(with_guidance=True)
+    tool_attempts = state["attempts"]
+    assert isinstance(tool_attempts, list) and len(tool_attempts) == 1
+    assert isinstance(tool_attempts[0], dict) and tool_attempts[0]["arguments"] == {"q": "x"}
+
+
+@pytest.mark.parametrize("field", ["evidence", "attempts"])
+def test_select_tool_rejects_mapping_before_request(
+    field: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dict for evidence/attempts is a caller defect: TypeError, no JEV request."""
+    client, seen = _capturing_client(tmp_path, monkeypatch)
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
+    # cast: deliberately violates the Sequence contract to prove runtime rejection.
+    bad = cast(Sequence[JSONValue], {"evidence_id": "ev-1"})
+    evidence = bad if field == "evidence" else None
+    attempts = bad if field == "attempts" else None
+    with pytest.raises(TypeError, match=f"jev {field} must be a sequence of records, not a mapping"):
+        asyncio.run(client.select_tool("obj", node, [{"name": "a"}], evidence, attempts, session_id="s"))
+    assert seen == []
+
+
+def test_assess_result_rejects_mapping_evidence_before_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client, seen = _capturing_client(tmp_path, monkeypatch)
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
+    bad = cast(Sequence[JSONValue], {"evidence_id": "ev-1"})  # contract violation on purpose
+    with pytest.raises(TypeError, match="jev evidence must be a sequence of records, not a mapping"):
+        asyncio.run(client.assess_result(node, {"content": "x"}, bad, session_id="s"))
+    assert seen == []
+
+
+def test_select_tool_none_context_sends_empty_lists(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client, seen = _capturing_client(tmp_path, monkeypatch)
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
+    asyncio.run(client.select_tool("obj", node, [{"name": "a"}], None, None, session_id="s"))
+    state, _questions = seen[0]
+    assert isinstance(state, dict) and state["evidence"] == [] and state["attempts"] == []
+
+
+@pytest.mark.parametrize("prior_calls", [None, "p1"])
+def test_select_tool_invalid_prior_calls_send_empty_list(
+    prior_calls: JSONValue, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, seen = _capturing_client(tmp_path, monkeypatch)
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
+    guidance: list[JSONValue] = [
+        {"type": "selection_guidance", "instruction": _GUIDANCE_LINE, "prior_calls": prior_calls}
+    ]
+    asyncio.run(client.select_tool("obj", node, [{"name": "a"}], guidance, None, session_id="s"))
+    state, _questions = seen[0]
+    assert isinstance(state, dict)
+    assert state["evidence"] == [{"type": "selection_guidance", "instruction": _GUIDANCE_LINE, "prior_calls": []}]
+
+
+def test_manifest_line_needs_no_description() -> None:
+    from app.decision_client import _manifest_line
+
+    assert _manifest_line({"name": "bare"}) == "bare"
+    assert _manifest_line({"name": "t", "useWhen": "  ", "pitSupport": "PIT-blind"}) == "t PIT: PIT-blind."
+
+
+def test_assess_result_keeps_raw_outcome_and_compacts_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """JEV assess request: raw current outcome capped at 2000, evidence compacted, caller untouched."""
+    client, seen = _capturing_client(tmp_path, monkeypatch)
+    evidence, _ = _raw_context()
+    ctx = evidence[:-1]  # scheduler passes no guidance to assessment
+    before = copy.deepcopy(ctx)
+    outcome: dict[str, JSONValue] = {"tool_name": "a", "content": "x" * 5000, "error": None, "tool_result_id": "r1"}
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
+
+    out = asyncio.run(client.assess_result(node, outcome, ctx, session_id="s", job_id="j1"))
+
+    assert out["continuation"] == "continue_research"
+    assert ctx == before
+    state, _questions = seen[0]
+    assert isinstance(state, dict)
+    assert state["outcome"] == {
+        "tool": "a",
+        "content": "x" * 2000,
+        "error": None,
+        "error_type": None,
+        "tool_result_id": "r1",
+    }
+    assert state["evidence"] == _compact_evidence_expected(with_guidance=False)
+    wire = json.dumps(state)
+    for marker in _MARKERS:
+        assert marker not in wire
+
+
+_RAW_KEYS = st.sampled_from(["content", "reasoning", "provenance", "metadata", "generate_ms", "outcome"])
+
+
+@settings(max_examples=200, derandomize=True)
+@given(st.text(max_size=400), st.text(max_size=400), st.dictionaries(_RAW_KEYS, st.text(max_size=50), max_size=6))
+def test_prop_compact_projection_clips_text_and_drops_raw(text: str, other: str, raw: dict[str, str]) -> None:
+    """Projection keeps exactly the approved fields. Text fields equal their first 200 chars."""
+    from app.decision_client import _compact_attempts, _compact_context
+
+    admitted: dict[str, JSONValue] = {
+        **raw,
+        "evidence_id": "ev",
+        "source_name": "S",
+        "subject": "X",
+        "claim_text": text,
+    }
+    observed: dict[str, JSONValue] = {**raw, "tool": "t", "outcome_summary": text, "error": other}
+    attempt: dict[str, JSONValue] = {
+        **raw,
+        "tool": "t",
+        "arguments": {"k": "v"},
+        "outcome_summary": text,
+        "error": other,
+    }
+    assert _compact_context([admitted, observed]) == [
+        {"evidence_id": "ev", "source_name": "S", "subject": "X", "claim_text": text[:200]},
+        {
+            "tool": "t",
+            "job_id": None,
+            "tool_result_ref": None,
+            "outcome_summary": text[:200],
+            "error": other[:200],
+            "error_type": None,
+        },
+    ]
+    assert _compact_attempts([attempt]) == [
+        {
+            "tool": "t",
+            "arguments": {"k": "v"},
+            "job_id": None,
+            "evidence_id": None,
+            "tool_result_ref": None,
+            "outcome_summary": text[:200],
+            "error": other[:200],
+            "error_type": None,
+        }
+    ]

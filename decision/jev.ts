@@ -238,25 +238,17 @@ export const TOOL_SELECTION_SENTINELS = {
 
 // Compact model-efficient manifest for one canonical tool, assembled
 // caller-side (Python scheduler) as one entry per canonical research tool.
-// name+description required (compat); all other fields optional budget aids
-// supplied by the scheduler's build_registry — never a filter, every
-// canonical tool stays visible. Builder renders one compact single line per
-// tool from all present fields.
+// Only name is required; every canonical tool stays visible. Selection
+// restrictions live in discovery metadata (useWhen/avoidWhen), so the option
+// line carries no description: Needle keeps full descriptions and schemas.
+// Mirrors app/decision_client.py _manifest_line field for field.
 export type ToolManifestEntry = {
   name: string;
-  description: string;
-  domain?: string;
   purpose?: string;
-  intent?: string;
-  keyInputs?: string;
-  outputKind?: string;
-  evidence?: string;
-  prerequisites?: string;
-  pitSupport?: string;
   useWhen?: string;
   avoidWhen?: string;
-  conflicts?: string;
-  nextTools?: string;
+  prerequisites?: string;
+  pitSupport?: string;
 };
 
 export type ToolSelectionNode = {
@@ -266,34 +258,20 @@ export type ToolSelectionNode = {
 };
 
 export type ToolSelectionAttempt = { tool: string; error: string };
+const MANIFEST_FIELDS = [
+  ["Purpose", "purpose"],
+  ["Use", "useWhen"],
+  ["Avoid", "avoidWhen"],
+  ["Needs", "prerequisites"],
+  ["PIT", "pitSupport"],
+] as const;
+
 function manifestLine(entry: ToolManifestEntry): string {
-  const opt = (v: unknown): string | null =>
-    typeof v === "string" && v.trim() ? v.replace(/\s+/g, " ").trim() : null;
-  let line = entry.description.replace(/\s+/g, " ").trim();
-  const purpose = opt(entry.purpose);
-  if (purpose && purpose !== line) line += ` Purpose: ${purpose}.`;
-  const intent = opt(entry.intent);
-  if (intent) line += ` Intent: ${intent}.`;
-  const inputs = opt(entry.keyInputs);
-  if (inputs) line += ` Inputs: ${inputs}.`;
-  const output = opt(entry.outputKind);
-  if (output) line += ` Output: ${output}.`;
-  const evidence = opt(entry.evidence);
-  if (evidence) line += ` Evidence: ${evidence}.`;
-  const prereq = opt(entry.prerequisites);
-  if (prereq) line += ` Needs: ${prereq}.`;
-  const pit = opt(entry.pitSupport);
-  if (pit) line += ` PIT: ${pit}.`;
-  const useWhen = opt(entry.useWhen);
-  if (useWhen) line += ` Use: ${useWhen}.`;
-  const avoidWhen = opt(entry.avoidWhen);
-  if (avoidWhen) line += ` Avoid: ${avoidWhen}.`;
-  const conflicts = opt(entry.conflicts);
-  if (conflicts) line += ` Conflicts: ${conflicts}.`;
-  const nextTools = opt(entry.nextTools);
-  if (nextTools) line += ` Next: ${nextTools}.`;
-  const domain = opt(entry.domain);
-  if (domain) line = `[${domain}] ${line}`;
+  let line = entry.name;
+  for (const [label, key] of MANIFEST_FIELDS) {
+    const value = entry[key];
+    if (typeof value === "string" && value.trim()) line += ` ${label}: ${value.replace(/\s+/g, " ").trim()}.`;
+  }
   return line;
 }
 
@@ -325,8 +303,6 @@ export function buildToolSelectionQuestion(
   for (const entry of registry) {
     if (!entry || typeof entry.name !== "string" || !entry.name)
       throw new Error("tool_selection: registry entry needs a name");
-    if (typeof entry.description !== "string" || !entry.description)
-      throw new Error(`tool_selection: tool ${entry.name} needs a description`);
     if (entry.name in options) throw new Error(`tool_selection: duplicate tool ${entry.name}`);
     options[entry.name] = manifestLine(entry);
   }

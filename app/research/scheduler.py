@@ -686,13 +686,11 @@ def build_registry() -> list[dict[str, JSONValue]]:
     """Compact manifests for every canonical RESEARCH tool (meta tools excluded).
 
     JEV sees this whole registry on EVERY selection including post-tool
-    transitions. Fields match decision/jev.ts ToolManifestEntry: name +
-    description required; the catalog detail (use/when-NOT/conflicts/next)
-    comes from TOOL_DISCOVERY_REGISTRY so JEV picks the best tool with
-    highest probability; prerequisites/pitSupport are budget aids, never a
-    filter — every canonical tool stays visible. ``parameters`` rides along
-    for Needle (single selected tool schema in). Catalog intent/useWhen/
-    avoidWhen/conflicts/nextTools ride along for JEV probability.
+    transitions. decision/jev.ts ToolManifestEntry requires only name. JEV
+    options render name/purpose/useWhen/avoidWhen/prerequisites/pitSupport
+    from TOOL_DISCOVERY_REGISTRY. prerequisites/pitSupport are budget aids,
+    never a filter: every canonical tool stays visible. Full ``description``
+    and ``parameters`` schemas stay for Needle (single selected tool in).
     """
     global _REGISTRY_CACHE
     # ponytail: TOOLS + discovery metadata are import-time constants; rebuild once per process.
@@ -1753,24 +1751,33 @@ async def _generate_tool_arguments(
             return sid_args, "session_id carried from scheduler session; no Needle grounding needed", False
     try:
         if _needle_takes_kwargs(needle_generate):
-            generated = await _awaited(
-                needle_generate(
-                    tool=tool_name, schema=schema, objective=objective, node=_node_dict(node), context=context
-                )
+            call = functools.partial(
+                needle_generate,
+                tool=tool_name,
+                schema=schema,
+                objective=objective,
+                node=_node_dict(node),
+                context=context,
             )
         else:
-            generated = await _awaited(
-                needle_generate(
-                    {
-                        "op": "arguments.generate",
-                        "tool": tool_name,
-                        "schema": schema,
-                        "objective": objective,
-                        "node": _node_dict(node),
-                        "context": context,
-                    }
-                )
+            call = functools.partial(
+                needle_generate,
+                {
+                    "op": "arguments.generate",
+                    "tool": tool_name,
+                    "schema": schema,
+                    "objective": objective,
+                    "node": _node_dict(node),
+                    "context": context,
+                },
             )
+        if inspect.iscoroutinefunction(needle_generate):
+            generated = await _awaited(call())
+        else:
+            # ponytail: sync generation leaves the loop on the tool pool (never the
+            # default executor), so a stall cannot freeze deadlines/heartbeats;
+            # Needle's process-local _LOCK stays serial.
+            generated = await _awaited(await asyncio.get_running_loop().run_in_executor(_TOOL_POOL, call))
     except RuntimeError as exc:
         # Needle down (server-unavailable only): carry packet accession, else
         # seed from the objective. Timeouts re-raise (retry, never seed).
@@ -2817,11 +2824,17 @@ async def _assess_attempt(
     nid: str,
     job_id: str,
 ) -> tuple[dict[str, JSONValue], float]:
-    """JEV result assessment with its decision record."""
+    """JEV result assessment with its decision record.
+
+    Evidence is limited to this node's jobs plus rows its attempts explicitly reference (duplicate winners).
+    """
+    node_jobs = {job_id, *(j for a in attempts if isinstance(j := a.get("job_id"), str))}
+    node_refs = {e for a in attempts if isinstance(e := a.get("evidence_id"), str)}
+    node_evidence = [ev for ev in evidence if ev.get("job_id") in node_jobs or ev.get("evidence_id") in node_refs]
     _t0 = _time.perf_counter()
     try:
         assessment = await jev.assess_result(
-            node, outcome, _context_evidence(evidence, attempts), session_id=sid, job_id=job_id
+            node, outcome, _context_evidence(node_evidence, attempts), session_id=sid, job_id=job_id
         )
     finally:
         assess_ms = (_time.perf_counter() - _t0) * 1000.0

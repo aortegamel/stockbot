@@ -290,7 +290,7 @@ def _outcome_dict(outcome: object) -> dict[str, JSONValue]:
     }
 
 
-def _evidence_ids(evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None) -> list[str]:
+def _evidence_ids(evidence: Sequence[JSONValue] | None) -> list[str]:
     ids: list[str] = []
     if not isinstance(evidence, list):
         return ids
@@ -306,7 +306,7 @@ def _evidence_ids(evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None
     return ids
 
 
-def _observation_lines(evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None) -> list[str]:
+def _observation_lines(evidence: Sequence[JSONValue] | None) -> list[str]:
     """Recent unadmitted tool observations (ctx evidence without an evidence id)."""
     lines: list[str] = []
     if not isinstance(evidence, list):
@@ -333,61 +333,106 @@ def _observation_lines(evidence: Sequence[JSONValue] | Mapping[str, JSONValue] |
     return lines
 
 
+# Compact JEV state: no LLM summarizes. Fields are projected and text clipped.
+_COMPACT_TEXT = 200
+_OBSERVATION_TAIL = 10  # mirrors scheduler _OBSERVATION_TAIL
+_PRIOR_CALLS_TAIL = 10
+
+
+def _clip(value: JSONValue | None) -> str | None:
+    return value[:_COMPACT_TEXT] if isinstance(value, str) else None
+
+
+def _records(items: Sequence[JSONValue] | None, label: str) -> Sequence[JSONValue]:
+    """None as empty. A mapping is a caller defect, never silently dropped."""
+    if isinstance(items, Mapping):
+        raise TypeError(f"jev {label} must be a sequence of records, not a mapping")
+    return items if isinstance(items, Sequence) and not isinstance(items, str) else ()
+
+
+def _compact_context(items: Sequence[JSONValue] | None) -> list[JSONValue]:
+    """Admitted records (4 fields), last observations, and repetition guidance without intake text."""
+    admitted: list[JSONValue] = []
+    observed: list[JSONValue] = []
+    guidance: list[JSONValue] = []
+    for item in _records(items, "evidence"):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "selection_guidance":
+            prior = item.get("prior_calls")
+            guidance.append(
+                {
+                    "type": "selection_guidance",
+                    "instruction": item.get("instruction"),
+                    "prior_calls": prior[-_PRIOR_CALLS_TAIL:] if isinstance(prior, list) else [],
+                }
+            )
+        elif eid := item.get("evidence_id") or item.get("id"):
+            admitted.append(
+                {
+                    "evidence_id": eid,
+                    "source_name": item.get("source_name"),
+                    "subject": item.get("subject"),
+                    "claim_text": _clip(item.get("claim_text")),
+                }
+            )
+        else:
+            observed.append(
+                {
+                    "tool": item.get("tool"),
+                    "job_id": item.get("job_id"),
+                    "tool_result_ref": item.get("tool_result_ref"),
+                    "outcome_summary": _clip(item.get("outcome_summary")),
+                    "error": _clip(item.get("error")),
+                    "error_type": item.get("error_type"),
+                }
+            )
+    return [*admitted, *observed[-_OBSERVATION_TAIL:], *guidance]
+
+
+def _compact_attempts(attempts: Sequence[JSONValue] | None) -> list[JSONValue]:
+    """Attempt history: tool, arguments, ids, clipped summary/error. No reasoning or metrics."""
+    return [
+        {
+            "tool": a.get("tool"),
+            "arguments": a.get("arguments"),
+            "job_id": a.get("job_id"),
+            "evidence_id": a.get("evidence_id"),
+            "tool_result_ref": a.get("tool_result_ref"),
+            "outcome_summary": _clip(a.get("outcome_summary")),
+            "error": _clip(a.get("error")),
+            "error_type": a.get("error_type"),
+        }
+        for a in _records(attempts, "attempts")
+        if isinstance(a, dict)
+    ]
+
+
+_MANIFEST_FIELDS = (
+    ("Purpose", "purpose"),
+    ("Use", "useWhen"),
+    ("Avoid", "avoidWhen"),
+    ("Needs", "prerequisites"),
+    ("PIT", "pitSupport"),
+)
+
+
 def _manifest_line(entry: Mapping[str, JSONValue]) -> str:
-    """One compact option line per registry entry (mirrors decision/jev.ts manifestLine)."""
-
-    def opt(value: object) -> str | None:
-        if not isinstance(value, str) or not value.strip():
-            return None
-        return " ".join(value.split())
-
-    desc = entry.get("description")
-    raw_name = entry.get("name", "")
-    line = " ".join(desc.split()) if isinstance(desc, str) and desc else (raw_name if isinstance(raw_name, str) else "")
-    purpose = opt(entry.get("purpose"))
-    if purpose and purpose != line:
-        line += f" Purpose: {purpose}."
-    intent = opt(entry.get("intent"))
-    if intent:
-        line += f" Intent: {intent}."
-    inputs = opt(entry.get("keyInputs"))
-    if inputs:
-        line += f" Inputs: {inputs}."
-    output = opt(entry.get("outputKind"))
-    if output:
-        line += f" Output: {output}."
-    evidence = opt(entry.get("evidence"))
-    if evidence:
-        line += f" Evidence: {evidence}."
-    prereq = opt(entry.get("prerequisites"))
-    if prereq:
-        line += f" Needs: {prereq}."
-    pit = opt(entry.get("pitSupport"))
-    if pit:
-        line += f" PIT: {pit}."
-    use = opt(entry.get("useWhen"))
-    if use:
-        line += f" Use: {use}."
-    avoid = opt(entry.get("avoidWhen"))
-    if avoid:
-        line += f" Avoid: {avoid}."
-    conflicts = opt(entry.get("conflicts"))
-    if conflicts:
-        line += f" Conflicts: {conflicts}."
-    nxt = opt(entry.get("nextTools"))
-    if nxt:
-        line += f" Next: {nxt}."
-    domain = opt(entry.get("domain"))
-    if domain:
-        line = f"[{domain}] {line}"
+    """Name plus Purpose/Use/Avoid/Needs/PIT (mirrors decision/jev.ts manifestLine). Needle keeps full descriptions."""
+    name = entry.get("name")
+    line = name if isinstance(name, str) else ""
+    for label, key in _MANIFEST_FIELDS:
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            line += f" {label}: {' '.join(value.split())}."
     return line
 
 
 def _tool_options_prompt(
     registry: Sequence[Mapping[str, JSONValue]],
     node: Mapping[str, JSONValue],
-    evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None,
-    attempts: Sequence[JSONValue] | Mapping[str, JSONValue] | None,
+    evidence: Sequence[JSONValue] | None,
+    attempts: Sequence[JSONValue] | None,
 ) -> tuple[dict[str, str], str]:
     if not registry:
         raise ValueError("tool_selection: empty registry")
@@ -927,8 +972,8 @@ class JevClient:
         objective: str,
         node: object,
         registry: Sequence[Mapping[str, JSONValue]] | None = None,
-        evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
-        attempts: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+        evidence: Sequence[JSONValue] | None = None,
+        attempts: Sequence[JSONValue] | None = None,
         *,
         session_id: str,
         job_id: str | None = None,
@@ -963,7 +1008,12 @@ class JevClient:
                 "criteria": validate_json_mapping(options, "<decision_client>: 'criteria'"),
             }
         }
-        state = {"objective": objective, "node": node_d, "evidence": evidence or [], "attempts": attempts or []}
+        state = {
+            "objective": objective,
+            "node": node_d,
+            "evidence": _compact_context(evidence),
+            "attempts": _compact_attempts(attempts),
+        }
         decisions = await self.decide(
             state,
             questions,
@@ -1197,7 +1247,7 @@ class JevClient:
         self,
         node: object,
         outcome: object,
-        evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+        evidence: Sequence[JSONValue] | None = None,
         *,
         session_id: str,
         job_id: str | None = None,
@@ -1219,7 +1269,7 @@ class JevClient:
                 "criteria": dict(CONTINUE_OPTIONS),
             },
         }
-        state = {"node": node_d, "outcome": _outcome_dict(outcome), "evidence": evidence or []}
+        state = {"node": node_d, "outcome": _outcome_dict(outcome), "evidence": _compact_context(evidence)}
         decisions = await self.decide(
             state,
             questions,

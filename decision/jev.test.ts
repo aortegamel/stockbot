@@ -346,7 +346,8 @@ test("scopeNodeState projects only allowed keys; evidence must be an array", () 
     scopeNodeState({ objective: "o", proposal: "p", evidence: "e1" as unknown as unknown[] }),
   ).toThrow("evidence must be an array");
 });
-test("tool selection covers the whole registry plus sentinels; enriched manifests render one line", () => {
+test("tool selection covers the whole registry plus sentinels; manifests render name plus six compact fields", () => {
+  // Entries arrive scheduler-shaped (description/domain/schema ride along for Needle); only six fields render.
   const registry = [
     { name: "search_sec_filings", description: "Full-text filing search." },
     {
@@ -358,9 +359,9 @@ test("tool selection covers the whole registry plus sentinels; enriched manifest
       keyInputs: "req(accession_no) opt(section, cursor, limit)",
       outputKind: "text window + source_refs",
       evidence: "filing text with accession citations",
-      prerequisites: "accession_no from a prior search",
-      pitSupport: "as_of",
-      useWhen: "reading a known section; following a search hit",
+      prerequisites: "needs accession_no",
+      pitSupport: "PIT-scoped",
+      useWhen: "reading a  known section;\nfollowing a search hit",
       avoidWhen: "do not use for discovery search",
       conflicts: "search_sec_filings",
       nextTools: "diff_sec_filings",
@@ -376,9 +377,29 @@ test("tool selection covers the whole registry plus sentinels; enriched manifest
   expect(Object.keys(q.options).sort()).toEqual(
     ["get_sec_document", "node_resolved", "reasoning_required", "search_sec_filings"].sort(),
   );
-  expect(q.options.search_sec_filings).toBe("Full-text filing search.");
+  // Description-only entries stay selectable by name; no description is ever rendered.
+  expect(q.options.search_sec_filings).toBe("search_sec_filings");
   const doc = q.options.get_sec_document;
-  for (const bit of ["[sec]", "Intent:", "Inputs:", "Output:", "Evidence:", "Needs:", "PIT:", "Use:", "Avoid:", "Conflicts:", "Next:"]) expect(doc).toContain(bit);
+  expect(doc.startsWith("get_sec_document")).toBe(true);
+  for (const kept of [
+    "Purpose: Read a known accession section",
+    "Use: reading a known section; following a search hit",
+    "Avoid: do not use for discovery search",
+    "Needs: needs accession_no",
+    "PIT: PIT-scoped",
+  ]) expect(doc).toContain(kept);
+  for (const dropped of [
+    "Bounded text window",
+    "[sec]",
+    "Intent:",
+    "read_filing_section",
+    "Inputs:",
+    "Output:",
+    "Evidence:",
+    "Conflicts:",
+    "Next:",
+    "diff_sec_filings",
+  ]) expect(doc).not.toContain(dropped);
   expect(q.prompt).toContain("n1");
   expect(q.prompt).toContain("search_sec_filings");
   expect(q.prompt).toContain("[Today UTC ");
@@ -406,7 +427,32 @@ test("tool selection covers the whole registry plus sentinels; enriched manifest
   expect(once.slice(once.indexOf("[Today UTC "), once.indexOf("]") + 1)).toContain(new Date().toISOString().slice(0, 10));
   expect(() => buildToolSelectionQuestion([], { nodeId: "n", question: "q" })).toThrow("empty registry");
   expect(() => buildToolSelectionQuestion(
-    [{ name: "reasoning_required", description: "collision" }],
+    [{ name: "reasoning_required" }],
     { nodeId: "n", question: "q" },
   )).toThrow("sentinel");
+  expect(() => buildToolSelectionQuestion(
+    [{ name: "a" }, { name: "a" }],
+    { nodeId: "n", question: "q" },
+  )).toThrow("duplicate tool a");
+});
+
+test("tool option line keeps every compact selection field and drops the description", () => {
+  const word = fc.stringMatching(/^[a-z][a-z ;,()]{0,40}[a-z)]$/);
+  const labels = [["Purpose", "purpose"], ["Use", "useWhen"], ["Avoid", "avoidWhen"], ["Needs", "prerequisites"], ["PIT", "pitSupport"]] as const;
+  fc.assert(fc.property(
+    fc.record({ purpose: word, useWhen: word, avoidWhen: word, prerequisites: word, pitSupport: word }),
+    (fields) => {
+      const entry = { name: "tool_x", description: "DESCRIPTION-ONLY TEXT", parameters: { type: "object" }, ...fields };
+      const line = buildToolSelectionQuestion([entry], { nodeId: "n", question: "q" }).options.tool_x;
+      expect(line.startsWith("tool_x")).toBe(true);
+      for (const [label, key] of labels) expect(line).toContain(`${label}: ${fields[key].replace(/\s+/g, " ").trim()}`);
+      expect(line).not.toContain("DESCRIPTION-ONLY");
+    },
+  ), { seed: 20261010, numRuns: 100 });
+  const blank = buildToolSelectionQuestion(
+    [{ name: "tool_y", purpose: "  ", useWhen: "", avoidWhen: "\n", prerequisites: "needs accession_no" }],
+    { nodeId: "n", question: "q" },
+  ).options.tool_y;
+  expect(blank).toContain("Needs: needs accession_no");
+  for (const absent of ["Purpose:", "Use:", "Avoid:", "PIT:"]) expect(blank).not.toContain(absent);
 });
