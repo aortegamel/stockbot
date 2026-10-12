@@ -511,7 +511,7 @@ def test_sec_section_capture_stores_full_document_coordinates(
     monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
     body = (
         "<html><head><script>hidden script</script><style>hidden style</style></head><body>"
-        "<!--hidden comment--><x:context>hidden context</x:context>"
+        "<!--hidden comment--><ix:hidden><x:context>hidden context</x:context></ix:hidden>"
         "<p>Cover page</p><p>Item 1. Business</p><p>We sell widgets.</p><p>Item 2. Properties</p><p>"
         + "intro " * 450
         + "</p><table><tr><td>Revenue</td><td>5</td></tr></table><p>We lease offices.</p></body></html>"
