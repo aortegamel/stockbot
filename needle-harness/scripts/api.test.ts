@@ -31,6 +31,11 @@ describe("bun api host", () => {
     }
   });
 
+  test("research rejects a wrong method without reading state", async () => {
+    const res = await dispatch(new Request("http://localhost/api/research/sessions", { method: "POST" }));
+    expect(res.status).toBe(405);
+  });
+
   test("startup prewarm sets KERNEL_PREWARMED without throwing", async () => {
     const prev = process.env.KERNEL_PREWARMED;
     delete process.env.KERNEL_PREWARMED;
