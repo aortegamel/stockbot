@@ -27,7 +27,8 @@ _MAX_CHARS = 32_000
 _VIEW_MAX_SECTIONS = 50
 
 _IXBLR_NOISE_RE = re.compile(
-    r"<[A-Za-z][\w.-]*:[^>]*>.*?</[A-Za-z][\w.-]*:[^>]*>|<[A-Za-z][\w.-]*:[^>]*/>", re.IGNORECASE | re.DOTALL
+    r"<(ix:(?:header|hidden|resources|references)|xbrli:(?:context|unit))\b[^>]*(?:/>|>.*?</\1\s*>)",
+    re.IGNORECASE | re.DOTALL,
 )
 _STYLE_SCRIPT_RE = re.compile(r"<(style|script)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -97,7 +98,7 @@ class _ViewTextParser(HTMLParser):
 
 
 def _strip_noise(source: str) -> str:
-    """Drop CSS/layout/XBRL noise before parsing; keep textual markup."""
+    """Remove CSS, scripts, comments, and hidden XBRL resources. Keep visible inline facts."""
     text = _STYLE_SCRIPT_RE.sub("\n", source)
     text = _COMMENT_RE.sub("", text)
     return _IXBLR_NOISE_RE.sub("", text)

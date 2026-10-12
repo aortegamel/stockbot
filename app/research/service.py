@@ -581,13 +581,16 @@ def _evidence_identity(
     subject: str,
     provenance: Mapping[str, object],
 ) -> str:
-    """Identity key for dedupe: the source-backed identity of one observed fact."""
+    """Identify one observed fact for dedupe.
+
+    SEC and FINRA record refs use the replayed tool name and record values.
+    """
     tail: object = data.get("observation_type", claim[:80] if isinstance(claim, str) else "")
     kind = str(provenance.get("kind") or "")
     if kind == "finra_record":
         return "|".join(
             (
-                "finra",
+                kind.removesuffix("_record"),
                 "record",
                 _norm_lower(provenance.get("tool_name")),
                 _norm_lower(provenance.get("record_identity")),

@@ -19,6 +19,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -26,6 +27,7 @@ import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from itertools import combinations
 from pathlib import Path
 from typing import Protocol, TypeGuard, runtime_checkable
 
@@ -69,6 +71,19 @@ _ENTRY_OPTIONS = {
     REASON_SENTINEL: "Answerable by reasoning/explanation from user-supplied context without new external evidence.",
     "research_required": "Needs current/external facts, evidence retrieval, source verification, or tool execution.",
 }
+# Persona choice labels mirror needle-harness FINAL_PERSONAS order.
+# JEV picks no_explicit_selection, no_personas_remaining, or one nonempty canonical subset, such as "stockbot_bearbot".
+_FINAL_PERSONAS = ("stockbot", "bearbot", "bullbot")
+_NO_PERSONA_SELECTION = "no_explicit_selection"
+_NO_PERSONAS_REMAINING = "no_personas_remaining"
+_PERSONA_OPTIONS = {
+    _NO_PERSONA_SELECTION: "The user neither requests nor excludes any persona.",
+    _NO_PERSONAS_REMAINING: "The user excludes every persona.",
+} | {
+    "_".join(subset): f"The user's request leaves exactly {' and '.join(p.title() for p in subset)} to answer."
+    for size in (1, 2, 3)
+    for subset in combinations(_FINAL_PERSONAS, size)
+}
 # Opt-in parallel fan-out: runner-up joins only when close to the winner and above floor (cap keeps blast radius small).
 _PARALLEL_MIN_PROB = 0.35
 _PARALLEL_WINDOW = 0.15
@@ -99,6 +114,20 @@ def _now() -> str:
 
 def _is_prob(v: object) -> TypeGuard[int | float]:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0
+
+
+def _classify_probability(value: object) -> str | None:
+    """Approved noul policy: yes >=.70, unsure >=.50, no below .50; None fail-closed."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    prob = float(value)
+    if not 0.0 <= prob <= 1.0:
+        return None
+    if prob >= 0.70:
+        return "yes"
+    if prob >= 0.50:
+        return "unsure"
+    return "no"
 
 
 def _parse_noul(name: str, qid: str, ans: object) -> dict[str, JSONValue]:
@@ -290,7 +319,9 @@ def _outcome_dict(outcome: object) -> dict[str, JSONValue]:
     }
 
 
-def _evidence_ids(evidence: Sequence[JSONValue] | None) -> list[str]:
+def _evidence_ids(
+    evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None,
+) -> list[str]:
     ids: list[str] = []
     if not isinstance(evidence, list):
         return ids
@@ -476,7 +507,10 @@ def _tool_options_prompt(
     prompt += f" Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values."
     prompt += " Search packets list candidates only — page with research_read_search beyond display_limit and open each accession via get_sec_filing/get_sec_document until answered or guard trips."
     _qtext = stamped if isinstance(stamped, str) else (question if isinstance(question, str) else "")
-    if "revenue" in _qtext.lower() and "quarter" in _qtext.lower():
+    _qlow = _qtext.lower()
+    if "revenue" in _qlow and re.search(r"\b10-?\s?q\b", _qlow) and re.search(r"\b(?:latest|most recent)\b", _qlow):
+        prompt += " Latest-10-Q revenue answers come from the 10-Q, not the 8-K: after the filing list, open the 10-Q accession via get_sec_document section reads (Item 1, Item 2, Item 1A) before re-reading any 8-K."
+    elif "revenue" in _qlow and "quarter" in _qlow:
         prompt += " Revenue-quarter answers come from the 10-Q (MD&A/segment revenue), not the 8-K: after the filing list, open the 10-Q accession via get_sec_document with a revenue query before re-reading any 8-K."
     return options, prompt
 
@@ -538,6 +572,31 @@ def _auto_registry() -> list[dict[str, JSONValue]]:
             }
         )
     return out
+
+
+def _entry_route_options(registry: Sequence[Mapping[str, JSONValue]] | None) -> dict[str, str]:
+    """Entry choice options: reasoning/research sentinels + whole canonical registry; raises on a defective registry."""
+    reg = list(registry) if registry else _auto_registry()
+    try:
+        if not reg:
+            raise ValueError("route_entry: empty registry")
+        options: dict[str, str] = dict(_ENTRY_OPTIONS)
+        for entry in reg:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if not isinstance(name, str) or not name:
+                raise ValueError("route_entry: registry entry needs a name")
+            if name in options:
+                raise ValueError(f"route_entry: duplicate tool {name}")
+            options[name] = _manifest_line(entry)
+    except Exception as exc:
+        logger.warning(
+            "toolflow route_defect sid=- nid=- registry=%d err=%s: %s",
+            len(reg),
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        raise
+    return options
 
 
 _LIVE_PROCS: set[subprocess.Popen[str]] = set()
@@ -1036,58 +1095,92 @@ class JevClient:
         self,
         prompt: str,
         registry: Sequence[Mapping[str, JSONValue]] | None = None,
-    ) -> str:
-        """JEV-first entry route: one choice over reasoning_required + whole canonical registry + research_required. Uses _invoke directly so nothing persists (never decide); raises on blank prompt, empty registry, or any JEV outage — the caller fail-opens to research_required."""
+        route_hint: str | None = None,
+    ) -> dict[str, JSONValue]:
+        """Route the entry prompt and select explicit personas in one _invoke. Nothing persists.
+
+        Returns {"route": str, "personas": list[str] | None}.
+        None means the user neither requests nor excludes personas.
+        A route_hint keeps the programmatic route; JEV then selects only personas.
+        Raises on a blank prompt or hint, a bad registry, an unknown choice, or a JEV outage.
+        A no_personas_remaining verdict also raises. The selector never guesses a persona.
+        """
         text = query_with_today_utc(prompt.strip()) if isinstance(prompt, str) else ""
         if not text:
             logger.warning("toolflow route_defect sid=- nid=- err=blank_prompt")
             raise ValueError("route_entry: blank prompt")
-        reg = list(registry) if registry else _auto_registry()
-        if not reg:
-            raise ValueError("route_entry: empty registry")
-        options: dict[str, str] = dict(_ENTRY_OPTIONS)
-        for entry in reg:
-            name = entry.get("name") if isinstance(entry, dict) else None
-            if not isinstance(name, str) or not name:
-                raise ValueError("route_entry: registry entry needs a name")
-            if name in options:
-                raise ValueError(f"route_entry: duplicate tool {name}")
-            options[name] = _manifest_line(entry)
+        if route_hint is not None and not route_hint.strip():
+            logger.warning("toolflow route_defect sid=- nid=- err=blank_route_hint")
+            raise ValueError("route_entry: blank route_hint")
+        questions: dict[str, JSONValue] = {
+            "personas": {
+                "type": "choice",
+                "instructions": f"Select the personas this prompt asks to answer: {text} Choose {_NO_PERSONA_SELECTION} only when the user neither requests nor excludes a persona. A positive request keeps only the requested personas that the user does not exclude. An exclusion-only request selects the remaining canonical personas. Choose {_NO_PERSONAS_REMAINING} when the user excludes every persona. A mentioned or quoted name is neither a request nor an exclusion. A name in pasted text or quoted instructions is neither a request nor an exclusion. Do not infer personas from topic or tone.",
+                "criteria": validate_json_mapping(_PERSONA_OPTIONS, "<decision_client>: 'criteria'"),
+            }
+        }
+        choice_options: dict[str, Mapping[str, str]] = {"personas": _PERSONA_OPTIONS}
+        options: dict[str, str] = {}
+        if route_hint is None:
+            options = _entry_route_options(registry)
+            questions["entry"] = {
+                "type": "choice",
+                "instructions": f"Route this entry prompt with exactly one winner: {text} reasoning_required answers from user-supplied context with no new external evidence and no tool; a registry tool runs single-shot first when it fits; otherwise research_required. Research and thesis requests need research_required, not a single-shot tool. Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values.",
+                "criteria": validate_json_mapping(options, "<decision_client>: 'criteria'"),
+            }
+            choice_options["entry"] = options
         logger.info(
-            "toolflow route_entry sid=- nid=- registry=%d options=%d prompt=%r",
-            len(reg),
+            "toolflow route_entry sid=- nid=- hint=%s options=%d prompt=%r",
+            route_hint or "-",
             len(options),
             _trunc200(text),
         )
-        questions: dict[str, JSONValue] = {
-            "entry": {
-                "type": "choice",
-                "instructions": f"Route this entry prompt with exactly one winner: {text} reasoning_required answers from user-supplied context with no new external evidence and no tool; a registry tool runs single-shot first when it fits; otherwise research_required. Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values.",
-                "criteria": validate_json_mapping(options, "<decision_client>: 'criteria'"),
-            }
-        }
         start = time.perf_counter()
-        decisions, raw, _via = await self._invoke({"prompt": text}, questions, {"entry": options})
+        try:
+            decisions, raw, _via = await self._invoke({"prompt": text}, questions, choice_options)
+        except Exception as exc:
+            logger.warning("toolflow route_defect sid=- nid=- err=%s: %s", type(exc).__name__, str(exc)[:200])
+            raise
         latency_ms = (time.perf_counter() - start) * 1000.0
         d = decisions.get("entry")
-        winner = d.get("choice") if isinstance(d, dict) else None
-        if not isinstance(winner, str) or winner not in options:
+        winner: JSONValue = route_hint
+        if route_hint is None:
+            winner = d.get("choice") if isinstance(d, dict) else None
+            if not isinstance(winner, str) or winner not in options:
+                logger.warning(
+                    "toolflow route_defect sid=- nid=- winner=%r err=winner_not_in_options %s",
+                    winner,
+                    _choice_summary(d),
+                )
+                raise ValueError(f"route_entry: winner {winner!r} not in options")
+        p = decisions.get("personas")
+        pick = p.get("choice") if isinstance(p, dict) else None
+        if not isinstance(pick, str) or pick not in _PERSONA_OPTIONS:
             logger.warning(
-                "toolflow route_defect sid=- nid=- winner=%r err=winner_not_in_options %s",
-                winner,
-                _choice_summary(d),
+                "toolflow route_defect sid=- nid=- personas=%r err=personas_not_in_options %s",
+                pick,
+                _choice_summary(p),
             )
-            raise ValueError(f"route_entry: winner {winner!r} not in options")
+            raise ValueError(f"route_entry: persona choice {pick!r} not in options")
+        if pick == _NO_PERSONAS_REMAINING:
+            logger.warning(
+                "toolflow route_defect sid=- nid=- err=no_personas_remaining %s",
+                _choice_summary(p),
+            )
+            raise ValueError("route_entry: no personas remain")
         jev_in, jev_out, _ = _jev_usage(raw)
         logger.info(
-            "toolflow route_exit sid=- nid=- %s via=%s latency_ms=%.1f in=%s out=%s",
+            "toolflow route_exit sid=- nid=- route=%s entry=[%s] personas=[%s] via=%s latency_ms=%.1f in=%s out=%s",
+            winner,
             _choice_summary(d),
+            _choice_summary(p),
             _via,
             latency_ms,
             jev_in,
             jev_out,
         )
-        return winner
+        personas: JSONValue = None if pick == _NO_PERSONA_SELECTION else [name for name in pick.split("_")]
+        return {"route": winner, "personas": personas}
 
     async def assess_entry_tool(
         self,
@@ -1252,12 +1345,26 @@ class JevClient:
         session_id: str,
         job_id: str | None = None,
     ) -> dict[str, JSONValue]:
-        """Post-tool assessment: relevance noul + evidence-state choice + continue choice."""
+        """Post-tool assessment: topical relevance + resolution support + state + continue."""
         node_d = _node_dict(node)
         nid = node_d.get("node_id") or node_d.get("id")
         question = node_d.get("question") or ""
         questions: dict[str, JSONValue] = {
-            "relevance": {"type": "noul", "instructions": f"Do the available facts support resolving: {question}"},
+            "topical_relevance": {
+                "type": "noul",
+                "instructions": (
+                    f"Is this outcome topically about the node question, even when it cannot prove or resolve it: {question} "
+                    + "A risk disclosure is relevant to that risk. An attributed report is relevant without proving the event. "
+                    + "Contradictory material stays relevant."
+                ),
+            },
+            "resolution_support": {
+                "type": "noul",
+                "instructions": (
+                    f"Does the combined evidence resolve the node question, not merely mention it: {question} "
+                    + "Tentative reports and contradictions do not resolve. Conflicted or insufficient evidence never resolves."
+                ),
+            },
             "evidence_state": {
                 "type": "choice",
                 "instructions": "What best characterizes the evidence state for this node?",
@@ -1279,12 +1386,15 @@ class JevClient:
             job_id=job_id,
             choice_options={"evidence_state": dict(EVIDENCE_STATE_OPTIONS), "continue": dict(CONTINUE_OPTIONS)},
         )
-        relevance = decisions.get("relevance") or {}
+        topical = decisions.get("topical_relevance") or {}
+        support = decisions.get("resolution_support") or {}
         ev_state = decisions.get("evidence_state") or {}
         cont = decisions.get("continue") or {}
         probs: dict[str, JSONValue] = {}
-        if isinstance(relevance.get("probability"), (int, float)):
-            probs["relevance"] = relevance["probability"]
+        if isinstance(topical.get("probability"), (int, float)):
+            probs["topical_relevance"] = topical["probability"]
+        if isinstance(support.get("probability"), (int, float)):
+            probs["resolution_support"] = support["probability"]
         if isinstance(ev_state.get("probabilities"), dict):
             probs.update(ev_state["probabilities"])
         if isinstance(cont.get("probabilities"), dict):
@@ -1302,7 +1412,159 @@ class JevClient:
             "admit": None,
             "evidence_state": ev_choice,
             "decision": ev_choice,
-            "relevance": relevance.get("probability"),
+            "topical_relevance": topical.get("probability"),
+            "resolution_support": support.get("probability"),
+            "topical_relevance_answer": _classify_probability(topical.get("probability")),
+            "resolution_support_answer": _classify_probability(support.get("probability")),
+        }
+
+    async def assess_final_response(
+        self,
+        text: str,
+        evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+        *,
+        session_id: str,
+        job_id: str | None = None,
+        confidence: float | None = None,
+        claims: Sequence[JSONValue] | None = None,
+    ) -> dict[str, JSONValue]:
+        """Whole-response gate: does cited evidence support the qualified wording as written."""
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("assess_final_response: text required")
+        excerpt = " ".join(text.split())[:2000]
+        count = len(evidence) if isinstance(evidence, list) else 0
+        ids = _evidence_ids(evidence)
+        suffix = f" [{','.join(ids)}]" if ids else ""
+        declared: list[JSONValue] = list(claims) if isinstance(claims, list) else []
+        types = sorted(
+            {
+                str(c.get("claim_type"))
+                for c in declared
+                if isinstance(c, dict) and isinstance(c.get("claim_type"), str) and c.get("claim_type")
+            }
+        )
+        scope = f" Declared claims: {len(declared)}" + (f" (types: {','.join(types)})" if types else "") + "."
+        carried = (
+            float(confidence)
+            if isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and 0.0 <= float(confidence) <= 1.0
+            else None
+        )
+        questions: dict[str, JSONValue] = {
+            "support": {
+                "type": "noul",
+                "instructions": (
+                    f"Does the cited evidence support the qualified wording as written, including any attribution or qualification, not the underlying event itself: {excerpt} "
+                    + f"Cited evidence: {count} item(s){suffix}.{scope} "
+                    + "The whole response rejects when any prose claim lacks inventory or cited support. "
+                    + "An attributed report is supported when the evidence shows the report was made as attributed, even when the event is unproven. "
+                    + "A conditional risk is supported when the evidence shows the condition and consequence as qualified, not that the consequence will occur. "
+                    + "Contradicted or missing evidence never supports."
+                ),
+            },
+            "evidence_state": {
+                "type": "choice",
+                "instructions": "What best characterizes the evidence state for this qualified wording as written?",
+                "criteria": dict(EVIDENCE_STATE_OPTIONS),
+            },
+        }
+        state = {"text": text.strip(), "claims": declared, "evidence": evidence or [], "confidence": carried}
+        decisions = await self.decide(
+            state,
+            questions,
+            decision_type="final_response_assessment",
+            session_id=session_id,
+            job_id=job_id,
+            choice_options={"evidence_state": dict(EVIDENCE_STATE_OPTIONS)},
+        )
+        support_d = decisions.get("support") or {}
+        ev_state = decisions.get("evidence_state") or {}
+        prob = support_d.get("probability")
+        probs: dict[str, JSONValue] = {}
+        if isinstance(prob, (int, float)):
+            probs["support"] = prob
+        if isinstance(ev_state.get("probabilities"), dict):
+            probs.update(ev_state["probabilities"])
+        ev_choice = ev_state.get("choice") if isinstance(ev_state.get("choice"), str) else None
+        return {
+            "probabilities": probs,
+            "confidence": carried,
+            "support": prob,
+            "support_answer": _classify_probability(prob),
+            "evidence_state": ev_choice,
+            "decision": ev_choice,
+        }
+
+    async def assess_final_claim(
+        self,
+        text: str,
+        claim_type: str,
+        evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+        *,
+        session_id: str,
+        job_id: str | None = None,
+        confidence: float | None = None,
+    ) -> dict[str, JSONValue]:
+        """Per-claim gate: does cited evidence support one qualified claim as written."""
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("assess_final_claim: text required")
+        if not isinstance(claim_type, str) or not claim_type.strip():
+            raise ValueError("assess_final_claim: claim_type required")
+        ctype = claim_type.strip()
+        excerpt = " ".join(text.split())[:2000]
+        count = len(evidence) if isinstance(evidence, list) else 0
+        ids = _evidence_ids(evidence)
+        suffix = f" [{','.join(ids)}]" if ids else ""
+        carried = (
+            float(confidence)
+            if isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and 0.0 <= float(confidence) <= 1.0
+            else None
+        )
+        questions: dict[str, JSONValue] = {
+            "support": {
+                "type": "noul",
+                "instructions": (
+                    f"Claim type {ctype}: does the cited evidence support the qualified wording as written, including any attribution or qualification, not the underlying event itself: {excerpt} "
+                    + f"Cited evidence: {count} item(s){suffix}. "
+                    + "An attributed report is supported when the evidence shows the report was made as attributed, even when the event is unproven. "
+                    + "A conditional risk is supported when the evidence shows the condition and consequence as qualified, not that the consequence will occur. "
+                    + "Contradicted or missing evidence never supports."
+                ),
+            },
+            "evidence_state": {
+                "type": "choice",
+                "instructions": "What best characterizes the evidence state for this qualified wording as written?",
+                "criteria": dict(EVIDENCE_STATE_OPTIONS),
+            },
+        }
+        state = {"text": text.strip(), "claim_type": ctype, "evidence": evidence or [], "confidence": carried}
+        decisions = await self.decide(
+            state,
+            questions,
+            decision_type="final_claim_assessment",
+            session_id=session_id,
+            job_id=job_id,
+            choice_options={"evidence_state": dict(EVIDENCE_STATE_OPTIONS)},
+        )
+        support_d = decisions.get("support") or {}
+        ev_state = decisions.get("evidence_state") or {}
+        prob = support_d.get("probability")
+        probs: dict[str, JSONValue] = {}
+        if isinstance(prob, (int, float)):
+            probs["support"] = prob
+        if isinstance(ev_state.get("probabilities"), dict):
+            probs.update(ev_state["probabilities"])
+        ev_choice = ev_state.get("choice") if isinstance(ev_state.get("choice"), str) else None
+        return {
+            "probabilities": probs,
+            "confidence": carried,
+            "support": prob,
+            "support_answer": _classify_probability(prob),
+            "evidence_state": ev_choice,
+            "decision": ev_choice,
         }
 
     @staticmethod

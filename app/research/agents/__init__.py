@@ -15,11 +15,22 @@ from dataclasses import dataclass, field
 
 from app.research.models import FailureCategory
 
-CLAIM_TYPES = ("observed_fact", "inference", "unknown", "contradicted")
+CLAIM_TYPES = (
+    "observed_fact",
+    "inference",
+    "unknown",
+    "contradicted",
+    "conditional_risk",
+    "attributed_report",
+)
 """Claim vocabulary: declared by the authoring model, never inferred from wording.
 
-``observed_fact``/``contradicted``/``inference`` need at least one freeze id;
-``unknown`` (nothing located within the searched scope) may cite none.
+``observed_fact``/``contradicted``/``inference``/``conditional_risk``/``attributed_report``
+need at least one freeze id; ``unknown`` (nothing located within the searched
+scope) may cite none. ``conditional_risk`` is a risk disclosure: the cited
+passage supports the risk as stated, not that the risk materialized.
+``attributed_report`` is a reporting claim: the cited passage supports that the
+report was made, not the underlying reported event.
 """
 
 MATERIALITY_LEVELS = ("critical", "high", "medium", "low")
@@ -259,7 +270,14 @@ def claims_refs(claims: Sequence[GroundedClaim]) -> list[str]:
     return refs
 
 
-_CONSERVATIVE_ORDER = ("contradicted", "unknown", "inference", "observed_fact")
+_CONSERVATIVE_ORDER = (
+    "contradicted",
+    "unknown",
+    "conditional_risk",
+    "attributed_report",
+    "inference",
+    "observed_fact",
+)
 
 
 def conservative_claim_type(claim_types: Sequence[str]) -> str:

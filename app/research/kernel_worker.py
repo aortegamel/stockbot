@@ -181,10 +181,14 @@ def _terminal(rid: str, category: str, message: str) -> dict[str, JSONValue]:
 
 
 def _evidence_text(rec: Mapping[str, JSONValue]) -> str:
+    # Stored SEC document observations go out whole (revenue tables sit past 2000 chars).
+    # Every other row, and any row without stored text, keeps the 2000-char wire cap.
+    prov = rec.get("provenance")
+    cap = None if isinstance(prov, Mapping) and prov.get("kind") == "sec_source" else 2000
     for key in ("content", "text", "fact", "passage"):
         val = rec.get(key)
         if isinstance(val, str) and val.strip():
-            return val[:2000]
+            return val[:cap]
     return json.dumps(rec, default=str)[:2000]
 
 
@@ -1247,25 +1251,37 @@ def _toolflow() -> str:
 
 
 def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
-    """Programmatic-fast entry route: code signals -> research_required, else JEV decides. Zero session/DB."""
+    """Entry route + JEV persona selection; zero session/DB.
+
+    Programmatic fast routes ride as route_hint (JEV still selects personas). Returns
+    {"id", "route", "personas"}; any selector/JEV failure returns {"id", "error"}, never an assumed persona set.
+    """
     raw_id = req.get("id")
     rid = raw_id if isinstance(raw_id, str) else "?"
     prompt = req.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         logger.info("toolflow route rid=%s route=research_required reason=blank-prompt", rid)
-        return {"id": rid, "route": "research_required"}
+        return {"id": rid, "route": "research_required", "personas": None}
+    hint: str | None = None
     if _toolflow() not in ("catalog", "full", "whole", "direct"):
         from app.research.programmatic_router import programmatic_route
 
-        fast = programmatic_route(prompt.strip())
-        if fast is not None:
-            logger.info("toolflow route rid=%s route=%s via=programmatic", rid, fast)
-            return {"id": rid, "route": fast}
-    logger.debug("toolflow route_entry rid=%s prompt=%.200s", rid, prompt.strip())
-    client = jev if jev is not None else _shared_jev()
-    winner = asyncio.run(client.route_entry(query_with_today_utc(prompt.strip())))
-    logger.info("toolflow route rid=%s route=%s", rid, winner)
-    return {"id": rid, "route": winner}
+        hint = programmatic_route(prompt.strip())
+    logger.debug("toolflow route_entry rid=%s hint=%s prompt=%.200s", rid, hint or "-", prompt.strip())
+    try:
+        client = jev if jev is not None else _shared_jev()
+        routed = asyncio.run(client.route_entry(query_with_today_utc(prompt.strip()), route_hint=hint))
+    except Exception as exc:
+        logger.warning("toolflow route_fail rid=%s err_type=%s", rid, type(exc).__name__)
+        return {"id": rid, "error": str(exc)[:500] or "route selection failed"}
+    logger.info(
+        "toolflow route rid=%s route=%s personas=%s via=%s",
+        rid,
+        routed.get("route"),
+        routed.get("personas"),
+        "programmatic" if hint is not None else "jev",
+    )
+    return {"id": rid, "route": routed.get("route"), "personas": routed.get("personas")}
 
 
 def _arguments(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
@@ -1445,6 +1461,150 @@ def _assess_entry(req: Mapping[str, JSONValue], jev: JevClient | None = None) ->
     return {"id": rid, "verdict": verdict}
 
 
+def _final_ids(item: object, key: str) -> list[str]:
+    """Non-empty string id list under key; [] when absent or malformed."""
+    if not isinstance(item, Mapping):
+        return []
+    raw = item.get(key)
+    if not isinstance(raw, list):
+        return []
+    return [eid for eid in raw if isinstance(eid, str) and eid.strip()]
+
+
+def _final_sid(req: Mapping[str, JSONValue], rid: str) -> str:
+    """Session id: sessionId (camelCase, matches run op) with session_id alias."""
+    for key in ("sessionId", "session_id"):
+        raw = req.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return rid
+
+
+def _final_evidence(req: Mapping[str, JSONValue]) -> list[JSONValue]:
+    """Evidence rows narrowed to {id, content}; other keys never cross."""
+    raw = req.get("evidence")
+    if not isinstance(raw, list):
+        return []
+    rows: list[JSONValue] = []
+    for rec in raw:
+        if not isinstance(rec, Mapping):
+            continue
+        eid = rec.get("id")
+        if not isinstance(eid, str) or not eid.strip():
+            continue
+        content = rec.get("content")
+        rows.append({"id": eid.strip(), "content": content if isinstance(content, str) else ""})
+    return rows
+
+
+def _final_fail(rid: str, message: str) -> dict[str, JSONValue]:
+    """Fail-closed verdict: never raises, never passes."""
+    return {
+        "id": rid,
+        "error": message[:500] or "final assessment failed",
+        "support": None,
+        "support_answer": None,
+        "evidence_state": "insufficient",
+    }
+
+
+def _assess_final_response(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
+    """Whole-response gate (runs even with empty claims): JEV judges the qualified wording as written."""
+    raw_id = req.get("id")
+    rid = raw_id if isinstance(raw_id, str) else "?"
+    text = req.get("text")
+    if not isinstance(text, str) or not text.strip():
+        logger.info("toolflow assess_final_response rid=%s reason=blank-text", rid)
+        return _final_fail(rid, "text required")
+    raw_conf = req.get("confidence")
+    confidence = float(raw_conf) if isinstance(raw_conf, (int, float)) and not isinstance(raw_conf, bool) else None
+    raw_claims = req.get("claims")
+    claims: list[JSONValue] = []
+    if isinstance(raw_claims, list):
+        for item in raw_claims:
+            if not isinstance(item, Mapping):
+                continue
+            ctext = item.get("text")
+            ctype = item.get("claim_type")
+            if not isinstance(ctext, str) or not ctext.strip() or not isinstance(ctype, str) or not ctype.strip():
+                continue
+            cconf = item.get("confidence")
+            cconf_f: float | None = (
+                float(cconf) if isinstance(cconf, (int, float)) and not isinstance(cconf, bool) else None
+            )
+            row: dict[str, JSONValue] = {
+                "text": ctext.strip()[:2000],
+                "claim_type": ctype.strip(),
+                "evidence_ids": [e for e in _final_ids(item, "evidence_ids")],
+                "confidence": cconf_f,
+            }
+            claims.append(row)
+    try:
+        client = jev if jev is not None else _shared_jev()
+        out = asyncio.run(
+            client.assess_final_response(
+                text.strip(),
+                _final_evidence(req),
+                session_id=_final_sid(req, rid),
+                confidence=confidence,
+                claims=claims,
+            )
+        )
+        if not isinstance(out, dict):
+            raise ValueError("assess_final_response: malformed result")
+        logger.info(
+            "toolflow assess_final_response rid=%s answer=%s state=%s",
+            rid,
+            out.get("support_answer"),
+            out.get("evidence_state"),
+        )
+        return {"id": rid, **out}
+    except Exception as exc:
+        logger.warning("toolflow assess_final_response_fail_closed rid=%s err_type=%s", rid, type(exc).__name__)
+        return _final_fail(rid, str(exc))
+
+
+def _assess_final_claim(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
+    """Per-claim gate (only after whole-response reject): JEV judges one qualified claim as written."""
+    raw_id = req.get("id")
+    rid = raw_id if isinstance(raw_id, str) else "?"
+    raw_claim = req.get("claim")
+    text = raw_claim.get("text") if isinstance(raw_claim, Mapping) else req.get("text")
+    ctype = raw_claim.get("claim_type") if isinstance(raw_claim, Mapping) else req.get("claim_type")
+    if not isinstance(text, str) or not text.strip():
+        logger.info("toolflow assess_final_claim rid=%s reason=blank-text", rid)
+        return _final_fail(rid, "text required")
+    if not isinstance(ctype, str) or not ctype.strip():
+        return _final_fail(rid, "claim_type required")
+    holder: Mapping[str, JSONValue] = raw_claim if isinstance(raw_claim, Mapping) else req
+    raw_conf = holder.get("confidence", req.get("confidence"))
+    confidence = float(raw_conf) if isinstance(raw_conf, (int, float)) and not isinstance(raw_conf, bool) else None
+    evidence: list[JSONValue] = _final_evidence(req)
+    if not evidence:
+        raw_ids = _final_ids(holder, "evidence_ids")
+        id_rows: list[JSONValue] = [{"id": eid, "content": ""} for eid in raw_ids]
+        evidence = id_rows
+    try:
+        client = jev if jev is not None else _shared_jev()
+        out = asyncio.run(
+            client.assess_final_claim(
+                text.strip(), ctype.strip(), evidence, session_id=_final_sid(req, rid), confidence=confidence
+            )
+        )
+        if not isinstance(out, dict):
+            raise ValueError("assess_final_claim: malformed result")
+        logger.info(
+            "toolflow assess_final_claim rid=%s answer=%s state=%s",
+            rid,
+            out.get("support_answer"),
+            out.get("evidence_state"),
+        )
+        return {"id": rid, **out}
+    except Exception as exc:
+        logger.warning("toolflow assess_final_claim_fail_closed rid=%s err_type=%s", rid, type(exc).__name__)
+        return _final_fail(rid, str(exc))
+
+
 def _run(
     req: Mapping[str, JSONValue],
     jev: JevClient | None = None,
@@ -1593,7 +1753,8 @@ def _run(
             category = str(raw_category) if isinstance(raw_category, str) and raw_category else "tool_error"
             call["error"] = str(error)[:500] if isinstance(error, str) else "tool failed"
             call["category"] = category
-            failures[category] = failures.get(category, 0) + 1
+            if category != "reselect":
+                failures[category] = failures.get(category, 0) + 1
         tool_calls.append(call)
     nodes_payload: list[JSONValue] = []
     for n in node_rows:
@@ -1716,18 +1877,36 @@ def main() -> None:
                     "route",
                     "arguments",
                     "assess_entry",
+                    "assess_final_response",
+                    "assess_final_claim",
                 ):
                     rid = parsed.get("id") if isinstance(parsed, dict) and isinstance(parsed.get("id"), str) else "?"
-                    _emit(_terminal(rid, "invalid_params", "op must be 'run', 'route', 'arguments', or 'assess_entry'"))
+                    _emit(
+                        _terminal(
+                            rid,
+                            "invalid_params",
+                            "op must be 'run', 'route', 'arguments', 'assess_entry', 'assess_final_response', or 'assess_final_claim'",
+                        )
+                    )
                     continue
                 req: Mapping[str, JSONValue] = parsed
-                if req.get("op") in ("route", "arguments", "assess_entry"):
+                if req.get("op") in (
+                    "route",
+                    "arguments",
+                    "assess_entry",
+                    "assess_final_response",
+                    "assess_final_claim",
+                ):
                     # Main-thread ops: fast JEV/Needle rounds never queue behind a long run.
                     try:
                         if req.get("op") == "route":
                             _emit(_route(req, jev=jev))
                         elif req.get("op") == "arguments":
                             _emit(_arguments(req))
+                        elif req.get("op") == "assess_final_response":
+                            _emit(_assess_final_response(req, jev=jev))
+                        elif req.get("op") == "assess_final_claim":
+                            _emit(_assess_final_claim(req, jev=jev))
                         else:
                             _emit(_assess_entry(req, jev=jev))
                     except Exception as exc:  # never raise out of the worker

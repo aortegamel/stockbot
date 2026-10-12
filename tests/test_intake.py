@@ -15,7 +15,13 @@ from app.decision_client import JevClient
 from app.reasoner_client import ReasonerClient, check_decompose_hints, check_proposals
 from app.research import kernel_worker as kw
 from app.research import scheduler as sched
-from app.research.models import DecisionRecord, JSONValue, ResearchNode, ToolDecision, new_decision_id
+from app.research.models import (
+    DecisionRecord,
+    JSONValue,
+    ResearchNode,
+    ToolDecision,
+    new_decision_id,
+)
 from app.research.repository import ResearchRepository
 from app.runtime import ToolResultMeta
 from app.tool_runtime import ToolOutcome
@@ -49,7 +55,11 @@ def _stored_evidence(
         "known_at": published_at,
         "retrieved_at": "2026-10-06T00:00:00+00:00",
         "metadata": {"form": form, "identity_key": f"k-{eid}"},
-        "provenance": {"kind": "sec_record", "tool_name": "search_sec_filings", "record_identity": f"r-{eid}"},
+        "provenance": {
+            "kind": "sec_record",
+            "tool_name": "search_sec_filings",
+            "record_identity": f"r-{eid}",
+        },
         "source_domain": source_name,
     }
 
@@ -163,11 +173,13 @@ def test_settle_continuation_false_never_resolves() -> None:
             job_id: str | None = None,
         ) -> dict[str, JSONValue]:
             return {
-                "probabilities": {},
+                "probabilities": {"topical_relevance": 0.9, "resolution_support": 0.9},
                 "confidence": 1.0,
                 "continuation": "resolve_node",
                 "evidence_state": "sufficient_support",
                 "decision": "sufficient_support",
+                "topical_relevance_answer": "yes",
+                "resolution_support_answer": "yes",
             }
 
     record: dict[str, object] = {
@@ -216,13 +228,22 @@ def test_digest_snippets_are_verbatim_substrings() -> None:
 
 def test_digest_dedupes_and_caps_newest_first() -> None:
     old = _stored_evidence(
-        "ev-old", "old content here", published_at="2020-01-01T00:00:00+00:00", accession="0000000000-26-000001"
+        "ev-old",
+        "old content here",
+        published_at="2020-01-01T00:00:00+00:00",
+        accession="0000000000-26-000001",
     )
     new = _stored_evidence(
-        "ev-new", "new content here", published_at="2026-09-01T00:00:00+00:00", accession="0000000000-26-000002"
+        "ev-new",
+        "new content here",
+        published_at="2026-09-01T00:00:00+00:00",
+        accession="0000000000-26-000002",
     )
     dup = _stored_evidence(
-        "ev-dup", "new content here", published_at="2026-09-01T00:00:00+00:00", accession="0000000000-26-000002"
+        "ev-dup",
+        "new content here",
+        published_at="2026-09-01T00:00:00+00:00",
+        accession="0000000000-26-000002",
     )
     digest = kw._build_digest([old, new, dup])
     assert "ev-new" in digest and "ev-old" in digest and "ev-dup" not in digest
@@ -232,7 +253,11 @@ def test_digest_dedupes_and_caps_newest_first() -> None:
 
 
 def test_hints_validator_accepts_optional_rejects_unknown() -> None:
-    good = {"proposals": [{"id": "x", "v": 1}], "tickers": ["nvda"], "corrected_query": "fixed query"}
+    good = {
+        "proposals": [{"id": "x", "v": 1}],
+        "tickers": ["nvda"],
+        "corrected_query": "fixed query",
+    }
     out = check_decompose_hints("decompose", good)
     assert out["tickers"] == ["NVDA"] and out["corrected_query"] == "fixed query"
     try:
@@ -260,7 +285,14 @@ def test_decompose_end_to_end_carries_all_three_keys() -> None:
     }
 
     def post(prompt: str, model: str) -> dict[str, object]:
-        return {"output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(body)}]}]}
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": json.dumps(body)}],
+                }
+            ]
+        }
 
     client = ReasonerClient(api_key="x", model="m", url="u", post=post)
     out = client.decompose("prompt", "rs:t")
@@ -268,7 +300,9 @@ def test_decompose_end_to_end_carries_all_three_keys() -> None:
     assert isinstance(out["proposals"], list) and len(out["proposals"]) == 1
 
 
-def test_retry_hints_come_from_winning_response_only(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_retry_hints_come_from_winning_response_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Stale first-attempt hints must not survive when attempt 2 wins."""
     good: dict[str, object] = {
         "id": "rs:t-q1",
@@ -282,7 +316,10 @@ def test_retry_hints_come_from_winning_response_only(monkeypatch: pytest.MonkeyP
     def fake_decompose(self: object, prompt: str, objective_id: str) -> dict[str, object]:
         calls["n"] += 1
         if calls["n"] == 1:
-            return {"proposals": [{"id": "bad self-ref", "dependsOn": ["bad self-ref"]}], "tickers": ["STALE"]}
+            return {
+                "proposals": [{"id": "bad self-ref", "dependsOn": ["bad self-ref"]}],
+                "tickers": ["STALE"],
+            }
         return {"proposals": [good]}
 
     monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", fake_decompose)
@@ -293,7 +330,13 @@ def test_retry_hints_come_from_winning_response_only(monkeypatch: pytest.MonkeyP
 
 def _proposal(pid: str, objective_id: str) -> dict[str, object]:
     deps: list[str] = []
-    return {"id": pid, "objectiveId": objective_id, "question": "Q?", "dependsOn": deps, "whyItMatters": "W"}
+    return {
+        "id": pid,
+        "objectiveId": objective_id,
+        "question": "Q?",
+        "dependsOn": deps,
+        "whyItMatters": "W",
+    }
 
 
 def _fake_opencode(monkeypatch: pytest.MonkeyPatch, bodies: Sequence[object]) -> list[str]:
@@ -316,17 +359,33 @@ def test_decompose_rejects_prefix_valid_id_with_wrong_objective_id() -> None:
     body = {"proposals": [_proposal("rs:t-q1", "rs:other")]}  # prefix-valid id, wrong objectiveId
 
     def post(prompt: str, model: str) -> dict[str, object]:
-        return {"output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(body)}]}]}
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": json.dumps(body)}],
+                }
+            ]
+        }
 
     with pytest.raises(ValueError, match="proposal rs:t-q1 references wrong objective"):
         ReasonerClient(api_key="x", model="m", url="u", post=post).decompose("prompt", "rs:t")
 
 
-def test_wrong_objective_id_retries_and_winner_owns_proposals_and_hints(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_wrong_objective_id_retries_and_winner_owns_proposals_and_hints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Attempt 1 is rejected whole; nothing from it reaches the accepted attempt-2 result."""
-    bad = {"proposals": [_proposal("rs:t-stale", "rs:other")], "tickers": ["STALE"], "corrected_query": "stale"}
+    bad = {
+        "proposals": [_proposal("rs:t-stale", "rs:other")],
+        "tickers": ["STALE"],
+        "corrected_query": "stale",
+    }
     good_body = {
-        "proposals": [{**_proposal("rs:t-q1", "rs:t"), "dependsOn": ["rs:t-q2"]}, _proposal("rs:t-q2", "rs:t")],
+        "proposals": [
+            {**_proposal("rs:t-q1", "rs:t"), "dependsOn": ["rs:t-q2"]},
+            _proposal("rs:t-q2", "rs:t"),
+        ],
         "tickers": ["NVDA"],
         "corrected_query": "NVIDIA",
     }
@@ -337,7 +396,10 @@ def test_wrong_objective_id_retries_and_winner_owns_proposals_and_hints(monkeypa
         stages.append(stage)
 
     proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "", progress=progress)
-    assert proposals == [{**_proposal("rs:t-q1", "rs:t"), "dependsOn": ["rs:t-q2"]}, _proposal("rs:t-q2", "rs:t")]
+    assert proposals == [
+        {**_proposal("rs:t-q1", "rs:t"), "dependsOn": ["rs:t-q2"]},
+        _proposal("rs:t-q2", "rs:t"),
+    ]
     assert hints == {"tickers": ["NVDA"], "corrected_query": "NVIDIA"}
     assert len(prompts) == 2
     assert stages.count("reasoner_retry") == 1 and stages[-1] == "reasoner_done"
@@ -436,7 +498,13 @@ def test_node_cap_four_through_entry(monkeypatch: pytest.MonkeyPatch) -> None:
 
     async def _six(*a: object, **k: object) -> list[dict[str, object]]:
         return [
-            {"id": f"s-q{i}", "objectiveId": "s", "question": f"q{i}?", "dependsOn": [], "whyItMatters": "w"}
+            {
+                "id": f"s-q{i}",
+                "objectiveId": "s",
+                "question": f"q{i}?",
+                "dependsOn": [],
+                "whyItMatters": "w",
+            }
             for i in range(6)
         ]
 
@@ -462,11 +530,27 @@ def test_log_carries_outcomes_and_ids(monkeypatch: pytest.MonkeyPatch) -> None:
         return (
             [],
             [{"tool": "list_sec_filings"}],
-            {"calls": 1, "admitted": 0, "admitted_ids": ["ev-1"], "outcomes": {"admitted": 1}},
+            {
+                "calls": 1,
+                "admitted": 0,
+                "admitted_ids": ["ev-1"],
+                "outcomes": {"admitted": 1},
+            },
         )
 
     def _decompose(*a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
-        return ([{"id": "s-q1", "objectiveId": "s", "question": "q?", "dependsOn": [], "whyItMatters": "w"}], {})
+        return (
+            [
+                {
+                    "id": "s-q1",
+                    "objectiveId": "s",
+                    "question": "q?",
+                    "dependsOn": [],
+                    "whyItMatters": "w",
+                }
+            ],
+            {},
+        )
 
     monkeypatch.setattr(kw, "_intake_round", _one_round)
     monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
@@ -495,7 +579,18 @@ def test_two_round_ceiling_without_new_hints(monkeypatch: pytest.MonkeyPatch) ->
         return ([], [], {"calls": 1, "admitted": 0})
 
     def _decompose(*a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
-        return ([{"id": "s-q1", "objectiveId": "s", "question": "q?", "dependsOn": [], "whyItMatters": "w"}], {})
+        return (
+            [
+                {
+                    "id": "s-q1",
+                    "objectiveId": "s",
+                    "question": "q?",
+                    "dependsOn": [],
+                    "whyItMatters": "w",
+                }
+            ],
+            {},
+        )
 
     monkeypatch.setattr(kw4, "_intake_round", _one_round)
     monkeypatch.setattr(kw4, "_reasoner_decompose_with_retry", _decompose)
@@ -503,7 +598,9 @@ def test_two_round_ceiling_without_new_hints(monkeypatch: pytest.MonkeyPatch) ->
     assert len(out) == 1 and rounds["n"] == 1
 
 
-def test_intake_never_searches_filings_and_chains_8k(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_intake_never_searches_filings_and_chains_8k(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Intake calls list by CIK + chained doc + exact-text web; no search_sec_filings, no Needle (C)."""
     from app.research import kernel_worker as kw3
 
@@ -543,7 +640,16 @@ def test_intake_never_searches_filings_and_chains_8k(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(kw3, "_intake_attempt", _fake_attempt)
     monkeypatch.setattr(kw3, "_intake_cik", _cik)
     asyncio.run(
-        kw3._intake_round("how will orcl's manjure affect AAPL?", ["ORCL"], "s1", {}, [], None, _IntakeKernel(), None)
+        kw3._intake_round(
+            "how will orcl's manjure affect AAPL?",
+            ["ORCL"],
+            "s1",
+            {},
+            [],
+            None,
+            _IntakeKernel(),
+            None,
+        )
     )
     tools = [t for t, _ in calls]
     assert "search_sec_filings" not in tools
@@ -553,7 +659,9 @@ def test_intake_never_searches_filings_and_chains_8k(monkeypatch: pytest.MonkeyP
     assert calls[0][0] == "list_sec_filings" and calls[0][1].get("identifier") == "320193"
 
 
-def test_chain_keeps_list_result_when_doc_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_chain_keeps_list_result_when_doc_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Real chain+attempt path, slow get_sec_document executor: budget keeps the list."""
     import asyncio
 
@@ -584,7 +692,9 @@ def test_chain_keeps_list_result_when_doc_times_out(monkeypatch: pytest.MonkeyPa
     assert record.get("error") is None and record.get("job_id")  # real list, not synthetic timeout
 
 
-def test_timeout_record_without_job_id_skips_settle(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_timeout_record_without_job_id_skips_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Jobless timeout records count timeout without settle KeyError noise (medium 4)."""
     import asyncio
 
@@ -675,7 +785,9 @@ def test_intake_budget_and_reasoner_timeouts_pinned() -> None:
     assert kw._INTAKE_REASONER_TIMEOUT_S == 45.0
 
 
-def test_reasoner_timeout_returns_without_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reasoner_timeout_returns_without_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A stuck decompose raises TimeoutError after one bound, not two full waits."""
     import time as _t
 
@@ -696,7 +808,9 @@ def test_reasoner_timeout_returns_without_waiting(monkeypatch: pytest.MonkeyPatc
     assert elapsed < 5.0
 
 
-def test_reasoner_retry_hang_capped_by_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reasoner_retry_hang_capped_by_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Rate-limit then hang: attempt 2 waits on remaining setup budget, not full timeout."""
     import time as _t
 
@@ -752,7 +866,13 @@ def test_quota_like_transient_still_retries(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def _good_proposal(oid: str = "rs:t") -> dict[str, object]:
-    return {"id": f"{oid}-q1", "objectiveId": oid, "question": "Q?", "dependsOn": [], "whyItMatters": "W"}
+    return {
+        "id": f"{oid}-q1",
+        "objectiveId": oid,
+        "question": "Q?",
+        "dependsOn": [],
+        "whyItMatters": "W",
+    }
 
 
 def _fake_reasoner_transport(monkeypatch: pytest.MonkeyPatch, reply: Callable[[int, str], str]) -> list[str]:
@@ -774,7 +894,9 @@ def _fake_reasoner_transport(monkeypatch: pytest.MonkeyPatch, reply: Callable[[i
     return prompts
 
 
-def test_model_copying_prompt_example_passes_real_validator(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_model_copying_prompt_example_passes_real_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The prompt's example is valid JSON carrying the exact objectiveId, even with quotes in the id."""
     oid = 'rs:"q"\\x'
 
@@ -799,10 +921,18 @@ def test_prop_prompt_example_passes_real_validator(oid: str) -> None:
     assert [(p["id"], p["objectiveId"]) for p in proposals] == [(f"{oid}-q1", oid)]
 
 
-_CROSS_OBJECTIVE = {"proposals": [{**_good_proposal(), "objectiveId": "rs:other"}], "tickers": ["STALE"]}
+_CROSS_OBJECTIVE = {
+    "proposals": [{**_good_proposal(), "objectiveId": "rs:other"}],
+    "tickers": ["STALE"],
+}
 _QUOTA_LIKE_ID = {"proposals": [{**_good_proposal("rs:t-429-free-usage-subscribe"), "objectiveId": "rs:x"}]}
 _CONFIG_LIKE_ID = {
-    "proposals": [{**_good_proposal("rs:t-opencode_unavailable-missing opencode"), "objectiveId": "rs:x"}]
+    "proposals": [
+        {
+            **_good_proposal("rs:t-opencode_unavailable-missing opencode"),
+            "objectiveId": "rs:x",
+        }
+    ]
 }
 _CYCLE = {
     "proposals": [
@@ -816,7 +946,10 @@ _CYCLE = {
 @pytest.mark.parametrize(
     ("first_reply", "error"),
     [
-        (json.dumps(_CROSS_OBJECTIVE), "decompose: proposal rs:t-q1 references wrong objective"),
+        (
+            json.dumps(_CROSS_OBJECTIVE),
+            "decompose: proposal rs:t-q1 references wrong objective",
+        ),
         # 429 / free-usage / subscribe / config markers inside a model id are validation,
         # never rate, quota, or config.
         (
@@ -828,7 +961,10 @@ _CYCLE = {
             "decompose: proposal rs:t-opencode_unavailable-missing opencode-q1 references wrong objective",
         ),
         ("not json", "decompose: malformed_opencode_json"),
-        (json.dumps({"proposals": [], "tickers": ["STALE"]}), "decompose: empty proposals"),
+        (
+            json.dumps({"proposals": [], "tickers": ["STALE"]}),
+            "decompose: empty proposals",
+        ),
         (json.dumps(_CYCLE), "decompose: cyclic dependency involving rs:t-q1"),
     ],
 )
@@ -858,7 +994,10 @@ def test_invalid_reply_repaired_with_validator_feedback(
     ("second_reply", "match"),
     [
         (_CROSS_OBJECTIVE, "references wrong objective"),
-        ({"proposals": [{**_good_proposal(), "whyItMatters": ""}]}, "whyItMatters must be a nonempty string"),
+        (
+            {"proposals": [{**_good_proposal(), "whyItMatters": ""}]},
+            "whyItMatters must be a nonempty string",
+        ),
     ],
 )
 def test_repeated_invalid_reply_raises_after_two_calls(

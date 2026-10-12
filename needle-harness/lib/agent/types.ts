@@ -13,7 +13,6 @@ export type FailureCategory =
   | "model_error"
   | "model_output_failure"
   | "no_evidence"
-  | "incomplete_evidence"
   | "freeze_mismatch"
   | "committee_deadlock"
   | "synthesis_failed"
@@ -73,6 +72,37 @@ export function sourceReferences(raw: unknown): SourceReference[] {
   }
   return out;
 }
+// Final-answer claim inventory: model-declared types mirror Python CLAIM_TYPES
+// exactly (snake_case over the wire); confidence is model-declared 0..1,
+// carried through, never a reject threshold.
+export const FINAL_CLAIM_TYPES = [
+  "observed_fact",
+  "inference",
+  "unknown",
+  "contradicted",
+  "conditional_risk",
+  "attributed_report",
+] as const;
+export type FinalClaimType = (typeof FINAL_CLAIM_TYPES)[number];
+
+export type FinalClaim = {
+  text: string;
+  claimType: FinalClaimType;
+  evidenceIds: string[];
+  confidence?: number;
+};
+
+export type FinalPersonaResult = {
+  persona: Persona;
+  text: string;
+  claims: FinalClaim[];
+  confidence?: number;
+  missingEvidence?: string;
+};
+
+// Final-answer personas in fixed output order; each runs as its own Muse call.
+export const FINAL_PERSONAS = ["stockbot", "bearbot", "bullbot"] as const;
+export type Persona = (typeof FINAL_PERSONAS)[number];
 
 export type ToolResult = { ok: true; evidence: Evidence } | { ok: false; error: string; category: FailureCategory; retryable: boolean };
 

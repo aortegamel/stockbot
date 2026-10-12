@@ -52,14 +52,25 @@ def _committee_output(claims: list[dict[str, object]], follow_ups: Sequence[obje
         if isinstance(raw_ids, list):
             ids.extend(eid for eid in raw_ids if isinstance(eid, str))
     channels: list[dict[str, object]] = (
-        [{"text": "frozen-evidence channel", "direction": "pressure", "evidence_ids": [ids[0]]}] if ids else []
+        [
+            {
+                "text": "frozen-evidence channel",
+                "direction": "pressure",
+                "evidence_ids": [ids[0]],
+            }
+        ]
+        if ids
+        else []
     )
     return _json.dumps(
         {
             "executive_view": "Balanced read of the frozen evidence.",
             "claims": claims,
             "impact_channels": channels,
-            "materiality": {"overall": "medium", "reasoning": "effect size read off the frozen evidence"},
+            "materiality": {
+                "overall": "medium",
+                "reasoning": "effect size read off the frozen evidence",
+            },
             "uncertainties": ["the freeze does not settle timing"],
             "what_would_change": ["a new filing disclosing the terms"],
             "follow_ups": list(follow_ups),
@@ -189,7 +200,12 @@ def test_journal_sequences_and_pit_rejection_logged() -> None:
 def test_ledger_append_only_and_supersede() -> None:
     s = _session.create_session("q?", "o", as_of=ASOF)
     led = EvidenceLedger()
-    ingest_evidence(led, _ev("EV-1", s.session_id, 1, datetime(2025, 5, 1, tzinfo=UTC)), as_of=ASOF, on_reject=None)
+    ingest_evidence(
+        led,
+        _ev("EV-1", s.session_id, 1, datetime(2025, 5, 1, tzinfo=UTC)),
+        as_of=ASOF,
+        on_reject=None,
+    )
     with pytest.raises(ValueError):
         led.append(_ev("EV-1", s.session_id, 1, datetime(2025, 5, 1, tzinfo=UTC)))
     fix = led.get("EV-1")
@@ -201,7 +217,12 @@ def test_freeze_immutable_and_cumulative_e2() -> None:
     s = _session.create_session("q?", "o", as_of=ASOF)
     led = EvidenceLedger()
     for eid, wave in (("EV-1", 1), ("EV-2", 1), ("EV-3", 2)):
-        ingest_evidence(led, _ev(eid, s.session_id, wave, datetime(2025, 5, 1, tzinfo=UTC)), as_of=ASOF, on_reject=None)
+        ingest_evidence(
+            led,
+            _ev(eid, s.session_id, wave, datetime(2025, 5, 1, tzinfo=UTC)),
+            as_of=ASOF,
+            on_reject=None,
+        )
     e1 = [e for e in led.list_session(s.session_id) if e.wave_id <= 1]
     e2 = [e for e in led.list_session(s.session_id) if e.wave_id <= 2]
     f1 = create_freeze(freeze_id="E1", session_id=s.session_id, wave_id=1, records=e1, as_of=ASOF)
@@ -278,7 +299,14 @@ def _fake_dispatch() -> DispatchFn:
 
     def _dispatch(name: str, args: dict[str, object]) -> dict[str, object]:
         if name in ("search_tools", "browse_tools"):
-            return {"matches": ["search_sec_filings", "list_sec_filings", "get_sec_document", "get_sec_filing"]}
+            return {
+                "matches": [
+                    "search_sec_filings",
+                    "list_sec_filings",
+                    "get_sec_document",
+                    "get_sec_filing",
+                ]
+            }
         if name == "call_tool":
             n = next(counter)
             inner = str(args.get("name") or "")
@@ -291,7 +319,11 @@ def _fake_dispatch() -> DispatchFn:
                 "query": str(requested.get("query") or ""),
                 "count": 1,
                 "top_hits": [
-                    {"accession": f"0000320193-25-{n:06d}", "document": f"nvda-20250331-{n}.htm", "form": "10-Q"}
+                    {
+                        "accession": f"0000320193-25-{n:06d}",
+                        "document": f"nvda-20250331-{n}.htm",
+                        "form": "10-Q",
+                    }
                 ],
             }
         return {}
@@ -397,7 +429,12 @@ def test_committee_prompts_carry_identical_freeze_payload() -> None:
 
     s = _session.create_session("NVDA demand?", "o", as_of=ASOF)
     led = EvidenceLedger()
-    ingest_evidence(led, _ev("EV-1", s.session_id, 1, datetime(2025, 5, 1, tzinfo=UTC)), as_of=ASOF, on_reject=None)
+    ingest_evidence(
+        led,
+        _ev("EV-1", s.session_id, 1, datetime(2025, 5, 1, tzinfo=UTC)),
+        as_of=ASOF,
+        on_reject=None,
+    )
     rec = led.get("EV-1")
     payload = f"[{rec.evidence_id}] {rec.subject} | claim: {rec.claim_text}\ncontent: {rec.content}"
     from app.research.agents.bearbot import run_bearbot
@@ -460,7 +497,14 @@ def test_source_timestamp_never_invented_and_post_cutoff_rejected() -> None:
     )
     assert known is not None and (known.year, known.month, known.day) == (2025, 5, 28)
     uri, ref = _extract_source_ref(
-        {"meta": {"source_refs": {"record_id": "0001045810-25-000023", "uri": "https://sec.gov/x"}}}
+        {
+            "meta": {
+                "source_refs": {
+                    "record_id": "0001045810-25-000023",
+                    "uri": "https://sec.gov/x",
+                }
+            }
+        }
     )
     assert (uri, ref) == ("https://sec.gov/x", "0001045810-25-000023")
     s = _session.create_session("q?", "o", as_of=ASOF)
@@ -670,7 +714,15 @@ def test_resume_failed_session_reports_error(tmp_path: Path, monkeypatch: pytest
         raise subprocess.TimeoutExpired(cmd="pi", timeout=1)
 
     with pytest.raises(LiveModelError) as excinfo:
-        run_live("timeout probe?", "probe", None, ["NVDA"], lambda n, a: {}, _timeout_model, repo=repo)
+        run_live(
+            "timeout probe?",
+            "probe",
+            None,
+            ["NVDA"],
+            lambda n, a: {},
+            _timeout_model,
+            repo=repo,
+        )
     sid = excinfo.value.session_id
     assert repo.get_session(sid).status == "failed"
     n_jobs = len(repo.list_jobs(sid))
@@ -760,7 +812,12 @@ def test_pit_unverified_historical_rejected_current_accepted() -> None:
     led = EvidenceLedger()
     seen: list[tuple[str, dict[str, object]]] = []
     with pytest.raises(EvidenceRejectedError) as ei:
-        ingest_evidence(led, _mk("EV-U1", None), as_of=hist, on_reject=lambda t, p: seen.append((t, p)))
+        ingest_evidence(
+            led,
+            _mk("EV-U1", None),
+            as_of=hist,
+            on_reject=lambda t, p: seen.append((t, p)),
+        )
     assert ei.value.reason == "PIT_UNVERIFIED"
     assert seen[0][1]["reason"] == "PIT_UNVERIFIED"
     assert led.ids() == ()
@@ -859,14 +916,19 @@ def test_grounded_claims_reject_unknown_and_empty() -> None:
     from app.research.agents import ModelOutputFailure, parse_grounded_claims
 
     claims = parse_grounded_claims(
-        _json.dumps([{"text": "revenue grew", "evidence_ids": ["EV-1"]}]), frozen=["EV-1", "EV-2"]
+        _json.dumps([{"text": "revenue grew", "evidence_ids": ["EV-1"]}]),
+        frozen=["EV-1", "EV-2"],
     )
     assert [c.text for c in claims] and claims[0].evidence_ids == ["EV-1"]
     with pytest.raises(ModelOutputFailure):
-        parse_grounded_claims(_json.dumps([{"text": "invented trend", "evidence_ids": ["EV-999"]}]), frozen=["EV-1"])
+        parse_grounded_claims(
+            _json.dumps([{"text": "invented trend", "evidence_ids": ["EV-999"]}]),
+            frozen=["EV-1"],
+        )
     with pytest.raises(ModelOutputFailure):
         parse_grounded_claims(
-            _json.dumps([{"text": "Revenue grew with no citation.", "evidence_ids": []}]), frozen=["EV-1"]
+            _json.dumps([{"text": "Revenue grew with no citation.", "evidence_ids": []}]),
+            frozen=["EV-1"],
         )
 
 
@@ -922,7 +984,12 @@ def test_scout_findings_cite_only_acquired_ids() -> None:
     from app.research.agents.scout import ScoutAssignment, run_scout
 
     assignment = ScoutAssignment(
-        assignment_id="scout-filings", session_id="rs:t", as_of="2025-06-30", role="filings", question="Q?", tickers=[]
+        assignment_id="scout-filings",
+        session_id="rs:t",
+        as_of="2025-06-30",
+        role="filings",
+        question="Q?",
+        tickers=[],
     )
 
     def _dispatch(name: str, args: dict[str, object]) -> dict[str, object]:
@@ -934,7 +1001,9 @@ def test_scout_findings_cite_only_acquired_ids() -> None:
     import json as _json
 
     good = run_scout(
-        assignment, dispatch=_dispatch, model=lambda prompt: _json.dumps([{"text": "found", "evidence_ids": ["EV-1"]}])
+        assignment,
+        dispatch=_dispatch,
+        model=lambda prompt: _json.dumps([{"text": "found", "evidence_ids": ["EV-1"]}]),
     )
     assert [c.evidence_ids for c in good.findings] == [["EV-1"]]
     # A fabricated id loses its own claim; the grounded sibling survives with a limitation.
@@ -942,7 +1011,10 @@ def test_scout_findings_cite_only_acquired_ids() -> None:
         assignment,
         dispatch=_dispatch,
         model=lambda prompt: _json.dumps(
-            [{"text": "found", "evidence_ids": ["EV-1"]}, {"text": "bad", "evidence_ids": ["EV-999"]}]
+            [
+                {"text": "found", "evidence_ids": ["EV-1"]},
+                {"text": "bad", "evidence_ids": ["EV-999"]},
+            ]
         ),
     )
     assert [c.text for c in mixed.findings] == ["found"]
@@ -1196,7 +1268,10 @@ def _svc_item(
 
 
 def _committee_analysis(
-    eid: str, follow_ups: Sequence[object] = (), claim_text: str = "finding", claim_type: str = "inference"
+    eid: str,
+    follow_ups: Sequence[object] = (),
+    claim_text: str = "finding",
+    claim_type: str = "inference",
 ) -> dict[str, object]:
     """Rich committee envelope mapping for service.record_committee_analysis (all required keys)."""
     return {
@@ -1233,7 +1308,11 @@ def test_committee_cannot_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     _svc.record_evidence(sid, src, _svc_item(eid), repo=repo)
     _svc.complete_job(src, {}, repo=repo)
     _svc.freeze_session(sid, 1, repo=repo)
-    out = execute_agent_tool("search_web", {"query": "x", "session_id": sid}, RuntimeToolSession(session_id="t1"))
+    out = execute_agent_tool(
+        "search_web",
+        {"query": "x", "session_id": sid},
+        RuntimeToolSession(session_id="t1"),
+    )
     assert "forbids" in str(out.get("error", ""))
 
 
@@ -1351,7 +1430,12 @@ def test_budget_stops_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
     def _fake_execute(name: str, arguments: dict[str, object], model: str, context: object = None) -> dict[str, object]:
         calls.append((name, dict(arguments)))
-        return {"result_type": "web_search", "query": arguments.get("query"), "results": [], "source": "exa"}
+        return {
+            "result_type": "web_search",
+            "query": arguments.get("query"),
+            "results": [],
+            "source": "exa",
+        }
 
     monkeypatch.setattr(_gw, "execute_tool", _fake_execute)
     first = execute_agent_tool("search_web", {"query": "NVDA demand"}, ctx)
@@ -1365,7 +1449,9 @@ def test_budget_stops_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert repo.get_job(jid).tool_budget == 0
     assert repo.get_session(sid).budget.get("tool_calls_used") == 1
     kept = execute_agent_tool(
-        "research_add_evidence", {"session_id": sid, "job_id": jid, "item": _svc_item(f"{sid}:ev:1")}, ctx
+        "research_add_evidence",
+        {"session_id": sid, "job_id": jid, "item": _svc_item(f"{sid}:ev:1")},
+        ctx,
     )
     assert "error" not in kept, kept
     assert repo.get_job(jid).tool_budget == 0
@@ -1498,7 +1584,9 @@ def test_job_runtime_identity_merges_partial_then_complete(tmp_path: Path, monke
     repo = ResearchRepository()
     _sid, src = _svc_sid(repo)
     partial = _svc.attach_job_runtime(
-        src, {"runtime": "omp", "runtime_agent_id": "agent-1", "not_accepted": "x"}, repo=repo
+        src,
+        {"runtime": "omp", "runtime_agent_id": "agent-1", "not_accepted": "x"},
+        repo=repo,
     )
     assert partial["diagnostics"] == {"runtime": "omp", "runtime_agent_id": "agent-1"}
     done = _svc.attach_job_runtime(
@@ -1635,7 +1723,12 @@ def test_sec_only_policy_persisted_and_round_trips(tmp_path: Path, monkeypatch: 
     # Budgets kept alongside the new policy keys.
     budget = doc["budget"]
     assert isinstance(budget, dict)
-    for key in ("deadline_seconds", "total_tool_budget", "total_token_budget", "total_cost_budget"):
+    for key in (
+        "deadline_seconds",
+        "total_tool_budget",
+        "total_token_budget",
+        "total_cost_budget",
+    ):
         assert key in budget, key
     # Persist + reload: SQLite round-trips both fields.
     repo.save_session(sess)
@@ -2084,7 +2177,12 @@ def test_scout_prompt_renders_context_baseline_and_queries() -> None:
 
     bare = build_scout_prompt(
         ScoutAssignment(
-            assignment_id="scout-risk", session_id="rs:t", as_of="unbounded", role="risk", question="Q?", tickers=[]
+            assignment_id="scout-risk",
+            session_id="rs:t",
+            as_of="unbounded",
+            role="risk",
+            question="Q?",
+            tickers=[],
         )
     )
     assert "Context " not in bare and "Latest-filing baseline" not in bare
@@ -2131,9 +2229,21 @@ def test_expansion_stop_prefers_info_over_counts() -> None:
 @pytest.mark.parametrize(
     ("question", "tickers", "must_contain"),
     [
-        ("Spirit AeroSystems Boeing 737 relationship and backlog?", ["SPR"], ("aerospace", "boeing")),
-        ("Novo Nordisk GLP-1 diabetes obesity outlook?", ["NVO"], ("glp", "diabetes", "obesity")),
-        ("Arista cloud networking datacenter Ethernet demand?", ["ANET"], ("cloud", "network", "datacenter")),
+        (
+            "Spirit AeroSystems Boeing 737 relationship and backlog?",
+            ["SPR"],
+            ("aerospace", "boeing"),
+        ),
+        (
+            "Novo Nordisk GLP-1 diabetes obesity outlook?",
+            ["NVO"],
+            ("glp", "diabetes", "obesity"),
+        ),
+        (
+            "Arista cloud networking datacenter Ethernet demand?",
+            ["ANET"],
+            ("cloud", "network", "datacenter"),
+        ),
         ("Albemarle lithium brine battery demand?", ["ALB"], ("lithium", "battery")),
         ("Apple China supply chain and tariffs?", ["AAPL"], ("china", "supply")),
     ],
@@ -2174,7 +2284,11 @@ def test_private_counterparty_queries_reach_filings_scout() -> None:
         return {}  # discovery hint only; no query execution on this path
 
     assignments = decompose_question(
-        question, session_id="rs:t", as_of="2026-08-10", tickers=["MSFT"], dispatch=_catalog_only
+        question,
+        session_id="rs:t",
+        as_of="2026-08-10",
+        tickers=["MSFT"],
+        dispatch=_catalog_only,
     )
     filings = next(a for a in assignments if a.role == "filings")
     assert "OpenAI" in filings.queries  # bare name -> unscoped EDGAR full-text search
@@ -2220,7 +2334,12 @@ def test_no_counterparty_question_keeps_existing_families() -> None:
             "growth N-PX",
             "growth agreement",
         ],
-        "supp_risk": ["data risk factor", "center risk factor", "revenue risk factor", "growth risk factor"],
+        "supp_risk": [
+            "data risk factor",
+            "center risk factor",
+            "revenue risk factor",
+            "growth risk factor",
+        ],
     }
 
 
@@ -2333,7 +2452,12 @@ def test_as_of_excludes_later_evidence() -> None:
     assert seen and seen[0][1]["reason"] == "PIT_VIOLATION"
     assert led.ids() == ()
     # Latest-doc respects cutoff: eligible doc ingests, later doc rejects.
-    ingest_evidence(led, _ev("EV-OK", sess.session_id, 1, datetime(2025, 5, 1, tzinfo=UTC)), as_of=ASOF, on_reject=None)
+    ingest_evidence(
+        led,
+        _ev("EV-OK", sess.session_id, 1, datetime(2025, 5, 1, tzinfo=UTC)),
+        as_of=ASOF,
+        on_reject=None,
+    )
     assert led.ids() == ("EV-OK",)
 
 
@@ -2353,7 +2477,11 @@ def test_coverage_shape_and_insufficient_never_terminal(tmp_path: Path, monkeypa
         "source_limitations": ["SEC-only: no private-issuer filings"],
     }
     out = _svc.submit_source_result(
-        src, coverage=coverage, evidence_ids=[], unresolved_questions=["Anthropic private revenue"], repo=repo
+        src,
+        coverage=coverage,
+        evidence_ids=[],
+        unresolved_questions=["Anthropic private revenue"],
+        repo=repo,
     )
     assert out["job_status"] == "completed"
     # submit = source job complete only; session never terminal here.
@@ -2363,7 +2491,12 @@ def test_coverage_shape_and_insufficient_never_terminal(tmp_path: Path, monkeypa
     result_cov = stored.get("coverage") if isinstance(stored, dict) else None
     if isinstance(result_cov, dict):
         assert result_cov.get("useful_for_question") == "insufficient"
-        for key in ("resolved", "partially_resolved", "unresolved", "source_limitations"):
+        for key in (
+            "resolved",
+            "partially_resolved",
+            "unresolved",
+            "source_limitations",
+        ):
             if key in result_cov:
                 assert isinstance(result_cov[key], list)
     # Insufficient still freezes + synthesizes via the kernel path.
@@ -2399,7 +2532,13 @@ def test_negatives_cite_searchrun_only() -> None:
 def test_sec_gates_deny_non_sec_even_via_browse() -> None:
     from app.research.agents.source_agent import is_sec_tool
 
-    for denied in ("query_finra", "get_short_interest", "search_web", "get_market_snapshot", "get_analyst_estimates"):
+    for denied in (
+        "query_finra",
+        "get_short_interest",
+        "search_web",
+        "get_market_snapshot",
+        "get_analyst_estimates",
+    ):
         assert is_sec_tool(denied) is False, denied
     for allowed in ("search_sec_filings", "list_sec_filings", "get_sec_document"):
         assert is_sec_tool(allowed) is True, allowed
@@ -2638,7 +2777,16 @@ def test_reg_unlimited_duplicate_no_progress_rejected() -> None:
         "LoopDetector.check(action,result_hash,evidence_delta)->{duplicate,reason} + telemetry list"
     )
     loop = loop_cls()
-    action = normalize("sec", "get_sec_document", "GS 10-K", "GS", ("10-K",), "2025-06-30", "ACC-1", "exposure?")
+    action = normalize(
+        "sec",
+        "get_sec_document",
+        "GS 10-K",
+        "GS",
+        ("10-K",),
+        "2025-06-30",
+        "ACC-1",
+        "exposure?",
+    )
     first = loop.check(action, "hash-a", 3)
     assert first.get("duplicate") is False
     repeat = loop.check(action, "hash-a", 0)
@@ -2657,8 +2805,26 @@ def test_reg_unlimited_different_queries_allowed() -> None:
         "LoopDetector.check(action,result_hash,evidence_delta)->{duplicate,reason} + telemetry list"
     )
     loop = loop_cls()
-    a = normalize("sec", "get_sec_document", "GS 10-K risk", "GS", ("10-K",), "2025-06-30", "ACC-1", "exposure?")
-    b = normalize("sec", "get_sec_document", "GS 10-Q MD&A", "GS", ("10-Q",), "2025-06-30", "ACC-2", "exposure?")
+    a = normalize(
+        "sec",
+        "get_sec_document",
+        "GS 10-K risk",
+        "GS",
+        ("10-K",),
+        "2025-06-30",
+        "ACC-1",
+        "exposure?",
+    )
+    b = normalize(
+        "sec",
+        "get_sec_document",
+        "GS 10-Q MD&A",
+        "GS",
+        ("10-Q",),
+        "2025-06-30",
+        "ACC-2",
+        "exposure?",
+    )
     assert loop.check(a, "hash-a", 2).get("duplicate") is False
     assert loop.check(b, "hash-b", 2).get("duplicate") is False
 
@@ -2722,8 +2888,20 @@ def test_dispatch_loop_gate_distinct_arguments_allowed(tmp_path: Path, monkeypat
     repo = ResearchRepository()
     sid, src = _reg_svc_sid(repo)
     calls = [
-        ("get_sec_document", {"accession_no": "0000320193-25-000079", "document_name": "nvda-20250331.htm"}),
-        ("get_sec_document", {"accession_no": "0000320193-25-000079", "document_name": "nvda-20250331ex10.htm"}),
+        (
+            "get_sec_document",
+            {
+                "accession_no": "0000320193-25-000079",
+                "document_name": "nvda-20250331.htm",
+            },
+        ),
+        (
+            "get_sec_document",
+            {
+                "accession_no": "0000320193-25-000079",
+                "document_name": "nvda-20250331ex10.htm",
+            },
+        ),
         ("search_sec_filings", {"query": "GS OpenAI exposure"}),
         ("search_sec_filings", {"query": "GS OpenAI exposure", "forms": ["10-Q"]}),
     ]
@@ -2764,7 +2942,12 @@ def test_dispatch_loop_gate_gateway_repeat_blocked(tmp_path: Path, monkeypatch: 
 
     def _fake_execute(name: str, arguments: dict[str, object], model: str, context: object = None) -> dict[str, object]:
         calls.append((name, dict(arguments)))
-        return {"result_type": "sec_search", "query": arguments.get("query"), "count": 1, "results": []}
+        return {
+            "result_type": "sec_search",
+            "query": arguments.get("query"),
+            "count": 1,
+            "results": [],
+        }
 
     monkeypatch.setattr(_gw, "execute_tool", _fake_execute)
     first = execute_agent_tool("search_sec_filings", {"query": "GS OpenAI exposure"}, ctx)
@@ -2799,7 +2982,8 @@ def test_reg_freshness_latest_default() -> None:
     from app.research.models import resolve_temporal_scope
 
     latest = resolve_temporal_scope(
-        query="What happens to Goldman Sachs if OpenAI goes bankrupt?", now=_dt(2025, 6, 30, tzinfo=UTC)
+        query="What happens to Goldman Sachs if OpenAI goes bankrupt?",
+        now=_dt(2025, 6, 30, tzinfo=UTC),
     )
     assert latest["mode"] == "latest-available"
     assert latest["as_of"] is not None
@@ -2809,9 +2993,24 @@ def test_reg_freshness_latest_10k_pinned() -> None:
     from app.research.models import select_latest_baseline
 
     filings: list[object] = [
-        {"form": "10-K", "known_at": "2025-02-14", "filed_at": "2025-02-14", "accession_no": "OLD"},
-        {"form": "10-K", "known_at": "2025-06-20", "filed_at": "2025-06-20", "accession_no": "NEW"},
-        {"form": "10-K/A", "known_at": "2025-06-25", "filed_at": "2025-06-25", "accession_no": "AMD"},
+        {
+            "form": "10-K",
+            "known_at": "2025-02-14",
+            "filed_at": "2025-02-14",
+            "accession_no": "OLD",
+        },
+        {
+            "form": "10-K",
+            "known_at": "2025-06-20",
+            "filed_at": "2025-06-20",
+            "accession_no": "NEW",
+        },
+        {
+            "form": "10-K/A",
+            "known_at": "2025-06-25",
+            "filed_at": "2025-06-25",
+            "accession_no": "AMD",
+        },
     ]
     base = select_latest_baseline(filings, as_of="2025-06-30")
     annual = base["annual_10k"]
@@ -2830,7 +3029,12 @@ def test_reg_freshness_superseded_only_current_rejected() -> None:
             "accession_no": "OLD",
             "superseded_by": "NEW",
         },
-        {"form": "10-K", "known_at": "2025-02-14", "filed_at": "2025-02-14", "accession_no": "NEW"},
+        {
+            "form": "10-K",
+            "known_at": "2025-02-14",
+            "filed_at": "2025-02-14",
+            "accession_no": "NEW",
+        },
     ]
     base = select_latest_baseline(filings, as_of="2025-06-30")
     annual = base["annual_10k"]
@@ -2850,7 +3054,12 @@ def test_reg_freshness_historical_allowed(tmp_path: Path, monkeypatch: pytest.Mo
     repo = ResearchRepository()
     sid = _svc.create_research("GS 2024 exposure?", "o", as_of="2025-06-30T00:00:00+00:00", repo=repo)
     jid = repo.list_jobs(sid)[0].job_id
-    out = _svc.record_evidence(sid, jid, _reg_item(f"{sid}:ev:1", known_at="2024-12-01T00:00:00+00:00"), repo=repo)
+    out = _svc.record_evidence(
+        sid,
+        jid,
+        _reg_item(f"{sid}:ev:1", known_at="2024-12-01T00:00:00+00:00"),
+        repo=repo,
+    )
     assert out["evidence_id"] == f"{sid}:ev:1"
     with pytest.raises(ValueError, match="PIT_VIOLATION|rejected|ERR_SEC_HANDLE_UNREADABLE"):
         _svc.record_evidence(
@@ -2878,7 +3087,14 @@ def test_reg_negatives_coverage_present() -> None:
 
     # Evidence is kernel-replayed claims only: a search-derived absence is coverage state.
     assert CLAIM_KINDS == ("observed_fact",)
-    assert PROVENANCE_KINDS == ("sec_source", "sec_record", "finra_record", "web_source", "search_run", "none")
+    assert PROVENANCE_KINDS == (
+        "sec_source",
+        "sec_record",
+        "finra_record",
+        "web_source",
+        "search_run",
+        "none",
+    )
     cov = default_coverage()
     for key in ("forms", "sources_examined", "complete", "exclusions"):
         assert key in cov, sorted(cov.keys())
@@ -2994,7 +3210,11 @@ def test_reg_pit_accepted_at_is_known_at() -> None:
             return "primary.htm"
 
     filing = _StubFiling(
-        cik=886982, company="Goldman Sachs", form="10-K", filing_date="2025-02-14", accession_no="0000886982-26-000001"
+        cik=886982,
+        company="Goldman Sachs",
+        form="10-K",
+        filing_date="2025-02-14",
+        accession_no="0000886982-26-000001",
     )
     meta = filing_from_edgar(filing)
     assert meta.known_at == "2025-02-14T17:30:00Z"
@@ -3015,7 +3235,12 @@ def test_reg_pit_future_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     repo = ResearchRepository()
     sid, src = _reg_svc_sid(repo)
     with pytest.raises(ValueError):
-        _svc.record_evidence(sid, src, _reg_item(f"{sid}:ev:9", known_at="2025-07-01T00:00:00+00:00"), repo=repo)
+        _svc.record_evidence(
+            sid,
+            src,
+            _reg_item(f"{sid}:ev:9", known_at="2025-07-01T00:00:00+00:00"),
+            repo=repo,
+        )
 
 
 # --- freeze/committee (5): immutable, identical freeze ID, no source tools, new wave, decide ---
@@ -3039,7 +3264,13 @@ def test_reg_freeze_immutable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     now = _dt(2025, 6, 30, tzinfo=UTC)
     with pytest.raises(_dc.FrozenInstanceError):
         frozen_obj = EvidenceFreeze(
-            freeze_id=fid, session_id=sid, wave_id=1, created_at=now, as_of=now, evidence_ids=(eid,), content_hash="h"
+            freeze_id=fid,
+            session_id=sid,
+            wave_id=1,
+            created_at=now,
+            as_of=now,
+            evidence_ids=(eid,),
+            content_hash="h",
         )
         _frozen_write(frozen_obj, "evidence_ids", ("tampered",))
     assert repo.get_freeze(fid)["freeze_id"] == fid
@@ -3134,7 +3365,11 @@ def test_reg_synthesis_supported_traces_to_raw(tmp_path: Path, monkeypatch: pyte
     for role in ("stockbot", "bullbot", "bearbot"):
         jid = str(_svc.start_job(sid, role, repo=repo, wave_id=1)["job_id"])
         _svc.record_committee_analysis(
-            sid, jid, role, _committee_analysis(eid, claim_text="GS discloses OpenAI-linked exposure"), repo=repo
+            sid,
+            jid,
+            role,
+            _committee_analysis(eid, claim_text="GS discloses OpenAI-linked exposure"),
+            repo=repo,
         )
     out = _svc.finalize_session(
         sid,
@@ -3230,7 +3465,8 @@ def test_reg_synthesis_manageable_rejected_as_fact() -> None:
 
     with pytest.raises(ModelOutputFailure):
         parse_grounded_claims(
-            '[{"text": "GS will manageably absorb any OpenAI loss", "evidence_ids": []}]', frozen=["EV-1"]
+            '[{"text": "GS will manageably absorb any OpenAI loss", "evidence_ids": []}]',
+            frozen=["EV-1"],
         )
 
 
@@ -3284,7 +3520,7 @@ def test_reg_evidence_record_kind_split(tmp_path: Path, monkeypatch: pytest.Monk
 
 def test_reg_evidence_claim_labels() -> None:
     """Claim type is declared, never inferred from wording: absent type stays inference, and
-    observed_fact/contradicted need at least one freeze id (unknown may cite none)."""
+    observed_fact/contradicted/conditional_risk/attributed_report need at least one freeze id (unknown may cite none)."""
     from app.research.agents import (
         CLAIM_TYPES,
         GroundedClaim,
@@ -3292,25 +3528,49 @@ def test_reg_evidence_claim_labels() -> None:
         parse_grounded_claims,
     )
 
-    assert tuple(CLAIM_TYPES) == ("observed_fact", "inference", "unknown", "contradicted")
+    assert tuple(CLAIM_TYPES) == (
+        "observed_fact",
+        "inference",
+        "unknown",
+        "contradicted",
+        "conditional_risk",
+        "attributed_report",
+    )
     assert GroundedClaim(text="GS revenue grew", evidence_ids=["EV-1"]).claim_type == "inference"
     declared = parse_grounded_claims(
-        '[{"text": "GS revenue grew", "claim_type": "observed_fact", "evidence_ids": ["EV-1"]}]', frozen=["EV-1"]
+        '[{"text": "GS revenue grew", "claim_type": "observed_fact", "evidence_ids": ["EV-1"]}]',
+        frozen=["EV-1"],
     )
     assert declared[0].claim_type == "observed_fact"
     # Wording and citation never type a claim: an undeclared confident sentence stays inference.
     undeclared = parse_grounded_claims(
-        '[{"text": "GS revenue grew per the filing, definitely observed.", "evidence_ids": ["EV-1"]}]', frozen=["EV-1"]
+        '[{"text": "GS revenue grew per the filing, definitely observed.", "evidence_ids": ["EV-1"]}]',
+        frozen=["EV-1"],
     )
     assert undeclared[0].claim_type == "inference"
     with pytest.raises(ModelOutputFailure):
         parse_grounded_claims(
-            '[{"text": "GS revenue grew", "claim_type": "observed_fact", "evidence_ids": []}]', frozen=["EV-1"]
+            '[{"text": "GS revenue grew", "claim_type": "observed_fact", "evidence_ids": []}]',
+            frozen=["EV-1"],
         )
     with pytest.raises(ModelOutputFailure):
-        parse_grounded_claims('[{"text": "unclear", "claim_type": "shrug", "evidence_ids": ["EV-1"]}]', frozen=["EV-1"])
+        parse_grounded_claims(
+            '[{"text": "A default could impair the marks", "claim_type": "conditional_risk", "evidence_ids": []}]',
+            frozen=["EV-1"],
+        )
+    with pytest.raises(ModelOutputFailure):
+        parse_grounded_claims(
+            '[{"text": "Management said exposure is capped", "claim_type": "attributed_report", "evidence_ids": []}]',
+            frozen=["EV-1"],
+        )
+    with pytest.raises(ModelOutputFailure):
+        parse_grounded_claims(
+            '[{"text": "unclear", "claim_type": "shrug", "evidence_ids": ["EV-1"]}]',
+            frozen=["EV-1"],
+        )
     unknown = parse_grounded_claims(
-        '[{"text": "OpenAI terms UNKNOWN", "claim_type": "unknown", "evidence_ids": []}]', frozen=["EV-1"]
+        '[{"text": "OpenAI terms UNKNOWN", "claim_type": "unknown", "evidence_ids": []}]',
+        frozen=["EV-1"],
     )
     assert unknown[0].claim_type == "unknown" and unknown[0].evidence_ids == []
 
@@ -3355,11 +3615,17 @@ def test_crap_temporal_patterns() -> None:
     lastyr = resolve_temporal_scope(temporal="last year", now=now)
     assert (lastyr["start"], lastyr["end"]) == ("2024-01-01", "2024-12-31")
     lastq = resolve_temporal_scope(query="What drove NVDA revenue last quarter?", now=now)
-    assert lastq["mode"] == "range" and (lastq["start"], lastq["end"]) == ("2025-01-01", "2025-03-31")
+    assert lastq["mode"] == "range" and (lastq["start"], lastq["end"]) == (
+        "2025-01-01",
+        "2025-03-31",
+    )
     thisw = resolve_temporal_scope(query="Apple news this week", now=now)
     assert thisw["mode"] == "range" and thisw["start"] == "2025-06-23" and str(thisw["end"])[:10] == "2025-06-30"
     lastw = resolve_temporal_scope(temporal="last week", now=now)
-    assert lastw["mode"] == "range" and (lastw["start"], lastw["end"]) == ("2025-06-16", "2025-06-22")
+    assert lastw["mode"] == "range" and (lastw["start"], lastw["end"]) == (
+        "2025-06-16",
+        "2025-06-22",
+    )
     assert resolve_temporal_scope(temporal="before earnings", now=now)["mode"] == "as_of"
     assert resolve_temporal_scope(temporal="latest available data", now=now)["mode"] == "latest-available"
     assert resolve_temporal_scope(temporal="most recent filing", now=now)["mode"] == "as_of"
@@ -3398,7 +3664,12 @@ def test_crap_superseded_violation_edges() -> None:
 
     assert superseded_current_violation([{"form": "8-K", "known_at": "2025-01-01"}], "X") is None
     filings: list[object] = [
-        {"form": "10-K", "known_at": "2024-02-10", "accession_no": "OLD", "superseded_by": "NEW"},
+        {
+            "form": "10-K",
+            "known_at": "2024-02-10",
+            "accession_no": "OLD",
+            "superseded_by": "NEW",
+        },
         {"form": "10-K", "known_at": "2025-02-14", "accession_no": "NEW"},
     ]
     assert superseded_current_violation(filings, [], as_of="2025-06-30") is None
@@ -3504,7 +3775,11 @@ def test_eval_committee_same_freeze_and_trio_created_before_run(
     fid, stock_jid, bull_jid, bear_jid = _eval_trio_ids(repo, sid, eid)
     assert repo.get_session(sid).freeze_ids[-1] == fid
     assert len({stock_jid, bull_jid, bear_jid}) == 3
-    for jid, role in ((stock_jid, "stockbot"), (bull_jid, "bullbot"), (bear_jid, "bearbot")):
+    for jid, role in (
+        (stock_jid, "stockbot"),
+        (bull_jid, "bullbot"),
+        (bear_jid, "bearbot"),
+    ):
         job = repo.get_job(jid)
         assert job.job_type == role and job.status == "running"
         _svc.record_committee_analysis(sid, jid, role, _committee_analysis(eid), repo=repo)
@@ -3534,11 +3809,21 @@ def test_eval_committee_cross_role_write_rejected_and_freeze_immutable(
     now = _dt(2026, 8, 10, tzinfo=UTC)
     with pytest.raises(_dc.FrozenInstanceError):
         frozen_obj = EvidenceFreeze(
-            freeze_id=fid, session_id=sid, wave_id=1, created_at=now, as_of=now, evidence_ids=(eid,), content_hash="h"
+            freeze_id=fid,
+            session_id=sid,
+            wave_id=1,
+            created_at=now,
+            as_of=now,
+            evidence_ids=(eid,),
+            content_hash="h",
         )
         _frozen_write(frozen_obj, "evidence_ids", ("tampered",))
     _svc.record_committee_analysis(
-        sid, stock_jid, "stockbot", _committee_analysis(eid, ["Probe Azure terms?"]), repo=repo
+        sid,
+        stock_jid,
+        "stockbot",
+        _committee_analysis(eid, ["Probe Azure terms?"]),
+        repo=repo,
     )
     assert repo.get_freeze(fid)["freeze_id"] == fid
 
@@ -3560,7 +3845,11 @@ def test_eval_committee_claims_resolve_and_requests_not_evidence(
         _svc.record_committee_analysis(sid, stock_jid, "stockbot", _committee_analysis("EV-NOPE"), repo=repo)
     n_evidence = len(repo.list_evidence(sid))
     _svc.record_committee_analysis(
-        sid, stock_jid, "stockbot", _committee_analysis(eid, ["Probe Azure terms?"]), repo=repo
+        sid,
+        stock_jid,
+        "stockbot",
+        _committee_analysis(eid, ["Probe Azure terms?"]),
+        repo=repo,
     )
     assert len(repo.list_evidence(sid)) == n_evidence
 
@@ -3579,7 +3868,11 @@ def test_eval_finalize_renders_answer_same_turn(tmp_path: Path, monkeypatch: pyt
     for role in ("stockbot", "bullbot", "bearbot"):
         jid = str(_svc.start_job(sid, role, repo=repo, wave_id=1)["job_id"])
         _svc.record_committee_analysis(
-            sid, jid, role, _committee_analysis(eid, claim_text="MSFT Azure exposure"), repo=repo
+            sid,
+            jid,
+            role,
+            _committee_analysis(eid, claim_text="MSFT Azure exposure"),
+            repo=repo,
         )
     _svc.decide_next_wave(sid, repo=repo)
     out = _svc.finalize_session(
@@ -3662,7 +3955,10 @@ def test_invariant_search_id_never_passes_as_accession(tmp_path: Path, monkeypat
     sid, src = _inv_sid(repo)
     with pytest.raises(ValueError, match="ERR_PROVENANCE_MISMATCH"):
         _svc.record_evidence(
-            sid, src, {**_svc_item(f"{sid}:ev:1"), "source_record_id": "s1", "search_id": "s1"}, repo=repo
+            sid,
+            src,
+            {**_svc_item(f"{sid}:ev:1"), "source_record_id": "s1", "search_id": "s1"},
+            repo=repo,
         )
     with pytest.raises(ValueError, match="ERR_ACCESSION_FORMAT"):
         _svc.record_evidence(sid, src, {**_svc_item(f"{sid}:ev:2"), "source_record_id": "s-1"}, repo=repo)
@@ -4055,7 +4351,11 @@ def test_invariant_sufficient_rejects_residual_branches(tmp_path: Path, monkeypa
             _svc.submit_source_result(src, coverage=cov, evidence_ids=[eid], repo=repo)
     with pytest.raises(ValueError, match="ERR_COVERAGE_INCOMPLETE"):
         _svc.submit_source_result(
-            src, coverage=_reg_cov(), evidence_ids=[eid], unresolved_questions=["still open?"], repo=repo
+            src,
+            coverage=_reg_cov(),
+            evidence_ids=[eid],
+            unresolved_questions=["still open?"],
+            repo=repo,
         )
     assert repo.get_job(src).status == "running"
     out = _svc.submit_source_result(src, coverage=_reg_cov(), evidence_ids=[eid], repo=repo)
@@ -4133,7 +4433,13 @@ def test_invariant_committee_roles_stay_out_of_the_tool_lane(tmp_path: Path, mon
     created = trio.get("jobs")
     assert isinstance(created, list) and len(created) == 3
     for jid in created:
-        for tool in ("search_sec_filings", "get_sec_document", "get_sec_filing", "research_add_evidence", "search_web"):
+        for tool in (
+            "search_sec_filings",
+            "get_sec_document",
+            "get_sec_filing",
+            "research_add_evidence",
+            "search_web",
+        ):
             with pytest.raises(ValueError, match="forbids"):
                 _svc.authorize_and_consume_dispatch(sid, str(jid), tool, repo=repo)
         with pytest.raises(ValueError):
@@ -4157,7 +4463,11 @@ def test_invariant_committee_follow_ups_route_through_director_gate(
     for i, role in enumerate(("stockbot", "bullbot", "bearbot")):
         jid = str(_svc.start_job(sid, role, repo=repo, wave_id=1)["job_id"])
         _svc.record_committee_analysis(
-            sid, jid, role, _committee_analysis(eid, [follow_up] if i == 0 else []), repo=repo
+            sid,
+            jid,
+            role,
+            _committee_analysis(eid, [follow_up] if i == 0 else []),
+            repo=repo,
         )
     assert len(repo.list_evidence(sid)) == 1  # requests never become evidence
     out = _svc.decide_next_wave(sid, repo=repo)
@@ -4170,11 +4480,18 @@ def test_invariant_committee_follow_ups_route_through_director_gate(
     _svc.record_evidence(sid2, src2, {**_svc_item(eid2), "subject": "GS"}, repo=repo)
     _svc.complete_job(src2, {}, repo=repo)
     _svc.freeze_session(sid2, 1, repo=repo)
-    off_lane = {"question": "What does the press say about the terms?", "suggested_source": "web"}
+    off_lane = {
+        "question": "What does the press say about the terms?",
+        "suggested_source": "web",
+    }
     for i, role in enumerate(("stockbot", "bullbot", "bearbot")):
         jid = str(_svc.start_job(sid2, role, repo=repo, wave_id=1)["job_id"])
         _svc.record_committee_analysis(
-            sid2, jid, role, _committee_analysis(eid2, [off_lane] if i == 0 else []), repo=repo
+            sid2,
+            jid,
+            role,
+            _committee_analysis(eid2, [off_lane] if i == 0 else []),
+            repo=repo,
         )
     out2 = _svc.decide_next_wave(sid2, repo=repo)
     assert out2["authorized"] is False and out2["stop_reason"] == "not_actionable"
@@ -4269,13 +4586,17 @@ def test_invariant_claims_only_envelope_is_incomplete(tmp_path: Path, monkeypatc
     jid = str(_svc.start_job(sid, "stockbot", repo=repo, wave_id=1)["job_id"])
     with pytest.raises(ValueError, match="ERR_COMMITTEE_ENVELOPE_INCOMPLETE"):
         _svc.record_committee_analysis(
-            sid, jid, "stockbot", {"claims": [{"text": "finding", "evidence_ids": [eid]}], "follow_ups": []}, repo=repo
+            sid,
+            jid,
+            "stockbot",
+            {"claims": [{"text": "finding", "evidence_ids": [eid]}], "follow_ups": []},
+            repo=repo,
         )
     assert repo.get_job(jid).status == "running"  # the incomplete envelope never closes the job
 
 
 def test_invariant_claim_type_is_declared_never_promoted() -> None:
-    """Absent type stays inference; observed_fact/contradicted need a freeze id; citations never upgrade."""
+    """Absent type stays inference; observed_fact/contradicted/conditional_risk/attributed_report need a freeze id; citations never upgrade."""
     from app.research.agents import ModelOutputFailure
     from app.research.agents.stockbot import run_stockbot
 
@@ -4298,20 +4619,70 @@ def test_invariant_claim_type_is_declared_never_promoted() -> None:
     assert undeclared.claims[0].evidence_ids == ["EV-1"]
     declared = _run(
         lambda prompt: _committee_output(
-            [{"text": "Revenue grew.", "claim_type": "observed_fact", "evidence_ids": ["EV-1"]}]
+            [
+                {
+                    "text": "Revenue grew.",
+                    "claim_type": "observed_fact",
+                    "evidence_ids": ["EV-1"],
+                }
+            ]
         )
     )
     assert [c.claim_type for c in declared.claims] == ["observed_fact"]
+    qualified = _run(
+        lambda prompt: _committee_output(
+            [
+                {
+                    "text": "A default could impair the marks.",
+                    "claim_type": "conditional_risk",
+                    "evidence_ids": ["EV-1"],
+                },
+                {
+                    "text": "Management said exposure is capped.",
+                    "claim_type": "attributed_report",
+                    "evidence_ids": ["EV-1"],
+                },
+            ]
+        )
+    )
+    assert [c.claim_type for c in qualified.claims] == [
+        "conditional_risk",
+        "attributed_report",
+    ]
     with pytest.raises(ModelOutputFailure, match="uncited"):
         _run(
             lambda prompt: _committee_output(
-                [{"text": "Revenue grew.", "claim_type": "observed_fact", "evidence_ids": []}]
+                [
+                    {
+                        "text": "A default could impair the marks.",
+                        "claim_type": "conditional_risk",
+                        "evidence_ids": [],
+                    }
+                ]
+            )
+        )
+    with pytest.raises(ModelOutputFailure, match="uncited"):
+        _run(
+            lambda prompt: _committee_output(
+                [
+                    {
+                        "text": "Revenue grew.",
+                        "claim_type": "observed_fact",
+                        "evidence_ids": [],
+                    }
+                ]
             )
         )
     with pytest.raises(ModelOutputFailure, match="EV-999"):
         _run(
             lambda prompt: _committee_output(
-                [{"text": "Revenue grew.", "claim_type": "observed_fact", "evidence_ids": ["EV-999"]}]
+                [
+                    {
+                        "text": "Revenue grew.",
+                        "claim_type": "observed_fact",
+                        "evidence_ids": ["EV-999"],
+                    }
+                ]
             )
         )
 
@@ -4477,7 +4848,8 @@ def test_prop_accession_normalization_is_idempotent(text: str) -> None:
 
 @settings(max_examples=200, derandomize=True)
 @given(
-    st.text(alphabet=_ACCESSION_ALPHABET, max_size=24), st.text(alphabet="0123456789abcdef", min_size=1, max_size=12)
+    st.text(alphabet=_ACCESSION_ALPHABET, max_size=24),
+    st.text(alphabet="0123456789abcdef", min_size=1, max_size=12),
 )
 def test_prop_provenance_accepts_exactly_canonical_accessions(blob: str, search_id: str) -> None:
     """sec_source provenance accepts exactly what accession normalization accepts; search runs stay search runs."""
@@ -4487,7 +4859,12 @@ def test_prop_provenance_accepts_exactly_canonical_accessions(blob: str, search_
         validate_provenance,
     )
 
-    item: dict[str, object] = {"kind": "sec_source", "accession_no": blob, "document_name": "d.htm", "passage": "p"}
+    item: dict[str, object] = {
+        "kind": "sec_source",
+        "accession_no": blob,
+        "document_name": "d.htm",
+        "passage": "p",
+    }
     try:
         canonical = normalize_accession(blob)
     except ValueError:
@@ -4568,7 +4945,13 @@ def test_accession_forms_normalize_to_canonical() -> None:
 
     assert normalize_accession("0000320193-25-000079") == "0000320193-25-000079"
     assert normalize_accession("000032019325000079") == "0000320193-25-000079"
-    for bad in ("7768855a3f91", "0000320193-25-00007", "0000320193/25/000079", "", "0000320193-25-000079x"):
+    for bad in (
+        "7768855a3f91",
+        "0000320193-25-00007",
+        "0000320193/25/000079",
+        "",
+        "0000320193-25-000079x",
+    ):
         with pytest.raises(ValueError):
             normalize_accession(bad)
 
@@ -4600,7 +4983,12 @@ def _nov_row(
         "content_hash": digest or f"h-{eid}",
     }
     if accession:
-        row["provenance"] = {"kind": "sec_source", "accession_no": accession, "document_name": document, "passage": "p"}
+        row["provenance"] = {
+            "kind": "sec_source",
+            "accession_no": accession,
+            "document_name": document,
+            "passage": "p",
+        }
     if record_id:
         row["source_record_id"] = record_id
         row["source_name"] = "SEC 10-K"
@@ -4618,10 +5006,24 @@ def test_gate_novelty_walks_rows_relationships_and_streak(tmp_path: Path, monkey
     repo.save_evidence(_nov_row(sid, f"{sid}:ev:2", 1, record_id="r-1"))  # accession fallback identity
     repo.save_evidence(_nov_row(sid, f"{sid}:ev:3", 1, subject="AMD"))  # no identity at all
     repo.save_evidence(
-        _nov_row(sid, f"{sid}:ev:4", 2, accession="0000320193-25-000079", document="a.htm", digest=f"h-{sid}:ev:1")
+        _nov_row(
+            sid,
+            f"{sid}:ev:4",
+            2,
+            accession="0000320193-25-000079",
+            document="a.htm",
+            digest=f"h-{sid}:ev:1",
+        )
     )  # re-read of a held document
     repo.save_evidence(
-        _nov_row(sid, f"{sid}:ev:5", 2, accession="0000320193-25-000081", document="b.htm", subject="AMD")
+        _nov_row(
+            sid,
+            f"{sid}:ev:5",
+            2,
+            accession="0000320193-25-000081",
+            document="b.htm",
+            subject="AMD",
+        )
     )
     repo.save_event(append_event(sid, "research_loop_detected", "runner", "runner", {}))
     repo.save_event(append_event(sid, "wave.novelty", "runner", "runner", {"zero_novelty_actions": 2}))
@@ -4695,7 +5097,11 @@ def test_telemetry_ledger_unresolvable_and_journal_fallback(tmp_path: Path, monk
     sid, src = _svc_sid(repo)
     repo.save_event(
         append_event(
-            sid, "tool.completed", "runner", "runner", {"tool": "search_sec_filings", "args": {"query": "NVDA 10-K"}}
+            sid,
+            "tool.completed",
+            "runner",
+            "runner",
+            {"tool": "search_sec_filings", "args": {"query": "NVDA 10-K"}},
         )
     )
     coverage: dict[str, object] = {
@@ -4723,7 +5129,14 @@ def test_telemetry_no_coverage_relationships_and_storage_degradation(
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     repo = ResearchRepository()
     sid, _ = _svc_sid(repo)
-    repo.save_evidence({"evidence_id": f"{sid}:ev:1", "session_id": sid, "wave_id": 1, "subject": "NVDA"})
+    repo.save_evidence(
+        {
+            "evidence_id": f"{sid}:ev:1",
+            "session_id": sid,
+            "wave_id": 1,
+            "subject": "NVDA",
+        }
+    )
     bare = _svc._derive_telemetry(repo, sid)
     assert bare.get("branches_covered") is None and bare.get("branches_remaining") is None
     assert bare.get("filings_opened") is None and bare.get("documents_opened") is None
@@ -4941,7 +5354,11 @@ def _hf_sid(repo: ResearchRepository, *sources: str, q: str = "NVDA demand?") ->
     from app.research import service as _svc
 
     sid = _svc.create_research(
-        q, "o", as_of="2025-06-30T00:00:00+00:00", policy=_hf_policy(*sources) if sources else None, repo=repo
+        q,
+        "o",
+        as_of="2025-06-30T00:00:00+00:00",
+        policy=_hf_policy(*sources) if sources else None,
+        repo=repo,
     )
     return sid, repo.list_jobs(sid)[0].job_id
 
@@ -5013,11 +5430,20 @@ def test_hf_sources_carry_kernel_integrity() -> None:
 
     obs = {
         "evidence_id": "EV-1",
-        "provenance": {"kind": "finra_record", "tool_name": "query_finra", "record_identity": "row-1"},
+        "provenance": {
+            "kind": "finra_record",
+            "tool_name": "query_finra",
+            "record_identity": "row-1",
+        },
     }
     rows = _normalize_sources(None, [GroundedClaim(text="t", evidence_ids=["EV-1"])], [obs])
     assert rows == [
-        {"evidence_id": "EV-1", "domain": "FINRA", "document": "", "integrity_class": "CANONICAL_STRUCTURED"}
+        {
+            "evidence_id": "EV-1",
+            "domain": "FINRA",
+            "document": "",
+            "integrity_class": "CANONICAL_STRUCTURED",
+        }
     ]
     assert "CANONICAL_STRUCTURED" in _source_line(rows[0])
     # Caller-supplied rows still get kernel integrity from the matching observation.
@@ -5091,13 +5517,20 @@ def test_hf_normalize_coverage_keeps_submit_keys_verbatim() -> None:
     from app.research.synthesis.final import _coverage_lines, _normalize_coverage
 
     coverage: dict[str, object] = {
-        "sec": {"docs": ["0000320193-25-000079"], "forms_examined": ["10-K"], "search_runs": ["s1"]},
+        "sec": {
+            "docs": ["0000320193-25-000079"],
+            "forms_examined": ["10-K"],
+            "search_runs": ["s1"],
+        },
         "finra": {
             "datasets_queried": ["short-interest"],
             "settlement_windows_covered": ["2025-06-15"],
             "tickers_covered": ["NVDA"],
         },
-        "web": {"queries_executed": ["NVDA news"], "results_inspected": ["https://example.com/a"]},
+        "web": {
+            "queries_executed": ["NVDA news"],
+            "results_inspected": ["https://example.com/a"],
+        },
     }
     norm = _normalize_coverage(coverage)
     sec = norm["sec"]
@@ -5151,7 +5584,11 @@ def test_hf_default_session_is_sec_only(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     repo = ResearchRepository()
     sid, _ = _hf_sid(repo)
-    assert repo.get_session(sid).source_policy == {"allowed": ["SEC"], "denied": [], "mode": "allowlist"}
+    assert repo.get_session(sid).source_policy == {
+        "allowed": ["SEC"],
+        "denied": [],
+        "mode": "allowlist",
+    }
 
 
 def test_hf_sec_only_denies_finra_and_web_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5181,7 +5618,16 @@ def test_hf_multisource_policy_allows_three_desks(tmp_path: Path, monkeypatch: p
         "mode": "allowlist",
     }
     ids = [
-        str(_svc.start_job(sid, "source_agent", source=d, budget={"owner": "omp"}, repo=repo, wave_id=1)["job_id"])
+        str(
+            _svc.start_job(
+                sid,
+                "source_agent",
+                source=d,
+                budget={"owner": "omp"},
+                repo=repo,
+                wave_id=1,
+            )["job_id"]
+        )
         for d in ("SEC", "FINRA", "WEB")
     ]
     assert len(set(ids)) == 3
@@ -5301,7 +5747,14 @@ def test_hf_replay_rejects_cross_wave_lane(tmp_path: Path, monkeypatch: pytest.M
     repo = ResearchRepository()
     sid, _ = _hf_sid(repo, "SEC", "FINRA", "WEB")
     w1 = str(_svc.start_job(sid, "source_agent", source="FINRA", repo=repo, wave_id=1)["job_id"])
-    w1_rid = _hf_persist_finra(repo, sid, w1, f"{sid}:tr:w1", as_of_date="2025-06-15", published_at="2025-06-15")
+    w1_rid = _hf_persist_finra(
+        repo,
+        sid,
+        w1,
+        f"{sid}:tr:w1",
+        as_of_date="2025-06-15",
+        published_at="2025-06-15",
+    )
     w1_marker = w1_rid.rsplit(":tr:", 1)[-1]
     _svc.record_evidence(
         sid,
@@ -5337,7 +5790,14 @@ def test_hf_replay_rejects_cross_wave_lane(tmp_path: Path, monkeypatch: pytest.M
             },
             repo=repo,
         )
-    w2_rid = _hf_persist_finra(repo, sid, w2, f"{sid}:tr:w2", as_of_date="2025-06-15", published_at="2025-06-15")
+    w2_rid = _hf_persist_finra(
+        repo,
+        sid,
+        w2,
+        f"{sid}:tr:w2",
+        as_of_date="2025-06-15",
+        published_at="2025-06-15",
+    )
     w2_marker = w2_rid.rsplit(":tr:", 1)[-1]
     out = _svc.record_evidence(
         sid,
@@ -5389,7 +5849,12 @@ def test_hf_admission_rejects_fabricated_sec_handle(tmp_path: Path, monkeypatch:
             repo=repo,
         )
     with pytest.raises(ValueError, match="ERR_PROVENANCE_MISMATCH"):
-        _svc.record_evidence(sid, src, _svc_item(f"{sid}:ev:4", source_record_id="0000320193-25-000080"), repo=repo)
+        _svc.record_evidence(
+            sid,
+            src,
+            _svc_item(f"{sid}:ev:4", source_record_id="0000320193-25-000080"),
+            repo=repo,
+        )
     assert repo.list_evidence(sid) == []
 
 
@@ -5401,7 +5866,13 @@ def test_hf_admission_rejects_fabricated_finra_record(tmp_path: Path, monkeypatc
     repo = ResearchRepository()
     sid, src = _hf_sid(repo, "SEC", "FINRA", "WEB")
     finra_row = {k: v for k, v in _svc_item(f"{sid}:ev:1").items() if k != "source_handle"}
-    finra_row.update({"content": "short interest 5%", "claim_text": "short interest 5%", "source_name": "FINRA"})
+    finra_row.update(
+        {
+            "content": "short interest 5%",
+            "claim_text": "short interest 5%",
+            "source_name": "FINRA",
+        }
+    )
     with pytest.raises(ValueError, match="ERR_RAW_SOURCE_REQUIRED"):
         _svc.record_evidence(sid, src, finra_row, repo=repo)
     assert repo.list_evidence(sid) == []
@@ -5478,7 +5949,11 @@ def test_hf_pit_unknown_time_fails_closed(tmp_path: Path, monkeypatch: pytest.Mo
     item.pop("known_at", None)
     # Archive is the PIT authority: caller known_at is overwritten by the
     # materialized timing, so unknown time is driven by the archive row.
-    seam._SOURCE_TIMING[("0000320193-25-000081", "nvda-undated.htm")] = ("", "2025-04-30", "2025-05-01T00:00:00Z")
+    seam._SOURCE_TIMING[("0000320193-25-000081", "nvda-undated.htm")] = (
+        "",
+        "2025-04-30",
+        "2025-05-01T00:00:00Z",
+    )
 
     with pytest.raises(ValueError, match="PIT_UNVERIFIED|rejected"):
         _svc.record_evidence(sid, src, item, repo=repo)
@@ -5506,7 +5981,9 @@ def test_hf_multisource_freeze_hash_stable(tmp_path: Path, monkeypatch: pytest.M
             document_name="nvda-2.htm",
             source_uri="https://sec.gov/2",
             source_handle=seam.handle_for(
-                "Second frozen passage.", accession="0000320193-25-000080", document="nvda-2.htm"
+                "Second frozen passage.",
+                accession="0000320193-25-000080",
+                document="nvda-2.htm",
             ),
         ),
         repo=repo,
@@ -5529,7 +6006,14 @@ def test_hf_finra_only_followup_single_desk(tmp_path: Path, monkeypatch: pytest.
     repo = ResearchRepository()
     sid, _ = _hf_sid(repo, "FINRA")
     fin = str(
-        _svc.start_job(sid, "source_agent", source="FINRA", budget={"owner": "omp"}, repo=repo, wave_id=1)["job_id"]
+        _svc.start_job(
+            sid,
+            "source_agent",
+            source="FINRA",
+            budget={"owner": "omp"},
+            repo=repo,
+            wave_id=1,
+        )["job_id"]
     )
     assert repo.get_job(fin).source_domain == "FINRA"
     with pytest.raises(ValueError, match="policy_denied"):
@@ -5646,9 +6130,17 @@ def test_hf_resume_after_one_committee_no_dup(tmp_path: Path, monkeypatch: pytes
     eid = f"{sid}:ev:1"
     first = str(_svc.start_job(sid, "stockbot", repo=repo, wave_id=1)["job_id"])
     _svc.record_committee_analysis(sid, first, "stockbot", _svc_ana(eid), repo=repo)
-    before = (len(repo.list_jobs(sid)), len(repo.list_evidence(sid)), list(repo.get_session(sid).freeze_ids))
+    before = (
+        len(repo.list_jobs(sid)),
+        len(repo.list_evidence(sid)),
+        list(repo.get_session(sid).freeze_ids),
+    )
     _svc.resume_research(sid, repo=repo)
-    assert (len(repo.list_jobs(sid)), len(repo.list_evidence(sid)), list(repo.get_session(sid).freeze_ids)) == before
+    assert (
+        len(repo.list_jobs(sid)),
+        len(repo.list_evidence(sid)),
+        list(repo.get_session(sid).freeze_ids),
+    ) == before
     assert repo.get_job(first).status == "completed"
     rest = _svc.create_committee_jobs(sid, 1, repo=repo)
     rest_jobs_raw = rest["jobs"]
@@ -5674,7 +6166,14 @@ def test_hf_provenance_vocab_closed() -> None:
         web_source_ref,
     )
 
-    assert set(PROVENANCE_KINDS) == {"sec_source", "sec_record", "finra_record", "web_source", "search_run", "none"}
+    assert set(PROVENANCE_KINDS) == {
+        "sec_source",
+        "sec_record",
+        "finra_record",
+        "web_source",
+        "search_run",
+        "none",
+    }
     assert validate_provenance({"kind": "none"}) == {"kind": "none"}
     assert validate_provenance(search_run_ref(search_id="s1", query="q"))["kind"] == "search_run"
     sec = sec_source_ref(
@@ -5772,13 +6271,14 @@ def test_hf_persist_accepts_matching_domain_tools(tmp_path: Path, monkeypatch: p
 
 
 def test_hf_persist_rejects_cross_domain_and_sec(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """persist_tool_result: cross-domain tools and every SEC-job persist fail closed."""
+    """Cross-domain tools and SEC tools without replay support fail closed."""
     from app.research import service as _svc
 
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     repo = ResearchRepository()
-    sid, sec = _hf_sid(repo, "SEC", "FINRA", "WEB")
+    sid, _first = _hf_sid(repo, "SEC", "FINRA", "WEB")
     fin, web = _hf_desks(repo, sid)
+    sec = str(_svc.start_job(sid, "source_agent", source="SEC", repo=repo, wave_id=1)["job_id"])
     with pytest.raises(ValueError, match="cannot ground FINRA evidence"):
         _svc.persist_tool_result(sid, fin, "search_web", f"{sid}:tr:x1", {"evidence": []}, repo=repo)
     with pytest.raises(ValueError, match="cannot ground WEB evidence"):
@@ -5786,7 +6286,7 @@ def test_hf_persist_rejects_cross_domain_and_sec(tmp_path: Path, monkeypatch: py
     with pytest.raises(ValueError, match="cannot ground FINRA evidence"):
         _svc.persist_tool_result(sid, fin, "list_finra_datasets", f"{sid}:tr:x3", {"datasets": []}, repo=repo)
     for tool in ("query_finra", "search_web", "get_sec_document"):
-        with pytest.raises(ValueError, match="persists no tool results"):
+        with pytest.raises(ValueError, match="cannot ground SEC replay"):
             _svc.persist_tool_result(sid, sec, tool, f"{sid}:tr:x-{tool}", {}, repo=repo)
 
 
@@ -5802,7 +6302,12 @@ def test_hf_persist_is_idempotent_first_bytes_win(tmp_path: Path, monkeypatch: p
     marker = rid.rsplit(":tr:", 1)[-1]
     _hf_persist_finra(repo, sid, fin, rid)
     again = _svc.persist_tool_result(
-        sid, fin, "query_finra", rid, {"records": [{"symbol": "ZZZ"}], "briefing": "other"}, repo=repo
+        sid,
+        fin,
+        "query_finra",
+        rid,
+        {"records": [{"symbol": "ZZZ"}], "briefing": "other"},
+        repo=repo,
     )
     assert again["tool_result_id"] == rid
     stored = _svc.get_tool_result(rid, repo=repo)
@@ -5853,7 +6358,10 @@ def test_hf_sec_record_identity_keys_on_record_and_tool_result(tmp_path: Path, m
     sid, _ = _hf_sid(repo)
     sec = str(_svc.start_job(sid, "source_agent", source="SEC", repo=repo, wave_id=1)["job_id"])
     payload: dict[str, object] = {
-        "filings": ["NVDA Form 4 accession 0001045810-25-000001", "NVDA 10-Q accession 0001045810-25-000002"],
+        "filings": [
+            "NVDA Form 4 accession 0001045810-25-000001",
+            "NVDA 10-Q accession 0001045810-25-000002",
+        ],
         "filed_at": "2025-06-01",
     }
     rid_a = str(
@@ -5882,8 +6390,16 @@ def test_hf_sec_record_identity_keys_on_record_and_tool_result(tmp_path: Path, m
     assert _hf_prov(first, "kind") == "sec_record"
     assert "duplicate_of" not in other_record and other_record["evidence_id"] == f"{sid}:ev:a-10q"
     assert "duplicate_of" not in other_result and other_result["evidence_id"] == f"{sid}:ev:b-form4"
-    assert repeat == {"evidence_id": f"{sid}:ev:a-form4", "accepted": False, "duplicate_of": f"{sid}:ev:a-form4"}
-    assert repo.list_evidence_ids(sid) == [f"{sid}:ev:a-form4", f"{sid}:ev:a-10q", f"{sid}:ev:b-form4"]
+    assert repeat == {
+        "evidence_id": f"{sid}:ev:a-form4",
+        "accepted": False,
+        "duplicate_of": f"{sid}:ev:a-form4",
+    }
+    assert repo.list_evidence_ids(sid) == [
+        f"{sid}:ev:a-form4",
+        f"{sid}:ev:a-10q",
+        f"{sid}:ev:b-form4",
+    ]
 
 
 def test_hf_replay_admits_web_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5916,7 +6432,9 @@ def test_hf_replay_admits_web_source(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert _hf_prov(out, "published_at") == "2025-06-20"
 
 
-def test_hf_replay_uses_explicit_store_and_rejects_cross_session(tmp_path: Path) -> None:
+def test_hf_replay_uses_explicit_store_and_rejects_cross_session(
+    tmp_path: Path,
+) -> None:
     """Explicit-repo replay reads the caller's DB and rejects another session's result."""
     from app.research import service as _svc
 
@@ -6086,20 +6604,41 @@ def test_hf_finra_known_at_gates_pit(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     early_job = str(_svc.start_job(sid, "source_agent", source="FINRA", repo=repo, wave_id=1)["job_id"])
     early_rid = _hf_persist_finra(
-        repo, sid, early_job, f"{sid}:tr:pit-early", as_of_date="2025-06-15", published_at="2025-06-15"
+        repo,
+        sid,
+        early_job,
+        f"{sid}:tr:pit-early",
+        as_of_date="2025-06-15",
+        published_at="2025-06-15",
     )
     _svc.record_evidence(
-        sid, early_job, _item(f"{sid}:ev:pit-early", early_rid, "NVDA short interest 12345 shares pit-early"), repo=repo
+        sid,
+        early_job,
+        _item(
+            f"{sid}:ev:pit-early",
+            early_rid,
+            "NVDA short interest 12345 shares pit-early",
+        ),
+        repo=repo,
     )
     late_job = str(_svc.start_job(sid, "source_agent", source="FINRA", repo=repo, wave_id=1)["job_id"])
     late_rid = _hf_persist_finra(
-        repo, sid, late_job, f"{sid}:tr:pit-late", as_of_date="2025-06-15", published_at="2025-07-15"
+        repo,
+        sid,
+        late_job,
+        f"{sid}:tr:pit-late",
+        as_of_date="2025-06-15",
+        published_at="2025-07-15",
     )
     with pytest.raises(ValueError, match="PIT_VIOLATION|rejected"):
         _svc.record_evidence(
             sid,
             late_job,
-            _item(f"{sid}:ev:pit-late", late_rid, "NVDA short interest 12345 shares pit-late"),
+            _item(
+                f"{sid}:ev:pit-late",
+                late_rid,
+                "NVDA short interest 12345 shares pit-late",
+            ),
             repo=repo,
         )
     bare_job = str(_svc.start_job(sid, "source_agent", source="FINRA", repo=repo, wave_id=1)["job_id"])
@@ -6108,7 +6647,11 @@ def test_hf_finra_known_at_gates_pit(tmp_path: Path, monkeypatch: pytest.MonkeyP
         _svc.record_evidence(
             sid,
             bare_job,
-            _item(f"{sid}:ev:pit-none", bare_rid, "NVDA short interest 12345 shares pit-none"),
+            _item(
+                f"{sid}:ev:pit-none",
+                bare_rid,
+                "NVDA short interest 12345 shares pit-none",
+            ),
             repo=repo,
         )
     assert [r["evidence_id"] for r in repo.list_evidence(sid)] == [f"{sid}:ev:pit-early"]
@@ -6122,7 +6665,14 @@ def test_hf_finra_settlement_is_not_publication(tmp_path: Path, monkeypatch: pyt
     repo = ResearchRepository()
     sid, _ = _hf_sid(repo, "SEC", "FINRA", "WEB")
     job = str(_svc.start_job(sid, "source_agent", source="FINRA", repo=repo, wave_id=1)["job_id"])
-    rid = _hf_persist_finra(repo, sid, job, f"{sid}:tr:pit-settle", as_of_date="2025-06-15", published_at="2025-07-15")
+    rid = _hf_persist_finra(
+        repo,
+        sid,
+        job,
+        f"{sid}:tr:pit-settle",
+        as_of_date="2025-06-15",
+        published_at="2025-07-15",
+    )
     with pytest.raises(ValueError, match="PIT_VIOLATION|rejected"):
         _svc.record_evidence(
             sid,
@@ -6172,11 +6722,18 @@ def test_hf_gate_finra_authorized_when_allowed(tmp_path: Path, monkeypatch: pyte
         repo=repo,
     )
     _svc.freeze_session(sid, 1, repo=repo)
-    follow_up = {"question": "What does FINRA short interest show for NVDA?", "suggested_source": "finra"}
+    follow_up = {
+        "question": "What does FINRA short interest show for NVDA?",
+        "suggested_source": "finra",
+    }
     for i, role in enumerate(("stockbot", "bullbot", "bearbot")):
         jid = str(_svc.start_job(sid, role, repo=repo, wave_id=1)["job_id"])
         _svc.record_committee_analysis(
-            sid, jid, role, _committee_analysis(eid, [follow_up] if i == 0 else []), repo=repo
+            sid,
+            jid,
+            role,
+            _committee_analysis(eid, [follow_up] if i == 0 else []),
+            repo=repo,
         )
     out = _svc.decide_next_wave(sid, repo=repo)
     assert out["authorized"] is True and out["targeted_domain"] == "finra"
@@ -6205,11 +6762,18 @@ def test_hf_gate_web_denied_when_sec_only(tmp_path: Path, monkeypatch: pytest.Mo
         repo=repo,
     )
     _svc.freeze_session(sid, 1, repo=repo)
-    off_lane = {"question": "What does the press say about the NVDA terms?", "suggested_source": "WEB"}
+    off_lane = {
+        "question": "What does the press say about the NVDA terms?",
+        "suggested_source": "WEB",
+    }
     for i, role in enumerate(("stockbot", "bullbot", "bearbot")):
         jid = str(_svc.start_job(sid, role, repo=repo, wave_id=1)["job_id"])
         _svc.record_committee_analysis(
-            sid, jid, role, _committee_analysis(eid, [off_lane] if i == 0 else []), repo=repo
+            sid,
+            jid,
+            role,
+            _committee_analysis(eid, [off_lane] if i == 0 else []),
+            repo=repo,
         )
     out = _svc.decide_next_wave(sid, repo=repo)
     assert out["authorized"] is False and out["stop_reason"] == "not_actionable"
@@ -6382,7 +6946,10 @@ def test_hf_finra_sufficient_with_residual_fails_incomplete(tmp_path: Path, monk
     )
     with pytest.raises(ValueError, match="ERR_COVERAGE_INCOMPLETE"):
         _svc.submit_source_result(
-            fin, coverage=_hf_finra_sufficient(remaining_branches=["Reg SHO"]), evidence_ids=[eid], repo=repo
+            fin,
+            coverage=_hf_finra_sufficient(remaining_branches=["Reg SHO"]),
+            evidence_ids=[eid],
+            repo=repo,
         )
     assert repo.get_job(fin).status == "running"
     sec_sid, sec = _hf_sid(repo)
@@ -6424,7 +6991,10 @@ def test_hf_replay_rejects_padded_finra_citation(tmp_path: Path, monkeypatch: py
     assert _hf_prov(out, "kind") == "finra_record"
     with pytest.raises(ValueError, match="ERR_PASSAGE_NOT_IN_SOURCE"):
         _svc.record_evidence(
-            sid, fin, _hf_replay_item(f"{sid}:ev:fin-padded", rid, briefing + " fabricated tail"), repo=repo
+            sid,
+            fin,
+            _hf_replay_item(f"{sid}:ev:fin-padded", rid, briefing + " fabricated tail"),
+            repo=repo,
         )
 
 
@@ -6441,7 +7011,13 @@ def test_hf_replay_rejects_padded_web_citation(tmp_path: Path, monkeypatch: pyte
     out = _svc.record_evidence(
         sid,
         web,
-        _hf_replay_item(f"{sid}:ev:web-exact", rid, highlight, source_name="web", known_at="2025-06-29T00:00:00+00:00"),
+        _hf_replay_item(
+            f"{sid}:ev:web-exact",
+            rid,
+            highlight,
+            source_name="web",
+            known_at="2025-06-29T00:00:00+00:00",
+        ),
         repo=repo,
     )
     assert _hf_prov(out, "kind") == "web_source"
@@ -6472,7 +7048,10 @@ def test_hf_stored_provenance_preserves_tool_result_id(tmp_path: Path, monkeypat
     web_rid = _hf_persist_web(repo, sid, web, f"{sid}:tr:web-id")
     marker = fin_rid.rsplit(":tr:", 1)[-1]
     fin_out = _svc.record_evidence(
-        sid, fin, _hf_replay_item(f"{sid}:ev:fin-id", fin_rid, f"NVDA short interest 12345 shares {marker}"), repo=repo
+        sid,
+        fin,
+        _hf_replay_item(f"{sid}:ev:fin-id", fin_rid, f"NVDA short interest 12345 shares {marker}"),
+        repo=repo,
     )
     web_out = _svc.record_evidence(
         sid,
@@ -6498,11 +7077,21 @@ def test_hf_rejected_evidence_journals_event(tmp_path: Path, monkeypatch: pytest
     repo = ResearchRepository()
     sid, _ = _hf_sid(repo, "SEC", "FINRA", "WEB")
     fin, _ = _hf_desks(repo, sid)
-    rid = _hf_persist_finra(repo, sid, fin, f"{sid}:tr:fin-rej", as_of_date="2025-06-15", published_at="2025-07-15")
+    rid = _hf_persist_finra(
+        repo,
+        sid,
+        fin,
+        f"{sid}:tr:fin-rej",
+        as_of_date="2025-06-15",
+        published_at="2025-07-15",
+    )
     marker = rid.rsplit(":tr:", 1)[-1]
     with pytest.raises(ValueError, match="PIT_VIOLATION|rejected"):
         _svc.record_evidence(
-            sid, fin, _hf_replay_item(f"{sid}:ev:fin-rej", rid, f"NVDA short interest 12345 shares {marker}"), repo=repo
+            sid,
+            fin,
+            _hf_replay_item(f"{sid}:ev:fin-rej", rid, f"NVDA short interest 12345 shares {marker}"),
+            repo=repo,
         )
     rejected = [e for e in repo.list_events(sid) if e.event_type == "evidence.rejected"]
     assert rejected and rejected[0].payload.get("evidence_id") == f"{sid}:ev:fin-rej"

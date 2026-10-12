@@ -190,6 +190,11 @@ def _source_ref_candidates(result: object) -> list[dict[str, object]]:
             for item in value:
                 if isinstance(item, dict):
                     candidates.append(item)
+    meta = result.get("meta")
+    if isinstance(meta, dict):
+        nested = meta.get("source_refs")
+        if isinstance(nested, dict):
+            candidates.append(nested)
     return candidates
 
 

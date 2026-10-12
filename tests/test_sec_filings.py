@@ -928,9 +928,17 @@ def test_filing_date_objects_normalize_to_str(monkeypatch: pytest.MonkeyPatch) -
 _VIEW_HTML = (
     "<html><head><style>.x{color:red}</style><script>var x = 1;</script></head>"
     "<body><!-- comment -->"
-    "<ix:nonNumeric name='x'>XBRL-NOISE-9</ix:nonNumeric>"
+    "<ix:header><ix:hidden><ix:nonNumeric name='x'>XBRL-NOISE-9</ix:nonNumeric></ix:hidden>"
+    "<ix:resources><xbrli:context id='c'><xbrli:entity>RESOURCE-NOISE-9</xbrli:entity>"
+    "</xbrli:context></ix:resources></ix:header>"
     "<h1>ITEM 1. Business</h1><p>alpha body</p>"
     "<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>"
+    "<table><tr><th>Revenue</th><th><ix:nonNumeric name='dei:DocumentPeriodEndDate'>"
+    "October 26, 2025</ix:nonNumeric></th><th>October 27, 2024</th></tr>"
+    "<tr><td>Revenue</td><td>$<ix:nonFraction name='us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax'"
+    " contextRef='current' unitRef='usd' scale='6'>57,006</ix:nonFraction></td>"
+    "<td>$<ix:nonFraction name='us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax'"
+    " contextRef='prior' unitRef='usd' scale='6'>35,082</ix:nonFraction></td></tr></table>"
     "<h1>ITEM 7. MD&amp;A</h1><p>beta body<a href='#f1'>1</a></p>"
     "<p id='f1'>footnote text</p>"
     "</body></html>"
@@ -987,8 +995,47 @@ def test_sec_view_strips_noise_keeps_tables_and_footnotes() -> None:
     assert "A | B" in view and "1 | 2" in view
     assert "alpha body" in view and "footnote text" in view
     assert "XBRL-NOISE-9" not in view
+    assert "RESOURCE-NOISE-9" not in view
     assert "color:red" not in view and "var x = 1;" not in view
     assert "comment" not in view
+
+
+@pytest.mark.parametrize(
+    "tag",
+    ["ix:header", "ix:hidden", "ix:resources", "ix:references", "xbrli:context", "xbrli:unit"],
+)
+def test_sec_view_removes_only_hidden_xbrl_blocks(tag: str) -> None:
+    source = (
+        f"<{tag}><ix:nonNumeric>HIDDEN-XBRL-DATA</ix:nonNumeric></{tag}><{tag}/>"
+        "<p>Revenue: <ix:nonFraction>57,006</ix:nonFraction></p>"
+        "<p>Period: <ix:nonNumeric>October 26, 2025</ix:nonNumeric></p>"
+    )
+    assert documents.render_sec_view(source) == "Revenue: 57,006\nPeriod: October 26, 2025"
+
+
+def test_sec_document_retains_visible_inline_facts_and_raw_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def _no_stored_text(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        return []
+
+    fake = _FakeFiling(accession="0003", attachments=[_FakeAttachment("primary.htm", text=_VIEW_HTML)])
+
+    def _fake_get(accession_no: str) -> _FakeFiling:
+        return fake
+
+    monkeypatch.setattr("app.sec.store.query_document_text", _no_stored_text)
+    monkeypatch.setattr(documents, "get_by_accession_number", _fake_get)
+    rendered = documents.get_sec_document("0003", "primary.htm", data_root=tmp_path)
+    assert rendered["view"] == "rendered"
+    assert isinstance(rendered["text"], str)
+    assert "Revenue | October 26, 2025 | October 27, 2024" in rendered["text"]
+    assert "Revenue | $57,006 | $35,082" in rendered["text"]
+    assert "XBRL-NOISE-9" not in rendered["text"] and "RESOURCE-NOISE-9" not in rendered["text"]
+    raw = documents.get_sec_document("0003", "primary.htm", raw=True, data_root=tmp_path)
+    assert raw["text"] == _VIEW_HTML
+    assert raw["content_hash"] == rendered["content_hash"]
+    assert raw["source_content_hash"] == rendered["source_content_hash"]
 
 
 def test_sec_view_section_select_offsets_stable() -> None:

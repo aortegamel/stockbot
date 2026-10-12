@@ -13,7 +13,7 @@ company, accession, and record helpers, models.ToolDecision contract.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from operator import itemgetter
 from typing import TYPE_CHECKING
 
@@ -118,7 +118,7 @@ def _signals(text: str) -> tuple[str, set[str]]:
     return " ".join(_normalize_discovery_text(text)), set(_discovery_keywords(text))
 
 
-def _registry_names(registry: _Registry) -> set[str]:
+def _registry_names(registry: Sequence[Mapping[str, JSONValue]]) -> set[str]:
     return {e.get("name") for e in registry if isinstance(e, dict) and isinstance(e.get("name"), str)}
 
 
@@ -161,7 +161,7 @@ def _short_tool(toks: set[str], norm: str, names: set[str]) -> str | None:
     return "get_short_interest" if "get_short_interest" in names else None
 
 
-def _has_accession(packets: list[JSONValue]) -> bool:
+def _has_accession(packets: Sequence[JSONValue]) -> bool:
     """Any accession-like token across attempts/ctx packets (scheduler scanner)."""
     from app.research.scheduler import _scan_packet_accession
 
@@ -186,10 +186,29 @@ def _router_pick(
     ctx_evidence: list[JSONValue],
 ) -> tuple[str, str] | None:
     """(tool, reason) or None when JEV must decide. Membership-gated: never picks outside the live registry."""
-    from app.research.scheduler import _ACCESSION_CARRY_TOOLS, _objective_company, _objective_ticker
+    from app.research.scheduler import (
+        _ACCESSION_CARRY_TOOLS,
+        _carry_packet_accession,
+        _objective_company,
+        _objective_ticker,
+    )
+
+    revenue_quarter = bool("revenue" in toks and toks & {"quarter", "10q"})
+    if revenue_quarter and any(a.get("tool") == "get_sec_document" and a.get("error") is not None for a in attempts):
+        return None  # JEV receives the rejected call through existing attempt feedback.
+    listed_10q = (
+        _carry_packet_accession("get_sec_document", {}, [], attempts, text)
+        if revenue_quarter and "10q" in toks
+        else None
+    )
 
     # 1. Carry-only registry (force-open narrowed): open the packet accession.
-    if names and names <= set(_ACCESSION_CARRY_TOOLS) and _has_accession([*attempts, *ctx_evidence]):
+    if (
+        names
+        and names <= set(_ACCESSION_CARRY_TOOLS)
+        and _has_accession([*attempts, *ctx_evidence])
+        and (not revenue_quarter or "10q" not in toks or listed_10q is not None)
+    ):
         if "get_sec_document" in names and toks & _READ_TOKS:
             return "get_sec_document", "carry:packet-doc"
         if "get_sec_filing" in names:
@@ -218,9 +237,16 @@ def _router_pick(
         (("filing" in toks or _FORM) and "mention" in norm) or "who filed" in norm or "who actually filed" in norm
     ):
         return _pick_variant("search_sec_filings", norm, toks, names), "person-mention"
-    # 6. Quarterly revenue always starts from the filing list.
-    if "revenue" in toks and "quarter" in toks and "list_sec_filings" in names:
-        return "list_sec_filings", "revenue-quarter"
+    # 6. Quarterly/10-Q revenue starts from the filing list, then reads the document
+    # the node's own listing names (carry picks its 10-Q; intake accessions never skip
+    # the list, same as force-open). After one read, later rules/JEV decide.
+    if revenue_quarter and not any(
+        isinstance(a, dict) and a.get("tool") == "get_sec_document" and a.get("error") is None for a in attempts
+    ):
+        if "get_sec_document" in names and (listed_10q is not None if "10q" in toks else _has_accession(attempts)):
+            return "get_sec_document", "revenue-quarter:doc"
+        if "list_sec_filings" in names:
+            return "list_sec_filings", "revenue-quarter"
     # 7. Filing list for a resolved ticker/company.
     if (
         "filing" in toks
@@ -239,30 +265,28 @@ def _router_pick(
     return None
 
 
-def _router_subset(ranked: list[tuple[int, str]], registry: _Registry, names: set[str]) -> _Registry | None:
-    """Top-5 scorer subset for the JEV fallback; None when the scorer is blank or the registry is already small."""
-    if not ranked:
-        return None
-    wanted = {n for _, n in ranked[:_TOP_N]}
-    # _ranked collapses each pair under the exhaustive name; re-expand so JEV keeps both variants.
-    for full, bounded in _VARIANTS.items():
-        if full in wanted:
-            wanted |= {full, bounded}
-    wanted &= names
-    if not wanted or len(wanted) >= len(names):
-        return None
-    return [e for e in registry if isinstance(e, dict) and e.get("name") in wanted]
-
-
 def _SMALL_TALK(prompt: str) -> bool:
     """Exact small-talk only: thanks / never mind / ok variants create no session."""
     text = " ".join(prompt.strip().lower().split())
-    return text in ("thanks", "thank you", "never mind", "nevermind", "ok", "okay", "got it", "great thanks")
+    return text in (
+        "thanks",
+        "thank you",
+        "never mind",
+        "nevermind",
+        "ok",
+        "okay",
+        "got it",
+        "great thanks",
+    )
 
 
 def programmatic_route(prompt: object) -> str | None:
     """Entry fast-path: research signals -> research_required, else None (JEV decides)."""
-    from app.research.scheduler import _ACCESSION_TOKEN_RE, _objective_company, _objective_ticker
+    from app.research.scheduler import (
+        _ACCESSION_TOKEN_RE,
+        _objective_company,
+        _objective_ticker,
+    )
 
     if not isinstance(prompt, str) or not prompt.strip():
         return "research_required"
@@ -311,7 +335,11 @@ async def programmatic_select_round(
         tool, reason = pick
         tool = _pick_variant(tool, norm, toks, names)
         decision = ToolDecision(
-            action="invoke", tool_name=tool, tool_names=(tool,), probabilities={tool: 1.0}, confidence=None
+            action="invoke",
+            tool_name=tool,
+            tool_names=(tool,),
+            probabilities={tool: 1.0},
+            confidence=None,
         )
         decision.validate("<programmatic_router>")
         sched._record(
@@ -325,22 +353,13 @@ async def programmatic_select_round(
             job_id=None,
             confidence=None,
         )
-        logger.info("toolflow programmatic sid=%s nid=%s tool=%s reason=%s", sid, nid, tool, reason)
-        return "invoke", decision
-    subset = _router_subset(ranked, registry, names)
-    if subset is not None:
         logger.info(
-            "toolflow programmatic_fallback sid=%s nid=%s subset=%s/%s",
+            "toolflow programmatic sid=%s nid=%s tool=%s reason=%s",
             sid,
             nid,
-            len(subset),
-            len(registry),
+            tool,
+            reason,
         )
-        action, decision = await sched._select_round(
-            jev, kernel, sid, nid, session, node, subset, ctx_evidence, attempts
-        )
-    else:
-        action, decision = await sched._select_round(
-            jev, kernel, sid, nid, session, node, registry, ctx_evidence, attempts
-        )
+        return "invoke", decision
+    action, decision = await sched._select_round(jev, kernel, sid, nid, session, node, registry, ctx_evidence, attempts)
     return action, _variant_decision(decision, norm, toks, names)

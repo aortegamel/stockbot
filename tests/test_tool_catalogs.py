@@ -8,7 +8,11 @@ from typing import override
 from app.decision_client import JevClient
 from app.research import scheduler
 from app.research.models import DecisionRecord, JSONValue, ToolDecision
-from app.research.tool_catalogs import build_tool_catalogs, catalog_options, catalog_select_round
+from app.research.tool_catalogs import (
+    build_tool_catalogs,
+    catalog_options,
+    catalog_select_round,
+)
 
 
 class _Kernel(scheduler._Kernel):
@@ -116,7 +120,10 @@ def test_catalog_pick_then_subset_select() -> None:
             kernel,
             "s1",
             "n1",
-            {"session_id": "s1", "objective": "List Apple's most recent 10-K and 10-Q filings."},
+            {
+                "session_id": "s1",
+                "objective": "List Apple's most recent 10-K and 10-Q filings.",
+            },
             _node("List Apple's most recent 10-K and 10-Q filings."),
             reg,
             [],
@@ -175,7 +182,10 @@ def test_pick_state_trims_blobs_and_caps_items() -> None:
     """Pick state keeps last-5 tool/error/outcome rows, blobs truncated, non-dicts dropped."""
     from app.research.tool_catalogs import _pick_state
 
-    items = [{"tool": "t", "outcome_summary": "x" * 5000, "error": "e" * 500}] * 20 + ["junk", 7]
+    items = [{"tool": "t", "outcome_summary": "x" * 5000, "error": "e" * 500}] * 20 + [
+        "junk",
+        7,
+    ]
     rows = _pick_state(items)
     assert len(rows) == 5
     assert all(isinstance(r, dict) for r in rows)

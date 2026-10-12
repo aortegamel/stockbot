@@ -5,7 +5,8 @@ import { AgentConsole } from "@/components/agent-console";
 import { PromptBox } from "@/components/prompt-box";
 import type { AgentEvent } from "@/lib/agent/types";
 
-// ponytail: stall watchdog — no chunk for this long aborts the stream; mirrors muse FETCH_TIMEOUT_MS.
+// ponytail: stall watchdog — no chunk for this long aborts the stream before reasoning starts.
+// It stops at reasoning_start: persona drafts are buffered server-side and have no time limit.
 const STALL_TIMEOUT_MS = 120_000;
 
 export default function Home() {
@@ -28,9 +29,11 @@ export default function Home() {
     const ctrl = new AbortController();
     let terminal = false;
     let stalled = false;
+    let reasoningStarted = false;
     let timer: number | undefined = undefined;
     const arm = () => {
       clearTimeout(timer);
+      if (reasoningStarted) return;
       timer = window.setTimeout(() => {
         stalled = true;
         ctrl.abort();
@@ -38,6 +41,10 @@ export default function Home() {
     };
     const push = (ev: AgentEvent) => {
       if (ev.type === "done" || ev.type === "error" || ev.type === "failed") terminal = true;
+      if (ev.type === "reasoning_start") {
+        reasoningStarted = true;
+        clearTimeout(timer);
+      }
       setEvents((prev) => [...prev, ev]);
     };
     arm();

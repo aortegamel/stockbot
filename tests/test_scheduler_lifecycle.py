@@ -1,17 +1,26 @@
 """Scheduler lifecycle: domain wiring, admit-then-complete, stall, expansion."""
 
 import asyncio
+import dataclasses
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import override
 from unittest import mock
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from app.decision_client import JevClient
 from app.reasoner_client import ReasonerClient
 from app.research import scheduler as sched
-from app.research.models import DecisionRecord, JSONValue, ResearchNode, ToolDecision, new_decision_id
+from app.research.models import (
+    DecisionRecord,
+    JSONValue,
+    ResearchNode,
+    ToolDecision,
+    new_decision_id,
+)
 from app.runtime import ToolResultMeta
 from app.tool_runtime import RuntimeToolSession, ToolOutcome
 
@@ -20,7 +29,11 @@ _FINRA_ROW: dict[str, JSONValue] = {
     "symbolCode": "XYZ",
     "currentShortPositionQuantity": 123,
 }
-_FINRA_RESULT: dict[str, JSONValue] = {"tool_result_id": "s1:tr:abc", "records": [_FINRA_ROW], "briefing": "B"}
+_FINRA_RESULT: dict[str, JSONValue] = {
+    "tool_result_id": "s1:tr:abc",
+    "records": [_FINRA_ROW],
+    "briefing": "B",
+}
 
 
 def _node(node_id: str = "n1", session_id: str = "s1") -> ResearchNode:
@@ -34,7 +47,11 @@ def _tool_session() -> RuntimeToolSession:
 class _Kernel(sched._Kernel):
     """Fake kernel recording lifecycle order; evidence and tool-result stores are in-memory."""
 
-    def __init__(self, tool_results: Mapping[str, dict[str, JSONValue]] | None = None, objective: str = "") -> None:
+    def __init__(
+        self,
+        tool_results: Mapping[str, dict[str, JSONValue]] | None = None,
+        objective: str = "",
+    ) -> None:
         super().__init__()
         self.calls: list[tuple[object, ...]] = []
         self.evidence: list[str] = []
@@ -114,7 +131,11 @@ class _Kernel(sched._Kernel):
 
     @override
     def create_node(
-        self, session_id: str, question: str, why_it_matters: str, depends_on: Sequence[str] | None = None
+        self,
+        session_id: str,
+        question: str,
+        why_it_matters: str,
+        depends_on: Sequence[str] | None = None,
     ) -> ResearchNode:
         return _node("n-new", session_id)
 
@@ -124,7 +145,12 @@ class _Kernel(sched._Kernel):
 
     @override
     def get_session(self, session_id: str) -> dict[str, JSONValue]:
-        return {"session_id": session_id, "objective": self.objective, "query": "", "as_of": None}
+        return {
+            "session_id": session_id,
+            "objective": self.objective,
+            "query": "",
+            "as_of": None,
+        }
 
     @override
     def list_evidence(self, session_id: str) -> list[dict[str, JSONValue]]:
@@ -141,7 +167,11 @@ class _DupKernel(_Kernel):
     @override
     def admit_evidence(self, session_id: str, job_id: str, data: Mapping[str, object]) -> dict[str, JSONValue]:
         self.calls.append(("admit", job_id))
-        return {"evidence_id": "ev-winner", "accepted": False, "duplicate_of": "ev-winner"}
+        return {
+            "evidence_id": "ev-winner",
+            "accepted": False,
+            "duplicate_of": "ev-winner",
+        }
 
 
 def _outcome(content: str = "record values here", error: str | None = None) -> ToolOutcome:
@@ -161,8 +191,26 @@ def _to_outcome(name: str, result: Mapping[str, object]) -> ToolOutcome:
     return _outcome()
 
 
+def _invoke_result(*a: object, **k: object) -> dict[str, JSONValue]:
+    return {"tool_result_id": "s1:tr:x"}
+
+
+def _xbrl_outcome(name: str, result: Mapping[str, object]) -> ToolOutcome:
+    return _outcome("NVDA XBRL fact")
+
+
+def _resolve_nvda(name: str) -> str | None:
+    return {"NVDA": "NVDA"}.get(name)
+
+
 def _invoke(tool: str) -> ToolDecision:
-    return ToolDecision(action="invoke", tool_name=tool, tool_names=(tool,), probabilities={}, confidence=1.0)
+    return ToolDecision(
+        action="invoke",
+        tool_name=tool,
+        tool_names=(tool,),
+        probabilities={},
+        confidence=1.0,
+    )
 
 
 class _JevAdmit(JevClient):
@@ -173,7 +221,7 @@ class _JevAdmit(JevClient):
     @override
     async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
         return {
-            "probabilities": {},
+            "probabilities": {"topical_relevance": 0.9, "resolution_support": 0.9},
             "confidence": 1.0,
             "continuation": "resolve_node",
             "continue": "resolve_node",
@@ -183,6 +231,8 @@ class _JevAdmit(JevClient):
             "admit": None,
             "evidence_state": "sufficient_support",
             "decision": "sufficient_support",
+            "topical_relevance_answer": "yes",
+            "resolution_support_answer": "yes",
         }
 
     @override
@@ -224,14 +274,25 @@ def test_admit_before_complete_with_finra_domain() -> None:
     seq = [c[0] for c in kernel.calls]
     assert seq.index("admit") < seq.index("complete"), seq
     assert res["status"] == "resolved" and res["admitted"] == 1
-    finra_result: dict[str, JSONValue] = {"tool_result_id": "s1:tr:abc", "records": [_FINRA_ROW]}
+    finra_result: dict[str, JSONValue] = {
+        "tool_result_id": "s1:tr:abc",
+        "records": [_FINRA_ROW],
+    }
     candidate = sched._evidence_candidate(
-        "query_finra", "FINRA", finra_result, _outcome(), _Kernel({"s1:tr:abc": finra_result})
+        "query_finra",
+        "FINRA",
+        finra_result,
+        _outcome(),
+        _Kernel({"s1:tr:abc": finra_result}),
     )
     assert candidate is not None
     row_text = " ".join(
         json.dumps(
-            {"settlementDate": "2024-01-01", "symbolCode": "XYZ", "currentShortPositionQuantity": 123},
+            {
+                "settlementDate": "2024-01-01",
+                "symbolCode": "XYZ",
+                "currentShortPositionQuantity": 123,
+            },
             sort_keys=True,
             default=str,
         ).split()
@@ -240,7 +301,13 @@ def test_admit_before_complete_with_finra_domain() -> None:
     replay = _finra_record_texts(
         {
             "result": {
-                "records": [{"settlementDate": "2024-01-01", "symbolCode": "XYZ", "currentShortPositionQuantity": 123}]
+                "records": [
+                    {
+                        "settlementDate": "2024-01-01",
+                        "symbolCode": "XYZ",
+                        "currentShortPositionQuantity": 123,
+                    }
+                ]
             },
             "tool_name": "query_finra",
         }
@@ -257,6 +324,224 @@ def test_sec_candidate_needs_handle_and_text() -> None:
     assert sched._sec_evidence_candidate(good_result, _outcome("words"), _Kernel()) is not None
     assert sched._sec_evidence_candidate({"text": "window words"}, _outcome("words"), _Kernel()) is None
     assert sched._sec_evidence_candidate({"source_handle": good_handle}, _outcome(""), _Kernel()) is None
+
+
+@pytest.mark.parametrize("runtime_envelope", [True, False], ids=["runtime-envelope", "canonical-text"])
+def test_sec_document_admits_full_window_with_bounded_summary(
+    runtime_envelope: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Admission preserves a revenue table after character 2,000. The attempt summary stays bounded."""
+    import tests.research_source_seam as seam
+    from app.research import service
+    from app.research.repository import ResearchRepository
+    from app.tool_runtime import outcome_from_result
+
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+    seam.install(monkeypatch)
+    fact = "Revenue | $ | 46,743 | $ | 30,040\nYear-over-year growth | 56%"
+    window = "Document context\n" + "Operating context. " * 130 + "\n" + fact + "\nEnd of the bounded window."
+    handle = seam.handle_for(window)
+    handle["query"] = "revenue"
+    assert window.index("Revenue") > sched._OUTCOME_SUMMARY_MAX
+    formatted = "Bottom line: SEC document\nCanonical window follows:\n" + window
+    result: dict[str, object] = {
+        "content": formatted,
+        "meta": {"source_handle": handle},
+        "tool_result_id": None,
+    }
+    if not runtime_envelope:
+        result["text"] = window
+        result["source_handle"] = handle
+    outcome = outcome_from_result("get_sec_document", result)
+    assert outcome.source_handle == handle
+    assert outcome.content != window
+    candidate = sched._evidence_candidate("get_sec_document", "SEC", result, outcome, _Kernel())
+    assert candidate is not None
+    assert candidate["content"] == candidate["matching_passage"] == window
+    store = ResearchRepository(data_root=tmp_path)
+    sid = service.create_research("What does the filing disclose?", repo=store)
+    node = service.create_node(sid, "q?", "w", repo=store)
+    kernel = sched._default_kernel(store)
+    jid = sched._attempt_job(kernel, sid, "SEC")
+    attempts: list[dict[str, JSONValue]] = []
+    settled = asyncio.run(
+        sched._settle_round(
+            [
+                {
+                    "tool": "get_sec_document",
+                    "source_domain": "SEC",
+                    "job_id": jid,
+                    "arguments": {
+                        "accession_no": handle["accession_no"],
+                        "query": "revenue",
+                    },
+                    "result": result,
+                    "outcome": outcome,
+                    "outcome_summary": sched._outcome_summary(outcome),
+                    "error": None,
+                }
+            ],
+            _JevAdmit(),
+            kernel,
+            _node(),
+            [],
+            attempts,
+            sid,
+            node.node_id,
+            _invoke("get_sec_document"),
+            0,
+            continuation=False,
+        )
+    )
+    assert settled["admitted"] == 1
+    assert attempts[0]["error"] is None
+    assert attempts[0]["outcome_summary"] == formatted[: sched._OUTCOME_SUMMARY_MAX]
+    summary = attempts[0]["outcome_summary"]
+    assert isinstance(summary, str)
+    assert len(summary) == 2000
+    assert fact not in summary
+    rows = store.list_evidence(sid)
+    assert len(rows) == 1
+    evidence = rows[0]
+    assert isinstance(evidence, dict)
+    assert evidence.get("content") == window
+    assert isinstance(evidence.get("provenance"), dict)
+    provenance = evidence.get("provenance")
+    assert isinstance(provenance, dict)
+    assert isinstance(provenance.get("passage"), str) and fact in str(provenance.get("passage"))
+    assert evidence.get("record_kind") == "evidence"
+    assert evidence.get("claim_kind") == "observed_fact"
+    assert provenance.get("text_hash") == handle["text_hash"]
+
+
+@pytest.mark.parametrize(
+    ("defect", "error_code"),
+    [
+        ("text_hash", "ERR_SEC_HANDLE_STALE"),
+        ("source_content_hash", "ERR_SEC_HANDLE_STALE"),
+        ("basis", "ERR_SEC_HANDLE_INVALID"),
+    ],
+)
+def test_sec_runtime_envelope_rejects_invalid_handle(
+    defect: str, error_code: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Canonical reload and admission reject stale hashes or invalid handle fields."""
+    import tests.research_source_seam as seam
+    from app.research.service import materialize_sec_passage
+    from app.tool_runtime import outcome_from_result
+
+    seam.install(monkeypatch)
+    handle = seam.handle_for("Revenue | $ | 46,743")
+    handle[defect] = "guessed" if defect == "basis" else "0" * 64
+    result: dict[str, object] = {
+        "content": "Bottom line: Formatted document output.",
+        "meta": {"source_handle": handle},
+        "tool_result_id": None,
+    }
+    outcome = outcome_from_result("get_sec_document", result)
+
+    class _ValidatedKernel(_Kernel):
+        @override
+        def admit_evidence(self, session_id: str, job_id: str, data: Mapping[str, object]) -> dict[str, JSONValue]:
+            handle = data["source_handle"]
+            passage = data["matching_passage"]
+            assert isinstance(handle, dict) and isinstance(passage, str)
+            materialize_sec_passage(handle, passage)
+            return super().admit_evidence(session_id, job_id, data)
+
+    kernel = _ValidatedKernel()
+    jid = sched._attempt_job(kernel, "s1", "SEC")
+    attempt = {
+        "result": result,
+        "job_id": jid,
+        "outcome_summary": sched._outcome_summary(outcome),
+    }
+    eid, progressed, failure = sched._admit_attempt_evidence(
+        kernel, "s1", "get_sec_document", attempt, outcome, "sufficient_support"
+    )
+    assert eid is None and not progressed
+    assert failure is not None and error_code in str(failure["error"])
+    assert kernel.evidence == []
+    assert ("complete", jid) in kernel.calls
+
+
+def test_sec_list_receipt_routes_through_persisted_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """list_sec_filings source_refs is a catalog receipt, never a handle: it replays by tool_result_id."""
+    import tests.research_source_seam as seam
+    from app.research.service import _handle_fields, _sec_record_texts
+    from app.tool_runtime import outcome_from_result
+
+    filing: dict[str, JSONValue] = {
+        "form": "8-K",
+        "accession_no": "0000320193-25-000079",
+        "url": "https://sec.gov/x",
+        "known_at": "2025-05-01",
+    }
+    listed: dict[str, JSONValue] = {
+        "tool_result_id": "s1:tr:list",
+        "filings": [filing],
+        "source": "SEC EDGAR",
+    }
+    receipt = outcome_from_result("list_sec_filings", dict(listed))
+    assert receipt.source_handle is None and receipt.source_refs
+    with pytest.raises(ValueError, match="ERR_SEC_HANDLE_INVALID"):
+        _handle_fields(receipt.source_refs)  # the receipt is no document handle
+    persisted: dict[str, JSONValue] = {
+        "tool_result_id": "s1:tr:list",
+        "tool_name": "list_sec_filings",
+        "result": listed,
+    }
+    reads: list[str] = []
+
+    class _StoredKernel(_Kernel):
+        @override
+        def get_tool_result(self, tool_result_id: str) -> dict[str, JSONValue]:
+            reads.append(tool_result_id)
+            return persisted
+
+    kernel = _StoredKernel()
+    cand = sched._evidence_candidate("list_sec_filings", "SEC", listed, receipt, kernel)
+    assert cand is not None and "source_handle" not in cand, cand
+    assert cand["tool_result_id"] == "s1:tr:list" and reads == ["s1:tr:list"]
+    assert cand["record_identity"] in _sec_record_texts(persisted)
+
+    # get_sec_document keeps its canonical handle; a malformed explicit handle still reaches the validator.
+    seam.install(monkeypatch)
+    passage = "Data center revenue grew."
+    handle = seam.handle_for(passage)
+    doc: dict[str, object] = {
+        "source_handle": handle,
+        "text": passage,
+        "content": passage,
+    }
+    doc_cand = sched._evidence_candidate(
+        "get_sec_document",
+        "SEC",
+        doc,
+        outcome_from_result("get_sec_document", doc),
+        kernel,
+    )
+    assert doc_cand is not None and doc_cand["source_handle"] == handle
+    _handle_fields(handle)
+    bogus: dict[str, object] = {
+        "source_handle": {"basis": "guessed"},
+        "text": passage,
+        "content": passage,
+    }
+    bad = sched._evidence_candidate(
+        "get_sec_document",
+        "SEC",
+        bogus,
+        outcome_from_result("get_sec_document", bogus),
+        kernel,
+    )
+    assert bad is not None and bad["source_handle"] == {"basis": "guessed"}
+    _bad_handle = bad["source_handle"]
+    assert isinstance(_bad_handle, Mapping)
+    with pytest.raises(ValueError, match="ERR_SEC_HANDLE_INVALID"):
+        _handle_fields(_bad_handle)
 
 
 def test_insufficient_evidence_state_skips_admission() -> None:
@@ -300,12 +585,22 @@ def test_duplicate_admission_signals_no_progress() -> None:
         @override
         async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
             base = await super().assess_result(*a, **k)
-            return {**base, "continuation": "continue_research", "continue": "continue_research"}
+            return {
+                **base,
+                "continuation": "continue_research",
+                "continue": "continue_research",
+            }
 
     def settle(kernel: _Kernel) -> dict[str, object]:
         result: dict[str, JSONValue] = {
             "tool_result_id": "s1:tr:abc",
-            "records": [{"settlementDate": "2024-01-01", "symbolCode": "XYZ", "currentShortPositionQuantity": 1}],
+            "records": [
+                {
+                    "settlementDate": "2024-01-01",
+                    "symbolCode": "XYZ",
+                    "currentShortPositionQuantity": 1,
+                }
+            ],
         }
         kernel.tool_results["s1:tr:abc"] = result
         record: dict[str, object] = {
@@ -320,15 +615,32 @@ def test_duplicate_admission_signals_no_progress() -> None:
         attempts: list[dict[str, JSONValue]] = []
         out = asyncio.run(
             sched._settle_round(
-                [record], _JevContinue(), kernel, _node(), [], attempts, "s1", "n1", _invoke("query_finra"), 0
+                [record],
+                _JevContinue(),
+                kernel,
+                _node(),
+                [],
+                attempts,
+                "s1",
+                "n1",
+                _invoke("query_finra"),
+                0,
             )
         )
         return {**out, "evidence_id": attempts[-1].get("evidence_id")}
 
     fresh = settle(_Kernel())
     dup = settle(_DupKernel())
-    assert (fresh["admitted"], fresh["progressed"], fresh["evidence_id"]) == (1, True, "ev-0")
-    assert (dup["admitted"], dup["progressed"], dup["evidence_id"]) == (0, False, "ev-winner")
+    assert (fresh["admitted"], fresh["progressed"], fresh["evidence_id"]) == (
+        1,
+        True,
+        "ev-0",
+    )
+    assert (dup["admitted"], dup["progressed"], dup["evidence_id"]) == (
+        0,
+        False,
+        "ev-winner",
+    )
 
 
 def test_assessment_evidence_is_scoped_to_current_node_jobs() -> None:
@@ -343,12 +655,22 @@ def test_assessment_evidence_is_scoped_to_current_node_jobs() -> None:
         async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
             seen.append(a[2])
             base = await super().assess_result(*a, **k)
-            return {**base, "continuation": "continue_research", "continue": "continue_research"}
+            return {
+                **base,
+                "continuation": "continue_research",
+                "continue": "continue_research",
+            }
 
     kernel = _Kernel()
     result: dict[str, JSONValue] = {
         "tool_result_id": "s1:tr:abc",
-        "records": [{"settlementDate": "2024-01-01", "symbolCode": "XYZ", "currentShortPositionQuantity": 1}],
+        "records": [
+            {
+                "settlementDate": "2024-01-01",
+                "symbolCode": "XYZ",
+                "currentShortPositionQuantity": 1,
+            }
+        ],
     }
     kernel.tool_results["s1:tr:abc"] = result
     evidence: list[dict[str, JSONValue]] = [
@@ -359,10 +681,31 @@ def test_assessment_evidence_is_scoped_to_current_node_jobs() -> None:
         {"evidence_id": "ev-intake", "job_id": "job-intake"},
     ]
     attempts: list[dict[str, JSONValue]] = [
-        {"tool": "query_finra", "job_id": "job-1", "evidence_id": "ev-prev", "outcome_summary": "admitted"},
-        {"tool": "query_finra", "job_id": "job-2", "evidence_id": None, "outcome_summary": "unadmitted obs"},
-        {"tool": "query_finra", "job_id": "job-4", "evidence_id": "ev-winner", "outcome_summary": "duplicate"},
-        {"tool": None, "job_id": None, "evidence_id": None, "outcome_summary": "", "error": "select failed"},
+        {
+            "tool": "query_finra",
+            "job_id": "job-1",
+            "evidence_id": "ev-prev",
+            "outcome_summary": "admitted",
+        },
+        {
+            "tool": "query_finra",
+            "job_id": "job-2",
+            "evidence_id": None,
+            "outcome_summary": "unadmitted obs",
+        },
+        {
+            "tool": "query_finra",
+            "job_id": "job-4",
+            "evidence_id": "ev-winner",
+            "outcome_summary": "duplicate",
+        },
+        {
+            "tool": None,
+            "job_id": None,
+            "evidence_id": None,
+            "outcome_summary": "",
+            "error": "select failed",
+        },
     ]
     record: dict[str, object] = {
         "tool": "query_finra",
@@ -374,11 +717,26 @@ def test_assessment_evidence_is_scoped_to_current_node_jobs() -> None:
         "job_id": "job-3",
     }
     asyncio.run(
-        sched._settle_round([record], _J(), kernel, _node(), evidence, attempts, "s1", "n1", _invoke("query_finra"), 0)
+        sched._settle_round(
+            [record],
+            _J(),
+            kernel,
+            _node(),
+            evidence,
+            attempts,
+            "s1",
+            "n1",
+            _invoke("query_finra"),
+            0,
+        )
     )
     (ctx,) = seen
     assert isinstance(ctx, list)
-    assert [c.get("evidence_id") for c in ctx if c.get("evidence_id")] == ["ev-prev", "ev-cur", "ev-winner"]
+    assert [c.get("evidence_id") for c in ctx if c.get("evidence_id")] == [
+        "ev-prev",
+        "ev-cur",
+        "ev-winner",
+    ]
     assert [c.get("outcome_summary") for c in ctx if "outcome_summary" in c] == ["unadmitted obs"]
 
 
@@ -389,7 +747,12 @@ def test_pure_stall_is_guard_false_with_stall_reason() -> None:
             return [_node()]
 
     async def stall(n: object, sid: str, **kw: object) -> dict[str, JSONValue]:
-        return {"node_id": "n1", "status": "gathering", "admitted": 0, "incomplete_guard": False}
+        return {
+            "node_id": "n1",
+            "status": "gathering",
+            "admitted": 0,
+            "incomplete_guard": False,
+        }
 
     with mock.patch.object(sched, "run_node", stall):
         out = asyncio.run(sched.run("s1", kernel=_KS(), repo=None))
@@ -405,7 +768,12 @@ def test_node_guard_trip_yields_incomplete_guard_not_stalled() -> None:
             return [_node()]
 
     async def trip(n: object, sid: str, **kw: object) -> dict[str, JSONValue]:
-        return {"node_id": "n1", "status": "blocked", "admitted": 0, "incomplete_guard": True}
+        return {
+            "node_id": "n1",
+            "status": "blocked",
+            "admitted": 0,
+            "incomplete_guard": True,
+        }
 
     with mock.patch.object(sched, "run_node", trip):
         out = asyncio.run(sched.run("s1", kernel=_KS(), repo=None))
@@ -421,9 +789,17 @@ def test_session_ceiling_yields_incomplete_guard() -> None:
             return [_node()]
 
     async def trip(n: object, sid: str, **kw: object) -> dict[str, JSONValue]:
-        return {"node_id": "n1", "status": "blocked", "admitted": 0, "incomplete_guard": True}
+        return {
+            "node_id": "n1",
+            "status": "blocked",
+            "admitted": 0,
+            "incomplete_guard": True,
+        }
 
-    with mock.patch.object(sched, "run_node", trip), mock.patch.object(sched, "_MAX_TOOL_ROUNDS", 0):
+    with (
+        mock.patch.object(sched, "run_node", trip),
+        mock.patch.object(sched, "_MAX_TOOL_ROUNDS", 0),
+    ):
         out = asyncio.run(sched.run("s1", kernel=_KS(), repo=None))
     assert "runtime guard" in str(out["reason"])
 
@@ -434,7 +810,11 @@ def test_expansion_creates_jev_admitted_nodes_with_dep() -> None:
     class _K(_Kernel):
         @override
         def create_node(
-            self, session_id: str, question: str, why_it_matters: str, depends_on: Sequence[str] | None = None
+            self,
+            session_id: str,
+            question: str,
+            why_it_matters: str,
+            depends_on: Sequence[str] | None = None,
         ) -> ResearchNode:
             created.append((question, why_it_matters, tuple(depends_on or ())))
             return _node(f"n-{len(created)}", session_id)
@@ -442,7 +822,11 @@ def test_expansion_creates_jev_admitted_nodes_with_dep() -> None:
     class _J(JevClient):
         @override
         async def decide(
-            self, state: object, questions: Mapping[str, JSONValue], decision_type: object = None, **kw: object
+            self,
+            state: object,
+            questions: Mapping[str, JSONValue],
+            decision_type: object = None,
+            **kw: object,
         ) -> dict[str, dict[str, JSONValue]]:
             assert decision_type == "graph_expansion"
             return {qid: {"choice": "admit"} for qid in questions}
@@ -467,7 +851,11 @@ def test_expansion_is_fail_closed_on_jev_outage() -> None:
     class _K(_Kernel):
         @override
         def create_node(
-            self, session_id: str, question: str, why_it_matters: str, depends_on: Sequence[str] | None = None
+            self,
+            session_id: str,
+            question: str,
+            why_it_matters: str,
+            depends_on: Sequence[str] | None = None,
         ) -> ResearchNode:
             created.append(question)
             return _node("n-x", session_id)
@@ -490,7 +878,11 @@ def test_reason_path_calls_analyze_then_expand() -> None:
     class _K(_Kernel):
         @override
         def create_node(
-            self, session_id: str, question: str, why_it_matters: str, depends_on: Sequence[str] | None = None
+            self,
+            session_id: str,
+            question: str,
+            why_it_matters: str,
+            depends_on: Sequence[str] | None = None,
         ) -> ResearchNode:
             created.append(question)
             return _node(f"n-{len(created)}", session_id)
@@ -508,20 +900,26 @@ def test_reason_path_calls_analyze_then_expand() -> None:
 
         @override
         async def decide(
-            self, state: object, questions: Mapping[str, JSONValue], decision_type: object = None, **kw: object
+            self,
+            state: object,
+            questions: Mapping[str, JSONValue],
+            decision_type: object = None,
+            **kw: object,
         ) -> dict[str, dict[str, JSONValue]]:
             return {qid: {"choice": "admit"} for qid in questions}
 
         @override
         async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
             return {
-                "probabilities": {},
+                "probabilities": {"topical_relevance": 0.4, "resolution_support": 0.2},
                 "confidence": 1.0,
                 "continuation": "continue_research",
                 "continue": "continue_research",
                 "action": "continue_research",
                 "evidence_state": "insufficient",
                 "decision": "insufficient",
+                "topical_relevance_answer": "no",
+                "resolution_support_answer": "no",
             }
 
     class _R(ReasonerClient):
@@ -707,7 +1105,7 @@ def test_repeated_winner_drop_triggers_on_4_of_5() -> None:
         @override
         async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
             return {
-                "probabilities": {},
+                "probabilities": {"topical_relevance": 0.4, "resolution_support": 0.2},
                 "confidence": 1.0,
                 "continuation": "continue_research",
                 "continue": "continue_research",
@@ -717,20 +1115,29 @@ def test_repeated_winner_drop_triggers_on_4_of_5() -> None:
                 "admit": None,
                 "evidence_state": "insufficient",
                 "decision": "insufficient",
+                "topical_relevance_answer": "no",
+                "resolution_support_answer": "no",
             }
 
     _gen_n = {"n": 0}
 
     async def fake_gen(**kw: object) -> dict[str, JSONValue]:
         _gen_n["n"] += 1
-        return {"tool": "get_reg_sho_volume", "arguments": {"round": _gen_n["n"]}, "reasoning": "r"}
+        return {
+            "tool": "get_reg_sho_volume",
+            "arguments": {"round": _gen_n["n"]},
+            "reasoning": "r",
+        }
 
     async def fake_invoke(name: str, args: dict[str, JSONValue], sess: object, **kw: object) -> dict[str, JSONValue]:
         return {"tool_result_id": "s1:tr:x"}
 
     def fake_outcome(name: str, result: Mapping[str, object]) -> ToolOutcome:
         calls["n"] += 1
-        return _outcome("window words here", error=None if calls["n"] == 3 else "finra downstream blew up")
+        return _outcome(
+            "window words here",
+            error=None if calls["n"] == 3 else "finra downstream blew up",
+        )
 
     with mock.patch.object(sched, "_MAX_TOOL_ROUNDS", 7):
         out = asyncio.run(
@@ -755,6 +1162,140 @@ def test_repeated_winner_drop_triggers_on_4_of_5() -> None:
     # Round 6 selects on [fail, fail, success, fail, fail]: 4-of-5 repeated winner -> dropped.
     assert "get_reg_sho_volume" not in seen[5]
     assert out["status"] == "blocked" and out["incomplete_guard"] is True
+
+
+def test_ungrounded_reselect_drops_tool_for_next_round_only() -> None:
+    """An ungrounded-argument reselect excludes that tool next round; later rounds may retry it."""
+    seen: list[list[str]] = []
+    real_select = sched._select_round
+
+    async def spy_select(
+        jev: JevClient,
+        kernel: sched._Kernel,
+        sid: str,
+        nid: str,
+        session: Mapping[str, JSONValue],
+        node: ResearchNode,
+        registry: Sequence[dict[str, JSONValue]],
+        ctx_ev: Sequence[JSONValue],
+        attempts: Sequence[Mapping[str, JSONValue]],
+    ) -> tuple[str, ToolDecision]:
+        seen.append([str(e.get("name")) for e in registry])
+        return await real_select(jev, kernel, sid, nid, session, node, registry, ctx_ev, attempts)
+
+    class _JLoop(_JevAdmit):
+        @override
+        async def select_tool(self, *a: object, **k: object) -> ToolDecision:
+            names = {e.get("name") for e in a[2]} if isinstance(a[2], list) else set()
+            pick = "get_xbrl_facts" if "get_xbrl_facts" in names else "query_finra"
+            return _invoke(pick)
+
+        @override
+        async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
+            base = await _JevAdmit().assess_result(*a, **k)
+            return {
+                **base,
+                "continuation": "continue_research",
+                "continue": "continue_research",
+                "action": "continue_research",
+            }
+
+    async def fake_gen(**kw: object) -> dict[str, JSONValue]:
+        if kw["tool"] == "get_xbrl_facts":
+            return {
+                "tool": "get_xbrl_facts",
+                "arguments": {"ticker": "NVDA", "concept": "instruction"},
+                "reasoning": "r",
+            }
+        return {
+            "tool": "query_finra",
+            "arguments": {"dataset": "consolidatedShortInterest", "ticker": "XYZ"},
+            "reasoning": "r",
+        }
+
+    async def fake_invoke(name: str, args: dict[str, JSONValue], sess: object, **kw: object) -> dict[str, JSONValue]:
+        return {"tool_result_id": "s1:tr:x", "records": [], "briefing": "B"}
+
+    with mock.patch.object(sched, "_MAX_TOOL_ROUNDS", 3):
+        out = asyncio.run(
+            sched._run_node(
+                _node(),
+                session_id="s1",
+                kernel=_Kernel(),
+                jev=_JLoop(),
+                repo=None,
+                needle_generate=fake_gen,
+                invoke=fake_invoke,
+                to_outcome=_to_outcome,
+                registry=[
+                    {"name": "get_xbrl_facts", "parameters": {}},
+                    {"name": "query_finra", "parameters": {}},
+                ],
+                tool_session=_tool_session(),
+                select_round=spy_select,
+            )
+        )
+    assert seen[0] == ["get_xbrl_facts", "query_finra"]
+    assert seen[1] == ["query_finra"]
+    assert "get_xbrl_facts" in seen[2]
+    attempts = out["attempts"]
+    assert isinstance(attempts, list) and isinstance(attempts[0], dict)
+    assert attempts[0]["error_type"] == "reselect"
+    assert attempts[0]["arguments"] == {}
+
+
+def test_ungrounded_reselect_keeps_last_tool_when_no_alternative() -> None:
+    """A lone-tool registry keeps the rejected tool: exclusion never leaves JEV with nothing to pick."""
+    seen: list[list[str]] = []
+    real_select = sched._select_round
+
+    async def spy_select(
+        jev: JevClient,
+        kernel: sched._Kernel,
+        sid: str,
+        nid: str,
+        session: Mapping[str, JSONValue],
+        node: ResearchNode,
+        registry: Sequence[dict[str, JSONValue]],
+        ctx_ev: Sequence[JSONValue],
+        attempts: Sequence[Mapping[str, JSONValue]],
+    ) -> tuple[str, ToolDecision]:
+        seen.append([str(e.get("name")) for e in registry])
+        return await real_select(jev, kernel, sid, nid, session, node, registry, ctx_ev, attempts)
+
+    class _JLoop(_JevAdmit):
+        @override
+        async def select_tool(self, *a: object, **k: object) -> ToolDecision:
+            return _invoke("get_xbrl_facts")
+
+        @override
+        async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
+            return await _JevAdmit().assess_result(*a, **k)
+
+    async def fake_gen(**kw: object) -> dict[str, JSONValue]:
+        return {
+            "tool": "get_xbrl_facts",
+            "arguments": {"ticker": "NVDA", "concept": "instruction"},
+            "reasoning": "r",
+        }
+
+    with mock.patch.object(sched, "_MAX_TOOL_ROUNDS", 2):
+        asyncio.run(
+            sched._run_node(
+                _node(),
+                session_id="s1",
+                kernel=_Kernel(),
+                jev=_JLoop(),
+                repo=None,
+                needle_generate=fake_gen,
+                invoke=_invoke_result,
+                to_outcome=_to_outcome,
+                registry=[{"name": "get_xbrl_facts", "parameters": {}}],
+                tool_session=_tool_session(),
+                select_round=spy_select,
+            )
+        )
+    assert seen == [["get_xbrl_facts"], ["get_xbrl_facts"]]
 
 
 def test_select_raises_twice_then_succeeds_continues() -> None:
@@ -824,13 +1365,22 @@ def test_select_raises_thrice_yields_blocked_terminal() -> None:
 def test_select_fail_trim_keeps_ctx_bounded() -> None:
     """A select retry after 400 sends a smaller state: last ~5 ctx items."""
     many = [
-        {"tool": "get_sec_filing", "job_id": f"job-{i}", "outcome_summary": f"obs {i}", "error": None} for i in range(8)
+        {
+            "tool": "get_sec_filing",
+            "job_id": f"job-{i}",
+            "outcome_summary": f"obs {i}",
+            "error": None,
+        }
+        for i in range(8)
     ]
     assert len(sched._context_evidence([], many)) == 8
     assert len(sched._context_evidence([], many, cap_last=5)) == 5
     seen: list[int] = []
 
-    kernel = _Kernel({"s1:tr:abc": {"tool_result_id": "s1:tr:abc", "records": [], "briefing": "B"}}, objective="q?")
+    kernel = _Kernel(
+        {"s1:tr:abc": {"tool_result_id": "s1:tr:abc", "records": [], "briefing": "B"}},
+        objective="q?",
+    )
 
     class _J(_JevAdmit):
         @override
@@ -878,14 +1428,37 @@ def test_accession_carry_fills_from_packet_context() -> None:
     session = {"session_id": "s1", "objective": "q?"}
     filing_evidence: list[JSONValue] = [{"outcome_summary": f"filing {acc} 10-K", "tool": "search_sec_filings"}]
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_gen, "get_sec_filing", [], session, _node(), filing_evidence, [], None)
+        sched._generate_tool_arguments(
+            fake_gen,
+            "get_sec_filing",
+            [],
+            session,
+            _node(),
+            filing_evidence,
+            [],
+            None,
+            _Kernel(),
+        )
     )
     assert args.get("accession_no") == acc
     doc_evidence: list[JSONValue] = [
-        {"source_handle": {"accession_no": acc, "document_name": "nvda-10k.htm"}, "outcome_summary": f"read {acc}"}
+        {
+            "source_handle": {"accession_no": acc, "document_name": "nvda-10k.htm"},
+            "outcome_summary": f"read {acc}",
+        }
     ]
     doc_args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_doc_gen, "get_sec_document", [], session, _node(), doc_evidence, [], None)
+        sched._generate_tool_arguments(
+            fake_doc_gen,
+            "get_sec_document",
+            [],
+            session,
+            _node(),
+            doc_evidence,
+            [],
+            None,
+            _Kernel(),
+        )
     )
     assert doc_args.get("accession_no") == acc
     assert doc_args.get("document_name") == "nvda-10k.htm"
@@ -896,17 +1469,43 @@ def test_accession_carry_withheld_none_still_fills_from_packet() -> None:
     acc = "0001628280-26-044069"
 
     async def fake_gen(**kw: object) -> dict[str, JSONValue]:
-        return {"tool": None, "arguments": {}, "reasoning": "withheld: no grounded accession"}
+        return {
+            "tool": None,
+            "arguments": {},
+            "reasoning": "withheld: no grounded accession",
+        }
 
     session = {"session_id": "s1", "objective": "q?"}
     evidence: list[JSONValue] = [{"outcome_summary": f"filing {acc} 10-K", "tool": "search_sec_filings"}]
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_gen, "get_sec_filing", [], session, _node(), evidence, [], None)
+        sched._generate_tool_arguments(
+            fake_gen,
+            "get_sec_filing",
+            [],
+            session,
+            _node(),
+            evidence,
+            [],
+            None,
+            _Kernel(),
+        )
     )
     assert args.get("accession_no") == acc
 
     try:
-        asyncio.run(sched._generate_tool_arguments(fake_gen, "get_sec_filing", [], session, _node(), [], [], None))
+        asyncio.run(
+            sched._generate_tool_arguments(
+                fake_gen,
+                "get_sec_filing",
+                [],
+                session,
+                _node(),
+                [],
+                [],
+                None,
+                _Kernel(),
+            )
+        )
     except ValueError as exc:
         assert "needle tool mismatch" in str(exc)
     else:
@@ -921,7 +1520,7 @@ def test_accession_carry_leaves_args_without_packet() -> None:
 
     session = {"session_id": "s1", "objective": "q?"}
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_gen, "get_sec_filing", [], session, _node(), [], [], None)
+        sched._generate_tool_arguments(fake_gen, "get_sec_filing", [], session, _node(), [], [], None, _Kernel())
     )
     assert "accession_no" not in args
 
@@ -936,7 +1535,17 @@ def test_runtime_mismatch_carry_returns_packet_accession() -> None:
     session = {"session_id": "s1", "objective": "q?"}
     evidence: list[JSONValue] = [{"outcome_summary": f"filing {acc} 10-K", "tool": "search_sec_filings"}]
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_gen, "get_sec_filing", [], session, _node(), evidence, [], None)
+        sched._generate_tool_arguments(
+            fake_gen,
+            "get_sec_filing",
+            [],
+            session,
+            _node(),
+            evidence,
+            [],
+            None,
+            _Kernel(),
+        )
     )
     assert args.get("accession_no") == acc
 
@@ -949,7 +1558,19 @@ def test_runtime_mismatch_no_packet_reraises() -> None:
 
     session = {"session_id": "s1", "objective": "q?"}
     try:
-        asyncio.run(sched._generate_tool_arguments(fake_gen, "get_sec_filing", [], session, _node(), [], [], None))
+        asyncio.run(
+            sched._generate_tool_arguments(
+                fake_gen,
+                "get_sec_filing",
+                [],
+                session,
+                _node(),
+                [],
+                [],
+                None,
+                _Kernel(),
+            )
+        )
     except RuntimeError as exc:
         assert "needle tool mismatch" in str(exc)
     else:
@@ -962,10 +1583,16 @@ def test_grounding_hint_present_in_context() -> None:
 
     async def fake_gen(**kw: object) -> dict[str, JSONValue]:
         seen.update(kw)
-        return {"tool": "list_sec_filings", "arguments": {"identifier": "NVDA"}, "reasoning": "r"}
+        return {
+            "tool": "list_sec_filings",
+            "arguments": {"identifier": "NVDA"},
+            "reasoning": "r",
+        }
 
     session = {"session_id": "s1", "objective": "q?"}
-    asyncio.run(sched._generate_tool_arguments(fake_gen, "list_sec_filings", [], session, _node(), [], [], None))
+    asyncio.run(
+        sched._generate_tool_arguments(fake_gen, "list_sec_filings", [], session, _node(), [], [], None, _Kernel())
+    )
     ctx = seen.get("context")
     assert isinstance(ctx, dict)
     hint = str(ctx.get("grounding_hint", ""))
@@ -978,11 +1605,25 @@ def test_context_carries_scope_and_today() -> None:
 
     async def fake_gen(**kw: object) -> dict[str, JSONValue]:
         seen.update(kw)
-        return {"tool": "list_sec_filings", "arguments": {"identifier": "NVDA"}, "reasoning": "r"}
+        return {
+            "tool": "list_sec_filings",
+            "arguments": {"identifier": "NVDA"},
+            "reasoning": "r",
+        }
 
-    scope: dict[str, JSONValue] = {"mode": "range", "start": "2025-04-01", "end": "2025-06-30"}
-    session: dict[str, JSONValue] = {"session_id": "s1", "objective": "q?", "temporal_scope": scope}
-    asyncio.run(sched._generate_tool_arguments(fake_gen, "list_sec_filings", [], session, _node(), [], [], None))
+    scope: dict[str, JSONValue] = {
+        "mode": "range",
+        "start": "2025-04-01",
+        "end": "2025-06-30",
+    }
+    session: dict[str, JSONValue] = {
+        "session_id": "s1",
+        "objective": "q?",
+        "temporal_scope": scope,
+    }
+    asyncio.run(
+        sched._generate_tool_arguments(fake_gen, "list_sec_filings", [], session, _node(), [], [], None, _Kernel())
+    )
     ctx = seen.get("context")
     assert isinstance(ctx, dict)
     assert ctx.get("temporal_scope") == scope and isinstance(ctx.get("today_utc"), str) and len(ctx["today_utc"]) == 10
@@ -995,10 +1636,16 @@ def test_generate_tool_arguments_objective_raw_verbatim() -> None:
 
     async def fake_gen(**kw: object) -> dict[str, JSONValue]:
         seen.update(kw)
-        return {"tool": "list_sec_filings", "arguments": {"identifier": "NVDA"}, "reasoning": "r"}
+        return {
+            "tool": "list_sec_filings",
+            "arguments": {"identifier": "NVDA"},
+            "reasoning": "r",
+        }
 
     session = {"session_id": "s1", "objective": "q?"}
-    asyncio.run(sched._generate_tool_arguments(fake_gen, "list_sec_filings", [], session, _node(), [], [], None))
+    asyncio.run(
+        sched._generate_tool_arguments(fake_gen, "list_sec_filings", [], session, _node(), [], [], None, _Kernel())
+    )
     assert str(seen.get("objective", "")) == "q?"
 
 
@@ -1090,7 +1737,12 @@ def test_force_open_registry_carry_tools_on_nav_packet() -> None:
     assert forced is not None and [e.get("name") for e in forced] == ["get_sec_filing"]
     assert sched._force_open_registry(registry, attempts, [], 1) is None
     assert (
-        sched._force_open_registry(registry, [{"tool": "search_sec_filings", "outcome_summary": "no hits"}], [], 0)
+        sched._force_open_registry(
+            registry,
+            [{"tool": "search_sec_filings", "outcome_summary": "no hits"}],
+            [],
+            0,
+        )
         is None
     )
 
@@ -1114,16 +1766,38 @@ def test_relative_tradedate_scrubbed_to_wtd_omit() -> None:
 
     session = {"session_id": "s1", "objective": "Apple this week?"}
     scrubbed, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_phrase, "get_reg_sho_volume", [], session, _node(), [], [], None)
+        sched._generate_tool_arguments(
+            fake_phrase,
+            "get_reg_sho_volume",
+            [],
+            session,
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
     )
     assert scrubbed == {"ticker": "AAPL"}
     kept, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_valid, "get_reg_sho_volume", [], session, _node(), [], [], None)
+        sched._generate_tool_arguments(
+            fake_valid,
+            "get_reg_sho_volume",
+            [],
+            session,
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
     )
     assert kept == {"ticker": "AAPL", "tradeDate": "2026-09-22"}
 
 
-def test_sec_withhold_falls_back_to_objective_ticker_latest(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sec_withhold_falls_back_to_objective_ticker_latest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Needle withhold (None) on SEC tools seeds explicit objective ticker, latest (no dates)."""
     import app.tools as _tools
 
@@ -1137,11 +1811,21 @@ def test_sec_withhold_falls_back_to_objective_ticker_latest(monkeypatch: pytest.
 
     session = {"session_id": "s1", "objective": "What drove NVDA revenue last quarter?"}
     listed, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_none, "list_sec_filings", [], session, _node(), [], [], None)
+        sched._generate_tool_arguments(fake_none, "list_sec_filings", [], session, _node(), [], [], None, _Kernel())
     )
     assert listed == {"identifier": "NVDA", "forms": ["10-Q", "10-K", "8-K"]}
     searched, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_none, "search_sec_filings", [], session, _node(), [], [], None)
+        sched._generate_tool_arguments(
+            fake_none,
+            "search_sec_filings",
+            [],
+            session,
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
     )
     assert searched["ticker"] == "NVDA" and "start_date" not in searched and "end_date" not in searched
 
@@ -1152,16 +1836,33 @@ def test_sec_withhold_without_ticker_still_raises() -> None:
     async def fake_none(**kw: object) -> dict[str, JSONValue]:
         return {"tool": None, "arguments": {}, "reasoning": "withheld: ungrounded"}
 
-    session = {"session_id": "s1", "objective": "Growth slowed last quarter — which segment drove it?"}
+    session = {
+        "session_id": "s1",
+        "objective": "Growth slowed last quarter — which segment drove it?",
+    }
     try:
-        asyncio.run(sched._generate_tool_arguments(fake_none, "list_sec_filings", [], session, _node(), [], [], None))
+        asyncio.run(
+            sched._generate_tool_arguments(
+                fake_none,
+                "list_sec_filings",
+                [],
+                session,
+                _node(),
+                [],
+                [],
+                None,
+                _Kernel(),
+            )
+        )
     except ValueError as exc:
         assert "needle tool" in str(exc)
     else:
         raise AssertionError("withhold without explicit ticker must still raise mismatch")
 
 
-def test_sho_withhold_falls_back_to_both_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sho_withhold_falls_back_to_both_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Needle withhold (None) on SHO seeds ticker+company_name from for-<Company>."""
     import app.tools as _tools
 
@@ -1173,9 +1874,22 @@ def test_sho_withhold_falls_back_to_both_fields(monkeypatch: pytest.MonkeyPatch)
     async def fake_none(**kw: object) -> dict[str, JSONValue]:
         return {"tool": None, "arguments": {}, "reasoning": "withheld: ungrounded"}
 
-    session = {"session_id": "s1", "objective": "What does FINRA Reg SHO daily short volume show for Apple this week?"}
+    session = {
+        "session_id": "s1",
+        "objective": "What does FINRA Reg SHO daily short volume show for Apple this week?",
+    }
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_none, "get_reg_sho_volume", [], session, _node(), [], [], None)
+        sched._generate_tool_arguments(
+            fake_none,
+            "get_reg_sho_volume",
+            [],
+            session,
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
     )
     assert args == {"ticker": "AAPL", "company_name": "Apple"}
 
@@ -1188,11 +1902,17 @@ def test_with_company_seeds_ticker_and_name(monkeypatch: pytest.MonkeyPatch) -> 
         return {"Oracle": "ORCL", "oracle": "ORCL"}.get(name)
 
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
-    assert sched._objective_company("What is happening with Oracle now") == ("Oracle", "ORCL")
+    assert sched._objective_company("What is happening with Oracle now") == (
+        "Oracle",
+        "ORCL",
+    )
     assert sched._objective_subject_ticker("What is happening with Oracle now") == "ORCL"
     repaired = sched._repair_tool_arguments("get_material_events", {}, "What is happening with Oracle now", "s", "n")
     assert repaired == {"company_name": "Oracle", "ticker": "ORCL"}
-    assert sched._objective_company("What is happening with oracle now") == ("oracle", "ORCL")
+    assert sched._objective_company("What is happening with oracle now") == (
+        "oracle",
+        "ORCL",
+    )
     assert sched._objective_subject_ticker("What is happening with oracle now") == "ORCL"
     assert sched._objective_company("What drove growth this week?") is None
     assert sched._objective_company("news for growth this week") is None
@@ -1211,7 +1931,17 @@ def test_sec_placeholder_forms_reseed_latest() -> None:
 
     session = {"session_id": "s1", "objective": "What drove NVDA revenue last quarter?"}
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_placeholder, "list_sec_filings", [], session, _node(), [], [], None)
+        sched._generate_tool_arguments(
+            fake_placeholder,
+            "list_sec_filings",
+            [],
+            session,
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
     )
     assert args == {"identifier": "NVDA", "forms": ["10-Q", "10-K", "8-K"]}
 
@@ -1232,9 +1962,22 @@ def test_sho_org_ticker_remaps_from_objective(monkeypatch: pytest.MonkeyPatch) -
             "reasoning": "r",
         }
 
-    session = {"session_id": "s1", "objective": "What does FINRA Reg SHO daily short volume show for Apple this week?"}
+    session = {
+        "session_id": "s1",
+        "objective": "What does FINRA Reg SHO daily short volume show for Apple this week?",
+    }
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_org, "get_reg_sho_volume", [], session, _node(), [], [], None)
+        sched._generate_tool_arguments(
+            fake_org,
+            "get_reg_sho_volume",
+            [],
+            session,
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
     )
     assert args == {"ticker": "AAPL", "company_name": "Apple"}
 
@@ -1244,7 +1987,11 @@ def test_repeat_8k_swaps_to_packet_10q() -> None:
     acc8, accq = "0001045810-26-000078", "0001045810-26-000075"
 
     async def fake_8k(**kw: object) -> dict[str, JSONValue]:
-        return {"tool": "get_sec_filing", "arguments": {"accession_no": acc8}, "reasoning": "r"}
+        return {
+            "tool": "get_sec_filing",
+            "arguments": {"accession_no": acc8},
+            "reasoning": "r",
+        }
 
     session = {"session_id": "s1", "objective": "What drove NVDA revenue last quarter?"}
     attempts: list[dict[str, JSONValue]] = [
@@ -1252,10 +1999,23 @@ def test_repeat_8k_swaps_to_packet_10q() -> None:
         {"tool": "get_sec_filing", "arguments": {"accession_no": acc8}, "error": None},
     ]
     evidence: list[JSONValue] = [
-        {"outcome_summary": f"filing {acc8} 8-K filing {accq} 10-Q", "tool": "list_sec_filings"}
+        {
+            "outcome_summary": f"filing {acc8} 8-K filing {accq} 10-Q",
+            "tool": "list_sec_filings",
+        }
     ]
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_8k, "get_sec_filing", [], session, _node(), evidence, attempts, None)
+        sched._generate_tool_arguments(
+            fake_8k,
+            "get_sec_filing",
+            [],
+            session,
+            _node(),
+            evidence,
+            attempts,
+            None,
+            _Kernel(),
+        )
     )
     assert args.get("accession_no") == accq
 
@@ -1269,17 +2029,38 @@ def test_withhold_carry_repairs_query_and_swaps_10q() -> None:
 
     session = {"session_id": "s1", "objective": "What drove NVDA revenue last quarter?"}
     attempts: list[dict[str, JSONValue]] = [
-        {"tool": "get_sec_document", "arguments": {"accession_no": acc8}, "error": None},
-        {"tool": "get_sec_document", "arguments": {"accession_no": acc8}, "error": None},
+        {
+            "tool": "get_sec_document",
+            "arguments": {"accession_no": acc8},
+            "error": None,
+        },
+        {
+            "tool": "get_sec_document",
+            "arguments": {"accession_no": acc8},
+            "error": None,
+        },
     ]
     evidence: list[JSONValue] = [
-        {"outcome_summary": f"filing {acc8} 8-K filing {accq} 10-Q", "tool": "list_sec_filings"}
+        {
+            "outcome_summary": f"filing {acc8} 8-K filing {accq} 10-Q",
+            "tool": "list_sec_filings",
+        }
     ]
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_none, "get_sec_document", [], session, _node(), evidence, attempts, None)
+        sched._generate_tool_arguments(
+            fake_none,
+            "get_sec_document",
+            [],
+            session,
+            _node(),
+            evidence,
+            attempts,
+            None,
+            _Kernel(),
+        )
     )
     assert args.get("accession_no") == accq
-    assert args.get("query") == "revenue increased"
+    assert args.get("query") == "revenue"
 
 
 def test_repeat_8k_error_swaps_to_packet_10q() -> None:
@@ -1287,18 +2068,43 @@ def test_repeat_8k_error_swaps_to_packet_10q() -> None:
     acc8, accq = "0001045810-26-000078", "0001045810-26-000075"
 
     async def fake_8k(**kw: object) -> dict[str, JSONValue]:
-        return {"tool": "get_sec_document", "arguments": {"accession_no": acc8}, "reasoning": "r"}
+        return {
+            "tool": "get_sec_document",
+            "arguments": {"accession_no": acc8},
+            "reasoning": "r",
+        }
 
     session = {"session_id": "s1", "objective": "What drove NVDA revenue last quarter?"}
     attempts: list[dict[str, JSONValue]] = [
-        {"tool": "get_sec_document", "arguments": {"accession_no": acc8}, "error": "query not found"},
-        {"tool": "get_sec_document", "arguments": {"accession_no": acc8}, "error": "query not found"},
+        {
+            "tool": "get_sec_document",
+            "arguments": {"accession_no": acc8},
+            "error": "query not found",
+        },
+        {
+            "tool": "get_sec_document",
+            "arguments": {"accession_no": acc8},
+            "error": "query not found",
+        },
     ]
     evidence: list[JSONValue] = [
-        {"outcome_summary": f"filing {acc8} 8-K filing {accq} 10-Q", "tool": "list_sec_filings"}
+        {
+            "outcome_summary": f"filing {acc8} 8-K filing {accq} 10-Q",
+            "tool": "list_sec_filings",
+        }
     ]
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_8k, "get_sec_document", [], session, _node(), evidence, attempts, None)
+        sched._generate_tool_arguments(
+            fake_8k,
+            "get_sec_document",
+            [],
+            session,
+            _node(),
+            evidence,
+            attempts,
+            None,
+            _Kernel(),
+        )
     )
     assert args.get("accession_no") == accq
 
@@ -1307,13 +2113,911 @@ def test_revenue_document_seeds_query() -> None:
     """get_sec_document without query on quarterly revenue seeds a revenue query."""
 
     async def fake_doc(**kw: object) -> dict[str, JSONValue]:
-        return {"tool": "get_sec_document", "arguments": {"accession_no": "0001045810-26-000075"}, "reasoning": "r"}
+        return {
+            "tool": "get_sec_document",
+            "arguments": {"accession_no": "0001045810-26-000075"},
+            "reasoning": "r",
+        }
 
     session = {"session_id": "s1", "objective": "What drove NVDA revenue last quarter?"}
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_doc, "get_sec_document", [], session, _node(), [], [], None)
+        sched._generate_tool_arguments(fake_doc, "get_sec_document", [], session, _node(), [], [], None, _Kernel())
     )
-    assert args.get("query") == "revenue increased"
+    assert args.get("query") == "revenue"
+    assert args.get("limit") == 32000
+
+
+def test_ten_q_revenue_lists_forms_and_reads_listed_10q(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit 10-Q revenue request lists only 10-Q filings and reads three sections of the listed 10-Q."""
+    import app.tools as _tools
+
+    def _resolve(name: str) -> str | None:
+        return {"NVDA": "NVDA"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
+    acc8, accq = "0001045810-26-000078", "0001045810-26-000075"
+
+    async def fake_none(**kw: object) -> dict[str, JSONValue]:
+        return {"tool": None, "arguments": {}, "reasoning": "withheld: ungrounded"}
+
+    # 8-K listed first, out of the 10-Q window, so only the 10-Q preference picks accq.
+    listing: dict[str, JSONValue] = {
+        "tool": "list_sec_filings",
+        "arguments": {"identifier": "NVDA"},
+        "error": None,
+        "outcome_summary": f"filing {acc8} 8-K {'x' * 130} filing {accq} 10-Q",
+    }
+    for objective, forms, doc in (
+        (
+            "What did NVDA's latest 10-Q disclose about revenue? Use stockbot, bearbot, and bullbot.",
+            ["10-Q"],
+            {"accession_no": accq, "query": "revenue", "limit": 32000},
+        ),
+        ("What did NVDA disclose about revenue?", None, {"accession_no": acc8}),
+    ):
+        session = {"session_id": "s1", "objective": objective}
+        listed, _, _ = asyncio.run(
+            sched._generate_tool_arguments(
+                fake_none,
+                "list_sec_filings",
+                [],
+                session,
+                _node(),
+                [],
+                [],
+                None,
+                _Kernel(),
+            )
+        )
+        assert listed.get("forms") == forms
+        read, _, _ = asyncio.run(
+            sched._generate_tool_arguments(
+                fake_none,
+                "get_sec_document",
+                [],
+                session,
+                _node(),
+                [],
+                [listing],
+                None,
+                _Kernel(),
+            )
+        )
+        assert read == doc
+
+    invoked: list[dict[str, JSONValue]] = []
+
+    async def invoke(name: str, args: dict[str, JSONValue], sess: object, **kw: object) -> dict[str, JSONValue]:
+        invoked.append(dict(args))
+        return {"text": "Revenue was $46.7 billion."}
+
+    explicit = "What did NVDA's latest 10-Q disclose about revenue? Use stockbot, bearbot, and bullbot."
+    sections = [{"accession_no": accq, "limit": 32000, "section": s} for s in ("Item 1", "Item 2", "Item 1A")]
+    revenue_read = {"accession_no": accq, "query": "revenue", "limit": 32000}
+    failed_read: dict[str, JSONValue] = {
+        "tool": "get_sec_document",
+        "arguments": {},
+        "error": "timeout",
+    }
+    # Only the first undated explicit latest-10-Q read fans out. Retries, dated asks, and other revenue asks keep one read.
+    dated = "What did NVDA's latest 10-Q as of 2026-09-01 disclose about revenue?"
+    for objective, attempts, reads in (
+        (explicit, [listing], sections),
+        (explicit, [listing, failed_read], [revenue_read]),
+        (dated, [listing], [revenue_read]),
+        ("What drove NVDA revenue last quarter?", [listing], [revenue_read]),
+        ("What did NVDA disclose about revenue?", [listing], [{"accession_no": acc8}]),
+    ):
+        invoked.clear()
+        results = asyncio.run(
+            sched._invoke_phase(
+                ["get_sec_document"],
+                _node(),
+                {"session_id": "s1", "objective": objective},
+                [],
+                [],
+                attempts,
+                _Kernel(),
+                fake_none,
+                invoke,
+                lambda n, r: _outcome(),
+                _tool_session(),
+                None,
+            )
+        )
+        assert invoked == reads
+        assert [r["arguments"] for r in results] == reads
+        assert all(r["error"] is None for r in results)
+
+    async def fail_needle(**kw: object) -> dict[str, JSONValue]:
+        raise RuntimeError("needle boom")
+
+    async def fail_invoke(name: str, args: dict[str, JSONValue], sess: object, **kw: object) -> dict[str, JSONValue]:
+        raise RuntimeError("sec read failed")
+
+    # Failed sibling section reads settle without a breaker block, so each section returns to the selector alone.
+    for needle, call, failed in (
+        (fake_none, fail_invoke, sections),
+        (fail_needle, invoke, [{"section": s["section"]} for s in sections]),
+    ):
+        attempts: list[dict[str, JSONValue]] = [listing]
+        results = asyncio.run(
+            sched._invoke_phase(
+                ["get_sec_document"],
+                _node(),
+                {"session_id": "s1", "objective": explicit},
+                [],
+                [],
+                attempts,
+                _Kernel(),
+                needle,
+                call,
+                lambda n, r: _outcome(),
+                _tool_session(),
+                None,
+            )
+        )
+        assert [r["arguments"] for r in results] == failed
+        assert all(r["error"] for r in results)
+        signal = asyncio.run(
+            sched._settle_round(
+                results,
+                _JevAdmit(),
+                _Kernel(),
+                _node(),
+                [],
+                attempts,
+                "s1",
+                "n1",
+                _invoke("get_sec_document"),
+                0,
+            )
+        )
+        assert signal["terminal"] is None and len(attempts) == 4
+
+
+@pytest.mark.parametrize(
+    "grounds",
+    ["none", "objective", "node", "scope", "scope-as-of", "session-as-of", "as-of"],
+)
+def test_latest_ten_q_listing_constrains_forms_and_preserves_grounded_dates(
+    grounds: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Valid broad forms become 10-Q only. Only grounded dates remain."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
+    generated: dict[str, JSONValue] = {
+        "identifier": "NVDA",
+        "forms": ["10-Q", "10-K", "8-K"],
+        "start_date": "2025-01-01",
+        "end_date": "2025-12-31",
+    }
+    needle_calls: list[str] = []
+
+    async def fake_gen(**kw: object) -> dict[str, JSONValue]:
+        needle_calls.append(str(kw["tool"]))
+        return {
+            "tool": "list_sec_filings",
+            "arguments": dict(generated),
+            "reasoning": "r",
+        }
+
+    prompt = "What did NVDA's latest 10-Q disclose about revenue?"
+    dated = f"{prompt} Include filings from 2025-01-01 through 2025-12-31."
+    session: dict[str, JSONValue] = {
+        "session_id": "s1",
+        "objective": dated if grounds == "objective" else prompt,
+    }
+    node = ResearchNode(
+        node_id="n1",
+        session_id="s1",
+        question=dated if grounds == "node" else prompt,
+        why_it_matters="w",
+    )
+    if grounds == "scope":
+        session["temporal_scope"] = {
+            "mode": "range",
+            "start": "2025-01-01",
+            "end": "2025-12-31",
+        }
+    if grounds == "scope-as-of":
+        session["temporal_scope"] = {"mode": "as_of", "as_of": "2025-12-31"}
+    if grounds == "session-as-of":
+        session["as_of"] = "2025-12-31"
+    args, _, _ = asyncio.run(
+        sched._generate_tool_arguments(
+            fake_gen,
+            "list_sec_filings",
+            sched.build_registry(),
+            session,
+            node,
+            [],
+            [],
+            "2025-12-31" if grounds == "as-of" else None,
+            _Kernel(),
+        )
+    )
+    expected: dict[str, JSONValue] = {"identifier": "NVDA", "forms": ["10-Q"]}
+    if grounds in ("objective", "node", "scope"):
+        expected.update(start_date="2025-01-01", end_date="2025-12-31")
+    elif grounds in ("scope-as-of", "session-as-of"):
+        expected.update(end_date="2025-12-31")
+    assert args == expected
+    assert needle_calls == ([] if grounds == "none" else ["list_sec_filings"])
+    assert generated["forms"] == ["10-Q", "10-K", "8-K"]
+
+
+def test_quarter_revenue_listing_keeps_generated_forms_and_dates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quarter-only request keeps its existing form and date behavior."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
+    generated: dict[str, JSONValue] = {
+        "identifier": "NVDA",
+        "forms": ["10-Q", "10-K", "8-K"],
+        "start_date": "2025-01-01",
+        "end_date": "2025-12-31",
+    }
+    needle_calls: list[str] = []
+
+    async def fake_gen(**kw: object) -> dict[str, JSONValue]:
+        needle_calls.append(str(kw["tool"]))
+        return {
+            "tool": "list_sec_filings",
+            "arguments": dict(generated),
+            "reasoning": "r",
+        }
+
+    args, _, _ = asyncio.run(
+        sched._generate_tool_arguments(
+            fake_gen,
+            "list_sec_filings",
+            sched.build_registry(),
+            {"session_id": "s1", "objective": "What drove NVDA revenue last quarter?"},
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
+    )
+    assert args == generated
+    assert needle_calls == ["list_sec_filings"]
+
+
+def test_latest_ten_q_listing_generates_missing_required_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Needle supplies a required limit that the local listing arguments cannot fill."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
+    generated: dict[str, JSONValue] = {
+        "identifier": "NVDA",
+        "forms": ["10-Q"],
+        "limit": 3,
+    }
+    needle_calls: list[str] = []
+
+    async def fake_gen(**kw: object) -> dict[str, JSONValue]:
+        needle_calls.append(str(kw["tool"]))
+        return {
+            "tool": "list_sec_filings",
+            "arguments": dict(generated),
+            "reasoning": "required limit",
+        }
+
+    args, reasoning, withheld = asyncio.run(
+        sched._generate_tool_arguments(
+            fake_gen,
+            "list_sec_filings",
+            [
+                {
+                    "name": "list_sec_filings",
+                    "parameters": {"required": ["identifier", "forms", "limit"]},
+                }
+            ],
+            {
+                "session_id": "s1",
+                "objective": "What did NVDA's latest 10-Q disclose about revenue?",
+            },
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
+    )
+    assert needle_calls == ["list_sec_filings"]
+    assert args == generated
+    assert reasoning == "required limit"
+    assert withheld is False
+
+
+@pytest.mark.parametrize("listed", [False, True], ids=["missing-listing", "only-8k"])
+def test_latest_ten_q_document_without_ten_q_generates_and_reselects(
+    listed: bool,
+) -> None:
+    """Without a listed 10-Q, Needle runs once. The scheduler does not read an 8-K."""
+    acc8 = "0001045810-26-000078"
+    attempts: list[dict[str, JSONValue]] = (
+        [
+            {
+                "tool": "list_sec_filings",
+                "arguments": {"identifier": "NVDA", "forms": ["10-Q"]},
+                "error": None,
+                "result": {"filings": [{"accession_no": acc8, "form": "8-K", "filed_at": "2026-09-01"}]},
+                "outcome_summary": f"8-K {acc8}",
+            }
+        ]
+        if listed
+        else []
+    )
+    needle_calls: list[str] = []
+    invoked: list[str] = []
+
+    async def fake_gen(**kw: object) -> dict[str, JSONValue]:
+        needle_calls.append(str(kw["tool"]))
+        return {
+            "tool": "get_sec_document",
+            "arguments": {"accession_no": acc8},
+            "reasoning": "r",
+        }
+
+    async def invoke(name: str, args: dict[str, JSONValue], sess: object, **kw: object) -> dict[str, JSONValue]:
+        invoked.append(name)
+        return {}
+
+    out = asyncio.run(
+        sched._attempt_tool(
+            tool_name="get_sec_document",
+            node=_node(),
+            session={
+                "session_id": "s1",
+                "objective": "What did NVDA's latest 10-Q disclose about revenue?",
+            },
+            registry=sched.build_registry(),
+            evidence=[],
+            attempts=attempts,
+            kernel=_Kernel(),
+            needle_generate=fake_gen,
+            invoke=invoke,
+            to_outcome=lambda n, r: _outcome(),
+            tool_session=_tool_session(),
+            as_of=None,
+        )
+    )
+    assert needle_calls == ["get_sec_document"]
+    assert invoked == []
+    assert out["error_type"] == "reselect"
+    assert "no 10-Q" in str(out["error"])
+
+
+def test_structured_listing_keeps_form_identity_and_selects_latest_ten_q() -> None:
+    """Source rows label their own accession. The latest 10-Q wins over an older 10-Q and a newer 8-K."""
+    acc8, old_q, latest_q = (
+        "0001045810-26-000078",
+        "0001045810-26-000050",
+        "0001045810-26-000075",
+    )
+    listing: dict[str, JSONValue] = {
+        "tool": "list_sec_filings",
+        "arguments": {"identifier": "NVDA", "forms": ["10-Q", "10-K", "8-K"]},
+        "error": None,
+        "result": {
+            "filings": [
+                {"accession_no": acc8, "form": "8-K", "filed_at": "2026-09-01"},
+                {"accession_no": old_q, "form": "10-Q", "filed_at": "2026-05-01"},
+                {"accession_no": latest_q, "form": "10-Q", "filed_at": "2026-08-01"},
+            ]
+        },
+        "outcome_summary": f"8-K {acc8}, 10-Q {old_q}, 10-Q {latest_q}",
+    }
+    labeled = sched._ten_q_accessions(listing)
+    assert set(labeled) == {old_q, latest_q}
+    assert acc8 not in labeled
+
+    async def fake_none(**kw: object) -> dict[str, JSONValue]:
+        return {"tool": None, "arguments": {}, "reasoning": "withheld"}
+
+    args, _, _ = asyncio.run(
+        sched._generate_tool_arguments(
+            fake_none,
+            "get_sec_document",
+            sched.build_registry(),
+            {
+                "session_id": "s1",
+                "objective": "What did NVDA's latest 10-Q disclose about revenue?",
+            },
+            _node(),
+            [],
+            [listing],
+            None,
+            _Kernel(),
+        )
+    )
+    assert args == {"accession_no": latest_q, "query": "revenue", "limit": 32000}
+
+
+def test_generated_valid_8k_accession_changes_to_listed_latest_ten_q_before_invoke() -> None:
+    """The scheduler replaces a valid generated 8-K accession before the first document call."""
+    acc8, accq = "0001045810-26-000078", "0001045810-26-000075"
+    listing: dict[str, JSONValue] = {
+        "tool": "list_sec_filings",
+        "arguments": {"identifier": "NVDA", "forms": ["10-Q"]},
+        "error": None,
+        "result": {
+            "filings": [
+                {"accession_no": acc8, "form": "8-K", "filed_at": "2026-09-01"},
+                {"accession_no": accq, "form": "10-Q", "filed_at": "2026-08-01"},
+            ]
+        },
+        "outcome_summary": f"8-K {acc8}, 10-Q {accq}",
+    }
+    invoked: list[tuple[str, dict[str, JSONValue]]] = []
+    needle_calls: list[str] = []
+
+    async def fake_gen(**kw: object) -> dict[str, JSONValue]:
+        needle_calls.append(str(kw["tool"]))
+        return {
+            "tool": "get_sec_document",
+            "arguments": {"accession_no": acc8},
+            "reasoning": "r",
+        }
+
+    async def invoke(name: str, args: dict[str, JSONValue], sess: object, **kw: object) -> dict[str, JSONValue]:
+        invoked.append((name, dict(args)))
+        return {"text": "Revenue was $46.7 billion."}
+
+    out = asyncio.run(
+        sched._attempt_tool(
+            tool_name="get_sec_document",
+            node=_node(),
+            session={
+                "session_id": "s1",
+                "objective": "What did NVDA's latest 10-Q disclose about revenue as of 2026-09-01?",
+            },
+            registry=sched.build_registry(),
+            evidence=[],
+            attempts=[listing],
+            kernel=_Kernel(),
+            needle_generate=fake_gen,
+            invoke=invoke,
+            to_outcome=lambda n, r: _outcome("Revenue was $46.7 billion."),
+            tool_session=_tool_session(),
+            as_of=None,
+        )
+    )
+    assert needle_calls == ["get_sec_document"]
+    assert invoked == [("get_sec_document", {"accession_no": accq, "query": "revenue", "limit": 32000})]
+    assert out["arguments"] == {
+        "accession_no": accq,
+        "query": "revenue",
+        "limit": 32000,
+    }
+    assert out["error"] is None
+
+
+@pytest.mark.parametrize("runtime_envelope", [True, False], ids=["runtime-envelope", "in-memory"])
+def test_ten_q_revenue_route_settles_structured_listing(
+    runtime_envelope: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The route reads the latest exact 10-Q from persisted or in-memory rows, not misleading summary text."""
+    from copy import deepcopy
+
+    import app.tools as _tools
+    import tests.research_source_seam as seam
+    from app.research.programmatic_router import programmatic_select_round
+    from app.tool_runtime import outcome_from_result
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
+    prompt = "What did NVDA's latest 10-Q disclose about revenue?"
+    acc8, old_q, latest_q = (
+        "0001045810-26-000078",
+        "0001045810-26-000050",
+        "0001045810-26-000075",
+    )
+    seam.install(monkeypatch)
+    document = "nvda-20260726.htm"
+    section_text = {
+        "Item 1": "Revenue was $46.7 billion, up 56% from a year ago.",
+        "Item 2": "Data Center revenue drove the increase. Gaming revenue rose 49%.",
+        "Item 1A": "Export controls may reduce our revenue from China.",
+    }
+    seam.register_document(latest_q, document, "\n".join(section_text.values()))
+    handles = {
+        section: seam.handle_for_registered(text, accession=latest_q, document=document)
+        for section, text in section_text.items()
+    }
+    passages: list[object] = []
+    receipt = "s1:tr:list"
+    rows: list[JSONValue] = [
+        {"accession_no": acc8, "form": "8-K", "filed_at": "2026-09-01"},
+        {"accession_no": old_q, "form": "10-Q", "filed_at": "2026-05-01"},
+        {"accession_no": latest_q, "form": "10-Q", "filed_at": "2026-08-26"},
+    ]
+    structured: dict[str, JSONValue] = {"filings": rows, "source": "SEC EDGAR"}
+    summary = f"Bottom line: The latest 10-Q is {acc8}. The other 10-Q is {old_q}."
+    listed: dict[str, JSONValue] = {
+        "content": summary,
+        "meta": {"source": "SEC EDGAR"},
+        "tool_result_id": receipt,
+    }
+    if not runtime_envelope:
+        listed.update(structured)
+    original = deepcopy(listed)
+    reads: list[str] = []
+    invoked: list[tuple[str, dict[str, JSONValue]]] = []
+    needle_calls: list[str] = []
+
+    def get_tool_result(ref: str) -> dict[str, JSONValue]:
+        reads.append(ref)
+        assert ref == receipt
+        if not runtime_envelope:
+            raise KeyError(ref)
+        return {
+            "tool_result_id": receipt,
+            "tool_name": "list_sec_filings",
+            "result": structured,
+        }
+
+    class _StoredKernel(_Kernel):
+        @override
+        def get_tool_result(self, tool_result_id: str) -> dict[str, JSONValue]:
+            return get_tool_result(tool_result_id)
+
+        @override
+        def admit_evidence(self, session_id: str, job_id: str, data: Mapping[str, object]) -> dict[str, JSONValue]:
+            passages.append(data.get("matching_passage"))
+            return super().admit_evidence(session_id, job_id, data)
+
+    class _Jev(_JevAdmit):
+        @override
+        async def select_tool(self, *a: object, **k: object) -> ToolDecision:
+            raise AssertionError("The programmatic router must select the 10-Q revenue tools.")
+
+    async def fake_none(**kw: object) -> dict[str, JSONValue]:
+        needle_calls.append(str(kw["tool"]))
+        return {"tool": None, "arguments": {}, "reasoning": "withheld"}
+
+    async def invoke(name: str, args: dict[str, JSONValue], sess: object, **kw: object) -> dict[str, JSONValue]:
+        assert needle_calls == []
+        invoked.append((name, dict(args)))
+        if name == "list_sec_filings":
+            return listed
+        section = args["section"]
+        assert isinstance(section, str)
+        return {
+            "tool_result_id": f"s1:tr:doc{list(section_text).index(section)}",
+            "content": f"Bottom line: {section_text[section]}",
+            "meta": {"source_handle": dict(handles[section])},  # pyrefly: ignore[bad-assignment] - seam handle values are JSON scalars at runtime
+        }
+
+    kernel = _StoredKernel()
+    out = asyncio.run(
+        sched._drive_rounds(
+            ResearchNode(
+                node_id="n1",
+                session_id="s1",
+                question=f"[Today UTC 2026-10-09] {prompt}",
+                why_it_matters="w",
+            ),
+            {
+                "session_id": "s1",
+                "objective": prompt,
+                "created_at": "2026-10-09T12:00:00+00:00",
+                "temporal_scope": {
+                    "mode": "as_of",
+                    "as_of": "2026-10-09T12:00:00+00:00",
+                    "start": None,
+                    "end": None,
+                    "raw": None,
+                },
+            },
+            [
+                {"name": "list_sec_filings", "parameters": {}},
+                {"name": "get_sec_document", "parameters": {}},
+            ],
+            kernel,
+            _Jev(),
+            "s1",
+            "n1",
+            {
+                "select_round": programmatic_select_round,
+                "reasoner": None,
+                "needle_generate": fake_none,
+                "invoke": invoke,
+                "to_outcome": outcome_from_result,
+                "max_rounds": 4,
+            },
+            _tool_session(),
+            None,
+        )
+    )
+    assert invoked == [
+        ("list_sec_filings", {"identifier": "NVDA", "forms": ["10-Q"]}),
+        *(
+            (
+                "get_sec_document",
+                {"accession_no": latest_q, "limit": 32000, "section": section},
+            )
+            for section in section_text
+        ),
+    ]
+    # Each section admits as its own evidence with its full section text.
+    assert out["status"] == "resolved" and out["admitted"] == 4
+    assert passages[1:] == list(section_text.values())
+    attempts = out["attempts"]
+    assert isinstance(attempts, list)
+    listing, *documents = attempts
+    assert isinstance(listing, dict)
+    assert all(isinstance(document, dict) for document in documents)
+    documents = [document for document in documents if isinstance(document, dict)]
+    assert needle_calls == []
+    for attempt in (listing, *documents):
+        assert isinstance(attempt, dict)
+        reasoning = attempt["reasoning"]
+        assert isinstance(reasoning, str)
+        assert reasoning.startswith("scheduler grounded latest 10-Q revenue arguments")
+        assert not any(word in reasoning.lower() for word in ("needle", "withhold", "failure"))
+    assert listing["tool_result_ref"] == receipt
+    assert listing["outcome_summary"] == summary
+    assert [d["tool_result_ref"] for d in documents] == [
+        "s1:tr:doc0",
+        "s1:tr:doc1",
+        "s1:tr:doc2",
+    ]
+    assert len({d["evidence_id"] for d in documents}) == 3
+    assert all("result" not in d for d in documents)
+    assert listed == original
+    assert reads and all(ref == receipt for ref in reads)
+    for _, job_id in (call for call in kernel.calls if call[0] == "admit"):
+        assert kernel.calls.index(("admit", job_id)) < kernel.calls.index(("complete", job_id))
+
+
+def test_ten_q_revenue_node_reads_document_after_reason_over_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live rs:39fb3c2e: reason_over_evidence on the node's own listing must not end the node before the 10-Q read."""
+    import app.tools as _tools
+    import tests.research_source_seam as seam
+    from app.research.programmatic_router import programmatic_select_round
+
+    def _resolve(name: str) -> str | None:
+        return {"NVDA": "NVDA"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
+    prompt = "What did NVDA's latest 10-Q disclose about revenue? Use stockbot, bearbot, and bullbot."
+    acc8, accq = "0001045810-26-000078", "0001045810-26-000075"
+    seam.install(monkeypatch)
+    document_handle = seam.handle_for(
+        "Revenue was $46.7 billion, up 56% from a year ago.",
+        accession=accq,
+        document="nvda-20260726.htm",
+    )
+    invoked: list[tuple[str, dict[str, JSONValue]]] = []
+
+    async def fake_none(**kw: object) -> dict[str, JSONValue]:
+        return {"tool": None, "arguments": {}, "reasoning": "withheld: ungrounded"}
+
+    async def invoke(name: str, args: dict[str, JSONValue], sess: object, **kw: object) -> dict[str, JSONValue]:
+        invoked.append((name, args))
+        return {"tool": name}
+
+    def to_outcome(name: str, result: Mapping[str, object]) -> ToolOutcome:
+        if name == "list_sec_filings":
+            content = f"filing {acc8} 8-K {'x' * 130} filing {accq} 10-Q"
+            handle = None
+        else:
+            content = "Revenue was $46.7 billion, up 56% from a year ago."
+            handle = document_handle
+        return dataclasses.replace(_outcome(content), tool_name=name, source_handle=handle)
+
+    class _Jev(JevClient):
+        @override
+        async def select_tool(self, *a: object, **k: object) -> ToolDecision:
+            raise AssertionError("router owns the 10-Q revenue route; JEV select must not run")
+
+        @override
+        async def assess_result(self, node: object, outcome: object, *a: object, **k: object) -> dict[str, JSONValue]:
+            assert isinstance(outcome, ToolOutcome)
+            listing = outcome.tool_name == "list_sec_filings"
+            continuation = "reason_over_evidence" if listing else "resolve_node"
+            return {
+                "continuation": continuation,
+                "evidence_state": "sufficient_support",
+                "topical_relevance_answer": "yes",
+                "resolution_support_answer": "unsure" if listing else "yes",
+            }
+
+    session = {"session_id": "s1", "objective": prompt}
+    out = asyncio.run(
+        sched._drive_rounds(
+            ResearchNode(node_id="n1", session_id="s1", question=prompt, why_it_matters="w"),
+            session,
+            [
+                {"name": "list_sec_filings", "parameters": {}},
+                {"name": "get_sec_document", "parameters": {}},
+            ],
+            _Kernel(),
+            _Jev(),
+            "s1",
+            "n1",
+            {
+                "select_round": programmatic_select_round,
+                "reasoner": None,
+                "needle_generate": fake_none,
+                "invoke": invoke,
+                "to_outcome": to_outcome,
+                "max_rounds": 4,
+            },
+            _tool_session(),
+            None,
+        )
+    )
+    sections = ("Item 1", "Item 2", "Item 1A")
+    assert [name for name, _ in invoked] == [
+        "list_sec_filings",
+        *["get_sec_document"] * 3,
+    ]
+    assert [args for _, args in invoked[1:]] == [{"accession_no": accq, "limit": 32000, "section": s} for s in sections]
+    assert out["status"] == "resolved" and out["admitted"] == 3
+    # Boundaries: the guard holds only until one document read, and only on revenue-quarter asks.
+    listing_ok = {"tool": "list_sec_filings", "error": None}
+    read_ok = {"tool": "get_sec_document", "error": None}
+    read_err = {"tool": "get_sec_document", "error": "timeout"}
+    node = ResearchNode(node_id="n1", session_id="s1", question=prompt, why_it_matters="w")
+    assert sched._revenue_read_pending(session, node, [listing_ok, read_err])
+    assert not sched._revenue_read_pending(session, node, [listing_ok, read_ok])
+    assert not sched._revenue_read_pending(session, node, [])
+    other = ResearchNode(
+        node_id="n1",
+        session_id="s1",
+        question="What did NVDA disclose about revenue?",
+        why_it_matters="w",
+    )
+    assert not sched._revenue_read_pending({"objective": "What did NVDA disclose about revenue?"}, other, [listing_ok])
+
+
+@pytest.mark.parametrize("selected_resolved", [False, True])
+def test_ten_q_revenue_node_reads_document_before_supported_listing_resolve(
+    selected_resolved: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scheduler reads the revenue document before assessment or selection resolves the node."""
+    import app.tools as _tools
+    import tests.research_source_seam as seam
+    from app.research.programmatic_router import programmatic_select_round
+
+    def _resolve(name: str) -> str | None:
+        return {"NVDA": "NVDA"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
+    prompt = "What did NVDA's latest 10-Q disclose about revenue? Use stockbot, bearbot, and bullbot."
+    acc8, accq = "0001045810-26-000078", "0001045810-26-000075"
+    seam.install(monkeypatch)
+    document_handle = seam.handle_for(
+        "Revenue was $46.7 billion, up 56% from a year ago.",
+        accession=accq,
+        document="nvda-20260726.htm",
+    )
+    invoked: list[tuple[str, dict[str, JSONValue]]] = []
+
+    async def fake_none(**kw: object) -> dict[str, JSONValue]:
+        return {"tool": None, "arguments": {}, "reasoning": "withheld: ungrounded"}
+
+    async def invoke(name: str, args: dict[str, JSONValue], sess: object, **kw: object) -> dict[str, JSONValue]:
+        invoked.append((name, args))
+        return {"tool": name}
+
+    def to_outcome(name: str, result: Mapping[str, object]) -> ToolOutcome:
+        content = (
+            f"filing {acc8} 8-K {'x' * 130} filing {accq} 10-Q"
+            if name == "list_sec_filings"
+            else "Revenue was $46.7 billion, up 56% from a year ago."
+        )
+        return dataclasses.replace(
+            _outcome(content),
+            tool_name=name,
+            source_handle=None if name == "list_sec_filings" else document_handle,
+        )
+
+    class _Jev(JevClient):
+        @override
+        async def select_tool(self, *a: object, **k: object) -> ToolDecision:
+            assert selected_resolved
+            assert [name for name, _ in invoked] == ["list_sec_filings"]
+            return ToolDecision(action="resolved", confidence=1.0)
+
+        @override
+        async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
+            return {
+                "continuation": "resolve_node",
+                "evidence_state": "sufficient_support",
+                "topical_relevance_answer": "yes",
+                "resolution_support_answer": "yes",
+            }
+
+    class _IntakeKernel(_Kernel):
+        @override
+        def list_evidence(self, session_id: str) -> list[dict[str, JSONValue]]:
+            return [{"evidence_id": "ev-intake", "content": "NVDA intake snippet"}]
+
+    sent_resolved = False
+
+    async def select_round(
+        jev: JevClient,
+        kernel: sched._Kernel,
+        sid: str,
+        nid: str,
+        session: Mapping[str, JSONValue],
+        node: ResearchNode,
+        registry: Sequence[dict[str, JSONValue]],
+        ctx_ev: Sequence[JSONValue],
+        attempts: Sequence[Mapping[str, JSONValue]],
+    ) -> tuple[str, ToolDecision]:
+        nonlocal sent_resolved
+        if selected_resolved and invoked and not sent_resolved:
+            sent_resolved = True
+            decision = await jev.select_tool(
+                sched.query_with_today_utc(str(session["objective"])),
+                node,
+                registry,
+                ctx_ev,
+                [dict(a) for a in attempts],
+                session_id=sid,
+            )
+            return sched._selection_action(decision), decision
+        return await programmatic_select_round(
+            jev,
+            kernel,
+            sid,
+            nid,
+            session,
+            node,
+            list(registry),
+            list(ctx_ev),
+            [dict(a) for a in attempts],
+        )
+
+    session = {"session_id": "s1", "objective": prompt}
+    out = asyncio.run(
+        sched._drive_rounds(
+            ResearchNode(node_id="n1", session_id="s1", question=prompt, why_it_matters="w"),
+            session,
+            [
+                {"name": "list_sec_filings", "parameters": {}},
+                {"name": "get_sec_document", "parameters": {}},
+            ],
+            _IntakeKernel(),
+            _Jev(),
+            "s1",
+            "n1",
+            {
+                "select_round": select_round,
+                "reasoner": None,
+                "needle_generate": fake_none,
+                "invoke": invoke,
+                "to_outcome": to_outcome,
+                "max_rounds": 4,
+            },
+            _tool_session(),
+            None,
+        )
+    )
+    sections = ("Item 1", "Item 2", "Item 1A")
+    assert [name for name, _ in invoked] == [
+        "list_sec_filings",
+        *["get_sec_document"] * 3,
+    ]
+    assert [args for _, args in invoked[1:]] == [{"accession_no": accq, "limit": 32000, "section": s} for s in sections]
+    assert out["status"] == "resolved" and out["admitted"] == 3
+    assert sent_resolved == selected_resolved
 
 
 def test_stale_as_of_dropped_dateless_objective() -> None:
@@ -1322,7 +3026,10 @@ def test_stale_as_of_dropped_dateless_objective() -> None:
     async def fake_stale(**kw: object) -> dict[str, JSONValue]:
         return {
             "tool": "get_sec_filing",
-            "arguments": {"accession_no": "0000320193-25-000079", "as_of": "2025-09-27"},
+            "arguments": {
+                "accession_no": "0000320193-25-000079",
+                "as_of": "2025-09-27",
+            },
             "reasoning": "r",
         }
 
@@ -1331,7 +3038,7 @@ def test_stale_as_of_dropped_dateless_objective() -> None:
         "objective": "For Apple's 10-K accession 0000320193-25-000079, give me the filing metadata (form, dates, filer)",
     }
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_stale, "get_sec_filing", [], session, _node(), [], [], None)
+        sched._generate_tool_arguments(fake_stale, "get_sec_filing", [], session, _node(), [], [], None, _Kernel())
     )
     assert args == {"accession_no": "0000320193-25-000079"}
 
@@ -1342,7 +3049,10 @@ def test_explicit_as_of_kept_when_in_objective() -> None:
     async def fake_kept(**kw: object) -> dict[str, JSONValue]:
         return {
             "tool": "get_sec_filing",
-            "arguments": {"accession_no": "0000320193-25-000079", "as_of": "2025-09-27"},
+            "arguments": {
+                "accession_no": "0000320193-25-000079",
+                "as_of": "2025-09-27",
+            },
             "reasoning": "r",
         }
 
@@ -1351,7 +3061,7 @@ def test_explicit_as_of_kept_when_in_objective() -> None:
         "objective": "For Apple's 10-K accession 0000320193-25-000079 as of 2025-09-27, give me the filing metadata",
     }
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_kept, "get_sec_filing", [], session, _node(), [], [], None)
+        sched._generate_tool_arguments(fake_kept, "get_sec_filing", [], session, _node(), [], [], None, _Kernel())
     )
     assert args == {"accession_no": "0000320193-25-000079", "as_of": "2025-09-27"}
 
@@ -1363,7 +3073,10 @@ def test_session_as_of_kept_when_datetime() -> None:
     async def fake_kept(**kw: object) -> dict[str, JSONValue]:
         return {
             "tool": "get_sec_filing",
-            "arguments": {"accession_no": "0000320193-25-000079", "as_of": "2025-09-27"},
+            "arguments": {
+                "accession_no": "0000320193-25-000079",
+                "as_of": "2025-09-27",
+            },
             "reasoning": "r",
         }
 
@@ -1373,12 +3086,24 @@ def test_session_as_of_kept_when_datetime() -> None:
         "as_of": datetime(2025, 9, 27, 12, 0, 0, tzinfo=UTC).isoformat(),
     }
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_kept, "get_sec_filing", [], session, _node(), [], [], "2025-09-27")
+        sched._generate_tool_arguments(
+            fake_kept,
+            "get_sec_filing",
+            [],
+            session,
+            _node(),
+            [],
+            [],
+            "2025-09-27",
+            _Kernel(),
+        )
     )
     assert args == {"accession_no": "0000320193-25-000079", "as_of": "2025-09-27"}
 
 
-def test_garbage_identifier_reseeded_from_objective(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_garbage_identifier_reseeded_from_objective(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Needle identifier F1/TODAY/SEC on an Apple query reseeds to AAPL."""
     import app.tools as _tools
 
@@ -1388,11 +3113,28 @@ def test_garbage_identifier_reseeded_from_objective(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
 
     async def fake_garbage(**kw: object) -> dict[str, JSONValue]:
-        return {"tool": "list_sec_filings", "arguments": {"identifier": "F1"}, "reasoning": "r"}
+        return {
+            "tool": "list_sec_filings",
+            "arguments": {"identifier": "F1"},
+            "reasoning": "r",
+        }
 
-    session = {"session_id": "s1", "objective": "List Apple's most recent 10-K and 10-Q filings."}
+    session = {
+        "session_id": "s1",
+        "objective": "List Apple's most recent 10-K and 10-Q filings.",
+    }
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_garbage, "list_sec_filings", [], session, _node(), [], [], None)
+        sched._generate_tool_arguments(
+            fake_garbage,
+            "list_sec_filings",
+            [],
+            session,
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
     )
     assert args.get("identifier") == "AAPL"
 
@@ -1401,18 +3143,39 @@ def test_identifier_repair_keeps_valid_cik_and_case() -> None:
     """CIK digits and lowercase ticker pass through; only EDGAR-unresolvable garbage reseeds."""
 
     async def fake_cik(**kw: object) -> dict[str, JSONValue]:
-        return {"tool": "list_sec_filings", "arguments": {"identifier": "0000320193"}, "reasoning": "r"}
+        return {
+            "tool": "list_sec_filings",
+            "arguments": {"identifier": "0000320193"},
+            "reasoning": "r",
+        }
 
     async def fake_lower(**kw: object) -> dict[str, JSONValue]:
-        return {"tool": "list_sec_filings", "arguments": {"identifier": "aapl"}, "reasoning": "r"}
+        return {
+            "tool": "list_sec_filings",
+            "arguments": {"identifier": "aapl"},
+            "reasoning": "r",
+        }
 
-    session = {"session_id": "s1", "objective": "List Apple's most recent 10-K and 10-Q filings."}
+    session = {
+        "session_id": "s1",
+        "objective": "List Apple's most recent 10-K and 10-Q filings.",
+    }
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_cik, "list_sec_filings", [], session, _node(), [], [], None)
+        sched._generate_tool_arguments(fake_cik, "list_sec_filings", [], session, _node(), [], [], None, _Kernel())
     )
     assert args.get("identifier") == "0000320193"
     args, _, _ = asyncio.run(
-        sched._generate_tool_arguments(fake_lower, "list_sec_filings", [], session, _node(), [], [], None)
+        sched._generate_tool_arguments(
+            fake_lower,
+            "list_sec_filings",
+            [],
+            session,
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
     )
     assert args.get("identifier") == "aapl"
 
@@ -1426,7 +3189,7 @@ def test_session_control_carries_sid_without_needle() -> None:
     session = {"session_id": "s1", "objective": "q?"}
     for tool in ("research_resume", "research_status", "research_cancel"):
         args, reasoning, withheld = asyncio.run(
-            sched._generate_tool_arguments(boom_gen, tool, [], session, _node(), [], [], None)
+            sched._generate_tool_arguments(boom_gen, tool, [], session, _node(), [], [], None, _Kernel())
         )
         assert args == {"session_id": "s1"}
         assert withheld is False
@@ -1467,7 +3230,17 @@ def test_empty_search_withhold_reselects() -> None:
     session = {"session_id": "s1", "objective": "What drove Growth this week?"}
     with pytest.raises(sched._ReselectRequest, match="re-selecting"):
         asyncio.run(
-            sched._generate_tool_arguments(fake_empty, "search_sec_filings", [], session, _node(), [], [], None)
+            sched._generate_tool_arguments(
+                fake_empty,
+                "search_sec_filings",
+                [],
+                session,
+                _node(),
+                [],
+                [],
+                None,
+                _Kernel(),
+            )
         )
 
 
@@ -1514,7 +3287,15 @@ def test_needle_carry_fails_loud_after_two() -> None:
     with pytest.raises(RuntimeError, match="carried fallbacks used"):
         asyncio.run(
             sched._generate_tool_arguments(
-                boom, "get_sec_filing", [], session, _node(), [], [{**carried}, {**carried}], None
+                boom,
+                "get_sec_filing",
+                [],
+                session,
+                _node(),
+                [],
+                [{**carried}, {**carried}],
+                None,
+                _Kernel(),
             )
         )
 
@@ -1523,16 +3304,40 @@ def test_accession_family_break_across_tools() -> None:
     """Same accession failing across get_sec_filing/get_sec_document breaks as one family (C)."""
     acc = "0001193125-09-214859"
     attempts: list[dict[str, JSONValue]] = [
-        {"tool": "get_sec_filing", "arguments": {"accession_no": acc}, "error": "boom-a"},
-        {"tool": "get_sec_document", "arguments": {"accession_no": acc}, "error": "boom-b"},
+        {
+            "tool": "get_sec_filing",
+            "arguments": {"accession_no": acc},
+            "error": "boom-a",
+        },
+        {
+            "tool": "get_sec_document",
+            "arguments": {"accession_no": acc},
+            "error": "boom-b",
+        },
     ]
     guided = sched._accession_family_break(attempts)
     assert guided is not None and guided["error_type"] == "invalid_tool_arguments"
     error = guided["error"]
     assert isinstance(error, str) and acc in error
+    # Sibling 10-Q section reads fail independently. A repeat of one section still breaks.
+    item1, item2 = (
+        dict[str, JSONValue](
+            {
+                "tool": "get_sec_document",
+                "arguments": {"accession_no": acc, "section": s},
+                "error": "boom",
+            }
+        )
+        for s in ("Item 1", "Item 2")
+    )
+    assert sched._accession_family_break([item1, item2]) is None
+    assert sched._accession_family_break([item1, {**item1, "error": "boom-2"}]) is not None
+    assert sched._accession_family_break([attempts[0], item1]) is not None
 
 
-def test_find_sec_entities_seeded_from_objective(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_find_sec_entities_seeded_from_objective(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """find_sec_entities seeds a grounded query (ticker-first) instead of erroring on empty args."""
     import app.tools as _tools
     from app.research import scheduler as _sched
@@ -1584,7 +3389,11 @@ def test_sync_invoke_overlaps_not_serial() -> None:
 
 def test_needle_error_streak_breaks_at_three() -> None:
     """3 consecutive generation-shaped errors streak 3; args-produced breaks it (D5)."""
-    bad: dict[str, JSONValue] = {"tool": "search_web", "error": "needle down", "arguments": {}}
+    bad: dict[str, JSONValue] = {
+        "tool": "search_web",
+        "error": "needle down",
+        "arguments": {},
+    }
     assert sched._needle_error_streak([dict(bad), dict(bad)]) == 2
     assert sched._needle_error_streak([dict(bad), dict(bad), dict(bad)]) == 3
     grounded = dict(bad, arguments={"query": "q"})
@@ -1594,12 +3403,23 @@ def test_needle_error_streak_breaks_at_three() -> None:
 @pytest.mark.parametrize(
     ("kernel_cls", "outcomes", "admitted_ids"),
     [
-        (_Kernel, {"admitted": 1, "duplicate": 0, "not_citable": 1, "error": 1, "timeout": 0}, ["ev-0"]),
-        (_DupKernel, {"admitted": 0, "duplicate": 1, "not_citable": 1, "error": 1, "timeout": 0}, []),
+        (
+            _Kernel,
+            {"admitted": 1, "duplicate": 0, "not_citable": 1, "error": 1, "timeout": 0},
+            ["ev-0"],
+        ),
+        (
+            _DupKernel,
+            {"admitted": 0, "duplicate": 1, "not_citable": 1, "error": 1, "timeout": 0},
+            [],
+        ),
     ],
 )
 def test_intake_round_admits_citable_without_jev_verdict(
-    monkeypatch: pytest.MonkeyPatch, kernel_cls: type[_Kernel], outcomes: dict[str, int], admitted_ids: list[str]
+    monkeypatch: pytest.MonkeyPatch,
+    kernel_cls: type[_Kernel],
+    outcomes: dict[str, int],
+    admitted_ids: list[str],
 ) -> None:
     """_intake_round admits citable bytes by code; uncitable/error close jobs (E1); duplicates never count."""
     from app.research import kernel_worker as kw
@@ -1607,7 +3427,12 @@ def test_intake_round_admits_citable_without_jev_verdict(
     kernel = kernel_cls()
     kernel.tool_results["s1:tr:w"] = {
         "tool_result_id": "s1:tr:w",
-        "evidence": [{"url": "https://example.com/a", "highlight": "Oracle merger filing mentions"}],
+        "evidence": [
+            {
+                "url": "https://example.com/a",
+                "highlight": "Oracle merger filing mentions",
+            }
+        ],
     }
 
     async def fake_attempt(
@@ -1620,7 +3445,12 @@ def test_intake_round_admits_citable_without_jev_verdict(
                 "job_id": "job-web",
                 "result": {
                     "tool_result_id": "s1:tr:w",
-                    "evidence": [{"url": "https://example.com/a", "highlight": "Oracle merger filing mentions"}],
+                    "evidence": [
+                        {
+                            "url": "https://example.com/a",
+                            "highlight": "Oracle merger filing mentions",
+                        }
+                    ],
                 },
                 "outcome": _outcome("web bytes here"),
                 "outcome_summary": "web bytes here",
@@ -1636,12 +3466,28 @@ def test_intake_round_admits_citable_without_jev_verdict(
                 "outcome_summary": "",
                 "error": None,
             }
-        return {"tool": tool, "arguments": args, "job_id": "job-bad", "error": "boom", "outcome": None}
+        return {
+            "tool": tool,
+            "arguments": args,
+            "job_id": "job-bad",
+            "error": "boom",
+            "outcome": None,
+        }
 
     async def fake_chain(*a: object, **k: object) -> list[tuple[str, dict[str, JSONValue], dict[str, object], float]]:
         return [
-            ("list_sec_filings", {"ticker": "ORCL"}, await fake_attempt("list_sec_filings", {}, "s1"), 5.0),
-            ("get_sec_document", {"accession_no": "x"}, await fake_attempt("get_sec_document", {}, "s1"), 5.0),
+            (
+                "list_sec_filings",
+                {"ticker": "ORCL"},
+                await fake_attempt("list_sec_filings", {}, "s1"),
+                5.0,
+            ),
+            (
+                "get_sec_document",
+                {"accession_no": "x"},
+                await fake_attempt("get_sec_document", {}, "s1"),
+                5.0,
+            ),
         ]
 
     monkeypatch.setattr(kw, "_intake_attempt", fake_attempt)
@@ -1658,7 +3504,9 @@ def test_intake_round_admits_citable_without_jev_verdict(
     assert stats["admitted_ids"] == admitted_ids and stats["admitted"] == 1 and admitted == [{"evidence_id": "ev-0"}]
 
 
-def test_intake_round_budget_timeout_records_per_call(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_intake_round_budget_timeout_records_per_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Pending budget tasks synthesize timeout records with wall_ms (A2)."""
     from app.research import kernel_worker as kw
 
@@ -1681,7 +3529,10 @@ def test_sec_thread_cap_survives_four_concurrent_calls() -> None:
 
     async def _main() -> list[str]:
         async def _call(i: int) -> str:
-            out = await asyncio.wait_for(sched._sec_thread_call(lambda: (time.sleep(0.1), f"r{i}")[1]), timeout=10)
+            out = await asyncio.wait_for(
+                sched._sec_thread_call(lambda: (time.sleep(0.1), f"r{i}")[1]),
+                timeout=10,
+            )
             assert isinstance(out, str)
             return out
 
@@ -1752,7 +3603,12 @@ def test_session_run_survives_second_event_loop() -> None:
 
     async def done(n: ResearchNode, sid: str, **kw: object) -> dict[str, JSONValue]:
         await asyncio.sleep(0)  # yield so the 3rd node actually waits on the 2-lane cap
-        return {"node_id": n.node_id, "status": "resolved", "admitted": 1, "incomplete_guard": False}
+        return {
+            "node_id": n.node_id,
+            "status": "resolved",
+            "admitted": 1,
+            "incomplete_guard": False,
+        }
 
     with mock.patch.object(sched, "run_node", done):
         first = asyncio.run(sched.run("s1", kernel=_KS(), repo=None))
@@ -1772,7 +3628,11 @@ def test_needle_streak_ignores_reselect_attempts() -> None:
         "error_type": "reselect",
     }
     assert sched._needle_error_streak([dict(reselect) for _ in range(3)]) == 0
-    gen_fail: dict[str, JSONValue] = {"tool": "query_finra", "arguments": {}, "error": "needle blew up"}
+    gen_fail: dict[str, JSONValue] = {
+        "tool": "query_finra",
+        "arguments": {},
+        "error": "needle blew up",
+    }
     assert sched._needle_error_streak([dict(gen_fail) for _ in range(3)]) == 3
 
 
@@ -1813,7 +3673,11 @@ def test_cancelled_attempt_fails_job() -> None:
 
     with pytest.raises(TimeoutError):
         asyncio.run(_main())
-    assert ("fail", "job-0", "timeout") in kernel.calls  # cancelled job fails as timeout, never running
+    assert (
+        "fail",
+        "job-0",
+        "timeout",
+    ) in kernel.calls  # cancelled job fails as timeout, never running
 
 
 def test_cancelled_generation_fails_job() -> None:
@@ -1850,10 +3714,16 @@ def test_cancelled_generation_fails_job() -> None:
 
     with pytest.raises(TimeoutError):
         asyncio.run(_main())
-    assert ("fail", "job-0", "timeout") in kernel.calls  # generation cancel fails as timeout, never running
+    assert (
+        "fail",
+        "job-0",
+        "timeout",
+    ) in kernel.calls  # generation cancel fails as timeout, never running
 
 
-def test_drive_rounds_emits_parseable_timing_per_round(caplog: pytest.LogCaptureFixture) -> None:
+def test_drive_rounds_emits_parseable_timing_per_round(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """One toolflow round_timing line per round with 4 phase ms + ev before/after."""
     import logging
 
@@ -1864,10 +3734,18 @@ def test_drive_rounds_emits_parseable_timing_per_round(caplog: pytest.LogCapture
         return ("invoke", _invoke("search_web"))
 
     async def gen(tool: object, schema: object = None, **k: object) -> dict[str, JSONValue]:
-        return {"tool": "search_web", "arguments": {"query": "q"}, "reasoning": "", "confidence": 1.0}
+        return {
+            "tool": "search_web",
+            "arguments": {"query": "q"},
+            "reasoning": "",
+            "confidence": 1.0,
+        }
 
     async def invoke(name: object, args: object, sess: object, **k: object) -> dict[str, JSONValue]:
-        return {"status": "ok", "rows": [{"url": "https://e.com", "title": "t", "passage": "p" * 50}]}
+        return {
+            "status": "ok",
+            "rows": [{"url": "https://e.com", "title": "t", "passage": "p" * 50}],
+        }
 
     class _J(JevClient):
         @override
@@ -1900,11 +3778,22 @@ def test_drive_rounds_emits_parseable_timing_per_round(caplog: pytest.LogCapture
     lines = [r.getMessage() for r in caplog.records if "round_timing" in r.getMessage()]
     assert len(lines) >= 1
     line = lines[0]
-    for key in ("round=", "tool=", "select_ms=", "generate_ms=", "tool_ms=", "assess_ms=", "ev_before=", "ev_after="):
+    for key in (
+        "round=",
+        "tool=",
+        "select_ms=",
+        "generate_ms=",
+        "tool_ms=",
+        "assess_ms=",
+        "ev_before=",
+        "ev_after=",
+    ):
         assert key in line
 
 
-def test_terminal_select_failure_still_logs_timing(caplog: pytest.LogCaptureFixture) -> None:
+def test_terminal_select_failure_still_logs_timing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Third straight select failure emits a round_timing row before the terminal return."""
     import asyncio
     import logging
@@ -1924,7 +3813,13 @@ def test_terminal_select_failure_still_logs_timing(caplog: pytest.LogCaptureFixt
                 JevClient(),
                 "s1",
                 "n1",
-                {"select_round": down, "reasoner": None, "needle_generate": None, "invoke": None, "to_outcome": None},
+                {
+                    "select_round": down,
+                    "reasoner": None,
+                    "needle_generate": None,
+                    "invoke": None,
+                    "to_outcome": None,
+                },
                 _tool_session(),
                 None,
             )
@@ -1988,6 +3883,249 @@ def test_selection_guidance_carries_intake_digest() -> None:
     assert isinstance(instruction, str) and "identical arguments" in instruction
 
 
+def _dup_gen(**kw: object) -> dict[str, JSONValue]:
+    return {
+        "tool": "search_web",
+        "arguments": {"query": "NVDA revenue 0"},
+    }
+
+
+def test_duplicate_guard_uses_full_history_beyond_generation_window() -> None:
+    """A repeat of a call older than the 10-attempt generation window still reselects without invoking."""
+    invoked: list[str] = []
+
+    def _dup_invoke(*a: object, **k: object) -> dict[str, JSONValue]:
+        invoked.append("invoked")
+        return {}
+
+    def _dup_outcome(name: str, result: Mapping[str, object]) -> ToolOutcome:
+        return _outcome()
+
+    attempts: list[dict[str, JSONValue]] = [
+        {
+            "tool": "search_web",
+            "arguments": {"query": f"NVDA revenue {i}"},
+            "error": None,
+        }
+        for i in range(14)
+    ]
+    out = asyncio.run(
+        sched._attempt_tool(
+            tool_name="search_web",
+            node=_node(),
+            session={"session_id": "s1", "objective": "NVDA revenue"},
+            registry=[],
+            evidence=[],
+            attempts=attempts,
+            kernel=_Kernel(),
+            needle_generate=_dup_gen,
+            invoke=_dup_invoke,
+            to_outcome=_dup_outcome,
+            tool_session=_tool_session(),
+            as_of=None,
+        )
+    )
+    assert out["error_type"] == "reselect" and "duplicate" in str(out["error"])
+    assert invoked == []
+
+
+def _xbrl_attempt(
+    objective: str,
+    concept: str,
+    *,
+    question: str = "q?",
+    evidence: Sequence[JSONValue] | None = None,
+    attempts: Sequence[Mapping[str, JSONValue]] | None = None,
+    reasoning: str = "r",
+    kernel: _Kernel | None = None,
+) -> tuple[dict[str, object], list[dict[str, JSONValue]]]:
+    """One real _attempt_tool for get_xbrl_facts with a fake Needle and a recording runtime invoke."""
+    invoked: list[dict[str, JSONValue]] = []
+
+    async def fake_gen(**kw: object) -> dict[str, JSONValue]:
+        return {
+            "tool": "get_xbrl_facts",
+            "arguments": {"ticker": "NVDA", "concept": concept},
+            "reasoning": reasoning,
+        }
+
+    async def fake_invoke(name: str, args: dict[str, JSONValue], sess: object, **kw: object) -> dict[str, JSONValue]:
+        invoked.append(dict(args))
+        return {"tool_result_id": "s1:tr:xbrl"}
+
+    out = asyncio.run(
+        sched._attempt_tool(
+            tool_name="get_xbrl_facts",
+            node=ResearchNode(node_id="n1", session_id="s1", question=question, why_it_matters="w"),
+            session={"session_id": "s1", "objective": objective},
+            registry=sched.build_registry(),
+            evidence=evidence or [],
+            attempts=attempts or [],
+            kernel=kernel if kernel is not None else _Kernel(),
+            needle_generate=fake_gen,
+            invoke=fake_invoke,
+            to_outcome=_xbrl_outcome,
+            tool_session=_tool_session(),
+            as_of=None,
+        )
+    )
+    return out, invoked
+
+
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("stored", [False, True])
+def test_xbrl_locator_grounds_only_successful_stored_source(failed: bool, stored: bool) -> None:
+    """Only stored bytes from a successful source call can ground an unrequested XBRL tag."""
+    ref = "s1:tr:sec"
+    text = "Balance sheet boilerplate. " * 3000 + "us-gaap:InventoryNet 10,080 million."
+    kernel = _Kernel({ref: {"tool_name": "get_sec_document", "result": {"text": text}}} if stored else {})
+    attempt: dict[str, JSONValue] = {
+        "tool": "get_sec_document",
+        "tool_result_ref": ref,
+        "arguments": {"accession_no": "0001045810-26-000075"},
+        "error": "timeout" if failed else None,
+        "outcome_summary": text[: sched._OUTCOME_SUMMARY_MAX],
+    }
+    assert "InventoryNet" not in str(attempt["outcome_summary"])
+    out, invoked = _xbrl_attempt(
+        "Which balance sheet facts did NVDA's latest 10-K tag?",
+        "InventoryNet",
+        attempts=[attempt],
+        kernel=kernel,
+    )
+    if stored and not failed:
+        assert out["error"] is None
+        assert invoked == [{"ticker": "NVDA", "concept": "InventoryNet"}]
+    else:
+        assert out["error_type"] == "reselect"
+        assert invoked == []
+
+
+@pytest.mark.parametrize("concept", ["Today UTC date", "TodayUTCDate", "today"])
+def test_xbrl_date_placeholder_concept_reselects_before_invoke(concept: str) -> None:
+    """Live control run: Needle copied the Today UTC date guidance into concept; the runtime must never see it."""
+    prompt = "[Today UTC 2026-10-09] What did NVDA report in its latest XBRL filing?"
+    out, invoked = _xbrl_attempt(prompt, concept, question=prompt)
+    assert invoked == []
+    assert out["error_type"] == "reselect" and "duplicate" not in str(out["error"])
+    assert out["arguments"] == {}
+
+
+@pytest.mark.parametrize("concept", ["NetIncomeLoss", "GrossProfit"])
+def test_xbrl_unrequested_concept_reselects_before_invoke(concept: str) -> None:
+    """A canonical or real tag the user never asked about and no source names cannot reach the runtime."""
+    out, invoked = _xbrl_attempt("What was NVDA revenue in the latest quarter?", concept)
+    assert invoked == []
+    assert out["error_type"] == "reselect" and "duplicate" not in str(out["error"])
+
+
+@pytest.mark.parametrize(
+    "concept",
+    ["Revenue", "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax"],
+)
+def test_xbrl_requested_canonical_revenue_alias_invokes(concept: str) -> None:
+    """A revenue ask grounds the canonical Revenue key and each of its existing SEC aliases, unchanged."""
+    out, invoked = _xbrl_attempt("What was NVDA revenue in the latest quarter?", concept)
+    assert out["error"] is None
+    assert invoked == [{"ticker": "NVDA", "concept": concept}]
+
+
+def test_xbrl_requested_exact_sec_tag_outside_canonical_map_invokes() -> None:
+    """An exact SEC tag the user names stays valid even though the canonical map does not list it."""
+    out, invoked = _xbrl_attempt(
+        "What did NVDA report as ResearchAndDevelopmentExpense in XBRL?",
+        "ResearchAndDevelopmentExpense",
+    )
+    assert out["error"] is None
+    assert invoked == [{"ticker": "NVDA", "concept": "ResearchAndDevelopmentExpense"}]
+
+
+def test_xbrl_concept_named_late_in_full_source_invokes() -> None:
+    """Grounding reads the full admitted source, so a tag past every generation bound still counts."""
+    row: dict[str, JSONValue] = {
+        "evidence_id": "ev-10k",
+        "source_name": "get_sec_document",
+        "content": "Balance sheet boilerplate. " * 3000 + "us-gaap:InventoryNet 10,080 million.",
+    }
+    out, invoked = _xbrl_attempt(
+        "Which balance sheet facts did NVDA's latest 10-K tag?",
+        "InventoryNet",
+        evidence=[row],
+    )
+    _row_content = row["content"]
+    assert isinstance(_row_content, str)
+    assert len(_row_content) > 69_000 and _row_content.index("InventoryNet") > sched._OUTCOME_SUMMARY_MAX
+    assert out["error"] is None
+    assert invoked == [{"ticker": "NVDA", "concept": "InventoryNet"}]
+
+
+def test_xbrl_failed_attempt_and_generated_text_cannot_ground_fabricated_concept() -> None:
+    """A concept that only prior generated args, error text, or Needle reasoning name stays ungrounded."""
+    fabricated = "AIAcceleratorRevenueNet"
+    failed: dict[str, JSONValue] = {
+        "tool": "get_xbrl_facts",
+        "arguments": {"ticker": "NVDA", "concept": fabricated, "period": "FY2026"},
+        "outcome_summary": f"concept {fabricated} not found",
+        "error": f"concept {fabricated} not found for NVDA",
+        "error_type": "tool_error",
+        "reasoning": f"use {fabricated}",
+    }
+    out, invoked = _xbrl_attempt(
+        "What did NVDA report about AI accelerators?",
+        fabricated,
+        attempts=[failed],
+        reasoning=f"{fabricated} is the matching concept",
+    )
+    assert invoked == []
+    assert out["error_type"] == "reselect" and "duplicate" not in str(out["error"])
+
+
+# Vowel-free segments keep generated tags from spelling date words (Today, ThisWeek) the guard rightly rejects.
+@settings(max_examples=60, derandomize=True, deadline=None)
+@given(
+    st.from_regex(r"Zq[bcdfgjkmpvxz]{3,6}(?:[A-Z][bcdfgjkmpvxz]{3,6}){1,3}", fullmatch=True),
+    st.sampled_from(["objective", "source", "failed_attempt", "generated_only"]),
+)
+def test_prop_xbrl_tag_invokes_only_when_requested_or_source_backed(tag: str, placement: str) -> None:
+    """Any arbitrary SEC-shaped tag reaches the runtime exactly when the user or an admitted source names it."""
+    objective = (
+        f"What did NVDA report as {tag} in XBRL?"
+        if placement == "objective"
+        else "What did NVDA report about AI accelerators?"
+    )
+    evidence: list[dict[str, JSONValue]] = (
+        [
+            {
+                "evidence_id": "ev-src",
+                "source_name": "get_sec_document",
+                "content": "Notes. " * 400 + f"us-gaap:{tag} 7",
+            }
+        ]
+        if placement == "source"
+        else []
+    )
+    attempts: list[dict[str, JSONValue]] = (
+        [
+            {
+                "tool": "get_xbrl_facts",
+                "arguments": {"ticker": "NVDA", "concept": tag, "period": "FY2026"},
+                "outcome_summary": f"concept {tag} not found",
+                "error": f"concept {tag} not found",
+                "error_type": "tool_error",
+            }
+        ]
+        if placement == "failed_attempt"
+        else []
+    )
+    out, invoked = _xbrl_attempt(objective, tag, evidence=evidence, attempts=attempts, reasoning=f"{tag} matches")
+    if placement in ("objective", "source"):
+        assert out["error"] is None
+        assert invoked == [{"ticker": "NVDA", "concept": tag}]
+    else:
+        assert invoked == []
+        assert out["error_type"] == "reselect" and "duplicate" not in str(out["error"])
+
+
 def test_duplicate_call_reselects() -> None:
     """Same tool plus equal args returns a duplicate reselect, never invokes."""
     kernel = _Kernel()
@@ -2019,7 +4157,12 @@ def test_duplicate_call_reselects() -> None:
     error = out["error"]
     assert out["error_type"] == "reselect" and isinstance(error, str) and "duplicate" in error
     assert seen == []
-    reselect: dict[str, JSONValue] = {"tool": "search_web", "arguments": {}, "error": error, "error_type": "reselect"}
+    reselect: dict[str, JSONValue] = {
+        "tool": "search_web",
+        "arguments": {},
+        "error": error,
+        "error_type": "reselect",
+    }
     assert sched._needle_error_streak([reselect]) == 0
 
 
@@ -2044,7 +4187,12 @@ def test_no_new_evidence_stops_after_two() -> None:
         return ("invoke", _invoke("search_web"))
 
     async def gen(tool: object, schema: object = None, **k: object) -> dict[str, JSONValue]:
-        return {"tool": "search_web", "arguments": {"query": f"q{calls['n']}"}, "reasoning": "", "confidence": 1.0}
+        return {
+            "tool": "search_web",
+            "arguments": {"query": f"q{calls['n']}"},
+            "reasoning": "",
+            "confidence": 1.0,
+        }
 
     def invoke(name: object, args: object, sess: object, **k: object) -> dict[str, JSONValue]:
         return {}
@@ -2052,7 +4200,10 @@ def test_no_new_evidence_stops_after_two() -> None:
     class _J(JevClient):
         @override
         async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
-            return {"evidence_state": "insufficient", "continuation": "continue_research"}
+            return {
+                "evidence_state": "insufficient",
+                "continuation": "continue_research",
+            }
 
     out = asyncio.run(
         sched._drive_rounds(
@@ -2072,11 +4223,28 @@ def test_no_new_evidence_stops_after_two() -> None:
             },
             _tool_session(),
             None,
-            None,
         )
     )
     assert out["status"] == "blocked" and out["reason"] == "incomplete: no new evidence"
     assert calls["n"] == 2
+
+
+def test_finra_datapoints_unknown_dataset_reselects() -> None:
+    with pytest.raises(sched._ReselectRequest, match="unknown dataset"):
+        sched._validate_finra_datapoint_args("get_finra_datapoints", {"dataset": "2025-03-08", "fields": ["trade"]})
+    with pytest.raises(sched._ReselectRequest, match="non-empty string list"):
+        sched._validate_finra_datapoint_args(
+            "get_finra_datapoints",
+            {"dataset": "consolidatedShortInterest", "fields": []},
+        )
+    sched._validate_finra_datapoint_args(
+        "get_finra_datapoints",
+        {
+            "dataset": "otcMarket/consolidatedShortInterest",
+            "fields": ["settlementDate"],
+            "ticker": "XYZ",
+        },
+    )
 
 
 def test_round_cap_is_five() -> None:
@@ -2104,7 +4272,11 @@ def test_expired_deadline_blocks_before_first_round() -> None:
             JevClient(),
             "s1",
             "n1",
-            {"select_round": spy, "reasoner": None, "deadline_at": _t.perf_counter() - 1.0},
+            {
+                "select_round": spy,
+                "reasoner": None,
+                "deadline_at": _t.perf_counter() - 1.0,
+            },
             _tool_session(),
             None,
         )
@@ -2159,7 +4331,11 @@ def test_mid_round_timeout_blocks_each_node() -> None:
             return super().block_node(session_id, node_id, reason)
 
     async def slow(
-        node: object, session_id: str, hooks: Mapping[str, object], kernel: sched._Kernel, cap: asyncio.Semaphore
+        node: object,
+        session_id: str,
+        hooks: Mapping[str, object],
+        kernel: sched._Kernel,
+        cap: asyncio.Semaphore,
     ) -> dict[str, JSONValue]:
         await asyncio.sleep(60)
         return {"node_id": "?", "status": "resolved"}
@@ -2193,7 +4369,10 @@ def test_max_rounds_hook_caps_rounds() -> None:
     class _J(JevClient):
         @override
         async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
-            return {"evidence_state": "sufficient_support", "continuation": "continue_research"}
+            return {
+                "evidence_state": "sufficient_support",
+                "continuation": "continue_research",
+            }
 
     out = asyncio.run(
         sched._drive_rounds(
@@ -2218,6 +4397,95 @@ def test_max_rounds_hook_caps_rounds() -> None:
     )
     reason = out["reason"]
     assert calls["n"] == 2 and isinstance(reason, str) and "(2 rounds without resolution)" in reason
+
+
+def test_reason_over_evidence_selects_again_with_admitted_evidence() -> None:
+    """Live rs:79691cfa: reason_over_evidence starts another selection inside the cap, not the runtime guard."""
+
+    class _StoreKernel(_Kernel):
+        @override
+        def list_evidence(self, session_id: str) -> list[dict[str, JSONValue]]:
+            return [{"evidence_id": eid, "content": "record values here"} for eid in self.evidence]
+
+        @override
+        def resolve_node(self, session_id: str, node_id: str) -> ResearchNode:
+            self.calls.append(("resolve", node_id))
+            return super().resolve_node(session_id, node_id)
+
+    def drive(
+        max_rounds: int,
+    ) -> tuple[dict[str, JSONValue], _StoreKernel, list[list[object]]]:
+        kernel = _StoreKernel()
+        seen: list[list[object]] = []
+
+        async def select_round(
+            jev: object,
+            kernel: object,
+            sid: str,
+            nid: str,
+            session: object,
+            node: object,
+            registry: object,
+            ctx_ev: list[object],
+            attempts: object,
+        ) -> tuple[str, ToolDecision]:
+            seen.append([e["evidence_id"] for e in ctx_ev if isinstance(e, dict) and e.get("evidence_id")])
+            return ("invoke", _invoke("query_finra"))
+
+        async def gen(tool: object, schema: object = None, **k: object) -> dict[str, object]:
+            ticker = "XYZ" if len(seen) == 1 else "ABC"
+            return {
+                "tool": "query_finra",
+                "arguments": {"dataset": "consolidatedShortInterest", "ticker": ticker},
+            }
+
+        async def invoke(name: object, args: object, sess: object, **k: object) -> dict[str, object]:
+            return {
+                "tool_result_id": f"s1:tr:{len(seen)}",
+                "records": [{"symbolCode": "XYZ"}],
+                "briefing": "B",
+            }
+
+        class _J(JevClient):
+            @override
+            async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
+                first = len(seen) == 1
+                return {
+                    "continuation": "reason_over_evidence" if first else "resolve_node",
+                    "evidence_state": "sufficient_support",
+                }
+
+        out = asyncio.run(
+            sched._drive_rounds(
+                _node(),
+                {"session_id": "s1", "objective": "o"},
+                [{"name": "query_finra", "parameters": {}}],
+                kernel,
+                _J(),
+                "s1",
+                "n1",
+                {
+                    "select_round": select_round,
+                    "reasoner": None,
+                    "needle_generate": gen,
+                    "invoke": invoke,
+                    "to_outcome": lambda n, r: _outcome(),  # pyrefly: ignore[implicit-any-lambda]
+                    "max_rounds": max_rounds,
+                },
+                _tool_session(),
+                None,
+            )
+        )
+        return {"node_id": "n1", **out}, kernel, seen
+
+    out, kernel, seen = drive(4)
+    assert out["status"] == "resolved" and out["admitted"] == 2
+    assert seen == [[], ["ev-0"]]  # the fresh selection receives the admitted evidence
+    assert ("resolve", "n1") in kernel.calls
+    # Boundary: a fresh selection past the cap still blocks the unresolved node.
+    out, kernel, seen = drive(1)
+    assert out["status"] == "blocked" and out["reason"] == "incomplete: runtime guard (1 rounds without resolution)"
+    assert seen == [[]] and ("resolve", "n1") not in kernel.calls
 
 
 def test_blocked_terminal_names_non_default_cap() -> None:
@@ -2290,6 +4558,7 @@ def test_reason_phase_skips_when_too_little_time() -> None:
             {"session_id": "s1", "objective": "o"},
             _node(),
             [],
+            [],
             attempts,
             JevClient(),
             _Kernel(),
@@ -2340,7 +4609,12 @@ def test_bounded_reasoner_preserves_fake_hooks() -> None:
 
 def test_force_open_ignores_intake_evidence() -> None:
     """Intake 8-K accession with no node attempts never forces the carry registry."""
-    intake: list[JSONValue] = [{"id": "ev:1", "content": "filed 8-K accession 0000320193-25-000079, see filing"}]
+    intake: list[JSONValue] = [
+        {
+            "id": "ev:1",
+            "content": "filed 8-K accession 0000320193-25-000079, see filing",
+        }
+    ]
     reg: list[dict[str, JSONValue]] = [
         {"name": "get_sec_filing"},
         {"name": "get_sec_document"},
@@ -2365,8 +4639,22 @@ def test_force_open_fires_on_node_attempt_accession() -> None:
         {"name": "get_short_interest"},
     ]
     out = sched._force_open_registry(reg, attempts, [], 0)
-    assert out is not None and {e["name"] for e in out} == {"get_sec_filing", "get_sec_document"}
+    assert out is not None and {e["name"] for e in out} == {
+        "get_sec_filing",
+        "get_sec_document",
+    }
     assert sched._force_open_registry(reg, attempts, [], 1) is None
+    after_meta = [
+        *attempts,
+        {
+            "tool": "get_sec_filing",
+            "arguments": {},
+            "outcome_summary": "meta",
+            "error": None,
+        },
+    ]
+    docs = sched._force_open_registry(reg, after_meta, [], 0)
+    assert docs is not None and {e["name"] for e in docs} == {"get_sec_document"}
 
 
 def test_needle_carry_streak_counts_trailing_carried_fallbacks() -> None:
@@ -2510,6 +4798,7 @@ def test_async_dict_generate_stays_supported() -> None:
             [],
             [],
             None,
+            _Kernel(),
         )
     )
     assert args.get("query") == "q"
@@ -2535,7 +4824,83 @@ def test_sync_wrapper_returning_coroutine_stays_supported() -> None:
             [],
             [],
             None,
+            _Kernel(),
         )
     )
     assert args.get("query") == "q"
     assert reasoning == "r"
+
+
+def test_xbrl_wrapper_echo_cannot_ground_without_real_tag_data() -> None:
+    """Envelope echoes (concept_searched, Form, valueless concept) never ground; real tag rows do."""
+    bogus = "ZqBogusNet"
+    echo: dict[str, JSONValue] = {
+        "evidence_id": "ev-echo",
+        "source_name": "get_xbrl_facts",
+        "content": "XBRL facts envelope.",
+        "concept_searched": bogus,
+        "form": "10-Q",
+        "concept": bogus,
+    }
+    out, invoked = _xbrl_attempt("What did NVDA report about AI accelerators?", bogus, evidence=[echo])
+    assert invoked == []
+    assert out["error_type"] == "reselect" and "duplicate" not in str(out["error"])
+    echo_attempt: dict[str, JSONValue] = {
+        "tool": "get_xbrl_facts",
+        "arguments": {"ticker": "NVDA", "concept": "Revenues"},
+        "outcome_summary": "XBRL facts envelope.",
+        "error": None,
+        "result": {"concept_searched": bogus, "form": "10-Q", "matching_concepts": []},
+    }
+    out, invoked = _xbrl_attempt("What did NVDA report about AI accelerators?", bogus, attempts=[echo_attempt])
+    assert invoked == []
+    assert out["error_type"] == "reselect" and "duplicate" not in str(out["error"])
+    real: dict[str, JSONValue] = {
+        "evidence_id": "ev-real",
+        "source_name": "get_xbrl_facts",
+        "content": "XBRL facts envelope.",
+        "matching_concepts": [{"concept": bogus, "value": 123, "period_end": "2026-07-31"}],
+    }
+    out, invoked = _xbrl_attempt("What did NVDA report about AI accelerators?", bogus, evidence=[real])
+    assert out["error"] is None
+    assert invoked == [{"ticker": "NVDA", "concept": bogus}]
+    namespaced: dict[str, JSONValue] = {
+        "evidence_id": "ev-ns",
+        "source_name": "get_sec_document",
+        "content": f"Notes to the filing. us-gaap:{bogus} 7 million.",
+    }
+    out, invoked = _xbrl_attempt("What did NVDA report about AI accelerators?", bogus, evidence=[namespaced])
+    assert out["error"] is None
+    assert invoked == [{"ticker": "NVDA", "concept": bogus}]
+
+
+def test_xbrl_error_and_summary_text_cannot_ground_alias() -> None:
+    """Errors and outcome summaries never ground, even when they name a real alias."""
+    bad_evidence: dict[str, JSONValue] = {
+        "evidence_id": "ev-bad",
+        "source_name": "get_sec_document",
+        "content": "Filing notes Revenues 10 million.",
+        "error": "tool_error",
+    }
+    failed: dict[str, JSONValue] = {
+        "tool": "get_xbrl_facts",
+        "arguments": {"ticker": "NVDA", "concept": "Revenues", "period": "FY2026"},
+        "outcome_summary": "concept Revenues not found",
+        "error": "concept Revenues not found for NVDA",
+        "error_type": "tool_error",
+    }
+    no_data: dict[str, JSONValue] = {
+        "tool": "get_xbrl_facts",
+        "arguments": {"ticker": "NVDA", "concept": "Revenues", "period": "FY2026"},
+        "outcome_summary": "Revenues 10 million",
+        "error": None,
+        "job_id": "job-1",
+    }
+    out, invoked = _xbrl_attempt(
+        "What did NVDA report about AI accelerators?",
+        "Revenues",
+        evidence=[bad_evidence],
+        attempts=[failed, no_data],
+    )
+    assert invoked == []
+    assert out["error_type"] == "reselect" and "duplicate" not in str(out["error"])

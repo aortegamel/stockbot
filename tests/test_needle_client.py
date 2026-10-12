@@ -122,7 +122,11 @@ def worker(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 def test_extract_fields_round_trip(worker: None) -> None:
     """extract_fields sends one extract action and returns declared record fields."""
-    record: dict[str, object] = {"name": "web_row", "description": "one row", "parameters": {"type": "object"}}
+    record: dict[str, object] = {
+        "name": "web_row",
+        "description": "one row",
+        "parameters": {"type": "object"},
+    }
     out = nc.extract_fields(record, "NVDA news https://x.example/a up 5%")
     assert out["record"] == "web_row"
     assert out["fields"] == {"q": 1}
@@ -177,7 +181,13 @@ def test_start_ping_then_two_calls_reuse_one_process(worker: None) -> None:
     first = nc.generate_arguments(tool="search_sec_filings", schema={}, objective="o", node="n", context={})
     assert first["withheld"] is False
     second = nc.generate_arguments(
-        {"tool": "search_sec_filings", "schema": {}, "objective": "o", "node": "n", "context": {}}
+        {
+            "tool": "search_sec_filings",
+            "schema": {},
+            "objective": "o",
+            "node": "n",
+            "context": {},
+        }
     )
     assert first == {
         "tool": "search_sec_filings",
@@ -221,7 +231,7 @@ def test_broken_pipe_restarts_once(worker: None) -> None:
 @pytest.mark.parametrize("operation", ["generate", "start", "extract", "embed"])
 def test_startup_timeout_reports_startup_budget(worker: None, monkeypatch: pytest.MonkeyPatch, operation: str) -> None:
     assert nc._TIMEOUT_S == 120.0
-    assert nc._GENERATE_TIMEOUT_S == 10.0
+    assert not hasattr(nc, "_GENERATE_TIMEOUT_S")
 
     def silent_startup(proc: _FakeProc, timeout_s: float) -> str:
         request = json.loads(proc.written[-1])
@@ -251,7 +261,8 @@ def test_generation_timeout_reaps_worker_then_recovers(worker: None, monkeypatch
         if request["action"] == "ping":
             assert timeout_s == 120.0
             return proc._readline()
-        assert timeout_s == 10.0
+        # No generation ceiling: generation reads share the worker timeout.
+        assert timeout_s == nc._TIMEOUT_S
         if len(_FakeProc.instances) == 1:
             raise TimeoutError("generation silence")
         return proc._readline()
@@ -261,7 +272,7 @@ def test_generation_timeout_reaps_worker_then_recovers(worker: None, monkeypatch
 
     monkeypatch.setattr(nc, "_readline", timeout_first_worker)
     monkeypatch.setattr(os, "killpg", reject_group_signal)
-    with pytest.raises(RuntimeError, match="arguments.generate timed out after 10s"):
+    with pytest.raises(RuntimeError, match="arguments.generate timed out after 120s"):
         nc.generate_arguments(tool="search_sec_filings")
     first = _FakeProc.instances[0]
     assert first.returncode is not None
@@ -305,11 +316,13 @@ def test_real_worker_cleanup_kills_owned_descendants(
     monkeypatch.setattr(nc, "_server", lambda: server)
     monkeypatch.setattr(nc, "_python", lambda: sys.executable)
     monkeypatch.setattr(nc, "_ensure_weights", lambda: None)
-    monkeypatch.setattr(nc, "_GENERATE_TIMEOUT_S", 0.05)
     proc: subprocess.Popen[str] | None = None
     descendants: list[int] = []
     try:
         nc.start()
+        if shutdown == "timeout":
+            # Shrink the shared worker timeout only after the real ping succeeded.
+            monkeypatch.setattr(nc, "_TIMEOUT_S", 0.05)
         proc = nc._PROC
         assert proc is not None
         descendants = json.loads(descendants_file.read_text())
@@ -399,7 +412,10 @@ def _load_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> types.Modul
                         "description": "SEC accession number, e.g. 0000320193-25-000079. Named accession_no, not accession_number.",
                         "pattern": "^\\d{10}-\\d{2}-\\d{6}$",
                     },
-                    "as_of": {"type": "string", "description": "Point-in-time date YYYY-MM-DD."},
+                    "as_of": {
+                        "type": "string",
+                        "description": "Point-in-time date YYYY-MM-DD.",
+                    },
                 },
                 "required": ["accession_no"],
             },
@@ -485,7 +501,11 @@ def test_legacy_global_catalog_stays_slim(monkeypatch: pytest.MonkeyPatch, tmp_p
 def test_extract_agent_binds_single_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Extraction binds exactly one record shape, never the registry."""
     srv = _load_server(monkeypatch, tmp_path)
-    record = {"name": "web_row", "description": "one row", "parameters": {"type": "object"}}
+    record = {
+        "name": "web_row",
+        "description": "one row",
+        "parameters": {"type": "object"},
+    }
     agent = srv._extract_agent(record, None)
     tools = agent.kwargs["tools"]
     assert isinstance(tools, list) and tools == [record]
@@ -540,7 +560,15 @@ def test_handle_extract_rejects_bad_shapes(monkeypatch: pytest.MonkeyPatch, tmp_
     assert srv.handle(bad_passage)["error"] == "bad passage"
     bad_record = _json.dumps({"id": "e2", "action": "extract", "record": {}, "passage": "x"})
     assert srv.handle(bad_record)["error"] == "bad record"
-    bad_tokens = _json.dumps({"id": "e3", "action": "extract", "record": rec, "passage": "x", "max_new_tokens": 0})
+    bad_tokens = _json.dumps(
+        {
+            "id": "e3",
+            "action": "extract",
+            "record": rec,
+            "passage": "x",
+            "max_new_tokens": 0,
+        }
+    )
     assert srv.handle(bad_tokens)["error"] == "bad max_new_tokens"
 
 
@@ -604,7 +632,13 @@ def test_handle_mismatch_error_carries_detail(monkeypatch: pytest.MonkeyPatch, t
 
     monkeypatch.setattr(srv, "_bound_agent", _bound)
     line = _json.dumps(
-        {"id": "m1", "action": "arguments.generate", "tool": "search_sec_filings", "schema": {}, "objective": "o"}
+        {
+            "id": "m1",
+            "action": "arguments.generate",
+            "tool": "search_sec_filings",
+            "schema": {},
+            "objective": "o",
+        }
     )
     out = srv.handle(line)
     assert "error" in out
@@ -636,7 +670,13 @@ def test_handle_withheld_same_name_returns_tool(monkeypatch: pytest.MonkeyPatch,
 
     monkeypatch.setattr(srv, "_bound_agent", _bound)
     line = _json.dumps(
-        {"id": "w1", "action": "arguments.generate", "tool": "search_sec_filings", "schema": {}, "objective": "o"}
+        {
+            "id": "w1",
+            "action": "arguments.generate",
+            "tool": "search_sec_filings",
+            "schema": {},
+            "objective": "o",
+        }
     )
     out = srv.handle(line)
     assert out["tool"] == "search_sec_filings" and out["withheld"] is True
@@ -660,7 +700,13 @@ def test_handle_rejects_engine_failure_ungrounded_and_missing_request(
     envelopes: dict[str, dict[str, object]] = {
         "clean": clean,
         "engine": {"type": "error", "error": "needle_init not called"},
-        "ungrounded": {**clean, "validation": {"ungrounded": ["list_sec_filings.identifier"], "negation": False}},
+        "ungrounded": {
+            **clean,
+            "validation": {
+                "ungrounded": ["list_sec_filings.identifier"],
+                "negation": False,
+            },
+        },
         "negated": {**clean, "validation": {"ungrounded": [], "negation": True}},
     }
     envelope: dict[str, object] = clean
@@ -679,7 +725,12 @@ def test_handle_rejects_engine_failure_ungrounded_and_missing_request(
 
     def _generate(rid: str, question: str) -> dict[str, object]:
         line = json.dumps(
-            {"id": rid, "action": "arguments.generate", "tool": "list_sec_filings", "node": {"question": question}}
+            {
+                "id": rid,
+                "action": "arguments.generate",
+                "tool": "list_sec_filings",
+                "node": {"question": question},
+            }
         )
         out: dict[str, object] = srv.handle(line)
         return out
@@ -719,7 +770,13 @@ def test_prop_flagged_or_failed_envelope_never_returns_arguments() -> None:
             st.sampled_from(["none", "type", "success", "error"]),
             st.booleans(),
         )
-        def check(args: dict[str, object], ungrounded: list[str], negation: bool, failure: str, withheld: bool) -> None:
+        def check(
+            args: dict[str, object],
+            ungrounded: list[str],
+            negation: bool,
+            failure: str,
+            withheld: bool,
+        ) -> None:
             nonlocal envelope
             call = [{"name": "list_sec_filings", "arguments": args}]
             envelope = {
@@ -731,7 +788,12 @@ def test_prop_flagged_or_failed_envelope_never_returns_arguments() -> None:
                 "validation": {"ungrounded": ungrounded, "negation": negation},
             }
             line = json.dumps(
-                {"id": "p", "action": "arguments.generate", "tool": "list_sec_filings", "node": {"question": "q"}}
+                {
+                    "id": "p",
+                    "action": "arguments.generate",
+                    "tool": "list_sec_filings",
+                    "node": {"question": "q"},
+                }
             )
             out = srv.handle(line)
             if ungrounded or negation or failure != "none":
@@ -748,12 +810,20 @@ def test_decision_variants(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     call = srv._decision({"type": "call", "function_calls": [{"name": "t", "arguments": {"a": 1}}]}, "t")
     assert call["tool"] == "t" and call["arguments"] == {"a": 1} and call["withheld"] is False
     same = srv._decision(
-        {"type": "withheld", "function_calls": [], "suppressed_calls": [{"name": "t", "arguments": {"a": 2}}]},
+        {
+            "type": "withheld",
+            "function_calls": [],
+            "suppressed_calls": [{"name": "t", "arguments": {"a": 2}}],
+        },
         "t",
     )
     assert same["tool"] == "t" and same["arguments"] == {"a": 2} and same["withheld"] is True
     other = srv._decision(
-        {"type": "withheld", "function_calls": [], "suppressed_calls": [{"name": "x", "arguments": {}}]},
+        {
+            "type": "withheld",
+            "function_calls": [],
+            "suppressed_calls": [{"name": "x", "arguments": {}}],
+        },
         "t",
     )
     assert other["tool"] is None and other["withheld"] is False
@@ -764,7 +834,7 @@ def test_decision_variants(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
 
 
 def test_generate_withheld_accept_and_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stubbed engine: withheld same-name accepted; short timeout uses generate limit."""
+    """The client accepts a withheld same-name call and retains the shared worker timeout."""
     import json as _json
 
     nc.close()
@@ -778,13 +848,20 @@ def test_generate_withheld_accept_and_timeout(monkeypatch: pytest.MonkeyPatch) -
         if raw.get("action") == "ping":
             return _json.dumps({"id": raw.get("id"), "ready": True}) + "\n"
         return (
-            _json.dumps({"id": raw.get("id"), "tool": raw.get("tool"), "arguments": {"q": 1}, "withheld": True}) + "\n"
+            _json.dumps(
+                {
+                    "id": raw.get("id"),
+                    "tool": raw.get("tool"),
+                    "arguments": {"q": 1},
+                    "withheld": True,
+                }
+            )
+            + "\n"
         )
 
     monkeypatch.setattr(subprocess, "Popen", _FakeProc)
     monkeypatch.setattr(nc, "_ensure_weights", lambda: None)
     monkeypatch.setattr(nc, "_readline", _fake_readline)
-    assert nc._GENERATE_TIMEOUT_S == 10.0
     out = nc.generate_arguments(tool="search_sec_filings")
     assert out["withheld"] is True
     assert out["tool"] == "search_sec_filings"
@@ -797,11 +874,11 @@ def test_generate_withheld_accept_and_timeout(monkeypatch: pytest.MonkeyPatch) -
         if raw2.get("action") == "ping":
             assert timeout_s == nc._TIMEOUT_S
             return _json.dumps({"id": raw2.get("id"), "ready": True}) + "\n"
-        assert timeout_s == nc._GENERATE_TIMEOUT_S
+        assert timeout_s == nc._TIMEOUT_S
         raise TimeoutError("slow")
 
     monkeypatch.setattr(nc, "_readline", _slow)
-    with pytest.raises(RuntimeError, match="timed out after 10s"):
+    with pytest.raises(RuntimeError, match="timed out after 120s"):
         nc.generate_arguments(tool="search_sec_filings")
     nc.close()
     _FakeProc.instances.clear()
@@ -832,7 +909,11 @@ def test_evidence_fact_keeps_block_and_all_remaining_fields(monkeypatch: pytest.
 def test_evidence_facts_keep_observation_entries_current_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Observation summaries keep full JSON and never carry the grounded label."""
     srv = _load_server(monkeypatch, tmp_path)
-    observation = {"tool": "list_sec_filings", "outcome_summary": "timed out", "error": "TimeoutError"}
+    observation = {
+        "tool": "list_sec_filings",
+        "outcome_summary": "timed out",
+        "error": "TimeoutError",
+    }
     facts = srv._evidence_facts([observation])
     assert facts == [json.dumps(observation, ensure_ascii=False)]
 

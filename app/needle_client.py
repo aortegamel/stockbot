@@ -40,9 +40,6 @@ __all__ = [
 
 _TIMEOUT_S = 120.0
 _STDERR_TAIL_CHARS = 2000
-# ponytail: 10s generation ceiling; a timeout kills + restarts the child (slow
-# tail, not queue wait — the clock starts at write/flush inside _exchange_locked).
-_GENERATE_TIMEOUT_S = 10.0
 _REAP_TIMEOUT_S = 2.0
 
 # ponytail: single-flight lock; per-request lanes if Needle throughput matters.
@@ -56,7 +53,7 @@ _REAL_POPEN = subprocess.Popen
 
 
 class _StartupTimeout(RuntimeError, TimeoutError):
-    """Startup/ping silence inside the 120s budget; distinct from the 10s generation ceiling."""
+    """Startup/ping silence inside the 120s budget; distinct from a generation read timeout."""
 
 
 def validate_needle_tool(jev_tool: str, needle_tool: object) -> str:
@@ -293,7 +290,7 @@ def _exchange_locked(proc: subprocess.Popen[str], tool: str, payload: dict[str, 
         raise RuntimeError(f"needle arguments.generate failed for {tool!r}: server stdin missing")
     inp.write(json.dumps(payload) + "\n")
     inp.flush()
-    raw_line = _readline(proc, _GENERATE_TIMEOUT_S)
+    raw_line = _readline(proc, _TIMEOUT_S)
     try:
         decoded: object = json.loads(raw_line)
     except ValueError as exc:
@@ -459,7 +456,7 @@ def generate_arguments(*args: object, **kwargs: object) -> dict[str, JSONValue]:
                 _kill_locked()
                 logger.warning("toolflow needle_gen_error sid=%s tool=%s err_type=TimeoutError", sid_hint, tool)
                 raise RuntimeError(
-                    f"needle arguments.generate timed out after {_GENERATE_TIMEOUT_S:g}s for {tool!r}; "
+                    f"needle arguments.generate timed out after {_TIMEOUT_S:g}s for {tool!r}; "
                     f"stderr tail: {_tail_text() or '(empty)'}"
                 ) from exc
             except OSError as exc:

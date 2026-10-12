@@ -1,17 +1,20 @@
 """Fail-closed guard contracts: failures propagate, envelopes preserved."""
 
+import asyncio
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from types import ModuleType
-from typing import override
+from typing import cast, override
 from unittest import mock
 
 import pytest
+from hypothesis import assume, given, settings
+from hypothesis import strategies as st
 
-from app.decision_client import JevClient
+from app.decision_client import _PERSONA_OPTIONS, JevClient
 from app.research import kernel_worker as kw
 from app.research import scheduler as sched
 from app.research.models import DecisionRecord, JSONValue, ResearchNode
@@ -52,8 +55,20 @@ def test_registry_failure_raises_not_empty() -> None:
 
 def _props() -> list[dict[str, object]]:
     return [
-        {"id": "s-q1", "objectiveId": "s", "question": "Other angle?", "dependsOn": [], "whyItMatters": "w"},
-        {"id": "s-q2", "objectiveId": "s", "question": "Exact user objective?", "dependsOn": [], "whyItMatters": "w"},
+        {
+            "id": "s-q1",
+            "objectiveId": "s",
+            "question": "Other angle?",
+            "dependsOn": [],
+            "whyItMatters": "w",
+        },
+        {
+            "id": "s-q2",
+            "objectiveId": "s",
+            "question": "Exact user objective?",
+            "dependsOn": [],
+            "whyItMatters": "w",
+        },
     ]
 
 
@@ -76,14 +91,36 @@ def test_jev_outage_missing_objective_propagates() -> None:
 class _JevAdmitTwoOfThree(JevClient):
     @override
     async def decide(self, *a: object, **k: object) -> dict[str, dict[str, JSONValue]]:
-        return {"s-q1": {"choice": "analyze"}, "s-q2": {"choice": "gather_evidence"}, "s-q3": {"choice": "reject"}}
+        return {
+            "s-q1": {"choice": "analyze"},
+            "s-q2": {"choice": "gather_evidence"},
+            "s-q3": {"choice": "reject"},
+        }
 
 
 def test_jev_success_preserves_all_admitted_proposals() -> None:
     props: list[dict[str, object]] = [
-        {"id": "s-q1", "objectiveId": "s", "question": "Other angle?", "dependsOn": [], "whyItMatters": "w"},
-        {"id": "s-q2", "objectiveId": "s", "question": "Exact user objective?", "dependsOn": [], "whyItMatters": "w"},
-        {"id": "s-q3", "objectiveId": "s", "question": "Tangent?", "dependsOn": [], "whyItMatters": "w"},
+        {
+            "id": "s-q1",
+            "objectiveId": "s",
+            "question": "Other angle?",
+            "dependsOn": [],
+            "whyItMatters": "w",
+        },
+        {
+            "id": "s-q2",
+            "objectiveId": "s",
+            "question": "Exact user objective?",
+            "dependsOn": [],
+            "whyItMatters": "w",
+        },
+        {
+            "id": "s-q3",
+            "objectiveId": "s",
+            "question": "Tangent?",
+            "dependsOn": [],
+            "whyItMatters": "w",
+        },
     ]
     out = kw._jev_admit("s", "Exact user objective?", props, jev=_JevAdmitTwoOfThree())
     assert out == props[:2]
@@ -103,38 +140,73 @@ def test_graph_prompt_registry_failure_is_terminal() -> None:
 
 
 class _JevRoute(JevClient):
-    def __init__(self, choice: str | None = None, fail: bool = False) -> None:
+    def __init__(
+        self,
+        choice: str | None = None,
+        personas: list[str] | None = None,
+        fail: bool = False,
+    ) -> None:
         super().__init__()
         self.choice = choice
+        self.personas = personas
         self.fail = fail
-        self.seen: list[tuple[str, Sequence[Mapping[str, JSONValue]] | None]] = []
+        self.seen: list[tuple[str, str | None]] = []
 
     @override
-    async def route_entry(self, prompt: str, registry: Sequence[Mapping[str, JSONValue]] | None = None) -> str:
+    async def route_entry(
+        self,
+        prompt: str,
+        registry: Sequence[Mapping[str, JSONValue]] | None = None,
+        route_hint: str | None = None,
+    ) -> dict[str, JSONValue]:
         if self.fail:
             raise RuntimeError("jev down")
-        self.seen.append((prompt, registry))
-        return self.choice or "research_required"
+        self.seen.append((prompt, route_hint))
+        return {
+            "route": route_hint or self.choice or "research_required",
+            "personas": list[JSONValue](self.personas) if self.personas is not None else None,
+        }
+
+
+@pytest.mark.parametrize("rid", [None, 7, False, [], {}])
+def test_route_invalid_request_id_uses_protocol_placeholder(rid: JSONValue) -> None:
+    out = kw._route({"id": rid, "prompt": "hello"}, jev=_JevRoute("reasoning_required"))
+    assert out == {"id": "?", "route": "reasoning_required", "personas": None}
 
 
 def test_route_reasoning_choice_returns_fast_path() -> None:
-    out = kw._route({"id": "r1", "op": "route", "prompt": "hello"}, jev=_JevRoute("reasoning_required"))
-    assert out == {"id": "r1", "route": "reasoning_required"}
+    out = kw._route(
+        {"id": "r1", "op": "route", "prompt": "hello"},
+        jev=_JevRoute("reasoning_required"),
+    )
+    assert out == {"id": "r1", "route": "reasoning_required", "personas": None}
 
 
-def test_route_outage_propagates() -> None:
-    with pytest.raises(RuntimeError, match="jev down"):
-        kw._route({"id": "r1", "op": "route", "prompt": "hello"}, jev=_JevRoute(fail=True))
+def test_route_selector_outage_is_error_not_assumed_personas() -> None:
+    out = kw._route({"id": "r1", "op": "route", "prompt": "hello"}, jev=_JevRoute(fail=True))
+    assert out == {"id": "r1", "error": "jev down"}
 
 
 def test_route_blank_prompt_needs_no_jev() -> None:
-    out = kw._route({"id": "r1", "op": "route", "prompt": "  "}, jev=_JevRoute("reasoning_required"))
-    assert out == {"id": "r1", "route": "research_required"}
+    jev = _JevRoute("reasoning_required")
+    out = kw._route({"id": "r1", "op": "route", "prompt": "  "}, jev=jev)
+    assert out == {"id": "r1", "route": "research_required", "personas": None}
+    assert jev.seen == []
 
 
 def test_route_tool_winner_returns_exact_tool() -> None:
-    out = kw._route({"id": "r1", "op": "route", "prompt": "what time is it?"}, jev=_JevRoute("get_current_time"))
-    assert out == {"id": "r1", "route": "get_current_time"}
+    out = kw._route(
+        {"id": "r1", "op": "route", "prompt": "what time is it?"},
+        jev=_JevRoute("get_current_time"),
+    )
+    assert out == {"id": "r1", "route": "get_current_time", "personas": None}
+
+
+def test_route_fast_path_keeps_programmatic_route_and_jev_personas() -> None:
+    jev = _JevRoute("research_required", personas=["bearbot"])
+    out = kw._route({"id": "r1", "op": "route", "prompt": "what time is it?"}, jev=jev)
+    assert out == {"id": "r1", "route": "get_current_time", "personas": ["bearbot"]}
+    assert [hint for _, hint in jev.seen] == ["get_current_time"]
 
 
 class _FailGenerate:
@@ -147,22 +219,39 @@ class _FailGenerate:
         return self.payload
 
 
-def test_arguments_uses_shared_needle_and_schema_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    gen = _FailGenerate({"tool": "query_finra", "arguments": {"ticker": "NVDA"}, "confidence": 0.9, "reasoning": "r"})
+def test_arguments_uses_shared_needle_and_schema_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gen = _FailGenerate(
+        {
+            "tool": "query_finra",
+            "arguments": {"ticker": "NVDA"},
+            "confidence": 0.9,
+            "reasoning": "r",
+        }
+    )
     monkeypatch.setattr(kw, "_shared_needle_generate", lambda: gen)
     monkeypatch.setattr(
-        "app.research.scheduler.build_registry", lambda: [{"name": "query_finra", "parameters": {"type": "object"}}]
+        "app.research.scheduler.build_registry",
+        lambda: [{"name": "query_finra", "parameters": {"type": "object"}}],
     )
 
     def _schema(name: str, reg: list[dict[str, object]]) -> dict[str, object]:
         return {"type": "object"}
 
     monkeypatch.setattr("app.research.scheduler._schema_for", _schema)
-    out = kw._arguments({"id": "a1", "op": "arguments", "tool": "query_finra", "objective": "short interest?"})
+    out = kw._arguments(
+        {
+            "id": "a1",
+            "op": "arguments",
+            "tool": "query_finra",
+            "objective": "short interest?",
+        }
+    )
     assert out == {
         "id": "a1",
         "tool": "query_finra",
-        "arguments": {"ticker": "NVDA"},
+        "arguments": {"ticker": "NVDA", "dataset": "consolidatedShortInterest"},
         "confidence": 0.9,
         "reasoning": "r",
     }
@@ -172,13 +261,15 @@ def test_arguments_uses_shared_needle_and_schema_fallback(monkeypatch: pytest.Mo
 
 
 def test_kernel_worker_stamps_route_assess_and_node() -> None:
-    jev = _JevRoute("get_current_time")
+    # Clock asks short-circuit in programmatic_route; JEV only selects personas for them.
+    jev = _JevRoute("research_required")
     out = kw._route({"id": "r1", "op": "route", "prompt": "what time is it?"}, jev=jev)
-    assert out == {"id": "r1", "route": "get_current_time"}
-    assert jev.seen == []
+    assert out == {"id": "r1", "route": "get_current_time", "personas": None}
+    assert jev.seen[0][1] == "get_current_time"
     jev2 = _JevRoute("research_required")
     out2 = kw._route({"id": "r2", "op": "route", "prompt": "halp money stuff?"}, jev=jev2)
-    assert out2 == {"id": "r2", "route": "research_required"}
+    assert out2 == {"id": "r2", "route": "research_required", "personas": None}
+    assert jev2.seen[0][1] is None
     assert isinstance(jev2.seen[0][0], str) and jev2.seen[0][0].startswith("[Today UTC ")
     assess = _JevAssess("node_resolved")
     kw._assess_entry({"id": "s1", "prompt": "risk?", "tool": "t", "result": {}}, jev=assess)
@@ -187,8 +278,14 @@ def test_kernel_worker_stamps_route_assess_and_node() -> None:
     assert "Today is" in prompt and "UTC" in prompt
 
 
-def test_arguments_mismatch_is_error_never_raise(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(kw, "_shared_needle_generate", lambda: _FailGenerate({"tool": "other", "arguments": {}}))
+def test_arguments_mismatch_is_error_never_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        kw,
+        "_shared_needle_generate",
+        lambda: _FailGenerate({"tool": "other", "arguments": {}}),
+    )
     out = kw._arguments({"id": "a2", "op": "arguments", "tool": "query_finra"})
     assert out["id"] == "a2" and "error" in out
     assert "error" in kw._arguments({"id": "a3"})
@@ -215,27 +312,56 @@ def test_arguments_withhold_seeds_sec_and_sho(monkeypatch: pytest.MonkeyPatch) -
         }
     )
     assert sho["arguments"] == {"ticker": "AAPL", "company_name": "Apple"}
-    sec = kw._arguments({"id": "s2", "tool": "list_sec_filings", "objective": "What drove NVDA revenue last quarter?"})
+    sec = kw._arguments(
+        {
+            "id": "s2",
+            "tool": "list_sec_filings",
+            "objective": "What drove NVDA revenue last quarter?",
+        }
+    )
     assert sec["arguments"] == {"identifier": "NVDA", "forms": ["10-Q", "10-K", "8-K"]}
-    none = kw._arguments({"id": "s3", "tool": "get_reg_sho_volume", "objective": "Which filings mention Elon Musk?"})
+    none = kw._arguments(
+        {
+            "id": "s3",
+            "tool": "get_reg_sho_volume",
+            "objective": "Which filings mention Elon Musk?",
+        }
+    )
     assert none["id"] == "s3" and "error" in none
 
 
-def test_arguments_generation_failure_is_error_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_arguments_generation_failure_is_error_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A raising Needle generate reaches the outer error envelope, never seeded success."""
 
     def _boom(**kwargs: object) -> object:
         raise RuntimeError("needle boom")
 
     monkeypatch.setattr(kw, "_shared_needle_generate", lambda: _boom)
-    out = kw._arguments({"id": "s9", "tool": "list_sec_filings", "objective": "What drove NVDA revenue last quarter?"})
+    out = kw._arguments(
+        {
+            "id": "s9",
+            "tool": "list_sec_filings",
+            "objective": "What drove NVDA revenue last quarter?",
+        }
+    )
     assert out["id"] == "s9" and "error" in out
     assert "needle boom" in str(out["error"])
     assert "arguments" not in out
 
 
-def test_arguments_schema_failure_is_error_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
-    gen = _FailGenerate({"tool": "query_finra", "arguments": {"ticker": "NVDA"}, "confidence": 0.9, "reasoning": "r"})
+def test_arguments_schema_failure_is_error_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gen = _FailGenerate(
+        {
+            "tool": "query_finra",
+            "arguments": {"ticker": "NVDA"},
+            "confidence": 0.9,
+            "reasoning": "r",
+        }
+    )
     monkeypatch.setattr(kw, "_shared_needle_generate", lambda: gen)
 
     def _bad_schema(name: str, reg: object) -> object:
@@ -247,18 +373,35 @@ def test_arguments_schema_failure_is_error_envelope(monkeypatch: pytest.MonkeyPa
     assert "schema boom" in str(out["error"])
 
 
-def test_arguments_repair_failure_is_error_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
-    gen = _FailGenerate({"tool": "query_finra", "arguments": {"ticker": "NVDA"}, "confidence": 0.9, "reasoning": "r"})
+def test_arguments_repair_failure_is_error_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gen = _FailGenerate(
+        {
+            "tool": "query_finra",
+            "arguments": {"ticker": "NVDA"},
+            "confidence": 0.9,
+            "reasoning": "r",
+        }
+    )
     monkeypatch.setattr(kw, "_shared_needle_generate", lambda: gen)
     monkeypatch.setattr(
-        "app.research.scheduler.build_registry", lambda: [{"name": "query_finra", "parameters": {"type": "object"}}]
+        "app.research.scheduler.build_registry",
+        lambda: [{"name": "query_finra", "parameters": {"type": "object"}}],
     )
 
     def _bad_repair(*a: object, **k: object) -> object:
         raise RuntimeError("repair boom")
 
     monkeypatch.setattr("app.research.scheduler._repair_tool_arguments", _bad_repair)
-    out = kw._arguments({"id": "a10", "tool": "query_finra", "objective": "q?", "schema": {"type": "object"}})
+    out = kw._arguments(
+        {
+            "id": "a10",
+            "tool": "query_finra",
+            "objective": "q?",
+            "schema": {"type": "object"},
+        }
+    )
     assert out["id"] == "a10" and "error" in out
     assert "repair boom" in str(out["error"])
 
@@ -333,7 +476,13 @@ class _JevAssess(JevClient):
 def test_assess_entry_returns_verdict() -> None:
     jev = _JevAssess("get_sec_document")
     out = kw._assess_entry(
-        {"id": "s1", "prompt": "risk?", "tool": "search_sec_filings", "arguments": {}, "result": {"ok": True}},
+        {
+            "id": "s1",
+            "prompt": "risk?",
+            "tool": "search_sec_filings",
+            "arguments": {},
+            "result": {"ok": True},
+        },
         jev=jev,
     )
     assert out == {"id": "s1", "verdict": "get_sec_document"}
@@ -341,7 +490,10 @@ def test_assess_entry_returns_verdict() -> None:
 
 def test_assess_entry_outage_propagates() -> None:
     with pytest.raises(RuntimeError, match="jev down"):
-        kw._assess_entry({"id": "s2", "prompt": "p", "tool": "t", "result": {}}, jev=_JevAssess(fail=True))
+        kw._assess_entry(
+            {"id": "s2", "prompt": "p", "tool": "t", "result": {}},
+            jev=_JevAssess(fail=True),
+        )
 
 
 def test_assess_entry_blank_still_research_required() -> None:
@@ -349,51 +501,238 @@ def test_assess_entry_blank_still_research_required() -> None:
     assert out == {"id": "s3", "verdict": "research_required"}
 
 
-def test_entry_prompts_carry_temporal_decoding() -> None:
-    import asyncio
+def _choice_stub(
+    picks: dict[str, str], seen: dict[str, object]
+) -> Callable[[object, Mapping[str, JSONValue]], Awaitable[dict[str, JSONValue]]]:
+    """The transport answers each choice question from picks or its first option."""
 
-    seen: dict[str, object] = {}
-
-    async def _stub(state: object, questions: object) -> object:
+    async def _stub(state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         seen["questions"] = questions
         assert isinstance(questions, dict)
-        qid = next(iter(questions))
-        opts: object = questions[qid]["criteria"] if isinstance(questions[qid], dict) else {}
-        assert isinstance(opts, dict)
-        winner = "reasoning_required" if "reasoning_required" in opts else next(iter(opts))
-        return {
-            "answers": {
-                qid: {
-                    "type": "choice",
-                    "choice": winner,
-                    "probabilities": dict.fromkeys(opts, 0.0) | {winner: 1.0},
-                    "confidence": 1.0,
-                }
+        answers: dict[str, JSONValue] = {}
+        for qid, q in questions.items():
+            assert isinstance(q, dict)
+            opts = q["criteria"]
+            assert isinstance(opts, dict)
+            pick = picks.get(qid) or next(iter(opts))
+            probs: dict[str, JSONValue] = dict.fromkeys(opts, 0.0)
+            if pick in opts:
+                probs[pick] = 1.0
+            answers[qid] = {
+                "type": "choice",
+                "choice": pick,
+                "probabilities": probs,
+                "confidence": 1.0,
             }
-        }
+        return {"answers": answers}
+
+    return _stub
+
+
+_ROUTE_REG: list[dict[str, JSONValue]] = [{"name": "get_current_time", "description": "Current time."}]
+
+
+def _route_entry(
+    prompt: str, picks: dict[str, str], route_hint: str | None = None
+) -> tuple[dict[str, JSONValue], dict[str, object]]:
+    seen: dict[str, object] = {}
+    client = JevClient(transport=_choice_stub(picks, seen), data_root=Path("/tmp"))
+    return asyncio.run(client.route_entry(prompt, _ROUTE_REG, route_hint=route_hint)), seen
+
+
+@pytest.mark.parametrize("prompt", [None, 7, "", " \t\n"])
+def test_route_entry_rejects_invalid_prompt(prompt: JSONValue) -> None:
+    with pytest.raises(ValueError, match="blank prompt"):
+        _route_entry(cast(str, prompt), {"entry": "research_required"})
+
+
+@pytest.mark.parametrize("hint", ["", " \t\n"])
+def test_route_entry_rejects_blank_hint(hint: str) -> None:
+    with pytest.raises(ValueError, match="blank route_hint"):
+        _route_entry("NVDA?", {"personas": "bearbot"}, route_hint=hint)
+
+
+@pytest.mark.parametrize(
+    ("registry", "error"),
+    [
+        ([{}], "registry entry needs a name"),
+        ([{"name": ""}], "registry entry needs a name"),
+        ([{"name": 7}], "registry entry needs a name"),
+        ([{"name": "research_required"}], "duplicate tool"),
+        (_ROUTE_REG * 2, "duplicate tool"),
+    ],
+)
+def test_route_entry_rejects_defective_registry(registry: list[dict[str, JSONValue]], error: str) -> None:
+    client = JevClient(
+        transport=_choice_stub({"entry": "research_required"}, {}),
+        data_root=Path("/tmp"),
+    )
+    with pytest.raises(ValueError, match=error):
+        asyncio.run(client.route_entry("NVDA?", registry))
+
+
+def test_route_entry_rejects_empty_installed_registry() -> None:
+    client = JevClient(
+        transport=_choice_stub({"entry": "research_required"}, {}),
+        data_root=Path("/tmp"),
+    )
+    with (
+        mock.patch("app.decision_client._auto_registry", return_value=[]),
+        pytest.raises(ValueError, match="empty registry"),
+    ):
+        asyncio.run(client.route_entry("NVDA?"))
+
+
+@pytest.mark.parametrize("mode", ["catalog", "full", "whole", "direct"])
+def test_route_catalog_modes_use_selector_instead_of_programmatic_hint(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    monkeypatch.setenv("STOCKBOT_TOOLFLOW", mode)
+    client = JevClient(
+        transport=_choice_stub({"entry": "reasoning_required", "personas": "bearbot"}, {}),
+        data_root=Path("/tmp"),
+    )
+    monkeypatch.setattr("app.decision_client._auto_registry", lambda: _ROUTE_REG)
+    monkeypatch.setattr(kw, "_shared_jev", lambda: client)
+    out = kw._route({"id": "catalog-request", "prompt": "what time is it?"})
+    assert out == {
+        "id": "catalog-request",
+        "route": "reasoning_required",
+        "personas": ["bearbot"],
+    }
+
+
+@pytest.mark.parametrize(("message", "error"), [("", "route selection failed"), ("x" * 501, "x" * 500)])
+def test_route_selector_error_is_nonempty_and_bounded(message: str, error: str) -> None:
+    async def _down(state: object, questions: object) -> object:
+        raise RuntimeError(message)
+
+    client = JevClient(transport=_down, data_root=Path("/tmp"))
+    assert kw._route({"id": "failed-request", "prompt": "NVDA?"}, jev=client) == {
+        "id": "failed-request",
+        "error": error,
+    }
+
+
+def test_route_entry_defaults_to_no_explicit_personas() -> None:
+    out, _ = _route_entry("Build the NVDA thesis", {"entry": "research_required"})
+    assert out == {"route": "research_required", "personas": None}
+
+
+def test_route_entry_explicit_subset_is_canonical() -> None:
+    out, _ = _route_entry(
+        "Stockbot and Bullbot: NVDA?",
+        {"entry": "research_required", "personas": "stockbot_bullbot"},
+    )
+    assert out == {"route": "research_required", "personas": ["stockbot", "bullbot"]}
+
+
+@pytest.mark.parametrize("pick", ["bullbot_stockbot", "stockbot_stockbot", "all"])
+def test_route_entry_rejects_malformed_persona_choice(pick: str) -> None:
+    with pytest.raises(ValueError, match="malformed_typesafe_answer for personas"):
+        _route_entry("NVDA?", {"entry": "research_required", "personas": pick})
+
+
+def test_route_entry_no_personas_remaining_raises() -> None:
+    with pytest.raises(ValueError, match="no personas remain"):
+        _route_entry("NVDA?", {"entry": "research_required", "personas": "no_personas_remaining"})
+
+
+@settings(max_examples=50, derandomize=True)
+@given(st.text(max_size=40))
+def test_route_entry_rejects_arbitrary_invalid_persona_label(label: str) -> None:
+    assume(label)
+    assume(label not in _PERSONA_OPTIONS)
+    with pytest.raises(ValueError, match="malformed_typesafe_answer for personas"):
+        _route_entry("NVDA?", {"entry": "research_required", "personas": label})
+
+
+@pytest.mark.parametrize(
+    "decisions",
+    [
+        {"entry": {"choice": "research_required"}, "personas": {"choice": "everyone"}},
+        {"entry": {"choice": "research_required"}},
+    ],
+)
+def test_route_entry_rejects_sidecar_persona_outside_options(
+    monkeypatch: pytest.MonkeyPatch, decisions: dict[str, JSONValue]
+) -> None:
+    client = JevClient(data_root=Path("/tmp"))
+
+    def _sidecar(payload: dict[str, JSONValue]) -> dict[str, JSONValue]:
+        return {"id": payload["id"], "decisions": decisions, "raw": {}}
+
+    monkeypatch.setattr(client, "_sidecar_roundtrip", _sidecar)
+    with pytest.raises(ValueError, match="persona choice"):
+        asyncio.run(client.route_entry("NVDA?", _ROUTE_REG))
+
+
+@pytest.mark.parametrize("entry", [None, {}, {"choice": "unknown_tool"}, {"choice": []}])
+def test_route_entry_rejects_missing_or_invalid_sidecar_route(
+    monkeypatch: pytest.MonkeyPatch, entry: JSONValue
+) -> None:
+    client = JevClient(data_root=Path("/tmp"))
+    decisions: dict[str, JSONValue] = {"personas": {"choice": "bearbot"}}
+    if entry is not None:
+        decisions["entry"] = entry
+
+    def _sidecar(payload: dict[str, JSONValue]) -> dict[str, JSONValue]:
+        return {"id": payload["id"], "decisions": decisions, "raw": {}}
+
+    monkeypatch.setattr(client, "_sidecar_roundtrip", _sidecar)
+    with pytest.raises(ValueError, match="winner .* not in options"):
+        asyncio.run(client.route_entry("NVDA?", _ROUTE_REG))
+
+
+def test_route_entry_hint_keeps_route_and_asks_only_personas() -> None:
+    out, seen = _route_entry(
+        "what time is it?",
+        {"personas": "bearbot_bullbot"},
+        route_hint="get_current_time",
+    )
+    assert out == {"route": "get_current_time", "personas": ["bearbot", "bullbot"]}
+    questions = seen["questions"]
+    assert isinstance(questions, dict) and list(questions) == ["personas"]
+
+
+def test_route_entry_selector_unavailable_raises() -> None:
+    async def _down(state: object, questions: object) -> object:
+        raise RuntimeError("jev down")
+
+    client = JevClient(transport=_down, data_root=Path("/tmp"))
+    with pytest.raises(RuntimeError, match="jev down"):
+        asyncio.run(client.route_entry("NVDA?", _ROUTE_REG))
+
+
+def test_entry_prompts_carry_temporal_decoding() -> None:
+    out, seen = _route_entry("hello", {"entry": "reasoning_required"})
+    assert out == {"route": "reasoning_required", "personas": None}
+    questions = seen["questions"]
+    assert isinstance(questions, dict)
+    entry_text = str(questions["entry"]["instructions"])
+    assert "Today UTC is" in entry_text and "decode relative dates before choosing" in entry_text
 
     class _NoPersistJev(JevClient):
         @override
         def _persist(self, **kwargs: object) -> None:
             return None
 
-    client = _NoPersistJev(transport=_stub, data_root=Path("/tmp"))
-    out = asyncio.run(client.route_entry("hello"))
-    assert out == "reasoning_required"
-    entry_q = seen["questions"]
-    assert isinstance(entry_q, dict)
-    entry_text = str(next(iter(entry_q.values()))["instructions"])
-    assert "Today UTC is" in entry_text and "decode relative dates before choosing" in entry_text
     seen.clear()
+    client = _NoPersistJev(
+        transport=_choice_stub({"assess": "reasoning_required"}, seen),
+        data_root=Path("/tmp"),
+    )
     verdict = asyncio.run(client.assess_entry_tool("risk?", "search_sec_filings", {}, {"ok": True}))
-    assert verdict in ("reasoning_required", "research_required", "node_resolved") or isinstance(verdict, str)
-    assess_q = seen["questions"]
-    assert isinstance(assess_q, dict)
-    assess_text = str(next(iter(assess_q.values()))["instructions"])
+    assert verdict == "reasoning_required"
+    questions = seen["questions"]
+    assert isinstance(questions, dict)
+    assess_text = str(questions["assess"]["instructions"])
     assert "Today UTC is" in assess_text and "decode relative dates before choosing" in assess_text
 
 
-def test_run_scheduler_deadline_honors_shared_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_scheduler_deadline_honors_shared_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """_run passes run_deadline to the scheduler; setup gets _SETUP_S of the wall."""
     import time as _time
 
@@ -428,7 +767,9 @@ def test_run_scheduler_deadline_honors_shared_budget(monkeypatch: pytest.MonkeyP
     assert abs(seen["deadline_at"] - (t0 + kw._RUN_WALL_S - kw._FINALIZE_S)) < 5.0
 
 
-def test_run_scheduler_deadline_honors_absolute_deadline_at(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_scheduler_deadline_honors_absolute_deadline_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """deadlineAt (epoch ms) shrinks the run; bool/str values fall back to _RUN_WALL_S."""
     import time as _time
 
@@ -451,18 +792,28 @@ def test_run_scheduler_deadline_honors_absolute_deadline_at(monkeypatch: pytest.
     _empty_repo(monkeypatch)
     t0 = _time.perf_counter()
     kw._run(
-        {"id": "r2", "op": "run", "prompt": "hello?", "deadlineAt": _time.time() * 1000 + 60_000},
+        {
+            "id": "r2",
+            "op": "run",
+            "prompt": "hello?",
+            "deadlineAt": _time.time() * 1000 + 60_000,
+        },
         jev=JevClient(),
     )
     assert isinstance(seen["deadline_at"], float)
     assert abs(float(seen["deadline_at"]) - (t0 + 60 - kw._FINALIZE_S)) < 5.0
     assert closed == ["s1"]
     for bad in (True, "soon"):
-        kw._run({"id": "r3", "op": "run", "prompt": "hello?", "deadlineAt": bad}, jev=JevClient())
+        kw._run(
+            {"id": "r3", "op": "run", "prompt": "hello?", "deadlineAt": bad},
+            jev=JevClient(),
+        )
         assert abs(float(seen["deadline_at"]) - (t0 + kw._RUN_WALL_S - kw._FINALIZE_S)) < 5.0
 
 
-def test_run_repository_read_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_repository_read_failure_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     def _fake_graph(prompt: str, as_of: object = None, **k: object) -> str:
         return "s1"
 
@@ -512,7 +863,9 @@ def _kernel_with_decision_log(recorded: list[dict[str, object]]) -> sched._Kerne
     return _K()
 
 
-def test_round2_skipped_for_corrected_query_only(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_round2_skipped_for_corrected_query_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Round 2 runs only for new tickers; a corrected query alone never earns it."""
     import asyncio
 
@@ -525,7 +878,15 @@ def test_round2_skipped_for_corrected_query_only(monkeypatch: pytest.MonkeyPatch
 
     def _decompose(*a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
         return (
-            [{"id": "s-q1", "objectiveId": "s", "question": "q?", "dependsOn": [], "whyItMatters": "w"}],
+            [
+                {
+                    "id": "s-q1",
+                    "objectiveId": "s",
+                    "question": "q?",
+                    "dependsOn": [],
+                    "whyItMatters": "w",
+                }
+            ],
             {"corrected_query": "fixed query"},
         )
 
@@ -560,7 +921,9 @@ def test_jev_admit_timeout_propagates() -> None:
     assert _time.perf_counter() - t0 < 5.0
 
 
-def test_decompose_retry_budget_propagates_original(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_decompose_retry_budget_propagates_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A transient decompose failure with <15s left propagates, no synthesized proposal."""
     import time as _time
 
@@ -576,7 +939,9 @@ def test_decompose_retry_budget_propagates_original(monkeypatch: pytest.MonkeyPa
     assert calls["n"] == 1
 
 
-def test_notify_progress_failure_propagates_with_setup_error_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_notify_progress_failure_propagates_with_setup_error_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Listener errors propagate directly and setup reports the real provider_error boundary."""
     failure = RuntimeError("listener down")
 
@@ -620,11 +985,19 @@ def test_normalize_proposals_malformed_raises_typeerror() -> None:
 
 
 def test_normalize_proposals_ignores_non_list_dependencies() -> None:
-    proposal = {"id": "s-q1", "objectiveId": "s", "question": "q?", "dependsOn": "s-q2", "whyItMatters": "w"}
+    proposal = {
+        "id": "s-q1",
+        "objectiveId": "s",
+        "question": "q?",
+        "dependsOn": "s-q2",
+        "whyItMatters": "w",
+    }
     assert kw._normalize_proposals([proposal], "s") == [{**proposal, "dependsOn": []}]
 
 
-def test_create_nodes_topological_cycle_rejects(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_create_nodes_topological_cycle_rejects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A cyclic dependsOn rejects; no nodes persist for the cyclic batch."""
     import tempfile
 
@@ -633,8 +1006,20 @@ def test_create_nodes_topological_cycle_rejects(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
     sid = service.create_research("q?", "q?")
     cyclic: list[dict[str, object]] = [
-        {"id": "s-q1", "objectiveId": "s", "question": "q1?", "dependsOn": ["s-q2"], "whyItMatters": "w"},
-        {"id": "s-q2", "objectiveId": "s", "question": "q2?", "dependsOn": ["s-q1"], "whyItMatters": "w"},
+        {
+            "id": "s-q1",
+            "objectiveId": "s",
+            "question": "q1?",
+            "dependsOn": ["s-q2"],
+            "whyItMatters": "w",
+        },
+        {
+            "id": "s-q2",
+            "objectiveId": "s",
+            "question": "q2?",
+            "dependsOn": ["s-q1"],
+            "whyItMatters": "w",
+        },
     ]
     with pytest.raises(ValueError, match="cyclic"):
         kw._create_nodes_topological(sid, "q?", cyclic)
@@ -677,14 +1062,24 @@ def test_startup_needle_failure_stays_live(monkeypatch: pytest.MonkeyPatch) -> N
 
 @pytest.mark.parametrize("stage", ["repository", "list", "cancel"])
 def test_close_bootstrap_job_failure_logs(
-    stage: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from app.research import service
     from app.research.models import Job
 
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     failure = RuntimeError(f"{stage} down")
-    job = Job(job_id="j1", session_id="rs:x", wave_id=1, parent_job_id=None, job_type="source_agent", owner="k")
+    job = Job(
+        job_id="j1",
+        session_id="rs:x",
+        wave_id=1,
+        parent_job_id=None,
+        job_type="source_agent",
+        owner="k",
+    )
 
     def _one_job(self: ResearchRepository, sid: str) -> list[Job]:
         return [job]
@@ -708,7 +1103,11 @@ def test_close_bootstrap_job_failure_logs(
         done_source = replace(job, job_id="j0", status="completed")
         open_other = replace(job, job_id="j2", job_type="stockbot")
         with (
-            mock.patch.object(ResearchRepository, "list_jobs", return_value=[open_other, done_source, job]),
+            mock.patch.object(
+                ResearchRepository,
+                "list_jobs",
+                return_value=[open_other, done_source, job],
+            ),
             mock.patch.object(service, "cancel_job") as cancel,
         ):
             kw._close_bootstrap_job("rs:x")
@@ -751,7 +1150,10 @@ def test_run_bootstrap_cleanup_failure_preserves_outcome(
     assert out["id"] == "rc"
     if scheduler_error:
         assert out["error"] == "kernel run failed: scheduler down"
-        assert out["terminal"] == {"category": "provider_error", "message": out["error"]}
+        assert out["terminal"] == {
+            "category": "provider_error",
+            "message": out["error"],
+        }
         assert out["failures"] == {"provider_error": 1}
     else:
         assert out["sessionId"] == "s1"
@@ -837,7 +1239,9 @@ def test_failed_intake_closes_bootstrap_without_replacing_setup_error(
         assert cleanup_records[0].exc_info[1] is cleanup_failure
 
 
-def test_graph_intake_reasoner_crash_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_graph_intake_reasoner_crash_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import asyncio
 
     recorded: list[dict[str, object]] = []
@@ -851,7 +1255,18 @@ def test_graph_intake_reasoner_crash_propagates(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(kw, "_intake_round", _one_round)
     monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _crash)
     with pytest.raises(RuntimeError, match="reasoner crash"):
-        asyncio.run(kw._graph_intake("q?", None, "s1", {}, [], JevClient(), _kernel_with_decision_log(recorded), None))
+        asyncio.run(
+            kw._graph_intake(
+                "q?",
+                None,
+                "s1",
+                {},
+                [],
+                JevClient(),
+                _kernel_with_decision_log(recorded),
+                None,
+            )
+        )
 
 
 def test_graph_intake_round_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -864,7 +1279,18 @@ def test_graph_intake_round_failure_propagates(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(kw, "_intake_round", _boom_round)
     with pytest.raises(RuntimeError, match="intake round down"):
-        asyncio.run(kw._graph_intake("q?", None, "s1", {}, [], JevClient(), _kernel_with_decision_log(recorded), None))
+        asyncio.run(
+            kw._graph_intake(
+                "q?",
+                None,
+                "s1",
+                {},
+                [],
+                JevClient(),
+                _kernel_with_decision_log(recorded),
+                None,
+            )
+        )
 
 
 def test_followup_reuses_session_skips_setup(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -919,7 +1345,9 @@ def test_followup_reuses_session_skips_setup(monkeypatch: pytest.MonkeyPatch) ->
     kw.run_graph_prompt = orig_graph
 
 
-def test_followup_unknown_session_is_invalid_params(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_followup_unknown_session_is_invalid_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """An unknown sessionId returns invalid_params, never a new session."""
     import tempfile
 
@@ -929,7 +1357,9 @@ def test_followup_unknown_session_is_invalid_params(monkeypatch: pytest.MonkeyPa
     assert isinstance(terminal, dict) and terminal.get("category") == "invalid_params"
 
 
-def test_followup_blocks_leftover_proposed_node(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_followup_blocks_leftover_proposed_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A leftover pass-1 proposed node is blocked; the scheduler sees only the gap node."""
     import asyncio
     import tempfile
@@ -972,7 +1402,9 @@ def test_followup_blocks_leftover_proposed_node(monkeypatch: pytest.MonkeyPatch)
     assert ResearchRepository().get_node(leftover.node_id).status == "blocked"
 
 
-def test_followup_links_only_explicit_known_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_followup_links_only_explicit_known_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Pass-2 calls cite their own known ids (pass-1 duplicate winner, repeats); others get no evidenceId."""
     import asyncio
     import tempfile
@@ -988,7 +1420,13 @@ def test_followup_links_only_explicit_known_evidence(monkeypatch: pytest.MonkeyP
     def _refs(record: Mapping[str, object]) -> list[dict[str, str]]:
         assert record.get("session_id") == sid
         if record.get("evidence_id") == "ev-pass1":
-            return [{"id": "evidence:ev-pass1", "title": "Prior capture", "url": "https://www.sec.gov/prior"}]
+            return [
+                {
+                    "id": "evidence:ev-pass1",
+                    "title": "Prior capture",
+                    "url": "https://www.sec.gov/prior",
+                }
+            ]
         return []
 
     monkeypatch.setattr("app.research.sources.source_references", _refs)
@@ -1004,11 +1442,30 @@ def test_followup_links_only_explicit_known_evidence(monkeypatch: pytest.MonkeyP
             {"tool": "get_sec_document", "arguments": {}, "evidence_id": "ev-pass2"},
             {"tool": "get_sec_document", "arguments": {}, "evidence_id": "ev-pass2"},
             {"tool": "search_web", "arguments": {}, "evidence_id": "ev-ghost"},
-            {"tool": "query_finra", "arguments": {}, "error": "boom", "evidence_id": "ev-pass2"},
-            {"tool": "get_sec_filing", "arguments": {}, "evidence_id": None, "evidenceId": "ev-pass1"},
-            {"tool": "get_sec_filing", "arguments": {}, "evidence_id": "", "evidenceId": "ev-pass2"},
+            {
+                "tool": "query_finra",
+                "arguments": {},
+                "error": "boom",
+                "evidence_id": "ev-pass2",
+            },
+            {
+                "tool": "get_sec_filing",
+                "arguments": {},
+                "evidence_id": None,
+                "evidenceId": "ev-pass1",
+            },
+            {
+                "tool": "get_sec_filing",
+                "arguments": {},
+                "evidence_id": "",
+                "evidenceId": "ev-pass2",
+            },
         ]
-        return {"status": "complete", "nodes": [{"node_id": "n", "attempts": attempts}], "incomplete_guard": False}
+        return {
+            "status": "complete",
+            "nodes": [{"node_id": "n", "attempts": attempts}],
+            "incomplete_guard": False,
+        }
 
     monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
     monkeypatch.setattr(kw, "_close_bootstrap_job", _no_bootstrap)
@@ -1031,9 +1488,87 @@ def test_followup_links_only_explicit_known_evidence(monkeypatch: pytest.MonkeyP
     assert "ev-pass1" in ids and "ev-pass2" in ids
     by_id = {e["id"]: e for e in evidence if isinstance(e, dict)}
     assert by_id["ev-pass1"]["sources"] == [
-        {"id": "evidence:ev-pass1", "title": "Prior capture", "url": "https://www.sec.gov/prior"}
+        {
+            "id": "evidence:ev-pass1",
+            "title": "Prior capture",
+            "url": "https://www.sec.gov/prior",
+        }
     ]
     assert "sources" not in by_id["ev-pass2"]
+
+
+def test_wire_evidence_sends_full_sec_document_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stored SEC document text reaches personas whole; other rows and textless rows keep the 2000 cap."""
+    import asyncio
+    import tempfile
+    from pathlib import Path
+
+    from app.research import service
+    from app.research.repository import ResearchRepository
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
+    sid = service.create_research("q?", "q?")
+    service.create_node(sid, "q1?", "w")
+    fact = "Total revenue $46,743 million"
+    window = "Item 2. MD&A | 25\n" * 112 + fact + "x" * 9000  # fact starts at char 2016 of an ~11k window
+    assert window.index(fact) > 2000
+    sec_prov = {
+        "kind": "sec_source",
+        "accession_no": "0001045810-26-000075",
+        "document_name": "nvda.htm",
+    }
+    store = ResearchRepository()
+    store.save_evidence(
+        {
+            "evidence_id": "ev-sec",
+            "session_id": sid,
+            "content": window,
+            "provenance": sec_prov,
+        }
+    )
+    store.save_evidence(
+        {
+            "evidence_id": "ev-web",
+            "session_id": sid,
+            "content": window,
+            "provenance": {"kind": "web_source"},
+        }
+    )
+    store.save_evidence(
+        {
+            "evidence_id": "ev-rec",
+            "session_id": sid,
+            "content": window,
+            "provenance": {"kind": "sec_record"},
+        }
+    )
+    store.save_evidence(
+        {
+            "evidence_id": "ev-sec-blank",
+            "session_id": sid,
+            "content": "  ",
+            "provenance": {**sec_prov, "passage": window},
+        }
+    )
+
+    async def _fake_sched(run_sid: str, **hooks: object) -> dict[str, object]:
+        for n in service.ready_nodes(run_sid):
+            service.resolve_node(run_sid, n.node_id)
+        return {"status": "complete", "nodes": [], "incomplete_guard": False}
+
+    monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", _no_bootstrap)
+    out = asyncio.run(asyncio.to_thread(kw._run, {"id": "r6", "prompt": "q?", "sessionId": sid, "gap": "revenue"}))
+    evidence = out["evidence"]
+    assert isinstance(evidence, list)
+    rows = {e["id"]: e["content"] for e in evidence if isinstance(e, dict)}
+    assert rows["ev-sec"] == window
+    assert rows["ev-web"] == window[:2000] and rows["ev-rec"] == window[:2000]
+    # No stored text: the row never gets the full SEC projection (clipped record JSON, no fact).
+    blank = rows["ev-sec-blank"]
+    assert isinstance(blank, str) and len(blank) == 2000 and fact not in blank
 
 
 def test_setup_keyerror_is_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:

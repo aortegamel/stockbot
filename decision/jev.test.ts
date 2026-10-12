@@ -410,6 +410,10 @@ test("tool selection covers the whole registry plus sentinels; manifests render 
   expect(q.prompt).toContain("page with research_read_search beyond display_limit");
   const rev = buildToolSelectionQuestion(registry, { nodeId: "n1", question: "What drove NVDA revenue last quarter?" }).prompt;
   expect(rev).toContain("open the 10-Q accession via get_sec_document with a revenue query");
+  const tenq = buildToolSelectionQuestion(registry, { nodeId: "n1", question: "What did NVDA's latest 10-Q disclose about revenue?" }).prompt;
+  expect(tenq).toContain("get_sec_document section reads (Item 1, Item 2, Item 1A)");
+  expect(tenq).not.toContain("with a revenue query");
+  expect(rev).not.toContain("section reads");
   const plain = buildToolSelectionQuestion(registry, { nodeId: "n1", question: "q?" }).prompt;
   expect(plain).not.toContain("open the 10-Q accession");
   expect(TOOL_SELECTION_SENTINELS.reasoning_required.length).toBeGreaterThan(0);

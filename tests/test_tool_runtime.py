@@ -71,6 +71,11 @@ def test_outcome_success() -> None:
     assert oc.source_handle == {"a": 1}
     assert oc.source_refs is not None and oc.source_refs.get("record_id") == "0001"
     assert oc.meta.row_count >= 0
+    nested = outcome_from_result(
+        "get_sec_filing",
+        {"content": "x", "meta": {"source_refs": {"record_id": "0001", "known_at": "2025-02-01"}}},
+    )
+    assert nested.source_refs is not None and nested.source_refs.get("record_id") == "0001"
 
 
 def test_outcome_retryable_only_transient() -> None:

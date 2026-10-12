@@ -57,6 +57,8 @@ _CLAIM_SEVERITY = {
     "inference": "indirect",
     "unknown": "uncertain",
     "contradicted": "contested",
+    "conditional_risk": "conditional",
+    "attributed_report": "attributed",
 }
 
 
@@ -350,9 +352,13 @@ def _observation_rows(
 
 
 def _split_effects(claims: Sequence[GroundedClaim]) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Directly observed claims vs reasoned/contested claims; unknown reads stay in the unknowns section."""
+    """Directly observed claims vs reasoned/contested/qualified claims; unknown reads stay in the unknowns section."""
     first = [_effect_row(c) for c in claims if c.claim_type == "observed_fact"]
-    second = [_effect_row(c) for c in claims if c.claim_type in ("inference", "contradicted")]
+    second = [
+        _effect_row(c)
+        for c in claims
+        if c.claim_type in ("inference", "contradicted", "conditional_risk", "attributed_report")
+    ]
     return first, second
 
 

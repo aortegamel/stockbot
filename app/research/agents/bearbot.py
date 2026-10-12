@@ -103,7 +103,7 @@ def run_bearbot(
         f"second-order effects on counterparties. Do not fabricate pessimism. Question: {question}\n"
         f"Freeze: {freeze_id} as of {as_of} evidence={len(frozen)}\n"
         'Respond with one JSON object only: {"role": "bearbot", "executive_view": "<bearish read>", '
-        '"claims": [{"text": "<finding>", "claim_type": "observed_fact|inference|unknown|contradicted", "evidence_ids": ["<freeze-id>", ...]}], '
+        '"claims": [{"text": "<finding>", "claim_type": "observed_fact|inference|unknown|contradicted|conditional_risk|attributed_report", "evidence_ids": ["<freeze-id>", ...]}], '
         '"impact_channels": [{"text": "<channel>", "direction": "<what it does to the question>", "evidence_ids": ["<freeze-id>"]}], '
         '"materiality": {"overall": "critical|high|medium|low", "reasoning": "<why>"}, '
         '"uncertainties": ["<what the freeze does not establish>"], '
@@ -111,8 +111,11 @@ def run_bearbot(
         '"follow_ups": [{"question": "<follow-up>?", "why_it_matters": "<why>", "suggested_source": "SEC"}]}. '
         "claim_type is declared, never inferred from wording: observed_fact when the cited passage states it directly, "
         "inference when it is reasoned from cited evidence, contradicted when cited evidence conflicts with the claim text, "
+        "conditional_risk when the cited passage discloses the risk as a risk (the citation supports the qualified risk wording, not that it materialized), "
+        "attributed_report when the cited passage reports someone else's statement (the citation supports that it was reported, not the underlying event), "
         "unknown when the frozen evidence does not establish it (for example no disclosure located within the searched scope). "
-        "observed_fact/inference/contradicted need at least one freeze id; unknown may cite none. "
+        "Cite both sides when evidence conflicts and declare contradicted. "
+        "observed_fact/inference/contradicted/conditional_risk/attributed_report need at least one freeze id; unknown may cite none. "
         "Cite only freeze ids; never invent ids, filings, or numbers. Every adverse claim needs a passage that supports it; "
         "if the freeze supports no downside case, say so instead of asserting one. "
         "Populate uncertainties and what_would_change with at least one concrete item each."
