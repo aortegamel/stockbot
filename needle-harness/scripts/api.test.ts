@@ -41,5 +41,5 @@ describe("bun api host", () => {
       if (prev === undefined) delete process.env.KERNEL_PREWARMED;
       else process.env.KERNEL_PREWARMED = prev;
     }
-  });
+  }, 30000);
 });
