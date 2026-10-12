@@ -95,6 +95,7 @@ function reset(): void {
   invoked.length = 0;
   ended.length = 0;
   process.env.STOCKBOT_DEBUG = "1";
+  process.env.OPENCODE_MODEL = "test-model";
 }
 
 type AgentEventShape = { type: string;[k: string]: unknown };

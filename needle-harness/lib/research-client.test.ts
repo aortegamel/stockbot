@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { fetchSourceDocument } from "./research-client";
 import type { SourceDocument } from "./research-client";
 
+const originalFetch = globalThis.fetch;
 const id = `capture:${"b".repeat(64)}`;
 function document(overrides: Partial<SourceDocument> = {}): SourceDocument {
   return {
@@ -23,7 +24,7 @@ function respond(body: unknown, status = 200): void {
 }
 
 afterEach(() => {
-  delete (globalThis as { fetch?: typeof fetch }).fetch;
+  (globalThis as { fetch?: typeof fetch }).fetch = originalFetch;
 });
 
 describe("fetchSourceDocument", () => {
