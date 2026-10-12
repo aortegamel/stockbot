@@ -69,13 +69,12 @@ reports/
 # Generated verification reports (Stryker mutation output; never commit)
 reports/
 
-# mutmut working tree (full source copy; never commit)
 mutants/
 .needle/
-needle-harness/.next/
-needle-harness/out/
 needle-harness/benchmarks/
 benchmarks/
+web/dist/
+web/public/pdfjs/
 .mutmut-cache
 *.tsbuildinfo
 

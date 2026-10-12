@@ -1,6 +1,6 @@
 # Needle Harness
 
-Local routing (Cactus Needle 3), remote reasoning (Muse Spark via OpenCode Go API), Bun orchestration, Next.js terminal UI.
+Local routing (Cactus Needle 3), remote reasoning (Muse Spark via OpenCode Go API), Bun orchestration, Vite terminal UI.
 
 ## 1. Requirements
 
@@ -24,9 +24,9 @@ See ../.env.example (single repo-root .env). Shell exports override .env. OPENCO
 
 ```bash
 cp ../.env.example ../.env  # once from repo root, then fill values
-bun run stockbot  # from repo root (or needle-harness/) → http://localhost:3000
-# staged logs per step; browser misbehaves? first check: curl -s localhost:3000/api/health
-bun run lint && bun run typecheck && bun run build
+bun run stockbot  # from repo root → Vite URL on PORT (127.0.0.1, free-picked from 3000)
+# staged logs per step; browser misbehaves? first check the Bun API port in the startup log, then curl that /api/health
+bun run lint && bun run typecheck
 BENCHMARK=1 bun run stockbot   # write benchmarks/*.json per run
 ```
 
@@ -36,10 +36,10 @@ BENCHMARK=1 bun run stockbot   # write benchmarks/*.json per run
 prompt → Needle 3 (local routing, JSONL bridge) → Bun loop (max 8 steps)
   → Tools (search_web, find_sec_entities, search_sec_filings, get_sec_document via the runtime-neutral tool bridge; get_current_time local)
   → Evidence[] → Muse Spark 1.3 (single reasoning call) → answer + metrics
-Next.js streams AgentEvents as SSE to the terminal UI.
+Bun streams AgentEvents as SSE to the terminal UI.
 ```
 
-Needle routes, Bun orchestrates, tools retrieve, Muse reasons, Next.js displays.
+Needle routes, Bun orchestrates, tools retrieve, Muse reasons, Vite displays.
 
 ### Captured evidence
 
@@ -85,8 +85,8 @@ A legacy row without a matching archive or excerpt shows an error.
 The viewer sanitizes captured HTML with DOMPurify.
 PDF.js renders only original SEC PDF captures, with selectable text and quote highlights.
 The client rejects a PDF with any other capture kind.
-`predev`, `prebuild`, and `prestart` run `copy-pdfjs`.
-That script copies the packaged PDF.js worker, fonts, character maps, WebAssembly, and ICC assets to `public/pdfjs`.
+The supervisor runs `copy-pdfjs` before Vite starts.
+That script copies the packaged PDF.js worker, fonts, character maps, WebAssembly, and ICC assets to `web/public/pdfjs`.
 The viewer loads these assets from the same origin. It uses no CDN.
 
 The navigation helpers adapt [Magellan](https://github.com/magellan-extension/magellan) under the MIT license.

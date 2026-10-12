@@ -2,8 +2,6 @@ import { execFile } from "node:child_process";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-export const dynamic = "force-dynamic";
-
 // Durable-state reads. /terminal polls these for backend state and logs:
 // snapshot = inspect_research (session + jobs + next action),
 // journal  = hash-chained journal tail (log tail + poll cursor),

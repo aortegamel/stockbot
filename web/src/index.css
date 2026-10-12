@@ -1,0 +1,140 @@
+:root {
+  --bg: #0A0E14;
+  --panel: #11161F;
+  --panel2: #151C29;
+  --border: #1E2635;
+  --text: #E6ECF5;
+  --muted: #93A0B8;
+  --up: #26A69A;
+  --down: #EF5350;
+  --accent: #2962FF;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+.source-panel .source-control {
+  border: 1px solid #52525b;
+  border-radius: 0.375rem;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.75rem;
+  color: #e4e4e7;
+}
+
+.source-panel .source-control:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.source-panel .source-control:not(:disabled):hover {
+  border-color: #a1a1aa;
+}
+
+/* Magellan-adapted citation classes. Cited marks persist; the active mark gets the outline. */
+.source-panel .mgl-cited-element-highlight,
+.source-pdf-page .textLayer .mgl-cited-element-highlight {
+  background-color: rgba(139, 139, 255, 0.4);
+  border-radius: 3px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.source-panel .mgl-active-element-highlight,
+.source-pdf-page .textLayer .mgl-active-element-highlight {
+  outline: 2px solid #8b8bff;
+  outline-offset: 2px;
+  box-shadow: 0 0 8px rgba(139, 139, 255, 0.6);
+}
+
+/* Subset of pdfjs-dist/web/pdf_viewer.css. The page sets --total-scale-factor to the viewport scale. */
+.source-pdf-page {
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+  overflow: auto;
+  margin-bottom: 1rem;
+}
+
+.source-pdf-page canvas {
+  display: block;
+}
+
+.source-pdf-page .textLayer {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  line-height: 1;
+  text-align: initial;
+  letter-spacing: normal;
+  word-spacing: normal;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+
+.source-pdf-page .textLayer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+}
+
+.source-pdf-page .textLayer > span {
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  transform: rotate(var(--rotate, 0deg)) scaleX(var(--scale-x, 1)) scale(var(--min-font-size-inv));
+}
+
+/* The UA mark color would paint fallback-font glyphs over the canvas text. */
+.source-pdf-page .textLayer mark {
+  color: transparent;
+}
+
+.source-pdf-page .textLayer ::selection {
+  background: rgba(0 0 255 / 0.25);
+  color: transparent;
+}
+
+.source-pdf-page .textLayer[data-main-rotation="90"] {
+  transform: rotate(90deg) translateY(-100%);
+}
+
+.source-pdf-page .textLayer[data-main-rotation="180"] {
+  transform: rotate(180deg) translate(-100%, -100%);
+}
+
+.source-pdf-page .textLayer[data-main-rotation="270"] {
+  transform: rotate(270deg) translateX(-100%);
+}
+
+.source-panel .source-html table {
+  border-collapse: collapse;
+  margin: 0.5rem 0;
+}
+
+.source-panel .source-html th,
+.source-panel .source-html td {
+  border: 1px solid #a1a1aa;
+  padding: 0.25rem 0.5rem;
+  text-align: left;
+}

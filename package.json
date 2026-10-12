@@ -3,10 +3,10 @@
   "private": true,
   "scripts": {
     "setup": "python3.14 -m venv venv && venv/bin/pip install --upgrade pip && venv/bin/pip install -r requirements.txt",
-    "test": "venv/bin/pytest && bun run test:ts && (cd needle-harness && bun test)",
+    "test": "venv/bin/pytest && bun run test:ts && (cd needle-harness && bun test) && (cd web && bun test)",
     "test:ts": "bun test decision/",
     "typecheck": "venv/bin/pyrefly check",
-    "typecheck-ts": "tsc --noEmit -p tsconfig.json && (cd needle-harness && bun run typecheck)",
+    "typecheck-ts": "tsc --noEmit -p tsconfig.json && (cd needle-harness && bun run typecheck) && (cd web && bunx tsc --noEmit)",
     "test-collect": "venv/bin/pytest --collect-only -q",
     "coverage:py": "venv/bin/coverage run -m pytest; venv/bin/coverage lcov -o coverage-python.lcov",
     "coverage:ts": "bun test decision/ --coverage --coverage-reporter=lcov --coverage-dir=coverage-ts",
@@ -43,7 +43,7 @@
     "sandbox-doctor": "venv/bin/python scripts/sandbox_doctor.py",
     "stockbot": "bun needle-harness/scripts/needle.ts",
     "llama": "llama-server --models-dir ${HOME}/.cache/huggingface/hub --models-preset ${HOME}/.config/llama-server/presets.ini --models-max 1 --host 127.0.0.1 --port 8080",
-    "lint": "venv/bin/ruff check . && venv/bin/ruff format --check . && (cd needle-harness && bun run lint)"
+    "lint": "venv/bin/ruff check . && venv/bin/ruff format --check . && (cd needle-harness && bun run typecheck) && (cd web && bunx tsc --noEmit)"
   },
   "dependencies": {
     "@typesafe-ai/sdk": "^0.6.0"

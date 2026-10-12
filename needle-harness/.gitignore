@@ -10,42 +10,28 @@
 !.yarn/releases
 !.yarn/versions
 
-# testing
-/coverage
-
-# next.js
-/.next/
-/out/
-
-# production
+/* testing */
+/*/coverage
+/*/coverage-ts/
+/*/coverage-harness/
+/* vite + tsc build output */
+/*/dist/
 /build
-
-# misc
+tsconfig.tsbuildinfo
+/* misc */
 .DS_Store
 *.pem
-
-# debug
+/* debug */
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
-
-# env files (can opt-in for committing if needed)
+*.log
+/* env files (can opt-in for committing if needed) */
 .env*
-
-# vercel
-.vercel
-
-next-env.d.ts
-
-# local benchmark output (never committed; keep the dir)
+/* local benchmark output (never committed; keep the dir) */
 /benchmarks/*.json
-# generated at warmup via tool_bridge describe (never committed)
+/* generated at warmup via tool_bridge describe (never committed) */
 /.needle-catalog.json
-# tsc incremental build info (never committed)
-tsconfig.tsbuildinfo
-# bun coverage output (never committed)
-/coverage-ts/
-/coverage-harness/
-# packaged PDF.js assets copied at dev/build time (never committed)
-/public/pdfjs/
+/* packaged PDF.js assets copied to web at dev time (never committed) */
+/web/public/pdfjs/

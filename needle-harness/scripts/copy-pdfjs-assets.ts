@@ -1,11 +1,11 @@
-// Copies packaged PDF.js runtime assets into ignored public/pdfjs (same-origin, no CDN).
-// Next serves public/ now and Vite will serve it after migration, so both frameworks resolve /pdfjs/*.
+// Copies packaged PDF.js runtime assets into web/public/pdfjs for same-origin loading.
 import { cpSync, mkdirSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const source = join(root, "node_modules", "pdfjs-dist");
+const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "web");
+const source = dirname(createRequire(join(root, "package.json")).resolve("pdfjs-dist/package.json"));
 const target = join(root, "public", "pdfjs");
 rmSync(target, { recursive: true, force: true });
 mkdirSync(target, { recursive: true });

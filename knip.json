@@ -20,7 +20,7 @@
       ]
     },
     "needle-harness": {
-      "entry": ["scripts/needle.ts"],
+      "entry": ["scripts/needle.ts", "scripts/api.ts", "scripts/copy-pdfjs-assets.ts"],
       "project": ["**/*.{js,ts,tsx,css}"]
     }
   }
