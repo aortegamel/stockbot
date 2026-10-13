@@ -4374,6 +4374,7 @@ def test_invariant_committee_trio_running_before_roles_complete(
 ) -> None:
     """All three committee jobs exist RUNNING before any role finishes; all share one freeze."""
     import sqlite3
+    import threading
 
     from app.research.repository import get_research_db_path
 
@@ -4389,10 +4390,13 @@ def test_invariant_committee_trio_running_before_roles_complete(
         return {str(job_type): str(status) for job_type, status in rows}
 
     snapshots: list[dict[str, str]] = []
+    barrier = threading.Barrier(3)
 
     def _model(prompt: str) -> str:
         if "Temporary assignment" not in prompt:  # a committee role call, not a scout
             snapshots.append(_committee_statuses())
+            # All three callbacks must record their snapshot before any role can complete.
+            barrier.wait(timeout=10)
         return _grounded(prompt)
 
     out = _run_wave(repo, _model)
