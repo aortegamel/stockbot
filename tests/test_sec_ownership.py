@@ -31,9 +31,14 @@ class _Person:
         self.percent_of_class = pct
 
 
-def _schedule(persons: list[_Person], purpose: str | None = None) -> SimpleNamespace:
+def _schedule(
+    persons: list[_Person], purpose: str | None = None, issuer_info: SimpleNamespace | None = None
+) -> SimpleNamespace:
     items = SimpleNamespace(purpose_of_transaction=purpose)
-    return SimpleNamespace(reporting_persons=persons, items=items)
+    schedule = SimpleNamespace(reporting_persons=persons, items=items)
+    if issuer_info is not None:
+        schedule.issuer_info = issuer_info
+    return schedule
 
 
 def test_two_person_schedule():
@@ -137,6 +142,146 @@ def test_changes_group_by_filer_and_skip_failures(monkeypatch: pytest.MonkeyPatc
     assert events[0].share_change == 500
     assert events[0].previous_accession == "a1"
     assert events[0].current_accession == "a2"
+
+
+def _window_filings(count: int) -> list[SimpleNamespace]:
+    return [
+        SimpleNamespace(accession_no=f"a{i:02d}", form="SC 13D", filed_at=f"2024-{(i % 12) + 1:02d}-15")
+        for i in range(count)
+    ]
+
+
+def test_bounded_limit_scans_newest_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    filings = _window_filings(10)
+    seen: dict[str, object] = {}
+    loads: list[str] = []
+
+    def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        seen.update(kwargs)
+        limit = kwargs.get("limit")
+        assert limit == 3  # max(2, 2 + 1) newest filings for limit=2
+        return filings[:limit]
+
+    def fake_load(accession_no: str) -> SimpleNamespace:
+        loads.append(accession_no)
+        assert accession_no in {"a00", "a01", "a02"}
+        return _schedule([_Person("1", "Alice", agg=1000)], purpose="p")
+
+    monkeypatch.setattr(ownership, "list_sec_filings", fake_list)
+    monkeypatch.setattr(ownership, "load_schedule", fake_load)
+    events = ownership.get_ownership_changes("ACME", limit=2)
+    assert isinstance(events, list)
+    assert sorted(loads) == ["a00", "a01", "a02"]
+    assert "limit" not in seen or seen["limit"] == 3
+
+
+def test_bounded_window_newest_first_and_delta(monkeypatch: pytest.MonkeyPatch) -> None:
+    filings = _window_filings(4)
+
+    def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        assert kwargs.get("limit") == 3  # max(2, 2 + 1)
+        return filings[:3]
+
+    def fake_load(accession_no: str) -> SimpleNamespace:
+        shares = {"a00": 1000, "a01": 1500, "a02": 1800}[accession_no]
+        return _schedule([_Person("1", "Alice", agg=shares)], purpose="p")
+
+    monkeypatch.setattr(ownership, "list_sec_filings", fake_list)
+    monkeypatch.setattr(ownership, "load_schedule", fake_load)
+    events = ownership.get_ownership_changes("ACME", limit=2)
+    assert [(e.previous_accession, e.current_accession) for e in events] == [("a01", "a02"), ("a00", "a01")]
+    assert [e.share_change for e in events] == [300, 500]
+    assert str(events[0].filed_at) >= str(events[1].filed_at)
+    assert isinstance(events, list)
+    assert all(isinstance(e.filed_at, str | type(None)) for e in events)
+
+
+def test_explicit_none_stays_exhaustive(monkeypatch: pytest.MonkeyPatch) -> None:
+    filings = _window_filings(6)
+    seen: dict[str, object] = {}
+    loads = 0
+
+    def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        seen.update(kwargs)
+        assert kwargs.get("limit") is None
+        return filings
+
+    def fake_load(accession_no: str) -> SimpleNamespace:
+        nonlocal loads
+        loads += 1
+        return _schedule([_Person("1", "Alice", agg=1000)], purpose="p")
+
+    monkeypatch.setattr(ownership, "list_sec_filings", fake_list)
+    monkeypatch.setattr(ownership, "load_schedule", fake_load)
+    ownership.get_ownership_changes("ACME", limit=None)
+    assert loads == len(filings)
+    assert seen["limit"] is None
+
+
+def test_coverage_discloses_scan_and_missing_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
+    filings = _window_filings(3)
+
+    def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        return filings
+
+    def fake_load(accession_no: str) -> SimpleNamespace:
+        if accession_no == "a02":
+            return _schedule([_Person("2", "Bob", agg=2000)], purpose="p")
+        shares = {"a00": 1000, "a01": 1500}[accession_no]
+        return _schedule([_Person("1", "Alice", agg=shares)], purpose="p")
+
+    monkeypatch.setattr(ownership, "list_sec_filings", fake_list)
+    monkeypatch.setattr(ownership, "load_schedule", fake_load)
+    covered = ownership.get_ownership_changes_with_coverage("ACME", limit=2)
+    assert covered["scanned_accessions"] == ["a00", "a01", "a02"]
+    assert covered["scanned_count"] == 3
+    assert covered["incomplete_history"] is True
+    paired = covered["events"]
+    assert isinstance(paired, list) and len(paired) == 1
+    assert paired[0].share_change == 500
+    assert (paired[0].previous_accession, paired[0].current_accession) == ("a00", "a01")
+    notices = covered["missing_baselines"]
+    assert isinstance(notices, list) and len(notices) == 1
+    assert notices[0]["filer_name"] == "Bob"
+    assert notices[0]["accession_no"] == "a02"
+    assert "no change inferred" in notices[0]["note"]
+
+
+def test_tool_wrapper_preserves_shape_with_coverage(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import tools
+
+    events = [
+        SimpleNamespace(
+            filer_name="Alice",
+            filer_cik="1",
+            issuer="ACME",
+            previous_accession="a00",
+            current_accession="a01",
+            filed_at="2024-02-15",
+            to_dict=lambda: {"previous_accession": "a00", "current_accession": "a01", "share_change": 500},
+        )
+    ]
+    covered: dict[str, object] = {
+        "events": events,
+        "scanned_accessions": ["a00", "a01"],
+        "scanned_count": 2,
+        "incomplete_history": False,
+        "missing_baselines": [],
+    }
+
+    def _fake_covered(*args: object, **kwargs: object) -> dict[str, object]:
+        return covered
+
+    monkeypatch.setattr(tools.sec, "get_ownership_changes_with_coverage", _fake_covered)
+    out = tools._get_ownership_changes({"ticker": "ACME", "limit": 20}, "test")
+    assert out["subject"] == "ACME"
+    assert out["count"] == 1
+    assert out["changes"] == [{"previous_accession": "a00", "current_accession": "a01", "share_change": 500}]
+    assert out["source"] == "SEC EDGAR"
+    assert out["scanned_accessions"] == ["a00", "a01"]
+    assert out["scanned_count"] == 2
+    assert out["incomplete_history"] is False
+    assert out["missing_baselines"] == []
 
 
 def test_unparseable_schedule_yields_no_records():
@@ -355,6 +500,222 @@ def test_cusip_contract(raw: str | None, expected: str | None) -> None:
     assert normalize_cusip(raw) == expected
     assert cusip_security_id("0378-33100") == "cusip:037833100"
     assert cusip_security_id("---") is None
+
+
+def test_default_limit_scans_the_bounded_newest_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    filings = _window_filings(25)
+    seen: dict[str, object] = {}
+
+    def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        seen.update(kwargs)
+        limit = kwargs.get("limit")
+        assert isinstance(limit, int)
+        return filings[:limit]
+
+    def fake_load(accession_no: str) -> SimpleNamespace:
+        return _schedule([_Person("1", "Alice", agg=1000)], purpose="p")
+
+    monkeypatch.setattr(ownership, "list_sec_filings", fake_list)
+    monkeypatch.setattr(ownership, "load_schedule", fake_load)
+    covered = ownership.get_ownership_changes_with_coverage("ACME")
+    assert seen["limit"] == 21  # max(2, default limit 20 + 1) newest filings
+    assert covered["scanned_count"] == 21
+    assert covered["incomplete_history"] is True
+    events = ownership.get_ownership_changes("ACME")
+    assert seen["limit"] == 21
+    assert len(events) == 20  # bounded to the default limit
+
+
+def test_readers_forward_subject_as_of_forms_and_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    filings = _window_filings(3)
+
+    def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        calls.append((args, dict(kwargs)))
+        return filings
+
+    monkeypatch.setattr(ownership, "list_sec_filings", fake_list)
+
+    def fake_load(accession_no: object) -> SimpleNamespace:
+        return _schedule([_Person("1", "Alice", agg=1000)], purpose="p")
+
+    monkeypatch.setattr(ownership, "load_schedule", fake_load)
+    ownership.get_ownership_changes_with_coverage("ACME", as_of="2024-06-30", limit=4)
+    ownership.get_ownership_changes("ACME", as_of="2024-06-30", limit=4)
+    ownership.get_beneficial_ownership("ACME", as_of="2024-06-30", limit=2)
+    bounded = ownership.get_beneficial_ownership("ACME", limit=2)
+    records = ownership.get_beneficial_ownership("ACME")
+
+    assert len(bounded) == 2  # the reader stays bounded by its own limit
+    assert [args for args, _ in calls] == [("ACME",)] * 5
+    assert [kwargs["as_of"] for _, kwargs in calls] == ["2024-06-30", "2024-06-30", "2024-06-30", None, None]
+    assert [kwargs["limit"] for _, kwargs in calls] == [5, 5, 2, 2, 20]
+    assert [kwargs["forms"] for _, kwargs in calls] == [["SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"]] * 5
+    assert len(records) == 3  # default limit 20 keeps every scanned record
+
+
+def test_single_filing_limit_still_scans_a_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    filings = _window_filings(3)
+    limits: list[object] = []
+
+    def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        limit = kwargs.get("limit")
+        limits.append(limit)
+        return filings[:limit] if isinstance(limit, int) else filings
+
+    def fake_load(accession_no: str) -> SimpleNamespace:
+        return _schedule([_Person("1", "Alice", agg=1000)], purpose="p")
+
+    monkeypatch.setattr(ownership, "list_sec_filings", fake_list)
+    monkeypatch.setattr(ownership, "load_schedule", fake_load)
+    covered_one = ownership.get_ownership_changes_with_coverage("ACME", limit=1)
+    covered_small = ownership.get_ownership_changes_with_coverage("ACME", limit=20)
+    covered_none = ownership.get_ownership_changes_with_coverage("ACME", limit=None)
+    # max(2, limit + 1) bounds integer limits; explicit None stays exhaustive.
+    assert limits == [2, 21, None]
+    assert covered_one["scanned_accessions"] == ["a00", "a01"]
+    assert covered_one["incomplete_history"] is True
+    assert covered_small["incomplete_history"] is False  # 3 scanned filers stay below the 21-filing window
+    assert covered_none["scanned_count"] == 3
+    assert covered_none["incomplete_history"] is False
+
+
+def test_event_list_stays_bounded_when_owners_outnumber_the_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    filings = _window_filings(2)
+
+    def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        return filings
+
+    def fake_load(accession_no: str) -> SimpleNamespace:
+        # Joint filers: two owners per filing, so the pairs outnumber the requested limit.
+        shares = {"a00": 1000, "a01": 1500}[accession_no]
+        return _schedule([_Person("1", "Alice", agg=shares), _Person("2", "Bob", agg=shares + 1)], purpose="p")
+
+    monkeypatch.setattr(ownership, "list_sec_filings", fake_list)
+    monkeypatch.setattr(ownership, "load_schedule", fake_load)
+    covered = ownership.get_ownership_changes_with_coverage("ACME", limit=1)
+    events = covered["events"]
+    assert isinstance(events, list) and len(events) == 1  # two owners make two pairs; the limit keeps one
+    assert covered["missing_baselines"] == []
+    assert covered["scanned_accessions"] == ["a00", "a01"]
+
+
+def test_scanned_accessions_keep_text_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    filings = [
+        SimpleNamespace(form="SC 13D", filed_at="2024-01-15"),
+        SimpleNamespace(accession_no="a01", form="SC 13G", filed_at="2024-02-15"),
+    ]
+
+    def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        return filings
+
+    def fake_load(accession_no: object) -> SimpleNamespace:
+        return _schedule([_Person("1", "Alice", agg=1000)], purpose="p")
+
+    monkeypatch.setattr(ownership, "list_sec_filings", fake_list)
+    monkeypatch.setattr(ownership, "load_schedule", fake_load)
+    covered = ownership.get_ownership_changes_with_coverage("ACME", limit=None)
+    assert covered["scanned_accessions"] == ["", "a01"]  # a filing without an accession reads as empty text
+    assert covered["scanned_count"] == 2
+
+
+def test_notice_fields_and_events_survive_one_bad_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    filings = [
+        SimpleNamespace(accession_no="a00", form="SC 13D", filed_at="2024-01-15"),
+        SimpleNamespace(accession_no="a01", form="SC 13D/A", filed_at="2024-02-15"),
+        SimpleNamespace(accession_no="a02", form="SC 13D/A", filed_at="2024-03-15"),
+        SimpleNamespace(accession_no="a03", form="SC 13G", filed_at="2024-04-15"),
+    ]
+    shares = {"a00": 900, "a01": 1000, "a02": 1500, "a03": 500}
+
+    def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        return filings
+
+    def fake_load(accession_no: str) -> SimpleNamespace:
+        # The single-record owner reads first, so a break after its notice would drop the other owner.
+        owner = "2" if accession_no == "a00" else "1"
+        return _schedule([_Person(owner, f"Owner {owner}", agg=shares[accession_no])], purpose="p")
+
+    real_diff = ownership.diff_ownership
+
+    def flaky_diff(prev: BeneficialOwnership, curr: BeneficialOwnership) -> object:
+        if curr.accession_no == "a02":
+            raise RuntimeError("boom")
+        return real_diff(prev, curr)
+
+    monkeypatch.setattr(ownership, "list_sec_filings", fake_list)
+    monkeypatch.setattr(ownership, "load_schedule", fake_load)
+    monkeypatch.setattr(ownership, "diff_ownership", flaky_diff)
+    covered = ownership.get_ownership_changes_with_coverage("ACME", limit=None)
+
+    events = covered["events"]
+    assert isinstance(events, list) and len(events) == 1  # (a01, a02) failed; (a02, a03) still diffed
+    event = events[0]
+    assert (event.previous_accession, event.current_accession) == ("a02", "a03")
+    assert (event.filer_name, event.filer_cik, event.issuer) == ("Owner 1", "1", "ACME")
+    assert (event.filed_at, event.prev_shares, event.curr_shares, event.share_change) == (
+        "2024-04-15",
+        1500,
+        500,
+        -1000,
+    )
+    assert (event.prev_percent, event.curr_percent, event.percent_change) == (0.0, 0.0, 0.0)
+    assert event.voting_changed is False
+    assert event.text_changed is False
+
+    notices = covered["missing_baselines"]
+    assert notices == [
+        {
+            "filer_name": "Owner 2",
+            "filer_cik": "2",
+            "accession_no": "a00",
+            "filed_at": "2024-01-15",
+            "note": "single filing in scanned window; no prior baseline, no change inferred",
+        }
+    ]
+
+
+def test_filing_metadata_reaches_records_and_sparse_filings_keep_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full = SimpleNamespace(
+        accession_no="a-full",
+        form="SC 13D/A",
+        filed_at="2024-05-01",
+        known_at="2024-05-02T00:00:00Z",
+        filer_name="Owner Co",
+        primary_document="primary.htm",
+        source="https://sec.example/full",
+    )
+    sparse = SimpleNamespace(form="SC 13D", filed_at="2024-02-15", filer_name="Fallback Co")
+    undated = SimpleNamespace(accession_no="a-undated")
+    loaded: list[object] = []
+
+    def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        return [full, sparse, undated]
+
+    def fake_load(accession_no: object) -> SimpleNamespace:
+        loaded.append(accession_no)
+        subject = SimpleNamespace(cik="9", name="Subject Co") if accession_no == "a-full" else None
+        return _schedule([_Person("1", "Alice", agg=1000, pct=5.0)], purpose="control", issuer_info=subject)
+
+    monkeypatch.setattr(ownership, "list_sec_filings", fake_list)
+    monkeypatch.setattr(ownership, "load_schedule", fake_load)
+    records = ownership.get_beneficial_ownership("ACME")
+
+    assert loaded == ["a-full", "", "a-undated"]
+    assert len(records) == 3  # a filing without a form still normalizes
+    assert [record.accession_no for record in records] == ["a-full", "", "a-undated"]
+    assert [record.form for record in records] == ["SC 13D/A", "SC 13D", ""]
+    assert [record.is_amendment for record in records] == [True, False, False]
+    assert [record.filed_at for record in records] == ["2024-05-01", "2024-02-15", None]
+    assert [record.known_at for record in records] == ["2024-05-02T00:00:00Z", "2024-02-15", None]
+    assert [record.document_name for record in records] == ["primary.htm", None, None]
+    assert [record.source_url for record in records] == ["https://sec.example/full", None, None]
+    # Structured issuer info names the subject; the filer name only fills the issuer fallback.
+    assert [record.issuer for record in records] == ["Subject Co", "Fallback Co", "ACME"]
+    assert [record.subject_name for record in records] == ["Subject Co", None, None]
+    assert [(record.filer_name, record.filer_cik) for record in records] == [("Alice", "1")] * 3
 
 
 def test_empty_cusip_is_none() -> None:

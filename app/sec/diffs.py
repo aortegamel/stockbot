@@ -44,37 +44,20 @@ def _list_document_names(accession_no: str) -> list[str]:
         raise ValueError(f"cannot list documents for {accession_no!r}: {exc}") from exc
 
 
-def _match_document_name(names: list[str], want: str, accession_no: str) -> str:
-    lowered = want.lower()
-    for name in names:
-        if name.lower() == lowered:
-            return name
-    hits = [n for n in names if lowered in n.lower() or n.lower() in lowered]
-    if len(hits) == 1:
-        return hits[0]
-    sample = ", ".join(names[:12])
-    raise ValueError(
-        f"document not found: {want!r} for accession {accession_no!r}; "
-        f"available documents: {sample or 'none'}. Omit 'section' to diff "
-        f"the primary document, or pick one of the listed names. Filing-text "
-        f"headings such as 'risk_factors' or 'Item 1A' are sections inside "
-        f"the primary document, not documents: page it with get_sec_document."
-    )
+def _text_for_section(accession_no: str, section: str | None) -> str:
+    """Read an exact attachment or a rendered heading in the primary document."""
+    from . import documents
 
-
-def _resolve_section(accession_no: str, section: str | None) -> str | None:
-    """Map the caller's ``section`` to a real document name (or None).
-
-    None/''/'full' diff the primary document. Any other value fuzzy-matches
-    the filing's document names (case-insensitive exact, then substring);
-    on a miss the error names real documents so the caller can recover via
-    list_sec_documents instead of guessing again. Filing-text headings
-    (``risk_factors``, ``Item 1A``) are never documents: the error says so.
-    """
     want = _wants_primary(section)
     if want is None:
-        return None
-    return _match_document_name(_list_document_names(accession_no), want, accession_no)
+        return documents.get_sec_filing_text(accession_no)
+    for name in _list_document_names(accession_no):
+        if name.lower() == want.lower():
+            return documents.get_sec_filing_text(accession_no, name)
+    text = documents.get_sec_document(accession_no, section=want)["text"]
+    if not isinstance(text, str):
+        raise TypeError(f"no text for accession: {accession_no!r}")
+    return text
 
 
 def diff_filings(
@@ -82,13 +65,11 @@ def diff_filings(
     previous_accession: str,
     section: str | None = None,
 ) -> dict[str, object]:
-    from . import documents, filings
+    from . import filings
 
     try:
-        cur_name = _resolve_section(current_accession, section)
-        prev_name = _resolve_section(previous_accession, section)
-        cur = documents.get_sec_filing_text(current_accession, cur_name)
-        prev = documents.get_sec_filing_text(previous_accession, prev_name)
+        cur = _text_for_section(current_accession, section)
+        prev = _text_for_section(previous_accession, section)
         forms = [filings.get_sec_filing(a).form for a in (current_accession, previous_accession)]
     except Exception as exc:  # noqa: BLE001 - intentional best-effort boundary, never aborts
         return {"error": str(exc)}

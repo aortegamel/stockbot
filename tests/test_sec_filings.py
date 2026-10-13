@@ -5,6 +5,7 @@ from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NoReturn
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -35,7 +36,7 @@ class _FakeFiling:
         self,
         form: str = "10-K",
         filed: str | date | datetime = "2024-01-15",
-        accepted: str | None = None,
+        accepted: str | datetime | None = None,
         accession: str = "0001",
         attachments: list[_FakeAttachment] | None = None,
     ) -> None:
@@ -74,6 +75,11 @@ def _patch_company(monkeypatch: pytest.MonkeyPatch, fake_filings: list[_FakeFili
         return _FakeCompany(fake_filings)
 
     monkeypatch.setattr(filings, "get_company", _get_company)
+
+
+@pytest.fixture(autouse=True)
+def _offline_company_submissions(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_company(monkeypatch, [])
 
 
 def _stub_find_sec_entities(query: str, **kwargs: object) -> SimpleNamespace:
@@ -127,6 +133,83 @@ def test_missing_acceptance_falls_back_to_filed_at(monkeypatch: pytest.MonkeyPat
     assert filing.accepted_at_missing is True
 
 
+@pytest.mark.parametrize(
+    ("accepted", "expected"),
+    [
+        (datetime(2025, 10, 31, 14, 1, 26, tzinfo=ZoneInfo("UTC")), "2025-10-31T14:01:26Z"),
+        (datetime(2024, 3, 10, 1, 59, tzinfo=ZoneInfo("America/New_York")), "2024-03-10T06:59:00Z"),
+        (datetime(2024, 3, 10, 3, 1, tzinfo=ZoneInfo("America/New_York")), "2024-03-10T07:01:00Z"),
+        (datetime(2024, 11, 3, 1, 30, tzinfo=ZoneInfo("America/New_York"), fold=0), "2024-11-03T05:30:00Z"),
+        (datetime(2024, 11, 3, 1, 30, tzinfo=ZoneInfo("America/New_York"), fold=1), "2024-11-03T06:30:00Z"),
+        (datetime(2024, 1, 15, 20, 30, tzinfo=ZoneInfo("America/New_York")), "2024-01-16T01:30:00Z"),
+        ("2024-01-15 10:00:00", "2024-01-15T10:00:00Z"),
+    ],
+)
+def test_submissions_clock_matches_list_direct_and_document(
+    accepted: datetime | str, expected: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    listed = _FakeFiling(filed="2024-01-15", accepted=accepted, accession="clock")
+    direct = _FakeFiling(filed="2024-01-15", accepted="2024-01-15 06:00:00", accession="clock")
+    monkeypatch.setattr(direct, "header", SimpleNamespace(acceptance_datetime="2024-01-15 06:00:00"), raising=False)
+    sgml_calls: list[str] = []
+
+    def sgml() -> SimpleNamespace:
+        sgml_calls.append("called")
+        return SimpleNamespace(acceptance_datetime=datetime.fromisoformat("2024-01-15T06:00:00"))
+
+    monkeypatch.setattr(direct, "sgml", sgml, raising=False)
+    _patch_company(monkeypatch, [listed])
+
+    def get_direct(_accession: str) -> _FakeFiling:
+        return direct
+
+    monkeypatch.setattr(documents, "get_by_accession_number", get_direct)
+    (from_list,) = filings.list_sec_filings("AAPL")
+    from_direct = filings.get_sec_filing("clock")
+    assert from_list.accepted_at == from_direct.accepted_at == expected
+    assert from_list.known_at == from_direct.known_at == expected
+    assert not from_direct.accepted_at_missing
+    assert _FakeCompany.seen == {"accession_number": "clock"}
+    doc = documents.get_sec_document("clock", data_root=tmp_path)
+    assert doc["known_at"] == expected
+    assert sgml_calls == []
+
+
+def test_submissions_midnight_controls_point_in_time(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    listed = _FakeFiling(filed="2024-01-15", accepted="2024-01-16T00:01:00Z", accession="midnight")
+    direct = _FakeFiling(filed="2024-01-15", accepted="2024-01-15 16:01:00", accession="midnight")
+    _patch_company(monkeypatch, [listed])
+
+    def get_direct(_accession: str) -> _FakeFiling:
+        return direct
+
+    monkeypatch.setattr(documents, "get_by_accession_number", get_direct)
+    assert filings.list_sec_filings("AAPL", as_of="2024-01-15") == []
+    with pytest.raises(ValueError, match="not known as of"):
+        filings.get_sec_filing("midnight", as_of="2024-01-15")
+    with pytest.raises(ValueError, match="not known as of"):
+        documents.get_sec_document("midnight", as_of="2024-01-15", data_root=tmp_path)
+    assert filings.get_sec_filing("midnight", as_of="2024-01-16").known_at == "2024-01-16T00:01:00Z"
+
+
+@pytest.mark.parametrize("has_submission", [True, False])
+def test_direct_missing_submissions_clock_never_uses_sgml(
+    has_submission: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    direct = _FakeFiling(accepted="2024-01-15 06:00:00", accession="missing")
+    listed = _FakeFiling(accepted=None, accession="missing")
+    _patch_company(monkeypatch, [listed] if has_submission else [])
+
+    def get_direct(_accession: str) -> _FakeFiling:
+        return direct
+
+    monkeypatch.setattr(documents, "get_by_accession_number", get_direct)
+    result = filings.get_sec_filing("missing")
+    assert result.accepted_at is None
+    assert result.accepted_at_missing is True
+    assert result.known_at == result.filed_at == "2024-01-15"
+
+
 def test_get_sec_filing_amendment(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeFiling(form="10-K/A", filed="2024-02-01", accepted="2024-02-01 10:00:00", accession="0002")
 
@@ -134,6 +217,7 @@ def test_get_sec_filing_amendment(monkeypatch: pytest.MonkeyPatch) -> None:
         return fake
 
     monkeypatch.setattr(documents, "get_by_accession_number", _fake_get)
+    _patch_company(monkeypatch, [fake])
     filing = filings.get_sec_filing("0002")
     assert filing.accession_no == "0002"
     assert filing.form == "10-K/A"
@@ -870,13 +954,11 @@ def test_list_sec_filings_stops_after_limit(monkeypatch: pytest.MonkeyPatch) -> 
             sgml_calls.append(1)
             raise RuntimeError("unbounded sgml download")
 
-    # Each normalization calls sgml exactly once (accepted=None falls
-    # through to the sgml fallback, swallowed by _best), so sgml_calls
-    # counts normalizations. Pre-fix normalizes all 100; post-fix 10.
+    # Submissions supply acceptance times. Normalization must never fetch SGML.
     _patch_company(monkeypatch, [_Bomb(filed="2024-01-15", accession=f"{i:04d}") for i in range(100)])
     out = filings.list_sec_filings("AAPL", limit=10)
     assert [f.accession_no for f in out] == [f"{i:04d}" for i in range(10)]
-    assert len(sgml_calls) <= 10
+    assert sgml_calls == []
 
 
 def test_list_sec_filings_as_of_keeps_lazy_semantics(monkeypatch: pytest.MonkeyPatch) -> None:

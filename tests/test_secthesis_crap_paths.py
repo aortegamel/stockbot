@@ -12,10 +12,11 @@ from __future__ import annotations
 import sys
 import threading
 from collections.abc import Callable, Iterator
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import ClassVar
+from typing import ClassVar, NoReturn
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -2001,31 +2002,61 @@ def test_wants_primary() -> None:
     assert diffs._wants_primary(" ex-99.htm ") == "ex-99.htm"
 
 
-def test_resolve_section_branches(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert diffs._resolve_section("a", None) is None
+def test_text_for_section_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     docs = [SimpleNamespace(document_name="ex-99.htm"), SimpleNamespace(document_name="primary.htm")]
     import app.sec.documents as _docs
 
-    def _fake_37(acc: object) -> object:
+    seen: list[tuple[str, str | None]] = []
+
+    def _fake_text(acc: str, document: str | None = None) -> str:
+        seen.append(("document", document))
+        return "attachment text" if document else "primary text"
+
+    def _fake_document(acc: str, *, section: str) -> dict[str, str]:
+        seen.append(("section", section))
+        if section == "missing-xyz":
+            raise ValueError("section not found: 'missing-xyz'; available sections: Item 1A. Risk Factors")
+        return {"text": "selected heading text"}
+
+    def _fake_docs(acc: object) -> object:
         return docs
 
-    monkeypatch.setattr(_docs, "list_sec_documents", _fake_37)
-    assert diffs._resolve_section("a", "EX-99.HTM") == "ex-99.htm"
-    assert diffs._resolve_section("a", "ex-9") == "ex-99.htm"
-    with pytest.raises(ValueError):
-        diffs._resolve_section("a", "missing-xyz")
+    monkeypatch.setattr(_docs, "list_sec_documents", _fake_docs)
+    monkeypatch.setattr(_docs, "get_sec_filing_text", _fake_text)
+    monkeypatch.setattr(_docs, "get_sec_document", _fake_document)
+    assert diffs._text_for_section("a", None) == "primary text"
+    assert diffs._text_for_section("a", "EX-99.HTM") == "attachment text"
+    assert diffs._text_for_section("a", "ex-9") == "selected heading text"
+    with pytest.raises(ValueError, match="available sections: Item 1A"):
+        diffs._text_for_section("a", "missing-xyz")
+    assert seen == [
+        ("document", None),
+        ("document", "ex-99.htm"),
+        ("section", "ex-9"),
+        ("section", "missing-xyz"),
+    ]
 
-    def _fake_36(acc: object) -> object:
+    def _down(acc: object) -> NoReturn:
         raise RuntimeError("down")
 
-    monkeypatch.setattr(_docs, "list_sec_documents", _fake_36)
-    with pytest.raises(ValueError):
-        diffs._resolve_section("a", "x")
+    monkeypatch.setattr(_docs, "list_sec_documents", _down)
+    with pytest.raises(ValueError, match="cannot list documents.*down"):
+        diffs._text_for_section("a", "x")
 
 
-def test_match_document_ambiguous() -> None:
-    with pytest.raises(ValueError):
-        diffs._match_document_name(["ab-1", "ab-2"], "ab", "a")
+def test_ambiguous_document_names_do_not_match_heading(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.sec.documents as _docs
+
+    def _fake_docs(acc: object) -> list[SimpleNamespace]:
+        return [SimpleNamespace(document_name="ab-1"), SimpleNamespace(document_name="ab-2")]
+
+    def _missing_section(acc: str, *, section: str) -> NoReturn:
+        raise ValueError(f"section not found: {section!r}; available sections: Item 1A. Risk Factors")
+
+    monkeypatch.setattr(_docs, "list_sec_documents", _fake_docs)
+    monkeypatch.setattr(_docs, "get_sec_document", _missing_section)
+    with pytest.raises(ValueError, match="'ab'.*available sections: Item 1A"):
+        diffs._text_for_section("a", "ab")
 
 
 # ----------------------------------------------------------- normalization
@@ -2038,21 +2069,15 @@ def test_first_present_attr() -> None:
 
 def test_accepted_at_branches() -> None:
     acc_untyped: Callable[..., object] = normalization._accepted_at
-    assert acc_untyped(SimpleNamespace(acceptance_datetime="2024-01-01")) == "2024-01-01"
-    assert acc_untyped(SimpleNamespace(header=SimpleNamespace(accepted_at="2024-02-01"))) == "2024-02-01"
+    assert acc_untyped(SimpleNamespace(acceptance_datetime="2024-01-01")) == "2024-01-01T00:00:00Z"
+    assert (
+        acc_untyped(SimpleNamespace(accepted_at=datetime(2024, 2, 1, 5, tzinfo=ZoneInfo("UTC"))))
+        == "2024-02-01T05:00:00Z"
+    )
     assert acc_untyped(SimpleNamespace()) is None
-
-    class _Sgml:
-        acceptance_datetime = "2024-03-01"
-
-    def _sgml_ok() -> object:
-        return _Sgml()
-
-    def _sgml_boom() -> object:
-        raise RuntimeError("x")
-
-    assert acc_untyped(SimpleNamespace(sgml=_sgml_ok)) == "2024-03-01"
-    assert acc_untyped(SimpleNamespace(sgml=_sgml_boom)) is None
+    assert acc_untyped(SimpleNamespace(acceptance_datetime="not-a-date")) is None
+    assert acc_untyped(SimpleNamespace(header=SimpleNamespace(accepted_at="2024-02-01"))) is None
+    assert acc_untyped(SimpleNamespace(sgml=lambda: SimpleNamespace(acceptance_datetime="2024-03-01"))) is None
 
 
 def test_filing_from_edgar_branches() -> None:

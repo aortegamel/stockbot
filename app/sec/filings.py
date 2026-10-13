@@ -3,14 +3,20 @@ edgartools with no allowlist; as_of filtering lives here (never leak
 filings the market couldn't know yet)."""
 
 import re
+from collections.abc import Iterable
+from dataclasses import replace
 from datetime import UTC, date, datetime
+from typing import TYPE_CHECKING
 
 from . import documents
 from .client import get_company
 from .models import Filing, pit_of
-from .normalization import filing_from_edgar
+from .normalization import _accepted_at, filing_from_edgar
 
 _AS_OF_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+if TYPE_CHECKING:
+    from edgar import Filing as EdgarFiling
 
 
 def _check_as_of(as_of: str | date | datetime | None) -> str | None:
@@ -120,6 +126,28 @@ def list_sec_filings(
     return out
 
 
+def _direct_filing_meta(filing: EdgarFiling) -> Filing:
+    """Use cached company submissions for the direct accession's clock."""
+    out = filing_from_edgar(filing)
+    rows: Iterable[object] = ()
+    try:
+        rows = get_company(out.filer_cik).get_filings(accession_number=out.accession_no)
+    except OSError, RuntimeError, ValueError, AttributeError:
+        rows = ()
+    accepted_at: str | None = None
+    for row in rows:
+        if getattr(row, "accession_no", None) == out.accession_no:
+            accepted_at = _accepted_at(row)
+            break
+    # No submissions row: the clock stays missing. Never fall back to SGML.
+    return replace(
+        out,
+        accepted_at=accepted_at,
+        known_at=accepted_at or out.filed_at,
+        accepted_at_missing=accepted_at is None,
+    )
+
+
 def get_sec_filing(
     accession_no: str,
     as_of: str | date | datetime | None = None,
@@ -135,7 +163,7 @@ def get_sec_filing(
         raise ValueError(f"invalid accession number: {accession_no!r}") from exc
     if filing is None:
         raise ValueError(f"invalid accession number: {accession_no!r}")
-    out = filing_from_edgar(filing)
+    out = _direct_filing_meta(filing)
     if as_of is not None:
         value, _basis = pit_of(out)
         if value is None or value[:10] > as_of:

@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     # Provider SDK filing type at the boundary only; never constructed here.
     from edgar import Filing as EdgarFiling
 from .models import Filing, FilingDocument, pit_of
-from .normalization import document_from_attachment, filing_from_edgar
+from .normalization import document_from_attachment
 
 _MAX_CHARS = 32_000
 _VIEW_MAX_SECTIONS = 50
@@ -159,6 +159,8 @@ def _section_spans(view: str) -> list[tuple[str, int, int]]:
 
 def _resolve_section(view: str, bounds: list[tuple[str, int, int]], section: str) -> tuple[str, str, int] | None:
     want = section.strip().lower()
+    if want == "risk_factors":
+        want = "item 1a"
     best: tuple[str, str, int] | None = None
     for name, start, end in bounds:
         lowered = name.lower()
@@ -237,7 +239,9 @@ def _filing(accession_no: str) -> EdgarFiling:
 
 def _meta(accession_no: str) -> Filing:
     """Hydrate filing metadata first so exact lookups cannot bypass PIT."""
-    return filing_from_edgar(_filing(accession_no))
+    from .filings import _direct_filing_meta
+
+    return _direct_filing_meta(_filing(accession_no))
 
 
 def _require_known(accession_no: str, as_of: str | None) -> Filing:
@@ -1111,8 +1115,10 @@ def _live_response(
 
 
 def _checked_live_meta(accession_no: str, as_of: str | None) -> tuple[EdgarFiling, Filing]:
+    from .filings import _direct_filing_meta
+
     filing = _filing(accession_no)
-    meta = filing_from_edgar(filing)
+    meta = _direct_filing_meta(filing)
     if as_of is not None:
         value, _basis = pit_of(meta)
         if value is None or value[:10] > as_of:

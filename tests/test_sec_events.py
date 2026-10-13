@@ -131,21 +131,26 @@ def test_diff_section_full_uses_primary(monkeypatch: pytest.MonkeyPatch) -> None
     assert seen == [None, None]
 
 
-def test_diff_section_miss_names_documents(monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.sec import filings
-
+def test_diff_section_miss_names_available_sections(monkeypatch: pytest.MonkeyPatch) -> None:
     docs = [SimpleNamespace(document_name="aapl-20250927.htm"), SimpleNamespace(document_name="exhibit211.htm")]
+    seen: list[tuple[str, str | None]] = []
 
     def _fake_docs(accession_no: str) -> object:
         return docs
 
-    def _fake_filing(accession_no: str) -> object:
-        return SimpleNamespace(form="10-K")
+    def _missing_heading(accession_no: str, *, section: str | None = None) -> NoReturn:
+        seen.append((accession_no, section))
+        raise ValueError("section not found: 'risk_factors'; available sections: Item 1. Business; Item 2. Properties")
+
+    def _no_full_text(accession_no: str, document: object = None) -> NoReturn:
+        raise AssertionError("a missing heading must not return the full document")
 
     monkeypatch.setattr(documents, "list_sec_documents", _fake_docs)
-    monkeypatch.setattr(filings, "get_sec_filing", _fake_filing)
+    monkeypatch.setattr(documents, "get_sec_document", _missing_heading)
+    monkeypatch.setattr(documents, "get_sec_filing_text", _no_full_text)
     out = diffs.diff_filings("n", "o", section="risk_factors")
     err = out["error"]
     assert isinstance(err, str)
-    assert "aapl-20250927.htm" in err
     assert "risk_factors" in err
+    assert "available sections: Item 1. Business; Item 2. Properties" in err
+    assert seen == [("n", "risk_factors")]

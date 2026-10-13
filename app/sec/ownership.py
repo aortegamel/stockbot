@@ -301,14 +301,7 @@ def load_schedule(accession_no: str) -> Schedule13D | Schedule13G:
     return _schedule_from_filing(filing, form, accession_no)
 
 
-def get_beneficial_ownership(
-    ticker_or_cik: str | int,
-    *,
-    as_of: str | None = None,
-    limit: int | None = 20,
-    forms: tuple[str, ...] | list[str] = _DEFAULT_FORMS,
-) -> list[BeneficialOwnership]:
-    filings = list_sec_filings(ticker_or_cik, forms=list(forms), as_of=as_of, limit=limit)
+def _records_from_filings(filings: list[Filing], ticker_or_cik: str | int) -> list[BeneficialOwnership]:
     out: list[BeneficialOwnership] = []
     for filing in filings:
         try:
@@ -337,6 +330,18 @@ def get_beneficial_ownership(
             )
         except Exception:  # noqa: BLE001, S112 - intentional best-effort boundary, never aborts
             continue
+    return out
+
+
+def get_beneficial_ownership(
+    ticker_or_cik: str | int,
+    *,
+    as_of: str | None = None,
+    limit: int | None = 20,
+    forms: tuple[str, ...] | list[str] = _DEFAULT_FORMS,
+) -> list[BeneficialOwnership]:
+    filings = list_sec_filings(ticker_or_cik, forms=list(forms), as_of=as_of, limit=limit)
+    out = _records_from_filings(filings, ticker_or_cik)
     if limit is not None:
         out = out[:limit]
     return out
@@ -403,20 +408,36 @@ def diff_ownership(previous: BeneficialOwnership, current: BeneficialOwnership) 
     )
 
 
-def get_ownership_changes(
+def _window_changes(
     ticker_or_cik: str | int,
     *,
-    as_of: str | None = None,
-    limit: int | None = 20,
-) -> list[OwnershipChangeEvent]:
-    records = get_beneficial_ownership(ticker_or_cik, as_of=as_of, limit=None)
+    as_of: str | None,
+    limit: int | None,
+) -> tuple[list[OwnershipChangeEvent], list[Filing], list[dict[str, object]]]:
+    """Newest-window pairwise diffs; single-record owners become notices, never deltas."""
+    scan_limit = None if limit is None else max(2, limit + 1)
+    filings = list_sec_filings(ticker_or_cik, forms=list(_DEFAULT_FORMS), as_of=as_of, limit=scan_limit)
+    records = _records_from_filings(filings, ticker_or_cik)
     groups: dict[str, list[BeneficialOwnership]] = {}
     for record in records:
         groups.setdefault(_filer_key(record), []).append(record)
     events: list[OwnershipChangeEvent] = []
-    for filings in groups.values():
-        filings.sort(key=_record_order)
-        for prev, curr in itertools.pairwise(filings):
+    missing: list[dict[str, object]] = []
+    for owner_records in groups.values():
+        owner_records.sort(key=_record_order)
+        if len(owner_records) < 2:
+            only = owner_records[0]
+            missing.append(
+                {
+                    "filer_name": only.filer_name,
+                    "filer_cik": only.filer_cik,
+                    "accession_no": only.accession_no,
+                    "filed_at": only.filed_at,
+                    "note": "single filing in scanned window; no prior baseline, no change inferred",
+                }
+            )
+            continue
+        for prev, curr in itertools.pairwise(owner_records):
             try:
                 events.append(diff_ownership(prev, curr))
             except Exception:  # noqa: BLE001, S112 - intentional best-effort boundary, never aborts
@@ -424,4 +445,36 @@ def get_ownership_changes(
     events.sort(key=_event_order, reverse=True)
     if limit is not None:
         events = events[:limit]
+    return events, filings, missing
+
+
+def get_ownership_changes_with_coverage(
+    ticker_or_cik: str | int,
+    *,
+    as_of: str | None = None,
+    limit: int | None = 20,
+) -> dict[str, object]:
+    """Bounded diffs plus retrieval coverage for the tool envelope.
+
+    Integer limits parse at most max(2, limit + 1) newest filings; explicit
+    None stays exhaustive. The list result stays under ``events``.
+    """
+    events, filings, missing = _window_changes(ticker_or_cik, as_of=as_of, limit=limit)
+    scan_limit = None if limit is None else max(2, limit + 1)
+    return {
+        "events": events,
+        "scanned_accessions": [getattr(filing, "accession_no", "") for filing in filings],
+        "scanned_count": len(filings),
+        "incomplete_history": scan_limit is not None and len(filings) == scan_limit,
+        "missing_baselines": missing,
+    }
+
+
+def get_ownership_changes(
+    ticker_or_cik: str | int,
+    *,
+    as_of: str | None = None,
+    limit: int | None = 20,
+) -> list[OwnershipChangeEvent]:
+    events, _, _ = _window_changes(ticker_or_cik, as_of=as_of, limit=limit)
     return events

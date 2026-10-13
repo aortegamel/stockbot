@@ -210,6 +210,100 @@ def test_normalize_144_never_raises():
     assert sale.shares_proposed is None
 
 
+def test_load_144_uses_installed_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    from edgar.form144 import Form144
+
+    import app.sec.documents as sec_docs
+
+    filing = SimpleNamespace(form="144")
+    form = SimpleNamespace(person_selling="John Smith")
+    seen: list[object] = []
+
+    def fake_from_filing(filing_arg: object) -> object:
+        seen.append(filing_arg)
+        return form
+
+    def fake_filing(accession: str) -> object:
+        return filing
+
+    monkeypatch.setattr(sec_docs, "get_by_accession_number", fake_filing)
+    monkeypatch.setattr(Form144, "from_filing", fake_from_filing)
+    assert insider.load_144("a1") is form
+    assert seen == [filing]
+
+
+def test_get_planned_insider_sales_sdk_seam(monkeypatch: pytest.MonkeyPatch) -> None:
+    from edgar.form144 import Form144
+
+    import app.sec.documents as sec_docs
+
+    filings = [
+        SimpleNamespace(
+            accession_no="t1",
+            form="144",
+            filed_at="2024-05-01",
+            filer_name="ACME",
+            primary_document="doc.xml",
+            known_at="2024-05-02T00:00:00Z",
+        )
+    ]
+
+    def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        return filings
+
+    def fake_filing(accession: str) -> object:
+        return SimpleNamespace(form="144")
+
+    monkeypatch.setattr(insider, "list_sec_filings", fake_list)
+    monkeypatch.setattr(sec_docs, "get_by_accession_number", fake_filing)
+
+    def fake_from_filing(filing_arg: object) -> object:
+        return SimpleNamespace(person_selling="John Smith", seller_cik="123", securities_to_be_sold=_FakeDF())
+
+    monkeypatch.setattr(Form144, "from_filing", fake_from_filing)
+    sales = insider.get_planned_insider_sales("ACME")
+    assert len(sales) == 1
+    assert sales[0].seller_name == "John Smith"
+    assert sales[0].shares_proposed == 1500
+    assert sales[0].accession_no == "t1"
+    assert sales[0].known_at == "2024-05-02T00:00:00Z"
+
+
+def test_get_planned_insider_sales_parse_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    from edgar.form144 import Form144
+
+    import app.sec.documents as sec_docs
+
+    error = RuntimeError("parse boom")
+    filings = [
+        SimpleNamespace(
+            accession_no="bad",
+            form="144",
+            filed_at="2024-05-01",
+            filer_name="ACME",
+            primary_document=None,
+            known_at=None,
+        )
+    ]
+
+    def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        return filings
+
+    def fake_filing(accession: str) -> object:
+        return SimpleNamespace(form="144")
+
+    monkeypatch.setattr(insider, "list_sec_filings", fake_list)
+    monkeypatch.setattr(sec_docs, "get_by_accession_number", fake_filing)
+
+    def boom(filing_arg: object) -> object:
+        raise error
+
+    monkeypatch.setattr(Form144, "from_filing", boom)
+    with pytest.raises(RuntimeError, match="^parse boom$") as exc:
+        insider.get_planned_insider_sales("ACME")
+    assert exc.value is error
+
+
 def test_compare_144_to_form4_date_filter():
     proposed = ProposedInsiderSale("John Smith", "123", "ACME", "2024-05-01", "t1", shares_proposed=1500)
 

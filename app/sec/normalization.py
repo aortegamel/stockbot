@@ -4,6 +4,7 @@ best-effort: any failure yields None, never an invented value."""
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from .models import Filing, FilingDocument
@@ -41,20 +42,24 @@ def _first_present_attr(obj: object, attrs: tuple[str, ...]) -> str | None:
     return None
 
 
+def _moment_or_none(raw: str) -> datetime | None:
+    """Parse SEC submissions timestamp text; None leaves normalization silent."""
+    try:
+        moment = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment
+
+
 def _accepted_at(filing: EdgarFiling) -> str | None:
-    direct = _first_present_attr(filing, ("acceptance_datetime", "accepted_at"))
-    if direct is not None:
-        return direct
-    header = _best(lambda: getattr(filing, "header", None))
-    if header is not None:
-        found = _first_present_attr(header, ("acceptance_datetime", "accepted_at", "acceptance_time"))
-        if found is not None:
-            return found
-    sgml_method = getattr(filing, "sgml", None)
-    sgml = _best(sgml_method) if callable(sgml_method) else None
-    if sgml is not None:
-        return _first_present_attr(sgml, ("acceptance_datetime", "accepted_at"))
-    return None
+    """Normalize the submissions clock. Accept list and direct submissions rows."""
+    listed = _first_present_attr(filing, ("acceptance_datetime", "accepted_at", "acceptanceDateTime"))
+    moment = _moment_or_none(listed) if listed is not None else None
+    if moment is None:
+        return None
+    return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 _ISSUER_SUBJECT_FORMS = frozenset({"10-K", "10-Q", "8-K", "S-1", "S-3", "DEF 14A"})

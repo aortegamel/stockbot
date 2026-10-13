@@ -10,7 +10,7 @@ import pytest
 
 from app import tools
 from app.policy import Capability, RequestContext
-from app.sec import documents
+from app.sec import documents, filings
 
 ACC = "0000000000-26-000001"
 DOC = "primary.htm"
@@ -40,10 +40,10 @@ def _no_pdftotext(name: str) -> None:
 
 
 class _FakeAttachment:
-    def __init__(self, text: str) -> None:
-        self.document = DOC
+    def __init__(self, text: str, document: str = DOC, accession: str = ACC) -> None:
+        self.document = document
         self.description = "10-K primary"
-        self.url = f"https://sec/{ACC}/{DOC}"
+        self.url = f"https://sec/{accession}/{document}"
         self.content = text
 
 
@@ -60,7 +60,13 @@ class _BytesAttachment:
 
 
 class _FakeFiling:
-    def __init__(self, text: str | _BytesAttachment, accession: str = ACC) -> None:
+    def __init__(
+        self,
+        text: str | _BytesAttachment,
+        accession: str = ACC,
+        *,
+        extra_attachments: tuple[_FakeAttachment, ...] = (),
+    ) -> None:
         self.form = "10-K"
         self.filing_date = "2026-01-15"
         self.acceptance_datetime: str | None = None
@@ -69,7 +75,8 @@ class _FakeFiling:
         self.cik = 123
         self.homepage_url = f"https://sec/{accession}"
         self.period_of_report = "2025-12-31"
-        self._att = _FakeAttachment(text) if isinstance(text, str) else text
+        self._att = _FakeAttachment(text, accession=accession) if isinstance(text, str) else text
+        self._extra_attachments = extra_attachments
 
     @property
     def document(self) -> _FakeAttachment | _BytesAttachment:
@@ -77,11 +84,37 @@ class _FakeFiling:
 
     @property
     def attachments(self) -> list[_FakeAttachment | _BytesAttachment]:
-        return [self._att]
+        return [self._att, *self._extra_attachments]
 
 
 def _ctx() -> RequestContext:
     return RequestContext("research", frozenset({Capability.RESEARCH}))
+
+
+class _EmptyCompany:
+    def get_filings(self, **kwargs: object) -> list[object]:
+        return []
+
+
+def _empty_company(ticker_or_cik: object) -> _EmptyCompany:
+    return _EmptyCompany()
+
+
+@pytest.fixture(autouse=True)
+def _empty_company_submissions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(filings, "get_company", _empty_company)
+
+
+def _annual_html(
+    risk_text: str, *, business: str = "Annual business text.", properties: str = "Annual properties text."
+) -> str:
+    return (
+        "<html><body><h1>Annual Report</h1>"
+        f"<h2>Item 1. Business</h2><p>{business}</p>"
+        "<h2>Item 1A. Risk Factors</h2>"
+        + "".join(f"<p>{line}</p>" for line in risk_text.splitlines())
+        + f"<h2>Item 2. Properties</h2><p>{properties}</p></body></html>"
+    )
 
 
 def test_archive_first_bounded_windows_and_local_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

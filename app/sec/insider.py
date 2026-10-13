@@ -609,15 +609,12 @@ def normalize_144(
 
 def load_144(accession_no: str) -> object:
     """Live seam: Form144 import stays here; raises on failure."""
+    from edgar.form144 import Form144
+
     from .documents import get_by_accession_number
 
     filing = get_by_accession_number(accession_no)
-    import edgar
-
-    # edgar ships no Form144 stub; getattr keeps the live seam raising on
-    # failure instead of failing the checker on a missing SDK attribute.
-    form: object = getattr(edgar, "Form144").from_filing(filing)  # noqa: B009 - edgar ships no Form144 stub; getattr keeps the live seam raising on failure instead of failing the checker
-    return form
+    return Form144.from_filing(filing)
 
 
 def get_planned_insider_sales(

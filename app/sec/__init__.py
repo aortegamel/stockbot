@@ -114,6 +114,7 @@ from .ownership import (
     diff_ownership,
     get_beneficial_ownership,
     get_ownership_changes,
+    get_ownership_changes_with_coverage,
     load_schedule,
     normalize_schedule,
 )
@@ -215,6 +216,7 @@ __all__ = [
     "get_material_events",
     "get_offering_history",
     "get_ownership_changes",
+    "get_ownership_changes_with_coverage",
     "get_planned_insider_sales",
     "get_sec_document",
     "get_sec_filing",

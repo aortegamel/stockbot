@@ -430,6 +430,8 @@ def get_fundamentals(ticker: str, metric: str, *, include_dividend_price: bool =
     if metric == "shares_float":
         metric = "shares_outstanding"
     key = f"fundamentals:{ticker}:{metric}"
+    if metric == "balance_sheet":
+        key += ":v2"
     result = _cached_or_fetch(key, lambda: _fetch_fundamentals(ticker, metric))
     if metric == "dividends" and isinstance(result, dict) and "error" not in result:
         result = dict(result)
@@ -661,14 +663,18 @@ def _fundamentals_dividends(ticker: str, company: Company) -> dict[str, object]:
 
 
 def _balance_sheet_stmt(financials: object) -> object:
-    """Balance-sheet statement handle (None when the SDK exposes neither view)."""
-    return getattr(financials, "balance_sheet", None) or getattr(financials, "get_balance_sheet", lambda: None)()
+    """Balance-sheet statement handle (zero-arg SDK methods are invoked)."""
+    stmt = getattr(financials, "balance_sheet", None)
+    if stmt is None:
+        stmt = getattr(financials, "get_balance_sheet", None)
+    return stmt() if callable(stmt) else stmt
 
 
 def _balance_sheet_text(bs: object) -> dict[str, object]:
     """Latest balance-sheet snapshot as a dict (raw string when unshaped)."""
     try:
         latest = bs.get_latest() if hasattr(bs, "get_latest") else bs
+        latest = latest() if callable(latest) else latest
         return latest.to_dict() if hasattr(latest, "to_dict") else {"raw": str(latest)}
     except AttributeError, TypeError, ValueError:
         return {"raw": str(bs)}
@@ -970,35 +976,32 @@ def _fetch_latest_earnings_release(ticker: str) -> dict[str, object]:
 
 
 def diff_risk_factors(ticker: str) -> dict[str, object]:
-    """Unified diff of risk factors between the last two 10-Qs."""
+    """Unified diff of risk factors between the newest two annual 10-Ks."""
     _ensure_init()
-    key = f"risk_diff:{ticker}"
+    key = f"risk_diff:annual-v2:{ticker}"
     return _cached_or_fetch(key, lambda: _fetch_diff_risk_factors(ticker))
 
 
 def _risk_text(filing: Filing) -> str | None:
     try:
-        rf = getattr(filing.obj(), "risk_factors", None)
-    except OSError, ValueError, RuntimeError, AttributeError:
+        from app.sec.documents import get_sec_document
+
+        document = get_sec_document(str(filing.accession_no), section="Item 1A")
+        text = document.get("text")
+    except OSError, RuntimeError, AttributeError:
         return None
-    if rf is None:
-        return None
-    text = rf if isinstance(rf, str) else getattr(rf, "text", lambda: str(rf))()
-    return text if text and str(text).strip() else None
+    # Missing-heading ValueError propagates: the fetch boundary reports it
+    # with the available sections named, never a full-document substitute.
+    return text if isinstance(text, str) and text.strip() else None
 
 
 def _risk_pair_texts(company: Company) -> list[tuple[Filing, str]]:
-    """First two filings (10-Q then 10-K) carrying risk-factor text."""
+    """Risk sections from the newest two annual 10-K filings."""
     with_text: list[tuple[Filing, str]] = []
-    for form in (["10-Q"], ["10-K"]):
-        for f in itertools.islice(company.get_filings(form=form), 8):
-            text = _risk_text(f)
-            if text is not None:
-                with_text.append((f, text))
-            if len(with_text) == 2:
-                break
-        if len(with_text) == 2:
-            break
+    for filing in itertools.islice(company.get_filings(form=["10-K"]), 2):
+        text = _risk_text(filing)
+        if text is not None:
+            with_text.append((filing, text))
     return with_text
 
 
@@ -1064,32 +1067,36 @@ def _fetch_diff_risk_factors(ticker: str) -> dict[str, object]:
 def get_financial_statements(ticker: str, statement_type: str) -> dict[str, object]:
     """Return parsed financial statement (income, balance sheet, or cash flow)."""
     _ensure_init()
-    key = f"financial_statements:{ticker}:{statement_type}"
+    key = f"financial_statements:v2:{ticker}:{statement_type}"
     return _cached_or_fetch(key, lambda: _fetch_financial_statements(ticker, statement_type))
 
 
 def _select_statement(financials: object, statement_type: str) -> tuple[object | None, dict[str, object] | None]:
-    """Statement handle for a known type (error dict for unknown types)."""
+    """Statement handle for a known type (zero-arg SDK methods are invoked)."""
     if statement_type == "income_statement":
-        return getattr(financials, "income_statement", getattr(financials, "income", None)), None
-    if statement_type == "balance_sheet":
-        return getattr(financials, "balance_sheet", getattr(financials, "balance", None)), None
-    if statement_type == "cash_flow":
-        return getattr(
+        stmt = getattr(financials, "income_statement", getattr(financials, "income", None))
+    elif statement_type == "balance_sheet":
+        stmt = getattr(financials, "balance_sheet", getattr(financials, "balance", None))
+    elif statement_type == "cash_flow":
+        stmt = getattr(
             financials,
             "cash_flow_statement",
             getattr(financials, "cashflow_statement", getattr(financials, "cash_flow", None)),
-        ), None
-    return None, {"error": f"Unknown statement type '{statement_type}'"}
+        )
+    else:
+        return None, {"error": f"Unknown statement type '{statement_type}'"}
+    return (stmt() if callable(stmt) else stmt), None
 
 
 def _statement_text(stmt: object) -> str:
     """Statement rendered as readable text (raw string when converters fail)."""
     try:
         if hasattr(stmt, "to_dataframe"):
-            return str(stmt.to_dataframe())
+            converter = stmt.to_dataframe
+            return str(converter() if callable(converter) else converter)
         if hasattr(stmt, "to_string"):
-            return str(stmt.to_string())
+            converter = stmt.to_string
+            return str(converter() if callable(converter) else converter)
         return str(stmt)
     except AttributeError, TypeError, ValueError:
         return str(stmt)
