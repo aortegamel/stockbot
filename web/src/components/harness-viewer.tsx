@@ -1,13 +1,58 @@
-import { getResearchRun, listResearchRuns } from "../../../convex/queries";
-import type { ResearchRun } from "../../../convex/schema";
+import { useEffect, useState } from "react";
+import type {
+  EvalRun,
+  EvidenceView,
+  HarnessProjection,
+  ResearchRun,
+} from "./harness-viewer-types";
+import { fetchSnapshot, type ResearchSnapshot } from "../lib/research-client";
+
+function snapshotToRun(sessionId: string, snapshot: ResearchSnapshot): ResearchRun | null {
+  const session = snapshot.session;
+  if (session === undefined || session.session_id === undefined || session.session_id !== sessionId) {
+    return null;
+  }
+  const jobs = Array.isArray(snapshot.jobs)
+    ? snapshot.jobs.map((job, index) => ({
+      jobId: job.job_id ?? `${sessionId}-job-${index}`,
+      parentJobId: null,
+      jobType: job.job_type ?? "research",
+      owner: job.owner ?? "kernel",
+      waveId: 1,
+      status: job.status ?? "unknown",
+      failureCategory: null,
+      failureMessage: null,
+      assignmentId: null,
+      role: null,
+    }))
+    : [];
+  return {
+    sessionId,
+    waveId: 1,
+    question: session.query ?? session.objective ?? sessionId,
+    status: session.status ?? "unknown",
+    asOf: null,
+    updatedAt: session.updated_at ?? "",
+    traceId: null,
+    conclusion: null,
+    traceStatus: null,
+    provider: null,
+    model: null,
+    jobs,
+    waves: [1],
+    events: [],
+    claims: [],
+    evidence: [],
+    freezes: [],
+    dossiers: [],
+    coverageArtifacts: [],
+    finalResult: null,
+    committeeRuns: [],
+  };
+}
 
 type Run = ResearchRun;
 type RunJob = Run["jobs"][number];
-
-function findRun(sessionId: string): Run | null {
-  const direct = sessionId !== "" ? getResearchRun(sessionId) : null;
-  return direct ?? listResearchRuns()[0] ?? null;
-}
 
 function waveIds(run: Run): number[] {
   const stored = run.waves ?? [];
@@ -34,7 +79,7 @@ function deskCounts(run: Run): string[] {
   });
 }
 
-function TopHeader({ run }: { run: Run }): JSX.Element {
+function TopHeader({ run }: { run: Run }) {
   const names = run.evidence.map((ev) => ev.sourceName).filter((name) => name !== "");
   const sources = [...new Set(names)];
   return (
@@ -67,7 +112,7 @@ function TopHeader({ run }: { run: Run }): JSX.Element {
   );
 }
 
-function DeskItem({ job }: { job: RunJob }): JSX.Element {
+function DeskItem({ job }: { job: RunJob }) {
   const detail = [
     job.jobType,
     job.sourceDomain ?? "domain unknown",
@@ -85,7 +130,7 @@ function DeskItem({ job }: { job: RunJob }): JSX.Element {
   );
 }
 
-function WaveDesks({ run }: { run: Run }): JSX.Element {
+function WaveDesks({ run }: { run: Run }) {
   const waves = waveIds(run);
   return (
     <>
@@ -110,7 +155,7 @@ function WaveDesks({ run }: { run: Run }): JSX.Element {
   );
 }
 
-function FreezeCommittee({ run }: { run: Run }): JSX.Element {
+function FreezeCommittee({ run }: { run: Run }) {
   const frozen = frozenIds(run);
   const failed = run.jobs.filter((job) => job.status === "failed" || job.status === "cancelled");
   const finalResult = run.finalResult ?? null;
@@ -157,7 +202,7 @@ function FreezeCommittee({ run }: { run: Run }): JSX.Element {
   );
 }
 
-function NamedList({ title, items }: { title: string; items: string[] }): JSX.Element | null {
+function NamedList({ title, items }: { title: string; items: string[] }) {
   if (items.length === 0) {
     return null;
   }
@@ -173,7 +218,7 @@ function NamedList({ title, items }: { title: string; items: string[] }): JSX.El
   );
 }
 
-function FinalSection({ run }: { run: Run }): JSX.Element {
+function FinalSection({ run }: { run: Run }) {
   const final = run.finalResult ?? null;
   if (final === null) {
     return (
@@ -242,7 +287,7 @@ function FinalSection({ run }: { run: Run }): JSX.Element {
   );
 }
 
-function AuditLog({ run }: { run: Run }): JSX.Element {
+function AuditLog({ run }: { run: Run }) {
   const events = [...run.events].sort((a, b) => a.seq - b.seq);
   const artifacts = run.coverageArtifacts ?? [];
   return (
@@ -274,9 +319,9 @@ function AuditLog({ run }: { run: Run }): JSX.Element {
   );
 }
 
-function RunPage({ run }: { run: Run }): JSX.Element {
+function RunTimeline({ run }: { run: Run }) {
   return (
-    <main>
+    <>
       <TopHeader run={run} />
       <WaveDesks run={run} />
       <FreezeCommittee run={run} />
@@ -284,7 +329,7 @@ function RunPage({ run }: { run: Run }): JSX.Element {
       <AuditLog run={run} />
       <h2>Conclusion</h2>
       <p>{run.conclusion ?? "No conclusion persisted."}</p>
-    </main>
+    </>
   );
 }
 
@@ -292,15 +337,196 @@ function missingSessionLabel(sessionId: string): string {
   return sessionId === "" ? "unselected" : sessionId;
 }
 
-export default function SessionTimelinePage({ params }: { params: { id: string } }): JSX.Element {
-  const run = findRun(params.id);
-  if (run === null) {
+function SessionsList({ runs, selected, onSelect }: { runs: Run[]; selected: string | null; onSelect: (id: string) => void }) {
+  return (
+    <>
+      <h1>Runs</h1>
+      {runs.length === 0 ? (
+        <p>No research runs persisted yet. Run a live research session, then re-run scripts/export_harness_viewer.py.</p>
+      ) : (
+        <p>
+          {runs.length} sessions (read-only projections from trace persistence)
+        </p>
+      )}
+      <ul>
+        {runs.map((run) => (
+          <li key={run.sessionId}>
+            <button onClick={() => onSelect(run.sessionId)} aria-pressed={selected === run.sessionId}>
+              {run.sessionId}
+            </button>{" "}
+            wave {run.waveId} [{run.status}] {run.question} — {run.evidence.length} evidence, {run.freezes.length}{" "}
+            freezes, {run.dossiers.length} dossiers, waves [{(run.waves ?? []).join(", ")}]
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
+
+function EvidenceDrill({ runs }: { runs: Run[] }) {
+  const rows = runs.flatMap((run) => run.evidence.map((ev: EvidenceView) => ({ run, ev })));
+  return (
+    <>
+      <h1>Evidence drill</h1>
+      {rows.length === 0 ? (
+        <p>No freeze-contained evidence persisted yet.</p>
+      ) : (
+        <p>{rows.length} evidence records with freeze-contained claim links below.</p>
+      )}
+      <ul>
+        {rows.map(({ run, ev }) => (
+          <li key={`${run.sessionId}:${ev.evidenceId}`}>
+            <a href={`evidence://${ev.evidenceId}`}>{ev.evidenceId}</a> [{ev.domain ?? "SEC"}] {ev.subject} [
+            {ev.knownAt ?? "known_at unknown"}] {ev.sourceName} <a href={`research://${run.sessionId}`}>{run.sessionId}</a>
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
+
+function EvalCompare({
+  projection,
+  activeId,
+  onSelect,
+}: {
+  projection: HarnessProjection;
+  activeId: string | null;
+  onSelect: (id: string) => void;
+}) {
+  const runs: EvalRun[] = projection.evalRuns;
+  const results =
+    activeId === null ? [] : projection.evalScenarioResults.filter((row) => row.evalRunId === activeId);
+  const failures =
+    activeId === null ? [] : projection.failureRecords.filter((row) => row.evalRunId === activeId);
+  return (
+    <>
+      <h1>Eval compare</h1>
+      <p>
+        {runs.length} eval runs, {projection.experiments.length} experiments
+        (projections: evalRuns, evalScenarioResults, experiments)
+      </p>
+      <ul>
+        {runs.map((run) => (
+          <li key={run.evalRunId}>
+            <button onClick={() => onSelect(run.evalRunId)} aria-pressed={activeId === run.evalRunId}>
+              {run.evalRunId}
+            </button>{" "}
+            {run.model} {run.provider} passed {run.passed} failed {run.failed}
+          </li>
+        ))}
+      </ul>
+      <ul>
+        {results.map((result) => (
+          <li key={result.scenarioName}>
+            {result.passed ? "PASS" : "FAIL"} {result.scenarioName}
+            {result.violations.length === 0 ? null : <> violations: {result.violations.join("; ")}</>}
+          </li>
+        ))}
+      </ul>
+      <ul>
+        {projection.experiments.map((exp) => (
+          <li key={exp.experimentId}>
+            {exp.experimentId} {exp.beforeRunId} → {exp.afterRunId} delta {exp.deltaPassed}
+          </li>
+        ))}
+      </ul>
+      <ul>
+        {failures.map((row) => (
+          <li key={row.failureId}>
+            {row.failureId} {row.scenarioName} {row.violation}
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
+
+export function HarnessViewer({ projection, sessionId }: { projection: HarnessProjection; sessionId?: string }) {
+  const [selectedSession, setSelectedSession] = useState<string | null>(sessionId ?? null);
+  const [selectedEvalRun, setSelectedEvalRun] = useState<string | null>(null);
+  const runs = projection.researchRuns;
+  const run = selectedSession === null ? null : (runs.find((row) => row.sessionId === selectedSession) ?? null);
+  const activeEvalId = selectedEvalRun ?? projection.evalRuns[0]?.evalRunId ?? null;
+  return (
+    <main>
+      <SessionsList runs={runs} selected={selectedSession} onSelect={setSelectedSession} />
+      {selectedSession === null || run === null ? (
+        <>
+          <h1>Session timeline</h1>
+          <p>No trace persisted for this session (research://{missingSessionLabel(selectedSession ?? "")}).</p>
+        </>
+      ) : (
+        <RunTimeline run={run} />
+      )}
+      <EvidenceDrill runs={runs} />
+      <EvalCompare projection={projection} activeId={activeEvalId} onSelect={setSelectedEvalRun} />
+    </main>
+  );
+}
+
+export function HarnessSessionViewer({ sessionId }: { sessionId: string | null }) {
+  const [projection, setProjection] = useState<HarnessProjection | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (sessionId === null) {
+      return;
+    }
+    const current = sessionId;
+    let alive = true;
+    const ctrl = new AbortController();
+    async function load() {
+      try {
+        const snapshot = await fetchSnapshot(current, ctrl.signal);
+        const run = snapshotToRun(current, snapshot);
+        if (alive) {
+          if (run === null) {
+            setError("snapshot unavailable");
+          } else {
+            setProjection({
+              researchRuns: [run],
+              evalRuns: [],
+              evalScenarioResults: [],
+              experiments: [],
+              failureRecords: [],
+            });
+          }
+        }
+      } catch {
+        if (alive) {
+          setError("snapshot unavailable");
+        }
+      }
+    }
+    void load();
+    return () => {
+      alive = false;
+      ctrl.abort();
+    };
+  }, [sessionId]);
+  if (sessionId === null) {
     return (
       <main>
         <h1>Session timeline</h1>
-        <p>No trace persisted for this session (research://{missingSessionLabel(params.id)}).</p>
+        <p>No trace persisted for this session (research://unselected).</p>
       </main>
     );
   }
-  return <RunPage run={run} />;
+  if (error !== null) {
+    return (
+      <main>
+        <h1>Session timeline</h1>
+        <p>Snapshot unavailable for this session (research://{sessionId}).</p>
+      </main>
+    );
+  }
+  if (projection === null) {
+    return (
+      <main>
+        <h1>Session timeline</h1>
+        <p>Loading session (research://{sessionId}).</p>
+      </main>
+    );
+  }
+  return <HarnessViewer projection={projection} sessionId={sessionId} />;
 }

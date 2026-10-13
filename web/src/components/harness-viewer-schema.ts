@@ -1,8 +1,5 @@
-// ponytail: projection types only. The authoritative ledger stays in SQLite
-// (data/research.sqlite, data/eval_runs.sqlite); these tables are read-only
-// projections. Upgrade path: add the convex dep + defineSchema with these
-// table names when a live backend lands.
-export interface TraceJob {
+// Read-only projections from the local SQLite ledgers.
+interface TraceJob {
   jobId: string;
   parentJobId: string | null;
   jobType: string;
@@ -16,13 +13,13 @@ export interface TraceJob {
   sourceDomain?: string | null;
 }
 
-export interface TraceEvent {
+interface TraceEvent {
   seq: number;
   eventType: string;
   payload: Record<string, string | number | boolean | null>;
 }
 
-export interface GroundedClaimView {
+interface GroundedClaimView {
   text: string;
   evidenceIds: string[];
 }
@@ -36,7 +33,7 @@ export interface EvidenceView {
   domain?: string;
 }
 
-export interface CoverageArtifactView {
+interface CoverageArtifactView {
   artifactId: string;
   waveId: number;
   claimText: string;
@@ -44,7 +41,7 @@ export interface CoverageArtifactView {
   query: string;
 }
 
-export interface FinalResultView {
+interface FinalResultView {
   answer: string;
   executiveSummary: string;
   consensus: string;
@@ -123,10 +120,10 @@ export interface FailureRecord {
   violation: string;
 }
 
-export const PROJECTION_TABLES = [
-  "researchRuns",
-  "evalRuns",
-  "evalScenarioResults",
-  "experiments",
-  "failureRecords",
-] as const;
+export interface HarnessProjection {
+  researchRuns: ResearchRun[];
+  evalRuns: EvalRun[];
+  evalScenarioResults: EvalScenarioResult[];
+  experiments: Experiment[];
+  failureRecords: FailureRecord[];
+}

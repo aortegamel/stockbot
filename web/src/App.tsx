@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { HarnessSessionViewer } from "./components/harness-viewer";
 import TradingChart from "./components/trading-chart";
 import {
   WatchlistPanel,
@@ -64,6 +65,7 @@ function Strip() {
 export default function App() {
   const [selected, setSelected] = useState("NVDA");
   const [query, setQuery] = useState("");
+  const [view, setView] = useState<"terminal" | "harness">("terminal");
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [busy, setBusy] = useState(false);
@@ -211,7 +213,7 @@ export default function App() {
   async function onSend() {
     const q = input.trim();
     if (!q || busy || abortRef.current) return;
-    const prompt = `[${selected}] ${q}`;
+    const prompt = q;
     setBusy(true);
     setEvents([{ type: "agent_start", prompt }]);
     setInput("");
@@ -242,7 +244,7 @@ export default function App() {
       const response = await fetch("/api/agent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ prompt, ticker: selected }),
         signal: ctrl.signal,
       });
       if (!response.ok || !response.body) {
@@ -331,7 +333,7 @@ export default function App() {
 
       <header
         className="thinbar"
-        style={{ position: "relative", zIndex: 1, height: 46 }}
+        style={{ position: "relative", zIndex: 2, height: 46 }}
       >
         <span style={{ display: "flex", alignItems: "center", gap: 12, padding: "0 18px", height: 46, width: "100%", fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif" }}>
           <b style={{ fontSize: 18, fontWeight: 700, letterSpacing: "0.12em", color: "var(--text, #E6ECF5)" }}>NEEDLE TERMINAL</b>
@@ -350,10 +352,12 @@ export default function App() {
               style={{ fontSize: 14, padding: "4px 10px", borderRadius: 999, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(255,255,255,0.07)", color: "#E6ECF5", width: 220 }}
             />
             {hits.length > 0 && (
-              <div style={{ position: "absolute", top: 30, left: 0, right: 0, background: "#141A30", border: "1px solid rgba(255,255,255,0.12)", borderRadius: 10, overflow: "hidden", zIndex: 10 }}>
+              <div role="listbox" aria-label="Ticker suggestions" style={{ position: "absolute", top: 30, left: 0, right: 0, background: "#141A30", border: "1px solid rgba(255,255,255,0.12)", borderRadius: 10, overflow: "hidden", zIndex: 10 }}>
                 {hits.map((h) => (
                   <button
                     key={h.sym}
+                    role="option"
+                    aria-selected="false"
                     onClick={() => pick(h.sym)}
                     style={{ display: "block", width: "100%", textAlign: "left", padding: "6px 10px", background: "transparent", border: 0, color: "#E6ECF5", cursor: "pointer", fontSize: 14 }}
                   >
@@ -363,8 +367,13 @@ export default function App() {
               </div>
             )}
           </span>
-          <span style={{ marginLeft: "auto", color: "var(--muted, #93A0B8)", fontSize: 15 }}>
-            <span style={{ color: "var(--down, #EF5350)" }}>○ DELAYED</span> · {clock}
+          <span style={{ display: "inline-flex", gap: 8, marginLeft: 12 }}>
+            <button onClick={() => setView("terminal")} aria-pressed={view === "terminal"} style={{ fontSize: 14, padding: "4px 10px", borderRadius: 999, border: "1px solid rgba(255,255,255,0.12)", background: view === "terminal" ? "rgba(255,255,255,0.16)" : "transparent", color: "#E6ECF5", cursor: "pointer" }}>
+              Terminal
+            </button>
+            <button onClick={() => setView("harness")} aria-pressed={view === "harness"} style={{ fontSize: 14, padding: "4px 10px", borderRadius: 999, border: "1px solid rgba(255,255,255,0.12)", background: view === "harness" ? "rgba(255,255,255,0.16)" : "transparent", color: "#E6ECF5", cursor: "pointer" }}>
+              Harness
+            </button>
           </span>
         </span>
       </header>
@@ -376,46 +385,54 @@ export default function App() {
         <Strip />
       </div>
 
-      <div
-        style={{
-          flex: 1,
-          minHeight: 0,
-          display: "grid",
-          gridTemplateColumns: "280px 1fr 470px",
-          gap: 8,
-          padding: 8,
-          position: "relative",
-          zIndex: 1,
-        }}
-      >
-        <div style={{ overflowY: "auto", minHeight: 0, display: "flex", flexDirection: "column", gap: 8 }}>
-          <div className="glass" style={{ flexShrink: 0 }}>
-            <WatchlistPanel selected={selected} onSelect={pick} />
-          </div>
-          <div className="glass" style={{ flexShrink: 0 }}>
-            <SessionPanel sessions={sessions} sessionId={sessionId} onSelect={setSessionId} snapshot={snapshot} />
-          </div>
-          <div className="glass" style={{ flexShrink: 0 }}>
-            <JournalPanel journal={journal} seq={seq} />
+      {view === "harness" ? (
+        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 8, position: "relative", zIndex: 1 }}>
+          <div className="glass" style={{ minHeight: 0 }}>
+            <HarnessSessionViewer sessionId={sessionId} />
           </div>
         </div>
-        <div style={{ overflow: "hidden", minHeight: 0, display: "flex", flexDirection: "column", gap: 8 }}>
-          <div className="glass" style={{ flex: "1.4 1 0", minHeight: 0 }}>
-            <TradingChart sym={selected} />
-          </div>
-          <div style={{ flex: "0.9 1 0", minHeight: 0, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, overflow: "hidden" }}>
-            <div className="glass" style={{ minHeight: 0, minWidth: 0, overflow: "hidden", display: "flex" }}>
-              <FinancialsPanel sym={selected} />
+      ) : (
+        <div
+          style={{
+            flex: 1,
+            minHeight: 0,
+            display: "grid",
+            gridTemplateColumns: "280px 1fr 470px",
+            gap: 8,
+            padding: 8,
+            position: "relative",
+            zIndex: 1,
+          }}
+        >
+          <div style={{ overflowY: "auto", minHeight: 0, display: "flex", flexDirection: "column", gap: 8 }}>
+            <div className="glass" style={{ flexShrink: 0 }}>
+              <WatchlistPanel selected={selected} onSelect={pick} />
             </div>
-            <div className="glass" style={{ minHeight: 0, minWidth: 0, overflow: "hidden", display: "flex" }}>
-              <NewsPanel sym={selected} />
+            <div className="glass" style={{ flexShrink: 0 }}>
+              <SessionPanel sessions={sessions} sessionId={sessionId} onSelect={setSessionId} snapshot={snapshot} />
+            </div>
+            <div className="glass" style={{ flexShrink: 0 }}>
+              <JournalPanel journal={journal} seq={seq} />
             </div>
           </div>
+          <div style={{ overflow: "hidden", minHeight: 0, display: "flex", flexDirection: "column", gap: 8 }}>
+            <div className="glass" style={{ flex: "1.4 1 0", minHeight: 0 }}>
+              <TradingChart sym={selected} />
+            </div>
+            <div style={{ flex: "0.9 1 0", minHeight: 0, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, overflow: "hidden" }}>
+              <div className="glass" style={{ minHeight: 0, minWidth: 0, overflow: "hidden", display: "flex" }}>
+                <FinancialsPanel sym={selected} />
+              </div>
+              <div className="glass" style={{ minHeight: 0, minWidth: 0, overflow: "hidden", display: "flex" }}>
+                <NewsPanel sym={selected} />
+              </div>
+            </div>
+          </div>
+          <div className="glass" style={{ overflow: "hidden", minHeight: 0, display: "flex" }}>
+            <AIPanel events={events} input={input} setInput={setInput} onSend={() => void onSend()} sym={selected} busy={busy} debug={debug} />
+          </div>
         </div>
-        <div className="glass" style={{ overflow: "hidden", minHeight: 0, display: "flex" }}>
-          <AIPanel events={events} input={input} setInput={setInput} onSend={() => void onSend()} sym={selected} busy={busy} debug={debug} />
-        </div>
-      </div>
+      )}
 
       <footer
         style={{ position: "relative", zIndex: 1, fontSize: 13, padding: "4px 12px", display: "flex", justifyContent: "space-between", color: "rgba(235,235,245,0.78)" }}

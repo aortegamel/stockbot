@@ -2,13 +2,14 @@
 """Export trace/eval/research SQLite projections for the read-only harness viewer (stdlib only).
 
 Reads the authoritative ledgers (research.sqlite, research_traces.sqlite,
-eval_runs.sqlite) and writes apps/harness-viewer/convex/projection.ts exporting
+eval_runs.sqlite) and writes web/src/components/projection.ts exporting
 PROJECTION. Re-run after live runs; the viewer never writes and never migrates
 the ledgers. Missing/in-progress/failed/empty states are preserved explicitly.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sqlite3
 import sys
@@ -498,7 +499,7 @@ def build_projection(
 
 def render_projection_ts(projection: dict[str, object]) -> str:
     return (
-        'import type { EvalRun, EvalScenarioResult, Experiment, FailureRecord, ResearchRun } from "./schema";\n'
+        'import type { EvalRun, EvalScenarioResult, Experiment, FailureRecord, ResearchRun } from "./harness-viewer-types";\n'
         "export const PROJECTION: { researchRuns: ResearchRun[]; evalRuns: EvalRun[]; "
         "evalScenarioResults: EvalScenarioResult[]; experiments: Experiment[]; "
         "failureRecords: FailureRecord[] } = " + json.dumps(projection, indent=2, sort_keys=True) + ";\n"
@@ -513,13 +514,18 @@ def _resolve_eval_db() -> Path:
     return root / "eval_runs.sqlite"
 
 
-def _write_projection(projection: dict[str, object]) -> Path:
-    out_path = REPO_ROOT / "apps" / "harness-viewer" / "convex" / "projection.ts"
+def _write_projection(projection: dict[str, object], out_path: Path | None = None) -> Path:
+    if out_path is None:
+        out_path = REPO_ROOT / "web" / "src" / "components" / "projection.ts"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(render_projection_ts(projection), encoding="utf-8")
     return out_path
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", type=Path, help="Write the projection to this path.")
+    args = parser.parse_args(argv)
     repo = ResearchRepository()
     session_ids = _all_session_ids(_research_db())
     research_runs: list[dict[str, object]] = []
@@ -530,7 +536,7 @@ def main() -> int:
     eval_runs, scenario_results, failure_records = read_eval_db(_resolve_eval_db())
     attach_pass_fail(eval_runs, scenario_results)
     projection = build_projection(research_runs, eval_runs, scenario_results, [], failure_records)
-    out_path = _write_projection(projection)
+    out_path = _write_projection(projection, args.out)
     print(f"wrote {out_path} researchRuns={len(research_runs)} evalRuns={len(eval_runs)}")
     return 0
 
