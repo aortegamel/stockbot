@@ -491,6 +491,20 @@ def test_build_projection_and_render_shape():
     assert parsed["failureRecords"] == [{"d": 4}]
 
 
+def test_export_output_path_preserves_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setattr(exh_viewer, "REPO_ROOT", tmp_path)
+    tracked = tmp_path / "web" / "src" / "components" / "projection.ts"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("tracked projection\n", encoding="utf-8")
+    projection = exh_viewer.build_projection([], [], [], [], [])
+    preview = tmp_path / "preview" / "projection.ts"
+    assert exh_viewer._write_projection(projection, preview) == preview
+    assert preview.read_text(encoding="utf-8") == exh_viewer.render_projection_ts(projection)
+    assert tracked.read_text(encoding="utf-8") == "tracked projection\n"
+    assert exh_viewer._write_projection(projection) == tracked
+    assert tracked.read_text(encoding="utf-8") == preview.read_text(encoding="utf-8")
+
+
 # ---- slice_agent_tests.py ----
 """Scratch tests for scripts/verify_agent_scenarios.py pure + fallback paths."""
 
@@ -2082,11 +2096,16 @@ def test_export_main_mixed_runs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     monkeypatch.setattr(exh_viewer, "attach_pass_fail", _attach_none)
     monkeypatch.setattr(exh_viewer, "build_projection", _proj_p)
 
-    def _write_o_tmp(projection: dict[str, object]) -> Path:
+    seen: list[Path | None] = []
+
+    def _write_o_tmp(projection: dict[str, object], out_path: Path | None = None) -> Path:
+        seen.append(out_path)
         return tmp_path / "o.ts"
 
     monkeypatch.setattr(exh_viewer, "_write_projection", _write_o_tmp)
-    assert exh_viewer.main() == 0
+    preview = tmp_path / "preview.ts"
+    assert exh_viewer.main(["--out", str(preview)]) == 0
+    assert seen == [preview]
     assert "researchRuns=1 evalRuns=1" in capsys.readouterr().out
 
 
@@ -2249,6 +2268,58 @@ def test_live_trace_fields_reach_the_evaluator(tmp_path: Path, monkeypatch: pyte
         scenario, "answer", [], [], "researching", ("ev:1",), 1.0, 0, {**trace, "branches_covered": ["orcl"]}
     )
     assert telemetry_branches.branches_covered == ("orcl",)
+
+
+def test_live_builder_carries_existing_trace_fields_without_invention() -> None:
+    """Every supported trace field reaches EvalInput unchanged; mistyped trace stays empty."""
+    sc = _g2_scenario(name="msft-openai-bankruptcy-sec-only", as_of="2026-08-10", requires_evidence=True)
+    trace = {
+        "requires_trace": True,
+        "trace_present": True,
+        "filings_opened": ["0000789019-26-000057"],
+        "documents_opened": ["0000789019-26-000057|msft.htm"],
+        "passages_opened": ["0000789019-26-000057|msft.htm|p18"],
+        "raw_evidence_ids": ["EV-1"],
+        "navigation_evidence_ids": ["sec-search:1"],
+        "claims": [
+            {"text": "MSFT 10-K discloses the marks", "claim_type": "observed_fact", "rendered_as": "observed_fact"}
+        ],
+        "claims_by_type": {"observed_fact": 1, "inference": True},
+        "trace_searches": ["sec-search:1"],
+        "material_channels": ["azure"],
+        "branches_covered": ["coreweave"],
+        "waves": ["rs:x:1:freeze"],
+        "roles_completed": ["stockbot", "bullbot", "bearbot"],
+        "limitations": ["SEC-only policy."],
+        "coverage_complete": False,
+        "universal_absence_claims": ["SpaceX has no relationship with OpenAI"],
+        "committee_freeze_ids": ["rs:x:1:freeze"] * 3,
+    }
+    built = vas._build_success_input(sc, "answer", ["get_sec_document"], [], "researching", ("EV-1",), 1.0, 0, trace)
+    assert built.passages_opened == ("0000789019-26-000057|msft.htm|p18",)
+    assert built.claims == (("MSFT 10-K discloses the marks", "observed_fact", "observed_fact"),)
+    assert built.claims_by_type == {"observed_fact": 1}
+    assert built.trace_searches == ("sec-search:1",)
+    assert built.material_channels == ("azure",) and built.branches_covered == ("coreweave",)
+    assert built.limitations == ("SEC-only policy.",) and built.coverage_complete is False
+    assert built.universal_absence_claims == ("SpaceX has no relationship with OpenAI",)
+    fixture_trace = {**trace, "searches": ["sec-search:1"]}
+    fixture_trace.pop("trace_searches")
+    assert vas._build_success_input(
+        sc, "answer", [], [], "researching", ("EV-1",), 1.0, 0, fixture_trace
+    ).trace_searches == ("sec-search:1",)
+    bad = vas._build_success_input(
+        sc,
+        "answer",
+        [],
+        [],
+        "researching",
+        ("EV-1",),
+        1.0,
+        0,
+        {"claims": "junk", "claims_by_type": [], "coverage_complete": "yes", "trace_present": True},
+    )
+    assert bad.claims == () and bad.claims_by_type == {} and bad.coverage_complete is True
 
 
 def test_row_provenance_narrows_raw_rows():

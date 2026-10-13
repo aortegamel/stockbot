@@ -1073,6 +1073,33 @@ def test_trace_evidence_ids_must_resolve_to_recorded_evidence() -> None:
     assert evaluate(eval_input_from_fixture(_trace_fixture(trace))).violations == ("trace-raw-evidence-unresolved",)
 
 
+def test_bad_raw_typed_scoped_traces_fail_closed() -> None:
+    """An invalid raw id, untyped claim, or universal absence all fail their own gates."""
+    bad_raw = _msft_trace(("azure",), ("coreweave",), ("EV-1",))
+    bad_raw["raw_evidence_ids"] = ["EV-1", "rs:ghost:ev:404"]
+    assert evaluate(eval_input_from_fixture(_trace_fixture(bad_raw))).violations == ("trace-raw-evidence-unresolved",)
+    untyped = _msft_trace(("azure",), ("coreweave",), ("EV-1",))
+    untyped["claims"] = [{"text": "MSFT 10-K discloses the marks", "claim_type": "", "rendered_as": ""}]
+    assert evaluate(eval_input_from_fixture(_trace_fixture(untyped))).violations == ("claim-without-type",)
+    scoped_bad = _msft_trace(("azure",), ("coreweave",), ("EV-1",))
+    scoped_bad["universal_absence_claims"] = ["No relationship exists between Microsoft and OpenAI"]
+    assert "overconfident-absence" in evaluate(eval_input_from_fixture(_trace_fixture(scoped_bad))).violations
+
+
+def test_valid_trace_preserves_unknown_and_scoped_absence() -> None:
+    """Unknown claims stay typed; searched-scope absence is not an overconfident claim."""
+    valid = _msft_trace(("azure",), ("coreweave",), ("EV-1",))
+    valid["claims"] = [
+        {"text": "MSFT 10-K discloses the marks", "claim_type": "observed_fact", "rendered_as": "observed_fact"},
+        {"text": "Private loan seniority is not disclosed", "claim_type": "unknown", "rendered_as": ""},
+    ]
+    valid["claims_by_type"] = {"observed_fact": 1, "unknown": 1}
+    valid["limitations"] = ["SEC-only policy: no disclosure was located within the searched SEC scope."]
+    outcome = eval_input_from_fixture(_trace_fixture(valid))
+    assert outcome.claims[1][1] == "unknown" and outcome.universal_absence_claims == ()
+    assert evaluate(outcome).passed
+
+
 def test_trace_requires_documents_and_filings() -> None:
     from app.research.evals.evaluators import EvalInput as _In
 
@@ -1299,3 +1326,98 @@ def test_multiwave_committee_freezes_are_not_a_disagreement() -> None:
     assert "committee-different-freeze" not in evaluate(two_waves).violations
     mixed_round = EvalInput(scenario_name="x", answer_text="a", committee_freeze_ids=("F1", "F2", "F1"))
     assert "committee-different-freeze" in evaluate(mixed_round).violations
+
+
+def test_promotion_derives_raw_declared_scoped_unknown_from_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A promoted durable run carries ledger trace, declared types, and unknown preservation."""
+    from app.research import service as svc
+    from app.research.evals.evaluators import eval_input_from_fixture, evaluate
+    from app.research.evals.regression import load_fixture, promote_to_fixture
+    from app.research.repository import ResearchRepository
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _gs_sid(repo)
+    eid = f"{sid}:ev:1"
+    svc.record_evidence(sid, src, _gs_item(eid), repo=repo)
+    _gs_submit(src, eid, repo)
+    fid = str(svc.freeze_session(sid, 1, repo=repo)["freeze_id"])
+    for role in ("stockbot", "bullbot", "bearbot"):
+        jid = str(svc.start_job(sid, role, repo=repo, wave_id=1)["job_id"])
+        svc.record_committee_analysis(sid, jid, role, _gs_envelope(eid), repo=repo)
+    svc.finalize_session(
+        sid,
+        "GS exposure is filing-backed.",
+        [{"text": "GS 10-K discloses OpenAI-linked exposure", "claim_type": "observed_fact", "evidence_ids": [eid]}],
+        repo=repo,
+    )
+    fixtures = tmp_path / "fixtures"
+    promote_to_fixture(session_id=sid, scenario_name="gs-openai-sec-only", fixtures_dir=fixtures, repo=repo)
+    promoted = load_fixture("gs-openai-sec-only", fixtures)
+    assert promoted["question"] == _GS_Q
+    assert promoted["evidence_ids"] == [eid] and promoted["known_ats"] == ["2025-05-01T00:00:00+00:00"]
+    assert promoted["answer_excerpt"] == "GS exposure is filing-backed."
+    assert promoted["freeze_before"] == fid and promoted["freeze_after"] == fid
+    assert promoted["trace"]["filings_opened"] == [_GS_ACC]
+    assert promoted["trace"]["documents_opened"] == [f"{_GS_ACC}|{_GS_DOC}"]
+    assert promoted["trace"]["raw_evidence_ids"] == [eid]
+    assert promoted["trace"]["waves"] == [fid] and promoted["trace"]["committee_freeze_ids"] == [fid] * 3
+    assert promoted["trace"]["roles_completed"] == ["stockbot", "bullbot", "bearbot"]
+    assert promoted["trace"]["navigation_evidence_ids"] == []
+    assert promoted["trace"]["claims"][0]["claim_type"] == "observed_fact"
+    assert promoted["trace"]["claims_by_type"] == {"observed_fact": 1, "unknown": 1}
+    unknown = [claim for claim in promoted["trace"]["claims"] if claim["claim_type"] == "unknown"]
+    assert [claim["text"] for claim in unknown] == ["OpenAI private loan terms"]
+    assert repo.get_freeze(fid)["evidence_ids"] == [eid]
+    assert evaluate(eval_input_from_fixture(promoted)).passed
+
+
+def test_promotion_rejects_absent_session_and_bad_trace_shapes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Absent sessions reject; bad raw/typed/scoped trace fails its own invariant."""
+    from app.research import service as svc
+    from app.research.evals.evaluators import eval_input_from_fixture, evaluate
+    from app.research.evals.regression import load_fixture, promote_to_fixture
+    from app.research.repository import ResearchRepository
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    with pytest.raises(ValueError, match="unknown session_id"):
+        promote_to_fixture(session_id="rs:missing", scenario_name="gs-openai-sec-only", repo=repo)
+    sid, src = _gs_sid(repo)
+    eid = f"{sid}:ev:1"
+    svc.record_evidence(sid, src, _gs_item(eid), repo=repo)
+    _gs_submit(src, eid, repo)
+    svc.freeze_session(sid, 1, repo=repo)
+    with pytest.raises(ValueError, match="unknown session_id"):
+        promote_to_fixture(session_id="rs:missing", scenario_name="gs-openai-sec-only", repo=repo)
+    promote_to_fixture(session_id=sid, scenario_name="gs-openai-sec-only", fixtures_dir=tmp_path, repo=repo)
+    promoted = load_fixture("gs-openai-sec-only", tmp_path)
+    raw = list(promoted["trace"]["raw_evidence_ids"])
+    promoted["trace"]["raw_evidence_ids"] = [*raw, "sec-search:gs:9", "rs:ghost:ev:99"]
+    outcome = eval_input_from_fixture(promoted)
+    assert "trace-raw-evidence-unresolved" in evaluate(outcome).violations
+
+
+def test_promotion_rejects_undeclared_rendered_and_unknown_raw_ids() -> None:
+    """A raw search id, undeclared claim type, and unknown raw id each fail their own invariant."""
+    trace = _msft_trace(("azure",), ("coreweave",), ("EV-1",))
+    trace["raw_evidence_ids"] = ["EV-1", "sec-search:msft:1", "rs:ghost:ev:99"]
+    trace["claims"] = [
+        {"text": "MSFT 10-K discloses the marks", "claim_type": "", "rendered_as": "observed_fact"},
+        {"text": "Private loan seniority is not disclosed", "claim_type": "unknown", "rendered_as": ""},
+    ]
+    outcome = eval_input_from_fixture(_trace_fixture(trace))
+    assert outcome.claims[1][1] == "unknown"
+    assert "trace-raw-evidence-unresolved" in evaluate(outcome).violations
+    assert "claim-without-type" in evaluate(outcome).violations
+
+
+def test_promotion_scoped_absence_is_not_universal_claim() -> None:
+    """Coverage-artifact scope stays in limitations; it never becomes a universal absence claim."""
+    trace = _msft_trace(("azure",), ("coreweave",), ("EV-1",))
+    trace["limitations"] = ["SEC-only policy: no disclosure was located within the searched SEC scope."]
+    outcome = eval_input_from_fixture(_trace_fixture(trace))
+    assert outcome.universal_absence_claims == ()
+    assert evaluate(outcome).passed

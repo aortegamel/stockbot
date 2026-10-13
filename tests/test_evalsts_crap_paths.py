@@ -1,7 +1,7 @@
 """EvalsTsFix slice gates: fixture/validator branches, eval persistence, SEC parsing-adjacent error paths.
 
 Owned paths only: evals/** + app/research/evals/** + app/research/synthesis/**
-+ freeze/models/journal/evidence/session + apps/harness-viewer (TS covered by CC<=10 note).
++ freeze/models/journal/evidence/session + web harness viewer (TS covered by CC<=10 note).
 Covers uncovered-line branches verbatim: every test below hits a line that was
 DA=0 in coverage-python.lcov (validators, fixture load errors, eval store,
 wave coercions, ingest/journal/freeze/model guards, committee/final merges).
@@ -264,14 +264,54 @@ def test_validator_timeout_closure_passes(tmp_path: Path):
     assert path.name == "timeout-model-call-failed-resume.json"
 
 
-def test_validator_promote_and_list(tmp_path: Path):
+def test_validator_promote_reads_durable_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import tests.research_source_seam as seam
+    from app.research import service as svc
+    from app.research.repository import ResearchRepository
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    seam.install(monkeypatch)
+    repo = ResearchRepository()
+    sid = svc.create_research("q?", "o", as_of="2025-06-30T00:00:00+00:00", repo=repo)
+    src = repo.list_jobs(sid)[0].job_id
+    passage = "GS 10-K discloses OpenAI-linked exposure."
+    eid = f"{sid}:ev:1"
+    svc.record_evidence(
+        sid,
+        src,
+        {
+            "evidence_id": eid,
+            "wave_id": 1,
+            "content": "c-" + eid,
+            "claim_text": passage,
+            "subject": "GS",
+            "source_name": "SEC",
+            "source_uri": "https://www.sec.gov/Archives/edgar/data/886982/000088698226000001/gs-10q-20260331.htm",
+            "source_record_id": "0000886982-26-000001",
+            "document_name": "gs-10q-20260331.htm",
+            "matching_passage": passage,
+            "source_handle": seam.handle_for(passage, accession="0000886982-26-000001", document="gs-10q-20260331.htm"),
+            "known_at": "2025-06-29T00:00:00+00:00",
+        },
+        repo=repo,
+    )
     assert _reg.list_fixtures(tmp_path) == []
-    _reg.promote_to_fixture(session_id="rs:x", scenario_name="pit-knowable-by-2025-06-30", fixtures_dir=tmp_path)
+    path = _reg.promote_to_fixture(
+        session_id=sid, scenario_name="pit-knowable-by-2025-06-30", fixtures_dir=tmp_path, repo=repo
+    )
     assert _reg.list_fixtures(tmp_path) == ["pit-knowable-by-2025-06-30"]
+    assert path.name == "pit-knowable-by-2025-06-30.json"
+    promoted = _reg.load_fixture("pit-knowable-by-2025-06-30", tmp_path)
+    assert promoted["trace"]["filings_opened"] == ["0000886982-26-000001"]
+    assert promoted["trace"]["documents_opened"] == ["0000886982-26-000001|gs-10q-20260331.htm"]
+    assert promoted["trace"]["raw_evidence_ids"] == []
+    assert promoted["evidence_ids"] == [] and promoted["known_ats"] == ["2025-05-01T00:00:00+00:00"]
     assert (
-        _reg.build_fixture(session_id="rs:x", scenario_name="pit-knowable-by-2025-06-30", question="qq")["question"]
+        _reg.build_fixture(session_id=sid, scenario_name="pit-knowable-by-2025-06-30", question="qq")["question"]
         == "qq"
     )
+    with pytest.raises(ValueError, match="unknown session_id"):
+        _reg.promote_to_fixture(session_id="rs:missing", scenario_name="pit-knowable-by-2025-06-30", repo=repo)
 
 
 def test_fixture_load_errors(tmp_path: Path):
@@ -384,7 +424,8 @@ def test_compare_experiments_noop_guard(tmp_path: Path):
 
 
 def test_outcomes_fixtures_and_eval_input(tmp_path: Path):
-    _reg.promote_to_fixture(session_id="rs:o", scenario_name="pit-knowable-by-2025-06-30", fixtures_dir=tmp_path)
+    saved = _reg.build_fixture(session_id="rs:o", scenario_name="pit-knowable-by-2025-06-30")
+    _reg.save_fixture(saved, tmp_path)
     outs = _ev.outcomes_from_fixtures(["pit-knowable-by-2025-06-30"], tmp_path)
     assert len(outs) == 1 and outs[0].scenario_name == "pit-knowable-by-2025-06-30"
     (tmp_path / "pit-knowable-by-2025-06-30.json").write_text("{}", encoding="utf-8")

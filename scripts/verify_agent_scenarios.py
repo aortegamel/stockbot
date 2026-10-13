@@ -329,6 +329,46 @@ def _job_failed(job: Job) -> bool:
     return job.status in _FAILED_JOB_STATUSES
 
 
+def _trace_claims(trace: Mapping[str, object]) -> tuple[tuple[str, str, str], ...]:
+    """Validated (text, declared type, rendered type) claims; undeclared types stay ""."""
+    raw = trace.get("claims")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    claims: list[tuple[str, str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        text, declared, rendered = item.get("text"), item.get("claim_type"), item.get("rendered_as")
+        claims.append(
+            (
+                text if isinstance(text, str) else "",
+                declared if isinstance(declared, str) else "",
+                rendered if isinstance(rendered, str) else "",
+            )
+        )
+    return tuple(claims)
+
+
+def _trace_counts(trace: Mapping[str, object]) -> dict[str, int]:
+    """Validated claim-type counts (mistyped entries dropped)."""
+    raw = trace.get("claims_by_type")
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool)}
+
+
+def _trace_flag(trace: Mapping[str, object], key: str, default: bool) -> bool:
+    """One optional trace bool (default when absent/mistyped)."""
+    raw = trace.get(key)
+    return raw if isinstance(raw, bool) else default
+
+
+def _trace_searches(trace: Mapping[str, object]) -> tuple[str, ...]:
+    """Trace searches: live "trace_searches" or fixture "searches" key."""
+    found = _trace_strs(trace, "trace_searches")
+    return found if found else _trace_strs(trace, "searches")
+
+
 def _trace_strs(trace: Mapping[str, object], key: str) -> tuple[str, ...]:
     """String tuple from one live trace record; non-sequence/non-string entries are dropped."""
     raw = trace.get(key)
@@ -434,11 +474,19 @@ def _build_success_input(
         trace_present=bool(live.get("trace_present")),
         filings_opened=_trace_strs(live, "filings_opened"),
         documents_opened=_trace_strs(live, "documents_opened"),
+        passages_opened=_trace_strs(live, "passages_opened"),
         raw_evidence_ids=_trace_strs(live, "raw_evidence_ids"),
         navigation_evidence_ids=_trace_strs(live, "navigation_evidence_ids"),
+        claims=_trace_claims(live),
+        claims_by_type=_trace_counts(live),
+        trace_searches=_trace_searches(live),
+        material_channels=_trace_strs(live, "material_channels"),
         branches_covered=_trace_strs(live, "branches_covered"),
         waves=_trace_strs(live, "waves"),
         roles_completed=_trace_strs(live, "roles_completed"),
+        limitations=_trace_strs(live, "limitations"),
+        coverage_complete=_trace_flag(live, "coverage_complete", True),
+        universal_absence_claims=_trace_strs(live, "universal_absence_claims"),
         committee_freeze_ids=_trace_strs(live, "committee_freeze_ids"),
     )
 

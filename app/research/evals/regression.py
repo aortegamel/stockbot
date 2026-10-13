@@ -8,10 +8,12 @@ evals/fixtures/agent_scenarios/<scenario-name>.json (indent=2 JSON).
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict
 
 from app.research.evals.scenarios import get_scenario
+from app.research.models import JSONValue
 
 FIXTURE_FORMAT = "agent-scenario-fixture/v1"
 
@@ -164,6 +166,135 @@ def default_fixtures_dir() -> Path:
     return _repo_root() / "evals" / "fixtures" / "agent_scenarios"
 
 
+def _ledger_strs(rows: object, key: str) -> list[str]:
+    """Non-empty strings under one final/synthesis key (missing sections stay empty)."""
+    if not isinstance(rows, dict):
+        return []
+    raw = rows.get(key)
+    if not isinstance(raw, list):
+        return []
+    return [item.strip() for item in raw if isinstance(item, str) and item.strip()]
+
+
+def _ledger_claims(final: object) -> list[FixtureClaim]:
+    """Declared claims from persisted final claims (explicit type only, never inferred)."""
+    if not isinstance(final, dict):
+        return []
+    raw = final.get("claims")
+    if not isinstance(raw, list):
+        return []
+    claims: list[FixtureClaim] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        declared = item.get("claim_type")
+        rendered = item.get("rendered_as")
+        claims.append(
+            FixtureClaim(
+                text=text,
+                claim_type=declared if isinstance(declared, str) else "",
+                rendered_as=rendered if isinstance(rendered, str) else "",
+            )
+        )
+    return claims
+
+
+def _ledger_counts(claims: list[FixtureClaim]) -> dict[str, int]:
+    """Declared-type counts from persisted claims (undeclared entries stay out of the map)."""
+    counts: dict[str, int] = {}
+    for claim in claims:
+        if claim["claim_type"]:
+            counts[claim["claim_type"]] = counts.get(claim["claim_type"], 0) + 1
+    return counts
+
+
+def _ledger_eids(rows: list[dict[str, object]], kind: str) -> list[str]:
+    """Ledger evidence ids of one record kind (discovery rows are navigation)."""
+    ids: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("record_kind") != kind:
+            continue
+        eid = row.get("evidence_id")
+        if isinstance(eid, str) and eid and eid not in ids:
+            ids.append(eid)
+    return ids
+
+
+def _sec_provenance_ids(rows: list[dict[str, object]]) -> tuple[list[str], list[str]]:
+    """(accessions, accession|document entries) of sec_source rows, in first-seen order."""
+    accessions: list[str] = []
+    documents: list[str] = []
+    for row in rows:
+        provenance = row.get("provenance")
+        if not isinstance(provenance, dict) or provenance.get("kind") != "sec_source":
+            continue
+        accession = provenance.get("accession_no")
+        if isinstance(accession, str) and accession and accession not in accessions:
+            accessions.append(accession)
+        document = provenance.get("document_name")
+        if isinstance(document, str) and isinstance(accession, str) and accession:
+            entry = f"{accession}|{document}"
+            if entry not in documents:
+                documents.append(entry)
+    return accessions, documents
+
+
+def _cited_present_ids(final_dict: Mapping[str, object], rows: list[dict[str, object]]) -> list[str]:
+    """Final-record filing references that the ledger actually carries."""
+    refs = final_dict.get("filing_references")
+    cited: list[str] = [item for item in refs if isinstance(item, str) and item] if isinstance(refs, list) else []
+    present = {row.get("evidence_id") for row in rows}
+    return [item for item in cited if item in present]
+
+
+def _freeze_ids_of(freeze_ids: tuple[str, ...], freeze_id: str | None) -> list[str]:
+    """Committee freeze ids when given, else the single freeze id, else none."""
+    if freeze_ids:
+        return [fid for fid in freeze_ids if isinstance(fid, str) and fid]
+    return [freeze_id] if freeze_id else []
+
+
+def _session_trace(
+    final: object,
+    evidence_rows: object,
+    *,
+    freeze_ids: tuple[str, ...] = (),
+    freeze_id: str | None = None,
+    committee_ids: tuple[str, ...] = (),
+    roles: tuple[str, ...] = (),
+) -> FixtureTrace:
+    """Trace fields derivable from persisted final/ledger rows (missing sections stay empty)."""
+    rows: list[dict[str, object]] = []
+    if isinstance(evidence_rows, list):
+        rows = [row for row in evidence_rows if isinstance(row, dict)]
+    final_dict = final if isinstance(final, dict) else {}
+    accessions, documents = _sec_provenance_ids(rows)
+    raw_ids = _cited_present_ids(final_dict, rows)
+    claims = _ledger_claims(final)
+    navigation = [eid for eid in _ledger_eids(rows, "discovery") if eid not in raw_ids]
+    return FixtureTrace(
+        filings_opened=accessions,
+        documents_opened=documents,
+        passages_opened=[],
+        raw_evidence_ids=raw_ids,
+        navigation_evidence_ids=navigation,
+        claims=claims,
+        claims_by_type=_ledger_counts(claims),
+        waves=_freeze_ids_of(freeze_ids, freeze_id),
+        searches=[],
+        committee_freeze_ids=list(committee_ids),
+        roles_completed=list(roles),
+        limitations=_ledger_strs(final_dict, "limitations"),
+        coverage_complete=False,
+        universal_absence_claims=[],
+        material_channels=[],
+        branches_covered=[],
+    )
+
+
 def build_fixture(
     *,
     session_id: str,
@@ -229,22 +360,65 @@ def promote_to_fixture(
     scenario_name: str,
     question: str | None = None,
     as_of: str | None = None,
-    tool_calls: tuple[str, ...] = (),
-    evidence_ids: tuple[str, ...] = (),
-    known_ats: tuple[str, ...] = (),
-    answer_excerpt: str = "",
+    tool_calls: tuple[str, ...] | None = None,
+    evidence_ids: tuple[str, ...] | None = None,
+    known_ats: tuple[str, ...] | None = None,
+    answer_excerpt: str | None = None,
     fixtures_dir: Path | None = None,
+    repo: object | None = None,
 ) -> Path:
-    """Validate the scenario name, build the fixture, and save it."""
+    """Promote one durable session: carry its ledger trace into the fixture."""
+    from app.research.repository import ResearchRepository
+
+    store = repo if isinstance(repo, ResearchRepository) else ResearchRepository()
+    try:
+        found = store.get_session(session_id)
+    except KeyError:
+        raise ValueError(f"promote: unknown session_id: {session_id!r}") from None
+    final: dict[str, JSONValue] = found.final_result if isinstance(found.final_result, dict) else {}
+    rows = store.list_evidence(session_id)
+    jobs = store.list_jobs(session_id)
+    freeze_id = final.get("freeze_id") if isinstance(final, dict) else None
+    freeze_ids = tuple(found.freeze_ids)
+    committee: list[str] = []
+    for entry in found.committee_runs:
+        if isinstance(entry, dict):
+            fid = entry.get("freeze_id")
+            got = entry.get("jobs")
+            if isinstance(fid, str) and isinstance(got, list):
+                committee.extend([fid] * sum(1 for jid in got if isinstance(jid, str)))
+    known = [str(row.get("known_at")) for row in rows if isinstance(row, dict) and isinstance(row.get("known_at"), str)]
+    completed = [job.job_type for job in jobs if job.status == "completed"]
+    roles = tuple(role for role in ("stockbot", "bullbot", "bearbot") if role in completed)
+    seen_tools: list[str] = []
+    for job in jobs:
+        tool = (job.diagnostics or {}).get("tool_name") if isinstance(job.diagnostics, dict) else None
+        name = tool if isinstance(tool, str) and tool else job.job_type
+        if name not in seen_tools:
+            seen_tools.append(name)
+    final_answer = final.get("answer") if isinstance(final, dict) else None
+    derived = _session_trace(
+        final,
+        rows,
+        freeze_ids=freeze_ids,
+        freeze_id=freeze_id if isinstance(freeze_id, str) else None,
+        committee_ids=tuple(committee) or freeze_ids,
+        roles=roles,
+    )
     fixture = build_fixture(
         session_id=session_id,
         scenario_name=scenario_name,
-        question=question,
-        as_of=as_of,
-        tool_calls=tool_calls,
-        evidence_ids=evidence_ids,
-        known_ats=known_ats,
-        answer_excerpt=answer_excerpt,
+        question=question if question is not None else (found.query or None),
+        as_of=as_of if as_of is not None else None,
+        tool_calls=tuple(tool_calls) if tool_calls is not None else tuple(seen_tools),
+        evidence_ids=tuple(evidence_ids) if evidence_ids is not None else tuple(derived["raw_evidence_ids"]),
+        known_ats=tuple(known_ats) if known_ats is not None else tuple(known),
+        answer_excerpt=answer_excerpt
+        if answer_excerpt is not None
+        else (final_answer if isinstance(final_answer, str) else ""),
+        freeze_before=freeze_ids[-1] if freeze_ids else None,
+        freeze_after=freeze_ids[-1] if freeze_ids else None,
+        trace=derived,
     )
     return save_fixture(fixture, fixtures_dir)
 

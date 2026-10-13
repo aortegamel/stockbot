@@ -2,9 +2,8 @@
 """Opt-in live golden scenario: real SEC + FINRA + Exa only (never CI).
 
 Runs one golden question through the production kernel path and exports the
-read-only harness-viewer projection. Requires reachable credentials:
-SEC_EDGAR_IDENTITY, FINRA_CLIENT_ID/SECRET, EXA_ENABLED=1 + EXA_API_KEY, and a
-reachable credentials (same prerequisites as scripts/verify_agent_scenarios.py).
+read-only web projection. Requires reachable credentials (same prerequisites
+as scripts/verify_agent_scenarios.py):
 
 This script performs real network calls and is NEVER run by CI. Invoke only:
   HEDGEFUND_LIVE=1 venv/bin/python scripts/verify_hedgefund_live.py [--scenario NAME] [--json]
@@ -266,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         import scripts.export_harness_viewer as viewer
 
-        viewer.main()
+        viewer.main([])
     except Exception as exc:  # noqa: BLE001 - export is best-effort after the verdict
         print(f"viewer export failed: {exc}", file=sys.stderr)
     if args.json:

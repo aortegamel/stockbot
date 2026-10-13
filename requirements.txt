@@ -6,6 +6,8 @@ requests==2.34.2
 # httpx2 (not httpx): the code's real direct import is httpx2 (app/robinhood/client.py), required by mcp==2.1.0; plain httpx is unused.
 httpx2==2.12.0
 pytest==9.1.1
+# Real-browser offline regressions use the local Chromium and ChromeDriver.
+selenium==4.51.0
 mcp==2.1.0
 pyrefly==1.2.0
 PyYAML==6.0.3
