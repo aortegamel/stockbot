@@ -422,6 +422,9 @@ def get_news(sym: str, limit: int = 12) -> dict[str, object]:
     key = f"news:{ticker}"
     hit = cache.get(key, ttl=_TTL_NEWS)
     if isinstance(hit, dict):
+        items = hit.get("items")
+        if isinstance(items, list):
+            return dict(hit, items=items[:limit])
         return hit
     q = urllib.parse.quote(f"{ticker} stock")
     feeds = [
@@ -463,6 +466,9 @@ def get_filings(sym: str, limit: int = 10) -> dict[str, object]:
     key = f"filings:{cik}"
     hit = cache.get(key, ttl=_TTL_FILINGS)
     if isinstance(hit, dict):
+        items = hit.get("items")
+        if isinstance(items, list):
+            return dict(hit, sym=ticker, items=items[:limit])
         return dict(hit, sym=ticker)
     try:
         url = _SEC_ATOM_URL.format(cik=f"{cik:010d}", n=max(1, min(limit, 40)))

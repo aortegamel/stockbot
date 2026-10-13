@@ -1,5 +1,10 @@
 """Configuration validation stays aligned with the documented .env template."""
 
+import importlib.util
+import os
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
 import pytest
 
 from app import config
@@ -61,3 +66,91 @@ def test_broker_enabled_defaults_false(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("BROKER_ENABLED", raising=False)
     monkeypatch.delenv("ROBINHOOD_ENABLED", raising=False)
     assert config.broker_enabled() is False
+
+
+def _root_and_foreign_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_env: str) -> None:
+    """Point config at a fixture repo root and run from a foreign cwd with its own .env."""
+    root = tmp_path / "repo"
+    foreign = tmp_path / "elsewhere"
+    root.mkdir()
+    foreign.mkdir()
+    (root / ".env").write_text(root_env)
+    (foreign / ".env").write_text("OPENCODE_MODEL=cwd-model\nSTOCKBOT_ENVTEST_CWD_ONLY=leaked\nPORT=9999\n")
+    monkeypatch.setattr(config, "REPO_ROOT", root)
+    monkeypatch.chdir(foreign)
+
+
+def _absent(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    # setenv first so monkeypatch restores the original state after the loader writes it.
+    monkeypatch.setenv(name, "")
+    monkeypatch.delenv(name)
+
+
+def test_root_dotenv_replaces_stale_inherited_opencode_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _root_and_foreign_cwd(
+        tmp_path,
+        monkeypatch,
+        "OPENCODE_API_KEY=file-key\nOPENCODE_URL=https://file.invalid/v1\nOPENCODE_MODEL=file-model\n",
+    )
+    monkeypatch.setenv("OPENCODE_API_KEY", "stale-key")
+    monkeypatch.setenv("OPENCODE_URL", "https://stale.invalid/v1")
+    monkeypatch.setenv("OPENCODE_MODEL", "stale-model")
+    monkeypatch.setenv("STOCKBOT_ENVTEST_INHERITED", "kept")
+    _absent(monkeypatch, "STOCKBOT_ENVTEST_CWD_ONLY")
+
+    config._load_root_dotenv()
+
+    assert os.environ["OPENCODE_API_KEY"] == "file-key"
+    assert os.environ["OPENCODE_URL"] == "https://file.invalid/v1"
+    assert os.environ["OPENCODE_MODEL"] == "file-model"
+    assert os.environ["STOCKBOT_ENVTEST_INHERITED"] == "kept"
+    assert "STOCKBOT_ENVTEST_CWD_ONLY" not in os.environ
+
+
+def test_root_dotenv_keeps_inherited_port(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _root_and_foreign_cwd(tmp_path, monkeypatch, "PORT=3000\n")
+    monkeypatch.setenv("PORT", "3101")
+
+    config._load_root_dotenv()
+
+    assert os.environ["PORT"] == "3101"
+
+
+def test_root_dotenv_sets_port_when_not_inherited(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _root_and_foreign_cwd(tmp_path, monkeypatch, "PORT=3000\n")
+    _absent(monkeypatch, "PORT")
+
+    config._load_root_dotenv()
+
+    assert os.environ["PORT"] == "3000"
+
+
+@pytest.mark.parametrize(("line", "expected"), (("OPENCODE_API_KEY=\n", ""), ("OPENCODE_API_KEY\n", "stale-key")))
+def test_root_dotenv_empty_value_clears_and_bare_name_keeps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, line: str, expected: str
+):
+    _root_and_foreign_cwd(tmp_path, monkeypatch, line)
+    monkeypatch.setenv("OPENCODE_API_KEY", "stale-key")
+
+    config._load_root_dotenv()
+
+    assert os.environ["OPENCODE_API_KEY"] == expected
+
+
+def test_fresh_config_import_loads_root_dotenv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Executing app/config.py as if it lived under a fixture repo loads that repo's .env at import."""
+    _root_and_foreign_cwd(tmp_path, monkeypatch, "OPENCODE_MODEL=file-model\n")
+    monkeypatch.setenv("OPENCODE_MODEL", "stale-model")
+    _absent(monkeypatch, "STOCKBOT_ENVTEST_CWD_ONLY")
+    name = "app._config_import_probe"
+    # Real source, fixture location: __file__ (and so REPO_ROOT) points at tmp_path/repo.
+    loader = SourceFileLoader(name, config.__file__)
+    spec = importlib.util.spec_from_file_location(name, tmp_path / "repo" / "app" / "config.py", loader=loader)
+    assert spec is not None
+    probe = importlib.util.module_from_spec(spec)
+
+    loader.exec_module(probe)
+
+    assert probe.REPO_ROOT == (tmp_path / "repo").resolve()
+    assert os.environ["OPENCODE_MODEL"] == "file-model"
+    assert "STOCKBOT_ENVTEST_CWD_ONLY" not in os.environ

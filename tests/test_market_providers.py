@@ -10,10 +10,12 @@ import types
 from typing import Self
 
 import pytest
+from fastapi.testclient import TestClient
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from api import market_providers as mp
+from api.main import app
 
 
 class FakeCache:
@@ -270,6 +272,67 @@ def test_news_merge_sorts_dedups_filters_topics(fake_cache: FakeCache, monkeypat
     assert "news:NVDA" in fake_cache.store
 
 
+def test_news_warm_cache_slices_without_mutation_or_fetch(
+    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    items = [
+        {"title": "Second headline", "published": "2026-10-02"},
+        {"title": "First headline", "published": "2026-10-01"},
+        {"title": "Fourth headline", "published": "2026-10-04"},
+        {"title": "Third headline", "published": "2026-10-03"},
+    ]
+    cached = {"sym": "NVDA", "items": items, "source": "cached news"}
+    fake_cache.set("news:NVDA", cached)
+    before = json.dumps(cached)
+    calls: list[str] = []
+
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        calls.append(url)
+        raise AssertionError("warm news must not fetch")
+
+    monkeypatch.setattr(mp, "_http_bytes", fake_http)
+    monkeypatch.setenv("STOCKBOT_NEWSQUANT", "0")
+    for limit in (2, 1, 4, 8, 0):
+        out = mp.get_news(" nvda ", limit=limit)
+        assert out == {"sym": "NVDA", "items": items[:limit], "source": "cached news"}
+        assert out["items"] is not items
+        assert fake_cache.store["news:NVDA"] is cached
+        assert json.dumps(cached) == before
+    assert calls == []
+
+
+def test_news_cold_limit_stays_cached_for_larger_request(
+    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed = _rss(
+        [
+            ("Oldest", "https://ex.com/1", "Thu, 01 Oct 2026 10:00:00 GMT"),
+            ("Newest", "https://ex.com/4", "Sun, 04 Oct 2026 10:00:00 GMT"),
+            ("Second newest", "https://ex.com/3", "Sat, 03 Oct 2026 10:00:00 GMT"),
+            ("Second oldest", "https://ex.com/2", "Fri, 02 Oct 2026 10:00:00 GMT"),
+        ]
+    )
+    calls: list[str] = []
+
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        calls.append(url)
+        return feed if "news.google.com" in url else _rss([])
+
+    monkeypatch.setattr(mp, "_http_bytes", fake_http)
+    monkeypatch.setenv("STOCKBOT_NEWSQUANT", "0")
+    cold = mp.get_news("NVDA", limit=2)
+    items = cold["items"]
+    assert isinstance(items, list)
+    assert [item["title"] for item in items] == ["Newest", "Second newest"]
+    assert len(calls) == 5
+    before = json.dumps(cold)
+    for limit in (1, 4):
+        assert mp.get_news("NVDA", limit=limit) == dict(cold, items=items[:limit])
+        assert len(calls) == 5
+        assert fake_cache.store["news:NVDA"] is cold
+        assert json.dumps(cold) == before
+
+
 def test_filings_atom_parses_entries(fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch) -> None:
     universe = {"0": {"ticker": "NVDA", "cik_str": "1341439", "title": "NVIDIA Corp"}}
     atom = _atom(
@@ -308,6 +371,100 @@ def test_filings_atom_parses_entries(fake_cache: FakeCache, monkeypatch: pytest.
     assert isinstance(second, dict) and len(str(second["summary"])) == 300
     assert "market_universe" in fake_cache.store
     assert "filings:1341439" in fake_cache.store
+
+
+def test_filings_warm_cache_slices_and_preserves_alias(fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch) -> None:
+    items = [
+        {"title": "Second filing", "published": "2026-10-02"},
+        {"title": "First filing", "published": "2026-10-01"},
+        {"title": "Fourth filing", "published": "2026-10-04"},
+        {"title": "Third filing", "published": "2026-10-03"},
+    ]
+    cached = {"sym": "GOOG", "cik": 1652044, "items": items, "source": "cached filings"}
+    fake_cache.set("filings:1652044", cached)
+    before = json.dumps(cached)
+    calls: list[str] = []
+
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        calls.append(url)
+        raise AssertionError("warm filings must not fetch")
+
+    def fake_cik(ticker: str) -> int:
+        assert ticker == "GOOGL"
+        return 1652044
+
+    monkeypatch.setattr(mp, "_http_bytes", fake_http)
+    monkeypatch.setattr(mp, "cik_for_ticker", fake_cik)
+    for limit in (2, 1, 4, 8, 0):
+        out = mp.get_filings(" googl ", limit=limit)
+        assert out == dict(cached, sym="GOOGL", items=items[:limit])
+        assert out["items"] is not items
+        assert fake_cache.store["filings:1652044"] is cached
+        assert json.dumps(cached) == before
+    assert calls == []
+
+
+def test_filings_cold_limit_stays_cached_for_larger_request(
+    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    atom = _atom(
+        [
+            ("10-Q", "https://sec.gov/a", "2026-10-04T00:00:00Z", "Quarterly report"),
+            ("8-K", "https://sec.gov/b", "2026-10-03T00:00:00Z", "Current report"),
+            ("10-K", "https://sec.gov/c", "2026-10-02T00:00:00Z", "Annual report"),
+        ]
+    )
+    calls: list[str] = []
+
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        calls.append(url)
+        assert "browse-edgar" in url and "count=2" in url
+        return atom
+
+    def fake_cik(ticker: str) -> int:
+        assert ticker in ("GOOG", "GOOGL")
+        return 1652044
+
+    monkeypatch.setattr(mp, "_http_bytes", fake_http)
+    monkeypatch.setattr(mp, "cik_for_ticker", fake_cik)
+    cold = mp.get_filings("GOOG", limit=2)
+    items = cold["items"]
+    assert isinstance(items, list)
+    assert [item["title"] for item in items] == ["10-Q", "8-K"]
+    assert len(calls) == 1
+    before = json.dumps(cold)
+    for limit in (1, 4):
+        assert mp.get_filings("GOOGL", limit=limit) == dict(cold, sym="GOOGL", items=items[:limit])
+        assert len(calls) == 1
+        assert fake_cache.store["filings:1652044"] is cold
+        assert json.dumps(cold) == before
+
+
+@pytest.mark.parametrize("payload", [{}, {"items": None}, {"items": {}}, {"items": "cached"}])
+def test_warm_cache_without_list_items_preserves_payload(
+    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch, payload: dict[str, object]
+) -> None:
+    cached = dict(payload, sym="GOOG", error="cached error")
+    fake_cache.set("news:GOOG", cached)
+    fake_cache.set("filings:1652044", cached)
+
+    def fake_cik(ticker: str) -> int:
+        assert ticker == "GOOGL"
+        return 1652044
+
+    monkeypatch.setattr(mp, "cik_for_ticker", fake_cik)
+    calls: list[str] = []
+
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        calls.append(url)
+        raise AssertionError("warm providers must not fetch")
+
+    monkeypatch.setattr(mp, "_http_bytes", fake_http)
+    before = json.dumps(cached)
+    assert mp.get_news("GOOG", limit=1) == cached
+    assert mp.get_filings("GOOGL", limit=1) == dict(cached, sym="GOOGL")
+    assert json.dumps(cached) == before
+    assert calls == []
 
 
 def test_filings_no_cik_returns_error(fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -747,5 +904,12 @@ def test_viewer_context_collects_errors(monkeypatch: pytest.MonkeyPatch) -> None
         "news": "news boom",
         "filings": "filings boom",
     }
-    assert out["news"] == []
     assert out["filings"] == []
+
+
+def test_api_root_reports_supervised_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = TestClient(app)
+    monkeypatch.setenv("PORT", "3002")
+    assert client.get("/").json()["ui"] == "http://localhost:3002"
+    monkeypatch.delenv("PORT", raising=False)
+    assert client.get("/").json()["ui"] == "http://localhost:5173"

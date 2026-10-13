@@ -7,6 +7,14 @@ describe("parseDotenv", () => {
     const p = parseDotenv('# lead\nA="x # y"\nB=\'z\'\nexport C=plain\nD=bare # tail\nE=\n');
     expect(p).toEqual({ A: "x # y", B: "z", C: "plain", D: "bare", E: "" });
   });
+
+  test("a bare name never becomes a set variable", () => {
+    // Only KEY=value lines count: a name alone (with or without export) sets nothing.
+    const p = parseDotenv("BARE_NAME\nEXPORTED_NAME\nlowercase_name\nKEY=value\n");
+    expect(p).toEqual({ KEY: "value" });
+    expect("BARE_NAME" in p).toBe(false);
+    expect("EXPORTED_NAME" in p).toBe(false);
+  });
 });
 
 describe("loadDotenvAuthoritative", () => {

@@ -1,6 +1,6 @@
 import { createServer } from "node:net";
 
-/** First free 127.0.0.1 port at or above the preferred port (default 3000). */
+/** First port free on every IPv4 interface (0.0.0.0) at or above the preferred port (default 3000). */
 export async function pickFreePort(preferred = 3000): Promise<number> {
   const start = Number.isInteger(preferred) && preferred > 0 ? preferred : 3000;
   // ponytail: 100-try ceiling; raise the bound if a host ever packs denser.
@@ -14,6 +14,6 @@ function isFree(port: number): Promise<boolean> {
   const { promise, resolve } = Promise.withResolvers<boolean>();
   const server = createServer();
   server.once("error", () => resolve(false));
-  server.listen(port, "127.0.0.1", () => server.close(() => resolve(true)));
+  server.listen(port, "0.0.0.0", () => server.close(() => resolve(true)));
   return promise;
 }

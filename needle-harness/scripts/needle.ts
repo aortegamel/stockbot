@@ -59,7 +59,7 @@ const childEnv: NodeJS.ProcessEnv = {
 
 // Vite owns its subtree; the supervisor only marks an unhealthy web child.
 const WEB_UNHEALTHY_MARKER = join(HARNESS_DIR, ".needle-web-unhealthy");
-process.stdout.write(`needle [web]: harness ${HARNESS_DIR} → http://127.0.0.1:${PORT} (cwd ${process.cwd()})\n`);
+process.stdout.write(`needle [web]: harness ${HARNESS_DIR} → http://0.0.0.0:${PORT} (all IPv4 interfaces, no login, cwd ${process.cwd()})\n`);
 process.stdout.write(dotenvLoaded ? `needle [web]: env loaded ${DOTENV}\n` : `needle [web]: no .env at ${DOTENV}, using shell env\n`);
 
 const owned = new Set<ChildProcess>();
@@ -253,14 +253,14 @@ const api = spawn("bun", ["scripts/api.ts"], {
   detached: true,
 });
 owned.add(api);
-const market = spawn(REPO_PYTHON, ["-m", "uvicorn", "api.main:app", "--host", "127.0.0.1", "--port", STOCKBOT_MARKET_PORT], {
+const market = spawn(REPO_PYTHON, ["-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", STOCKBOT_MARKET_PORT], {
   cwd: ROOT_DIR,
   stdio: "inherit",
   env: childEnv,
   detached: true,
 });
 owned.add(market);
-const web = spawn("bun", ["x", "vite", "--host", "127.0.0.1", "--port", PORT, "--strictPort"], {
+const web = spawn("bun", ["x", "vite", "--host", "0.0.0.0", "--port", PORT, "--strictPort"], {
   cwd: WEB_DIR,
   stdio: "inherit",
   env: childEnv,

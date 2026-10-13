@@ -2,6 +2,7 @@
 
 Routes:
 - GET /api/health, / — service status.
+  The root advertises the UI on PORT, or localhost:5173 for standalone development.
 - GET /api/candles?sym=NVDA&range=6mo&interval=1d — Yahoo chart v8 OHLCV.
 - GET /api/quote?sym=NVDA — valuation.get_live_quote (Yahoo quoteSummary).
 - GET /api/search?q=nvda — any-ticker validation (Yahoo search).
@@ -15,6 +16,8 @@ Routes:
   Nothing here calls any agent.
 """
 
+import os
+
 from fastapi import FastAPI
 
 from . import market_providers as providers
@@ -27,7 +30,7 @@ def root():
     return {
         "ok": True,
         "service": "needle-api",
-        "ui": "http://localhost:5173",
+        "ui": f"http://localhost:{os.getenv('PORT') or '5173'}",
         "docs": "/docs",
     }
 

@@ -3,10 +3,27 @@
 // port is written back to the env so /api/health reports it); PORT stays Vite. Importing this
 // module only exposes dispatch: listening happens in startApiServer().
 import type { Server } from "bun";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { POST as agentPOST } from "@/app/api/agent/route";
 import { GET as healthGET } from "@/app/api/health/route";
 import { GET as researchGET } from "@/app/api/research/[...path]/route";
 import { kernelRouter, prewarmKernel } from "@/lib/agent/kernel";
+import { fingerprintKey, loadDotenvAuthoritative } from "@/lib/env";
+
+const HARNESS_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
+const DOTENV = join(dirname(HARNESS_DIR), ".env");
+// .env is authoritative: stale inherited exports (daemon broker, shell) lose. Loaded at module
+// scope before startApiServer() reads env; the only module-scope env read elsewhere is
+// STOCKBOT_REPO_ROOT in the kernel, which the cwd default already resolves for this launch.
+const { loaded: dotenvLoaded, overridden } = loadDotenvAuthoritative(DOTENV);
+for (const o of overridden) {
+  process.stdout.write(`api [env]: override ${o.key} inherited ${o.oldRedacted} → .env ${o.newRedacted}\n`);
+}
+process.stdout.write(dotenvLoaded ? `api [env]: env loaded ${DOTENV}\n` : `api [env]: no .env at ${DOTENV}, using shell env\n`);
+if (process.env.OPENCODE_API_KEY) {
+  process.stdout.write(`api [env]: opencode identity fp=${fingerprintKey(process.env.OPENCODE_API_KEY)}\n`);
+}
 
 // Former cactus API paths owned by Bun. Wrong methods are 405; unknown paths are 404.
 export async function dispatch(req: Request): Promise<Response> {
@@ -46,7 +63,7 @@ export async function registerPrewarm(): Promise<void> {
 
 export async function startApiServer(): Promise<Server<undefined>> {
   const requested = resolveApiPort();
-  const server = Bun.serve({ hostname: "127.0.0.1", port: requested, idleTimeout: 0, fetch: dispatch });
+  const server = Bun.serve({ hostname: "0.0.0.0", port: requested, idleTimeout: 0, fetch: dispatch });
   process.env.STOCKBOT_API_PORT = String(server.port ?? requested);
   await registerPrewarm();
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
@@ -61,7 +78,7 @@ export async function startApiServer(): Promise<Server<undefined>> {
       process.exit(0);
     });
   }
-  console.log(`[web] bun api listening http://127.0.0.1:${server.port ?? requested}`);
+  console.log(`[web] bun api listening http://0.0.0.0:${server.port ?? requested} (all IPv4 interfaces, no login)`);
   return server;
 }
 

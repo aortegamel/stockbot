@@ -1,4 +1,4 @@
-"""Configuration: loads .env, fails fast on missing keys.
+"""Configuration: loads the repository root .env, fails fast on missing keys.
 
 edgartools identity configuration lives behind the edgar boundary in
 ``app/edgar_client.py``; this module only validates the env values it needs.
@@ -8,7 +8,7 @@ import logging
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 from .log_stream import LogStreamHandler
 
@@ -35,7 +35,15 @@ YAHOO_QUERY_BASE = "https://query2.finance.yahoo.com"
 YAHOO_CRUMB_URL = "https://fc.yahoo.com"
 SLICKCHARTS_SP500_URL = "https://www.slickcharts.com/sp500"
 
-load_dotenv()
+
+def _load_root_dotenv() -> None:
+    """Root .env values replace inherited ones. Inherited PORT wins, as in needle-harness/lib/env.ts."""
+    for key, value in dotenv_values(REPO_ROOT / ".env").items():
+        if value is not None and not (key == "PORT" and key in os.environ):
+            os.environ[key] = value
+
+
+_load_root_dotenv()
 
 
 def _require_env(name: str) -> str:
