@@ -65,3 +65,8 @@ None
 - `security_identifier` (string): Ticker, CUSIP, ISIN, or class title; never treated as issuer identity.
 - `start_date` (string): YYYY-MM-DD. Combined with end_date as a range.
 - `ticker` (string)
+
+## Returns
+
+- `search_id` (string): Saved search ID. Page the full ranked set with research_read_search.
+- `session_id` (string): Persisted research session ID. A direct call creates it when no session is attached; pass it back to research_read_search.

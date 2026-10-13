@@ -5,30 +5,39 @@ Local routing (Cactus Needle 3), remote reasoning (Muse Spark via OpenCode Go AP
 ## 1. Requirements
 
 - Bun 1.4.2, Python 3 with `cactus-needle`, repo-root `needle3.cact` weights
-- `SEC_EDGAR_IDENTITY="Name email@example.com"` for SEC tools (in `.env` or shell)
+- `SEC_EDGAR_IDENTITY="Name email@example.com"` in the repo-root `.env` for SEC tools
 
 ## 2. Setup
 
 ```bash
 bash scripts/setup-needle.sh
 bun install
-export OPENCODE_API_KEY="$(../scripts/host/pi-opencode-go-secret)"
-export SEC_EDGAR_IDENTITY="Name email@example.com"
+# Set OPENCODE_API_KEY in the repo-root ../.env (value from ../scripts/host/pi-opencode-go-secret).
+# Do not export it: an empty OPENCODE_API_KEY="" in ../.env replaces any shell export.
+# Set SEC_EDGAR_IDENTITY="Name email@example.com" in the repo-root ../.env.
 ```
 
 ## 3. Env vars
 
-See ../.env.example (single repo-root .env). Shell exports override .env. OPENCODE_API_KEY may come from either; never commit .env.
+See ../.env.example (single repo-root .env). Startup reads the repo-root .env from the harness location, never from the cwd. Never commit .env.
+
+Values in .env replace inherited shell exports. An inherited PORT is the one exception and stays. Shell exports apply only to keys absent from .env. An empty `OPENCODE_API_KEY=""` line counts as present and replaces an exported key.
 
 ## 4. How to run
 
 ```bash
 cp ../.env.example ../.env  # once from repo root, then fill values
-bun run stockbot  # from repo root → Vite URL on PORT (127.0.0.1, free-picked from 3000)
+bun run stockbot  # from repo root → Vite on PORT, free-picked from 3000, bound to all IPv4 interfaces
 # staged logs per step; browser misbehaves? first check the Bun API port in the startup log, then curl that /api/health
 bun run lint && bun run typecheck
 BENCHMARK=1 bun run stockbot   # write benchmarks/*.json per run
 ```
+
+Vite (`PORT`), the Bun API (`STOCKBOT_API_PORT`), and the FastAPI market service (`STOCKBOT_MARKET_PORT`) bind `0.0.0.0`.
+The startup log prints each selected port.
+From another device, open `http://<host LAN IP>:<PORT>`, for example `http://192.168.1.20:3000`.
+`0.0.0.0` is a bind address, not a client address.
+These endpoints have no login protection. Use them only on a trusted network. Never forward the ports to the internet.
 
 ## 5. Architecture
 

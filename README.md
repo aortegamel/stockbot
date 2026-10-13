@@ -49,9 +49,39 @@ bun run setup
 
 Offline tests do not need FINRA, Robinhood, or SEC credentials.
 
+### Offline browser regression
+
+The default Python suite runs Selenium against the actual Vite UI.
+The test uses local HTTP fixtures for every market and research request.
+It does not start the live API servers or call SEC, Yahoo, or broker services.
+
+Install Chromium and a ChromeDriver version that matches the Chromium major version.
+The test searches `PATH` for `chromium`, `chromium-browser`, or `google-chrome`, plus `chromedriver`.
+Set `STOCKBOT_CHROMIUM_BINARY` and `STOCKBOT_CHROMEDRIVER` to use explicit executable paths.
+The test fails if either executable is missing.
+It never downloads a browser or driver through Selenium Manager.
+
+```bash
+bun run setup
+bun install --cwd web
+chromium --version
+chromedriver --version
+bun run test:browser
+```
+
+The repository pins [Selenium 4.51.0](https://pypi.org/project/selenium/4.51.0/).
+Its package metadata supports Python 3.10 or later, including the repository's Python 3.14.
+The test uses headless Chromium without a display server.
+`bun run test` and `bun run verify` include this regression through the default Python suite.
+
 ## Environment variables
 
 See [`.env.example`](.env.example) for the current list and whether each setting is required, optional, or testing-only. `SEC_EDGAR_IDENTITY` is required only for SEC features. FINRA and Robinhood are optional integrations.
+
+Python and Bun startup both load only the repository root `.env`, regardless of the current directory.
+Root `.env` values replace inherited shell values.
+Inherited keys absent from `.env` stay in effect.
+An inherited `PORT` stays in effect, so `PORT=3101 bun run stockbot` works.
 
 ## Running research
 
@@ -62,6 +92,25 @@ bun run stockbot
 Pi owns model selection and the agent loop; Stockbot exposes its tools and
 security gates over the stdio bridge. `cli.py` remains for admin tasks only
 (`runs`, `inspect`, `refresh-data`, `log-server`, `robinhood-login`).
+
+### LAN access
+
+`bun run stockbot` binds three listeners to every IPv4 interface (`0.0.0.0`):
+
+- Vite UI on `PORT` (free-picked from 3000).
+- Bun API on `STOCKBOT_API_PORT` (free-picked above the Vite port).
+- FastAPI market service on `STOCKBOT_MARKET_PORT` (free-picked above the API port).
+
+The startup log prints each selected port.
+From another device, use the host LAN IP, for example `http://192.168.1.20:3000`.
+Find the host LAN IP with `ip -4 addr` on Linux.
+`0.0.0.0` is a bind address, not a client address. Do not put it in a browser.
+Each service also answers health checks directly, for example `http://192.168.1.20:3001/api/health`.
+
+These endpoints have no login protection.
+Anyone who can reach the host can use the UI, run research, and read market and research data.
+Run Stockbot only on a trusted network.
+Do not forward these ports through a router or expose them to the internet.
 
 ## Running tests
 ```bash

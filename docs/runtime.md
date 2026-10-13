@@ -148,6 +148,9 @@ The caller cancellation signal still reaches every persona call and aborts it.
 The kernel scheduler owns the agent loop.
 JEV selects from the whole registry when deterministic routing does not select a tool.
 Needle fills tool arguments only.
+The browser sends the selected ticker separately from the original question.
+The route and research session retain that ticker context.
+Pure clock questions use the clock tool even when a ticker context exists.
 Tools execute through `app/tool_runtime.py` against canonical `app/tools.py`.
 Thesis monitoring runs the same scheduler in-process through `app/thesis/runner.py run_trigger`.
 Its injectable `_RUN_KERNEL` uses `run_graph_prompt` and `scheduler.run` by default.
@@ -187,16 +190,16 @@ It binds exactly the tool that JEV selects.
 The catalog preserves the original description and parameter schema.
 Structured extraction keeps its native 512-token default and 1-4096 validation bound.
 
-The SDK receives every admitted evidence record without clipping.
-The SDK facts reuse the shared grounded formatter, `format_grounded_block`.
-Each SDK fact block carries the evidence ID, content hash, provenance, complete stored content, and all remaining record fields.
-The formatter does not clip SDK facts or Reasoner prompts.
+The argument SDK receives no research evidence, raw tool results, or attempt history.
+Its context contains temporal anchors, the selected ticker, and explicitly grounded argument values.
+The server filters context fields before it binds the selected tool.
+Durable storage retains complete evidence records.
+JEV retains its evidence context outside the argument SDK.
+Downstream checks retain evidence for identifier validation and quote validation.
 Each Reasoner block carries the evidence ID, content hash, provenance, and complete stored content.
 Complete stored content is not complete source text.
-
 Source text that intake clipped before storage stays clipped.
 Wrapper instructions such as `grounding_hint` do not enter the SDK facts.
-
 The worker rejects explicit engine failures, SDK-reported ungrounded fields, and negated requests.
 The emitted tool must match JEV's selected tool.
 
@@ -222,6 +225,8 @@ golden scenario through the production kernel path with real SEC/FINRA/Exa
 credentials (`HEDGEFUND_LIVE=1`, `SEC_EDGAR_IDENTITY`, `FINRA_CLIENT_ID` /
 `FINRA_CLIENT_SECRET`, `EXA_ENABLED=1` + `EXA_API_KEY`) and re-exports the
 read-only harness-viewer projection. Without the opt-in flag it exits 2.
+
+The terminal Harness tab renders `HarnessSessionViewer` with the selected session id. It reads the existing session plus snapshot research APIs only. A missing or failed snapshot stays unavailable for that session, never another session. Static `HarnessViewer` with a projection prop remains for untracked preview files; export previews write only the `--out` path.
 
 ## SEC discovery labels
 
