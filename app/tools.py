@@ -145,7 +145,7 @@ TOOLS: list[dict[str, object]] = [
         "type": "function",
         "function": {
             "name": "find_sec_entities",
-            "description": "Resolves a company name, ticker, or CIK to verified SEC entity candidates (CIK, tickers, verification status), including no-ticker registrants and former names. Ties and fuzzy-only matches stay ambiguous; verify identity before list_sec_filings. Dispatched inside a deep research session, every entity route is searched by default and limit bounds only the returned packet (default 20); pass exhaustive=false for the quick bounded lookup.",
+            "description": "Resolves a company name, ticker, or CIK to verified SEC entity candidates (CIK, tickers, verification status), including no-ticker registrants and former names. Ties and fuzzy-only matches stay ambiguous; verify identity before list_sec_filings. Dispatched inside a deep research session, every entity route is searched by default and limit bounds only the returned packet (default 20); pass exhaustive=false for the quick bounded lookup. A direct call creates and returns its persisted session_id.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -195,7 +195,7 @@ TOOLS: list[dict[str, object]] = [
         "type": "function",
         "function": {
             "name": "search_sec_filings",
-            "description": 'EDGAR discovery over entity, full-text (EFTS), filer-submissions, global filing, and local routes. Dispatched inside a deep research session, every applicable route is drained by default and limit bounds only the returned hit packet (default 20; page the rest with research_read_search); pass exhaustive=false for the quick bounded lookup, which is also the default outside a research session. Hits are text mentions: each names the filer (filer_name/filer_cik) and the exact matched document, never inferred subject identity. Returns coverage, attempts, counts, PIT basis, warnings/errors, auto-queued backfill jobs, and bounded evidence IDs. Required: at least one of query, ticker, cik, company_name, person_name, domain, accession_no, security_identifier (a call with none is rejected). Optional: forms, start_date, end_date, as_of, exhaustive, limit. Example: {"query": "risk factors", "ticker": "AAPL", "forms": ["10-K"], "limit": 10}.',
+            "description": 'EDGAR discovery over entity, full-text (EFTS), filer-submissions, global filing, and local routes. Dispatched inside a deep research session, every applicable route is drained by default and limit bounds only the returned hit packet (default 20; page the rest with research_read_search); pass exhaustive=false for the quick bounded lookup, which is also the default outside a research session. A direct call creates and returns its persisted session_id for later research_read_search reads. Hits are text mentions: each names the filer (filer_name/filer_cik) and the exact matched document, never inferred subject identity. Returns coverage, attempts, counts, PIT basis, warnings/errors, auto-queued backfill jobs, and bounded evidence IDs. Required: at least one of query, ticker, cik, company_name, person_name, domain, accession_no, security_identifier (a call with none is rejected). Optional: forms, start_date, end_date, as_of, exhaustive, limit. Example: {"query": "risk factors", "ticker": "AAPL", "forms": ["10-K"], "limit": 10}.',
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -5815,7 +5815,59 @@ def _envelope_backfill(cov: dict[str, object]) -> list[object]:
     return list(cov["pending_backfill_jobs"]) if isinstance(cov.get("pending_backfill_jobs"), (list, tuple)) else []
 
 
-def _search_envelope(result: SECSearchResult, *, limit: int | None = 20) -> dict[str, object]:
+def _direct_search_question(request: dict[str, object]) -> str:
+    """Human question for a direct-search session (never empty)."""
+    for key in (
+        "query",
+        "company_name",
+        "person_name",
+        "ticker",
+        "cik",
+        "domain",
+        "accession_no",
+        "security_identifier",
+    ):
+        value = request.get(key)
+        if isinstance(value, str) and value.strip():
+            return f"SEC search: {value.strip()}"
+    return "SEC search"
+
+
+def _direct_search_ticker(request: dict[str, object]) -> str | None:
+    """Validated session ticker, else None (an odd ticker never fails the search)."""
+    from app.research.models import validate_ticker
+
+    try:
+        return validate_ticker(_str_or_none(request.get("ticker")))
+    except ValueError:
+        return None
+
+
+def _direct_search_session(request: dict[str, object], as_of: str | None, context: RequestContext) -> str:
+    """Persisted session for a direct search; reuses a live context session."""
+    from app.research import service as research_service
+
+    repo = _research_repo_for(context)
+    existing = context.research_session_id
+    if isinstance(existing, str) and existing:
+        try:
+            repo.get_session(existing)
+        except KeyError:
+            pass
+        else:
+            return existing
+    return research_service.create_research(
+        _direct_search_question(request),
+        _direct_search_question(request),
+        as_of=as_of,
+        ticker=_direct_search_ticker(request),
+        repo=repo,
+    )
+
+
+def _search_envelope(
+    result: SECSearchResult, *, limit: int | None = 20, session_id: str | None = None
+) -> dict[str, object]:
     """SECSearchResult -> model packet: roles, ledger, PIT, jobs, evidence."""
     data = result.to_dict()
     cov = _envelope_dict(data.get("coverage"))
@@ -5825,13 +5877,21 @@ def _search_envelope(result: SECSearchResult, *, limit: int | None = 20) -> dict
     runs = _search_runs(data.get("search_runs"))
     documents = _document_matches(hits)
     top_hits, additional_hits = _discovery_packet(hits, data.get("search_id"), limit)
+    shown = len(hits) if limit is None else min(len(hits), limit)
+    more = len(hits) > shown
     return {
         "subject": request.get("query") or request.get("company_name"),
         "query": request.get("query"),
         "search_id": data.get("search_id"),
+        "session_id": session_id,
         "request": request,
         "scope": _envelope_scope(request),
         "count": len(hits),
+        "total": len(hits),
+        "offset": 0,
+        "limit": limit,
+        "more": more,
+        "next_offset": shown if more else None,
         "retrieval": {
             "hits_are": "navigation_artifacts",
             "display_limit": limit,
@@ -5850,7 +5910,7 @@ def _search_envelope(result: SECSearchResult, *, limit: int | None = 20) -> dict
         "parties": data.get("relationships"),
         "relationships": data.get("relationships"),
         "relationship_matches": data.get("relationships"),
-        "hits": hits,
+        "hits": hits if limit is None else hits[:limit],
         "coverage": cov,
         "attempts": attempts,
         "search_runs": runs,
@@ -5893,16 +5953,16 @@ def _find_sec_entities(args: dict[str, object], context: RequestContext) -> dict
     if as_of_err is not None:
         return as_of_err
     exhaustive, max_results, packet = _discovery_bounds(args, context)
-    return _search_envelope(
-        sec.find_sec_entities(
-            str(args["query"]),
-            as_of=as_of,
-            exhaustive=exhaustive,
-            max_results=max_results,
-            data_root=get_data_root(),
-        ),
-        limit=packet,
+    result = sec.find_sec_entities(
+        str(args["query"]),
+        as_of=as_of,
+        exhaustive=exhaustive,
+        max_results=max_results,
+        data_root=context.data_root,
     )
+    session_id = _direct_search_session({"query": str(args["query"])}, as_of, context)
+    _persist_search_envelope(result, context)
+    return _search_envelope(result, limit=packet, session_id=session_id)
 
 
 def _sec_search_result(args: dict[str, object], context: RequestContext) -> dict[str, object]:
@@ -5937,13 +5997,10 @@ def _sec_search_result(args: dict[str, object], context: RequestContext) -> dict
     as_of, as_of_err = _sec_date_arg(args, "search_sec_filings", "as_of")
     if as_of_err is not None:
         return as_of_err
-    raw_forms = args.get("forms")
-    if isinstance(raw_forms, str):
-        forms: tuple[str, ...] | None = (raw_forms,)
-    elif isinstance(raw_forms, (list, tuple)):
-        forms = tuple(str(x) for x in raw_forms)
-    else:
-        forms = None
+    search_forms, search_forms_err = _search_forms_arg(args.get("forms"), "search_sec_filings")
+    if search_forms_err is not None:
+        return search_forms_err
+    forms = search_forms
     request = sec.SECSearchRequest(
         query=_str_or_none(args.get("query")),
         ticker=_str_or_none(args.get("ticker")),
@@ -5960,7 +6017,31 @@ def _sec_search_result(args: dict[str, object], context: RequestContext) -> dict
         exhaustive=exhaustive,
         max_results=max_results,
     )
-    return _search_envelope(sec.SECDiscoveryService(data_root=get_data_root()).search(request), limit=packet)
+    result = sec.SECDiscoveryService(data_root=context.data_root).search(request)
+    session_id = _direct_search_session(dict(args), as_of, context)
+    _persist_search_envelope(result, context)
+    return _search_envelope(result, limit=packet, session_id=session_id)
+
+
+def _persist_search_envelope(result: SECSearchResult, context: RequestContext) -> None:
+    """Persist the visible search packet when the provider path bypassed storage."""
+    request = result.request.to_dict()
+    coverage = result.coverage.to_dict()
+    try:
+        _research_repo_for(context).save_search(
+            {
+                "search_id": result.search_id,
+                "query": request.get("query") or request.get("company_name"),
+                "request": request,
+                "scope": {key: request[key] for key in ("ticker", "cik", "forms") if request.get(key) is not None},
+                "hits": [hit.to_dict() for hit in result.text_hits],
+                "coverage": coverage,
+                "pagination_complete": coverage["status"] in ("complete", "complete_within_source_limits"),
+                "source_exhausted": result.request.exhaustive and coverage["status"] == "complete",
+            }
+        )
+    except ValueError:
+        pass
 
 
 def _find_sec_entities_bounded(args: dict[str, object], context: RequestContext) -> dict[str, object]:
@@ -6295,7 +6376,34 @@ def _filing_forms_arg(
     if forms is None:
         return None, None
     values = [forms] if isinstance(forms, str) else list(forms)
-    if any(_date_like_form(v) for v in values):
+    if any(_date_like_form(v) or _search_prose_form(v) for v in values):
+        return None, _invalid_args_error(tool, f"tool '{tool}': invalid forms {raw!r}; {_FILING_FORMS_HINT}")
+    return forms, None
+
+
+def _search_prose_form(value: object) -> bool:
+    """Malformed generated organization prose, never a routable SEC form."""
+    if not isinstance(value, str):
+        return False
+    text = value.strip().upper().replace("\u2010", "-").replace("\u2011", "-")
+    if len(text) <= 4 or len(text.split()) <= 1:
+        return False
+    if "/" in text or text.endswith("/A"):
+        return False
+    return not any(char.isdigit() for char in text)
+
+
+def _search_forms_arg(raw: object, tool: str) -> tuple[tuple[str, ...] | None, dict[str, object] | None]:
+    """Search forms: one string stays one member; /A survives; date/prose fails before SEC."""
+    if raw is None:
+        return None, None
+    if isinstance(raw, str):
+        forms = (raw,)
+    elif isinstance(raw, (list, tuple)):
+        forms = tuple(str(item) for item in raw)
+    else:
+        return None, None
+    if any(_date_like_form(item) or _search_prose_form(item) for item in forms):
         return None, _invalid_args_error(tool, f"tool '{tool}': invalid forms {raw!r}; {_FILING_FORMS_HINT}")
     return forms, None
 
@@ -6595,15 +6703,18 @@ def _get_ownership_changes(args: dict[str, object], model: str) -> dict[str, obj
     as_of, as_of_err = _sec_date_arg(args, "get_ownership_changes", "as_of")
     if as_of_err is not None:
         return as_of_err
-    return _wrap_list(
-        args.get("ticker"),
-        sec.get_ownership_changes(
-            str(args["ticker"]),
-            as_of=as_of,
-            limit=_optional_int(args.get("limit", 20)),
-        ),
-        "changes",
+    covered = sec.get_ownership_changes_with_coverage(
+        str(args["ticker"]),
+        as_of=as_of,
+        limit=_optional_int(args.get("limit", 20)),
     )
+    return {
+        **_wrap_list(args.get("ticker"), covered["events"], "changes"),
+        "scanned_accessions": covered["scanned_accessions"],
+        "scanned_count": covered["scanned_count"],
+        "incomplete_history": covered["incomplete_history"],
+        "missing_baselines": covered["missing_baselines"],
+    }
 
 
 def _get_planned_insider_sales(args: dict[str, object], model: str) -> dict[str, object]:
@@ -8045,16 +8156,20 @@ def _read_search_page(arguments: dict[str, object]) -> tuple[int, int, tuple[str
 
 
 def _research_read_search(arguments: dict[str, object], context: RequestContext) -> dict[str, object]:
-    """No persisted SEC search universe remains; every read is unknown_search."""
-    # Seam: live reads via SourceGateway + normalization + raw_archive (write-once) + write_bundle; NOTE: a future warehouse slots in behind live readers, never here.
+    """Page one persisted ranked hit set with actual coverage. Unknown IDs stay unknown_search."""
     session_id = str(arguments["session_id"])
     search_id = str(arguments["search_id"])
-    _read_search_page(arguments)
+    offset, limit, forms = _read_search_page(arguments)
+    repo = _research_repo_for(context)
     try:
-        _research_repo_for(context).get_session(session_id)
+        repo.get_session(session_id)
     except KeyError as e:
         return _research_not_found_error(e)
-    return {"error": f"unknown search_id: {search_id!r}", "error_type": "unknown_search"}
+    try:
+        page = repo.read_search(search_id, offset=offset, limit=limit, forms=forms)
+    except KeyError:
+        return {"error": f"unknown search_id: {search_id!r}", "error_type": "unknown_search"}
+    return {**page, "session_id": session_id}
 
 
 def _research_add_evidence(arguments: dict[str, object], context: RequestContext) -> dict[str, object]:

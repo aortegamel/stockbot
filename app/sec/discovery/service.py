@@ -4921,40 +4921,6 @@ def _forms_from_hits(ranked: tuple[SECTextHit, ...]) -> set[str]:
     return {h.form.strip().upper() for h in ranked if str(getattr(h, "form", "") or "").strip()}
 
 
-def _search_persist_ledger(
-    state: _SearchState,
-    request: SECSearchRequest,
-    search_id: str,
-    ranked: tuple[SECTextHit, ...],
-    active: list[SearchAttempt],
-    completed: tuple[str, ...],
-    failed: tuple[str, ...],
-    limits: tuple[str, ...],
-    status: _CoverageStatus,
-    forms_seen: set[str],
-    date_coverage: str | None,
-    pagination_complete: bool,
-    source_exhausted: bool,
-) -> None:
-    """Per-session bundle owns the search ledger; no persisted search rows remain."""
-    # Live seam: per-session bundle writer owns search ledgers; NOTE warehouse slots beside seam.
-    _ = (
-        state,
-        request,
-        search_id,
-        ranked,
-        active,
-        completed,
-        failed,
-        limits,
-        status,
-        forms_seen,
-        date_coverage,
-        pagination_complete,
-        source_exhausted,
-    )
-
-
 def _search_attempt_failed(active: list[SearchAttempt]) -> bool:
     return any(a.status in ("failed", "partial") for a in active)
 
@@ -5023,6 +4989,7 @@ def _search_finalize(
     display_limit: int | None,
     evidence_max_items: int,
     evidence_max_chars: int,
+    data_root: Path | str | None = None,
 ) -> SECSearchResult:
     as_of: str | None = _check_as_of(request.as_of)
     search_id = state.search_id
@@ -5045,7 +5012,7 @@ def _search_finalize(
     status = _search_coverage_status(state, active, limits)
     forms_seen = _search_forms_seen(state, ranked_full, global_forms)
     date_coverage = _search_date_coverage(request)
-    _search_persist_ledger(
+    result = _search_result_packet(
         state,
         request,
         search_id,
@@ -5057,23 +5024,35 @@ def _search_finalize(
         status,
         forms_seen,
         date_coverage,
-        pagination_complete=not _search_is_partial(state, active),
-        source_exhausted=status == "complete",
-    )
-    return _search_result_packet(
-        state,
-        request,
-        search_id,
-        ranked,
-        active,
-        completed,
-        failed,
-        limits,
-        status,
-        forms_seen,
-        date_coverage,
         packet,
         as_of,
+    )
+    persist_search_result(result, data_root=data_root)
+    return replace(result, text_hits=ranked)
+
+
+def persist_search_result(result: SECSearchResult, *, data_root: Path | str | None = None) -> None:
+    """Save the complete ranked result before the display window removes any hits."""
+    from ...research.repository import ResearchRepository, get_research_db_path
+
+    request = result.request.to_dict()
+    coverage = result.coverage.to_dict()
+    root = Path(data_root) if data_root is not None else get_research_db_path().parent
+    ResearchRepository(data_root=root).save_search(
+        {
+            "search_id": result.search_id,
+            "query": request.get("query") or request.get("company_name"),
+            "request": request,
+            "scope": {
+                key: request[key]
+                for key in ("ticker", "cik", "forms", "start_date", "end_date", "as_of")
+                if request.get(key) is not None
+            },
+            "hits": [hit.to_dict() for hit in result.text_hits],
+            "coverage": coverage,
+            "pagination_complete": coverage["status"] in ("complete", "complete_within_source_limits"),
+            "source_exhausted": result.request.exhaustive and coverage["status"] == "complete",
+        }
     )
 
 
@@ -5181,6 +5160,7 @@ class SECDiscoveryService:
             50 if result_limit is None else result_limit,
             evidence_max_items,
             evidence_max_chars,
+            data_root,
         )
 
 
@@ -6033,11 +6013,7 @@ def get_sec_search_coverage(
     data_root: Path | str | None = None,
     limit: int = 200,
 ) -> dict[str, object]:
-    """Persisted coverage + backfill jobs only; never infers from rows.
-
-    Reads ``sec_ingestion_coverage`` / ``sec_searches`` ledgers and the
-    durable job queue. Absent ledgers mean unknown coverage, never complete.
-    """
+    """Read persisted ingestion coverage, saved searches, and backfill jobs. Never infer coverage from hits."""
     from .. import store as _store
 
     coverage, coverage_error = _coverage_ledger(_store, source, form, limit, data_root)
@@ -6081,7 +6057,13 @@ def _coverage_jobs(
 def _coverage_search(
     store: ModuleType, search_id: str | None, data_root: Path | str | None
 ) -> dict[str, object] | None:
-    # Live seam: no persisted search ledger remains; per-session bundles own search ledgers.
-    # NOTE: a future warehouse slots in beside this seam, never inside providers.
-    _ = (store, search_id, data_root)
-    return None
+    from ...research.repository import ResearchRepository
+
+    if search_id is None:
+        return None
+    repo = ResearchRepository(data_root=Path(data_root) if data_root is not None else None)
+    try:
+        record = repo.get_search(search_id)
+    except KeyError:
+        return None
+    return {key: value for key, value in record.items() if key != "hits"}

@@ -254,7 +254,7 @@ def _router_pick(
         and (_objective_ticker(text) is not None or _objective_company(text) is not None)
     ):
         return "list_sec_filings", "sec-list"
-    # 8. Clock question.
+    # 8. Clock question on the original text: generated trading words never divert it.
     if toks and toks <= _TIME_TOKS and "get_current_time" in names and not (toks & _RESEARCH_TOKS):
         return "get_current_time", "time"
     # 9. Clear scorer winner outside any ambiguity group.
@@ -280,7 +280,7 @@ def _SMALL_TALK(prompt: str) -> bool:
     )
 
 
-def programmatic_route(prompt: object) -> str | None:
+def programmatic_route(prompt: object, ticker: str | None = None) -> str | None:
     """Entry fast-path: research signals -> research_required, else None (JEV decides)."""
     from app.research.scheduler import (
         _ACCESSION_TOKEN_RE,
@@ -292,6 +292,8 @@ def programmatic_route(prompt: object) -> str | None:
         return "research_required"
     if _SMALL_TALK(prompt):
         return "no_session"
+    # Pure clock question wins on the original prompt even with a selected ticker:
+    # a [TICKER] prefix or generated trading plan never diverts it to research.
     norm, toks = _signals(prompt)
     if toks and toks <= _TIME_TOKS and not (toks & _RESEARCH_TOKS):
         return "get_current_time"
@@ -299,11 +301,11 @@ def programmatic_route(prompt: object) -> str | None:
         return "research_required"
     if (
         (("should" in toks and toks & _ADVICE_VERBS) or "good investment" in norm)
-        and (_objective_ticker(prompt) is not None or _objective_company(prompt) is not None)
+        and (_objective_ticker(prompt) is not None or _objective_company(prompt) is not None or ticker is not None)
         and not (toks & _RESEARCH_TOKS)
     ):
         return "reasoning_required"
-    if _objective_ticker(prompt) is not None or _objective_company(prompt) is not None:
+    if _objective_ticker(prompt) is not None or _objective_company(prompt) is not None or ticker is not None:
         return "research_required"
     if toks & _RESEARCH_TOKS or "reg sho" in norm or "betting against" in norm:
         return "research_required"
@@ -326,6 +328,42 @@ async def programmatic_select_round(
     raw_objective = session.get("objective") or session.get("query") or ""
     objective = raw_objective if isinstance(raw_objective, str) else ""
     question = sched._f(sched._node_dict(node), "question", default="") or ""
+    # Clock routes on the original question first: node text may carry generated
+    # trading words that must never divert a clock ask to the insider tool.
+    for clock_text in (question, objective):
+        if isinstance(clock_text, str) and clock_text.strip():
+            clock_norm, clock_toks = _signals(clock_text)
+            if clock_toks and clock_toks <= _TIME_TOKS and not (clock_toks & _RESEARCH_TOKS):
+                names = _registry_names(registry)
+                if "get_current_time" in names:
+                    tool = _pick_variant("get_current_time", clock_norm, clock_toks, names)
+                    decision = ToolDecision(
+                        action="invoke",
+                        tool_name=tool,
+                        tool_names=(tool,),
+                        probabilities={tool: 1.0},
+                        confidence=None,
+                    )
+                    decision.validate("<programmatic_router>")
+                    sched._record(
+                        kernel,
+                        sid,
+                        "tool_selection",
+                        candidates={tool: 1.0},
+                        probabilities={tool: 1.0},
+                        selected=tool,
+                        node_id=nid or None,
+                        job_id=None,
+                        confidence=None,
+                    )
+                    logger.info(
+                        "toolflow programmatic sid=%s nid=%s tool=%s reason=%s",
+                        sid,
+                        nid,
+                        tool,
+                        "time:original-question",
+                    )
+                    return "invoke", decision
     text = f"{objective} {question}".strip() if isinstance(question, str) else objective
     norm, toks = _signals(text)
     names = _registry_names(registry)

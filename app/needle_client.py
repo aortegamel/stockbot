@@ -66,6 +66,11 @@ def validate_needle_tool(jev_tool: str, needle_tool: object) -> str:
     return needle_tool
 
 
+_NODE_KEYS = ("question", "node_id", "id", "type")
+_CONTEXT_KEYS = ("as_of", "temporal_scope", "today_utc", "ticker", "grounded_arguments")
+_SCOPE_KEYS = ("mode", "as_of", "start", "end")
+
+
 def _sid_hint(req_dict: dict[str, object]) -> str:
     """Best-effort sid for toolflow logs: node/context session_id, else '-'."""
     for key in ("node", "context"):
@@ -75,6 +80,72 @@ def _sid_hint(req_dict: dict[str, object]) -> str:
             if isinstance(sid, str) and sid.strip():
                 return sid.strip()
     return "-"
+
+
+def _is_scalar(value: object) -> bool:
+    """JSON scalar without non-finite floats, so NaN/Infinity never enter Needle."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def _is_argument_value(value: object) -> bool:
+    """Admit scalars and scalar lists only; records and nested structures never enter."""
+    return _is_scalar(value) or (isinstance(value, list) and all(_is_scalar(item) for item in value))
+
+
+def _filter_scope(scope: object) -> dict[str, JSONValue] | None:
+    """Persisted temporal window without generated wording: string window fields only."""
+    if not isinstance(scope, dict):
+        return None
+    out: dict[str, JSONValue] = {}
+    for key in _SCOPE_KEYS:
+        value = scope.get(key)
+        if isinstance(value, str):
+            out[key] = value
+    return out
+
+
+def _filter_grounded_arguments(values: object, schema: object) -> dict[str, JSONValue] | None:
+    """Explicit schema properties only; malformed, off-schema, or nested values never enter."""
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(values, dict) or not isinstance(properties, dict):
+        return None
+    out: dict[str, JSONValue] = {}
+    for key, value in values.items():
+        if key in properties and _is_argument_value(value):
+            out[key] = validate_json_value(value, "<needle_client>: 'grounded_arguments'")
+    return out
+
+
+def _filter_node(node: object) -> JSONValue | None:
+    """Request text plus node metadata only; research records and feedback never enter."""
+    if not isinstance(node, dict):
+        return validate_json_value(node, "<needle_client>: 'node'") if node is not None else None
+    return {key: validate_json_value(node[key], "<needle_client>: 'node'") for key in _NODE_KEYS if key in node}
+
+
+def _filter_context(context: object, schema: object) -> JSONValue | None:
+    """Execution context only; evidence, attempts, feedback, and intake never enter."""
+    if not isinstance(context, dict):
+        return validate_json_value(context, "<needle_client>: 'context'") if context is not None else None
+    out: dict[str, JSONValue] = {}
+    for key in _CONTEXT_KEYS:
+        if key not in context:
+            continue
+        if key == "temporal_scope":
+            scope = _filter_scope(context[key])
+            if scope is not None:
+                out[key] = scope
+        elif key == "grounded_arguments":
+            grounded = _filter_grounded_arguments(context[key], schema)
+            if grounded is not None:
+                out[key] = grounded
+        else:
+            value = context[key]
+            if isinstance(value, str):
+                out[key] = value
+    return out
 
 
 def _server() -> Path:
@@ -431,14 +502,15 @@ def generate_arguments(*args: object, **kwargs: object) -> dict[str, JSONValue]:
         logger.warning("toolflow needle_gen_error sid=%s tool=%s err_type=%s", sid_hint, tool, type(exc).__name__)
         raise
     where = "<needle_client>"
+    schema = validate_json_value(req_dict.get("schema"), where)
     payload: dict[str, JSONValue] = {
         "id": f"needle:{uuid.uuid4().hex[:12]}",
         "action": "arguments.generate",
         "tool": tool,
-        "schema": validate_json_value(req_dict.get("schema"), where),
+        "schema": schema,
         "objective": validate_json_value(req_dict.get("objective"), where),
-        "node": validate_json_value(req_dict.get("node"), where),
-        "context": validate_json_value(req_dict.get("context"), where),
+        "node": _filter_node(req_dict.get("node")),
+        "context": _filter_context(req_dict.get("context"), schema),
     }
     with _LOCK:
         attempt = 0

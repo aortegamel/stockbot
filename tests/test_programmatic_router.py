@@ -561,3 +561,14 @@ def test_tokenizer_merges_form_pairs_only() -> None:
     assert "8k" in _norm("filed 8-K accession here")
     assert "10k" in _norm("Which 10-K mentions X?")
     assert "10key" not in _norm("10 key facts") and "10" in _norm("10 key facts")
+
+
+def test_prefixed_clock_routes_clock_with_ticker_channel() -> None:
+    """Exact NVDA clock regression: ticker channel never diverts the original clock ask."""
+    assert programmatic_route("What time is it?", ticker="NVDA") == "get_current_time"
+    assert programmatic_route("should I buy NVDA", ticker="NVDA") == "reasoning_required"
+
+
+def test_explicit_persona_market_research_keeps_ticker_grounding() -> None:
+    """Explicit-persona market asks still resolve the ticker subject for research."""
+    assert programmatic_route("Bullbot view on ORCL revenue", ticker="ORCL") == "research_required"

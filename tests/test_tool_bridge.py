@@ -257,3 +257,84 @@ def test_invoke_failure_reports_bridge_envelope(monkeypatch: pytest.MonkeyPatch)
         ) == {"id": "f1", "error": "bridge_failed"}
     finally:
         tool_bridge._sessions.pop("boom-1", None)
+
+
+def test_direct_bridge_search_supports_session_scoped_read_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A direct bridge search persists rows; its session reads them after restart."""
+    from app import tools as _tools
+    from app.policy import Capability
+    from app.policy import RequestContext as _Ctx
+    from app.research.repository import ResearchRepository
+    from app.sec.models import SearchCoverage, SECSearchRequest, SECSearchResult, SECTextHit
+
+    hits = tuple(
+        SECTextHit(
+            search_id="sb-1",
+            attempt_id="sb-1-efts-1",
+            query="Acme Labs",
+            accession_no=f"0000000001-26-00000{i}",
+            form="10-K",
+            filed_at="2026-01-01",
+            filer_cik=1234567,
+            filer_name="Acme Labs Inc",
+            matched_document=f"0000000001-26-00000{i}.htm",
+            file_type="10-K",
+            score=float(10 - i),
+            snippet="supply agreement",
+        )
+        for i in range(1, 4)
+    )
+    result = SECSearchResult(
+        search_id="sb-1",
+        request=SECSearchRequest(query="Acme Labs"),
+        text_hits=hits,
+        coverage=SearchCoverage(status="partial"),
+        attempts=(),
+        retrieval_order=(),
+    )
+
+    class _FakeService:
+        def __init__(self, data_root: Path | None = None) -> None:
+            pass
+
+        def search(self, request: SECSearchRequest) -> SECSearchResult:
+            del request
+            return result
+
+    monkeypatch.setattr(_tools.sec, "SECDiscoveryService", _FakeService)
+    tool_bridge._sessions.pop("bridge-search-1", None)
+    try:
+        response = tool_bridge.handle(
+            {
+                "id": "b1",
+                "op": "tool.invoke",
+                "name": "search_sec_filings",
+                "arguments": {"query": "Acme Labs", "limit": 2},
+                "session_id": "bridge-search-1",
+                "data_root": str(tmp_path),
+            }
+        )
+    finally:
+        tool_bridge._sessions.pop("bridge-search-1", None)
+    assert "result" in response, response
+    fresh = ResearchRepository(data_root=tmp_path)
+    stored = fresh.get_search("sb-1")
+    assert stored["query"] == "Acme Labs"
+    with fresh._connect() as conn:
+        rows = conn.execute("SELECT session_id FROM sessions").fetchall()
+    assert len(rows) == 1
+    session_id = str(rows[0]["session_id"])
+    context = _Ctx("research", frozenset({Capability.RESEARCH}), data_root=tmp_path)
+    page = _tools.execute_tool(
+        "research_read_search",
+        {"session_id": session_id, "search_id": "sb-1", "offset": 2},
+        "test",
+        context=context,
+    )
+    assert page["session_id"] == session_id
+    assert page["total"] == 3
+    raw_hits = page["hits"]
+    assert isinstance(raw_hits, list)
+    assert [hit["accession_no"] for hit in raw_hits if isinstance(hit, dict)] == ["0000000001-26-000003"]

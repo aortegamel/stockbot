@@ -268,6 +268,22 @@ def _source_cleaned_sources(raw: Mapping[str, object], norm: str, where: str) ->
     return cleaned
 
 
+def validate_ticker(value: object, where: str = "<session>") -> str | None:
+    """Validated ticker channel: uppercase token, None when absent; rejects org words and bad shapes."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{where}: 'ticker' must be a string or null, got {type(value).__name__}")  # noqa: TRY004 - public error contract pins ValueError, tests are oracle
+    text = value.strip().upper()
+    if not text:
+        return None
+    if text in {"FINRA", "SEC", "NYSE", "NASDAQ", "OTC", "EDGAR", "SHO", "REG"}:
+        raise ValueError(f"{where}: 'ticker' must not be an organization word, got {value!r}")
+    if len(text) > 10 or not re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", text):
+        raise ValueError(f"{where}: 'ticker' must match ^[A-Z][A-Z0-9.\\-]{{0,9}}$, got {value!r}")
+    return text
+
+
 def resolve_source_policy(policy: object, where: str = "<session>") -> dict[str, JSONValue]:
     """Build source_policy from a full policy or a bare research_sources mapping.
 
@@ -871,6 +887,7 @@ class ResearchSession:
     unresolved_questions: list[str] = field(default_factory=list)
     targeted_question: str | None = None
     targeted_domain: str | None = None
+    ticker: str | None = None
     final_result: dict[str, JSONValue] | None = None
     failure: Failure | None = None
 
@@ -894,6 +911,8 @@ class ResearchSession:
             raise ValueError(f"{where}: 'targeted_question' must be a string or null")
         if self.targeted_domain is not None and not isinstance(self.targeted_domain, str):
             raise ValueError(f"{where}: 'targeted_domain' must be a string or null")
+        if self.ticker is not None and validate_ticker(self.ticker, where) != self.ticker:
+            raise ValueError(f"{where}: 'ticker' must be a validated uppercase token, got {self.ticker!r}")
         if self.failure is not None:
             self.failure.validate(f"{where}: failure")
 
@@ -928,6 +947,7 @@ class ResearchSession:
             "unresolved_questions": _json_str_list(self.unresolved_questions),
             "targeted_question": self.targeted_question,
             "targeted_domain": self.targeted_domain,
+            "ticker": self.ticker,
             "final_result": validate_json_mapping(self.final_result, "<session>: 'final_result'")
             if self.final_result is not None
             else None,
@@ -1006,6 +1026,7 @@ class ResearchSession:
             unresolved_questions=_req_list_str(d, "unresolved_questions", where),
             targeted_question=_opt_str(d.get("targeted_question"), "targeted_question", where),
             targeted_domain=_opt_str(d.get("targeted_domain"), "targeted_domain", where),
+            ticker=validate_ticker(d.get("ticker"), f"{where}: 'ticker'") if d.get("ticker") is not None else None,
             final_result=cls._parse_result(d, where),
             failure=cls._parse_failure(d, where),
         )

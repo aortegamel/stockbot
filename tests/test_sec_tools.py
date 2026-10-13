@@ -4,10 +4,11 @@ Offline: app.sec seams are monkeypatched at the tools.sec boundary; no
 network, no edgar import.
 """
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import NoReturn
+from typing import NoReturn, cast
 
 import pytest
 
@@ -1016,6 +1017,20 @@ def test_get_sec_search_coverage_reads_persisted_only(monkeypatch: pytest.Monkey
     assert result["provenance"] == "persisted-ledgers-only"
 
 
+def test_get_sec_search_coverage_returns_saved_search_without_hits(tmp_path: Path) -> None:
+    from app.sec.discovery.service import get_sec_search_coverage
+
+    record = _seed_read_search_ledger(tmp_path, hits=_read_search_hits()[:2])
+    found = get_sec_search_coverage(search_id=_READ_SEARCH, data_root=tmp_path)
+    assert found["search_id"] == _READ_SEARCH
+    search = found["search"]
+    assert isinstance(search, dict)
+    assert search["query"] == record["query"]
+    assert "hits" not in search
+    assert get_sec_search_coverage(search_id="missing", data_root=tmp_path)["search"] is None
+    assert get_sec_search_coverage(data_root=tmp_path)["search"] is None
+
+
 def test_discovery_blank_and_bad_limit_surface_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     missing = tools.execute_tool("find_sec_entities", {}, "test", context=_research_context())
     assert missing["error_type"] == "invalid_tool_arguments"
@@ -1997,9 +2012,14 @@ def test_edgar_alias_expansion_validated_keeps_provenance_no_false_identity(
     assert candidate["cik"] == 789790
 
 
-# ---- research_read_search: paged reads of one persisted search universe ----
-
 _READ_SEARCH = "s-read-1"
+
+
+def _stored_record(record: dict[str, object]) -> dict[str, object]:
+    """JSON-normalized expected value: tuples become lists, mapping order drops."""
+    normalized = json.loads(json.dumps(record))
+    assert isinstance(normalized, dict)
+    return normalized
 
 
 def _read_search_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> RequestContext:
@@ -2019,9 +2039,30 @@ def _seed_research_session(root: Path) -> str:
 
 def _seed_read_search_ledger(
     root: Path, *, request: SECSearchRequest | None = None, hits: tuple[SECTextHit, ...] = ()
-) -> None:
-    """No persisted search universe: reads always resolve unknown_search live."""
-    _ = (root, request, hits)
+) -> dict[str, object]:
+    """Save the complete ranked search independently of the displayed page."""
+    from app.research.repository import ResearchRepository
+
+    search_request = request or SECSearchRequest(query="Acme Labs")
+    record: dict[str, object] = {
+        "search_id": _READ_SEARCH,
+        "query": search_request.query or search_request.company_name,
+        "request": json.loads(json.dumps(search_request.to_dict())),
+        "scope": {"ticker": search_request.ticker} if search_request.ticker else {},
+        "hits": [hit.to_dict() for hit in hits],
+        "coverage": {"status": "partial", "results_reported": 20, "results_retrieved": len(hits)},
+        "pagination_complete": False,
+        "source_exhausted": False,
+    }
+    ResearchRepository(data_root=root).save_search(record)
+    return record
+
+
+def _stored_hits(record: dict[str, object]) -> list[dict[str, object]]:
+    hits = _stored_record(record)["hits"]
+    assert isinstance(hits, list)
+    assert all(isinstance(hit, dict) for hit in hits)
+    return [hit for hit in hits if isinstance(hit, dict)]
 
 
 def _read_search_hits() -> tuple[SECTextHit, ...]:
@@ -2045,6 +2086,9 @@ def _read_search_hits() -> tuple[SECTextHit, ...]:
         _hit("0000000001-26-000001", "10-K", 9.0),
         _hit("0000000001-26-000002", "8-K", 5.0),
         _hit("0000000001-26-000003", "10-K", 1.0),
+        _hit("0000000001-26-000004", "10-K/A", 0.9),
+        _hit("0000000001-26-000005", "SC 13D/A", 0.8),
+        _hit("0000000001-26-000006", "DEF 14A", 0.7),
     )
 
 
@@ -2054,24 +2098,50 @@ def _read(context: RequestContext, arguments: dict[str, object]) -> dict[str, ob
 
 def test_research_read_search_pages_persisted_hits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     context = _read_search_context(tmp_path, monkeypatch)
-    _seed_read_search_ledger(tmp_path, hits=_read_search_hits())
+    record = _seed_read_search_ledger(tmp_path, hits=_read_search_hits())
     session_id = _seed_research_session(tmp_path)
 
     page = _read(context, {"session_id": session_id, "search_id": _READ_SEARCH, "limit": 2})
-    assert page["error_type"] == "unknown_search"
-    assert _READ_SEARCH in str(page["error"])
+    assert page["hits"] == _stored_hits(record)[:2]
+    assert page["total"] == 6
+    assert page["offset"] == 0
+    assert page["limit"] == 2
+    assert page["more"] is True
+    assert page["next_offset"] == 2
+    stored = _stored_record(record)
+    for key in ("search_id", "query", "request", "scope", "coverage", "pagination_complete", "source_exhausted"):
+        assert page[key] == stored[key]
+
+    remainder = _read(context, {"session_id": session_id, "search_id": _READ_SEARCH, "offset": 2, "limit": 4})
+    assert remainder["hits"] == _stored_hits(record)[2:]
+    assert remainder["total"] == 6
+    assert remainder["offset"] == 2
+    assert remainder["limit"] == 4
+    assert remainder["more"] is False
+    assert remainder["next_offset"] is None
 
 
 def test_research_read_search_forms_filter_and_limit_clamp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     context = _read_search_context(tmp_path, monkeypatch)
-    _seed_read_search_ledger(tmp_path, hits=_read_search_hits())
+    record = _seed_read_search_ledger(tmp_path, hits=_read_search_hits())
     session_id = _seed_research_session(tmp_path)
 
-    filtered = _read(context, {"session_id": session_id, "search_id": _READ_SEARCH, "forms": ["10-k"]})
-    assert filtered["error_type"] == "unknown_search"
+    filtered = _read(context, {"session_id": session_id, "search_id": _READ_SEARCH, "forms": [" 10-k "], "offset": 1})
+    assert filtered["hits"] == [_stored_hits(record)[2]]
+    assert filtered["total"] == 2
+    assert filtered["offset"] == 1
+    assert filtered["more"] is False
+    assert filtered["next_offset"] is None
+
+    amended = _read(context, {"session_id": session_id, "search_id": _READ_SEARCH, "forms": ["10-k/a"]})
+    assert amended["hits"] == [_stored_hits(record)[3]]
+    assert amended["total"] == 1
 
     clamped = _read(context, {"session_id": session_id, "search_id": _READ_SEARCH, "limit": 999})
-    assert clamped["error_type"] == "unknown_search"
+    assert clamped["limit"] == 500
+    assert clamped["hits"] == _stored_hits(record)
+    assert clamped["total"] == 6
+    assert clamped["more"] is False
 
 
 def test_research_read_search_unknown_session_and_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2099,6 +2169,8 @@ def test_research_read_search_rejects_bad_page_arguments(tmp_path: Path, monkeyp
         ({"offset": True}, "'offset' must be an integer >= 0"),
         ({"limit": 0}, "'limit' must be an integer >= 1"),
         ({"limit": "5"}, "'limit' must be an integer >= 1"),
+        ({"offset": "1"}, "'offset' must be an integer >= 0"),
+        ({"limit": True}, "'limit' must be an integer >= 1"),
         ({"forms": "10-K"}, "'forms' must be a list of strings"),
         ({"forms": [1]}, "'forms' must be a list of strings"),
     ):
@@ -2108,21 +2180,230 @@ def test_research_read_search_rejects_bad_page_arguments(tmp_path: Path, monkeyp
 
 def test_research_read_search_reports_company_name_query(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     context = _read_search_context(tmp_path, monkeypatch)
-    _seed_read_search_ledger(tmp_path, request=SECSearchRequest(company_name="Acme Labs"))
+    record = _seed_read_search_ledger(tmp_path, request=SECSearchRequest(company_name="Acme Labs"))
     session_id = _seed_research_session(tmp_path)
 
     packet = _read(context, {"session_id": session_id, "search_id": _READ_SEARCH})
-    assert packet["error_type"] == "unknown_search"
+    assert packet["query"] == "Acme Labs"
+    assert packet["request"] == record["request"]
+    assert packet["hits"] == []
+    assert packet["total"] == 0
+    assert packet["more"] is False
+    assert packet["next_offset"] is None
 
 
 def test_research_read_search_unknown_search_universe_is_gone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """No persisted search universe remains; every read is unknown_search."""
+    """A missing search ID stays unknown after persistence returns."""
     context = _read_search_context(tmp_path, monkeypatch)
     session_id = _seed_research_session(tmp_path)
 
     packet = _read(context, {"session_id": session_id, "search_id": "s-read-raw-null"})
     assert packet["error_type"] == "unknown_search"
     assert "s-read-raw-null" in str(packet["error"])
+
+
+@pytest.mark.parametrize("hit_count", [0, 1, 3, 6])
+@pytest.mark.parametrize("limit", [1, 2, 5])
+@pytest.mark.parametrize("forms", [None, (" 10-k ",), ("10-k/a", "sc 13d/a", "def 14a"), ("4",)])
+def test_saved_search_pages_concatenate_after_restart(
+    tmp_path: Path,
+    hit_count: int,
+    limit: int,
+    forms: tuple[str, ...] | None,
+) -> None:
+    from app.research.repository import ResearchRepository
+
+    record = _seed_read_search_ledger(tmp_path, hits=_read_search_hits()[:hit_count])
+    repository = ResearchRepository(data_root=tmp_path)
+    assert repository.get_search(_READ_SEARCH) == _stored_record(record)
+    expected = _stored_hits(record)
+    if forms is not None:
+        selected = {form.strip().upper() for form in forms}
+        expected = [hit for hit in expected if str(hit["form"]).strip().upper() in selected]
+    combined: list[object] = []
+    for offset in range(0, len(expected) + limit, limit):
+        page = repository.read_search(_READ_SEARCH, offset=offset, limit=limit, forms=forms)
+        rows = _as_seq(page["hits"])
+        assert rows == expected[offset : offset + limit]
+        assert page["total"] == len(expected)
+        assert page["offset"] == offset
+        assert page["limit"] == limit
+        more = offset + len(rows) < len(expected)
+        assert page["more"] is more
+        assert page["next_offset"] == (offset + len(rows) if more else None)
+        assert page["coverage"] == record["coverage"]
+        assert page["pagination_complete"] is False
+        assert page["source_exhausted"] is False
+        combined.extend(rows)
+    assert combined == expected
+    for offset in (len(expected), len(expected) + 100):
+        page = repository.read_search(_READ_SEARCH, offset=offset, limit=limit, forms=forms)
+        assert page["hits"] == []
+        assert page["more"] is False
+        assert page["next_offset"] is None
+
+
+@pytest.mark.parametrize("hit_count", [0, 1, 6])
+def test_saved_search_storage_is_idempotent_and_immutable(tmp_path: Path, hit_count: int) -> None:
+    from app.research.repository import ResearchRepository
+
+    record = _seed_read_search_ledger(tmp_path, hits=_read_search_hits()[:hit_count])
+    repository = ResearchRepository(data_root=tmp_path)
+    for _ in range(3):
+        assert repository.save_search(dict(reversed(list(record.items())))) == _READ_SEARCH
+        repository = ResearchRepository(data_root=tmp_path)
+        assert repository.get_search(_READ_SEARCH) == _stored_record(record)
+    for changed in (
+        {**record, "query": "Different question"},
+        {**record, "hits": [{"accession_no": "different", "form": "10-K/A"}]},
+        {**record, "source_exhausted": True},
+        {**record, "coverage": {"status": "complete"}},
+    ):
+        with pytest.raises(ValueError, match="conflicting search_id"):
+            repository.save_search(changed)
+        assert ResearchRepository(data_root=tmp_path).get_search(_READ_SEARCH) == _stored_record(record)
+    with pytest.raises(KeyError, match="unknown search_id"):
+        repository.get_search("missing-search")
+    with pytest.raises(KeyError, match="unknown search_id"):
+        repository.read_search("missing-search")
+
+
+def test_saved_search_defaults_and_validation_contract(tmp_path: Path) -> None:
+    """The stored-search reader pins its page defaults and its error messages."""
+    from app.research.repository import ResearchRepository
+
+    record = _seed_read_search_ledger(tmp_path, hits=_read_search_hits())
+    repository = ResearchRepository(data_root=tmp_path)
+    stored = _stored_hits(record)
+
+    page = repository.read_search(_READ_SEARCH)
+    assert page["offset"] == 0
+    assert page["limit"] == 50
+    assert [hit["accession_no"] for hit in _as_seq(page["hits"])] == [hit["accession_no"] for hit in stored]
+
+    offset_error = "search offset must be an integer >= 0"
+    for bad_offset in (-1, 1.5, True):
+        with pytest.raises(ValueError) as offset_exc:
+            repository.read_search(_READ_SEARCH, offset=cast("int", bad_offset))
+        assert str(offset_exc.value) == offset_error
+    limit_error = "search limit must be an integer from 1 to 500"
+    for bad_limit in (0, 501, 0.5, True, "5"):
+        with pytest.raises(ValueError) as limit_exc:
+            repository.read_search(_READ_SEARCH, limit=cast("int", bad_limit))
+        assert str(limit_exc.value) == limit_error
+
+    search_id_error = "<research.sqlite>: search: 'search_id' must be a non-empty string"
+    for bad_search_id in ("", 123):
+        with pytest.raises(ValueError) as search_id_exc:
+            repository.save_search({**record, "search_id": bad_search_id})
+        assert str(search_id_exc.value) == search_id_error
+    for key in ("request", "scope", "coverage"):
+        with pytest.raises(TypeError) as object_exc:
+            repository.save_search({**record, key: "not-an-object"})
+        assert str(object_exc.value) == f"<research.sqlite>: search: {key!r} must be an object"
+    with pytest.raises(TypeError) as hits_exc:
+        repository.save_search({**record, "hits": {"accession_no": "x"}})
+    assert str(hits_exc.value) == "<research.sqlite>: search: 'hits' must contain objects"
+    # Hits must be a list or tuple: another iterable of mappings still fails the contract.
+    with pytest.raises(TypeError) as values_exc:
+        repository.save_search({**record, "hits": {"a": {"accession_no": "x"}}.values()})
+    assert str(values_exc.value) == "<research.sqlite>: search: 'hits' must contain objects"
+    for key in ("pagination_complete", "source_exhausted"):
+        with pytest.raises(TypeError) as bool_exc:
+            repository.save_search({**record, key: "yes"})
+        assert str(bool_exc.value) == f"<research.sqlite>: search: {key!r} must be a boolean"
+    with pytest.raises(ValueError) as json_exc:
+        repository.save_search({**record, "coverage": {"status": object()}})
+    assert str(json_exc.value) == "<research.sqlite>: search: not a JSON value, got object"
+
+    with repository._connect() as conn:
+        conn.execute("INSERT INTO searches (search_id, record) VALUES (?, ?)", ("s-corrupt", "[1, 2]"))
+    with pytest.raises(ValueError) as corrupt_exc:
+        repository.get_search("s-corrupt")
+    assert str(corrupt_exc.value) == "<research.sqlite>: search: must be a mapping, got list"
+
+
+@pytest.mark.parametrize("offset", [6, 100])
+def test_research_read_search_offset_boundaries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offset: int) -> None:
+    context = _read_search_context(tmp_path, monkeypatch)
+    _seed_read_search_ledger(tmp_path, hits=_read_search_hits())
+    session_id = _seed_research_session(tmp_path)
+    page = _read(context, {"session_id": session_id, "search_id": _READ_SEARCH, "offset": offset})
+    assert page["hits"] == []
+    assert page["total"] == 6
+    assert page["offset"] == offset
+    assert page["more"] is False
+    assert page["next_offset"] is None
+
+
+def test_direct_search_returns_persisted_session_for_later_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A direct search creates a session; its search reads survive a repository restart."""
+    from app.research.repository import ResearchRepository
+
+    context = _read_search_context(tmp_path, monkeypatch)
+    _patch_discovery(monkeypatch, _result(text_hits=_read_search_hits()))
+    packet = tools.execute_tool("search_sec_filings", {"query": "Acme Labs", "limit": 2}, "test", context=context)
+    session_id = packet["session_id"]
+    assert isinstance(session_id, str) and session_id
+    assert packet["search_id"] == "s1"
+    assert packet["total"] == 6
+    assert packet["offset"] == 0
+    assert packet["limit"] == 2
+    assert packet["more"] is True
+    assert packet["next_offset"] == 2
+    assert len(_as_seq(packet["hits"])) == 2
+    fresh = ResearchRepository(data_root=tmp_path)
+    assert fresh.get_session(str(session_id)) is not None
+    page = tools.execute_tool(
+        "research_read_search",
+        {"session_id": session_id, "search_id": "s1", "offset": 2, "limit": 4},
+        "test",
+        context=context,
+    )
+    assert [hit["accession_no"] for hit in _as_seq(page["hits"])] == [
+        hit.accession_no for hit in _read_search_hits()[2:]
+    ]
+    assert page["total"] == 6
+    assert page["session_id"] == session_id
+    stored_coverage = _as_dict(page["coverage"])
+    live_coverage = _as_dict(packet["coverage"])
+    assert json.loads(json.dumps(live_coverage)) == stored_coverage
+    assert stored_coverage["status"] == "partial"
+    assert list(stored_coverage["pending_backfill_jobs"]) == ["job-1"]
+
+
+def test_direct_search_reuses_live_context_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An attached context session is reused, never duplicated per search."""
+    session_id = _seed_research_session(tmp_path)
+    context = RequestContext(
+        "research",
+        frozenset({Capability.RESEARCH}),
+        data_root=tmp_path,
+        research_session_id=session_id,
+    )
+    _patch_discovery(monkeypatch, _result(text_hits=_read_search_hits()))
+    packet = tools.execute_tool("search_sec_filings", {"query": "Acme Labs"}, "test", context=context)
+    assert packet["session_id"] == session_id
+    page = tools.execute_tool(
+        "research_read_search", {"session_id": session_id, "search_id": "s1"}, "test", context=context
+    )
+    assert page["total"] == 6
+
+
+def test_find_sec_entities_returns_persisted_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Entity discovery also carries a readable persisted session."""
+    context = _read_search_context(tmp_path, monkeypatch)
+    _entity_search_seam(monkeypatch)
+    packet = tools.execute_tool("find_sec_entities", {"query": "Acme Labs"}, "test", context=context)
+    session_id = packet["session_id"]
+    assert isinstance(session_id, str) and session_id
+    page = tools.execute_tool(
+        "research_read_search", {"session_id": session_id, "search_id": packet["search_id"]}, "test", context=context
+    )
+    assert page["session_id"] == session_id
+    assert page["total"] == 0
 
 
 def test_search_sec_filings_remainder_names_read_search(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2208,6 +2489,40 @@ def test_diff_sec_filings_rejects_date_like_forms_before_provider(monkeypatch: p
     )
     assert result["error_type"] == "invalid_tool_arguments"
     assert "2025-01-01" in str(result["error"])
+
+
+@pytest.mark.parametrize("form", ["10-K/A", "SC 13D/A", "DEF 14A"])
+@pytest.mark.parametrize("single_string", [False, True])
+def test_search_sec_filings_preserves_valid_forms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, form: str, single_string: bool
+) -> None:
+    context = _read_search_context(tmp_path, monkeypatch)
+    seen = _discovery_search_seam(monkeypatch)
+    result = tools.execute_tool(
+        "search_sec_filings",
+        {"query": "Acme Labs", "forms": form if single_string else [form]},
+        "test",
+        context=context,
+    )
+    assert "error" not in result, result
+    assert seen["request"].forms == (form,)
+
+
+@pytest.mark.parametrize("invalid_form", ["Acme Labs Incorporated", "2025-01-01", "2020"])
+@pytest.mark.parametrize("tool_name", ["list_sec_filings", "search_sec_filings"])
+def test_sec_tools_reject_non_forms_before_provider(
+    monkeypatch: pytest.MonkeyPatch, invalid_form: str, tool_name: str
+) -> None:
+    def _boom(*args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("invalid forms must not reach the provider")
+
+    monkeypatch.setattr(tools.sec, "list_sec_filings", _boom)
+    monkeypatch.setattr(tools.sec, "SECDiscoveryService", _boom)
+    arguments: dict[str, object] = {"forms": [invalid_form]}
+    arguments["identifier" if tool_name == "list_sec_filings" else "query"] = "NVDA"
+    result = tools.execute_tool(tool_name, arguments, "test", context=_research_context())
+    assert result["error_type"] == "invalid_tool_arguments"
+    assert invalid_form in str(result["error"])
 
 
 def test_list_sec_filings_valid_forms_reach_provider(monkeypatch: pytest.MonkeyPatch) -> None:

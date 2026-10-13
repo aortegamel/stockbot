@@ -7184,3 +7184,59 @@ def test_write_bundle_propagates_evidence_failure(tmp_path: Path, monkeypatch: p
     monkeypatch.setattr("app.research.evidence.evidence_from_dict", _corrupt)
     with pytest.raises(ValueError, match="corrupt row"):
         run._bundle_evidence_entries(sid)
+
+
+def test_session_preserves_original_question_text() -> None:
+    """Original question text survives session creation without ticker prefixes."""
+    session = _session.create_session("What time is it now?", "What time is it now?", ticker="NVDA")
+    stored = session.to_dict()
+    assert stored["query"] == "What time is it now?"
+    assert stored["objective"] == "What time is it now?"
+    assert stored["ticker"] == "NVDA"
+    assert _session.create_session("q?", "q?").to_dict()["ticker"] is None
+    round_tripped = _session.ResearchSession.from_dict(stored, "<test>")
+    assert round_tripped.ticker == "NVDA"
+
+
+def test_needle_execution_context_excludes_raw_evidence() -> None:
+    """Scheduler Needle context carries anchors and grounded values, never session evidence."""
+    import asyncio as _asyncio
+
+    from app.research import scheduler as _sched
+
+    seen: dict[str, object] = {}
+
+    async def _generate(**kwargs: object) -> dict[str, object]:
+        seen.update(kwargs)
+        return {"tool": "list_sec_filings", "arguments": {"identifier": "ORCL"}, "reasoning": "", "withheld": False}
+
+    session: dict[str, JSONValue] = {
+        "session_id": "sched-boundary",
+        "objective": "What is ORCL's filing history?",
+        "query": "What is ORCL's filing history?",
+        "temporal_scope": {"mode": "latest-available", "raw": "filing history"},
+    }
+    registry: list[dict[str, JSONValue]] = [
+        {"name": "list_sec_filings", "parameters": {"type": "object", "properties": {"identifier": {"type": "string"}}}}
+    ]
+    filled, _, _ = _asyncio.run(
+        _sched._generate_tool_arguments(
+            _generate,
+            "list_sec_filings",
+            registry,
+            session,
+            {"node_id": "n1", "question": "What is ORCL's filing history?"},
+            [{"evidence_id": "EV-1", "content": "oversized raw bytes"}],
+            [{"tool": "list_sec_filings", "error": "boom", "outcome_summary": "raw attempt bytes"}],
+            None,
+            _sched._default_kernel(),
+        )
+    )
+    assert filled["identifier"] == "ORCL"
+    context = seen["context"]
+    assert isinstance(context, dict)
+    assert set(context) <= {"as_of", "temporal_scope", "today_utc", "ticker", "grounded_arguments"}
+    assert "evidence" not in context and "attempts" not in context and "grounding_hint" not in context
+    assert context["ticker"] == "ORCL"
+    assert context["temporal_scope"] == {"mode": "latest-available"}
+    assert context["grounded_arguments"] == {"identifier": "ORCL"}

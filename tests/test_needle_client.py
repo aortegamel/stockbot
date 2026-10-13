@@ -168,6 +168,76 @@ def test_embed_round_trip_rejects_blank(worker: None) -> None:
     assert _FakeProc.instances == []
 
 
+def test_generate_arguments_transmits_only_execution_inputs(worker: None) -> None:
+    """generateArguments sends request metadata plus explicit arguments; raw records never enter."""
+    marker = "MARKER-" + "x" * 4096
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"identifier": {"type": "string"}, "ticker": {"type": "string"}, "tags": {"type": "array"}},
+    }
+    out = nc.generate_arguments(
+        tool="list_sec_filings",
+        schema=schema,
+        objective="objective text",
+        node={
+            "question": "What ticker?",
+            "node_id": "n1",
+            "id": "i1",
+            "type": "t",
+            "evidence": [marker],
+            "attempts": [marker],
+            "feedback": marker,
+            "intake": marker,
+            "reasoning": marker,
+        },
+        context={
+            "as_of": "2026-01-01",
+            "today_utc": "2026-10-12",
+            "ticker": "AAPL",
+            "temporal_scope": {
+                "mode": "latest-available",
+                "as_of": "2026-01-01",
+                "start": "2026-01-01",
+                "end": "2026-02-01",
+                "raw": marker,
+            },
+            "grounded_arguments": {
+                "identifier": "AAPL",
+                "ticker": "AAPL",
+                "tags": ["a", 1, None],
+                "nested": {"a": 1},
+                "evil": marker,
+            },
+            "evidence": [{"evidence_id": "ev-1", "content": marker}],
+            "attempts": [{"result": marker}],
+            "grounding_hint": "do not send",
+            "feedback": marker,
+            "intake": marker,
+            "reasoning": marker,
+        },
+    )
+    assert out["tool"] == "list_sec_filings"
+    proc = _FakeProc.instances[0]
+    sent: object = json.loads(proc.written[-1])
+    assert isinstance(sent, dict)
+    assert set(sent) == {"id", "action", "tool", "schema", "objective", "node", "context"}
+    assert sent["node"] == {"question": "What ticker?", "node_id": "n1", "id": "i1", "type": "t"}
+    assert sent["context"] == {
+        "as_of": "2026-01-01",
+        "today_utc": "2026-10-12",
+        "ticker": "AAPL",
+        "temporal_scope": {
+            "mode": "latest-available",
+            "as_of": "2026-01-01",
+            "start": "2026-01-01",
+            "end": "2026-02-01",
+        },
+        "grounded_arguments": {"identifier": "AAPL", "ticker": "AAPL", "tags": ["a", 1, None]},
+    }
+    assert marker not in json.dumps(sent, ensure_ascii=False)
+    assert "do not send" not in json.dumps(sent, ensure_ascii=False)
+
+
 def test_start_ping_then_two_calls_reuse_one_process(worker: None) -> None:
     nc.start()
     nc.start()
@@ -885,50 +955,70 @@ def test_generate_withheld_accept_and_timeout(monkeypatch: pytest.MonkeyPatch) -
     _FakeProc.behavior = "echo"
 
 
-def test_evidence_fact_keeps_block_and_all_remaining_fields(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """One SDK evidence fact keeps the shared block and every non-block field."""
+def test_arguments_facts_keep_only_execution_inputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Bound facts keep request metadata plus explicit arguments; raw records never bind."""
     srv = _load_server(monkeypatch, tmp_path)
-    record = {
-        "evidence_id": "ev-1",
-        "content": "Total revenue: 12.5%\u00a0of FY26 — see Note 9.",
-        "content_hash": "h1",
-        "provenance": "SEC",
-        "claim_text": "Total revenue: 12.5%",
-        "subject": "NVDA",
-    }
-    facts = srv._evidence_facts([record])
-    assert len(facts) == 1
-    assert facts[0].startswith("[GROUNDED evidence_id=ev-1]")
-    assert "Total revenue: 12.5%\u00a0of FY26 — see Note 9." in facts[0]
-    assert json.loads(facts[0].rsplit(" evidence[0] extra: ", 1)[1]) == {
-        "claim_text": "Total revenue: 12.5%",
-        "subject": "NVDA",
-    }
-
-
-def test_evidence_facts_keep_observation_entries_current_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Observation summaries keep full JSON and never carry the grounded label."""
-    srv = _load_server(monkeypatch, tmp_path)
-    observation = {
-        "tool": "list_sec_filings",
-        "outcome_summary": "timed out",
-        "error": "TimeoutError",
-    }
-    facts = srv._evidence_facts([observation])
-    assert facts == [json.dumps(observation, ensure_ascii=False)]
-
-
-def test_arguments_facts_routes_evidence_and_excludes_hint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Wired SDK facts reuse grounded evidence and still exclude wrapper instructions."""
-    srv = _load_server(monkeypatch, tmp_path)
-    record = {"evidence_id": "ev-1", "content": "12.5%", "claim_text": "12.5%"}
+    marker = "MARKER-" + "x" * 4096
+    schema: dict[str, object] = {"type": "object", "properties": {"identifier": {}, "ticker": {}, "tags": {}}}
     text = srv._arguments_facts(
         "objective",
-        {"question": "q", "node_id": "n1"},
-        {"evidence": [record], "grounding_hint": "do not send"},
+        {
+            "question": "q",
+            "node_id": "n1",
+            "id": "i1",
+            "type": "t",
+            "evidence": [marker],
+            "attempts": [marker],
+            "feedback": marker,
+            "intake": marker,
+            "reasoning": marker,
+        },
+        {
+            "as_of": "2026-01-01",
+            "today_utc": "2026-10-12",
+            "ticker": "AAPL",
+            "temporal_scope": {
+                "mode": "latest-available",
+                "as_of": "2026-01-01",
+                "start": "2026-01-01",
+                "end": "2026-02-01",
+                "raw": marker,
+            },
+            "grounded_arguments": {
+                "identifier": "AAPL",
+                "ticker": "AAPL",
+                "tags": ["a", 1, None],
+                "nested": {"a": 1},
+                "evil": marker,
+            },
+            "evidence": [{"evidence_id": "ev-1", "content": marker}],
+            "attempts": [{"result": marker}],
+            "grounding_hint": "do not send",
+            "feedback": marker,
+            "intake": marker,
+            "reasoning": marker,
+        },
+        schema,
     )
-    assert "[GROUNDED evidence_id=ev-1]" in text
-    assert "do not send" not in text
+    assert "node node_id: n1" in text and "node id: i1" in text and "node type: t" in text
+    assert "as_of: 2026-01-01" in text and "ticker: AAPL" in text
+    assert "temporal_scope mode: latest-available" in text and "temporal_scope start: 2026-01-01" in text
+    assert "argument identifier: AAPL" in text and "argument tags:" in text
+    assert marker not in text and "do not send" not in text
+    assert "evidence" not in text and "attempt" not in text
+
+
+def test_arguments_facts_reject_nonfinite_and_nested_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """NaN, Infinity, mappings, and off-schema values never bind as Needle facts."""
+    srv = _load_server(monkeypatch, tmp_path)
+    schema = {"type": "object", "properties": {"count": {"type": "integer"}, "rows": {"type": "array"}}}
+    text = srv._arguments_facts(
+        "objective",
+        {"node_id": "n1"},
+        {"grounded_arguments": {"count": float("nan"), "rows": [{"a": 1}], "evil": "x"}},
+        schema,
+    )
+    assert "argument count" not in text and "argument rows" not in text and "evil" not in text
 
 
 def test_handle_passes_raw_request_text_to_complete(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

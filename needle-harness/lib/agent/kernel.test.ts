@@ -1,6 +1,8 @@
 import { describe, expect, setSystemTime, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import fc from "fast-check";
-import { applyFinalGates, inventoryDefect, KernelRouter, REQUEST_WALL_MS, runKernelAgent, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
+import { applyFinalGates, inventoryDefect, KernelRouter, parseTicker, REQUEST_WALL_MS, runKernelAgent, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
 import { FINAL_PERSONAS, type AgentEvent, type Evidence, type FinalClaim, type Metrics, type Persona } from "./types";
 
 class FakeChild implements KernelChild {
@@ -76,6 +78,31 @@ function markerOf(res: object): unknown {
   if ("marker" in res) return res.marker;
   throw new Error("response missing marker");
 }
+
+describe("parseTicker", () => {
+  test("valid tickers trim and uppercase", () => {
+    const valid: [string, string][] = [
+      ["nvda", "NVDA"],
+      [" brk.b ", "BRK.B"],
+      ["RDS-A", "RDS-A"],
+      ["\tmsft\n", "MSFT"],
+      ["a", "A"],
+      ["abcdefghij", "ABCDEFGHIJ"],
+      ["x1", "X1"],
+    ];
+    for (const [input, out] of valid) expect(parseTicker(input)).toBe(out);
+  });
+
+  test("non-strings, blanks, organizations, and bad shapes drop to undefined", () => {
+    const invalid: unknown[] = [
+      undefined, null, 7, true, ["NVDA"], { ticker: "NVDA" },
+      "", "   ",
+      "SEC", "sec", "FINRA", "NYSE", "NASDAQ", "OTC", "EDGAR", "SHO", "REG", " reg ",
+      "ABCDEFGHIJK", "1AB", "AB CD", "A-B-C-D-E-F-G-H-I-J-K", "NVDA!", ".AB", "-AB", "AB/C",
+    ];
+    for (const v of invalid) expect(parseTicker(v)).toBeUndefined();
+  });
+});
 
 describe("KernelRouter", () => {
   test("two sequential calls share one spawn with distinct correlated IDs", async () => {
@@ -369,12 +396,17 @@ describe("runKernelAgent final personas", () => {
     personas?: readonly Persona[];
     deadlineAt?: number;
     signal?: AbortSignal;
-  }): Promise<{ events: AgentEvent[]; calls: Call[]; bodies: Record<string, unknown>[]; gates: Record<string, unknown>[]; maxInFlight: number; runTimeouts: (number | undefined)[] }> {
+    ticker?: string;
+    // Injects only spawnFn+reason so the router falls back to its default python/worker path.
+    spawnOnly?: boolean;
+  }): Promise<{ events: AgentEvent[]; calls: Call[]; bodies: Record<string, unknown>[]; gates: Record<string, unknown>[]; maxInFlight: number; runTimeouts: (number | undefined)[]; spawns: { cmd: string; args: string[] }[] }> {
     process.env.OPENCODE_MODEL = "test-model";
     const bodies: Record<string, unknown>[] = [];
     const gates: Record<string, unknown>[] = [];
     const gateFn = opts.gate;
-    const spawn: KernelSpawn = (): KernelChild => {
+    const spawns: { cmd: string; args: string[] }[] = [];
+    const spawn: KernelSpawn = (cmd, args): KernelChild => {
+      spawns.push({ cmd, args });
       const c = new FakeChild();
       const innerReply = opts.reply ?? ((_p: boolean, id: string) => graphReply(id));
       // bodies.at(-1) is the run body being answered: it records before the reply.
@@ -420,9 +452,9 @@ describe("runKernelAgent final personas", () => {
           ...(opts.deadlineAt !== undefined ? { deadlineAt: opts.deadlineAt } : {}),
           ...(opts.personas ? { personas: opts.personas } : {}),
           ...(opts.signal ? { signal: opts.signal } : {}),
+          ...(opts.ticker !== undefined ? { ticker: opts.ticker } : {}),
           deps: {
-            python: "py",
-            workerPath: "w",
+            ...(opts.spawnOnly ? {} : { python: "py", workerPath: "w" }),
             spawnFn: spawn,
             reason: async (o) => {
               const key = `${pass}:${o.persona}`;
@@ -450,7 +482,7 @@ describe("runKernelAgent final personas", () => {
     } finally {
       KernelRouter.prototype.call = realCall;
     }
-    return { events, calls, bodies, gates, maxInFlight, runTimeouts };
+    return { events, calls, bodies, gates, maxInFlight, runTimeouts, spawns };
   }
   const answers = (events: AgentEvent[]): string[] => events.flatMap((e) => (e.type === "answer_delta" ? [e.text] : []));
   const doneMetrics = (events: AgentEvent[]): Metrics => {
@@ -1139,6 +1171,104 @@ describe("runKernelAgent final personas", () => {
     expect(failedCategory(events)).toBe("provider_error");
   });
 
+  test("selected ticker rides every run body with the prompt verbatim", async () => {
+    const { bodies } = await runFinal({ ticker: "nvda" });
+    const runs = runBodies(bodies);
+    expect(runs.length).toBe(1);
+    expect(runs[0]?.prompt).toBe("q");
+    expect(runs[0]?.ticker).toBe("NVDA");
+  });
+
+  test("selected ticker survives a same-session gap follow-up", async () => {
+    const { bodies } = await runFinal({
+      ticker: "nvda",
+      decide: (p, pass) => (pass === 1 && p === "bullbot" ? { missingEvidence: "need doc X" } : {}),
+    });
+    const runs = runBodies(bodies);
+    expect(runs.length).toBe(2);
+    for (const run of runs) expect(run.ticker).toBe("NVDA");
+    expect(runs[0]?.prompt).toBe("q");
+  });
+
+  test("invalid ticker drops from the run body", async () => {
+    const { bodies } = await runFinal({ ticker: "SEC" });
+    const runs = runBodies(bodies);
+    expect(runs.length).toBe(1);
+    expect(runs[0]?.prompt).toBe("q");
+    expect("ticker" in (runs[0] ?? {})).toBe(false);
+  });
+
+  test("absent or invalid ticker never rides the first or follow-up run body", async () => {
+    for (const ticker of [undefined, "SEC", "1AB"]) {
+      const { bodies } = await runFinal({
+        ...(ticker !== undefined ? { ticker } : {}),
+        decide: (p, pass) => (pass === 1 && p === "bullbot" ? { missingEvidence: "need doc X" } : {}),
+      });
+      const runs = runBodies(bodies);
+      expect(runs.length).toBe(2);
+      expect(runs[0]?.prompt).toBe("q");
+      expect(runs[1]?.prompt).toBe("q\nStill missing: need doc X");
+      for (const run of runs) expect("ticker" in run).toBe(false);
+    }
+  });
+
+  test("follow-up run body keeps op, prompt, and deadline beside the ticker", async () => {
+    const { bodies } = await runFinal({
+      ticker: " brk.b ",
+      decide: (p, pass) => (pass === 1 && p === "bullbot" ? { missingEvidence: "need doc X" } : {}),
+    });
+    const runs = runBodies(bodies);
+    expect(runs.length).toBe(2);
+    expect(runs[1]?.op).toBe("run");
+    expect(runs[1]?.prompt).toBe("q\nStill missing: need doc X");
+    expect(typeof runs[1]?.deadlineAt).toBe("number");
+    for (const run of runs) expect(run.ticker).toBe("BRK.B");
+  });
+
+  test("default deadline sits one research wall in the future", async () => {
+    const before = Date.now();
+    const { bodies, runTimeouts } = await runFinal({});
+    const after = Date.now();
+    const first = Number(runBodies(bodies)[0]?.deadlineAt);
+    expect(first).toBeGreaterThanOrEqual(before + REQUEST_WALL_MS);
+    expect(first).toBeLessThanOrEqual(after + REQUEST_WALL_MS);
+    expect(runTimeouts[0]).toBeGreaterThan(REQUEST_WALL_MS - 5_000);
+  });
+
+  test("injected python and worker path reach the spawner", async () => {
+    const { spawns } = await runFinal({});
+    expect(spawns.length).toBe(1);
+    expect(spawns[0]).toEqual({ cmd: "py", args: ["w"] });
+  });
+
+  test("spawner-only deps use the injected spawner with the real repo worker", async () => {
+    const { spawns, bodies } = await runFinal({ spawnOnly: true });
+    expect(spawns.length).toBe(1);
+    expect(runBodies(bodies).length).toBe(1);
+    const worker = spawns[0]?.args[0] ?? "";
+    expect(worker.endsWith(join("app", "research", "kernel_worker.py"))).toBe(true);
+    expect(existsSync(worker)).toBe(true);
+    const python = spawns[0]?.cmd ?? "";
+    expect(python === "python3" || python.endsWith(join("bin", "python"))).toBe(true);
+  });
+
+  test("worker progress reaches the stream with detail only when the worker sent one", async () => {
+    const progressLines = (id: string): string =>
+      `${JSON.stringify({ type: "progress", id, stage: "p_bare" })}\n${JSON.stringify({ type: "progress", id, stage: "p_detail", detail: { calls: 3 } })}\n`;
+    const { events } = await runFinal({
+      reply: (_p, id) => progressLines(id) + graphReply(id),
+      decide: (p, pass) => (pass === 1 && p === "bullbot" ? { missingEvidence: "need doc X" } : {}),
+    });
+    const progress = events.filter((e) => e.type === "progress" && (e.stage === "p_bare" || e.stage === "p_detail"));
+    // Two runs (first + follow-up), each relaying both lines.
+    expect(progress.length).toBe(4);
+    for (const e of progress) {
+      if (e.type !== "progress") throw new Error("expected progress");
+      if (e.stage === "p_bare") expect("detail" in e).toBe(false);
+      else expect(e.detail).toEqual({ calls: 3 });
+    }
+  });
+
   test("applyFinalGates treats worker error as reject and deletes surgically", async () => {
     const ev = [{ id: "ev:1", source: "kernel", retrievedAt: "t", content: "fact" }];
     const gated = await applyFinalGates({
@@ -1147,7 +1277,9 @@ describe("runKernelAgent final personas", () => {
       personaOrder: ["bearbot"],
       gate: async (body) => {
         if (body.op === "assess_final_response") return { error: "boom" };
-        return (body.claim as Record<string, unknown>).text === "KEEP" ? { support_answer: "yes" } : { error: "boom" };
+        const claim = body.claim;
+        const text = claim && typeof claim === "object" && "text" in claim ? claim.text : undefined;
+        return text === "KEEP" ? { support_answer: "yes" } : { error: "boom" };
       },
     });
     if (!("text" in gated)) throw new Error("expected gated text");

@@ -1,5 +1,5 @@
 import { reason } from "@/lib/muse/client";
-import { kernelRouter, REQUEST_WALL_MS, runKernelAgent, type KernelResponse } from "@/lib/agent/kernel";
+import { kernelRouter, parseTicker, REQUEST_WALL_MS, runKernelAgent, type KernelResponse } from "@/lib/agent/kernel";
 import { tools } from "@/lib/tools";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
 import { FINAL_PERSONAS, redactArgs, sourceReferences, type AgentEvent, type Evidence, type FailureCategory, type Persona } from "@/lib/agent/types";
@@ -19,8 +19,9 @@ function parsePersonas(v: unknown): Persona[] | null | undefined {
 export async function POST(req: Request): Promise<Response> {
   const deadlineAt = Date.now() + REQUEST_WALL_MS;
   let prompt: unknown;
+  let ticker: unknown;
   try {
-    ({ prompt } = await req.json());
+    ({ prompt, ticker } = await req.json());
   } catch {
     console.error("[web] [agent-api] invalid JSON");
     return Response.json({ error: "invalid JSON" }, { status: 400 });
@@ -29,6 +30,9 @@ export async function POST(req: Request): Promise<Response> {
     console.error("[web] [agent-api] prompt required");
     return Response.json({ error: "prompt required" }, { status: 400 });
   }
+  // Validated ticker channel beside the verbatim prompt; invalid values drop (prompt never changes).
+  const parsedTicker = parseTicker(ticker);
+  const tickerField = parsedTicker !== undefined ? { ticker: parsedTicker } : {};
   console.log(`[web] [agent-api] POST prompt_chars=${prompt.length}`);
   const stream = new ReadableStream({
     async start(controller) {
@@ -116,7 +120,7 @@ export async function POST(req: Request): Promise<Response> {
           let args: Record<string, unknown>;
           let confidence: number | null = null;
           try {
-            const gen = await kernelRouter.call({ op: "arguments", tool, objective: prompt }, { signal: req.signal });
+            const gen = await kernelRouter.call({ op: "arguments", tool, objective: prompt, ...tickerField }, { signal: req.signal });
             if (typeof gen.error === "string" && gen.error) return false;
             if (gen.tool !== tool || typeof gen.arguments !== "object" || gen.arguments === null) return false;
             args = gen.arguments as Record<string, unknown>;
@@ -157,7 +161,7 @@ export async function POST(req: Request): Promise<Response> {
           let verdict: string;
           try {
             const assessed = await kernelRouter.call(
-              { op: "assess_entry", prompt, tool, arguments: args, result: outcome },
+              { op: "assess_entry", prompt, tool, arguments: args, result: outcome, ...tickerField },
               { signal: req.signal },
             );
             verdict = typeof assessed.verdict === "string" && assessed.verdict ? assessed.verdict : "research_required";
@@ -187,7 +191,7 @@ export async function POST(req: Request): Promise<Response> {
       let routed: KernelResponse | undefined;
       let routeError = "route_invalid: malformed route selection";
       try {
-        routed = await kernelRouter.call({ op: "route", prompt }, { signal: req.signal });
+        routed = await kernelRouter.call({ op: "route", prompt, ...tickerField }, { signal: req.signal });
         if (typeof routed.error === "string" && routed.error) routeError = routed.error;
       } catch (err) {
         routeError = err instanceof Error ? err.message : String(err);
@@ -222,7 +226,7 @@ export async function POST(req: Request): Promise<Response> {
         }
       }
       try {
-        await runKernelAgent(prompt, send, { signal: req.signal, seedEvidence: singleShotEvidence, deadlineAt, ...(personas ? { personas } : {}) });
+        await runKernelAgent(prompt, send, { signal: req.signal, seedEvidence: singleShotEvidence, deadlineAt, ...(personas ? { personas } : {}), ...tickerField });
       } catch (err) {
         console.error(`[web] [agent-api] runKernelAgent error: ${err instanceof Error ? err.message : String(err)}`);
         send({ type: "error", message: err instanceof Error ? err.message : String(err) });

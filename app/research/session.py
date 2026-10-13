@@ -18,6 +18,7 @@ from .models import (
     resolve_temporal_scope,
     utcnow,
     validate_json_mapping,
+    validate_ticker,
 )
 
 __all__ = [
@@ -90,6 +91,7 @@ def create_session(
     policy: Mapping[str, object] | None = None,
     budget: dict[str, JSONValue] | None = None,
     temporal: str | None = None,
+    ticker: str | None = None,
 ) -> ResearchSession:
     """Create a validated session in CREATED; persists source_policy + temporal_scope.
 
@@ -120,6 +122,7 @@ def create_session(
         budget=validate_json_mapping(budget, "<session>: 'budget'") if budget is not None else default_budget(),
         source_policy=resolve_source_policy(checked_policy),
         temporal_scope=temporal_scope,
+        ticker=validate_ticker(ticker, "<session>: 'ticker'"),
     )
     session.validate("<session>")
     return session

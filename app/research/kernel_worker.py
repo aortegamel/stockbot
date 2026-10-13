@@ -1152,6 +1152,7 @@ def run_graph_prompt(
     jev: JevClient | None = None,
     progress: ProgressFn | None = None,
     setup_deadline: float | None = None,
+    ticker: str | None = None,
 ) -> str:
     """Shared graph entry: session + intake evidence + Reasoner proposals. Returns sid.
 
@@ -1177,7 +1178,7 @@ def run_graph_prompt(
     # ponytail: multi-source graph path (JEV selects over the whole registry);
     # SEC-only stays the default for narrow sessions created elsewhere.
     sid = service.create_research(
-        objective, objective, as_of=as_of, policy={"research_sources": {"mode": "all", "sources": []}}
+        objective, objective, as_of=as_of, policy={"research_sources": {"mode": "all", "sources": []}}, ticker=ticker
     )
     try:
         _notify(progress, "session", {"session_id": sid})
@@ -1245,6 +1246,44 @@ def _followup_gap_nodes(sid: str, gap: str) -> tuple[str, list[str]]:
     return sid, [node.node_id] if node.node_id else []
 
 
+def _request_ticker(req: Mapping[str, JSONValue], where: str = "<worker>") -> str | None:
+    """Validated ticker channel beside the verbatim prompt; None when absent."""
+    from app.research.models import validate_ticker as _validate
+
+    return _validate(req.get("ticker"), f"{where}: 'ticker'") if req.get("ticker") is not None else None
+
+
+def _needle_request_context(context: JSONValue, tool: str, objective: str, ticker: str | None) -> dict[str, JSONValue]:
+    """Approved Needle context only: as_of/temporal_scope/today_utc/ticker/grounded_arguments.
+
+    Raw evidence and attempts never cross; grounded ids derive outside Needle
+    from the repaired scheduler seed while full bytes stay durable for JEV.
+    """
+    from datetime import UTC, datetime
+
+    from app.research import scheduler as _sched
+
+    scoped: dict[str, JSONValue] = {}
+    if isinstance(context, dict):
+        raw_scope = context.get("temporal_scope")
+        if isinstance(raw_scope, dict):
+            scoped = _sched._needle_scope(raw_scope)
+        raw_as_of = context.get("as_of")
+        as_of = raw_as_of.strip() if isinstance(raw_as_of, str) and raw_as_of.strip() else None
+    else:
+        as_of = None
+    schema = _sched._schema_for(tool, _sched.build_registry())
+    out: dict[str, JSONValue] = {
+        "as_of": as_of,
+        "temporal_scope": scoped,
+        "today_utc": datetime.now(UTC).date().isoformat(),
+        "grounded_arguments": _sched._grounded_execution_values(tool, schema, objective),
+    }
+    if ticker is not None:
+        out["ticker"] = ticker
+    return out
+
+
 def _toolflow() -> str:
     """Normalized STOCKBOT_TOOLFLOW ("" = programmatic default)."""
     return (os.environ.get("STOCKBOT_TOOLFLOW") or "").strip().lower()
@@ -1262,12 +1301,16 @@ def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[s
     if not isinstance(prompt, str) or not prompt.strip():
         logger.info("toolflow route rid=%s route=research_required reason=blank-prompt", rid)
         return {"id": rid, "route": "research_required", "personas": None}
+    try:
+        ticker = _request_ticker(req)
+    except ValueError as exc:
+        logger.warning("toolflow route_deny rid=%s reason=bad-ticker", rid)
+        return {"id": rid, "error": str(exc)[:500] or "bad ticker"}
     hint: str | None = None
     if _toolflow() not in ("catalog", "full", "whole", "direct"):
         from app.research.programmatic_router import programmatic_route
 
-        hint = programmatic_route(prompt.strip())
-    logger.debug("toolflow route_entry rid=%s hint=%s prompt=%.200s", rid, hint or "-", prompt.strip())
+        hint = programmatic_route(prompt.strip(), ticker=ticker)
     try:
         client = jev if jev is not None else _shared_jev()
         routed = asyncio.run(client.route_entry(query_with_today_utc(prompt.strip()), route_hint=hint))
@@ -1375,6 +1418,11 @@ def _arguments(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         context: JSONValue = (
             validate_json_value(context_raw, "<arguments>: 'context'") if context_raw is not None else None
         )
+        try:
+            arg_ticker = _request_ticker(req)
+        except ValueError as exc:
+            return {"id": rid, "error": str(exc)[:500] or "bad ticker"}
+        context = _needle_request_context(context, tool, prompt, arg_ticker)
         generated: object = _shared_needle_generate()(
             tool=tool, schema=schema, objective=prompt, node=node, context=context
         )
@@ -1628,6 +1676,10 @@ def _run(
     prompt = req.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         return _terminal(rid, "invalid_params", "prompt required")
+    try:
+        run_ticker = _request_ticker(req)
+    except ValueError as exc:
+        return _terminal(rid, "invalid_params", str(exc)[:500] or "bad ticker")
     raw_as_of = req.get("asOf")
     as_of = raw_as_of if isinstance(raw_as_of, str) else None
     objective = prompt.strip()
@@ -1656,7 +1708,9 @@ def _run(
             return _terminal(rid, "provider_error", f"session setup failed: {exc}")
     else:
         try:
-            sid = run_graph_prompt(objective, as_of, jev=client, progress=progress, setup_deadline=setup_deadline)
+            sid = run_graph_prompt(
+                objective, as_of, jev=client, progress=progress, setup_deadline=setup_deadline, ticker=run_ticker
+            )
         except RuntimeError as exc:
             logger.exception("kernel session setup failed rid=%s", rid)
             if "registry guard forbids" in str(exc):

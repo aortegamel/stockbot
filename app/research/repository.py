@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   job_ids TEXT NOT NULL, evidence_ids TEXT NOT NULL,
   freeze_ids TEXT NOT NULL, dossier_ids TEXT NOT NULL,
   committee_runs TEXT NOT NULL, unresolved_questions TEXT NOT NULL,
-  targeted_question TEXT, targeted_domain TEXT,
+  targeted_question TEXT, targeted_domain TEXT, ticker TEXT,
   final_result TEXT, failure TEXT);
 CREATE TABLE IF NOT EXISTS jobs (
   job_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, wave_id INTEGER NOT NULL,
@@ -87,6 +87,8 @@ CREATE TABLE IF NOT EXISTS tool_results (
   tool_result_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, job_id TEXT NOT NULL,
   tool_name TEXT NOT NULL, created_at TEXT NOT NULL, record TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS ix_tool_results_session ON tool_results(session_id);
+CREATE TABLE IF NOT EXISTS searches (
+  search_id TEXT PRIMARY KEY, record TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS research_nodes (
   node_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
   created_at TEXT NOT NULL, record TEXT NOT NULL);
@@ -306,9 +308,9 @@ _SESSION_SQL = (
     "INSERT OR REPLACE INTO sessions (session_id, created_at, updated_at, query, objective,"
     " as_of, status, current_wave, policy, budget, source_policy, temporal_scope,"
     " job_ids, evidence_ids, freeze_ids,"
-    " dossier_ids, committee_runs, unresolved_questions, targeted_question, targeted_domain,"
+    " dossier_ids, committee_runs, unresolved_questions, targeted_question, targeted_domain, ticker,"
     " final_result, failure)"
-    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 _JOB_SQL = (
     "INSERT OR REPLACE INTO jobs (job_id, session_id, wave_id, parent_job_id, job_type, owner,"
@@ -349,6 +351,7 @@ def _session_params(session: ResearchSession) -> tuple[object, ...]:
         json.dumps(doc["unresolved_questions"], sort_keys=True),
         session.targeted_question,
         session.targeted_domain,
+        session.ticker,
         json.dumps(doc["final_result"], sort_keys=True) if session.final_result is not None else None,
         json.dumps(doc["failure"], sort_keys=True) if session.failure is not None else None,
     )
@@ -421,6 +424,38 @@ def _duplicate_evidence_error(
     return ValueError(f"{where}: duplicate identity_key {identity_key!r}")
 
 
+def _search_page_args(offset: object, limit: object) -> None:
+    """Page arguments must be plain integers inside the documented bounds."""
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("search offset must be an integer >= 0")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+        raise ValueError("search limit must be an integer from 1 to 500")
+
+
+_SEARCH_RECORD_FIELDS: tuple[tuple[str, type, str], ...] = (
+    ("request", Mapping, "an object"),
+    ("scope", Mapping, "an object"),
+    ("coverage", Mapping, "an object"),
+    ("pagination_complete", bool, "a boolean"),
+    ("source_exhausted", bool, "a boolean"),
+)
+
+
+def _validated_search_id(record: Mapping[str, object]) -> str:
+    """Search id plus the record contract: named objects and booleans, hits as objects."""
+    where = "<research.sqlite>: search"
+    search_id = record.get("search_id")
+    if not isinstance(search_id, str) or not search_id:
+        raise ValueError(f"{where}: 'search_id' must be a non-empty string")
+    for key, kind, label in _SEARCH_RECORD_FIELDS:
+        if not isinstance(record.get(key), kind):
+            raise TypeError(f"{where}: {key!r} must be {label}")
+    hits = record.get("hits")
+    if not isinstance(hits, (list, tuple)) or any(not isinstance(hit, Mapping) for hit in hits):
+        raise TypeError(f"{where}: 'hits' must contain objects")
+    return search_id
+
+
 class ResearchRepository:
     """Per-operation SQLite connections; no shared state.
 
@@ -437,7 +472,7 @@ class ResearchRepository:
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
         # ponytail: lazy ALTER for pre-targeted DBs; drop once all DBs migrate.
-        for col in ("targeted_question", "targeted_domain"):
+        for col in ("targeted_question", "targeted_domain", "ticker"):
             try:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT")
             except sqlite3.Error:
@@ -546,6 +581,7 @@ class ResearchRepository:
         names = set(row.keys())
         doc["targeted_question"] = row["targeted_question"] if "targeted_question" in names else None
         doc["targeted_domain"] = row["targeted_domain"] if "targeted_domain" in names else None
+        doc["ticker"] = row["ticker"] if "ticker" in names else None
         # ponytail: pre-policy rows carry NULL/blank columns; SEC default + session.as_of win.
         doc["source_policy"] = _session_policy_doc(names, row)
         doc["temporal_scope"] = _session_temporal_doc(names, row, doc["as_of"], _dts)
@@ -996,6 +1032,53 @@ class ResearchRepository:
                 (session_id,),
             ).fetchall()
         return [validate_json_mapping(json.loads(str(r["record"])), "<research.sqlite>: dossier") for r in rows]
+
+    def save_search(self, record: Mapping[str, object]) -> str:
+        """Persist every ranked hit and actual coverage. Identical writes are idempotent."""
+        where = "<research.sqlite>: search"
+        search_id = _validated_search_id(record)
+        encoded = _record_json(record, where)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO searches (search_id, record) VALUES (?, ?) ON CONFLICT(search_id) DO NOTHING",
+                (search_id, encoded),
+            )
+            row = conn.execute("SELECT record FROM searches WHERE search_id = ?", (search_id,)).fetchone()
+            if row is None or str(row["record"]) != encoded:
+                raise ValueError(f"{where}: conflicting search_id {search_id!r}")
+        return search_id
+
+    def get_search(self, search_id: str) -> dict[str, JSONValue]:
+        """Read the complete saved search. Unknown IDs raise KeyError."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT record FROM searches WHERE search_id = ?", (search_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"unknown search_id: {search_id!r}")
+        return validate_json_mapping(json.loads(str(row["record"])), "<research.sqlite>: search")
+
+    def read_search(
+        self, search_id: str, *, offset: int = 0, limit: int = 50, forms: tuple[str, ...] | None = None
+    ) -> dict[str, object]:
+        """Page saved hits in their original rank order. Filter forms before applying the offset."""
+        _search_page_args(offset, limit)
+        record = self.get_search(search_id)
+        stored_hits = record["hits"]
+        assert isinstance(stored_hits, list)
+        hits = [hit for hit in stored_hits if isinstance(hit, dict)]
+        if forms is not None:
+            selected = {form.strip().upper() for form in forms}
+            hits = [hit for hit in hits if str(hit.get("form") or "").strip().upper() in selected]
+        page = hits[offset : offset + limit]
+        more = offset + len(page) < len(hits)
+        return {
+            **record,
+            "total": len(hits),
+            "offset": offset,
+            "limit": limit,
+            "more": more,
+            "next_offset": offset + len(page) if more else None,
+            "hits": page,
+        }
 
     def save_coverage_artifact(self, record: Mapping[str, object]) -> str:
         """Insert one immutable coverage artifact (search scope + absence); duplicate ids raise ValueError.

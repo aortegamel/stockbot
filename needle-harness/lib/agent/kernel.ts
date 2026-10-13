@@ -19,12 +19,23 @@ const WORKER_TIMEOUT_MS = 10 * 60 * 1000;
 export const REQUEST_WALL_MS = 120_000;
 const PREWARM_TIMEOUT_MS = 30_000;
 
-// next dev runs with cwd=needle-harness; the repo root is its parent.
+// Bun host runs with cwd=needle-harness; the repo root is its parent.
 const ROOT = process.env.STOCKBOT_REPO_ROOT ?? join(process.cwd(), "..");
 const WORKER = join(ROOT, "app/research/kernel_worker.py");
 const VENV_PYTHON = `${homedir()}/.cache/needle-harness/.needle/bin/python`;
 // Stockbot kernel needs repo deps (dotenv, app.*); the needle-only venv lacks them.
 const REPO_PYTHON = join(ROOT, "venv/bin/python");
+const TICKER_RE = /^[A-Z][A-Z0-9.\-]{0,9}$/;
+const TICKER_ORG: Record<string, true> = { FINRA: true, SEC: true, NYSE: true, NASDAQ: true, OTC: true, EDGAR: true, SHO: true, REG: true };
+// Validated ticker channel beside the verbatim prompt; undefined when absent or invalid (dropped, never errors).
+export function parseTicker(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const t = v.trim().toUpperCase();
+  if (!t) return undefined;
+  if (TICKER_ORG[t]) return undefined;
+  if (t.length > 10 || !TICKER_RE.test(t)) return undefined;
+  return t;
+}
 
 type KernelEvidence = {
   id: string;
@@ -536,12 +547,14 @@ function graphProjection(input: {
 export async function runKernelAgent(
   prompt: string,
   emit: (e: AgentEvent) => void,
-  opts?: { signal?: AbortSignal; deadlineAt?: number; deps?: RunKernelDeps; seedEvidence?: Evidence[]; personas?: readonly Persona[] },
+  opts?: { signal?: AbortSignal; deadlineAt?: number; deps?: RunKernelDeps; seedEvidence?: Evidence[]; personas?: readonly Persona[]; ticker?: string },
 ): Promise<void> {
   const t0 = performance.now();
   const deps = opts?.deps ?? {};
   const reasonFn = deps.reason ?? reason;
   const deadlineAt = opts?.deadlineAt ?? Date.now() + REQUEST_WALL_MS;
+  const runTicker = parseTicker(opts?.ticker);
+  const runBody = (extra: Record<string, unknown>): Record<string, unknown> => ({ ...extra, ...(runTicker !== undefined ? { ticker: runTicker } : {}) });
   const hasWorkerDeps = deps.spawnFn !== undefined || deps.python !== undefined || deps.workerPath !== undefined;
   const router = hasWorkerDeps
     ? new KernelRouter({
@@ -578,7 +591,7 @@ export async function runKernelAgent(
   let res: KernelResponse;
   const workerStart = performance.now();
   try {
-    res = await router.call({ op: "run", prompt, deadlineAt }, { signal: opts?.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1), onProgress: (stage, detail) => emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage }) });
+    res = await router.call(runBody({ op: "run", prompt, deadlineAt }), { signal: opts?.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1), onProgress: (stage, detail) => emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage }) });
   } catch (err) {
     // ponytail: needle-down shape — worker failure still ends at done, never throws to the route.
     const msg = err instanceof Error ? err.message : String(err);
@@ -939,10 +952,10 @@ export async function runKernelAgent(
     // full session evidence visible. Old workers without sessionId keep the
     // legacy full-prompt call. The follow-up gets a fresh research wall.
     const followDeadlineAt = Date.now() + REQUEST_WALL_MS;
-    const followBody: Record<string, unknown> =
+    const followBody: Record<string, unknown> = runBody(
       typeof res.sessionId === "string" && res.sessionId
         ? { op: "run", prompt, sessionId: res.sessionId, gap, deadlineAt: followDeadlineAt }
-        : { op: "run", prompt: `${prompt}\nStill missing: ${gap}`, deadlineAt: followDeadlineAt };
+        : { op: "run", prompt: `${prompt}\nStill missing: ${gap}`, deadlineAt: followDeadlineAt });
     try {
       follow = await router.call(followBody, { signal: opts?.signal, timeoutMs: REQUEST_WALL_MS, onProgress: (stage, detail) => emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage }) });
     } catch (err) {

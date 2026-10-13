@@ -288,3 +288,22 @@ def test_grounded_block_keeps_content_past_2000_chars_for_citation():
         "numbers": [{"value": "12.5%", "evidenceId": "ev-long", "quote": quote}],
     }
     assert check_grounded_analysis(cited, {"ev-long"}, [record]) is cited
+
+
+def test_fabricated_identifier_and_quote_rejected() -> None:
+    """Needle must cite admitted ids with verbatim quotes; invented ids/quotes fail closed."""
+    record: JSONValue = {
+        "evidence_id": "ev-1",
+        "content": "Total revenue $10",
+        "content_hash": "h",
+        "provenance": "SEC",
+    }
+    forged_id: dict[str, object] = {"evidenceRefs": ["ev-9"], "numbers": []}
+    with pytest.raises(ValueError):
+        check_grounded_analysis(forged_id, {"ev-1"}, [record])
+    paraphrase: dict[str, object] = {
+        "evidenceRefs": ["ev-1"],
+        "numbers": [{"value": "$10", "evidenceId": "ev-1", "quote": "ten dollars somewhere"}],
+    }
+    with pytest.raises(ValueError):
+        check_grounded_analysis(paraphrase, {"ev-1"}, [record])

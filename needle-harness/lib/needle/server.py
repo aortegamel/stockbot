@@ -1,6 +1,6 @@
-import importlib.util
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -62,29 +62,6 @@ def load_catalog():
 
 
 TOOLS = load_catalog()
-
-
-def _grounding_formatter():
-    """Shared grounded formatter, loaded directly so the worker avoids app imports."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.normpath(os.path.join(here, "..", "..", "..", "app", "research", "grounding.py"))
-    try:
-        spec = importlib.util.spec_from_file_location("needle_grounding", path)
-        if spec is None or spec.loader is None:
-            raise ValueError("missing loader")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        formatter = module.format_grounded_block
-    except Exception:
-        logger.exception("needle server: cannot load grounded formatter at %s", path)
-        sys.exit(1)
-    if not callable(formatter):
-        sys.stderr.write(f"needle server: grounded formatter at {path} is invalid\n")
-        sys.exit(1)
-    return formatter
-
-
-format_grounded_block = _grounding_formatter()
 
 
 def resolve_weights():
@@ -164,57 +141,68 @@ def _tool_entry(tool, schema):
     return entry
 
 
-# Wrapper instructions, not facts: the SDK system carries facts only (docs: "facts, never instructions").
-_INSTRUCTION_KEYS = frozenset({"grounding_hint"})
+_NODE_KEYS = ("node_id", "id", "type")
+_SCOPE_KEYS = ("mode", "as_of", "start", "end")
 
 
-def _fact(value):
-    """One fact value verbatim: strings raw, structures as full JSON (never clipped)."""
-    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-
-
-_GROUNDED_FIELDS = frozenset({"content", "content_hash", "evidence_id", "provenance"})
-
-
-def _evidence_fact(index, record):
-    """One admitted record: shared block first, then every remaining field as JSON."""
-    extras = {k: v for k, v in record.items() if k not in _GROUNDED_FIELDS}
-    text = format_grounded_block(record)
-    if extras:
-        text += f" evidence[{index}] extra: {json.dumps(extras, ensure_ascii=False)}"
-    return text
-
-
-def _evidence_facts(records):
-    """Admitted records in order; malformed or observation entries keep current JSON."""
+def _scope_facts(scope):
+    """Persisted temporal window without generated wording: string window fields only."""
+    if not isinstance(scope, dict):
+        return []
     facts = []
-    for index, record in enumerate(records):
-        if isinstance(record, dict) and isinstance(record.get("evidence_id"), str) and record["evidence_id"]:
-            facts.append(_evidence_fact(index, record))
-        else:
-            facts.append(_fact(record))
+    for key in _SCOPE_KEYS:
+        value = scope.get(key)
+        if isinstance(value, str):
+            facts.append(f"temporal_scope {key}: {value}")
     return facts
 
 
-def _context_facts(key, value):
-    """One context entry: evidence lists reuse the grounded renderer, others use JSON."""
-    if key == "evidence" and isinstance(value, list):
-        return _evidence_facts(value)
-    return [f"{key}: {_fact(value)}"]
+def _fact(value):
+    """Keep one explicit execution value without truncation."""
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
 
 
-def _arguments_facts(objective, node, context):
-    """SDK system facts: UTC date, objective, node metadata, context (evidence, attempts, temporal anchors)."""
+def _scalar(value):
+    """JSON scalar without non-finite floats, so NaN/Infinity never ground arguments."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def _argument_value(value):
+    """Admit scalars and scalar lists only; records and nested structures never bind."""
+    return _scalar(value) or (isinstance(value, list) and all(_scalar(item) for item in value))
+
+
+def _grounded_argument_facts(values, schema):
+    """Explicit schema properties only; malformed, off-schema, or nested values never bind."""
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(values, dict) or not isinstance(properties, dict):
+        return []
+    facts = []
+    for key, value in values.items():
+        if key in properties and _argument_value(value):
+            facts.append(f"argument {key}: {_fact(value)}")
+    return facts
+
+
+def _arguments_facts(objective, node, context, schema=None):
+    """Bind request facts and explicit arguments. Never bind research records or feedback."""
     facts = [f"date: {datetime.now(UTC).strftime('%Y-%m-%d %a %H:%M')} UTC", "locale: en-US"]
     if isinstance(objective, str) and objective.strip():
         facts.append(f"objective: {objective}")
     if isinstance(node, dict):
-        # The question is the request text itself, not a fact.
-        facts.extend(f"node {k}: {_fact(v)}" for k, v in node.items() if k != "question")
+        for key in _NODE_KEYS:
+            value = node.get(key)
+            if isinstance(value, str):
+                facts.append(f"node {key}: {value}")
     if isinstance(context, dict):
-        for k, v in context.items():
-            if k not in _INSTRUCTION_KEYS:
-                facts.extend(_context_facts(k, v))
+        for key in ("as_of", "today_utc", "ticker"):
+            value = context.get(key)
+            if isinstance(value, str):
+                facts.append(f"{key}: {value}")
+        facts.extend(_scope_facts(context.get("temporal_scope")))
+        facts.extend(_grounded_argument_facts(context.get("grounded_arguments"), schema))
     return "; ".join(facts)
 
 
@@ -386,7 +374,10 @@ def handle(line):
             node = req.get("node")
             objective = req.get("objective")
             text = _request_text(node, objective)
-            bound = _bound_agent(tool, req.get("schema"), _arguments_facts(objective, node, req.get("context")))
+            entry = _tool_entry(tool, req.get("schema"))
+            bound = _bound_agent(
+                tool, entry["parameters"], _arguments_facts(objective, node, req.get("context"), entry["parameters"])
+            )
             _init_ms = (_t.perf_counter() - _gen_t0) * 1000.0
             try:
                 r = bound.complete(text, max_new_tokens=512)

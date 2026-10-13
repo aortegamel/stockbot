@@ -301,6 +301,7 @@ def create_research(
     as_of: str | None = None,
     policy: Mapping[str, object] | None = None,
     repo: ResearchRepository | Path | str | None = None,
+    ticker: str | None = None,
 ) -> str:
     """Create a session plus its first source_agent job; returns session_id."""
     if not isinstance(question, str) or not question.strip():
@@ -311,6 +312,7 @@ def create_research(
         (objective or question).strip(),
         as_of=as_of,
         policy=policy if policy is not None else default_policy(),
+        ticker=ticker,
     )
     updated, job = _jobs.create_job(new_session, [], job_type="source_agent", owner="kernel", source_domain=None)
     running = _jobs.start_job(job)
@@ -2201,11 +2203,24 @@ def _submit_coverage_merge(coverage: dict[str, object], cov: dict[str, object] |
         coverage[key] = list(values)
 
 
-def _sec_search_ledger(search_ids: Sequence[str]) -> tuple[dict[str, str], bool]:
-    """No persisted SEC search ledger remains; always empty but readable."""
-    # Seam: live reads via SourceGateway + normalization + raw_archive (write-once) + write_bundle; NOTE: a future warehouse slots in behind live readers, never here.
-    del search_ids
-    return {}, True
+def _search_query(record: Mapping[str, object]) -> str:
+    """Saved query text from one stored search row, else empty."""
+    query = record.get("query")
+    return query.strip() if isinstance(query, str) and query.strip() else ""
+
+
+def _sec_search_ledger(
+    search_ids: Sequence[str], *, repo: ResearchRepository | Path | str | None = None
+) -> tuple[dict[str, str], bool]:
+    """Saved search queries under one search_id each. Unknown IDs stay absent."""
+    store = _repo(repo)
+    ledger: dict[str, str] = {}
+    for search_id in search_ids:
+        try:
+            ledger[search_id] = _search_query(store.get_search(search_id))
+        except KeyError:
+            continue
+    return ledger, True
 
 
 def _submit_search_run_warnings(cov: dict[str, object]) -> list[str]:
@@ -2336,7 +2351,7 @@ def _telemetry_search_signals(
     search ids. A key with no persisted source anywhere is ``None`` + a gap.
     """
     search_ids = _coverage_strs(cov, "search_runs")
-    ledger, readable = _sec_search_ledger(search_ids)
+    ledger, readable = _sec_search_ledger(search_ids, repo=store)
     journal_calls, journal_queries = _journal_search_activity(store, session_id)
     resolved_queries = _ledger_queries(ledger, search_ids, readable) | set(journal_queries)
     queries: object = sorted(resolved_queries) if resolved_queries else None

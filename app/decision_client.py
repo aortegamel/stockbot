@@ -512,6 +512,8 @@ def _tool_options_prompt(
         prompt += " Latest-10-Q revenue answers come from the 10-Q, not the 8-K: after the filing list, open the 10-Q accession via get_sec_document section reads (Item 1, Item 2, Item 1A) before re-reading any 8-K."
     elif "revenue" in _qlow and "quarter" in _qlow:
         prompt += " Revenue-quarter answers come from the 10-Q (MD&A/segment revenue), not the 8-K: after the filing list, open the 10-Q accession via get_sec_document with a revenue query before re-reading any 8-K."
+    elif "revenue" in _qlow and re.search(r"\b(?:latest|most recent)\b", _qlow):
+        prompt += " Latest revenue means the latest reported financial period. List 10-Q/10-K filings without invented start/end dates. Open the selected accession with a revenue query. State whether the figure covers a quarter or a year."
     return options, prompt
 
 

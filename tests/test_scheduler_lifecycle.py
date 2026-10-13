@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses
+import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import override
@@ -1577,28 +1578,6 @@ def test_runtime_mismatch_no_packet_reraises() -> None:
         raise AssertionError("mismatch without packet must re-raise")
 
 
-def test_grounding_hint_present_in_context() -> None:
-    """Accession/ticker/dataset tools get one compact grounding hint in context."""
-    seen: dict[str, object] = {}
-
-    async def fake_gen(**kw: object) -> dict[str, JSONValue]:
-        seen.update(kw)
-        return {
-            "tool": "list_sec_filings",
-            "arguments": {"identifier": "NVDA"},
-            "reasoning": "r",
-        }
-
-    session = {"session_id": "s1", "objective": "q?"}
-    asyncio.run(
-        sched._generate_tool_arguments(fake_gen, "list_sec_filings", [], session, _node(), [], [], None, _Kernel())
-    )
-    ctx = seen.get("context")
-    assert isinstance(ctx, dict)
-    hint = str(ctx.get("grounding_hint", ""))
-    assert "accession_no only from packet" in hint and "never org words" in hint and "singular YYYY-MM-DD" in hint
-
-
 def test_context_carries_scope_and_today() -> None:
     """Needle context carries resolved temporal_scope + today_utc."""
     seen: dict[str, object] = {}
@@ -2544,6 +2523,47 @@ def test_structured_listing_keeps_form_identity_and_selects_latest_ten_q() -> No
     assert args == {"accession_no": latest_q, "query": "revenue", "limit": 32000}
 
 
+def test_latest_revenue_accessions_reads_every_persisted_shape() -> None:
+    """Exact row labels win over summary text; every persisted shape returns newest-first revenue accessions."""
+    acc_q, acc_k, acc_8k = (
+        "0001045810-26-000075",
+        "0001045810-26-000070",
+        "0001045810-26-000078",
+    )
+    rows: JSONValue = [
+        {"accession_no": acc_8k, "form": "8-K", "filed_at": "2026-09-01"},
+        {"accession_no": "not-an-accession", "form": "10-K", "filed_at": "2026-08-15"},
+        {"accession_no": acc_k, "form": "10-K", "filed_at": "2026-07-01"},
+        {"accession_no": acc_q, "form": "10-Q", "filed_at": "2026-08-01"},
+    ]
+    assert sched._latest_revenue_accessions({"result": {"filings": rows}}) == [acc_q, acc_k]
+    assert sched._latest_revenue_accessions({"filings": rows}) == [acc_q, acc_k]
+    assert sched._latest_revenue_accessions(json.dumps({"filings": rows})) == [acc_q, acc_k]
+    assert sched._latest_revenue_accessions({"outcome_summary": f"10-Q {acc_q}"}) == [acc_q]
+    assert sched._latest_revenue_accessions(f"seen 8-K {acc_8k} then 10-K accession {acc_k}") == [acc_k]
+    assert sched._latest_revenue_accessions({"result": {"form": "10-Q", "accession_no": acc_q}}) == [acc_q]
+    assert sched._latest_revenue_accessions({"result": {"form": "10-Q", "accession_no": "nope"}}) == []
+    assert sched._latest_revenue_accessions({"tool": "get_sec_document", "error": None}) == []
+    assert sched._latest_revenue_accessions("{not json") == []
+    assert sched._latest_revenue_accessions("no filings here") == []
+    assert sched._latest_revenue_accessions(42) == []
+    # A revenue-form row without a usable accession is skipped, never aborts the scan.
+    assert sched._latest_revenue_accessions({"result": {"filings": [{"form": "10-Q", "accession_no": None}]}}) == []
+    assert sched._latest_revenue_accessions({"result": {"filings": [{"form": "10-K"}]}}) == []
+    assert sched._latest_revenue_accessions({"result": {"form": "10-Q"}}) == []
+
+
+def test_scalar_or_scalar_list_accepts_finite_scalars_only() -> None:
+    """Grounded execution values accept scalars and scalar lists; non-finite numbers and maps drop."""
+    assert sched._scalar_or_scalar_list("ORCL")
+    assert sched._scalar_or_scalar_list(2.5)
+    assert sched._scalar_or_scalar_list([1, "a", 2.5, None])
+    assert not sched._scalar_or_scalar_list(float("inf"))
+    assert not sched._scalar_or_scalar_list([float("nan")])
+    assert not sched._scalar_or_scalar_list([])
+    assert not sched._scalar_or_scalar_list({"a": 1})
+
+
 def test_generated_valid_8k_accession_changes_to_listed_latest_ten_q_before_invoke() -> None:
     """The scheduler replaces a valid generated 8-K accession before the first document call."""
     acc8, accq = "0001045810-26-000078", "0001045810-26-000075"
@@ -2763,7 +2783,7 @@ def test_ten_q_revenue_route_settles_structured_listing(
         assert isinstance(attempt, dict)
         reasoning = attempt["reasoning"]
         assert isinstance(reasoning, str)
-        assert reasoning.startswith("scheduler grounded latest 10-Q revenue arguments")
+        assert reasoning.startswith("scheduler grounded latest revenue arguments")
         assert not any(word in reasoning.lower() for word in ("needle", "withhold", "failure"))
     assert listing["tool_result_ref"] == receipt
     assert listing["outcome_summary"] == summary
@@ -4904,3 +4924,299 @@ def test_xbrl_error_and_summary_text_cannot_ground_alias() -> None:
     )
     assert invoked == []
     assert out["error_type"] == "reselect" and "duplicate" not in str(out["error"])
+
+
+def _resolve_orcl(name: str) -> str | None:
+    return {"ORCL": "ORCL", "Oracle": "ORCL", "oracle": "ORCL"}.get(name)
+
+
+def test_orcl_latest_revenue_lists_10q_10k_without_invented_dates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ORCL latest revenue (live Bullbot defect): malformed 10-Q/10-K forms and today dates repair to 10-Q/10-K."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_orcl)
+
+    async def fake_malformed(**kw: object) -> dict[str, JSONValue]:
+        return {
+            "tool": "list_sec_filings",
+            "arguments": {
+                "identifier": "ORCL",
+                "forms": ["10-Q/10-K"],
+                "start_date": "2026-10-12",
+                "end_date": "2026-10-12",
+            },
+            "reasoning": "r",
+        }
+
+    session = {"session_id": "s1", "objective": "What is ORCL's latest revenue?"}
+    args, _, _ = asyncio.run(
+        sched._generate_tool_arguments(
+            fake_malformed,
+            "list_sec_filings",
+            sched.build_registry(),
+            session,
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
+    )
+    assert args == {"identifier": "ORCL", "forms": ["10-Q", "10-K"]}
+
+
+def test_orcl_latest_revenue_bypass_skips_needle_and_reads_listed_filing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Undated ORCL latest revenue grounds listing/reads without Needle; the read carries the newest 10-Q/10-K."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_orcl)
+    acc8, old_k, latest_q = (
+        "0001341439-26-000099",
+        "0001341439-26-000050",
+        "0001341439-26-000075",
+    )
+    listing: dict[str, JSONValue] = {
+        "tool": "list_sec_filings",
+        "arguments": {"identifier": "ORCL", "forms": ["10-Q", "10-K"]},
+        "error": None,
+        "result": {
+            "filings": [
+                {"accession_no": acc8, "form": "8-K", "filed_at": "2026-10-01"},
+                {"accession_no": old_k, "form": "10-K", "filed_at": "2026-06-01"},
+                {"accession_no": latest_q, "form": "10-Q", "filed_at": "2026-09-01"},
+            ]
+        },
+        "outcome_summary": f"8-K {acc8}, 10-K {old_k}, 10-Q {latest_q}",
+    }
+    needle_calls: list[str] = []
+
+    async def fake_none(**kw: object) -> dict[str, JSONValue]:
+        needle_calls.append(str(kw["tool"]))
+        return {"tool": None, "arguments": {}, "reasoning": "withheld: ungrounded"}
+
+    session = {"session_id": "s1", "objective": "What is ORCL's latest revenue?"}
+    listed, reasoning, _ = asyncio.run(
+        sched._generate_tool_arguments(
+            fake_none, "list_sec_filings", sched.build_registry(), session, _node(), [], [], None, _Kernel()
+        )
+    )
+    assert listed == {"identifier": "ORCL", "forms": ["10-Q", "10-K"]}
+    assert reasoning.startswith("scheduler grounded latest revenue arguments")
+    read, _, _ = asyncio.run(
+        sched._generate_tool_arguments(
+            fake_none, "get_sec_document", sched.build_registry(), session, _node(), [], [listing], None, _Kernel()
+        )
+    )
+    assert read == {"accession_no": latest_q, "query": "revenue", "limit": 32000}
+    assert needle_calls == []
+
+
+def test_orcl_latest_revenue_read_requires_listing_first() -> None:
+    """A revenue read with no 10-Q/10-K listing reselects instead of reading an unlisted accession."""
+
+    async def fake_gen(**kw: object) -> dict[str, JSONValue]:
+        return {"tool": "get_sec_document", "arguments": {}, "reasoning": "r"}
+
+    out = asyncio.run(
+        sched._attempt_tool(
+            tool_name="get_sec_document",
+            node=_node(),
+            session={"session_id": "s1", "objective": "What is ORCL's latest revenue?"},
+            registry=sched.build_registry(),
+            evidence=[],
+            attempts=[],
+            kernel=_Kernel(),
+            needle_generate=fake_gen,
+            invoke=_invoke_result,
+            to_outcome=_to_outcome,
+            tool_session=_tool_session(),
+            as_of=None,
+        )
+    )
+    assert out["error_type"] == "reselect"
+    assert "10-Q/10-K" in str(out["error"])
+
+
+def test_repeated_empty_search_reselects_without_invoking() -> None:
+    """A second identical empty search reselects pre-invoke, so it never consumes handler budget."""
+    invoked: list[str] = []
+
+    async def fake_empty(**kw: object) -> dict[str, JSONValue]:
+        return {"tool": "search_sec_filings_bounded", "arguments": {}, "reasoning": "r"}
+
+    def _never_invoke(*a: object, **k: object) -> dict[str, JSONValue]:
+        invoked.append("invoked")
+        return {}
+
+    session = {"session_id": "s1", "objective": "What drove Growth this week?"}
+    prior: dict[str, JSONValue] = {
+        "tool": "search_sec_filings_bounded",
+        "arguments": {},
+        "outcome": None,
+        "outcome_summary": "",
+        "error": "search_sec_filings ungrounded (no grounding after repair); re-selecting",
+        "error_type": "reselect",
+        "reasoning": "r",
+        "job_id": "job-0",
+        "evidence_id": None,
+        "tool_result_ref": None,
+    }
+    out = asyncio.run(
+        sched._attempt_tool(
+            tool_name="search_sec_filings_bounded",
+            node=_node(),
+            session=session,
+            registry=[{"name": "search_sec_filings_bounded", "parameters": {}}],
+            evidence=[],
+            attempts=[prior],
+            kernel=_Kernel(),
+            needle_generate=fake_empty,
+            invoke=_never_invoke,
+            to_outcome=_to_outcome,
+            tool_session=_tool_session(),
+            as_of=None,
+        )
+    )
+    assert out["error_type"] == "reselect" and "duplicate" in str(out["error"])
+    assert invoked == []
+    assert sched._empty_search_repeat([prior], "search_sec_filings_bounded", {})
+    assert not sched._empty_search_repeat([prior], "search_sec_filings_bounded", {"ticker": "ORCL"})
+    assert not sched._empty_search_repeat([], "search_sec_filings_bounded", {})
+    # Non-dict args and non-search tools never count as a repeat.
+    assert not sched._empty_search_repeat([prior], "search_sec_filings_bounded", None)
+    assert not sched._empty_search_repeat([prior], "get_sec_filing", {})
+
+
+def test_needle_context_carries_ticker_scope_grounded_without_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Needle context carries ticker, narrowed scope, and grounded args; evidence and attempts stay out."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_orcl)
+    seen: dict[str, object] = {}
+
+    async def fake_gen(**kw: object) -> dict[str, JSONValue]:
+        seen.update(kw)
+        return {"tool": "list_sec_filings", "arguments": {"identifier": "ORCL"}, "reasoning": "r"}
+
+    session: dict[str, JSONValue] = {
+        "session_id": "s1",
+        "objective": "What is ORCL's filing history?",
+        "ticker": "ORCL",
+        "temporal_scope": {"mode": "latest-available", "raw": "filing history", "as_of": None},
+    }
+    registry: list[Mapping[str, JSONValue]] = [
+        {
+            "name": "list_sec_filings",
+            "parameters": {"type": "object", "properties": {"identifier": {"type": "string"}}},
+        }
+    ]
+    asyncio.run(
+        sched._generate_tool_arguments(
+            fake_gen,
+            "list_sec_filings",
+            registry,
+            session,
+            _node(),
+            [{"evidence_id": "ev-1", "content": "raw bytes"}],
+            [{"tool": "list_sec_filings", "error": "boom", "outcome_summary": "raw attempt"}],
+            None,
+            _Kernel(),
+        )
+    )
+    ctx = seen.get("context")
+    assert isinstance(ctx, dict)
+    assert set(ctx) == {"as_of", "temporal_scope", "today_utc", "ticker", "grounded_arguments"}
+    assert ctx["ticker"] == "ORCL"
+    assert ctx["temporal_scope"] == {"mode": "latest-available"}
+    assert ctx["grounded_arguments"] == {"identifier": "ORCL"}
+
+
+@pytest.mark.parametrize("form", ["10-Q/A", "10-K/A"])
+def test_valid_amendment_forms_survive_repair(form: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Valid /A amendment forms are explicit selections, never malformed generated prose."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_orcl)
+
+    async def fake_amend(**kw: object) -> dict[str, JSONValue]:
+        return {"tool": "list_sec_filings", "arguments": {"identifier": "ORCL", "forms": [form]}, "reasoning": "r"}
+
+    args, _, _ = asyncio.run(
+        sched._generate_tool_arguments(
+            fake_amend,
+            "list_sec_filings",
+            sched.build_registry(),
+            {"session_id": "s1", "objective": "List ORCL's most recent 10-K and 10-Q filings."},
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
+    )
+    assert args.get("forms") == [form]
+
+
+def test_explicit_dated_latest_revenue_keeps_dates_and_uses_needle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit dates on a latest-revenue ask stay grounded and still route through Needle."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_orcl)
+    generated: dict[str, JSONValue] = {
+        "identifier": "ORCL",
+        "forms": ["10-Q", "10-K"],
+        "start_date": "2025-01-01",
+        "end_date": "2025-12-31",
+    }
+    needle_calls: list[str] = []
+
+    async def fake_gen(**kw: object) -> dict[str, JSONValue]:
+        needle_calls.append(str(kw["tool"]))
+        return {"tool": "list_sec_filings", "arguments": dict(generated), "reasoning": "r"}
+
+    dated = "What is ORCL's latest revenue? Include filings from 2025-01-01 through 2025-12-31."
+    args, _, _ = asyncio.run(
+        sched._generate_tool_arguments(
+            fake_gen,
+            "list_sec_filings",
+            sched.build_registry(),
+            {"session_id": "s1", "objective": dated},
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
+    )
+    assert args == generated
+    assert needle_calls == ["list_sec_filings"]
+
+
+@settings(max_examples=40, derandomize=True, deadline=None)
+@given(
+    st.sampled_from(["10-Q/10-K", "Oracle Corp", "10-Q 10-K", "2026-10-12", "YYYY-MM-DD", "10-Q/A", "10-K/A"]),
+    st.sampled_from(["list_sec_filings", "get_sec_document"]),
+)
+def test_prop_malformed_forms_never_reach_listing_or_read(form: str, tool: str) -> None:
+    """Generated prose/date forms either repair to valid lists or drop; /A amendments survive."""
+    filled = sched._repair_tool_arguments(
+        tool,
+        ({"identifier": "ORCL", "forms": [form]} if tool == "list_sec_filings" else {"accession_no": "x"}),
+        "What is ORCL's latest revenue?",
+        "s",
+        "n",
+    )
+    forms = filled.get("forms")
+    if tool == "list_sec_filings" and form in ("10-Q/A", "10-K/A"):
+        assert forms == [form]
+    elif tool == "list_sec_filings":
+        assert forms in (["10-Q", "10-K"], ["10-Q"], ["10-Q", "10-K", "8-K"])
+        assert filled.get("start_date") is None and filled.get("end_date") is None

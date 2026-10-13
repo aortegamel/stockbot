@@ -183,6 +183,11 @@ def test_tool_options_prompt_keeps_last_three_failures() -> None:
             "get_sec_document with a revenue query",
             "section reads",
         ),
+        (
+            "What is ORCL's latest revenue?",
+            "Latest revenue means the latest reported financial period",
+            "with invented start",
+        ),
     ):
         _, revenue_prompt = _tool_options_prompt(reg, {"node_id": "n1", "question": question}, [], [])
         assert wanted in revenue_prompt and absent not in revenue_prompt

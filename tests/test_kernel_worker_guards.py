@@ -209,6 +209,63 @@ def test_route_fast_path_keeps_programmatic_route_and_jev_personas() -> None:
     assert [hint for _, hint in jev.seen] == ["get_current_time"]
 
 
+def test_route_prefixed_clock_keeps_prompt_and_returns_clock() -> None:
+    """Exact NVDA clock regression: the [NVDA] prefix never diverts the clock ask."""
+    jev = _JevRoute("research_required")
+    out = kw._route({"id": "r1", "op": "route", "prompt": "What time is it?", "ticker": "NVDA"}, jev=jev)
+    assert out == {"id": "r1", "route": "get_current_time", "personas": None}
+    assert jev.seen[0][0].startswith("[Today UTC ")
+    assert "What time is it?" in jev.seen[0][0]
+    assert "[NVDA]" not in jev.seen[0][0]
+
+
+def test_route_bad_ticker_is_error() -> None:
+    out = kw._route({"id": "r1", "op": "route", "prompt": "hello", "ticker": "FINRA"}, jev=_JevRoute("x"))
+    assert out["id"] == "r1" and "error" in out
+
+
+def test_arguments_context_carries_ticker_without_raw_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Raw evidence/attempts never cross; the ticker rides beside grounded scalar args."""
+    gen = _FailGenerate(
+        {"tool": "list_sec_filings", "arguments": {"identifier": "NVDA"}, "confidence": 0.8, "reasoning": "r"}
+    )
+    import app.tools as _tools
+
+    def _resolve(name: str) -> str | None:
+        return {"NVDA": "NVDA"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
+    monkeypatch.setattr(kw, "_shared_needle_generate", lambda: gen)
+    out = kw._arguments(
+        {
+            "id": "a1",
+            "op": "arguments",
+            "tool": "list_sec_filings",
+            "objective": "What drove NVDA revenue last quarter?",
+            "ticker": "NVDA",
+            "context": {
+                "evidence": [{"evidence_id": "ev-1", "content": "raw bytes"}],
+                "attempts": [{"tool": "list_sec_filings"}],
+                "grounding_hint": "do not send",
+                "as_of": None,
+                "temporal_scope": {"mode": "latest-available"},
+                "today_utc": "2026-10-12",
+                "ticker": "NVDA",
+            },
+            "schema": {"type": "object"},
+        }
+    )
+    assert out["arguments"] == {"identifier": "NVDA", "forms": ["10-Q", "10-K", "8-K"]}
+    seen = gen.seen[0]
+    assert isinstance(seen, dict)
+    context = seen.get("context")
+    assert isinstance(context, dict)
+    assert context.get("ticker") == "NVDA"
+    assert "evidence" not in context and "attempts" not in context and "grounding_hint" not in context
+    grounded = context.get("grounded_arguments")
+    assert isinstance(grounded, dict) and grounded.get("identifier") == "NVDA"
+
+
 class _FailGenerate:
     def __init__(self, payload: object) -> None:
         self.payload = payload

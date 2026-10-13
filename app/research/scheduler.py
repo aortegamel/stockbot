@@ -27,6 +27,7 @@ import functools
 import inspect
 import json as _json
 import logging
+import math
 import os
 import re
 import time as _time
@@ -319,12 +320,12 @@ _NO_EVIDENCE_ROUNDS = 2
 _JEV_REGISTRY_EXCLUDED = frozenset({"call_tool", "browse_tools", "search_tools", "list_tool_domains", "describe_tool"})
 
 # research_start creates a NEW session so it can never advance the current
-# node (10x start/None loop in toolflow logs); research_read_search's handler
-# always returns unknown_search with no persisted universe (9x read_search/None
-# loop in toolflow logs); research_resume re-enters the node itself so it can
-# never advance it either (resume/None loop: Needle emits None vs JEV pick
-# every round). All stay in build_registry so entry/assess paths are untouched;
-# only the in-node context filters them.
+# node (10x start/None loop in toolflow logs); research_read_search pages a
+# persisted search universe and needs its saved session/search pair (9x
+# read_search/None loop in toolflow logs); research_resume re-enters the node
+# itself so it can never advance it either (resume/None loop: Needle emits
+# None vs JEV pick every round). All stay in build_registry so entry/assess
+# paths are untouched; only the in-node context filters them.
 _NODE_INVALID_CONTROL_TOOLS = frozenset({"research_start", "research_read_search", "research_resume"})
 
 
@@ -664,6 +665,50 @@ def _bounded_reasoner(reasoner: ReasonerClient, timeout: float | None) -> Reason
 _REASON_MIN_S = 10.0
 
 
+def _scalar_or_scalar_list(value: object) -> bool:
+    """Scalar or scalar-list allowlist for Needle grounded execution values."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return (
+        isinstance(value, (list, tuple))
+        and bool(value)
+        and all(
+            item is None or isinstance(item, (str, bool, int)) or (isinstance(item, float) and math.isfinite(item))
+            for item in value
+        )
+    )
+
+
+def _grounded_execution_values(tool_name: str, schema: Mapping[str, object], objective: object) -> dict[str, JSONValue]:
+    """Explicitly grounded execution values keyed by selected schema properties."""
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    names = set(properties) if isinstance(properties, dict) else set()
+    seeded = _fallback_sec_args(tool_name, objective) or {}
+    return {
+        str(key): list(value) if isinstance(value, tuple) else value
+        for key, value in seeded.items()
+        if key in names and _scalar_or_scalar_list(value)
+    }
+
+
+def _needle_scope(scope: object) -> dict[str, JSONValue]:
+    """Temporal scope for Needle: typed mode/as_of/start/end scalars only, never raw request text."""
+    if not isinstance(scope, dict):
+        return {}
+    narrowed: dict[str, JSONValue] = {}
+    for key in ("mode", "as_of", "start", "end"):
+        day = _as_day(scope.get(key)) if key != "mode" else None
+        if key == "mode":
+            mode = scope.get(key)
+            if isinstance(mode, str) and mode.strip():
+                narrowed[key] = mode.strip()
+        elif day is not None:
+            narrowed[key] = day
+    return narrowed
+
+
 def _node_dict(node: object) -> dict[str, object]:
     if isinstance(node, dict):
         return dict(node)
@@ -989,6 +1034,41 @@ _ACCESSION_TOKEN_RE = re.compile(r"\b(\d{10}-\d{2}-\d{6})\b")
 _TEN_Q_RE = re.compile(r"\b10-?\s?q\b")
 _TEN_Q_SECTIONS = ("Item 1", "Item 2", "Item 1A")
 """First-pass latest 10-Q revenue reads: statements, MD&A drivers and segments, risk factors."""
+_REVENUE_FORMS = ("10-Q", "10-K")
+"""Latest-revenue listing: the latest reported quarter or year, never adjacent current reports."""
+
+
+def _latest_revenue_objective(objective: object) -> bool:
+    """Undated latest-revenue ask: revenue plus latest/most-recent wording, never an explicit dated window."""
+    if not isinstance(objective, str):
+        return False
+    return "revenue" in objective.lower() and re.search(r"\b(?:latest|most recent)\b", objective.lower()) is not None
+
+
+def _latest_revenue_requested(session: Mapping[str, JSONValue], node: object, as_of: str | None) -> bool:
+    """True when no date constrains the latest-revenue ask: request text, scope window, and cutoff all stay empty."""
+    objective = session.get("objective") or session.get("query") or ""
+    if not _latest_revenue_objective(objective):
+        return False
+    requested = " ".join(
+        re.sub(r"^\[Today UTC \d{4}-\d{2}-\d{2}\]\s*", "", str(value or ""))
+        for value in (objective, _f(node, "question"), _f(session.get("temporal_scope"), "raw"))
+    )
+    dated = re.search(
+        r"\d|\b(?:as\s+of|before|after|since|until|between|today|now|yesterday|tomorrow|"
+        r"days?|weeks?|months?|years?|quarters?|spring|summer|autumn|fall|winter|"
+        r"january|february|march|april|may|june|july|august|september|october|november|december|"
+        r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b",
+        requested.lower(),
+    )
+    scope = session.get("temporal_scope")
+    scoped_dates = isinstance(scope, dict) and (
+        scope.get("start")
+        or scope.get("end")
+        or scope.get("as_of") not in (None, session.get("created_at"))
+        or scope.get("mode", "latest-available") not in {"latest", "latest-available", "as_of"}
+    )
+    return not dated and not scoped_dates and not session.get("as_of") and as_of is None
 
 
 def _revenue_quarter_objective(objective: object) -> bool:
@@ -997,6 +1077,11 @@ def _revenue_quarter_objective(objective: object) -> bool:
         return False
     low = objective.lower()
     return "revenue" in low and ("quarter" in low or _TEN_Q_RE.search(low) is not None)
+
+
+def _revenue_read_objective(objective: object) -> bool:
+    """Revenue section read: quarterly wording or an undated latest-revenue ask."""
+    return _revenue_quarter_objective(objective) or _latest_revenue_objective(objective)
 
 
 def _args_need_accession(tool_name: str, args: Mapping[str, object]) -> bool:
@@ -1131,6 +1216,97 @@ def _ten_q_accessions(candidate: object) -> list[str]:
     return labeled
 
 
+def _decoded_json_mapping(candidate: str) -> dict[str, object] | None:
+    """Persisted payload decoded from its JSON string form; None when it is not a mapping."""
+    import json as _json
+
+    try:
+        decoded = _json.loads(candidate)
+    except ValueError, TypeError:
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _summary_text_of(candidate: Mapping[str, object]) -> str | None:
+    """First summary text field a persisted packet carries, if any."""
+    for key in ("outcome_summary", "record_identity", "content"):
+        value = candidate.get(key)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _revenue_rows_accessions(rows: list[object]) -> list[str]:
+    """Newest-first 10-Q/10-K accessions from persisted filing rows; malformed rows drop."""
+    from app.sec.discovery.service import normalize_accession_no
+
+    def _filed_at(row: Mapping[str, object]) -> str:
+        return str(row.get("filed_at") or "")
+
+    labeled: list[str] = []
+    for row in sorted((row for row in rows if isinstance(row, dict)), key=_filed_at, reverse=True):
+        if row.get("form") not in _REVENUE_FORMS:
+            continue
+        try:
+            labeled.append(normalize_accession_no(row.get("accession_no")))
+        except TypeError, ValueError:
+            continue
+    return labeled
+
+
+def _labeled_text_accessions(text: str) -> list[str]:
+    """Accessions the text itself labels 10-Q/10-K, in reading order."""
+    from app.sec.discovery.service import normalize_accession_no
+
+    labeled: list[str] = []
+    for match in _ACCESSION_TOKEN_RE.finditer(text):
+        after = re.match(r"\s+(10-Q|10-K)\b", text[match.end() :])
+        before = re.search(
+            r"\b(10-Q|10-K)\b(?:\s+\d{4}-\d{2}-\d{2})?\s+(?:accession\s+)?$",
+            text[: match.start()],
+        )
+        label = after or before
+        if label is None or label.group(1) not in _REVENUE_FORMS:
+            continue
+        try:
+            labeled.append(normalize_accession_no(match.group(1)))
+        except ValueError:
+            continue
+    return labeled
+
+
+def _revenue_payload_accessions(candidate: Mapping[str, object]) -> list[str]:
+    """Persisted payload: filings rows win, then summary text, then the payload's own label."""
+    from app.sec.discovery.service import normalize_accession_no
+
+    payload = _persisted_shapes(candidate)
+    rows = payload.get("filings")
+    if isinstance(rows, list):
+        return _revenue_rows_accessions(rows)
+    summary = _summary_text_of(candidate)
+    if summary is not None:
+        return _latest_revenue_accessions(summary)
+    if payload.get("form") in _REVENUE_FORMS:
+        try:
+            return [normalize_accession_no(payload.get("accession_no"))]
+        except TypeError, ValueError:
+            return []
+    return []
+
+
+def _latest_revenue_accessions(candidate: object) -> list[str]:
+    """Latest 10-Q/10-K accessions, newest filing first; exact row labels win over summary text."""
+    if isinstance(candidate, str):
+        decoded = _decoded_json_mapping(candidate)
+        if decoded is not None:
+            return _latest_revenue_accessions(decoded)
+    elif isinstance(candidate, dict):
+        return _revenue_payload_accessions(candidate)
+    if not isinstance(candidate, str):
+        return []
+    return _labeled_text_accessions(candidate)
+
+
 def _carry_packet_accession(
     tool_name: str,
     args: Mapping[str, JSONValue],
@@ -1141,6 +1317,18 @@ def _carry_packet_accession(
     """Most-recent-first packet scan for an accession to fill; None when none found."""
     want_10q = _revenue_quarter_objective(objective)
     explicit_10q = want_10q and _TEN_Q_RE.search(str(objective).lower()) is not None
+    want_latest = _latest_revenue_objective(objective)
+    if want_latest and not explicit_10q:
+        for packet in reversed(attempts):
+            if packet.get("tool") != "list_sec_filings" or packet.get("error") is not None:
+                continue
+            accessions = _latest_revenue_accessions(packet)
+            if not accessions:
+                return None
+            listed: dict[str, JSONValue] = {**args, "accession_no": accessions[0]}
+            if args.get("accession_no") != accessions[0]:
+                listed.pop("document_name", None)
+            return listed
     if explicit_10q:
         for packet in reversed(attempts):
             if packet.get("tool") != "list_sec_filings" or packet.get("error") is not None:
@@ -1148,7 +1336,7 @@ def _carry_packet_accession(
             accessions = _ten_q_accessions(packet)
             if not accessions:
                 return None
-            listed: dict[str, JSONValue] = {**args, "accession_no": accessions[0]}
+            listed = {**args, "accession_no": accessions[0]}
             if args.get("accession_no") != accessions[0]:
                 listed.pop("document_name", None)
             return listed
@@ -1164,7 +1352,11 @@ def _carry_packet_accession(
             text = candidate if isinstance(candidate, str) else None
             if text is None:
                 text = _json.dumps(candidate, default=str)
-            labeled: list[str] = _ten_q_accessions(candidate)[:1] if want_10q else []
+            labeled: list[str] = []
+            if want_latest and not explicit_10q:
+                labeled = _latest_revenue_accessions(candidate)[:1]
+            elif want_10q:
+                labeled = _ten_q_accessions(candidate)[:1]
             for match in _ACCESSION_TOKEN_RE.finditer(text):
                 try:
                     from app.sec.discovery.service import normalize_accession_no
@@ -1182,7 +1374,7 @@ def _carry_packet_accession(
                     return filled
                 if fallback is None:
                     fallback = filled
-    return None if explicit_10q else fallback
+    return None if (explicit_10q or want_latest) else fallback
 
 
 def _swap_repeat_accession(
@@ -1545,7 +1737,13 @@ def _fallback_sec_args(tool_name: str, objective: object) -> dict[str, JSONValue
         if tool_name == "list_sec_filings":
             # Explicit 10-Q requests exclude other forms from the latest listing.
             _forms: list[JSONValue] | None = None
-            if _revenue_quarter_objective(objective):
+            if _latest_revenue_objective(objective):
+                _forms = (
+                    ["10-Q"]
+                    if _TEN_Q_RE.search(str(objective).lower()) and _revenue_quarter_objective(objective)
+                    else list(_REVENUE_FORMS)
+                )
+            elif _revenue_quarter_objective(objective):
                 _forms = ["10-Q"] if _TEN_Q_RE.search(str(objective).lower()) else ["10-Q", "10-K", "8-K"]
             return {"identifier": _ticker} if _forms is None else {"identifier": _ticker, "forms": _forms}
         if isinstance(objective, str) and objective.strip():
@@ -1696,7 +1894,23 @@ def _repair_tool_arguments(
                 )
                 _nm = _cand
     # The latest explicit 10-Q request must not list adjacent forms instead.
-    if (
+    # Valid explicit selections (including /A amendments) survive; missing or
+    # malformed forms fall through to the scrub below.
+    if tool_name == "list_sec_filings" and _latest_revenue_objective(objective) and not filled.get("forms"):
+        _rev_forms: list[JSONValue] = (
+            ["10-Q"]
+            if _TEN_Q_RE.search(str(objective).lower()) and _revenue_quarter_objective(objective)
+            else list(_REVENUE_FORMS)
+        )
+        filled["forms"] = _rev_forms
+        logger.info(
+            "toolflow args_seed sid=%s nid=%s tool=%s keys=%s",
+            sid,
+            nid,
+            tool_name,
+            "forms",
+        )
+    elif (
         tool_name == "list_sec_filings"
         and _revenue_quarter_objective(objective)
         and (_TEN_Q_RE.search(str(objective).lower()) or not filled.get("forms"))
@@ -1779,22 +1993,44 @@ def _repair_tool_arguments(
     if isinstance(_fv, (str, list)):
         from app.tools import _RELATIVE_DATE_RE as _FORMS_REL_RE
         from app.tools import _date_like_form as _FORMS_DATE_LIKE
+        from app.tools import _filing_forms_arg as _forms_arg
 
         def _forms_placeholder(_v: object) -> bool:
+            if isinstance(_v, list):
+                return any(_forms_placeholder(_x) for _x in _v)
             if not isinstance(_v, str):
-                return False
+                return True
             _t = _v.strip()
+            _coerced, _err = _forms_arg(_t, tool_name)
+            if _err is not None:
+                return True
+            if _coerced is None:
+                return True
+            _vals = [_coerced] if isinstance(_coerced, str) else list(_coerced)
+            if not _vals or not all(isinstance(_x, str) and _x.strip() for _x in _vals):
+                return True
+            if any("/" in _x.strip() and not _x.strip().upper().endswith("/A") for _x in _vals if isinstance(_x, str)):
+                return True
+            # A single form never contains whitespace: joined generations re-list.
+            if any(len(_x.strip().split()) > 1 for _x in _vals if isinstance(_x, str)):
+                return True
             return "YYYY" in _t.upper() or _FORMS_DATE_LIKE(_t) or bool(_FORMS_REL_RE.search(_t.lower()))
 
         _fl: list[JSONValue] = [_fv] if isinstance(_fv, str) else list(_fv)
         if any(_forms_placeholder(_v) for _v in _fl):
-            # Quarterly revenue questions re-list latest 10-Q/10-K/8-K after the
-            # scrub; most-recent listing questions drop the fabricated window
-            # too (the dates came from the same ungrounded generation).
-            if tool_name == "list_sec_filings" and _revenue_quarter_objective(objective):
-                filled["forms"] = ["10-Q", "10-K", "8-K"]
-                filled.pop("start_date", None)
-                filled.pop("end_date", None)
+            # Latest-revenue questions re-list 10-Q/10-K after the scrub;
+            # quarterly revenue questions re-list latest 10-Q/10-K/8-K; most-recent
+            # listing questions drop the fabricated window too (the dates came
+            # from the same ungrounded generation).
+            _scrub_forms: list[JSONValue] | None = None
+            if tool_name == "list_sec_filings" and _latest_revenue_objective(objective):
+                _scrub_forms = (
+                    ["10-Q"]
+                    if _TEN_Q_RE.search(str(objective).lower()) and _revenue_quarter_objective(objective)
+                    else list(_REVENUE_FORMS)
+                )
+            elif tool_name == "list_sec_filings" and _revenue_quarter_objective(objective):
+                _scrub_forms = ["10-Q", "10-K", "8-K"]
             elif (
                 tool_name == "list_sec_filings"
                 and isinstance(objective, str)
@@ -1802,7 +2038,9 @@ def _repair_tool_arguments(
                     "recent" in objective.lower() or "latest" in objective.lower() or "most recent" in objective.lower()
                 )
             ):
-                filled["forms"] = ["10-K", "10-Q"]
+                _scrub_forms = ["10-K", "10-Q"]
+            if _scrub_forms is not None:
+                filled["forms"] = _scrub_forms
                 filled.pop("start_date", None)
                 filled.pop("end_date", None)
             else:
@@ -1829,11 +2067,13 @@ def _repair_tool_arguments(
                 "tradeDate",
             )
     date_keys = _DATE_ARG_KEYS
-    if (
-        tool_name == "list_sec_filings"
-        and _revenue_quarter_objective(objective)
-        and isinstance(objective, str)
-        and re.search(r"\b(?:latest|most recent)\b", objective.lower())
+    if tool_name == "list_sec_filings" and (
+        _latest_revenue_objective(objective)
+        or (
+            _revenue_quarter_objective(objective)
+            and isinstance(objective, str)
+            and re.search(r"\b(?:latest|most recent)\b", objective.lower())
+        )
     ):
         date_keys += ("start_date", "end_date")
     for _dropped_key in _scrub_ungrounded_date_args(filled, objective, question, scope, session_as_of, keys=date_keys):
@@ -1844,7 +2084,7 @@ def _repair_tool_arguments(
             tool_name,
             _dropped_key,
         )
-    if tool_name == "get_sec_document" and _revenue_quarter_objective(objective) and not filled.get("query"):
+    if tool_name == "get_sec_document" and _revenue_read_objective(objective) and not filled.get("query"):
         filled["query"] = "revenue"
         logger.info(
             "toolflow args_seed sid=%s nid=%s tool=%s keys=%s",
@@ -1855,7 +2095,7 @@ def _repair_tool_arguments(
         )
     if (
         tool_name == "get_sec_document"
-        and _revenue_quarter_objective(objective)
+        and _revenue_read_objective(objective)
         and not filled.get("limit")
         and not filled.get("max_chars")
     ):
@@ -2157,17 +2397,19 @@ async def _generate_tool_arguments(
 ) -> tuple[dict[str, JSONValue], str, bool]:
     schema = _schema_for(tool_name, registry)
     objective = session.get("objective") or session.get("query") or ""
-    scope = session.get("temporal_scope")
-    no_scope: dict[str, JSONValue] = {}
+    scoped = _needle_scope(session.get("temporal_scope"))
+    raw_ticker = session.get("ticker")
+    ticker = raw_ticker.strip().upper() if isinstance(raw_ticker, str) and raw_ticker.strip() else None
+    if ticker is None:
+        ticker = _objective_subject_ticker(objective)
     context: dict[str, object] = {
-        "evidence": evidence,
-        "attempts": attempts,
         "as_of": as_of,
-        "temporal_scope": scope if isinstance(scope, dict) else no_scope,
+        "temporal_scope": scoped,
         "today_utc": datetime.now(UTC).date().isoformat(),
+        "grounded_arguments": _grounded_execution_values(tool_name, schema, objective),
     }
-    if tool_name in _ACCESSION_CARRY_TOOLS or tool_name in _GROUNDING_HINT_TOOLS:
-        context["grounding_hint"] = _GROUNDING_HINT
+    if ticker is not None:
+        context["ticker"] = ticker
     sid = str(session.get("session_id") or "-")
     nid = str(_f(node, "node_id", "id", default="-"))
     schema_empty = not bool(schema)
@@ -2193,7 +2435,9 @@ async def _generate_tool_arguments(
                 False,
             )
     grounded_args: dict[str, JSONValue] | None = None
-    if tool_name in {"list_sec_filings", "get_sec_document"} and _undated_latest_ten_q(session, node, as_of):
+    if tool_name in {"list_sec_filings", "get_sec_document"} and (
+        _undated_latest_ten_q(session, node, as_of) or _latest_revenue_requested(session, node, as_of)
+    ):
         if tool_name == "list_sec_filings":
             grounded_args = _fallback_sec_args(tool_name, objective)
         else:
@@ -2211,7 +2455,7 @@ async def _generate_tool_arguments(
                 sid,
                 nid,
                 question=_f(node, "question"),
-                scope=scope,
+                scope=scoped,
             )
             required = schema.get("required")
             if isinstance(required, list) and not all(
@@ -2224,9 +2468,9 @@ async def _generate_tool_arguments(
                 "tool": tool_name,
                 "arguments": grounded_args,
                 "reasoning": (
-                    "scheduler grounded latest 10-Q revenue arguments from the user request"
+                    "scheduler grounded latest revenue arguments from the user request"
                     if tool_name == "list_sec_filings"
-                    else "scheduler grounded latest 10-Q revenue arguments from the successful listing"
+                    else "scheduler grounded latest revenue arguments from the successful listing"
                 ),
             }
         else:
@@ -2432,11 +2676,18 @@ async def _generate_tool_arguments(
         and _revenue_quarter_objective(objective)
         and _TEN_Q_RE.search(str(objective).lower()) is not None
     )
-    if _args_need_accession(tool_name, filled) or explicit_ten_q_read:
+    explicit_latest_read = (
+        tool_name == "get_sec_document" and _latest_revenue_objective(objective) and not explicit_ten_q_read
+    )
+    if _args_need_accession(tool_name, filled) or explicit_ten_q_read or explicit_latest_read:
         carried = _carry_packet_accession(tool_name, filled, evidence, attempts, objective)
         if carried is None and explicit_ten_q_read:
             raise _ReselectRequest(
                 "The latest listing contains no 10-Q. Request the 10-Q listing before reading a document."
+            )
+        if carried is None and explicit_latest_read:
+            raise _ReselectRequest(
+                "The latest listing contains no 10-Q/10-K. Request the 10-Q/10-K listing before reading a document."
             )
         if carried is not None:
             filled = carried
@@ -2639,7 +2890,9 @@ async def _attempt_tool(
                     **{k: v for k, v in arguments.items() if k != "query"},
                     "section": section,
                 }
-            if _is_duplicate_call(attempts, tool_name, arguments):
+            if _is_duplicate_call(attempts, tool_name, arguments) or _empty_search_repeat(
+                attempts, tool_name, arguments
+            ):
                 _fail_attempt_job(kernel, job_id, f"duplicate {tool_name} {arguments!r}; re-selecting")
                 return {
                     "tool": tool_name,
@@ -2696,20 +2949,23 @@ async def _attempt_tool(
         )
         return record
     except _ReselectRequest as exc:
-        _fail_attempt_job(kernel, job_id, str(exc))
+        message = str(exc)
+        if _empty_search_repeat(attempts, tool_name, {}):
+            message = f"duplicate tool call {tool_name} with identical arguments; re-selecting"
+        _fail_attempt_job(kernel, job_id, message)
         logger.info(
             "toolflow reselect sid=%s nid=%s tool=%s reason=%.200s",
             session_id,
             node_id,
             tool_name,
-            exc,
+            message,
         )
         return {
             "tool": tool_name,
             "arguments": {},
             "outcome": None,
             "outcome_summary": "",
-            "error": str(exc)[:500],
+            "error": message[:500],
             "error_type": "reselect",
             "reasoning": needle_reasoning[:2000],
             "job_id": job_id,
@@ -4066,6 +4322,26 @@ def _selection_guidance(
     }
 
 
+def _has_grounding_argument(args: Mapping[str, JSONValue]) -> bool:
+    """True when the search args carry any grounding value (text keys, blank values dropped)."""
+    return any(
+        (value.strip() if isinstance(value, str) else value)
+        for key in _SEARCH_GROUNDING_KEYS
+        if (value := args.get(key)) is not None
+    )
+
+
+def _empty_search_repeat(attempts: Sequence[Mapping[str, JSONValue]], tool: str, args: object) -> bool:
+    """True when an ungrounded empty search already reselected: the retry spends budget without grounding."""
+    if tool not in ("search_sec_filings", "search_sec_filings_bounded"):
+        return False
+    if not isinstance(args, dict) or _has_grounding_argument(args):
+        return False
+    return any(
+        a.get("tool") == tool and a.get("error_type") == "reselect" and a.get("arguments") == {} for a in attempts
+    )
+
+
 def _is_duplicate_call(attempts: Sequence[Mapping[str, JSONValue]], tool: str, args: object) -> bool:
     """True when tool plus equal args already ran earlier in this node."""
     return isinstance(args, dict) and any(a.get("tool") == tool and a.get("arguments") == args for a in attempts)
@@ -4130,7 +4406,8 @@ def _revenue_read_pending(
 ) -> bool:
     """Keep a revenue node active after successful SEC navigation until its document read succeeds."""
     objective = session.get("objective") or session.get("query") or ""
-    if not _revenue_quarter_objective(f"{objective} {_f(node, 'question', default='')}"):
+    question = f"{objective} {_f(node, 'question', default='')}"
+    if not (_revenue_quarter_objective(question) or _latest_revenue_objective(question)):
         return False
     ok = [a.get("tool") for a in attempts if a.get("error") is None]
     return "get_sec_document" not in ok and any(t in _SEC_NAVIGATION_TOOLS for t in ok)
@@ -4212,10 +4489,21 @@ async def _drive_rounds(
         # candidates but admits nothing) so the filing must open next round.
         # JEV still picks among the carry tools; no bypass.
         forced = _force_open_registry(registry, attempts, evidence, admitted)
-        if _revenue_quarter_objective(session.get("objective") or session.get("query")) and (
+        _rev_objective = session.get("objective") or session.get("query")
+        if (_revenue_quarter_objective(_rev_objective) or _latest_revenue_objective(_rev_objective)) and (
             any(a.get("tool") == "get_sec_document" and a.get("error") is not None for a in attempts)
             or (
                 _TEN_Q_RE.search(str(session.get("objective") or session.get("query") or "").lower())
+                and not _carry_packet_accession(
+                    "get_sec_document",
+                    {},
+                    [],
+                    attempts,
+                    session.get("objective") or session.get("query"),
+                )
+            )
+            or (
+                _latest_revenue_objective(_rev_objective)
                 and not _carry_packet_accession(
                     "get_sec_document",
                     {},

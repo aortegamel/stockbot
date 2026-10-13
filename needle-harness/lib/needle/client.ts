@@ -365,7 +365,46 @@ export class NeedleRouter {
     if (!req.tool) throw new Error("generateArguments: tool must be a nonempty tool name");
     const release = await acquireNeedle();
     try {
-      const r = (await this.rawCall({ action: "arguments.generate", ...req }, "route")) as NeedleRouteResult;
+      // Tool-only boundary: raw evidence, attempts, feedback, and arbitrary
+      // caller fields never reach this server input.
+      const body: Record<string, unknown> = {
+        action: "arguments.generate",
+        tool: req.tool,
+        schema: req.schema,
+        objective: req.objective,
+      };
+      if (req.node && typeof req.node === "object" && !Array.isArray(req.node)) {
+        const node = req.node as Record<string, unknown>;
+        const picked: Record<string, unknown> = {};
+        for (const key of ["question", "node_id", "id", "type"]) {
+          if (Object.prototype.hasOwnProperty.call(node, key)) picked[key] = node[key];
+        }
+        body.node = picked;
+      }
+      if (req.context && typeof req.context === "object" && !Array.isArray(req.context)) {
+        const context = req.context as Record<string, unknown>;
+        const filtered: Record<string, unknown> = {};
+        for (const key of ["as_of", "temporal_scope", "today_utc", "ticker"]) {
+          if (Object.prototype.hasOwnProperty.call(context, key)) filtered[key] = context[key];
+        }
+        const grounded = context.grounded_arguments;
+        const properties = req.schema && typeof req.schema === "object" && !Array.isArray(req.schema)
+          ? (req.schema as Record<string, unknown>).properties : undefined;
+        if (grounded && typeof grounded === "object" && !Array.isArray(grounded)
+          && properties && typeof properties === "object" && !Array.isArray(properties)) {
+          const isScalar = (value: unknown): boolean =>
+            value === null || typeof value === "string" || typeof value === "boolean"
+            || (typeof value === "number" && Number.isFinite(value));
+          const admitted: Record<string, unknown> = {};
+          for (const [key, value] of Object.entries(grounded)) {
+            if (!Object.prototype.hasOwnProperty.call(properties, key)) continue;
+            if (isScalar(value) || (Array.isArray(value) && value.every(isScalar))) admitted[key] = value;
+          }
+          filtered.grounded_arguments = admitted;
+        }
+        body.context = filtered;
+      }
+      const r = (await this.rawCall(body, "route")) as NeedleRouteResult;
       validateNeedleTool(req.tool, r.tool);
       return r;
     } finally {
