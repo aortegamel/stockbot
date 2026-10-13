@@ -1154,3 +1154,85 @@ def test_unquantified_hash_tracks_excerpt_and_trigger():
         dict(base)
     )
     assert obligations._content_hash({**base, "_accession": "acc-10q"}) != obligations._content_hash(dict(base))
+
+
+def test_xbrl_gateway_long_null_prefix_keeps_duration_debt(monkeypatch: pytest.MonkeyPatch):
+    """Consumer regression: 128 nullable instant facts before duration debt.
+
+    Raw companyfacts run the real normalizer through the real gateway seam
+    (offline transport double); filing text stays on the layered helper.
+    Without pinned nullable metadata dtypes, Polars reads the all-None
+    prefix as Null and rejects the later duration strings/ints.
+    """
+    cik = 320193
+    leading = [
+        {"end": "2025-07-31", "val": 100 + i, "accn": f"instant-{i:03d}", "filed": "2025-08-28"} for i in range(128)
+    ]
+    debt = [
+        {
+            "start": "2025-05-01",
+            "end": "2025-07-31",
+            "val": 5e9,
+            "accn": "0000320193-25-000001",
+            "filed": "2025-08-28",
+            "fy": 2025,
+            "fp": "Q2",
+            "frame": "CY2025Q2",
+        },
+        {
+            "start": "2025-05-01",
+            "end": "2025-07-31",
+            "val": 6e9,
+            "accn": "0000320193-25-000002",
+            "filed": "2025-08-27",
+        },
+    ]
+    raw = {
+        "cik": cik,
+        "entityName": "SYN Corp",
+        "facts": {
+            "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": leading}}},
+            "us-gaap": {"LongTermDebt": {"units": {"USD": debt}}},
+        },
+    }
+    real_gateway_facts = obligations._xbrl_gateway_facts
+    _install_layered(
+        monkeypatch,
+        {"10-K": ({"Commitments and Contingencies": "No dollar amounts here."}, "2026-02-01")},
+    )
+    # _install_layered stubs the gateway seam; this test exercises the real one.
+    monkeypatch.setattr(obligations, "_xbrl_gateway_facts", real_gateway_facts)
+
+    def _no_identity() -> None:
+        return None
+
+    def _resolve_syn(ticker: str) -> int:
+        assert ticker == "SYN"
+        return cik
+
+    def _download_company_facts(got: int) -> dict[str, object]:
+        assert got == cik
+        return dict(raw)
+
+    monkeypatch.setattr("app.sec.client.ensure_identity", _no_identity)
+    monkeypatch.setattr("app.sec.client.resolve_cik", _resolve_syn)
+    monkeypatch.setattr("edgar.entity.entity_facts.download_company_facts_from_sec", _download_company_facts)
+    result = obligations.get_obligations("SYN")
+    assert "error" not in result
+    rows = result["obligations"]
+    assert isinstance(rows, list)
+    assert len(rows) == 1
+    (row,) = rows
+    assert row["type"] == "debt"
+    assert row["amount_billions"] == pytest.approx(5.0)
+    assert row["status"] == "on_balance_sheet"
+    assert row["concept"] == "LongTermDebt"
+    assert row["filed"] == "2025-08-28"
+    assert row["as_of"] == "2025-07-31"
+    assert row["known_at"] == "2025-08-28"
+    assert row["source"] == "SEC EDGAR XBRL LongTermDebt"
+    assert row["parser_version"] == obligations.PARSER_VERSION
+    assert row["content_hash"]
+    snapshot = result["current_snapshot"]
+    assert isinstance(snapshot, list)
+    assert [s["amount_billions"] for s in snapshot] == [pytest.approx(5.0)]

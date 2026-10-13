@@ -12,10 +12,13 @@ import hashlib
 import json
 import os
 from collections.abc import Callable, Iterator
+from datetime import date
 from pathlib import Path
 
 import pytest
 import requests
+from hypothesis import given, seed, settings
+from hypothesis import strategies as st
 
 from app.google_data import bigquery_client as bq
 from app.google_data import (
@@ -1100,15 +1103,15 @@ def test_checkpoint_replay_is_scope_exact(monkeypatch: pytest.MonkeyPatch, tmp_p
 # behavior is pinned here.
 
 
-def _dc_payload() -> _Row:
+def _dc_payload(when: str = "2020") -> _Row:
     return {
         "byVariable": {
             "Count_Person": {
                 "byEntity": {
                     "geoId/06": {
                         "orderedFacets": [
-                            {"facetId": "f1", "observations": [{"date": "2020", "value": 1.0}]},
-                            {"facetId": "f2", "observations": [{"date": "2020", "value": 2.0}]},
+                            {"facetId": "f1", "observations": [{"date": when, "value": 1.0}]},
+                            {"facetId": "f2", "observations": [{"date": when, "value": 2.0}]},
                         ]
                     }
                 }
@@ -1142,6 +1145,123 @@ def test_datacommons_two_facets_stay_distinct(monkeypatch: pytest.MonkeyPatch) -
     assert seen["url"] == "https://api.datacommons.org/v2/observation"
     assert seen["headers"] == {"X-API-Key": "dc-test"}
     assert "params" not in seen
+
+
+def _assert_dc_period_series(result: _Row, when: str, included: bool) -> None:
+    assert result["status"] == "ok"
+    assert result["source"] == "datacommons"
+    assert result["count"] == (2 if included else 0)
+    series = result["series"]
+    assert isinstance(series, list)
+    if not included:
+        assert series == []
+        return
+    assert len(series) == 2
+    by_facet = {s["facet"]: s for s in series}
+    assert set(by_facet) == {"f1", "f2"}
+    for facet_id, unit, provider, value in [
+        ("f1", "people", "US Census", 1.0),
+        ("f2", "USD", "BEA", 2.0),
+    ]:
+        entry = by_facet[facet_id]
+        assert entry["geo"] == "geoId/06"
+        assert entry["variable"] == "Count_Person"
+        assert entry["unit"] == unit
+        assert entry["provider"] == provider
+        assert entry["importName"] == provider
+        assert entry["observations"] == [{"date": when, "value": value}]
+
+
+@pytest.mark.parametrize(
+    ("when", "start_date", "end_date", "included"),
+    [
+        ("2020", "2020-06-01", "2020-06-30", True),
+        ("2020", "2020-12-31", "2021-01-01", True),
+        ("2020", "2019-12-31", "2020-01-01", True),
+        ("2020", "2021-01-01", "2021-12-31", False),
+        ("2020", "2019-01-01", "2019-12-31", False),
+        ("2020", "2020-12-31", None, True),
+        ("2020", "2021-01-01", None, False),
+        ("2020", None, "2020-01-01", True),
+        ("2020", None, "2019-12-31", False),
+        ("2024-02", "2024-02-15", "2024-02-20", True),
+        ("2024-02", "2024-02-29", "2024-02-29", True),
+        ("2024-02", "2024-03-01", "2024-03-31", False),
+        ("2024-02", "2024-01-01", "2024-01-31", False),
+        ("2023-02", "2023-02-28", "2023-03-01", True),
+        ("2023-02", "2023-03-01", None, False),
+        ("2024-04", "2024-04-30", "2024-05-01", True),
+        ("2024-04", "2024-05-01", None, False),
+        ("2024-01", "2024-01-31", "2024-02-01", True),
+        ("2024-02", "2024-02-29", None, True),
+        ("2024-02", None, "2024-02-01", True),
+        ("2024-02", None, "2024-01-31", False),
+        ("2024-02-29", "2024-02-29", "2024-02-29", True),
+        ("2024-02-29", "2024-02-28", "2024-02-29", True),
+        ("2024-02-29", "2024-02-29", "2024-03-01", True),
+        ("2024-02-29", "2024-03-01", "2024-03-02", False),
+        ("2024-02-29", "2024-02-27", "2024-02-28", False),
+        ("2024-02-29", "2024-02-29", None, True),
+        ("2024-02-29", "2024-03-01", None, False),
+        ("2024-02-29", None, "2024-02-29", True),
+        ("2024-02-29", None, "2024-02-28", False),
+        ("2024-Q1", "2024-01-01", None, True),
+    ],
+)
+def test_datacommons_observation_period_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+    when: str,
+    start_date: str | None,
+    end_date: str | None,
+    included: bool,
+) -> None:
+    monkeypatch.setenv("GOOGLE_DATA_ENABLED", "true")
+    monkeypatch.setenv("DATACOMMONS_API_KEY", "dc-test")
+
+    def _post(url: str, **kwargs: object) -> _Resp:
+        return _Resp(_dc_payload(when))
+
+    monkeypatch.setattr(requests, "post", _post)
+    result = datacommons.get_macro_context(["geoId/06"], ["Count_Person"], start_date=start_date, end_date=end_date)
+    _assert_dc_period_series(result, when, included)
+
+
+@pytest.mark.parametrize("precision", [4, 7, 10])
+@seed(20261012)
+@settings(max_examples=100, derandomize=True)
+@given(
+    observed_on=st.dates(min_value=date(2018, 1, 1), max_value=date(2026, 12, 31)),
+    boundary_a=st.dates(min_value=date(2018, 1, 1), max_value=date(2026, 12, 31)),
+    boundary_b=st.dates(min_value=date(2018, 1, 1), max_value=date(2026, 12, 31)),
+    has_start=st.booleans(),
+    has_end=st.booleans(),
+)
+def test_prop_datacommons_calendar_period_overlap(
+    precision: int,
+    observed_on: date,
+    boundary_a: date,
+    boundary_b: date,
+    has_start: bool,
+    has_end: bool,
+) -> None:
+    lower, upper = sorted((boundary_a, boundary_b))
+    when = observed_on.isoformat()[:precision]
+    start_date = lower.isoformat() if has_start else None
+    end_date = upper.isoformat() if has_end else None
+    # Project the bounds onto the observation's calendar precision.
+    included = (start_date is None or when >= start_date[:precision]) and (
+        end_date is None or when <= end_date[:precision]
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("GOOGLE_DATA_ENABLED", "true")
+        monkeypatch.setenv("DATACOMMONS_API_KEY", "dc-test")
+
+        def _post(url: str, **kwargs: object) -> _Resp:
+            return _Resp(_dc_payload(when))
+
+        monkeypatch.setattr(requests, "post", _post)
+        result = datacommons.get_macro_context(["geoId/06"], ["Count_Person"], start_date=start_date, end_date=end_date)
+    _assert_dc_period_series(result, when, included)
 
 
 def test_datacommons_missing_key_makes_no_call(monkeypatch: pytest.MonkeyPatch) -> None:

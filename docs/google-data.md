@@ -44,6 +44,13 @@ Stack Overflow tag activity. Pending: official Trends API
 `GOOGLE_TRENDS_API_PENDING_ACCESS`) and hourly Trends tables
 (`hourly_unavailable` in coverage).
 
+Data Commons filters observation periods with inclusive date bounds.
+Year-only dates cover the full calendar year.
+Month-only dates cover the full calendar month, including leap days.
+Full dates cover one day.
+The source keeps observations whose periods overlap the requested window.
+Each facet retains its original date, value, unit, provider, and metadata.
+
 ## Retention and point-in-time
 
 Observations land in the `google_observations` warehouse

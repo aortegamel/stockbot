@@ -680,3 +680,101 @@ def test_iter_archive_company_facts_propagates_corrupt_payload(tmp_path: Path):
 
     with pytest.raises(ValueError):
         research_data.iter_archive_company_facts(320193, data_root=tmp_path)
+
+
+def test_refresh_late_null_metadata_survives_archive_normalize(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Late-null refresh: 120 nullable instants then duration facts archive + normalize for real."""
+    instant = [
+        {
+            "end": "2025-07-31",
+            "val": 100 + index,
+            "accn": f"instant-{index}",
+            "filed": "2025-08-28",
+            "start": None,
+            "fy": None,
+            "fp": None,
+            "frame": None,
+        }
+        for index in range(120)
+    ]
+    duration = [
+        {
+            "start": "2025-05-01",
+            "end": "2025-07-31",
+            "val": 1.5,
+            "accn": "duration-full",
+            "filed": "2025-08-28",
+            "fy": 2025,
+            "fp": "Q2",
+            "frame": "CY2025Q2",
+        },
+        {
+            "start": "2025-05-01",
+            "end": "2025-07-31",
+            "val": 1.52,
+            "accn": "duration-null",
+            "filed": "2025-08-28",
+            "fy": None,
+            "fp": None,
+            "frame": None,
+        },
+    ]
+    payload = {
+        "cik": 320193,
+        "entityName": "CIK320193",
+        "facts": {"us-gaap": {"EarningsPerShareDiluted": {"units": {"USD/shares": instant + duration}}}},
+    }
+    get_script: list[bytes | Exception] = [
+        json.dumps(TICKERS_PAYLOAD).encode(),
+        json.dumps(payload).encode(),
+    ]
+    get_calls = _install_mocks(monkeypatch, get_script, [_page([_finra_row("AAPL", 20)], 1, 0)])
+
+    summary = prepare_short_interest_data(SETTLEMENT, tickers=["AAPL"], data_root=tmp_path)
+
+    assert summary["unresolved_tickers"] == []
+    assert summary["failed_enrichments"] == []
+    sec_facts = summary["sec_facts"]
+    assert isinstance(sec_facts, list) and len(sec_facts) == 1
+    entry = sec_facts[0]
+    assert isinstance(entry, dict)
+    assert entry["cik"] == 320193
+    assert entry["written"] == 0
+    assert entry["normalized_rows"] == 124  # 122 facts + documents + securities
+    assert set(entry) == {"source", "cik", "written", "normalized_rows", "content_hash", "retrieved_at"}
+    assert get_calls == [
+        "https://www.sec.gov/files/company_tickers.json",
+        "https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json",
+    ]
+    assert raw_archive.find("sec", "cik0000320193", "companyfacts", root=tmp_path / "raw") is not None
+
+    rows = research_data.iter_archive_company_facts(320193, data_root=tmp_path)
+    assert len(rows) == 122
+    assert [r.get("accession") for r in rows] == [f.get("accn") for f in instant + duration]
+    by_accn = {str(r.get("accession")): r for r in rows}
+    full = by_accn["duration-full"]
+    assert full["concept"] == "EarningsPerShareDiluted"
+    assert full["unit"] == "USD/shares"
+    assert (full["duration_type"], full["period_start"], full["fiscal_year"], full["fiscal_period"], full["frame"]) == (
+        "duration",
+        "2025-05-01",
+        2025,
+        "Q2",
+        "CY2025Q2",
+    )
+    assert type(full["fiscal_year"]) is int
+    assert type(full["period_start"]) is str
+    null = by_accn["duration-null"]
+    assert (null["duration_type"], null["period_start"], null["fiscal_year"], null["fiscal_period"], null["frame"]) == (
+        "duration",
+        "2025-05-01",
+        None,
+        None,
+        None,
+    )
+    assert all(
+        (r.get("duration_type"), r.get("period_start"), r.get("fiscal_year"), r.get("fiscal_period"), r.get("frame"))
+        == ("instant", None, None, None, None)
+        for r in rows
+        if str(r.get("accession")).startswith("instant-")
+    )

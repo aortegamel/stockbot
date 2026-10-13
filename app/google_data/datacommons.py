@@ -12,7 +12,8 @@ the request stays one bounded call.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from calendar import monthrange
+from datetime import UTC, date, datetime
 
 import requests
 
@@ -163,10 +164,27 @@ def _decode_body(response: requests.Response) -> tuple[dict[str, object] | None,
 
 
 def _in_window(when: object, start_date: str | None, end_date: str | None) -> bool:
-    """True when the observation date survives client-side date filtering."""
-    if start_date and str(when) < start_date:
+    """Keep observation periods that overlap the inclusive date window."""
+    raw = str(when)
+    bounds = _calendar_bounds(raw)
+    period_start, period_end = bounds if bounds is not None else (raw, raw)
+    if start_date and period_end < start_date:
         return False
-    return not (end_date and str(when) > end_date)
+    return not (end_date and period_start > end_date)
+
+
+def _calendar_bounds(raw: str) -> tuple[str, str] | None:
+    """(start, end) for YYYY/YYYY-MM periods; None keeps the lexical contract."""
+    try:
+        if len(raw) == 4:
+            year = date.fromisoformat(f"{raw}-01-01").year
+            return f"{year:04d}-01-01", f"{year:04d}-12-31"
+        if len(raw) == 7:
+            month = date.fromisoformat(f"{raw}-01")
+            return f"{raw}-01", f"{raw}-{monthrange(month.year, month.month)[1]:02d}"
+    except ValueError:
+        return None
+    return None
 
 
 def _facet_meta(facets: object, facet_id: object) -> dict[str, object]:

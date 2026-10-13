@@ -13,7 +13,7 @@ from datetime import date
 import pytest
 
 from app.domain.market.securities import TickerAlias
-from app.normalization import normalize_sec_company_facts, normalize_sec_tickers
+from app.normalization import DIVIDEND_PER_SHARE_CONCEPT, normalize_sec_company_facts, normalize_sec_tickers
 from app.policy import LOCAL_CONTEXT
 from app.services import sec_facts
 from app.tool_render import render_tool_result
@@ -94,6 +94,7 @@ def _seed_facts(
     diluted: Iterable[Mapping[str, object]] = (),
     basic: Iterable[Mapping[str, object]] = (),
     shares: Iterable[Mapping[str, object]] = (),
+    dividends: Iterable[Mapping[str, object]] = (),
 ) -> None:
     facts: dict[str, object] = {}
     payload: dict[str, object] = {"cik": cik, "entityName": f"CIK{cik}", "facts": facts}
@@ -106,6 +107,8 @@ def _seed_facts(
         us_gaap["EarningsPerShareDiluted"] = {"units": {"USD/shares": list(diluted)}}
     if basic:
         us_gaap["EarningsPerShareBasic"] = {"units": {"USD/shares": list(basic)}}
+    if dividends:
+        us_gaap[DIVIDEND_PER_SHARE_CONCEPT] = {"units": {"USD/shares": list(dividends)}}
     if us_gaap:
         facts["us-gaap"] = us_gaap
     datasets = normalize_sec_company_facts(
@@ -555,3 +558,61 @@ def test_now_stamped_alias_unresolved_at_past_as_of(gateway: _Gateway, monkeypat
     monkeypatch.setattr(sec_facts.edgar_client, "get_fundamentals", _boom)
     result = sec_facts.get_fundamentals("NVDA", "shares_outstanding", as_of="2026-08-10")
     assert result["error_type"] == "pit_data_unavailable"
+
+
+def test_eps_shares_dividends_survive_long_null_instant_prefix(
+    gateway: _Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consumer regression: 120 nullable instant shares before duration EPS/dividends."""
+    _seed_ticker(gateway, NVDA_CIK, "NVDA")
+    prefix = [
+        _shares_fact(1000 + i, f"2024-{(i % 12) + 1:02d}-15", f"2024-{(i % 12) + 1:02d}-20", f"p{i:03d}")
+        for i in range(120)
+    ]
+    shares = [*prefix, _shares_fact(1100, "2026-01-25", "2026-02-25", "s-final")]
+    diluted = [f for f in _NVDA_FACTS if f["val"] not in _NVDA_BASIC]
+    basic = [f for f in _NVDA_FACTS if f["val"] in _NVDA_BASIC]
+    dividends = [
+        _eps_fact(0.50, "2025-07-01", "2025-09-30", 2025, "Q3", "2025-10-28", "d1"),
+        _eps_fact(0.50, "2025-10-01", "2025-12-31", 2025, "Q4", "2026-02-10", "d2"),
+        _eps_fact(0.50, "2026-01-01", "2026-03-31", 2026, "Q1", "2026-04-28", "d3"),
+        _eps_fact(0.50, "2026-04-01", "2026-06-30", 2026, "Q2", "2026-07-29", "d4"),
+        _eps_fact(2.00, "2025-01-01", "2025-12-31", 2025, "FY", "2026-02-10", "dfy"),
+    ]
+    _seed_facts(gateway, NVDA_CIK, diluted=diluted, basic=basic, shares=shares, dividends=dividends)
+
+    rows = gateway.facts_by_cik[NVDA_CIK]["financial_facts"]
+    assert len(rows) == 121 + len(diluted) + len(basic) + len(dividends)
+    leading = rows[:101]
+    assert all(r["duration_type"] == "instant" for r in leading)
+    assert all(r["period_start"] is None and r["fiscal_year"] is None and r["fiscal_period"] is None for r in leading)
+    by_accn = {str(r["accession"]): r for r in rows}
+    assert by_accn["a7"]["period_start"] == "2025-01-27"
+    assert by_accn["a7"]["fiscal_year"] == 2026
+    assert type(by_accn["a7"]["fiscal_year"]) is int
+    assert by_accn["dfy"]["period_start"] == "2025-01-01"
+    assert by_accn["dfy"]["fiscal_year"] == 2025
+
+    def _boom(ticker: str, metric: str):
+        raise AssertionError(f"store rows must serve {metric}, never live fallback")
+
+    monkeypatch.setattr(sec_facts.edgar_client, "get_fundamentals", _boom)
+    eps = sec_facts.get_fundamentals("NVDA", "eps", as_of="2026-08-10")
+    assert eps["data_source"] == "live"
+    assert eps["row_count"] == 4
+    assert eps["ttm_eps_diluted"] == 6.53
+    assert eps["source_label"] == "SEC EDGAR company facts (Basic & Diluted EPS)"
+
+    out = sec_facts.get_fundamentals("NVDA", "shares_outstanding", as_of="2026-08-10")
+    assert out["data_source"] == "live"
+    assert out["shares_outstanding"] == 1100
+    assert out["as_of"] == "2026-01-25"
+    assert out["accession"] == "s-final"
+    assert out["source_label"] == "SEC EDGAR company facts"
+
+    div = sec_facts.get_fundamentals("NVDA", "dividends", as_of="2026-08-10")
+    assert div["data_source"] == "live"
+    assert div["dividend_status"] == "paying"
+    assert div["ttm_dividend_per_share"] == 2.00
+    assert div["annual_history"] == [{"fiscal_year": 2025, "dividend_per_share": 2.00}]
+    assert div["price"] is None

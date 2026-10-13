@@ -5,6 +5,9 @@ no network access.
 """
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
+from pandera.errors import SchemaError
 
 from app.normalization import (
     COMPANY_FACTS_PARSER_VERSION,
@@ -360,6 +363,142 @@ def test_eps_instant_fact_without_period_metadata_is_nullable():
     assert row["period_start"] is None
     assert row["fiscal_year"] is None
     assert row["fiscal_period"] is None
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["null-prefix", "duration-prefix"])
+def test_mixed_facts_preserve_metadata_after_long_null_prefix(reverse: bool) -> None:
+    instant: list[dict[str, object]] = [
+        {
+            "end": "2025-07-31",
+            "val": 100 + index,
+            "accn": f"instant-{index}",
+            "filed": "2025-08-28",
+            "start": None,
+            "fy": None,
+            "fp": None,
+            "frame": None,
+        }
+        for index in range(128)
+    ]
+    duration: list[dict[str, object]] = [
+        {
+            "start": "2025-05-01",
+            "end": "2025-07-31",
+            "val": 1.5,
+            "accn": "duration-full",
+            "filed": "2025-08-28",
+            "fy": 2025,
+            "fp": "Q2",
+            "frame": "CY2025Q2",
+        },
+        {
+            "start": "2025-05-01",
+            "end": "2025-07-31",
+            "val": 1.52,
+            "accn": "duration-null",
+            "filed": "2025-08-28",
+            "fy": None,
+            "fp": None,
+            "frame": None,
+        },
+    ]
+    facts = instant + duration
+    if reverse:
+        facts.reverse()
+    rows = _normalize(_eps_payload(diluted=facts))["financial_facts"]
+    assert [row["accession"] for row in rows] == [fact["accn"] for fact in facts]
+    metadata = {
+        row["accession"]: (
+            row["duration_type"],
+            row["period_start"],
+            row["fiscal_year"],
+            row["fiscal_period"],
+            row["frame"],
+        )
+        for row in rows
+    }
+    assert metadata == {
+        **{fact["accn"]: ("instant", None, None, None, None) for fact in instant},
+        "duration-full": ("duration", "2025-05-01", 2025, "Q2", "CY2025Q2"),
+        "duration-null": ("duration", "2025-05-01", None, None, None),
+    }
+    assert type(next(row["fiscal_year"] for row in rows if row["accession"] == "duration-full")) is int
+
+
+@settings(max_examples=60, derandomize=True, deadline=None)
+@given(
+    st.lists(
+        st.fixed_dictionaries(
+            {},
+            optional={
+                "start": st.one_of(st.none(), st.sampled_from(["2025-01-01", "2025-05-01"])),
+                "fy": st.one_of(st.none(), st.integers(min_value=1900, max_value=2100)),
+                "fp": st.one_of(st.none(), st.sampled_from(["FY", "Q1", "Q2", "Q3", "Q4"])),
+                "frame": st.one_of(st.none(), st.sampled_from(["CY2025", "CY2025Q2", "CY2025Q2I"])),
+            },
+        ),
+        min_size=1,
+        max_size=8,
+    )
+)
+def test_prop_optional_fact_metadata_preserves_values(metadata: list[dict[str, object]]) -> None:
+    facts: list[dict[str, object]] = [
+        {
+            "end": "2025-07-31",
+            "val": 1.5,
+            "accn": f"a{index}",
+            "filed": "2025-08-28",
+            **fields,
+        }
+        for index, fields in enumerate(metadata)
+    ]
+    rows = _normalize(_eps_payload(diluted=facts))["financial_facts"]
+    assert len(rows) == len(facts)
+    for row, fields in zip(rows, metadata, strict=True):
+        assert (
+            row["duration_type"],
+            row["period_start"],
+            row["fiscal_year"],
+            row["fiscal_period"],
+            row["frame"],
+        ) == (
+            "duration" if fields.get("start") else "instant",
+            fields.get("start"),
+            fields.get("fy"),
+            fields.get("fp"),
+            fields.get("frame"),
+        )
+        if fields.get("fy") is not None:
+            assert type(row["fiscal_year"]) is int
+
+
+@settings(max_examples=40, derandomize=True, deadline=None)
+@given(st.integers(min_value=101, max_value=256), st.sampled_from(["first", "middle", "last"]))
+def test_prop_fact_metadata_does_not_depend_on_order(null_count: int, position: str) -> None:
+    facts: list[dict[str, object]] = [
+        {"end": "2025-07-31", "val": index, "accn": f"a{index}", "filed": "2025-08-28"} for index in range(null_count)
+    ]
+    facts.insert(
+        {"first": 0, "middle": null_count // 2, "last": null_count}[position],
+        {
+            "start": "2025-05-01",
+            "end": "2025-07-31",
+            "val": 1.5,
+            "accn": "duration",
+            "filed": "2025-08-28",
+            "fy": 2025,
+            "fp": "Q2",
+            "frame": "CY2025Q2",
+        },
+    )
+    forward = _normalize(_eps_payload(diluted=facts))["financial_facts"]
+    backward = _normalize(_eps_payload(diluted=list(reversed(facts))))["financial_facts"]
+    assert forward == list(reversed(backward))
+
+
+def test_fact_validation_rejects_invalid_known_at() -> None:
+    with pytest.raises(SchemaError, match="_timestamp"):
+        _normalize(_eps_payload(diluted=[{"end": "2025-07-31", "val": 1.5, "accn": "a1", "filed": "not-a-date"}]))
 
 
 def test_eps_non_usd_shares_units_are_ignored():

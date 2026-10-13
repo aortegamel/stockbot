@@ -69,7 +69,15 @@ def _is_parseable_timestamp(value: object) -> bool:
 def _validate(rows: list[dict[str, object]], model: type[pa.DataFrameModel]) -> None:
     """Validate one normalized dataset's rows; empty is valid, else raises."""
     if rows:
-        model.validate(pl.from_dicts(rows, strict=False))
+        # ponytail: pin the four optional CompanyFacts metadata columns only; the row
+        # contract stays ISO String/null and integer/null, but Polars otherwise reads
+        # all-None prefixes as Null and rejects later strings/ints.
+        schema = (
+            {"period_start": pl.String, "fiscal_year": pl.Int64, "fiscal_period": pl.String, "frame": pl.String}
+            if model is FinancialFactsFrame
+            else None
+        )
+        model.validate(pl.from_dicts(rows, schema_overrides=schema, strict=False))
 
 
 class _LenientConfig(pa.DataFrameModel.Config):

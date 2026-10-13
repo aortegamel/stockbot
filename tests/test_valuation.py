@@ -7,6 +7,8 @@ are injected via monkeypatch; nothing touches the network or cache.db.
 import pytest
 
 from app import valuation
+from app.domain.market.securities import TickerAlias
+from app.normalization import normalize_sec_company_facts, normalize_sec_tickers
 from app.policy import LOCAL_CONTEXT
 from app.tools import execute_tool
 
@@ -641,3 +643,193 @@ def test_eps_gateway_failure_reaches_tool_error_envelope(monkeypatch: pytest.Mon
     result = execute_tool("get_valuation_metrics", {"ticker": "NVDA"}, "test", context=LOCAL_CONTEXT)
     assert result == {"error": f"Tool 'get_valuation_metrics' failed: {message}"}
     assert cache.store == {}
+
+
+_NVDA_CIK = 1045810
+_VALUATION_FACTS_RETRIEVED_AT = "2026-08-01T00:00:00Z"
+
+
+class _LiveLikeSecFactsGateway:
+    """Offline SourceGateway double: real normalized rows, PIT-filtered like the live gateway."""
+
+    def __init__(self) -> None:
+        self.alias_rows: list[dict[str, object]] = []
+        self.facts_by_cik: dict[int, dict[str, list[dict[str, object]]]] = {}
+
+    def ticker_candidates(self, ticker: str, as_of: object = None) -> list[TickerAlias]:
+        """All aliases for the ticker, unfiltered (PIT stays in resolve_ticker_aliases)."""
+        del as_of
+        want = str(ticker).strip().upper()
+        out: list[TickerAlias] = []
+        for row in self.alias_rows:
+            if str(row.get("alias_value") or "").strip().upper() != want:
+                continue
+            security_id = row.get("security_id")
+            out.append(
+                TickerAlias(
+                    alias_type=str(row.get("alias_type")),
+                    alias_value=str(row.get("alias_value")),
+                    entity_id=str(row.get("entity_id")),
+                    security_id=str(security_id) if security_id else None,
+                    source=str(row.get("source")),
+                    valid_from=str(row.get("valid_from")) if row.get("valid_from") else None,
+                    valid_to=str(row.get("valid_to")) if row.get("valid_to") else None,
+                    known_at=str(row.get("known_at")) if row.get("known_at") else None,
+                    retrieved_at=str(row.get("retrieved_at")) if row.get("retrieved_at") else None,
+                )
+            )
+        return out
+
+    def company_facts(self, cik: int, as_of: str | None = None) -> dict[str, object]:
+        """Full normalized dict, PIT-filtered to as_of like the live gateway."""
+        facts = self.facts_by_cik.get(int(cik))
+        if facts is None:
+            return {"documents": [], "financial_facts": [], "securities": [], "dividend_events": []}
+        out: dict[str, object] = {name: list(rows) for name, rows in facts.items()}
+        if as_of is None:
+            return out
+        for rows in out.values():
+            if isinstance(rows, list):
+                rows[:] = [
+                    row for row in rows if isinstance(row, dict) and str(row.get("known_at") or "")[:10] <= as_of
+                ]
+        return out
+
+
+def _valuation_eps_fact(val: float, start: str, end: str, fy: int, fp: str, filed: str, accn: str) -> dict[str, object]:
+    return {"val": val, "start": start, "end": end, "fy": fy, "fp": fp, "filed": filed, "accn": accn}
+
+
+def _valuation_diluted() -> list[dict[str, object]]:
+    """NVDA diluted EPS facts (quarterly + YTD + FY-only Q4) yielding TTM 6.53."""
+    return [
+        _valuation_eps_fact(0.76, "2025-01-27", "2025-04-27", 2026, "Q1", "2025-05-28", "v-a1"),
+        _valuation_eps_fact(1.84, "2025-01-27", "2025-07-27", 2026, "Q2", "2025-08-27", "v-a3"),
+        _valuation_eps_fact(1.08, "2025-04-28", "2025-07-27", 2026, "Q2", "2025-08-27", "v-a4"),
+        _valuation_eps_fact(3.14, "2025-01-27", "2025-10-26", 2026, "Q3", "2025-11-19", "v-a5"),
+        _valuation_eps_fact(1.30, "2025-07-28", "2025-10-26", 2026, "Q3", "2025-11-19", "v-a6"),
+        _valuation_eps_fact(4.90, "2025-01-27", "2026-01-25", 2026, "FY", "2026-02-25", "v-a7"),
+        _valuation_eps_fact(2.39, "2026-01-26", "2026-04-26", 2027, "Q1", "2026-05-27", "v-a8"),
+    ]
+
+
+def _valuation_basic() -> list[dict[str, object]]:
+    return [
+        _valuation_eps_fact(0.77, "2025-01-27", "2025-04-27", 2026, "Q1", "2025-05-28", "v-a2"),
+        _valuation_eps_fact(2.40, "2026-01-26", "2026-04-26", 2027, "Q1", "2026-05-27", "v-a9"),
+    ]
+
+
+def _valuation_shares_prefix(count: int = 120) -> list[dict[str, object]]:
+    """Leading nullable instant rows: shares facts carry no start/fy/fp/frame metadata."""
+    return [
+        {
+            "end": f"2026-01-{(i % 28) + 1:02d}",
+            "val": 24_221_000_000 + i,
+            "accn": f"0001045810-26-{i:06d}",
+            "filed": f"2026-02-{(i % 27) + 1:02d}",
+        }
+        for i in range(count)
+    ]
+
+
+def test_valuation_through_real_normalization_with_instant_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Valuation EPS through real normalization: 120 nullable instant rows precede duration EPS facts."""
+    payload: dict[str, object] = {
+        "cik": _NVDA_CIK,
+        "entityName": "NVDA Corp",
+        "facts": {
+            "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": _valuation_shares_prefix()}}},
+            "us-gaap": {
+                "EarningsPerShareDiluted": {"units": {"USD/shares": _valuation_diluted()}},
+                "EarningsPerShareBasic": {"units": {"USD/shares": _valuation_basic()}},
+            },
+        },
+    }
+    datasets = normalize_sec_company_facts(
+        payload,
+        retrieved_at=_VALUATION_FACTS_RETRIEVED_AT,
+        content_hash="valuation-eps-regression",
+        source_url=f"https://data.sec.gov/api/xbrl/companyfacts/CIK{_NVDA_CIK:010d}.json",
+        source_record_id=f"cik{_NVDA_CIK:010d}",
+    )
+    financial_facts = datasets["financial_facts"]
+    leading = financial_facts[:101]
+    assert len(leading) == 101
+    assert all(row["duration_type"] == "instant" for row in leading)
+    assert all(
+        row["period_start"] is None and row["fiscal_year"] is None and row["fiscal_period"] is None for row in leading
+    )
+    duration_rows = [row for row in financial_facts if row["duration_type"] == "duration"]
+    assert duration_rows
+    assert all(isinstance(row["period_start"], str) and isinstance(row["fiscal_year"], int) for row in duration_rows)
+
+    gw = _LiveLikeSecFactsGateway()
+    gw.alias_rows.extend(
+        normalize_sec_tickers(
+            {"0": {"cik_str": _NVDA_CIK, "ticker": "NVDA", "title": "NVDA Corp"}},
+            retrieved_at=_VALUATION_FACTS_RETRIEVED_AT,
+            content_hash="valuation-tickers-regression",
+        ).get("entity_aliases", [])
+    )
+    gw.facts_by_cik[_NVDA_CIK] = datasets
+
+    def _no_live_fallback(*args: object, **kwargs: object) -> dict[str, object]:
+        raise AssertionError("valuation regression must use normalized store rows, never live fallback")
+
+    def _price(ticker: str) -> float:
+        return 213.05
+
+    def _estimates_for(ticker: str) -> dict[str, object]:
+        return _estimates()
+
+    def _obligations_for(ticker: str) -> dict[str, object]:
+        return _obligations()
+
+    def _margin_for(ticker: str) -> tuple[float | None, str]:
+        return (0.75, "company_facts")
+
+    def _gateway_for() -> _LiveLikeSecFactsGateway:
+        return gw
+
+    monkeypatch.setattr(valuation, "cache", FakeCache())
+    monkeypatch.setattr(valuation, "get_live_price", _price)
+    monkeypatch.setattr(valuation.analyst_client, "get_analyst_estimates", _estimates_for)
+    monkeypatch.setattr(valuation.obligations, "get_obligations", _obligations_for)
+    monkeypatch.setattr(valuation, "_revenue_matched_margin", _margin_for)
+    monkeypatch.setattr(valuation.sec_facts, "_gateway", _gateway_for)
+    monkeypatch.setattr(valuation.sec_facts.edgar_client, "get_fundamentals", _no_live_fallback)
+
+    result = valuation.get_valuation_metrics("NVDA")
+    assert result["ticker"] == "NVDA"
+    price = result["price"]
+    assert isinstance(price, dict)
+    assert price["last"] == 213.05
+    assert result["ttm_gaap_eps"] == 6.53
+    assert result["trailing_pe"] == pytest.approx(32.6, abs=0.1)
+    forward = result["forward_eps"]
+    assert isinstance(forward, dict)
+    consensus = forward["consensus"]
+    assert isinstance(consensus, dict)
+    assert consensus["eps"] == 9.02
+    consensus_next = forward["consensus_next_fy"]
+    assert isinstance(consensus_next, dict)
+    assert consensus_next["eps"] == 13.04
+    scenario = forward["scenario"]
+    assert isinstance(scenario, dict)
+    assert scenario["eps_after_all_obligations"] > 8.0
+    worst = forward["worst_case"]
+    assert isinstance(worst, dict)
+    assert worst["eps_after_all_obligations"] < scenario["eps_after_all_obligations"]
+    obligations_block = result["obligations"]
+    assert isinstance(obligations_block, dict)
+    assert obligations_block["revenue_matched_annual_billions"] > 100
+    assert obligations_block["revenue_matched_gross_margin"] == 0.75
+    assert obligations_block["revenue_matched_margin_source"] == "company_facts"
+    assert obligations_block["revenue_matched_implied_revenue_billions"] > 400
+    projected = result["projected_prices"]
+    assert isinstance(projected, dict)
+    assert projected["current_price"] == 213.05
+    tiers = projected["tiers"]
+    assert isinstance(tiers, list)
+    assert tiers
