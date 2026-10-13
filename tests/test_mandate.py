@@ -8,14 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from app import tools
+from app import config, tools
 from app.domain.portfolio import PortfolioSnapshot, Position
 from app.domain.risk.evaluation import UNKNOWN_SECTOR, EvaluationIssue, evaluate_mandate
 from app.domain.risk.mandate import Mandate, RiskLimit, parse_mandate
 from app.services import risk as risk_service
 from app.services.mandate import load_mandate_file
 from app.services.portfolio_sync import persist_snapshot, read_latest_snapshot
-from cli import _cmd_evaluate_mandate
+from cli import _build_parser, _cmd_evaluate_mandate, _dispatch_command
 
 
 @pytest.fixture
@@ -597,6 +597,66 @@ def test_cli_evaluate_mandate_missing_mandate_exits_1(capsys: pytest.CaptureFixt
         _cmd_evaluate_mandate(data_root / "mandate.json", str(data_root))
     assert excinfo.value.code == 1
     assert "error:" in capsys.readouterr().err
+
+
+def test_cli_evaluate_mandate_dispatch_uses_default_mandate(
+    capsys: pytest.CaptureFixture[str],
+    data_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    seeded_mandate = _seed_snapshot_and_mandate(data_root, monkeypatch=monkeypatch)
+    default_root = tmp_path / "default"
+    default_root.mkdir()
+    mandate_path = seeded_mandate.rename(default_root / "mandate.json")
+    monkeypatch.setattr(config, "get_data_root", lambda: default_root)
+    args = _build_parser().parse_args(["evaluate-mandate", "--data-root", str(data_root)])
+
+    assert not hasattr(args, "mandate")
+    assert _dispatch_command(args) is True
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert f"Mandate: {mandate_path}" in captured.out
+    expected_created = f"Snapshot: portfolio:robinhood:2026-08-25T12:00:00+00:00 created {datetime(2026, 8, 25, 12, 0, tzinfo=UTC).astimezone().isoformat()}"
+    assert expected_created in captured.out
+    assert "Sector exposures: semiconductors 75.0%, unknown_sector 25.0%" in captured.out
+    assert "[warning] sector_exposure semiconductors: actual 75.0%, limit 20.0%, excess 55.0%" in captured.out
+    assert "[warning] single_position_weight: actual 75.0%, limit 25.0%, excess 50.0%" in captured.out
+    assert "No breaches." not in captured.out
+
+
+def test_cli_evaluate_mandate_dispatch_missing_default_exits_1(
+    capsys: pytest.CaptureFixture[str],
+    data_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _seed_snapshot_and_mandate(data_root, monkeypatch=monkeypatch)
+    default_root = tmp_path / "default"
+    monkeypatch.setattr(config, "get_data_root", lambda: default_root)
+    args = _build_parser().parse_args(["evaluate-mandate", "--data-root", str(data_root)])
+
+    with pytest.raises(SystemExit) as excinfo:
+        _dispatch_command(args)
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert "No such file or directory" in captured.err
+    assert str(default_root / "mandate.json") in captured.err
+
+
+def test_cli_evaluate_mandate_parser_rejects_mandate_argument(capsys: pytest.CaptureFixture[str]):
+    parser = _build_parser()
+    assert not hasattr(parser.parse_args(["evaluate-mandate"]), "mandate")
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["evaluate-mandate", "--mandate", "mandate.json"])
+
+    assert excinfo.value.code == 2
+    assert "unrecognized arguments: --mandate mandate.json" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

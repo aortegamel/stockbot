@@ -18,6 +18,7 @@ import json
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -179,22 +180,22 @@ def _is_uri_like(value: str) -> bool:
 
 
 def _source_ref_candidates(result: object) -> list[dict[str, object]]:
-    """Candidate mappings: the result plus one level of nested dicts/lists."""
+    """Candidate mappings at every depth, with stable breadth-first ordering."""
     if not isinstance(result, dict):
         return []
-    candidates: list[dict[str, object]] = [result]
-    for value in result.values():
-        if isinstance(value, dict):
-            candidates.append(value)
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    candidates.append(item)
-    meta = result.get("meta")
-    if isinstance(meta, dict):
-        nested = meta.get("source_refs")
-        if isinstance(nested, dict):
-            candidates.append(nested)
+    candidates: list[dict[str, object]] = []
+    pending: deque[object] = deque([result])
+    seen: set[int] = set()
+    while pending:
+        item = pending.popleft()
+        if not isinstance(item, (dict, list)) or id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, dict):
+            candidates.append(item)
+            pending.extend(item.values())
+        else:
+            pending.extend(item)
     return candidates
 
 
@@ -1296,6 +1297,31 @@ def _success_meta(
     handle = result.get("source_handle") if isinstance(result, dict) else None
     if isinstance(handle, dict) and handle:
         safe_meta["source_handle"] = dict(handle)
+    if isinstance(result, dict):
+        for key in (
+            "search_id",
+            "coverage",
+            "cursor",
+            "end_cursor",
+            "next_cursor",
+            "offset",
+            "end_offset",
+            "next_offset",
+            "total",
+            "total_count",
+            "total_chars",
+            "limit",
+            "page_size",
+            "more",
+            "has_more",
+            "more_available",
+            "continuation",
+            "source_uri",
+            "section",
+            "view",
+        ):
+            if key in result:
+                safe_meta[key] = result[key]
     if name in ("search_tools", "browse_tools") and isinstance(result, dict):
         # Deferred loading: the TS extension activates these schemas additively.
         # Names are already model-visible in content; meta carries them structured.

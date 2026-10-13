@@ -115,6 +115,8 @@ def _dispatch_shape_render_doc(result: dict[str, object], max_bytes: int) -> str
         return _render_web_search(result, max_bytes)
     if _is_insider_envelope(result):
         return _render_insider_activity(result, max_bytes)
+    if isinstance(result.get("text"), str) and "next_cursor" in result:
+        return _render_text_result(result, max_bytes)
     if _is_text_result(result):
         return _render_text_result(result, max_bytes)
     return _render_generic(result, max_bytes)
@@ -420,8 +422,8 @@ def _research_search_hit_line(hit: object) -> str:
         for part in (
             _cell(row.get("form")),
             _cell(row.get("filed_at")),
-            _cell(row.get("accession")),
-            _cell(row.get("document")),
+            _cell(row.get("accession_no") or row.get("accession")),
+            _cell(row.get("matched_document") or row.get("document")),
         )
         if part
     )
@@ -435,9 +437,8 @@ def _research_search_hit_line(hit: object) -> str:
 
 
 def _research_search_head(result: dict[str, object], shown: list[object]) -> list[str]:
-    """Retrieval-truth header of a paged search card (coverage, never the display bound)."""
     cov = _as_dict(result.get("coverage"))
-    return [
+    lines = [
         f"SEC search {_cell(result.get('search_id'))} — {len(shown)} hit(s) at offset {_cell(result.get('offset'))} of {_cell(result.get('total'))} persisted",
         f"query: {_cell(result.get('query')) or 'none'}",
         (
@@ -447,11 +448,27 @@ def _research_search_head(result: dict[str, object], shown: list[object]) -> lis
             + f"; source exhausted: {_briefing_flag_status(cov.get('source_exhausted'))}"
         ),
     ]
+    for key, value in cov.items():
+        if key not in ("status", "pagination_complete", "source_exhausted"):
+            lines.append(f"coverage.{key}: {_cell(value)}")
+    return lines
 
 
-def _research_search_hit_lines(shown: list[object]) -> list[str]:
-    """Rendered hit lines, dropping rows that carry no document identity."""
-    return [line for line in (_research_search_hit_line(hit) for hit in shown) if line]
+def _research_search_tail(result: dict[str, object], next_offset: int | None, more: bool) -> list[str]:
+    """Navigation instructions preserve the search identity and page size."""
+    if not more:
+        continuation = "More hits: none (end of persisted hits)"
+    elif next_offset is None:
+        continuation = "More hits: continuation unavailable (offset missing)"
+    else:
+        continuation = f"More hits: call research_read_search with offset={next_offset}"
+        for key in ("search_id", "session_id", "limit"):
+            if result.get(key) is not None:
+                continuation += f", {key}={_cell(result[key])}"
+    return [
+        "Hits are navigation artifacts: open the filing and cite a raw passage before recording evidence.",
+        continuation,
+    ]
 
 
 def _research_search_card(result: dict[str, object], max_bytes: int) -> str | None:
@@ -462,18 +479,26 @@ def _research_search_card(result: dict[str, object], max_bytes: int) -> str | No
     offset = result.get("offset")
     next_offset = offset + len(shown) if isinstance(offset, int) else None
     head = _research_search_head(result, shown)
-    tail = [
-        "Hits are navigation artifacts: open the filing and cite a raw passage before recording evidence.",
-        (
-            f"More hits: call research_read_search with offset={next_offset}"
-            if result.get("more") and next_offset is not None
-            else "More hits: none (every persisted hit is shown)"
-        ),
-    ]
-    budget = max_bytes - _utf8_size("\n".join(head + tail)) - 2
-    kept, omitted = _fit_lines(_research_search_hit_lines(shown), max(budget, 1))
-    body = kept + ([f"{TRUNCATED_MARKER} (Omitted hits: {omitted})"] if omitted else [])
-    return "\n".join(head + body + tail)
+    tail = _research_search_tail(result, next_offset, True)
+    notice = f"{TRUNCATED_MARKER} (Omitted hits: {len(shown)})"
+    budget = max_bytes - _utf8_size("\n".join(head + [notice] + tail)) - 3
+    kept: list[str] = []
+    consumed = 0
+    for hit in shown:
+        line = _research_search_hit_line(hit)
+        if line:
+            cost = _utf8_size(line) + 1
+            if cost > budget:
+                break
+            kept.append(line)
+            budget -= cost
+        consumed += 1
+    omitted = len(shown) - consumed
+    next_offset = offset + consumed if isinstance(offset, int) else None
+    tail = _research_search_tail(result, next_offset, bool(result.get("more")) or omitted > 0)
+    if omitted:
+        kept.append(f"{TRUNCATED_MARKER} (Omitted hits: {omitted})")
+    return _truncate_bytes("\n".join(head + kept + tail), max_bytes)
 
 
 def _render_market_snapshot(result: dict[str, object], max_bytes: int) -> str:
@@ -2399,6 +2424,43 @@ def _text_result_header(result: dict[str, object]) -> str:
         header_lines.append(f"Filed: {result['filed']}")
     if result.get("source"):
         header_lines.append(f"Source: {result['source']}")
+    for key in (
+        "accession_no",
+        "document_name",
+        "source_uri",
+        "view",
+        "section",
+        "query",
+        "cursor",
+        "end_cursor",
+        "next_cursor",
+        "offset",
+        "end_offset",
+        "total_chars",
+        "more_available",
+        "next_offset",
+        "total_count",
+        "returned_count",
+        "limit",
+        "page_size",
+    ):
+        if key in result:
+            value = result[key]
+            header_lines.append(f"{key}: {_cell(value) if value is not None else 'none'}")
+    handle = _as_dict(result.get("source_handle"))
+    if handle:
+        header_lines.append("source_handle: " + ", ".join(f"{k}: {_cell(v)}" for k, v in handle.items()))
+    for ref in _as_list(result.get("source_refs")):
+        if isinstance(ref, dict):
+            header_lines.append("source_ref: " + ", ".join(f"{k}: {_cell(v)}" for k, v in ref.items()))
+    next_cursor = result.get("next_cursor")
+    if next_cursor is not None:
+        args = [f"{key}={result[key]}" for key in ("accession_no", "document_name") if result.get(key)]
+        args.append(f"cursor={next_cursor}")
+        header_lines.append("Continue: call get_sec_document with " + ", ".join(args) + ".")
+        header_lines.append("Preserve section, query, and raw settings.")
+    if result.get("continuation"):
+        header_lines.append(f"continuation: {_cell(result['continuation'])}")
     return "\n".join(header_lines)
 
 
@@ -2511,6 +2573,28 @@ def _render_insider_activity(result: dict[str, object], max_bytes: int) -> str:
 def _generic_list_value(key: str, value: list[object], acc: _GenericAccumulator) -> None:
     """List value as bulleted summary lines (empty list renders none)."""
     kept = 0
+    if key == "series":
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            context = ", ".join(
+                f"{field}: {_cell(raw)}" for field, raw in item.items() if field != "observations" and raw is not None
+            )
+            if not acc.add("series: " + context):
+                acc.omitted.append(key)
+                break
+            for observation in _as_list(item.get("observations")):
+                if not isinstance(observation, dict):
+                    continue
+                line = f"  - date: {_cell(observation.get('date'))}, value: {_cell(observation.get('value'))}"
+                if item.get("unit") is not None:
+                    line += f", unit: {_cell(item['unit'])}"
+                if not acc.add(line):
+                    acc.omitted.append(key)
+                    break
+        if not value:
+            acc.add("series: none")
+        return
     for item in value:
         line = "  - " + _cell(item if not isinstance(item, dict) else _summarize_dict(item))
         if not acc.add(line):

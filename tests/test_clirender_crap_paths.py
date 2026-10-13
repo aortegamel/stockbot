@@ -1107,12 +1107,59 @@ def test_cli_eval_inspect_unknown_and_ok(monkeypatch: pytest.MonkeyPatch, capsys
 def test_cli_eval_promote(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
     import app.research.evals.regression as reg
 
+    real = reg.promote_to_fixture
+
     def _f638_69(**k: object) -> object:
         return tmp_path / "f.json"
 
     monkeypatch.setattr(reg, "promote_to_fixture", _f638_69)
     _eval_promote(_ns(session_id="s", scenario_name="n", question=None, as_of=None))
     assert "f.json" in capsys.readouterr().out
+    monkeypatch.setattr(reg, "promote_to_fixture", real)
+    with pytest.raises(SystemExit, match="eval: promote: unknown session_id"):
+        _eval_promote(_ns(session_id="rs:missing", scenario_name="n", question=None, as_of=None))
+
+
+def test_cli_eval_promote_actual_session(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    import tests.research_source_seam as seam
+    from app.research import service as svc
+    from app.research.repository import ResearchRepository
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    seam.install(monkeypatch)
+    repo = ResearchRepository()
+    sid = svc.create_research("q?", "o", as_of="2025-06-30T00:00:00+00:00", repo=repo)
+    src = repo.list_jobs(sid)[0].job_id
+    passage = "GS 10-K discloses OpenAI-linked exposure."
+    eid = f"{sid}:ev:1"
+    svc.record_evidence(
+        sid,
+        src,
+        {
+            "evidence_id": eid,
+            "wave_id": 1,
+            "content": "c-" + eid,
+            "claim_text": passage,
+            "subject": "GS",
+            "source_name": "SEC",
+            "source_uri": "https://www.sec.gov/Archives/edgar/data/886982/000088698226000001/gs-10q-20260331.htm",
+            "source_record_id": "0000886982-26-000001",
+            "document_name": "gs-10q-20260331.htm",
+            "matching_passage": passage,
+            "source_handle": seam.handle_for(passage, accession="0000886982-26-000001", document="gs-10q-20260331.htm"),
+            "known_at": "2025-06-29T00:00:00+00:00",
+        },
+        repo=repo,
+    )
+    fixtures = tmp_path / "fixtures"
+    monkeypatch.setattr(
+        "app.research.evals.regression.default_fixtures_dir",
+        lambda: fixtures,
+    )
+    cli._eval_promote(_ns(session_id=sid, scenario_name="pit-knowable-by-2025-06-30", question=None, as_of=None))
+    assert "pit-knowable-by-2025-06-30.json" in capsys.readouterr().out
 
 
 def test_cli_rewrite_bare_log_server_and_stream_url():
@@ -1949,28 +1996,148 @@ def test_edgar_earnings_arms(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "error" in ec._fetch_latest_earnings_release("T")
 
 
+def test_edgar_financial_accessors_use_zero_arg_methods(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def _income_statement() -> object:
+        calls.append("income")
+        return "INC"
+
+    def _balance_sheet() -> object:
+        calls.append("balance")
+        return "BAL"
+
+    def _cash_flow_statement() -> object:
+        calls.append("cash")
+        return "CASH"
+
+    fin = SimpleNamespace()
+    setattr(fin, "income_statement", _income_statement)  # noqa: B010 - test double: setattr keeps the fake invisible to the checker
+    setattr(fin, "balance_sheet", _balance_sheet)  # noqa: B010 - test double: setattr keeps the fake invisible to the checker
+    setattr(fin, "cash_flow_statement", _cash_flow_statement)  # noqa: B010 - test double: setattr keeps the fake invisible to the checker
+
+    def _fcompany(t: object) -> _RealCompany:
+        return _company(financials=fin)("T")
+
+    monkeypatch.setattr(ec, "Company", _fcompany)
+    assert ec._fetch_financial_statements("T", "income_statement")["text"] == "INC"
+    assert ec._fetch_financial_statements("T", "balance_sheet")["text"] == "BAL"
+    assert ec._fetch_financial_statements("T", "cash_flow")["text"] == "CASH"
+    assert calls == ["income", "balance", "cash"]
+    assert str(ec._fetch_financial_statements("T", "bogus")["error"]).startswith("Unknown statement")
+
+
+def test_edgar_get_financial_statements_namespace_regression(monkeypatch: pytest.MonkeyPatch) -> None:
+    fin = SimpleNamespace()
+    setattr(fin, "income_statement", lambda: "NEW-INC")  # noqa: B010 - test double: setattr keeps the fake invisible to the checker
+    setattr(fin, "balance_sheet", lambda: "NEW-BAL")  # noqa: B010 - test double: setattr keeps the fake invisible to the checker
+    setattr(fin, "cash_flow_statement", lambda: "NEW-CASH")  # noqa: B010 - test double: setattr keeps the fake invisible to the checker
+    want = {"income_statement": "NEW-INC", "balance_sheet": "NEW-BAL", "cash_flow": "NEW-CASH"}
+
+    def _fcompany(t: object) -> _RealCompany:
+        return _company(financials=fin)("T")
+
+    monkeypatch.setattr(ec, "Company", _fcompany)
+    legacy_store = getattr(ec.cache, "store")  # noqa: B009 - cache type lacks store statically; getattr keeps pyrefly-0
+    for statement_type in want:
+        legacy_store[f"financial_statements:T:{statement_type}"] = {
+            "ticker": "T",
+            "statement_type": statement_type,
+            "text": "STALE",
+        }
+    for statement_type, text in want.items():
+        got = ec.get_financial_statements("T", statement_type)
+        assert got["text"] == text
+        assert got["cache_hit"] is False
+        assert legacy_store[f"financial_statements:T:{statement_type}"]["text"] == "STALE"
+        assert legacy_store[f"financial_statements:v2:T:{statement_type}"]["text"] == text
+
+    def _fempty(t: object) -> _RealCompany:
+        return _company(financials=SimpleNamespace())("U")
+
+    monkeypatch.setattr(ec, "Company", _fempty)
+    assert "error" in ec.get_financial_statements("U", "income_statement")
+
+
+def test_edgar_get_fundamentals_balance_sheet_namespace_regression(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _to_dict() -> object:
+        return {"assets": 3}
+
+    latest = SimpleNamespace()
+    setattr(latest, "to_dict", _to_dict)  # noqa: B010 - test double: setattr keeps the fake invisible to the checker
+    bs = SimpleNamespace()
+    setattr(bs, "get_latest", lambda: latest)  # noqa: B010 - test double: setattr keeps the fake invisible to the checker
+    fin = SimpleNamespace()
+    setattr(fin, "get_balance_sheet", lambda: bs)  # noqa: B010 - test double: setattr keeps the fake invisible to the checker
+
+    def _fcompany(t: object) -> _RealCompany:
+        return _company(financials=fin)("T")
+
+    monkeypatch.setattr(ec, "Company", _fcompany)
+    legacy_store = getattr(ec.cache, "store")  # noqa: B009 - cache type lacks store statically; getattr keeps pyrefly-0
+    legacy_store["fundamentals:T:balance_sheet"] = {"ticker": "T", "balance_sheet": {"stale": True}}
+    got = ec.get_fundamentals("T", "balance_sheet")
+    assert got["balance_sheet"] == {"assets": 3}
+    assert got["cache_hit"] is False
+    assert legacy_store["fundamentals:T:balance_sheet"] == {"ticker": "T", "balance_sheet": {"stale": True}}
+    assert legacy_store["fundamentals:T:balance_sheet:v2"]["balance_sheet"] == {"assets": 3}
+
+    def _fnone(t: object) -> _RealCompany:
+        return _company(financials=None)("U")
+
+    monkeypatch.setattr(ec, "Company", _fnone)
+    assert "error" in ec.get_fundamentals("U", "balance_sheet")
+
+
 def test_edgar_risk_arms(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _boom_obj() -> object:
-        raise RuntimeError("x")
+    calls: list[tuple[str, str]] = []
 
-    _boom_filing = _filing()
-    _boom_filing.__dict__["obj"] = _boom_obj
-    assert ec._risk_text(_boom_filing) is None
-    assert ec._risk_text(_filing(_doc=SimpleNamespace(risk_factors=None))) is None
-    assert ec._risk_text(_filing(_doc=SimpleNamespace(risk_factors="  "))) is None
-    assert ec._risk_text(_filing(_doc=SimpleNamespace(risk_factors="RISK"))) == "RISK"
+    def _stub_doc(accession_no: str, **kw: object) -> dict[str, object]:
+        section = kw.get("section")
+        assert section == "Item 1A"
+        assert isinstance(section, str)
+        calls.append((accession_no, section))
+        return {"text": f"SECTION-{accession_no}"}
 
-    def _t2_text() -> object:
-        return "T2"
+    def _fempty_co(t: object) -> _RealCompany:
+        return _filings_company([], ["10-K"])
 
-    _t2_ns = SimpleNamespace(risk_factors=SimpleNamespace())
-    setattr(_t2_ns.risk_factors, "text", _t2_text)  # noqa: B010 - test double: setattr keeps the fake invisible to the checker
-    assert ec._risk_text(_filing(_doc=_t2_ns)) == "T2"
-    f1 = _filing(form="10-Q", filing_date="2024-01-01", accession_no="A1", _doc=SimpleNamespace(risk_factors="A"))
-    f2 = _filing(form="10-Q", filing_date="2024-04-01", accession_no="A2", _doc=SimpleNamespace(risk_factors="B"))
-    co = _filings_company([f1, f2], ["10-Q"])
+    monkeypatch.setattr(ec, "Company", _fempty_co)
+    monkeypatch.setattr("app.sec.documents.get_sec_document", _stub_doc)
+    # The SDK risk_factors handle stays unread: filings carry risk_factors=None yet sections resolve.
+    assert ec._risk_text(_filing(accession_no="K1", _doc=SimpleNamespace(risk_factors=None))) == "SECTION-K1"
+    assert calls == [("K1", "Item 1A")]
+    calls.clear()
+
+    def _missing_doc(accession_no: str, **kw: object) -> dict[str, object]:
+        return {"text": "   "}
+
+    monkeypatch.setattr("app.sec.documents.get_sec_document", _missing_doc)
+    assert ec._risk_text(_filing(accession_no="K1")) is None
+
+    def _boom_doc(accession_no: str, **kw: object) -> dict[str, object]:
+        raise RuntimeError("doc down")
+
+    monkeypatch.setattr("app.sec.documents.get_sec_document", _boom_doc)
+    assert ec._risk_text(_filing(accession_no="K1")) is None
+
+    monkeypatch.setattr("app.sec.documents.get_sec_document", _stub_doc)
+    f1 = _filing(form="10-K", filing_date="2025-01-01", accession_no="K1")
+    f2 = _filing(form="10-K", filing_date="2026-01-01", accession_no="K2")
+    co = _filings_company([f2, f1], ["10-K"])
     pair = ec._risk_pair_texts(co)
-    assert len(pair) == 2
+    assert [(f.accession_no, t) for f, t in pair] == [("K2", "SECTION-K2"), ("K1", "SECTION-K1")]
+    assert calls == [("K2", "Item 1A"), ("K1", "Item 1A")]
+    seen: list[object] = []
+
+    def _spy(form: object = None, **rest: object) -> list[object]:
+        seen.append(form)
+        return [f1, f2]
+
+    co_spy = _filings_company([f1, f2], ["10-K"])
+    co_spy.__dict__["get_filings"] = _spy
+    ec._risk_pair_texts(co_spy)
+    assert seen == [["10-K"]]
     assert "No changes" in ec._risk_diff_text(f1, "same", f2, "same")
     assert "+line" in ec._risk_diff_text(f2, "a\nline2", f1, "a\nline1") or "@@" in ec._risk_diff_text(
         f2, "a\nline2", f1, "a\nline1"
@@ -1978,34 +2145,131 @@ def test_edgar_risk_arms(monkeypatch: pytest.MonkeyPatch) -> None:
     pay = ec._risk_diff_payload("T", f2, "B", f1, "A", "1")
     assert pay["cik"] == "1" and "source_urls" in pay
     f3 = _filing(
-        form="10-Q",
+        form="10-K",
         filing_date="2024-01-01",
         accession_no="A1",
         filing_url="http://u",
-        _doc=SimpleNamespace(risk_factors="A"),
     )
     pay2 = ec._risk_diff_payload("T", f3, "B", f3, "A", None)
     assert pay2["source_url"] == "http://u"
 
     # fetch arms
-    def _f1087_106(t: object) -> _RealCompany:
+    def _f_co(t: object) -> _RealCompany:
         return co
 
-    monkeypatch.setattr(ec, "Company", _f1087_106)
+    monkeypatch.setattr(ec, "Company", _f_co)
     got = ec._fetch_diff_risk_factors("T")
     assert "diff" in got
-    co_empty = _filings_company([], ["10-Q"])
+    co_empty = _filings_company([], ["10-K"])
 
-    def _f1090_107(t: object) -> _RealCompany:
+    def _f_empty(t: object) -> _RealCompany:
         return co_empty
 
-    monkeypatch.setattr(ec, "Company", _f1090_107)
+    monkeypatch.setattr(ec, "Company", _f_empty)
     assert "error" in ec._fetch_diff_risk_factors("T")
 
-    def _f1092_109(t: object) -> _RealCompany:
+    def _f_boom(t: object) -> _RealCompany:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(ec, "Company", _f1092_109)
+    monkeypatch.setattr(ec, "Company", _f_boom)
+    assert "error" in ec._fetch_diff_risk_factors("T")
+    monkeypatch.setattr(ec, "Company", _f_co)
+    monkeypatch.setattr("app.sec.documents.get_sec_document", _boom_doc)
+    assert "error" in ec._fetch_diff_risk_factors("T")
+
+
+def test_edgar_annual_risk_diff_namespace_and_sections(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec import documents
+
+    prior_html = (
+        "<html><body><h1>ITEM 1A. Risk Factors</h1><p>" + "prior-risk " * 4000 + "</p>"
+        "<h1>ITEM 7. MD&amp;A</h1><p>other</p></body></html>"
+    )
+    latest_html = (
+        "<html><body><h1>ITEM 1A. Risk Factors</h1><p>" + "latest-risk " * 4000 + "</p>"
+        "<h1>ITEM 7. MD&amp;A</h1><p>other</p></body></html>"
+    )
+    no_risk_html = "<html><body><h1>ITEM 7. MD&amp;A</h1><p>other</p></body></html>"
+    calls: list[tuple[str, object]] = []
+    real_get = documents.get_sec_document
+
+    def _real_doc(accession_no: str, **kw: object) -> dict[str, object]:
+        calls.append((accession_no, kw.get("section")))
+        return real_get(accession_no, document_name=None, section="Item 1A")
+
+    def _risk_company(all_filings: list[object]) -> _RealCompany:
+        inst = _RealCompany.__new__(_RealCompany)
+        inst.__dict__["_cik"] = 1
+        inst.__dict__["_data"] = SimpleNamespace(name="Fake Corp")
+
+        def _get_filings(form: object = None, **rest: object) -> list[object]:
+            if form == ["10-K"]:
+                return [f for f in all_filings if getattr(f, "form", None) == "10-K"]
+            return []
+
+        inst.__dict__["get_filings"] = _get_filings
+        return inst
+
+    class _RiskAttachment:
+        def __init__(self, text: str) -> None:
+            self.document = "primary.htm"
+            self.description = "10-K"
+            self.url = "https://sec/primary.htm"
+            self.content = text
+
+    class _RiskFilingDoc:
+        def __init__(self, accession_no: str, text: str) -> None:
+            self.accession_no = accession_no
+            self.cik = 1
+            self.company = "Fake Corp"
+            self.form = "10-K"
+            self.filing_date = "2026-01-01"
+            self.homepage_url = f"https://sec/{accession_no}"
+            self.period_of_report = "2025-12-31"
+            self.document = _RiskAttachment(text)
+            self.attachments = [self.document]
+
+    docs = {"K1": prior_html, "K2": latest_html}
+
+    def _fake_by_accession(accession_no: str) -> _RiskFilingDoc:
+        return _RiskFilingDoc(accession_no, docs[accession_no])
+
+    def _no_rows(**kw: object) -> list[object]:
+        return []
+
+    def _no_submissions(cik: object) -> SimpleNamespace:
+        def _empty(**kw: object) -> list[object]:
+            return []
+
+        return SimpleNamespace(get_filings=_empty)
+
+    # SDK risk_factors stay None: the Item 1A text comes from rendered documents only.
+    k1 = _filing(form="10-K", filing_date="2025-01-01", accession_no="K1", _doc=SimpleNamespace(risk_factors=None))
+    k2 = _filing(form="10-K", filing_date="2026-01-01", accession_no="K2", _doc=SimpleNamespace(risk_factors=None))
+    newer_q = _filing(form="10-Q", filing_date="2026-06-01", accession_no="Q9", _doc=SimpleNamespace(risk_factors=None))
+
+    def _fco(t: object) -> _RealCompany:
+        return _risk_company([newer_q, k2, k1])
+
+    monkeypatch.setattr("app.sec.store.query_filings", _no_rows)
+    monkeypatch.setattr(documents, "get_by_accession_number", _fake_by_accession)
+    monkeypatch.setattr("app.sec.filings.get_company", _no_submissions)
+    monkeypatch.setattr(ec, "Company", _fco)
+    monkeypatch.setattr("app.sec.documents.get_sec_document", _real_doc)
+    legacy_store = getattr(ec.cache, "store")  # noqa: B009 - cache type lacks store statically; getattr keeps pyrefly-0
+    legacy_store["risk_diff:T"] = {"ticker": "T", "diff": "STALE"}
+    got = ec.diff_risk_factors("T")
+    assert got["diff"] != "STALE"
+    assert "latest-risk" in str(got["diff"]) and "prior-risk" in str(got["diff"])
+    assert got["cache_hit"] is False
+    assert legacy_store["risk_diff:T"] == {"ticker": "T", "diff": "STALE"}
+    assert legacy_store["risk_diff:annual-v2:T"]["diff"] == got["diff"]
+    assert [c[0] for c in calls] == ["K2", "K1"]
+    assert {c[1] for c in calls} == {"Item 1A"}
+    # Item 1A extraction stays complete: long rendered sections are not truncated.
+    assert len(str(real_get("K2", document_name=None, section="Item 1A")["text"])) > 20000
+    # A 10-K without Item 1A propagates through the existing retrieval boundary as an error.
+    docs["K1"] = no_risk_html
     assert "error" in ec._fetch_diff_risk_factors("T")
 
 

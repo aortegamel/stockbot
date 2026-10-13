@@ -233,18 +233,139 @@ def test_cross_thesis_refs_rejected(tmp_path: Path) -> None:
         )
 
 
-def test_pause_resume_close_transitions_enforced(tmp_path: Path) -> None:
+@pytest.mark.parametrize("use_slug", [False, True], ids=["canonical-id", "slug"])
+def test_pause_resume_close_transitions_enforced(tmp_path: Path, use_slug: bool) -> None:
     r = _repo(tmp_path)
-    t = r.create_thesis("NVDA thesis", scope="NVDA", claims=["c"])
-    assert r.pause_thesis(t.thesis_id).status == "paused"
-    assert r.resume_thesis(t.thesis_id).status == "active"
-    assert r.close_thesis(t.thesis_id).status == "closed"
-    with pytest.raises(ValueError):
-        r.pause_thesis(t.thesis_id)
-    with pytest.raises(ValueError):
-        r.resume_thesis(t.thesis_id)
+    t = r.create_thesis("NVDA thesis", scope="NVDA", claims=["c"], effective_at="2026-01-01T00:00:00+00:00")
+    identifier = t.slug if use_slug else t.thesis_id
+    thesis_dir = r.dir_for_thesis(t.thesis_id)
+    for operation, status, effective_at in (
+        (r.pause_thesis, "paused", "2026-01-02T00:00:00+00:00"),
+        (r.resume_thesis, "active", "2026-01-03T00:00:00+00:00"),
+        (r.close_thesis, "closed", "2026-01-04T00:00:00+00:00"),
+    ):
+        updated = operation(identifier, effective_at=effective_at)
+        assert (updated.thesis_id, updated.slug, updated.status) == (t.thesis_id, t.slug, status)
+        persisted = load_raw_yaml(thesis_dir / "thesis.yaml")
+        assert (persisted["thesis_id"], persisted["status"]) == (t.thesis_id, status)
+        snapshot = r.load_state_as_of(t.thesis_id, effective_at)
+        assert (snapshot.thesis_id, snapshot.effective_at, snapshot.reason) == (
+            t.thesis_id,
+            effective_at,
+            "status_changed",
+        )
+        assert (snapshot.thesis["thesis_id"], snapshot.thesis["status"]) == (t.thesis_id, status)
+        for section in (snapshot.state, snapshot.questions, snapshot.watch, snapshot.memory):
+            assert section["thesis_id"] == t.thesis_id
+    assert r.close_thesis(identifier).status == "closed"
+    with pytest.raises(ValueError, match="closed"):
+        r.pause_thesis(identifier)
+    with pytest.raises(ValueError, match="closed"):
+        r.resume_thesis(identifier)
     with pytest.raises(ValueError):
         r.create_trigger(t.thesis_id, canonical_refs=["x"], summary="s", summary_origin="deterministic")
+
+
+@pytest.mark.parametrize("action", ["pause", "resume", "close"])
+@pytest.mark.parametrize("identifier", ["thesis:absent", "absent-slug"])
+def test_status_unknown_identifier_does_not_write(tmp_path: Path, action: str, identifier: str) -> None:
+    r = _repo(tmp_path)
+    t = r.create_thesis("NVDA thesis", scope="NVDA", claims=["c"])
+    thesis_file = r.dir_for_thesis(t.thesis_id) / "thesis.yaml"
+    before = thesis_file.read_text(encoding="utf-8")
+    versions = r.list_state_versions(t.thesis_id)
+    operation = {"pause": r.pause_thesis, "resume": r.resume_thesis, "close": r.close_thesis}[action]
+    with pytest.raises(KeyError, match="unknown thesis"):
+        operation(identifier)
+    assert thesis_file.read_text(encoding="utf-8") == before
+    assert r.list_state_versions(t.thesis_id) == versions
+
+
+@pytest.mark.parametrize("action,status", [("pause", "paused"), ("resume", "active"), ("close", "closed")])
+def test_slug_status_backdated_preserves_live_state(tmp_path: Path, action: str, status: str) -> None:
+    r = _repo(tmp_path)
+    t = r.create_thesis("NVDA thesis", scope="NVDA", claims=["c"], effective_at="2026-01-01T00:00:00+00:00")
+    r.pause_thesis(t.thesis_id, effective_at="2026-01-01T12:00:00+00:00")
+    r.resume_thesis(t.thesis_id, effective_at="2026-01-04T00:00:00+00:00")
+    thesis_file = r.dir_for_thesis(t.thesis_id) / "thesis.yaml"
+    before = thesis_file.read_text(encoding="utf-8")
+    effective_at = "2026-01-02T00:00:00+00:00"
+    operation = {"pause": r.pause_thesis, "resume": r.resume_thesis, "close": r.close_thesis}[action]
+    updated = operation(t.slug, effective_at=effective_at)
+    assert (updated.thesis_id, updated.status, updated.updated_at) == (t.thesis_id, status, effective_at)
+    assert thesis_file.read_text(encoding="utf-8") == before
+    snapshot = r.load_state_as_of(t.thesis_id, effective_at)
+    assert (snapshot.thesis_id, snapshot.effective_at, snapshot.thesis["status"]) == (t.thesis_id, effective_at, status)
+    assert snapshot.thesis["thesis_id"] == t.thesis_id
+    assert r.load_state_as_of(t.thesis_id, "2026-01-04T00:00:00+00:00").thesis["status"] == "active"
+
+
+@pytest.mark.parametrize("action", ["pause", "resume", "close"])
+def test_slug_status_rechecks_owner_after_directory_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    r = _repo(tmp_path)
+    t = r.create_thesis("NVDA thesis", scope="NVDA", claims=["c"])
+    foreign = r.create_thesis("other thesis", scope="AMD", claims=["c"])
+    thesis_dir = r.dir_for_thesis(t.thesis_id)
+    thesis_file = thesis_dir / "thesis.yaml"
+    versions = r.list_state_versions(t.thesis_id)
+    history = {p.name: p.read_text(encoding="utf-8") for p in (thesis_dir / "history").glob("*.yaml")}
+    dir_for = r._dir_for
+    swapped: list[str] = []
+
+    def replace_owner(thesis_id: str) -> Path:
+        resolved = dir_for(thesis_id)
+        assert thesis_id == t.thesis_id
+        raw = load_raw_yaml(thesis_file)
+        raw["thesis_id"] = foreign.thesis_id
+        atomic_write_yaml(thesis_file, raw, r.root)
+        swapped.append(thesis_file.read_text(encoding="utf-8"))
+        return resolved
+
+    monkeypatch.setattr(r, "_dir_for", replace_owner)
+    operation = {"pause": r.pause_thesis, "resume": r.resume_thesis, "close": r.close_thesis}[action]
+    with pytest.raises(ValueError, match="thesis_id mismatch") as error:
+        operation(t.slug)
+    assert repr(t.thesis_id) in str(error.value)
+    assert repr(foreign.thesis_id) in str(error.value)
+    assert len(swapped) == 1
+    assert thesis_file.read_text(encoding="utf-8") == swapped[0]
+    assert {p.name: p.read_text(encoding="utf-8") for p in (thesis_dir / "history").glob("*.yaml")} == history
+    assert len(history) == len(versions)
+
+
+def test_cli_slug_status_uses_canonical_id(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    import cli
+
+    r = ThesisRepository(tmp_path / "thesis")
+    t = r.create_thesis("NVDA thesis", scope="NVDA", claims=["c"])
+    parser = cli._build_parser()
+    for action, status in (("pause", "paused"), ("resume", "active"), ("close", "closed")):
+        args = parser.parse_args(["thesis", action, t.slug, "--data-root", str(tmp_path)])
+        assert cli._dispatch_command(args) is True
+        assert capsys.readouterr().out == f"{t.thesis_id} ({t.slug}) [{status}]\n"
+        assert r.load_thesis(t.thesis_id).status == status
+    args = parser.parse_args(["thesis", "pause", "absent-slug", "--data-root", str(tmp_path)])
+    with pytest.raises(SystemExit, match="unknown thesis"):
+        cli._dispatch_command(args)
+    assert r.load_thesis(t.thesis_id).status == "closed"
+
+
+def test_tool_slug_status_uses_canonical_id(tmp_path: Path) -> None:
+    from app.policy import Capability, RequestContext
+    from app.tools import execute_tool
+
+    r = ThesisRepository(tmp_path / "thesis")
+    t = r.create_thesis("NVDA thesis", scope="NVDA", claims=["c"])
+    context = RequestContext("test", frozenset({Capability.RESEARCH}), data_root=tmp_path)
+    for action, status in (("pause", "paused"), ("resume", "active"), ("close", "closed")):
+        result = execute_tool("thesis_status", {"id": t.slug, "action": action}, "m", context=context)
+        assert result == {"thesis_id": t.thesis_id, "slug": t.slug, "status": status, "action": action}
+        assert r.load_thesis(t.thesis_id).status == status
+    result = execute_tool("thesis_status", {"id": "absent-slug", "action": "pause"}, "m", context=context)
+    assert "unknown thesis" in str(result["error"])
+    assert r.load_thesis(t.thesis_id).status == "closed"
 
 
 def test_quarantine_lists_corrupt_child_while_healthy_ids_proceed(tmp_path: Path) -> None:

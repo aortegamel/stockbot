@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -97,3 +98,122 @@ def test_accepted_result_without_capture_scope_keeps_shape(tmp_path: Path, monke
     meta = out["meta"]
     assert isinstance(meta, dict) and "sources" not in meta
     assert not (tmp_path / "raw").exists()
+
+
+def test_outcome_nested_source_refs_keep_primary_and_breadth_first_order() -> None:
+    primary = {
+        "record_id": "0000320193-25-000079",
+        "uri": "https://www.sec.gov/Archives/filing.htm",
+        "known_at": "2025-02-01T18:00:00Z",
+    }
+    result: dict[str, object] = {
+        "accession_no": primary["record_id"],
+        "url": primary["uri"],
+        "known_at": primary["known_at"],
+        "date": "2024",
+        "shallow": {"filed_at": "2025-01-31"},
+        "deep": {"level": {"record_id": "nested-record", "known_at": "2025-01-30"}},
+        "other": [["not a reference", {"published_at": "2025-01-29"}]],
+        "duplicate": {
+            "accession_no": primary["record_id"],
+            "url": primary["uri"],
+            "known_at": primary["known_at"],
+        },
+    }
+
+    outcome = outcome_from_result("get_sec_filing", result)
+
+    assert outcome.source_refs == {
+        **primary,
+        "all": [
+            primary,
+            {"known_at": "2025-01-31"},
+            {"record_id": "nested-record", "known_at": "2025-01-30"},
+            {"known_at": "2025-01-29"},
+        ],
+    }
+
+
+@pytest.mark.parametrize("date", ["2020", "2020-05", "2020-05-31"])
+def test_outcome_observation_dates_do_not_become_known_at(date: str) -> None:
+    result: dict[str, object] = {"series": [{"observations": [{"date": date, "value": 42}]}]}
+
+    assert outcome_from_result("get_macro_context", result).source_refs is None
+    series = result["series"]
+    assert isinstance(series, list)
+    first = series[0]
+    assert isinstance(first, dict)
+    observations = first["observations"]
+    assert isinstance(observations, list)
+    observation = observations[0]
+    assert isinstance(observation, dict)
+    assert observation["date"] == date
+
+
+@pytest.mark.parametrize("date", ["2020", "2020-05", "2020-05-31"])
+def test_execution_macro_nested_known_at_preserves_original_observation_dates(
+    date: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result: dict[str, object] = {
+        "source": "datacommons",
+        "known_at": "2026-09-01T12:00:00Z",
+        "series": [
+            {
+                "geo": "country/USA",
+                "variable": "Count_Person",
+                "facet": "census",
+                "unit": "Count",
+                "provider": "Census",
+                "provenanceUrl": "https://datacommons.org/browser/census",
+                "known_at": "2026-09-01T12:00:00Z",
+                "observations": [
+                    {
+                        "date": date,
+                        "value": 42,
+                        "provenance": {"releases": [[{"known_at": "2026-08-31T10:00:00Z"}]]},
+                    }
+                ],
+            }
+        ],
+        "continuation": True,
+    }
+    original = deepcopy(result)
+
+    def _macro(name: str, arguments: dict[str, object], model: str, context: object = None) -> dict[str, object]:
+        assert name == "get_macro_context"
+        assert arguments == {"geos": ["country/USA"], "variables": ["Count_Person"]}
+        return result
+
+    monkeypatch.setattr(rt, "execute_tool", _macro)
+    out = execute_agent_tool(
+        "get_macro_context",
+        {"geos": ["country/USA"], "variables": ["Count_Person"]},
+        RuntimeToolSession(session_id="macro-dates"),
+        data_root=tmp_path,
+    )
+
+    assert set(out) == {"content", "meta"}, out
+    meta = out["meta"]
+    assert isinstance(meta, dict)
+    assert meta["source_refs"] == {
+        "known_at": "2026-09-01T12:00:00Z",
+        "all": [
+            {"known_at": "2026-09-01T12:00:00Z"},
+            {"known_at": "2026-08-31T10:00:00Z"},
+        ],
+    }
+    assert meta["continuation"] is True
+    content = out["content"]
+    assert isinstance(content, str)
+    assert f"  - date: {date}, value: 42, unit: Count" in content
+    for field in (
+        "geo: country/USA",
+        "variable: Count_Person",
+        "facet: census",
+        "unit: Count",
+        "provider: Census",
+        "provenanceUrl: https://datacommons.org/browser/census",
+    ):
+        assert field in content
+    assert "continuation: True" in content
+    assert result == original

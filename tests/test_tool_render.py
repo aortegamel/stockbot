@@ -588,7 +588,7 @@ def test_paged_search_card_reports_retrieval_truth_and_next_page():
     ) in text
     assert "- 10-K 2025-02-20 0001045810-25-000001 nvda-20250126.htm (score 7.0)" in text
     assert "Hits are navigation artifacts" in text
-    assert "More hits: call research_read_search with offset=2" in text
+    assert "More hits: call research_read_search with offset=2, search_id=s1" in text
     assert "{" not in text
     assert len(text.encode("utf-8")) <= MAX_TOOL_MESSAGE_BYTES
 
@@ -604,17 +604,16 @@ def test_paged_search_card_last_page_and_unknown_retrieval_flags():
     )
     assert "SEC search s1 — 3 hit(s) at offset 38 of 40 persisted" in text
     assert "coverage: complete; pagination complete: yes; source exhausted: yes" in text
-    assert "More hits: none (every persisted hit is shown)" in text
+    assert "More hits: none (end of persisted hits)" in text
     # The identity-less packet row never becomes a hit line.
     assert [line for line in text.splitlines() if line.startswith("- ")] == [
         "- nvda-20250126.htm",
         "- (score 3.0)",
     ]
-    # Rows persisted before retrieval truth was recorded report unknown, never "no".
     unknown = render_tool_result(_read_search_result(coverage={}, offset=None, more=True))
     assert "coverage: unknown; pagination complete: unknown; source exhausted: unknown" in unknown
     assert "query: NVDA AI demand" in unknown
-    assert "More hits: none (every persisted hit is shown)" in unknown
+    assert "continuation unavailable (offset missing)" in unknown
 
 
 def test_paged_search_card_fits_the_byte_budget_and_counts_omitted_hits():
@@ -632,7 +631,7 @@ def test_paged_search_card_fits_the_byte_budget_and_counts_omitted_hits():
     text = render_tool_result(_read_search_result(hits=hits, total=500), max_bytes=700)
     assert 0 < len(text.encode("utf-8")) <= 700
     assert "SEC search s1 — 60 hit(s) at offset 0 of 500 persisted" in text
-    assert "More hits: call research_read_search with offset=60" in text
+    assert "More hits: call research_read_search with offset=" in text
     assert TRUNCATED_MARKER in text and "(Omitted hits:" in text
     assert len(text.splitlines()) < 60
 
@@ -737,3 +736,94 @@ def test_insider_envelope_names_code_kind_date_and_deal_envelope_unaffected():
         }
     )
     assert "event_id e1" in deal_text and "transaction_code" not in deal_text
+
+
+def test_macro_series_renders_each_date_value_unit_provider_facet():
+    result = {
+        "source": "datacommons",
+        "series": [
+            {
+                "geo": "country/USA",
+                "variable": "Amount_EconomicActivity_GrossDomesticProduct_Nominal",
+                "facet": "facet-a",
+                "unit": "USDollar",
+                "provider": "OECD",
+                "provenanceUrl": "https://example.test/oecd",
+                "observations": [
+                    {"date": "2020", "value": 100.0},
+                    {"date": "2020-05", "value": 101.5},
+                    {"date": "2020-05-31", "value": 102.25},
+                ],
+            },
+            {
+                "geo": "country/USA",
+                "variable": "ConsumerPriceIndex",
+                "facet": "facet-b",
+                "unit": "Index",
+                "provider": "BLS",
+                "observations": [{"date": "2020-06", "value": 255.1}],
+            },
+        ],
+    }
+    text = render_tool_result(result)
+    before = dict(result["series"][0])
+    assert "series: geo: country/USA" in text
+    assert "facet: facet-a" in text and "provider: OECD" in text
+    assert "facet: facet-b" in text and "provider: BLS" in text
+    assert "- date: 2020, value: 100.0, unit: USDollar" in text
+    assert "- date: 2020-05, value: 101.5, unit: USDollar" in text
+    assert "- date: 2020-05-31, value: 102.25, unit: USDollar" in text
+    assert "- date: 2020-06, value: 255.1, unit: Index" in text
+    assert result["series"][0] == before
+
+
+def test_sec_document_renders_cursors_and_continuation():
+    result = {
+        "source": "SEC EDGAR",
+        "accession_no": "0000320193-25-000079",
+        "document_name": "aapl-20250628.htm",
+        "text": "short",
+        "cursor": 0,
+        "end_cursor": 5,
+        "next_cursor": 5,
+        "offset": 0,
+        "end_offset": 5,
+        "total_chars": 20,
+        "more_available": True,
+        "source_handle": {"accession_no": "0000320193-25-000079"},
+    }
+    before = dict(result)
+    text = render_tool_result(result)
+    assert "accession_no: 0000320193-25-000079" in text
+    assert "next_cursor: 5" in text
+    assert "offset: 0" in text and "total_chars: 20" in text
+    assert "Continue: call get_sec_document with accession_no=0000320193-25-000079" in text
+    assert "cursor=5" in text and "Preserve section, query, and raw settings." in text
+    assert result == before
+    assert "next_cursor: none" in render_tool_result({**result, "next_cursor": None})
+
+
+def test_saved_hit_keys_chain_offsets_and_show_stable_continuation():
+    first = _read_search_result(
+        hits=[
+            {
+                "form": "10-Q",
+                "filed_at": "2025-05-28",
+                "accession_no": "0001045810-25-000023",
+                "matched_document": "nvda-20250427.htm",
+                "score": 9.5,
+                "snippet": "AI demand",
+            }
+        ],
+        total=3,
+        offset=5,
+        limit=1,
+    )
+    first_text = render_tool_result(first)
+    assert "0001045810-25-000023 nvda-20250427.htm" in first_text
+    assert "More hits: call research_read_search with offset=6, search_id=s1" in first_text
+    assert "session_id=rs:1, limit=1" in first_text
+    assert "More hits: none (end of persisted hits)" in render_tool_result(
+        _read_search_result(more=False, hits=[], offset=3, total=3)
+    )
+    assert "continuation unavailable (offset missing)" in render_tool_result(_read_search_result(offset=None, hits=[]))

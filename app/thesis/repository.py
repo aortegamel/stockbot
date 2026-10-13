@@ -1767,6 +1767,7 @@ class ThesisRepository:
         eff_dt = _as_dt(eff)
         if eff_dt is None:
             raise ValueError(f"<status>: bad effective_at {effective_at!r}")
+        thesis_id = self._resolve_id(thesis_id)
         thesis_dir = self._dir_for(thesis_id)
         with thesis_lock(thesis_dir):
             thesis = self._check_owner(thesis_dir, thesis_id)
@@ -1784,18 +1785,22 @@ class ThesisRepository:
             return candidate
 
     def pause_thesis(self, thesis_id: str, *, effective_at: str | None = None) -> Thesis:
+        """Pause a thesis; accepts canonical ID or slug, resolved before owner checks."""
         return self._set_status(thesis_id, models.ThesisStatus.PAUSED.value, effective_at=effective_at)
 
     def resume_thesis(self, thesis_id: str, *, effective_at: str | None = None) -> Thesis:
+        """Resume a thesis; accepts canonical ID or slug, resolved before owner checks."""
         return self._set_status(thesis_id, models.ThesisStatus.ACTIVE.value, effective_at=effective_at)
 
     def close_thesis(self, thesis_id: str, *, effective_at: str | None = None) -> Thesis:
+        """Close a thesis; accepts canonical ID or slug, resolved before owner checks."""
         from app.thesis.monitor import _as_dt  # local: monitor owns the clock helpers
 
         eff = effective_at or _utcnow()
         eff_dt = _as_dt(eff)
         if eff_dt is None:
             raise ValueError(f"<status>: bad effective_at {effective_at!r}")
+        thesis_id = self._resolve_id(thesis_id)
         thesis_dir = self._dir_for(thesis_id)
         with thesis_lock(thesis_dir):
             thesis = self._check_owner(thesis_dir, thesis_id)

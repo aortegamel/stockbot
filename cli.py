@@ -1164,9 +1164,12 @@ def _eval_inspect(args: argparse.Namespace) -> None:
 def _eval_promote(args: argparse.Namespace) -> None:
     from app.research.evals.regression import promote_to_fixture
 
-    path = promote_to_fixture(
-        session_id=args.session_id, scenario_name=args.scenario_name, question=args.question, as_of=args.as_of
-    )
+    try:
+        path = promote_to_fixture(
+            session_id=args.session_id, scenario_name=args.scenario_name, question=args.question, as_of=args.as_of
+        )
+    except ValueError as exc:
+        raise SystemExit(f"eval: {exc}") from None
     print(str(path))
 
 
@@ -1214,7 +1217,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     obligations_parser.add_argument("ticker", help="ticker, e.g. NVDA")
     mandate_parser = subparsers.add_parser(
-        "evaluate-mandate", help="evaluate the mandate JSON against the latest portfolio snapshot"
+        "evaluate-mandate", help="evaluate the default mandate.json against the latest portfolio snapshot"
     )
     mandate_parser.add_argument("--data-root", default=None, help="data root directory (default: repo data/)")
     log_server_parser = subparsers.add_parser(
@@ -1419,7 +1422,7 @@ def _run_evaluate_mandate(args: argparse.Namespace) -> None:
     data_root = args.data_root or None
     from app.config import get_data_root
 
-    mandate_path = Path(args.mandate) if args.mandate else get_data_root() / "mandate.json"
+    mandate_path = get_data_root() / "mandate.json"
     _cmd_evaluate_mandate(mandate_path, data_root)
 
 
