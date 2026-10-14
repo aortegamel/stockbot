@@ -4,7 +4,7 @@ Launch: `bun run stockbot` runs `bun needle-harness/scripts/needle.ts`,
 which refreshes the tool catalog via `scripts/tool_bridge.py describe` and
 starts three loopback services: the Bun API host (`needle-harness/scripts/api.ts`),
 FastAPI (`api.main:app`), and Vite. The Bun host dispatches `POST /api/agent`,
-`GET /api/health`, and `GET /api/research/*` to the existing handlers. Vite
+`GET /api/watchlist`, `GET /api/health`, and `GET /api/research/*` to the existing handlers. Vite
 proxies those paths to Bun and the existing market `/api/*` paths to FastAPI.
 `needle-harness/app/api/agent/route.ts` runs `runKernelAgent`
 (`needle-harness/lib/agent/kernel.ts`, prewarmed by the Bun host): one
@@ -110,6 +110,8 @@ The kernel never runs a third research pass.
 The second pass is final even when a gap remains.
 
 Final gates check the claim inventory and the whole response.
+The gate requests carry the research session id of the run they judge.
+A gate error rejects its claim or response; it never keeps ungraded prose.
 If the whole response fails, the gates check each claim.
 The kernel removes each rejected claim substring.
 Other prose stays unchanged, including uncertainty and `Missing-Evidence`.
@@ -151,6 +153,40 @@ Needle fills tool arguments only.
 The browser sends the selected ticker separately from the original question.
 The route and research session retain that ticker context.
 Pure clock questions use the clock tool even when a ticker context exists.
+
+The browser also sends its actual watchlist as a separate `watchlist` list.
+It never adds the symbols to the prompt.
+The route rejects a malformed list with HTTP 400. It accepts 1-25 valid tickers and removes duplicates.
+A prompt that names the watchlist ("watchlist" or "watch list") takes watchlist scope.
+That request drops the selected-ticker scope: the list is the requested scope.
+The route passes the list to JEV as separate entry context, in the same `op:"route"` call.
+JEV sees the scope before it decides whether one registry tool fits, so the watchlist never requires a code-side route override.
+JEV's returned route governs dispatch: `no_session` and `reasoning_required` answer direct, a tool name runs single-shot, anything else researches.
+On a watchlist request the same list rides `op:"run"`, and the intake fan-out covers every symbol.
+Live JEV behavior for a watchlist prompt is unverified until a live run checks it; the mocked route replies only prove the context and the dispatch wiring.
+Every other prompt keeps the selected-ticker behavior and ignores the list, so a selected-ticker question never becomes watchlist-wide.
+
+Watchlist sources load at two triggers through one worker path:
+
+1. Page load: the watchlist panel sends `GET /api/watchlist?symbols=...` once per watchlist.
+   The worker `op:"watchlist"` runs on its own thread, so it never waits behind a research run.
+   It creates no session, job, or evidence.
+2. Watchlist question: round 1 of the intake fans out the same calls.
+   The existing boundary admits each successful result as evidence.
+
+Each symbol gets four fixed-argument calls through the existing tool handlers.
+`list_sec_filings` uses `limit=5` and no forms filter, so fund forms stay in.
+The three FINRA calls are `get_short_interest`, `get_reg_sho_volume` (the handler's current NYC week), and `get_threshold_securities`.
+Every call is an independent task on the existing SEC and tool pools under the 15s intake budget.
+A call past the budget is cancelled and reported as a timeout.
+Each (symbol, source) row carries `status` (`ok`, `no_records`, `error`, `timeout`), `as_of`, source references, and the evidence ID when admitted.
+A FINRA "No data found" answer is `no_records`. Any other failure is `error`.
+The intake_digest decision persists the rows.
+The writer prompt lists every row under WATCHLIST COVERAGE, so a failed source is disclosed.
+Reuse follows the existing caches: FINRA results use the `app.cache` 3600s TTL.
+SEC submissions use the edgartools HTTP cache with its 30s revalidation.
+A fresh entry serves the agent request without source work. An expired entry refreshes through the same path.
+
 Tools execute through `app/tool_runtime.py` against canonical `app/tools.py`.
 Thesis monitoring runs the same scheduler in-process through `app/thesis/runner.py run_trigger`.
 Its injectable `_RUN_KERNEL` uses `run_graph_prompt` and `scheduler.run` by default.
@@ -160,6 +196,15 @@ SEC replay evidence uses the tool name, record identity, and tool-result ID
 to distinguish records. Repeated citations of the same record and result
 reuse the existing evidence ID. Identical records from different result IDs
 remain separate. Existing sessions retain their stored identity keys.
+
+FINRA replay evidence uses the tool name and record identity only, so an
+identical repeated call dedupes onto the stored row. The record identity is
+the first canonical row when the result carries rows. `get_short_interest`
+and `get_reg_sho_volume` answer with an analysis envelope and no rows, so
+their identity is the envelope query JSON, which names the one symbol and
+window the result covers. The briefing source stays the last fallback; it is
+one constant string, so using it as the identity collapses every symbol onto
+the first admitted row and leaves the other symbols uncitable.
 
 Duplicate admissions retain their evidence IDs but do not count as new
 evidence or scheduler progress. The harness links a tool call only to its
@@ -202,6 +247,20 @@ Source text that intake clipped before storage stays clipped.
 Wrapper instructions such as `grounding_hint` do not enter the SDK facts.
 The worker rejects explicit engine failures, SDK-reported ungrounded fields, and negated requests.
 The emitted tool must match JEV's selected tool.
+For record-count `limit` arguments, the worker applies one order: a structured grounded limit, then an explicit count in the original request, then a declared schema default.
+Record counts never constrain the character-window `limit` on `get_sec_document` (whose schema has `max_chars`).
+Recognized count phrases include "latest 5 filings", "5 most recent filings", "up to 37 records", and "limit 10".
+Plain digit counts are read whole without a length ceiling. "limit 2000" and "up to 2000 records" request 2000.
+Dates, CIKs, accession numbers, form names such as 10-K, and year text such as "latest 2024 filings" are not counts.
+Percentages, including "position limit of 10% of float", are not record counts.
+Two different requested counts fail before generation.
+A count written as a compound ("one hundred", "thirty five"), with separators ("1,000"), or with an unsupported word ("seventy") also fails before generation.
+The error asks for plain digits.
+A generated limit that differs from the requested count fails, and an omitted limit fails too.
+SEC `forms` filters must be exact form types from the installed edgartools registries, or a single `/A` suffix on a registered non-amendment form.
+Exact registered amendments such as `N-MFP2/A` pass even without a registered base form. Unregistered doubled `/A` values fail.
+An unknown form, such as a ticker, fails as `invalid_tool_arguments` before any EDGAR call.
+The scheduler passes generated forms through unchanged.
 
 The process supervisor retains the 120-second startup budget and shared 120-second worker request timeout.
 Argument generation has no separate 10s/20s timeout; the shared worker timeout still bounds each generation call.
@@ -258,6 +317,68 @@ to its existing `provider_error` envelope.
 JEV choice answers must name an own configured option. The parser rejects
 inherited names. It retains explicitly configured names such as `__proto__`
 without changing the result object's prototype.
+
+## JEV decision API
+
+JEV calls one configured decision endpoint. `DECISION_API_FORMAT` selects the protocol for that endpoint.
+The `decision/runtime.ts` sidecar and the direct HTTP path in `app/decision_client.py` read the same settings:
+
+- `DECISION_API_FORMAT`: required. Accepted values are `chat_completions` and `decisions`.
+- `DECISION_API_URL`: the full endpoint URL. Stockbot sends each `POST` to this URL verbatim and appends no path.
+- `DECISION_API_KEY`: the credential. Stockbot sends it as `Authorization: Bearer <key>`.
+- `DECISION_MODEL`: the one model for every existing JEV operation. These operations include entry routing, proposal disposition, tool selection, result assessment, and adjudication.
+
+Set these values in the root `.env` to select the protocol, endpoint, key, and model. No code change is necessary.
+The code supplies no format, URL, or model default. A live call fails when a value is blank.
+A missing, blank, or unsupported `DECISION_API_FORMAT` fails before any HTTP request.
+Stockbot never infers the format from the key, model name, host, or URL path.
+Tests inject fake values.
+
+### `chat_completions` format
+
+Use this value for an OpenAI-compatible Chat Completions endpoint, such as `https://<provider-host>/v1/chat/completions`.
+The request body contains `model`, `messages`, and `stream: false`.
+One fixed system message carries the answer instructions.
+One user message carries the JSON text of `{state, questions}`.
+The request uses no tools, `response_format`, JSON Schema, or logprobs.
+
+The client reads `choices[0].message.content`, which must be a nonempty string that contains a JSON object.
+It rejects HTTP failures, absent choices, empty or nonstring content, refusals, and truncated output (`finish_reason: "length"`).
+It parses the string and rejects malformed JSON or a parsed value that is not a JSON object.
+The model reports noul probabilities, choice distributions, and confidence values in that JSON.
+These values are model estimates, not calibrated measurements.
+
+### `decisions` format
+
+Use this value for a native Decisions API endpoint.
+For example, set `DECISION_MODEL="typesafe/jev-1.13"`, `DECISION_API_FORMAT="decisions"`, and `DECISION_API_URL="https://openrouter.ai/api/alpha/decisions"` for that OpenRouter model.
+These values are a configuration example only. The code does not default to them.
+A Chat Completions request for this model returned HTTP 400.
+
+The request body is exactly `{model, state, questions}`.
+It contains no `messages`, system prompt, or `stream` field.
+The response is a JSON object with a top-level `answers` object, `model`, and `usage` with `input_tokens` and `output_tokens`.
+The client rejects HTTP failures and a response without a top-level `answers` object.
+The provider supplies the probabilities. The client keeps the numeric probabilities and score legend unchanged.
+It does not add new persistence fields or billing logic for other response fields, such as `id`, `provider`, or `usage.cost`.
+
+### Shared validation and records
+
+Both formats feed the same `{answers, model, usage}` result to the existing parsers. The `usage` field is optional.
+The answer IDs must match the question IDs exactly. Each answer must match its question type, labels, and score range.
+Errors use `decision_request_failed`, `malformed_decision_response`, `malformed_decision_answer`, and `decision answers do not match questions`.
+A noul probability outside [0, 1] keeps the `invalid_probability` error.
+The client makes no retry and uses no fallback model.
+The existing thresholds, fan-out rules, and evidence gates stay unchanged for both formats.
+
+Decision records keep the provider-reported model and token usage as `model`, `usage.input_tokens`, and `usage.output_tokens`.
+Usage records include only integer token counts.
+If the response omits the model or reports an invalid model, the record uses `DECISION_MODEL`.
+The client never invents probabilities, confidence values, usage, or answers.
+Errors and artifacts never include the API key.
+
+The `JevClient` name and the historical event names stay unchanged. These names do not select a provider.
+The Reasoner keeps its separate `OPENCODE_*` settings.
 
 ## TypeScript usage checks
 

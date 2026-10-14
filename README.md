@@ -54,6 +54,8 @@ Offline tests do not need FINRA, Robinhood, or SEC credentials.
 The default Python suite runs Selenium against the actual Vite UI.
 The test uses local HTTP fixtures for every market and research request.
 It does not start the live API servers or call SEC, Yahoo, or broker services.
+At 1440x900 and 1280x720, it checks that the agent input and Send button stay visible.
+It also sends native wheel input to scroll the transcript and the captured source content.
 
 Install Chromium and a ChromeDriver version that matches the Chromium major version.
 The test searches `PATH` for `chromium`, `chromium-browser`, or `google-chrome`, plus `chromedriver`.
@@ -77,6 +79,8 @@ The test uses headless Chromium without a display server.
 ## Environment variables
 
 See [`.env.example`](.env.example) for the current list and whether each setting is required, optional, or testing-only. `SEC_EDGAR_IDENTITY` is required only for SEC features. FINRA and Robinhood are optional integrations.
+
+JEV decisions use one configured endpoint. Set `DECISION_API_FORMAT` to `chat_completions` for an OpenAI-compatible Chat Completions endpoint or to `decisions` for a native Decisions API endpoint, such as OpenRouter `/api/alpha/decisions`. Set `DECISION_API_URL`, `DECISION_API_KEY`, and `DECISION_MODEL` to select the endpoint, credential, and model. The code supplies no format, URL, or model default. See [docs/runtime.md](docs/runtime.md#jev-decision-api).
 
 Python and Bun startup both load only the repository root `.env`, regardless of the current directory.
 Root `.env` values replace inherited shell values.

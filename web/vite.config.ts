@@ -1,16 +1,18 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 const api = `http://127.0.0.1:${process.env.STOCKBOT_API_PORT ?? "3001"}`;
 const market = `http://127.0.0.1:${process.env.STOCKBOT_MARKET_PORT ?? "8000"}`;
 const proxy = (target: string) => ({ target, changeOrigin: true });
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   server: {
     host: "0.0.0.0",
     proxy: {
       "/api/agent": proxy(api),
+      "/api/watchlist": proxy(api),
       "/api/research": proxy(api),
       "/api/health": proxy(api),
       "/api/candles": proxy(market),

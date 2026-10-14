@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -12,8 +13,9 @@ import tempfile
 import time
 import types
 from collections.abc import Iterator
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, override
 
 import pytest
 from hypothesis import given, seed, settings
@@ -1019,6 +1021,211 @@ def test_arguments_facts_reject_nonfinite_and_nested_values(monkeypatch: pytest.
         schema,
     )
     assert "argument count" not in text and "argument rows" not in text and "evil" not in text
+
+
+def _production_schema(name: str) -> dict[str, object]:
+    """Exact parameters the kernel binds for one production tool."""
+    from app.tools import TOOLS
+
+    for tool in TOOLS:
+        fn = tool.get("function")
+        if isinstance(fn, dict) and fn.get("name") == name and isinstance(fn.get("parameters"), dict):
+            return fn["parameters"]
+    raise AssertionError(f"no production schema for {name}")
+
+
+_TSLA = "What did TSLA file recently?"
+_TESLA = "Quick lookup of Tesla"
+_LATEST_5 = "Show TSLA's latest 5 filings"
+_UP_TO_37 = "Show up to 37 records of TSLA filings"
+_NO_COUNT = "TSLA 10-K filings since 2025-01-01 for CIK 0001318605, accession 0001318605-25-000010"
+
+
+@pytest.mark.parametrize(
+    ("tool", "request_text", "emitted", "grounded", "outcome"),
+    [
+        # User omitted the count: the declared handler default grounds.
+        ("list_sec_filings", _TSLA, {"identifier": "TSLA", "limit": 50}, None, "accepted"),
+        ("find_sec_entities_bounded", _TESLA, {"query": "Tesla", "limit": 20}, None, "accepted"),
+        # Dates, CIKs, accessions, and 10-K are not counts: the default still grounds.
+        ("list_sec_filings", _NO_COUNT, {"identifier": "TSLA", "limit": 50}, None, "accepted"),
+        # Unknown numbers stay rejected.
+        ("list_sec_filings", _TSLA, {"identifier": "TSLA", "limit": 37}, None, "not grounded"),
+        ("find_sec_entities_bounded", _TESLA, {"query": "Tesla", "limit": 50}, None, "not grounded"),
+        # A "(default 20)" description is not a declared default.
+        ("find_sec_entities", _TESLA, {"query": "Tesla", "limit": 20}, None, "not grounded"),
+        # An explicit grounded limit is authoritative; the default never replaces it.
+        ("list_sec_filings", _TSLA, {"identifier": "TSLA", "limit": 50}, {"limit": 10}, "not grounded"),
+        ("list_sec_filings", _TSLA, {"identifier": "TSLA", "limit": 10}, {"limit": 10}, "accepted"),
+        # An explicit request count is authoritative; the default, another number, or omission never replaces it.
+        ("list_sec_filings", _LATEST_5, {"identifier": "TSLA", "limit": 5}, None, "accepted"),
+        ("list_sec_filings", _LATEST_5, {"identifier": "TSLA", "limit": 50}, None, "limit"),
+        ("list_sec_filings", _LATEST_5, {"identifier": "TSLA"}, None, "asks for 5"),
+        ("list_sec_filings", _UP_TO_37, {"identifier": "TSLA", "limit": 37}, None, "accepted"),
+        ("list_sec_filings", _UP_TO_37, {"identifier": "TSLA", "limit": 50}, None, "limit"),
+        # Plain integers are never silently discarded because of length or year-like digits.
+        ("list_sec_filings", "TSLA latest 10000 filings", {"identifier": "TSLA", "limit": 10000}, None, "accepted"),
+        ("list_sec_filings", "TSLA latest 10000 filings", {"identifier": "TSLA", "limit": 50}, None, "limit"),
+        ("list_sec_filings", "TSLA filings, limit 2000", {"identifier": "TSLA", "limit": 2000}, None, "accepted"),
+        ("list_sec_filings", "TSLA filings, limit 2000", {"identifier": "TSLA", "limit": 50}, None, "limit"),
+        ("list_sec_filings", "TSLA up to 2000 records", {"identifier": "TSLA", "limit": 2000}, None, "accepted"),
+        ("list_sec_filings", "TSLA up to 2000 records", {"identifier": "TSLA", "limit": 50}, None, "limit"),
+        # A risk percentage is not a count; the declared record default stays available.
+        (
+            "list_sec_filings",
+            "TSLA filings, position limit of 10% of float",
+            {"identifier": "TSLA", "limit": 50},
+            None,
+            "accepted",
+        ),
+        (
+            "list_sec_filings",
+            "TSLA latest 5 filings, position limit of 10 % of float",
+            {"identifier": "TSLA", "limit": 5},
+            None,
+            "accepted",
+        ),
+        # A record count never overrides the character-window limit on a document read.
+        (
+            "get_sec_document",
+            "Summarize risk factors in TSLA latest 2 10-K filings",
+            {"accession_no": "0001318605-25-000010", "limit": 12000},
+            {"limit": 12000},
+            "accepted",
+        ),
+        # Conflicting counts fail before the engine runs.
+        ("list_sec_filings", f"{_LATEST_5}, up to 37 records", {"identifier": "TSLA", "limit": 5}, None, "conflicting"),
+        ("list_sec_filings", _LATEST_5, {"identifier": "TSLA", "limit": 5}, {"limit": 10}, "conflicting"),
+        # Compound, separated, or unsupported number words fail before the engine instead of a partial count.
+        (
+            "list_sec_filings",
+            "TSLA latest one hundred filings",
+            {"identifier": "TSLA", "limit": 1},
+            None,
+            "plain digits",
+        ),
+        (
+            "list_sec_filings",
+            "TSLA latest thirty five filings",
+            {"identifier": "TSLA", "limit": 30},
+            None,
+            "plain digits",
+        ),
+        (
+            "list_sec_filings",
+            "List TSLA filings, limit 1,000",
+            {"identifier": "TSLA", "limit": 1},
+            None,
+            "plain digits",
+        ),
+    ],
+)
+def test_generate_applies_count_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tool: str,
+    request_text: str,
+    emitted: dict[str, object],
+    grounded: dict[str, object] | None,
+    outcome: str,
+) -> None:
+    """Structured limit, then explicit request count, then declared default; anything else fails."""
+    srv = _load_server(monkeypatch, tmp_path)
+    engines: list[object] = []
+
+    class _Engine:
+        def __init__(self, **kwargs: object) -> None:
+            self.system = str(kwargs["system"])
+            engines.append(self)
+
+        def complete(self, text: str, max_new_tokens: int = 0) -> dict[str, object]:
+            numbers = set(re.findall(r"(?<![\w.,])\d+(?!\d)", f"{text}\n{self.system}"))
+            flagged = [
+                f"{tool}.{key}"
+                for key, value in emitted.items()
+                if isinstance(value, int) and str(value) not in numbers
+            ]
+            return {
+                "type": "call",
+                "function_calls": [{"name": tool, "arguments": emitted}],
+                "validation": {"ungrounded": flagged, "negation": False},
+            }
+
+        def close(self) -> None:
+            pass
+
+    class _Clock(datetime):
+        @override
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> _Clock:
+            return cls(2026, 1, 2, 3, 4, tzinfo=UTC)
+
+    # Fixed clock: the bound date/time facts never license a tested number.
+    monkeypatch.setattr(srv, "datetime", _Clock)
+    monkeypatch.setattr(srv.needle, "Needle", _Engine)
+    context: dict[str, object] = {"grounded_arguments": grounded} if grounded is not None else {}
+    out = srv.handle(
+        json.dumps(
+            {
+                "id": "d1",
+                "action": "arguments.generate",
+                "tool": tool,
+                "schema": _production_schema(tool),
+                "objective": request_text,
+                "node": {"node_id": "n1"},
+                "context": context,
+            }
+        )
+    )
+    if outcome == "accepted":
+        assert out["arguments"] == emitted
+    else:
+        assert outcome in str(out["error"]) and "arguments" not in out
+    assert len(engines) == (0 if outcome in ("conflicting", "plain digits") else 1)
+
+
+_COUNT_TEMPLATES = (
+    "Show {ticker}'s latest {n} filings",
+    "List the last {n} 10-K filings for {ticker}",
+    "Give me up to {n} records for {ticker}",
+    "{ticker}: the {n} most recent Form 4 transactions",
+    "Top {n} holders of {ticker}, limit {n}",
+    "At most {n} SEC filings for {ticker} since 2025-01-01",
+)
+_NON_COUNTS = (
+    "{ticker} 10-K and 10-Q filings",
+    "{ticker} filings since 2025-01-01",
+    "{ticker} filings for CIK 0001318605",
+    "{ticker} accession 0001318605-25-000010",
+    "last 3 years of {ticker} filings",
+    "{ticker} 8-K filings in 2024",
+    "latest 2024 filings for {ticker}",
+    "{ticker} filings with a position limit of 10% of float",
+    "{ticker} filings with a position limit of 10 percent of float",
+)
+
+
+def test_prop_explicit_counts_ignore_dates_ciks_and_forms() -> None:
+    """A count phrase yields exactly its number; dates, CIKs, accessions, and form names never yield one."""
+    schema = _production_schema("list_sec_filings")
+    with pytest.MonkeyPatch.context() as mp, tempfile.TemporaryDirectory() as tmp:
+        srv = _load_server(mp, Path(tmp))
+
+        @seed(20261013)
+        @settings(max_examples=200, derandomize=True)
+        @given(
+            st.one_of(st.integers(min_value=1, max_value=1899), st.integers(min_value=2100, max_value=100000)),
+            st.sampled_from(_COUNT_TEMPLATES),
+            st.sampled_from(_NON_COUNTS),
+            st.sampled_from(["TSLA", "AMZN", "META"]),
+        )
+        def check(n: int, counted: str, plain: str, ticker: str) -> None:
+            text = plain.format(ticker=ticker)
+            assert srv._explicit_counts(text) == set()
+            assert "default limit: 50" in srv._arguments_facts(text, None, {}, schema)
+            assert srv._explicit_counts(f"{text}. {counted.format(ticker=ticker, n=n)}") == {n}
+
+        check()
 
 
 def test_handle_passes_raw_request_text_to_complete(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -1,16 +1,19 @@
 """Phase-10 tool cutover: bounded SEC inventory + search envelopes.
 
 Offline: app.sec seams are monkeypatched at the tools.sec boundary; no
-network, no edgar import.
+network. Forms validation reads only the installed edgartools registries.
 """
 
 import json
+import string
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NoReturn, cast
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from app import tools
 from app.policy import Capability, RequestContext
@@ -2508,7 +2511,23 @@ def test_search_sec_filings_preserves_valid_forms(
     assert seen["request"].forms == (form,)
 
 
-@pytest.mark.parametrize("invalid_form", ["Acme Labs Incorporated", "2025-01-01", "2020"])
+@pytest.mark.parametrize(
+    "invalid_form",
+    [
+        "Acme Labs Incorporated",
+        "2025-01-01",
+        "2020",
+        "TSLA",
+        "AMZN",
+        "META",
+        "CIK",
+        "SEC",
+        "10-Q/10-K",
+        "10-k",
+        "N-MFP2/A/A",
+        "10-K/A/A",
+    ],
+)
 @pytest.mark.parametrize("tool_name", ["list_sec_filings", "search_sec_filings"])
 def test_sec_tools_reject_non_forms_before_provider(
     monkeypatch: pytest.MonkeyPatch, invalid_form: str, tool_name: str
@@ -2525,8 +2544,47 @@ def test_sec_tools_reject_non_forms_before_provider(
     assert invalid_form in str(result["error"])
 
 
-def test_list_sec_filings_valid_forms_reach_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Legit forms still coerce and reach the provider untouched."""
+_VALID_FORMS = [
+    # Stock: annual, quarterly, current, proxy, foreign.
+    "10-K",
+    "10-Q",
+    "8-K",
+    "DEF 14A",
+    "NT 10-K",
+    "20-F",
+    "6-K",
+    # Fund, including the edgartools N-PORT alias.
+    "NPORT-P",
+    "N-PORT",
+    "N-CSR",
+    "N-CEN",
+    "40-17G",
+    "N-MFP2/A",
+    # Ownership.
+    "4",
+    "144",
+    "SC 13D",
+    "SCHEDULE 13G",
+    "13F-HR",
+    # Offering, including forms missing from secforms.csv.
+    "S-1",
+    "S-3ASR",
+    "424B5",
+    "1-A",
+    "EFFECT",
+    "D",
+    "C",
+    # Amendments, normalized like edgartools describe_form.
+    "10-K/A",
+    "SC 13D/A",
+    "13F-HR/A",
+    "1-A/A",
+]
+
+
+@pytest.mark.parametrize("form", _VALID_FORMS)
+def test_list_sec_filings_valid_forms_reach_provider(monkeypatch: pytest.MonkeyPatch, form: str) -> None:
+    """Known stock, fund, ownership, offering forms, aliases, and amendments reach the provider untouched."""
     seen: dict[str, object] = {}
 
     def _fake(*args: object, **kwargs: object) -> list[object]:
@@ -2535,10 +2593,32 @@ def test_list_sec_filings_valid_forms_reach_provider(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(tools.sec, "list_sec_filings", _fake)
     result = tools.execute_tool(
-        "list_sec_filings", {"identifier": "NVDA", "forms": ["10-K", "8-K"]}, "test", context=_research_context()
+        "list_sec_filings", {"identifier": "NVDA", "forms": [form, "8-K"]}, "test", context=_research_context()
     )
     assert result["source"] == "SEC EDGAR"
-    assert seen["forms"] == ("10-K", "8-K")
+    assert seen["forms"] == (form, "8-K")
+
+
+@settings(max_examples=200, derandomize=True)
+@given(
+    st.sampled_from(sorted(tools._sec_form_types())),
+    st.booleans(),
+    st.text(alphabet=string.ascii_uppercase, min_size=1, max_size=6),
+)
+def test_prop_forms_pass_exactly_when_registered(known: str, amended: bool, token: str) -> None:
+    """Every registered form (optionally /A) passes; any other token fails with the token named."""
+    form = f"{known}/A" if amended else known
+    forms, err = tools._filing_forms_arg([form], "list_sec_filings")
+    if amended and known.endswith("/A") and form not in tools._sec_form_types():
+        assert forms is None and err is not None and err["error_type"] == "invalid_tool_arguments"
+    else:
+        assert forms == (form,) and err is None
+    forms, err = tools._search_forms_arg([token], "search_sec_filings")
+    if token in tools._sec_form_types():
+        assert forms == (token,) and err is None
+    else:
+        assert forms is None and err is not None and err["error_type"] == "invalid_tool_arguments"
+        assert token in str(err["error"])
 
 
 def test_get_insider_activity_self_contained_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:

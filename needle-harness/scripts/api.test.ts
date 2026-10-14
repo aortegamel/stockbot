@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { dispatch, registerPrewarm, resolveApiPort, startApiServer } from "./api";
+import { kernelRouter, type KernelResponse } from "@/lib/agent/kernel";
 
 describe("bun api startup env", () => {
   // Real startup in a child process: the child's env and cwd never touch this suite.
@@ -93,6 +94,62 @@ describe("bun api host", () => {
   test("research rejects a wrong method without reading state", async () => {
     const res = await dispatch(new Request("http://localhost/api/research/sessions", { method: "POST" }));
     expect(res.status).toBe(405);
+  });
+
+  test("watchlist page load forwards the deduplicated list with one budgeted deadline", async () => {
+    const rows = [
+      { symbol: "NVDA", source: "sec_filings", tool: "list_sec_filings", status: "ok" },
+      { symbol: "QQQ", source: "finra_threshold_list", tool: "get_threshold_securities", status: "no_records" },
+    ];
+    const calls: Record<string, unknown>[] = [];
+    const spy = spyOn(kernelRouter, "call").mockImplementation(async (body: Record<string, unknown>) => {
+      calls.push(body);
+      return { watchlist: rows } as unknown as KernelResponse;
+    });
+    try {
+      const before = Date.now();
+      const res = await dispatch(new Request("http://localhost/api/watchlist?symbols=nvda,QQQ,nvda"));
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ watchlist: rows });
+      expect(calls.length).toBe(1);
+      expect(calls[0]?.op).toBe("watchlist");
+      expect(calls[0]?.watchlist).toEqual(["NVDA", "QQQ"]);
+      const deadline = calls[0]?.deadlineAt as number;
+      expect(deadline).toBeGreaterThanOrEqual(before + 15_000);
+      expect(deadline).toBeLessThanOrEqual(Date.now() + 15_000);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("watchlist worker failure is a 502 with the worker error, never an empty list", async () => {
+    for (const [reply, error] of [
+      [{ error: "<worker>: 'watchlist' must be a list of 1-25 tickers" }, "<worker>: 'watchlist' must be a list of 1-25 tickers"],
+      [{ route: "x" }, "malformed watchlist reply"],
+    ] as const) {
+      const spy = spyOn(kernelRouter, "call").mockImplementation(async () => reply as unknown as KernelResponse);
+      try {
+        const res = await dispatch(new Request("http://localhost/api/watchlist?symbols=NVDA"));
+        expect(res.status).toBe(502);
+        expect(await res.json()).toEqual({ error });
+      } finally {
+        spy.mockRestore();
+      }
+    }
+  });
+
+  test("malformed watchlist symbols are rejected before any worker call", async () => {
+    const spy = spyOn(kernelRouter, "call");
+    try {
+      for (const query of ["", "?symbols=", "?symbols=SEC", "?symbols=NVDA,,AAPL", `?symbols=${Array.from({ length: 26 }, (_, i) => `T${i}`).join(",")}`]) {
+        const res = await dispatch(new Request(`http://localhost/api/watchlist${query}`));
+        expect(res.status).toBe(400);
+      }
+      expect((await dispatch(new Request("http://localhost/api/watchlist?symbols=NVDA", { method: "POST" }))).status).toBe(405);
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   test("startup prewarm sets KERNEL_PREWARMED without throwing", async () => {

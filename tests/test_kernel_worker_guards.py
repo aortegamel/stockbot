@@ -151,6 +151,7 @@ class _JevRoute(JevClient):
         self.personas = personas
         self.fail = fail
         self.seen: list[tuple[str, str | None]] = []
+        self.watchlists: list[Sequence[str] | None] = []
 
     @override
     async def route_entry(
@@ -158,10 +159,12 @@ class _JevRoute(JevClient):
         prompt: str,
         registry: Sequence[Mapping[str, JSONValue]] | None = None,
         route_hint: str | None = None,
+        watchlist: Sequence[str] | None = None,
     ) -> dict[str, JSONValue]:
         if self.fail:
             raise RuntimeError("jev down")
         self.seen.append((prompt, route_hint))
+        self.watchlists.append(watchlist)
         return {
             "route": route_hint or self.choice or "research_required",
             "personas": list[JSONValue](self.personas) if self.personas is not None else None,
@@ -222,6 +225,60 @@ def test_route_prefixed_clock_keeps_prompt_and_returns_clock() -> None:
 def test_route_bad_ticker_is_error() -> None:
     out = kw._route({"id": "r1", "op": "route", "prompt": "hello", "ticker": "FINRA"}, jev=_JevRoute("x"))
     assert out["id"] == "r1" and "error" in out
+
+
+def test_route_forwards_watchlist_as_context_and_keeps_prompt_verbatim() -> None:
+    """The list rides beside the prompt; nothing is appended to the text JEV and Needle read."""
+    jev = _JevRoute("research_required")
+    out = kw._route(
+        {"id": "r1", "op": "route", "prompt": "Latest filings for my watchlist?", "watchlist": ["nvda", "QQQ", "nvda"]},
+        jev=jev,
+    )
+    assert out == {"id": "r1", "route": "research_required", "personas": None}
+    assert jev.watchlists == [["NVDA", "QQQ"]]
+    assert jev.seen[0][0].startswith("[Today UTC ")
+    assert "Latest filings for my watchlist?" in jev.seen[0][0]
+    for sym in ("NVDA", "QQQ"):
+        assert sym not in jev.seen[0][0]
+
+
+@pytest.mark.parametrize("bad", ["NVDA", [], [""], [7], [f"T{i}" for i in range(26)]])
+def test_route_bad_watchlist_is_error_without_jev(bad: JSONValue) -> None:
+    jev = _JevRoute("research_required")
+    out = kw._route({"id": "r1", "op": "route", "prompt": "my watchlist?", "watchlist": bad}, jev=jev)
+    assert out["id"] == "r1" and "watchlist" in str(out["error"])
+    assert jev.seen == []
+
+
+def test_route_entry_states_watchlist_scope_only_in_entry_instructions() -> None:
+    """Entry instructions carry the scope fact; the personas question and the prompt text stay scope-free."""
+    out, seen = _route_entry(
+        "Latest filings for my watchlist?",
+        {"entry": "research_required"},
+        watchlist=["NVDA", "QQQ"],
+    )
+    assert out == {"route": "research_required", "personas": None}
+    questions = seen["questions"]
+    assert isinstance(questions, dict)
+    entry_text = str(questions["entry"]["instructions"])
+    assert "The user's watchlist is NVDA, QQQ" in entry_text
+    assert "single-shot tool never fits" in entry_text
+    assert entry_text.startswith("Route this entry prompt with exactly one winner: [Today UTC ")
+    assert "Latest filings for my watchlist?" in entry_text
+    assert "watchlist is" not in str(questions["personas"]["instructions"])
+
+
+def test_route_entry_without_watchlist_keeps_entry_instructions_unchanged() -> None:
+    _, seen = _route_entry("Latest filings for my watchlist?", {"entry": "research_required"})
+    questions = seen["questions"]
+    assert isinstance(questions, dict)
+    assert "watchlist is" not in str(questions["entry"]["instructions"])
+
+
+@pytest.mark.parametrize("bad", ["NVDA", [], [""], [7], [object()]])
+def test_route_entry_rejects_blank_watchlist(bad: object) -> None:
+    with pytest.raises(ValueError, match="blank watchlist"):
+        _route_entry("my watchlist?", {"entry": "research_required"}, watchlist=cast(Sequence[str], bad))
 
 
 def test_arguments_context_carries_ticker_without_raw_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -464,7 +521,7 @@ def test_arguments_repair_failure_is_error_envelope(
 
 
 def test_arguments_repairs_needle_placeholders(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Needle placeholder forms / org ticker repair through the shared scheduler path."""
+    """Org ticker repairs through the shared scheduler path; generated forms stay verbatim for tool rejection."""
     import app.tools as _tools
 
     def _resolve(name: str) -> str | None:
@@ -497,7 +554,7 @@ def test_arguments_repairs_needle_placeholders(monkeypatch: pytest.MonkeyPatch) 
             "schema": {"type": "object"},
         }
     )
-    assert sec["arguments"] == {"identifier": "NVDA", "forms": ["10-Q", "10-K", "8-K"]}
+    assert sec["arguments"] == {"identifier": "NVDA", "forms": ["YYYY-MM-DD"]}
     sho = kw._arguments(
         {
             "id": "r2",
@@ -590,11 +647,14 @@ _ROUTE_REG: list[dict[str, JSONValue]] = [{"name": "get_current_time", "descript
 
 
 def _route_entry(
-    prompt: str, picks: dict[str, str], route_hint: str | None = None
+    prompt: str,
+    picks: dict[str, str],
+    route_hint: str | None = None,
+    watchlist: Sequence[str] | None = None,
 ) -> tuple[dict[str, JSONValue], dict[str, object]]:
     seen: dict[str, object] = {}
     client = JevClient(transport=_choice_stub(picks, seen), data_root=Path("/tmp"))
-    return asyncio.run(client.route_entry(prompt, _ROUTE_REG, route_hint=route_hint)), seen
+    return asyncio.run(client.route_entry(prompt, _ROUTE_REG, route_hint=route_hint, watchlist=watchlist)), seen
 
 
 @pytest.mark.parametrize("prompt", [None, 7, "", " \t\n"])
@@ -686,7 +746,7 @@ def test_route_entry_explicit_subset_is_canonical() -> None:
 
 @pytest.mark.parametrize("pick", ["bullbot_stockbot", "stockbot_stockbot", "all"])
 def test_route_entry_rejects_malformed_persona_choice(pick: str) -> None:
-    with pytest.raises(ValueError, match="malformed_typesafe_answer for personas"):
+    with pytest.raises(ValueError, match="malformed_decision_answer for personas"):
         _route_entry("NVDA?", {"entry": "research_required", "personas": pick})
 
 
@@ -700,7 +760,7 @@ def test_route_entry_no_personas_remaining_raises() -> None:
 def test_route_entry_rejects_arbitrary_invalid_persona_label(label: str) -> None:
     assume(label)
     assume(label not in _PERSONA_OPTIONS)
-    with pytest.raises(ValueError, match="malformed_typesafe_answer for personas"):
+    with pytest.raises(ValueError, match="malformed_decision_answer for personas"):
         _route_entry("NVDA?", {"entry": "research_required", "personas": label})
 
 
@@ -822,6 +882,81 @@ def test_run_scheduler_deadline_honors_shared_budget(
     assert isinstance(seen["deadline_at"], float)
     assert abs(seen["setup_deadline"] - (t0 + kw._SETUP_S)) < 5.0
     assert abs(seen["deadline_at"] - (t0 + kw._RUN_WALL_S - kw._FINALIZE_S)) < 5.0
+
+
+def test_run_watchlist_replaces_ticker_scope_and_returns_persisted_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A watchlist request drops the session ticker; coverage rows come only from the persisted intake_digest."""
+    seen: list[dict[str, object]] = []
+    rows: list[JSONValue] = [
+        {"symbol": "NVDA", "source": "sec_filings", "tool": "list_sec_filings", "status": "ok", "evidence_id": "ev:1"},
+        {"symbol": "QQQ", "source": "finra_threshold_list", "tool": "get_threshold_securities", "status": "timeout"},
+    ]
+
+    def _fake_graph(prompt: str, as_of: object = None, **k: object) -> str:
+        seen.append({"prompt": prompt, "ticker": k.get("ticker"), "watchlist": k.get("watchlist")})
+        return "s1"
+
+    async def _fake_sched(sid: str, **hooks: object) -> dict[str, object]:
+        return {"status": "complete", "nodes": [], "incomplete_guard": False}
+
+    def _decisions(self: ResearchRepository, sid: str) -> list[DecisionRecord]:
+        digest = DecisionRecord(
+            decision_id="dec-digest",
+            session_id=sid,
+            node_id=None,
+            job_id=None,
+            decision_type="intake_digest",
+            candidates={},
+            probabilities={},
+            selected={"stats": {"watchlist": rows}},
+        )
+        # A non-digest decision carrying the same key never contributes coverage.
+        other = DecisionRecord(
+            decision_id="dec-other",
+            session_id=sid,
+            node_id=None,
+            job_id=None,
+            decision_type="route",
+            candidates={},
+            probabilities={},
+            selected={"stats": {"watchlist": [{"symbol": "FAKE"}]}},
+        )
+        return [digest, other]
+
+    monkeypatch.setattr(kw, "run_graph_prompt", _fake_graph)
+    monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
+    monkeypatch.setattr(kw, "_close_bootstrap_job", _no_bootstrap)
+    _empty_repo(monkeypatch)
+    monkeypatch.setattr(ResearchRepository, "list_decisions", _decisions)
+    prompt = "Latest filings for my watchlist?"
+    out = kw._run(
+        {"id": "rw", "prompt": prompt, "ticker": "aapl", "watchlist": ["nvda", "QQQ", "nvda"]}, jev=JevClient()
+    )
+    assert seen == [{"prompt": prompt, "ticker": None, "watchlist": ["NVDA", "QQQ"]}]
+    assert out["watchlist"] == rows
+
+    seen.clear()
+    _empty_repo(monkeypatch)
+    out = kw._run({"id": "rt", "prompt": "NVDA risk factors?", "ticker": "nvda"}, jev=JevClient())
+    assert seen == [{"prompt": "NVDA risk factors?", "ticker": "NVDA", "watchlist": None}]
+    assert "watchlist" not in out
+
+
+@pytest.mark.parametrize("bad", ["NVDA", [], ["NVDA", "SEC"], ["NVDA", 7], ["  "], [f"T{i}" for i in range(26)]])
+def test_run_malformed_watchlist_is_invalid_params_before_setup(
+    monkeypatch: pytest.MonkeyPatch, bad: JSONValue
+) -> None:
+    def _boom(*a: object, **k: object) -> str:
+        raise AssertionError("setup must not run for a malformed watchlist")
+
+    monkeypatch.setattr(kw, "run_graph_prompt", _boom)
+    out = kw._run({"id": "rb", "prompt": "my watchlist?", "watchlist": bad}, jev=JevClient())
+    terminal = out["terminal"]
+    assert isinstance(terminal, dict) and terminal["category"] == "invalid_params"
+    assert "watchlist" in str(terminal["message"])
+    assert kw._watchlist({"id": "wb", "watchlist": bad}) == {"id": "wb", "error": terminal["message"]}
 
 
 def test_run_scheduler_deadline_honors_absolute_deadline_at(

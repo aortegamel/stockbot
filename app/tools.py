@@ -13,6 +13,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from functools import cache
+from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 from zoneinfo import ZoneInfo
@@ -184,6 +186,7 @@ TOOLS: list[dict[str, object]] = [
                     },
                     "limit": {
                         "type": "integer",
+                        "default": 20,
                         "description": "Max candidates returned (default 20).",
                     },
                 },
@@ -319,7 +322,7 @@ TOOLS: list[dict[str, object]] = [
                         "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                         "description": "Point-in-time date YYYY-MM-DD; filings known after it are excluded.",
                     },
-                    "limit": {"type": "integer"},
+                    "limit": {"type": "integer", "default": 50},
                 },
                 "required": ["identifier"],
             },
@@ -6368,33 +6371,64 @@ def _date_like_form(value: object) -> bool:
     return "/" in text and re.search(r"\d{4}", text) is not None
 
 
+@cache
+def _sec_form_types() -> frozenset[str]:
+    """Exact SEC form types from the installed edgartools registries.
+
+    secforms.csv omits real forms (1-A, EFFECT), so the entity, enum, prospectus,
+    alias, and skill-mapping registries shipped with edgartools join it.
+    """
+    import yaml
+    from edgar.entity import constants as entity_forms
+    from edgar.enums import FormType
+    from edgar.filtering import FORM_ALIASES
+    from edgar.reference.forms import PROSPECTUSES, sec_form_data
+
+    skill = yaml.safe_load((files("edgar") / "ai" / "skills" / "forms.yaml").read_text(encoding="utf-8"))
+    forms: set[object] = {
+        *sec_form_data.Form,
+        *FORM_ALIASES,
+        *(form for targets in FORM_ALIASES.values() for form in targets),
+        *entity_forms.ALL_FORM_TYPES,
+        *entity_forms.FILER_TYPE_FOREIGN_FORMS,
+        *entity_forms.FILER_TYPE_DOMESTIC_FORMS,
+        *(member.value for member in FormType),
+        *PROSPECTUSES,
+        *(form for group in skill["mappings"].values() for form in group.values()),
+    }
+    return frozenset(str(form).strip() for form in forms)
+
+
+def _known_sec_form(value: object) -> bool:
+    """Exact registry member, or a single /A appended to a registered non-amendment form.
+
+    No case or whitespace folding: edgartools filter_by_form matches exact strings,
+    so a folded value would pass here and then silently match no filings.
+    """
+    if not isinstance(value, str):
+        return False
+    forms = _sec_form_types()
+    if value in forms:
+        return True
+    base = value.removesuffix("/A")
+    return value.endswith("/A") and not base.endswith("/A") and base in forms
+
+
 def _filing_forms_arg(
     raw: object, tool: str
 ) -> tuple[str | list[str] | tuple[str, ...] | None, dict[str, object] | None]:
-    """Coerced forms or an invalid_tool_arguments error naming the date-like value."""
+    """Coerced forms or an invalid_tool_arguments error when any value is not a known SEC form."""
     forms = _filing_forms(raw)
     if forms is None:
         return None, None
     values = [forms] if isinstance(forms, str) else list(forms)
-    if any(_date_like_form(v) or _search_prose_form(v) for v in values):
+    if not all(_known_sec_form(v) for v in values):
         return None, _invalid_args_error(tool, f"tool '{tool}': invalid forms {raw!r}; {_FILING_FORMS_HINT}")
     return forms, None
 
 
-def _search_prose_form(value: object) -> bool:
-    """Malformed generated organization prose, never a routable SEC form."""
-    if not isinstance(value, str):
-        return False
-    text = value.strip().upper().replace("\u2010", "-").replace("\u2011", "-")
-    if len(text) <= 4 or len(text.split()) <= 1:
-        return False
-    if "/" in text or text.endswith("/A"):
-        return False
-    return not any(char.isdigit() for char in text)
-
-
 def _search_forms_arg(raw: object, tool: str) -> tuple[tuple[str, ...] | None, dict[str, object] | None]:
-    """Search forms: one string stays one member; /A survives; date/prose fails before SEC."""
+    """Search forms: one string stays one member; /A survives; unknown forms fail before SEC."""
     if raw is None:
         return None, None
     if isinstance(raw, str):
@@ -6403,7 +6437,7 @@ def _search_forms_arg(raw: object, tool: str) -> tuple[tuple[str, ...] | None, d
         forms = tuple(str(item) for item in raw)
     else:
         return None, None
-    if any(_date_like_form(item) or _search_prose_form(item) for item in forms):
+    if not all(_known_sec_form(item) for item in forms):
         return None, _invalid_args_error(tool, f"tool '{tool}': invalid forms {raw!r}; {_FILING_FORMS_HINT}")
     return forms, None
 

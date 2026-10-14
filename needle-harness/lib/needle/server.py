@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import threading
 from datetime import UTC, datetime
@@ -186,8 +187,134 @@ def _grounded_argument_facts(values, schema):
     return facts
 
 
-def _arguments_facts(objective, node, context, schema=None):
-    """Bind request facts and explicit arguments. Never bind research records or feedback."""
+def _default_facts(schema, explicit):
+    """Schema-declared `default` values only; an explicit argument for the key wins."""
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict):
+        return []
+    return [
+        f"default {key}: {_fact(spec['default'])}"
+        for key, spec in properties.items()
+        if isinstance(spec, dict) and "default" in spec and key not in explicit and _argument_value(spec["default"])
+    ]
+
+
+_COUNT_WORDS = {
+    word: n
+    for n, word in enumerate(
+        (
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+            "eleven",
+            "twelve",
+            "thirteen",
+            "fourteen",
+            "fifteen",
+            "sixteen",
+            "seventeen",
+            "eighteen",
+            "nineteen",
+            "twenty",
+        ),
+        1,
+    )
+} | {"thirty": 30, "forty": 40, "fifty": 50, "hundred": 100}
+# Number words that are never a supported count on their own; a request using them gets a digits instruction.
+_UNSUPPORTED_WORDS = ("sixty", "seventy", "eighty", "ninety", "thousand", "million", "dozen")
+_NUMBER_WORD = rf"(?:{'|'.join((*_COUNT_WORDS, *_UNSUPPORTED_WORDS))})\b"
+# Plain digits are read whole. Temporal phrases exclude year-shaped tokens separately below.
+_COUNT = rf"(\d+|{'|'.join(_COUNT_WORDS)})(?![\w./:%-]|,\d)(?!\s*(?:%|percent\b|per\s+cent\b))"
+# Counts the matcher never reads partially: separators or decimals (1,000; 2.5), compounds (one hundred,
+# thirty five, twenty-five), and unsupported number words.
+_BAD_COUNT = (
+    rf"(\d+(?:[.,]\d+)+|{_NUMBER_WORD}(?:[\s-]+(?:and[\s-]+)?{_NUMBER_WORD})+|(?:{'|'.join(_UNSUPPORTED_WORDS)})\b)"
+)
+_RECORDS = (
+    r"(?:filings?|records?|results?|rows?|items?|entry|entries|hits?|matches|candidates?|forms?|reports?|"
+    r"documents?|transactions?|trades?|events?|sales?|notices?|changes?|offerings?|holders?|owners?|"
+    r"companies|entities|stocks?|tickers?|names?|observations?|publications?|articles?|sources?)\b"
+)
+# Up to three qualifier words (10-K, insider, SEC) may sit between the count and the record noun. A time unit
+# never does, so "last 3 years of filings" is a window, not a count. A number word never does, so the rest of
+# a compound count is never skipped as a qualifier.
+_QUALIFIERS = (
+    rf"(?:(?!(?:days?|weeks?|months?|quarters?|years?|hours?|minutes?|sessions?)\b|{_NUMBER_WORD})[\w/&.-]+\s+){{0,3}}?"
+)
+
+
+def _count_phrases(count):
+    """Recognized count phrases with `count` (one capture group) in the number position."""
+    return re.compile(
+        rf"\b(?:latest|last|most\s+recent|newest|recent|past|previous)\s+"
+        rf"(?!(?:19|20)\d\d\b){count}\s+{_QUALIFIERS}{_RECORDS}"
+        rf"|\b(?:top|first|up\s+to|at\s+most|no\s+more\s+than|max(?:imum)?(?:\s+of)?)\s+"
+        rf"{count}\s+{_QUALIFIERS}{_RECORDS}"
+        rf"|\b(?!(?:19|20)\d\d\b){count}\s+(?:latest|most\s+recent|newest|recent|last)\s+{_QUALIFIERS}{_RECORDS}"
+        rf"|\blimit(?:\s*[:=]\s*|\s+(?:of\s+|to\s+)?){count}(?!\s*(?:%|percent\b|per\s+cent\b))",
+        re.IGNORECASE,
+    )
+
+
+_COUNT_RE = _count_phrases(_COUNT)
+_BAD_COUNT_RE = _count_phrases(_BAD_COUNT)
+
+
+def _explicit_counts(text):
+    """Distinct counts named by recognized count phrases (latest 5 filings, up to 37 records, limit 10).
+
+    A count phrase whose number is a compound, separated, decimal, or unsupported word fails instead of
+    yielding a smaller count or leaving the default in place.
+    """
+    text = text if isinstance(text, str) else ""
+    bad = _BAD_COUNT_RE.search(text)
+    if bad is not None:
+        raw = next(group for group in bad.groups() if group)
+        raise ValueError(f"unsupported count {raw!r} in the request; write the count as plain digits, e.g. 100")
+    counts = set()
+    for match in _COUNT_RE.finditer(text):
+        raw = next(group for group in match.groups() if group)
+        counts.add(int(raw) if raw.isdigit() else _COUNT_WORDS[raw.lower()])
+    return counts
+
+
+def _requested_limit(objective, node, context, schema):
+    """One requested limit from a structured grounded limit or the original request text; None when absent.
+
+    The original request (objective) is the authority; the node question stands in only without one.
+    Distinct counts fail rather than choosing one.
+    """
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    # get_sec_document's limit counts characters, not records. Its max_chars alias identifies that schema.
+    if not isinstance(properties, dict) or "limit" not in properties or "max_chars" in properties:
+        return None
+    text = objective if isinstance(objective, str) and objective.strip() else _request_text(node, objective)
+    counts = _explicit_counts(text)
+    grounded = context.get("grounded_arguments") if isinstance(context, dict) else None
+    structured = grounded.get("limit") if isinstance(grounded, dict) else None
+    if isinstance(structured, int) and not isinstance(structured, bool):
+        counts.add(structured)
+    if len(counts) > 1:
+        raise ValueError(f"conflicting explicit counts {sorted(counts)} in the request; ask for one count")
+    return next(iter(counts), None)
+
+
+def _check_limit(tool, arguments, limit):
+    """A requested limit must reach execution exactly; a default or other number never replaces it."""
+    value = arguments.get("limit") if isinstance(arguments, dict) else None
+    if limit is not None and (isinstance(value, bool) or value != limit):
+        raise ValueError(f"needle arguments for {tool!r} set limit {value!r}; the request asks for {limit}")
+
+
+def _arguments_facts(objective, node, context, schema=None, limit=None):
+    """Bind request facts, explicit arguments, and declared schema defaults. Never bind research records or feedback."""
     facts = [f"date: {datetime.now(UTC).strftime('%Y-%m-%d %a %H:%M')} UTC", "locale: en-US"]
     if isinstance(objective, str) and objective.strip():
         facts.append(f"objective: {objective}")
@@ -196,13 +323,18 @@ def _arguments_facts(objective, node, context, schema=None):
             value = node.get(key)
             if isinstance(value, str):
                 facts.append(f"node {key}: {value}")
+    grounded = context.get("grounded_arguments") if isinstance(context, dict) else None
+    explicit = dict(grounded) if isinstance(grounded, dict) else {}
+    if limit is not None:
+        explicit["limit"] = limit
     if isinstance(context, dict):
         for key in ("as_of", "today_utc", "ticker"):
             value = context.get(key)
             if isinstance(value, str):
                 facts.append(f"{key}: {value}")
         facts.extend(_scope_facts(context.get("temporal_scope")))
-        facts.extend(_grounded_argument_facts(context.get("grounded_arguments"), schema))
+    facts.extend(_grounded_argument_facts(explicit, schema))
+    facts.extend(_default_facts(schema, explicit))
     return "; ".join(facts)
 
 
@@ -375,9 +507,11 @@ def handle(line):
             objective = req.get("objective")
             text = _request_text(node, objective)
             entry = _tool_entry(tool, req.get("schema"))
-            bound = _bound_agent(
-                tool, entry["parameters"], _arguments_facts(objective, node, req.get("context"), entry["parameters"])
-            )
+            schema = entry["parameters"]
+            context = req.get("context")
+            # Conflicting counts fail here, before the engine runs.
+            limit = _requested_limit(objective, node, context, schema)
+            bound = _bound_agent(tool, schema, _arguments_facts(objective, node, context, schema, limit))
             _init_ms = (_t.perf_counter() - _gen_t0) * 1000.0
             try:
                 r = bound.complete(text, max_new_tokens=512)
@@ -402,6 +536,7 @@ def handle(line):
             flagged = _grounding_flags(r)
             if flagged:
                 raise ValueError(f"needle arguments for {tool!r} not grounded in the request: {', '.join(flagged)}")
+            _check_limit(tool, decision["arguments"], limit)
         elif action == "extract":
             # Structured extraction: one record shape in, typed fields out.
             # Never hands the full registry — the grammar admits exactly this record.

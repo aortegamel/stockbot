@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { POST as agentPOST } from "@/app/api/agent/route";
 import { GET as healthGET } from "@/app/api/health/route";
 import { GET as researchGET } from "@/app/api/research/[...path]/route";
+import { GET as watchlistGET } from "@/app/api/watchlist/route";
 import { kernelRouter, prewarmKernel } from "@/lib/agent/kernel";
 import { fingerprintKey, loadDotenvAuthoritative } from "@/lib/env";
 
@@ -31,6 +32,10 @@ export async function dispatch(req: Request): Promise<Response> {
   if (path === "/api/agent" || path === "/api/agent/") {
     if (req.method !== "POST") return Response.json({ error: "method not allowed" }, { status: 405 });
     return agentPOST(req);
+  }
+  if (path === "/api/watchlist" || path === "/api/watchlist/") {
+    if (req.method !== "GET") return Response.json({ error: "method not allowed" }, { status: 405 });
+    return watchlistGET(req);
   }
   if (path === "/api/health" || path === "/api/health/") {
     if (req.method !== "GET") return Response.json({ error: "method not allowed" }, { status: 405 });

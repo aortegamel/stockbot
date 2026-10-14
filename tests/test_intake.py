@@ -5,7 +5,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
-from typing import override
+from typing import cast, override
 
 import pytest
 from hypothesis import given, settings
@@ -1033,3 +1033,385 @@ def test_transport_error_resends_without_validator_feedback(
     proposals, _ = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
     assert len(prompts) == 2 and prompts[1] == prompts[0]
     assert proposals == [_good_proposal()]
+
+
+_UNAVAILABLE = (
+    "The requested data is unavailable: one or more tool calls failed or returned no data, so the exact "
+    "values cannot be provided. No values are estimated, derived, or substituted.\n\nTool: {tool}\n  error: {msg}\n\n"
+    "Next step: correct the request (dataset, fields, filters, or credentials) and retry."
+)
+
+
+def _watch_symbol(args: Mapping[str, object]) -> str:
+    return str(args.get("identifier") or args.get("ticker"))
+
+
+def _rows(value: JSONValue) -> list[dict[str, JSONValue]]:
+    """Narrow a worker watchlist reply to its row dicts."""
+    assert isinstance(value, list) and all(isinstance(r, dict) for r in value), value
+    return [r for r in value if isinstance(r, dict)]
+
+
+def _watch_success(tool: str, symbol: str) -> dict[str, object]:
+    """Gateway success shape (content + safe meta) with per-issuer provenance."""
+    return {
+        "content": f"{tool} rows for {symbol}",
+        "meta": {
+            "as_of": f"2026-10-0{len(symbol)}",
+            "returned_count": 3,
+            "source_refs": {"record_id": f"{symbol}:{tool}", "uri": f"https://example.test/{symbol}", "known_at": "x"},
+        },
+    }
+
+
+def test_watchlist_intake_overlaps_every_symbol_and_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every (symbol, source) call is in flight at once (barrier gate); outcomes stay per issuer and per source."""
+    symbols = ["NVDA", "QQQ", "AAPL"]
+    barrier = asyncio.Barrier(len(symbols) * len(kw._WATCHLIST_SOURCES))
+    never = asyncio.Event()
+    started: list[tuple[str, dict[str, object]]] = []
+    cancelled: list[tuple[str, str]] = []
+
+    async def _gated(tool: str, args: dict[str, object], *a: object, **k: object) -> dict[str, object]:
+        started.append((tool, dict(args)))
+        # A serial fan-out never fills the barrier, so every call would time out instead.
+        await barrier.wait()
+        sym = _watch_symbol(args)
+        base: dict[str, object] = {"tool": tool, "arguments": args, "job_id": f"j-{sym}-{tool}", "outcome": _outcome()}
+        if (sym, tool) == ("QQQ", "get_reg_sho_volume"):
+            try:
+                await never.wait()
+            except asyncio.CancelledError:
+                cancelled.append((sym, tool))
+                raise
+        if (sym, tool) == ("AAPL", "get_threshold_securities"):
+            err = _UNAVAILABLE.format(tool=tool, msg="No data found for AAPL: thresholdList")
+            return {**base, "result": {"error": err}, "error": err[:500], "error_type": "tool_error"}
+        if (sym, tool) == ("NVDA", "get_short_interest"):
+            err = _UNAVAILABLE.format(tool=tool, msg="FINRA data request failed: HTTP 503")
+            return {**base, "result": {"error": err}, "error": err[:500], "error_type": "tool_error"}
+        return {**base, "result": _watch_success(tool, sym), "error": None}
+
+    def _candidate(tool: str, *a: object) -> dict[str, object]:
+        return {"tool": tool}
+
+    def _persist(kernel: object, sid: str, record: Mapping[str, object], candidate: object) -> tuple[str, bool]:
+        args = record["arguments"]
+        assert isinstance(args, dict)
+        return f"ev:{_watch_symbol(args)}:{record['tool']}", True
+
+    def _noop(*a: object, **k: object) -> None:
+        return None
+
+    def _no_evidence(*a: object, **k: object) -> list[dict[str, JSONValue]]:
+        return []
+
+    monkeypatch.setattr(kw, "_intake_attempt", _gated)
+    monkeypatch.setattr(kw, "_INTAKE_BUDGET_S", 1.0)
+    monkeypatch.setattr(kw, "_INTAKE_CALL_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(sched, "_evidence_candidate", _candidate)
+    monkeypatch.setattr(sched, "_persist_admitted_evidence", _persist)
+    monkeypatch.setattr(sched, "_complete_attempt_job", _noop)
+    monkeypatch.setattr(sched, "_settle_attempt", _noop)
+    monkeypatch.setattr(sched, "_load_evidence", _no_evidence)
+    _admitted, _raw, stats = asyncio.run(
+        kw._intake_round(None, [], "s1", {}, [], None, _IntakeKernel(), None, None, symbols)
+    )
+
+    expected_calls = [
+        (tool, {"identifier": sym, "limit": kw._INTAKE_SEC_LIMIT} if tool == "list_sec_filings" else {"ticker": sym})
+        for sym in symbols
+        for tool in kw._WATCHLIST_SOURCES
+    ]
+    assert sorted(started, key=repr) == sorted(expected_calls, key=repr)  # no forms filter: fund forms stay in
+    assert cancelled == [("QQQ", "get_reg_sho_volume")]
+    assert stats["outcomes"] == {"admitted": 9, "duplicate": 0, "not_citable": 0, "error": 2, "timeout": 1}
+    rows = stats["watchlist"]
+    assert isinstance(rows, list) and len(rows) == 12
+    by_key = {(r["symbol"], r["tool"]): r for r in rows}
+    assert [(r["symbol"], r["tool"]) for r in rows] == [(s, t) for s in symbols for t in kw._WATCHLIST_SOURCES]
+    assert by_key[("QQQ", "get_reg_sho_volume")]["status"] == "timeout"
+    no_records = by_key[("AAPL", "get_threshold_securities")]
+    assert (
+        no_records["status"] == "no_records" and no_records["error"] == "error: No data found for AAPL: thresholdList"
+    )
+    failed = by_key[("NVDA", "get_short_interest")]
+    assert failed["status"] == "error" and "HTTP 503" in failed["error"] and "evidence_id" not in failed
+    for (sym, tool), row in by_key.items():
+        if row["status"] != "ok":
+            continue
+        # Issuer, date, and provenance stay with their own source: nothing crosses symbols.
+        assert row["source"] == kw._WATCHLIST_SOURCES[tool]
+        assert row["evidence_id"] == f"ev:{sym}:{tool}"
+        assert row["as_of"] == f"2026-10-0{len(sym)}"
+        assert row["ref"] == {"record_id": f"{sym}:{tool}", "uri": f"https://example.test/{sym}", "known_at": "x"}
+
+
+def _finra_envelope(tool: str, symbol: str) -> dict[str, JSONValue]:
+    """Persisted FINRA watchlist shape: the analysis tools answer with metrics, never rows."""
+    dataset = "otcMarket/consolidatedShortInterest" if tool == "get_short_interest" else "otcMarket/regShoDaily"
+    return {
+        "dataset_id": dataset,
+        "briefing": None,
+        "briefing_source": "deterministic_only",
+        "query": {
+            "ticker": symbol,
+            "start_date": None,
+            "end_date": None,
+            "limit": 5,
+            "offset": 0,
+            "filters": None,
+        },
+        "metrics": {"fields": {"currentShortPositionQuantity": {"sum": 100}}, "latest_vs_prior": []},
+        "warnings": [],
+    }
+
+
+def _watchlist_tool_outcome(tool: str, symbol: str) -> ToolOutcome:
+    """Successful outcome of one watchlist call: summary content, no error, no handle."""
+    return ToolOutcome(
+        tool_name=tool,
+        content=f"{tool} {symbol}",
+        source_handle=None,
+        source_refs=None,
+        error=None,
+        error_type=None,
+        retryable=False,
+        meta=ToolResultMeta(0, None, False, None, [], {}),
+    )
+
+
+def test_watchlist_intake_admits_one_finra_row_per_symbol_and_dedupes_repeats(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Real locator, identity and dedupe: each symbol's FINRA envelope is its own citable row.
+
+    The analysis envelopes of get_short_interest/get_reg_sho_volume carry no rows, so their
+    kernel identity comes from the envelope scope. A constant identity collapsed all nine
+    watchlist symbols onto NVDA's row, leaving the other symbols uncitable; a repeated
+    identical call must still dedupe onto the same row.
+    """
+    from app.research import service
+
+    symbols = ["NVDA", "QQQ"]
+    finra_sources = [tool for tool in kw._WATCHLIST_SOURCES if tool != "list_sec_filings"]
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+    store = ResearchRepository(data_root=tmp_path)
+    policy = {"research_sources": {"mode": "allowlist", "sources": ["SEC", "FINRA"]}}
+    sid = service.create_research("Latest filings for my watchlist?", policy=policy, repo=store)
+    kernel = sched._default_kernel(store)
+
+    async def _fake_attempt(
+        tool: str,
+        args: dict[str, object],
+        sid_: str,
+        session: dict[str, JSONValue],
+        registry: list[dict[str, JSONValue]],
+        jev: object,
+        kernel_: sched._Kernel,
+        as_of: str | None,
+    ) -> dict[str, object]:
+        symbol = str(args.get("ticker") or args.get("identifier"))
+        if tool == "list_sec_filings":
+            return {
+                "tool": tool,
+                "arguments": dict(args),
+                "job_id": None,
+                "error": "tool error: SEC unavailable",
+                "error_type": "tool_error",
+            }
+        job_id = sched._attempt_job(kernel_, sid_, "FINRA")
+        envelope = _finra_envelope(tool, symbol)
+        ref = service.persist_tool_result(sid_, job_id, tool, None, envelope, repo=store)["tool_result_id"]
+        assert isinstance(ref, str)
+        result: dict[str, JSONValue] = {**envelope, "content": f"{tool} {symbol}", "tool_result_id": ref}
+        outcome = _watchlist_tool_outcome(tool, symbol)
+        return {
+            "tool": tool,
+            "arguments": dict(args),
+            "job_id": job_id,
+            "result": result,
+            "outcome": outcome,
+            "outcome_summary": sched._outcome_summary(outcome),
+            "error": None,
+        }
+
+    monkeypatch.setattr(kw, "_intake_attempt", _fake_attempt)
+    _admitted, _raw, stats = asyncio.run(kw._intake_round(None, [], sid, {}, [], None, kernel, None, None, symbols))
+
+    def _watch_rows(value: object) -> list[dict[str, JSONValue]]:
+        assert isinstance(value, list), value
+        return _rows(cast(JSONValue, value))
+
+    expected = len(symbols) * len(finra_sources)
+    assert stats["outcomes"] == {
+        "admitted": expected,
+        "duplicate": 0,
+        "not_citable": 0,
+        "error": len(symbols),
+        "timeout": 0,
+    }
+    all_rows = _watch_rows(stats["watchlist"])
+    rows = [r for r in all_rows if r["tool"] in finra_sources]
+    assert [(r["symbol"], r["tool"]) for r in rows] == [(symbol, tool) for symbol in symbols for tool in finra_sources]
+    ids = [r["evidence_id"] for r in rows]
+    assert len(set(ids)) == len(ids) == expected
+    # A failed source stays a failed source: no evidence id is passed off as coverage.
+    failed = [r for r in all_rows if r["tool"] == "list_sec_filings"]
+    assert [r["status"] for r in failed] == ["error", "error"]
+    assert all("evidence_id" not in r for r in failed)
+    stored = {str(e["evidence_id"]): e for e in store.list_evidence(sid)}
+    assert len(stored) == expected
+    for row in rows:
+        record = stored[str(row["evidence_id"])]
+        symbol = str(row["symbol"])
+        provenance = record["provenance"]
+        assert isinstance(provenance, dict)
+        # The row it points at is that symbol's own call, never a sibling's.
+        assert f"{row['tool']} {symbol}" in str(record["content"])
+        assert provenance.get("tool_name") == row["tool"]
+        assert f'"{symbol}"' in str(provenance.get("record_identity"))
+
+    # An identical repeated call re-fetches fresh tool bytes but still dedupes onto the stored row.
+    _admitted2, _raw2, stats2 = asyncio.run(kw._intake_round(None, [], sid, {}, [], None, kernel, None, None, symbols))
+    assert stats2["outcomes"] == {
+        "admitted": 0,
+        "duplicate": expected,
+        "not_citable": 0,
+        "error": len(symbols),
+        "timeout": 0,
+    }
+    assert [r["evidence_id"] for r in _watch_rows(stats2["watchlist"]) if r["tool"] in finra_sources] == ids
+    assert {str(e["evidence_id"]) for e in store.list_evidence(sid)} == set(ids)
+
+
+def test_watchlist_page_load_overlaps_read_only_and_deduplicates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """op:watchlist fans out on the existing pools with no research session, job, or evidence."""
+    import threading
+
+    from app import tool_runtime as rt
+
+    symbols = ["NVDA", "QQQ"]
+    # 2 SEC calls fit the 4-worker SEC pool and 6 FINRA calls fit the 8-worker tool pool, so all can overlap.
+    gate = threading.Barrier(len(symbols) * len(kw._WATCHLIST_SOURCES), timeout=10)
+    lock = threading.Lock()
+    seen: list[tuple[str, dict[str, object], object, object, str]] = []
+
+    def _gateway(tool: str, args: dict[str, object], session: rt.RuntimeToolSession, **k: object) -> dict[str, object]:
+        with lock:
+            seen.append(
+                (
+                    tool,
+                    dict(args),
+                    k.get("active_research_session_id"),
+                    k.get("active_research_job_id"),
+                    session.session_id,
+                )
+            )
+        gate.wait()  # BrokenBarrierError (an error row) unless every call is in flight at once
+        if (tool, args.get("ticker")) == ("get_threshold_securities", "QQQ"):
+            return {"error": _UNAVAILABLE.format(tool=tool, msg="No data found for QQQ: thresholdList")}
+        return _watch_success(tool, _watch_symbol(args))
+
+    monkeypatch.setattr(rt, "execute_agent_tool", _gateway)
+    out = kw._watchlist({"id": "w1", "watchlist": ["nvda", "QQQ", "nvda"]})
+    assert out["id"] == "w1"
+    rows = _rows(out["watchlist"])
+    assert len(rows) == 8
+    assert [(r["symbol"], r["tool"]) for r in rows] == [(s, t) for s in symbols for t in kw._WATCHLIST_SOURCES]
+    assert len(seen) == 8
+    # Read-only: no research session, no job, so the gateway stages and persists nothing.
+    assert {(sid, jid, rsid) for _t, _a, sid, jid, rsid in seen} == {("", "", "watchlist")}
+    assert {(t, _watch_symbol(a)) for t, a, *_ in seen} == {(t, s) for s in symbols for t in kw._WATCHLIST_SOURCES}
+    statuses = {(r["symbol"], r["tool"]): r["status"] for r in rows}
+    assert statuses.pop(("QQQ", "get_threshold_securities")) == "no_records"
+    assert set(statuses.values()) == {"ok"}
+    assert all("evidence_id" not in r for r in rows)
+
+
+def test_watchlist_page_load_past_deadline_reports_every_call_as_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A spent deadline cancels outstanding calls and still reports one timeout row per (symbol, source)."""
+    import threading
+    import time as _t
+
+    from app import tool_runtime as rt
+
+    release = threading.Event()
+
+    def _held(tool: str, args: dict[str, object], session: object, **k: object) -> dict[str, object]:
+        release.wait(10)
+        return _watch_success(tool, _watch_symbol(args))
+
+    monkeypatch.setattr(rt, "execute_agent_tool", _held)
+    try:
+        out = kw._watchlist({"id": "w2", "watchlist": ["SPY"], "deadlineAt": (_t.time() - 1) * 1000})
+    finally:
+        release.set()
+    rows = _rows(out["watchlist"])
+    assert [(r["symbol"], r["source"], r["status"]) for r in rows] == [
+        ("SPY", source, "timeout") for source in kw._WATCHLIST_SOURCES.values()
+    ]
+    assert all(r["error"] == "no result within 0s" for r in rows)
+
+
+def test_watchlist_page_load_reuses_finra_cache_until_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Page load fills the existing FINRA cache; a fresh hit skips the source, an expired one refreshes it."""
+    from datetime import UTC, datetime, timedelta
+    from unittest.mock import MagicMock
+
+    from app import finra_client
+    from tests.test_finra import _mock_get, _response, _token_response
+
+    clock = {"now": 1_000.0}
+
+    class _TtlCache:
+        def __init__(self) -> None:
+            self.rows: dict[str, tuple[object, float]] = {}
+
+        def get(self, key: str, ttl: float | None = None) -> object | None:
+            hit = self.rows.get(key)
+            if hit is None or (ttl is not None and clock["now"] - hit[1] > ttl):
+                return None
+            return hit[0]
+
+        def set(self, key: str, value: object) -> None:
+            self.rows[key] = (json.loads(json.dumps(value)), clock["now"])
+
+    settled = (datetime.now(UTC).date() - timedelta(days=3)).isoformat()
+    record = {"symbolCode": "AAPL", "settlementDate": settled, "currentShortPositionQuantity": 100}
+    post = MagicMock(side_effect=[_token_response(), _response([record]), _response([record])])
+    monkeypatch.setenv("FINRA_USE_MOCK", "")
+    monkeypatch.setenv("FINRA_ANALYSIS_MODEL", "")
+    monkeypatch.setattr("app.finra_client.requests.get", MagicMock(side_effect=_mock_get))
+    monkeypatch.setattr("app.finra_client.requests.post", post)
+    monkeypatch.setattr("app.finra_client.get_finra_client_id", lambda: "client")
+    monkeypatch.setattr("app.finra_client.get_finra_client_secret", lambda: "secret")
+    monkeypatch.setattr(finra_client, "cache", _TtlCache())
+    finra_client.reset_token_cache()
+    finra_client.reset_discovery_cache()
+    finra_client.reset_partitions_cache()
+
+    # The handler's exact-ticker check stays offline: AAPL resolves without EDGAR.
+    def _cik(value: object) -> int:
+        return 320193
+
+    monkeypatch.setattr("app.sec.client.resolve_cik", _cik)
+    monkeypatch.setattr(kw, "_WATCHLIST_SOURCES", {"get_short_interest": "finra_short_interest"})
+
+    def data_posts() -> int:
+        return sum(1 for c in post.call_args_list if "oauth2" not in str(c.args[0]))
+
+    try:
+        page = asyncio.run(kw._watchlist_fetch(["AAPL"], 10.0))
+        assert page[0]["status"] == "ok" and page[0]["symbol"] == "AAPL", page
+        assert data_posts() == 1
+        clock["now"] += finra_client.CACHE_TTL_SECONDS - 1
+        assert asyncio.run(kw._watchlist_fetch(["AAPL"], 10.0)) == page
+        assert data_posts() == 1  # fresh cache: no duplicate source work
+        clock["now"] += 2
+        assert asyncio.run(kw._watchlist_fetch(["AAPL"], 10.0))[0]["status"] == "ok"
+        assert data_posts() == 2  # expired under the existing TTL: one refresh through the same path
+    finally:
+        finra_client.reset_token_cache()
+        finra_client.reset_discovery_cache()
+        finra_client.reset_partitions_cache()

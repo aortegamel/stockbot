@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { fetchFilings, fetchNews, fetchQuote, type FilingItem, type NewsItem } from "../lib/market-data";
+import { fetchFilings, fetchNews, fetchQuote, fetchWatchlistSources, type FilingItem, type NewsItem, type SourceRow } from "../lib/market-data";
 
 import { AgentConsole } from "./agent-console";
 import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
@@ -23,13 +23,48 @@ const down = "var(--down, #EF5350)";
 
 const WATCH_DEFAULTS = ["NVDA", "AAPL", "MSFT", "TSLA", "SPY", "QQQ", "AMZN", "META", "GOOG"];
 
-// Watchlist: real delayed quotes from /api/quote. The selected symbol is
-// always present even when it isn't in the defaults (any-ticker search).
-export function WatchlistPanel({ selected, onSelect }: { selected: string; onSelect: (s: string) => void }) {
+// The actual UI watchlist: the selected symbol is always present even when it
+// isn't in the defaults (any-ticker search). The agent receives this same list.
+export function watchlistFor(selected: string): string[] {
   const extra = selected && !WATCH_DEFAULTS.includes(selected) ? [selected] : [];
-  const syms = [...extra, ...WATCH_DEFAULTS];
+  return [...extra, ...WATCH_DEFAULTS];
+}
+
+const SOURCE_LABEL: Record<SourceRow["source"], string> = {
+  sec_filings: "SEC",
+  finra_short_interest: "SI",
+  finra_short_sale_volume: "VOL",
+  finra_threshold_list: "THR",
+};
+
+function sourceText(row: SourceRow): string {
+  if (row.status === "ok") return row.as_of ? row.as_of.slice(0, 10) : "ok";
+  return row.status === "no_records" ? "none" : row.status;
+}
+
+// Watchlist: real delayed quotes from /api/quote, plus one page-load fan-out of
+// SEC filings and the three FINRA datasets per symbol. Every source shows its own status.
+export function WatchlistPanel({ selected, onSelect }: { selected: string; onSelect: (s: string) => void }) {
+  const syms = watchlistFor(selected);
   const symKey = syms.join(",");
   const [prices, setPrices] = useState<Record<string, number | null>>({});
+  const [sources, setSources] = useState<SourceRow[]>([]);
+  const [sourceError, setSourceError] = useState<string | null>(null);
+  useEffect(() => {
+    const ctrl = new AbortController();
+    // Deferred one tick: a StrictMode remount cancels the timer, so one page load sends one request.
+    const id = setTimeout(() => {
+      setSources([]);
+      setSourceError(null);
+      fetchWatchlistSources(symKey.split(","), ctrl.signal)
+        .then(setSources)
+        .catch((e: unknown) => !ctrl.signal.aborted && setSourceError(`sources unavailable: ${e instanceof Error ? e.message : String(e)}`));
+    }, 0);
+    return () => {
+      clearTimeout(id);
+      ctrl.abort();
+    };
+  }, [symKey]);
   useEffect(() => {
     const current = symKey.split(",");
     let alive = true;
@@ -59,6 +94,7 @@ export function WatchlistPanel({ selected, onSelect }: { selected: string; onSel
   return (
     <div style={{ ...panel, height: "100%", overflowY: "auto" }}>
       <div style={h}>WATCHLIST · DELAYED</div>
+      {sourceError && <div style={{ fontSize: 14, color: down, marginBottom: 8 }}>{sourceError}</div>}
       {syms.map((sym) => (
         <button
           key={sym}
@@ -80,6 +116,19 @@ export function WatchlistPanel({ selected, onSelect }: { selected: string; onSel
           <span style={{ textAlign: "right" }}>
             <div>{prices[sym] == null ? "—" : prices[sym]!.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
             <div style={{ color: "var(--muted, #93A0B8)", fontSize: 14 }}>DELAYED</div>
+            <div aria-label={`${sym} sources`} style={{ color: "var(--muted, #93A0B8)", fontSize: 12 }}>
+              {sources
+                .filter((row) => row.symbol === sym)
+                .map((row) => (
+                  <span
+                    key={row.source}
+                    title={[row.tool, row.status, row.as_of, row.ref?.record_id, row.error].filter(Boolean).join(" · ")}
+                    style={{ color: row.status === "error" || row.status === "timeout" ? down : undefined }}
+                  >
+                    {`${SOURCE_LABEL[row.source]} ${sourceText(row)} `}
+                  </span>
+                ))}
+            </div>
           </span>
         </button>
       ))}
@@ -91,12 +140,17 @@ export function WatchlistPanel({ selected, onSelect }: { selected: string; onSel
 // plus the latest SEC filing link. No static table.
 export function FinancialsPanel({ sym }: { sym: string }) {
   const [filings, setFilings] = useState<FilingItem[]>([]);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let alive = true;
     const ctrl = new AbortController();
     fetchFilings(sym, ctrl.signal)
-      .then((page) => alive && setFilings(page.items.slice(0, 3)))
-      .catch(() => { });
+      .then((page) => {
+        if (!alive) return;
+        setFilings(page.items.slice(0, 3));
+        setError(page.error ?? null);
+      })
+      .catch((e: unknown) => alive && setError(`filings unavailable: ${e instanceof Error ? e.message : String(e)}`));
     return () => {
       alive = false;
       ctrl.abort();
@@ -105,12 +159,15 @@ export function FinancialsPanel({ sym }: { sym: string }) {
   return (
     <div style={{ ...panel, height: "100%", minHeight: 0, overflowY: "auto" }}>
       <div style={h}>FILINGS · {sym}</div>
-      {filings.length === 0 && (
+      {error && <div style={{ fontSize: 18, color: "var(--muted, #93A0B8)", marginBottom: 8 }}>{error}</div>}
+      {filings.length === 0 && !error && (
         <div style={{ fontSize: 20, color: "var(--muted, #93A0B8)" }}>no SEC filings found</div>
       )}
       {filings.map((f, i) => (
         <div key={i} style={{ fontSize: 20, marginBottom: 12, lineHeight: 1.5 }}>
-          <span style={{ color: "var(--muted, #93A0B8)", fontSize: 18 }}>{f.published.slice(0, 10)}</span>
+          <span style={{ color: "var(--muted, #93A0B8)", fontSize: 18 }} title={`updated ${f.updated}`}>
+            filed {f.filed}
+          </span>
           <div>
             {f.link ? (
               <a href={f.link} target="_blank" rel="noreferrer" style={{ color: "inherit" }}>

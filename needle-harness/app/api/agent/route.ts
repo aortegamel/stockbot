@@ -1,5 +1,5 @@
 import { reason } from "@/lib/muse/client";
-import { kernelRouter, parseTicker, REQUEST_WALL_MS, runKernelAgent, type KernelResponse } from "@/lib/agent/kernel";
+import { asksWatchlist, kernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, type KernelResponse } from "@/lib/agent/kernel";
 import { tools } from "@/lib/tools";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
 import { FINAL_PERSONAS, redactArgs, sourceReferences, type AgentEvent, type Evidence, type FailureCategory, type Persona } from "@/lib/agent/types";
@@ -20,8 +20,9 @@ export async function POST(req: Request): Promise<Response> {
   const deadlineAt = Date.now() + REQUEST_WALL_MS;
   let prompt: unknown;
   let ticker: unknown;
+  let watchlistRaw: unknown;
   try {
-    ({ prompt, ticker } = await req.json());
+    ({ prompt, ticker, watchlist: watchlistRaw } = await req.json());
   } catch {
     console.error("[web] [agent-api] invalid JSON");
     return Response.json({ error: "invalid JSON" }, { status: 400 });
@@ -30,10 +31,19 @@ export async function POST(req: Request): Promise<Response> {
     console.error("[web] [agent-api] prompt required");
     return Response.json({ error: "prompt required" }, { status: 400 });
   }
+  // Watchlist context rides beside the verbatim prompt; a malformed list fails loudly, never shrinks.
+  const parsedWatchlist = parseWatchlist(watchlistRaw);
+  if (parsedWatchlist === null) {
+    console.error("[web] [agent-api] invalid watchlist");
+    return Response.json({ error: "watchlist must list 1-25 valid tickers" }, { status: 400 });
+  }
+  // Only a prompt that names the watchlist takes watchlist scope; its symbols are the scope and replace the selected ticker.
+  const watchlist = parsedWatchlist !== undefined && asksWatchlist(prompt) ? parsedWatchlist : undefined;
+  const watchlistField = watchlist ? { watchlist } : {};
   // Validated ticker channel beside the verbatim prompt; invalid values drop (prompt never changes).
-  const parsedTicker = parseTicker(ticker);
+  const parsedTicker = watchlist ? undefined : parseTicker(ticker);
   const tickerField = parsedTicker !== undefined ? { ticker: parsedTicker } : {};
-  console.log(`[web] [agent-api] POST prompt_chars=${prompt.length}`);
+  console.log(`[web] [agent-api] POST prompt_chars=${prompt.length}${watchlist ? ` watchlist=${watchlist.length}` : ""}`);
   const stream = new ReadableStream({
     async start(controller) {
       const enc = new TextEncoder();
@@ -188,10 +198,11 @@ export async function POST(req: Request): Promise<Response> {
         return false;
       };
       // ponytail: JEV-first entry — one route round selects the route and any explicit personas.
+      // The watchlist rides as separate context; JEV's returned route governs dispatch here.
       let routed: KernelResponse | undefined;
       let routeError = "route_invalid: malformed route selection";
       try {
-        routed = await kernelRouter.call({ op: "route", prompt, ...tickerField }, { signal: req.signal });
+        routed = await kernelRouter.call({ op: "route", prompt, ...tickerField, ...watchlistField }, { signal: req.signal });
         if (typeof routed.error === "string" && routed.error) routeError = routed.error;
       } catch (err) {
         routeError = err instanceof Error ? err.message : String(err);
@@ -226,7 +237,7 @@ export async function POST(req: Request): Promise<Response> {
         }
       }
       try {
-        await runKernelAgent(prompt, send, { signal: req.signal, seedEvidence: singleShotEvidence, deadlineAt, ...(personas ? { personas } : {}), ...tickerField });
+        await runKernelAgent(prompt, send, { signal: req.signal, seedEvidence: singleShotEvidence, deadlineAt, ...(personas ? { personas } : {}), ...tickerField, ...(watchlist ? { watchlist } : {}) });
       } catch (err) {
         console.error(`[web] [agent-api] runKernelAgent error: ${err instanceof Error ? err.message : String(err)}`);
         send({ type: "error", message: err instanceof Error ? err.message : String(err) });

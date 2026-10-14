@@ -36,6 +36,39 @@ export function parseTicker(v: unknown): string | undefined {
   if (t.length > 10 || !TICKER_RE.test(t)) return undefined;
   return t;
 }
+const WATCHLIST_MAX = 25;
+// Watchlist context channel beside the verbatim prompt: undefined when absent,
+// null when malformed (callers reject; a bad list never silently shrinks).
+export function parseWatchlist(v: unknown): string[] | null | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (!Array.isArray(v) || v.length === 0 || v.length > WATCHLIST_MAX) return null;
+  const out: string[] = [];
+  for (const item of v) {
+    const t = parseTicker(item);
+    if (t === undefined) return null;
+    if (!out.includes(t)) out.push(t);
+  }
+  return out;
+}
+// Watchlist scope applies only when the prompt names the watchlist; every
+// other question keeps the selected-ticker scope.
+const WATCHLIST_WORD = /\bwatch[\s-]?lists?\b/i;
+export function asksWatchlist(prompt: string): boolean {
+  return WATCHLIST_WORD.test(prompt);
+}
+// One (symbol, source) outcome the worker persisted; never client-provided.
+export type WatchlistRow = {
+  symbol: string;
+  source: string;
+  tool: string;
+  status: "ok" | "no_records" | "error" | "timeout";
+  as_of?: string;
+  evidence_id?: string;
+  error?: string;
+};
+// Page-load trigger: same worker, same tool handlers and caches as agent intake; read-only.
+// The budget mirrors the worker intake budget (_INTAKE_BUDGET_S); a queued call keeps the same deadline.
+export const WATCHLIST_BUDGET_MS = 15_000;
 
 type KernelEvidence = {
   id: string;
@@ -112,6 +145,7 @@ export type KernelResponse = {
   reasoning?: string;
   verdict?: string;
   error?: string;
+  watchlist?: WatchlistRow[];
   terminal?: { category: FailureCategory; message: string };
 };
 
@@ -179,11 +213,15 @@ function inventoryCorrection(validIds: readonly string[], prose: string, claims:
 // Final accuracy gates: inventory -> whole-response JEV via Python worker ops ->
 // on reject per-claim gates -> surgical deletion of rejected substrings ->
 // single answer_delta. Fail closed; never deletes evidence rows.
+// `sessionId` is the run's session: the worker judges gates against that
+// session's persisted rows, and its request-id fallback (the numeric kernel
+// request id) fails closed with "unknown session_id" for every call.
 export async function applyFinalGates(opts: {
   results: FinalPersonaResult[];
   evidence: Evidence[];
   personaOrder: readonly Persona[];
   gate: FinalGateCaller;
+  sessionId?: string;
   gateOpts?: { signal?: AbortSignal; timeoutMs?: number };
 }): Promise<{ text: string } | { failure: string }> {
   const known = new Set(opts.evidence.map((e) => e.id));
@@ -197,6 +235,7 @@ export async function applyFinalGates(opts: {
       whole = await opts.gate(
         {
           op: "assess_final_response",
+          ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
           persona: r.persona,
           text: r.text,
           claims: r.claims.map(toWireClaim),
@@ -219,6 +258,7 @@ export async function applyFinalGates(opts: {
         one = await opts.gate(
           {
             op: "assess_final_claim",
+            ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
             persona: r.persona,
             claim: toWireClaim(c),
             evidence: evidenceWire,
@@ -513,6 +553,7 @@ function graphProjection(input: {
   unresolved: string[];
   incompleteGuard: boolean;
   escalated: boolean;
+  watchlist?: WatchlistRow[];
 }): string {
   const nodeById: Record<string, KernelGraphNode> = {};
   for (const n of input.nodes) nodeById[n.node_id] = n;
@@ -534,11 +575,19 @@ function graphProjection(input: {
   const guard = input.incompleteGuard
     ? "INCOMPLETE: the tool-round guard tripped — coverage is partial, say what is missing, never present this as converged."
     : "Guard: not tripped — still, unresolved items below are open, never present them as answered.";
+  // Watchlist requests list every (symbol, source) outcome, so a failed or slow source is disclosed, never omitted.
+  const watchLines = (input.watchlist ?? []).map(
+    (r) =>
+      `${r.symbol} ${r.source} ${r.status}${r.as_of ? ` as_of=${r.as_of}` : ""}${r.evidence_id ? ` evidence=${r.evidence_id}` : ""}${r.error ? ` error=${JSON.stringify(r.error.slice(0, 200))}` : ""}`,
+  );
   return [
     `OBJECTIVE (verbatim user intent; never restate or change it): ${input.objective}`,
     graphSection("NODES", nodeLines),
     graphSection("JEV DECISIONS (persisted dispositions; the only authority)", decisionLines),
     graphSection("UNRESOLVED (explicitly open; cite as gaps, never answer from memory)", unresolvedLines),
+    ...(watchLines.length
+      ? [graphSection("WATCHLIST COVERAGE (one row per symbol and source; error/timeout means unknown, never 'no records'; disclose every non-ok row)", watchLines)]
+      : []),
     guard,
     "AUTHORITY: project this graph into prose only. Node ids and decision records may name graph structure, but they never support a fact — claims[].evidence_ids takes only EVIDENCE row ids. No invented conclusions, no buy/sell/hold/order/portfolio/committee verdicts — research never decides, the user does.",
   ].join("\n\n");
@@ -547,14 +596,20 @@ function graphProjection(input: {
 export async function runKernelAgent(
   prompt: string,
   emit: (e: AgentEvent) => void,
-  opts?: { signal?: AbortSignal; deadlineAt?: number; deps?: RunKernelDeps; seedEvidence?: Evidence[]; personas?: readonly Persona[]; ticker?: string },
+  opts?: { signal?: AbortSignal; deadlineAt?: number; deps?: RunKernelDeps; seedEvidence?: Evidence[]; personas?: readonly Persona[]; ticker?: string; watchlist?: readonly string[] },
 ): Promise<void> {
   const t0 = performance.now();
   const deps = opts?.deps ?? {};
   const reasonFn = deps.reason ?? reason;
   const deadlineAt = opts?.deadlineAt ?? Date.now() + REQUEST_WALL_MS;
-  const runTicker = parseTicker(opts?.ticker);
-  const runBody = (extra: Record<string, unknown>): Record<string, unknown> => ({ ...extra, ...(runTicker !== undefined ? { ticker: runTicker } : {}) });
+  // A watchlist request carries the list as context and never the selected-ticker scope.
+  const runWatchlist = opts?.watchlist?.length ? [...opts.watchlist] : undefined;
+  const runTicker = runWatchlist ? undefined : parseTicker(opts?.ticker);
+  const runBody = (extra: Record<string, unknown>): Record<string, unknown> => ({
+    ...extra,
+    ...(runTicker !== undefined ? { ticker: runTicker } : {}),
+    ...(runWatchlist ? { watchlist: runWatchlist } : {}),
+  });
   const hasWorkerDeps = deps.spawnFn !== undefined || deps.python !== undefined || deps.workerPath !== undefined;
   const router = hasWorkerDeps
     ? new KernelRouter({
@@ -702,7 +757,12 @@ export async function runKernelAgent(
   const isTrio =
     personas.length === FINAL_PERSONAS.length && FINAL_PERSONAS.every((p) => (personas as readonly string[]).includes(p));
   // ponytail: empty graph never closes silent — first pass answers direct.
-  let direct = evidence.length === 0 && decisions.length === 0 && calls.length === 0 && unresolved.length === 0 && !incompleteGuard;
+  // Worker rows are untrusted JSON: keep only rows with the fields the writer reads.
+  const watchRows = (r: KernelResponse): WatchlistRow[] =>
+    (Array.isArray(r.watchlist) ? r.watchlist : []).filter((w) => w && typeof w.symbol === "string" && typeof w.source === "string" && typeof w.status === "string");
+  let mergedWatchlist = watchRows(res);
+  // A watchlist request with every source failed still projects its coverage rows, never a silent direct answer.
+  let direct = evidence.length === 0 && decisions.length === 0 && calls.length === 0 && unresolved.length === 0 && !incompleteGuard && mergedWatchlist.length === 0;
   let pass = 1;
   const mergedEvidence = evidence;
   let mergedNodes = nodes;
@@ -721,7 +781,7 @@ export async function runKernelAgent(
     emit({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
     const tm = performance.now();
     const input = {
-      prompt: direct ? prompt : `${prompt}\n\n${graphProjection({ objective, nodes: mergedNodes, decisions: mergedDecisions, unresolved: mergedUnresolved, incompleteGuard: mergedGuard, escalated: mergedEscalated })}`,
+      prompt: direct ? prompt : `${prompt}\n\n${graphProjection({ objective, nodes: mergedNodes, decisions: mergedDecisions, unresolved: mergedUnresolved, incompleteGuard: mergedGuard, escalated: mergedEscalated, watchlist: mergedWatchlist })}`,
       evidence: mergedEvidence,
       escalated: direct ? false : mergedEscalated,
       direct: direct || (mergedEscalated && mergedEvidence.length === 0),
@@ -926,6 +986,9 @@ export async function runKernelAgent(
           results: order.flatMap((p) => personaResults?.filter((r) => r.persona === p) ?? []),
           evidence: mergedEvidence,
           personaOrder: order,
+          // Gates are judged against this run's session; without it the worker
+          // falls back to the numeric request id and fails every gate closed.
+          ...(typeof res.sessionId === "string" && res.sessionId ? { sessionId: res.sessionId } : {}),
           gate: (body, gateOpts) => router.call(body, { ...(opts?.signal ? { signal: opts.signal } : {}), ...gateOpts }),
         });
         if ("failure" in gated) {
@@ -1000,6 +1063,7 @@ export async function runKernelAgent(
     mergedUnresolved = Array.isArray(follow.unresolved) ? follow.unresolved.map(String) : [];
     mergedGuard = follow.incompleteGuard ?? follow.incomplete_guard ?? false;
     mergedEscalated = follow.escalated ?? false;
+    if (sameSession) mergedWatchlist = watchRows(follow);
     totalDecisions += (Array.isArray(follow.toolExecutions) ? follow.toolExecutions : follow.needleDecisions ?? []).length;
     totalCalls += (Array.isArray(follow.toolCalls) ? follow.toolCalls : []).length;
     totalEscalations += follow.escalations ?? 0;

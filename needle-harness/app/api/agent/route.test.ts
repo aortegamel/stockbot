@@ -1,8 +1,10 @@
 import { describe, expect, mock, test } from "bun:test";
 import { FINAL_PERSONAS, type Evidence } from "@/lib/agent/types";
 // Real validator captured before mock.module replaces the kernel exports; route.ts must see the production rule.
-import { parseTicker } from "@/lib/agent/kernel";
+import { asksWatchlist, parseTicker, parseWatchlist } from "@/lib/agent/kernel";
 const realParseTicker = parseTicker;
+const realParseWatchlist = parseWatchlist;
+const realAsksWatchlist = asksWatchlist;
 
 // Mutable stubs reconfigured per test; route.ts is imported dynamically after
 // mock.module setup because static imports would bind the real kernel/muse
@@ -22,7 +24,7 @@ let runThrows: unknown = null;
 const runCalls: unknown[][] = [];
 type ReasonCall = { prompt: string; evidence: Evidence[]; onDelta?: (t: string) => void };
 const reasonCalls: ReasonCall[] = [];
-type KernelCall = { op?: unknown; tool?: unknown; prompt?: unknown; objective?: unknown; ticker?: unknown };
+type KernelCall = { op?: unknown; tool?: unknown; prompt?: unknown; objective?: unknown; ticker?: unknown; watchlist?: unknown };
 const kernelCalls: KernelCall[] = [];
 const invoked: unknown[][] = [];
 const ended: string[] = [];
@@ -37,7 +39,10 @@ const bridgeEvidence: Evidence = {
 };
 mock.module("@/lib/agent/kernel", () => ({
   REQUEST_WALL_MS: 120_000,
+  WATCHLIST_BUDGET_MS: 15_000,
   parseTicker: realParseTicker,
+  parseWatchlist: realParseWatchlist,
+  asksWatchlist: realAsksWatchlist,
   kernelRouter: {
     call: async (body: KernelCall) => {
       kernelCalls.push(body);
@@ -111,12 +116,12 @@ function reset(): void {
 
 type AgentEventShape = { type: string;[k: string]: unknown };
 
-async function eventsFor(prompt: string, ticker?: unknown): Promise<AgentEventShape[]> {
+async function eventsFor(prompt: string, ticker?: unknown, watchlist?: unknown): Promise<AgentEventShape[]> {
   const { POST } = await import("./route");
   const req = new Request("http://localhost/api/agent", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(ticker === undefined ? { prompt } : { prompt, ticker }),
+    body: JSON.stringify({ prompt, ...(ticker === undefined ? {} : { ticker }), ...(watchlist === undefined ? {} : { watchlist }) }),
   });
   const res = await POST(req);
   const text = await res.text();
@@ -543,6 +548,69 @@ describe("agent entry route", () => {
       const events = await eventsFor("What drove NVDA revenue?");
       expect(runCalls.length).toBe(1);
       expect(events.at(-1)).toEqual({ type: "error", message });
+    }
+  });
+
+  test("watchlist rides the route call as context and JEV's route governs dispatch", async () => {
+    // research_required: the run body carries the deduplicated list and no selected ticker.
+    reset();
+    winner = "research_required";
+    await eventsFor("Summarize the latest filings for my watchlist", "aapl", ["nvda", "QQQ", "nvda", "spy"]);
+    expect(kernelCalls.map((c) => c.op)).toEqual(["route"]);
+    const routeCall = kernelCalls[0];
+    expect(routeCall?.prompt).toBe("Summarize the latest filings for my watchlist");
+    expect(routeCall?.watchlist).toEqual(["NVDA", "QQQ", "SPY"]);
+    expect(routeCall && "ticker" in routeCall).toBe(false);
+    expect(reasonCalls.length).toBe(0);
+    expect(runCalls.length).toBe(1);
+    expect(runCalls[0]?.[0]).toBe("Summarize the latest filings for my watchlist");
+    const runOpts = runCalls[0]?.[2] as Record<string, unknown>;
+    expect(runOpts.watchlist).toEqual(["NVDA", "QQQ", "SPY"]);
+    expect("ticker" in runOpts).toBe(false);
+
+    // no_session: the same route resolves direct, with no run and no fabricated watchlist work.
+    reset();
+    winner = "no_session";
+    await eventsFor("Summarize the latest filings for my watchlist", "aapl", ["NVDA", "QQQ"]);
+    expect(kernelCalls.map((c) => c.op)).toEqual(["route"]);
+    expect(kernelCalls[0]?.watchlist).toEqual(["NVDA", "QQQ"]);
+    expect(runCalls.length).toBe(0);
+    expect(reasonCalls.length).toBe(1);
+
+    // A registry tool name: the single-shot chain runs, as JEV decided.
+    reset();
+    winner = "get_sec_document";
+    await eventsFor("Summarize the latest filings for my watchlist", "aapl", ["NVDA", "QQQ"]);
+    expect(kernelCalls.map((c) => c.op)).toEqual(["route", "arguments", "assess_entry"]);
+    expect(runCalls.length).toBe(0);
+  });
+
+  test("selected-ticker question ignores the watchlist context", async () => {
+    reset();
+    winner = "research_required";
+    await eventsFor("NVDA risk factors?", "nvda", ["NVDA", "AAPL", "MSFT"]);
+    const runOpts = runCalls[0]?.[2] as Record<string, unknown>;
+    expect(runOpts.ticker).toBe("NVDA");
+    expect("watchlist" in runOpts).toBe(false);
+    expect(kernelCalls[0]?.ticker).toBe("NVDA");
+    expect(kernelCalls[0] && "watchlist" in kernelCalls[0]).toBe(false);
+  });
+
+  test("malformed watchlist context is rejected before any worker call", async () => {
+    const { POST } = await import("./route");
+    for (const bad of [["SEC"], "NVDA", [], [7], ["NVDA", ""], Array.from({ length: 26 }, (_, i) => `T${i}`)]) {
+      reset();
+      const res = await POST(
+        new Request("http://localhost/api/agent", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prompt: "my watchlist filings", ticker: "NVDA", watchlist: bad }),
+        }),
+      );
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: "watchlist must list 1-25 valid tickers" });
+      expect(kernelCalls.length).toBe(0);
+      expect(runCalls.length).toBe(0);
     }
   });
 });

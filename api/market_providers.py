@@ -15,7 +15,8 @@ Every source here is keyless:
   (PyPI fin-news 0.1.2) maps; all fetches use this module's own
   ``_http_bytes`` transport — never fin-news' parser/fake-useragent stack
   (its UA bootstrap 403s). Items merge under one cache key, newest-first.
-- SEC EDGAR Atom: per-company filings (needs CIK + contact User-Agent).
+- SEC EDGAR Atom: per-company filings (needs CIK + contact User-Agent). Funds
+  missing from company_tickers resolve via edgartools' SEC fund registry.
 - Quote via valuation.get_live_quote: Yahoo quoteSummary with its own
   5-minute price TTL in cache.db.
 
@@ -66,6 +67,7 @@ _TTL_CANDLES = 900
 _TTL_UNIVERSE = 24 * 3600
 _TTL_NEWS = 900
 _TTL_FILINGS = 3600
+_FILINGS_PAGE = 40  # the existing per-request ceiling; every cold fetch pulls the whole page
 _NEG_TTL = 60
 # newsquant fetch() runs trafilatura over every item (~120s/ticker in probe):
 # never on the request hot path — daemon thread + join timeout, partial wins.
@@ -313,16 +315,29 @@ def resolve_identity(sym: str) -> dict[str, object]:
 
 
 def cik_for_ticker(sym: str) -> int | None:
-    """CIK for a ticker from the cached universe; None when unmapped."""
+    """CIK from the SEC company universe, else the SEC fund registry; None when unmapped.
+
+    Funds/ETFs absent from company_tickers.json (QQQ) resolve through
+    edgartools' ``find_mutual_fund_cik`` (company_tickers_mf.json), so the
+    trust's own CIK wins, never a sponsor. Lookup failures raise.
+    """
+    want = sym.strip().upper()
     universe = get_universe()
     tickers = universe.get("tickers")
-    if not isinstance(tickers, list):
-        return None
-    want = sym.strip().upper()
-    for row in tickers:
+    for row in tickers if isinstance(tickers, list) else []:
         if isinstance(row, dict) and row.get("sym") == want:
             cik = row.get("cik")
             return int(cik) if isinstance(cik, int) else None
+    from edgar.reference.tickers import find_mutual_fund_cik
+
+    from app.sec.client import ensure_identity
+
+    ensure_identity()
+    fund_cik = find_mutual_fund_cik(want)
+    if fund_cik is not None:
+        return int(fund_cik)
+    if universe.get("error"):
+        raise RuntimeError(str(universe["error"]))
     return None
 
 
@@ -458,12 +473,23 @@ def get_news(sym: str, limit: int = 12) -> dict[str, object]:
 
 
 def get_filings(sym: str, limit: int = 10) -> dict[str, object]:
-    """Per-company SEC filings from the EDGAR Atom feed (needs CIK lookup)."""
+    """Per-company SEC filings from the EDGAR Atom feed (needs CIK lookup).
+
+    Items carry ``filed`` (official SEC filing date, content ``filing-date``)
+    apart from ``updated`` (Atom ``<updated>`` verbatim, acceptance clock with
+    its own offset). One cold fetch always pulls the full 40-entry page, so a
+    small first request never truncates a later larger one.
+    """
     ticker = sym.strip().upper()
-    cik = cik_for_ticker(ticker)
+    try:
+        cik = cik_for_ticker(ticker)
+    except Exception as e:  # noqa: BLE001 - best-effort boundary
+        logger.warning("filings CIK lookup failed for %s: %s", ticker, e)
+        return {"sym": ticker, "cik": None, "items": [], "error": f"filings unavailable: CIK lookup failed: {e}"}
     if cik is None:
         return {"sym": ticker, "cik": None, "items": [], "error": f"no SEC CIK for {ticker}"}
-    key = f"filings:{cik}"
+    # v2: filed/updated item schema + full-page count; pre-v2 `filings:{cik}` rows stay untouched.
+    key = f"filings:v2:{cik}"
     hit = cache.get(key, ttl=_TTL_FILINGS)
     if isinstance(hit, dict):
         items = hit.get("items")
@@ -471,24 +497,28 @@ def get_filings(sym: str, limit: int = 10) -> dict[str, object]:
             return dict(hit, sym=ticker, items=items[:limit])
         return dict(hit, sym=ticker)
     try:
-        url = _SEC_ATOM_URL.format(cik=f"{cik:010d}", n=max(1, min(limit, 40)))
+        url = _SEC_ATOM_URL.format(cik=f"{cik:010d}", n=_FILINGS_PAGE)
         raw = _http_bytes(url, headers={"Accept": "application/atom+xml"})
         ns = {"a": "http://www.w3.org/2005/Atom"}
         root = ET.fromstring(raw)
         items: list[dict[str, object]] = []
-        for entry in root.findall("a:entry", ns)[:limit]:
+        for entry in root.findall("a:entry", ns):
             link = entry.find("a:link", ns)
+            filed = (entry.findtext("a:content/a:filing-date", default="", namespaces=ns) or "").strip()
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", filed):
+                raise ValueError(f"Atom entry without a YYYY-MM-DD filing-date: {filed!r}")
             items.append(
                 {
                     "title": (entry.findtext("a:title", default="", namespaces=ns) or "").strip(),
                     "link": link.get("href", "") if link is not None else "",
-                    "published": (entry.findtext("a:updated", default="", namespaces=ns) or "").strip(),
+                    "filed": filed,
+                    "updated": (entry.findtext("a:updated", default="", namespaces=ns) or "").strip(),
                     "summary": (entry.findtext("a:summary", default="", namespaces=ns) or "").strip()[:300],
                 }
             )
         out: dict[str, object] = {"sym": ticker, "cik": cik, "items": items}
         cache.set(key, out)
-        return out
+        return dict(out, items=items[:limit])
     except Exception as e:  # noqa: BLE001 - best-effort boundary
         logger.warning("filings failed for %s: %s", ticker, e)
         return {"sym": ticker, "cik": cik, "items": [], "error": f"filings unavailable: {e}"}

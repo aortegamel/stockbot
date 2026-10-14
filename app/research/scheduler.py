@@ -391,7 +391,15 @@ def _persisted_shapes(result: object) -> Mapping[str, object]:
 
 
 def _finra_locator(payload: Mapping[str, object]) -> str | None:
-    """First citable FINRA text: canonical row JSON (matches replay), else briefing/metrics."""
+    """First citable FINRA text: canonical row JSON, then the envelope's own scope.
+
+    FINRA cites canonical row JSON (matches replay). The analysis envelopes of
+    ``get_short_interest``/``get_reg_sho_volume`` carry no rows, so their identity must come
+    from the envelope itself: the query JSON names the requested symbol, while metrics alone
+    can coincide between two symbols and ``briefing_source`` is one constant for all of them
+    (that constant collapsed every watchlist symbol onto one evidence row). Every tier here is
+    a text of ``service._finra_record_texts``, so replayed citations still validate.
+    """
     records = payload.get("records")
     if isinstance(records, list):
         for row in records:
@@ -399,15 +407,16 @@ def _finra_locator(payload: Mapping[str, object]) -> str | None:
                 text = " ".join(_json.dumps(row, sort_keys=True, default=str).split())
                 if text:
                     return text[:2000]
+    for key in ("query", "metrics"):
+        value = payload.get(key)
+        if isinstance(value, dict) and value:
+            text = " ".join(_json.dumps(value, sort_keys=True, default=str).split())
+            if text:
+                return text[:2000]
     for key in ("briefing", "briefing_source"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return " ".join(value.split())[:2000]
-    metrics = payload.get("metrics")
-    if isinstance(metrics, dict):
-        text = " ".join(_json.dumps(metrics, sort_keys=True, default=str).split())
-        if text:
-            return text[:2000]
     return None
 
 
@@ -1988,69 +1997,6 @@ def _repair_tool_arguments(
                 nid,
                 tool_name,
                 _seeded_sho["ticker"],
-            )
-    _fv = filled.get("forms")
-    if isinstance(_fv, (str, list)):
-        from app.tools import _RELATIVE_DATE_RE as _FORMS_REL_RE
-        from app.tools import _date_like_form as _FORMS_DATE_LIKE
-        from app.tools import _filing_forms_arg as _forms_arg
-
-        def _forms_placeholder(_v: object) -> bool:
-            if isinstance(_v, list):
-                return any(_forms_placeholder(_x) for _x in _v)
-            if not isinstance(_v, str):
-                return True
-            _t = _v.strip()
-            _coerced, _err = _forms_arg(_t, tool_name)
-            if _err is not None:
-                return True
-            if _coerced is None:
-                return True
-            _vals = [_coerced] if isinstance(_coerced, str) else list(_coerced)
-            if not _vals or not all(isinstance(_x, str) and _x.strip() for _x in _vals):
-                return True
-            if any("/" in _x.strip() and not _x.strip().upper().endswith("/A") for _x in _vals if isinstance(_x, str)):
-                return True
-            # A single form never contains whitespace: joined generations re-list.
-            if any(len(_x.strip().split()) > 1 for _x in _vals if isinstance(_x, str)):
-                return True
-            return "YYYY" in _t.upper() or _FORMS_DATE_LIKE(_t) or bool(_FORMS_REL_RE.search(_t.lower()))
-
-        _fl: list[JSONValue] = [_fv] if isinstance(_fv, str) else list(_fv)
-        if any(_forms_placeholder(_v) for _v in _fl):
-            # Latest-revenue questions re-list 10-Q/10-K after the scrub;
-            # quarterly revenue questions re-list latest 10-Q/10-K/8-K; most-recent
-            # listing questions drop the fabricated window too (the dates came
-            # from the same ungrounded generation).
-            _scrub_forms: list[JSONValue] | None = None
-            if tool_name == "list_sec_filings" and _latest_revenue_objective(objective):
-                _scrub_forms = (
-                    ["10-Q"]
-                    if _TEN_Q_RE.search(str(objective).lower()) and _revenue_quarter_objective(objective)
-                    else list(_REVENUE_FORMS)
-                )
-            elif tool_name == "list_sec_filings" and _revenue_quarter_objective(objective):
-                _scrub_forms = ["10-Q", "10-K", "8-K"]
-            elif (
-                tool_name == "list_sec_filings"
-                and isinstance(objective, str)
-                and (
-                    "recent" in objective.lower() or "latest" in objective.lower() or "most recent" in objective.lower()
-                )
-            ):
-                _scrub_forms = ["10-K", "10-Q"]
-            if _scrub_forms is not None:
-                filled["forms"] = _scrub_forms
-                filled.pop("start_date", None)
-                filled.pop("end_date", None)
-            else:
-                del filled["forms"]
-            logger.info(
-                "toolflow args_scrub sid=%s nid=%s tool=%s keys=%s",
-                sid,
-                nid,
-                tool_name,
-                "forms",
             )
     if tool_name == "get_reg_sho_volume" and isinstance(_trade := filled.get("tradeDate"), str):
         from app.tools import _RELATIVE_DATE_RE as _SCRUB_RE

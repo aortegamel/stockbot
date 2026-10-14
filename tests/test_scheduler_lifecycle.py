@@ -316,6 +316,38 @@ def test_admit_before_complete_with_finra_domain() -> None:
     assert any(str(candidate["record_identity"]) in t for t in replay)
 
 
+def test_finra_envelope_identity_is_symbol_distinct_and_replay_valid() -> None:
+    """Envelope identity comes from its own scope: replay-valid, stable across repeats, distinct per symbol."""
+    from app.research.service import _finra_record_texts
+
+    def envelope(symbol: str, metrics_sum: int) -> dict[str, JSONValue]:
+        return {
+            "dataset_id": "otcMarket/consolidatedShortInterest",
+            "briefing": None,
+            "briefing_source": "deterministic_only",
+            "query": {"ticker": symbol, "start_date": None, "end_date": None, "limit": 5, "offset": 0},
+            "metrics": {"fields": {"currentShortPositionQuantity": {"sum": metrics_sum}}, "latest_vs_prior": []},
+        }
+
+    def identity(payload: dict[str, JSONValue]) -> str:
+        persisted: dict[str, JSONValue] = {"result": payload, "tool_name": "get_short_interest"}
+        result = {**payload, "tool_result_id": "s1:tr:si"}
+        candidate = sched._evidence_candidate(
+            "get_short_interest", "FINRA", result, _outcome(), _Kernel({"s1:tr:si": persisted})
+        )
+        assert candidate is not None
+        locator = str(candidate["record_identity"])
+        assert locator
+        # A model citing this identity must still replay against the persisted result.
+        assert any(locator in text for text in _finra_record_texts(persisted))
+        return locator
+
+    first = identity(envelope("NVDA", 100))
+    assert first == identity(envelope("NVDA", 100))  # identical repeated call keeps one identity
+    # Two symbols can return identical metrics; the identity still separates them.
+    assert first != identity(envelope("QQQ", 100))
+
+
 def test_sec_candidate_needs_handle_and_text() -> None:
     """SEC boundary pins: missing handle or empty window/content stays uncitable."""
     good_handle = {"tool_result_id": "s1:tr:sec"}
@@ -1898,8 +1930,8 @@ def test_with_company_seeds_ticker_and_name(monkeypatch: pytest.MonkeyPatch) -> 
     assert sched._objective_subject_ticker("news for growth this week") is None
 
 
-def test_sec_placeholder_forms_reseed_latest() -> None:
-    """Needle forms ['YYYY-MM-DD'] on quarterly revenue re-lists latest 10-Q/10-K/8-K."""
+def test_sec_placeholder_forms_are_not_substituted() -> None:
+    """Needle forms ['YYYY-MM-DD'] stay verbatim; the tool rejects them, so no substituted listing runs."""
 
     async def fake_placeholder(**kw: object) -> dict[str, JSONValue]:
         return {
@@ -1922,7 +1954,7 @@ def test_sec_placeholder_forms_reseed_latest() -> None:
             _Kernel(),
         )
     )
-    assert args == {"identifier": "NVDA", "forms": ["10-Q", "10-K", "8-K"]}
+    assert args == {"identifier": "NVDA", "forms": ["YYYY-MM-DD"]}
 
 
 def test_sho_org_ticker_remaps_from_objective(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4930,15 +4962,18 @@ def _resolve_orcl(name: str) -> str | None:
     return {"ORCL": "ORCL", "Oracle": "ORCL", "oracle": "ORCL"}.get(name)
 
 
-def test_orcl_latest_revenue_lists_10q_10k_without_invented_dates(
+def test_orcl_latest_revenue_bypass_seeds_listing_without_needle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ORCL latest revenue (live Bullbot defect): malformed 10-Q/10-K forms and today dates repair to 10-Q/10-K."""
+    """ORCL latest revenue takes the deterministic bypass: seeded 10-Q/10-K listing, no Needle call."""
     import app.tools as _tools
 
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_orcl)
 
+    needle_calls: list[str] = []
+
     async def fake_malformed(**kw: object) -> dict[str, JSONValue]:
+        needle_calls.append(str(kw["tool"]))
         return {
             "tool": "list_sec_filings",
             "arguments": {
@@ -4965,6 +5000,7 @@ def test_orcl_latest_revenue_lists_10q_10k_without_invented_dates(
         )
     )
     assert args == {"identifier": "ORCL", "forms": ["10-Q", "10-K"]}
+    assert needle_calls == []
 
 
 def test_orcl_latest_revenue_bypass_skips_needle_and_reads_listed_filing(
@@ -5202,21 +5238,40 @@ def test_explicit_dated_latest_revenue_keeps_dates_and_uses_needle(
 
 @settings(max_examples=40, derandomize=True, deadline=None)
 @given(
-    st.sampled_from(["10-Q/10-K", "Oracle Corp", "10-Q 10-K", "2026-10-12", "YYYY-MM-DD", "10-Q/A", "10-K/A"]),
-    st.sampled_from(["list_sec_filings", "get_sec_document"]),
+    st.sampled_from(
+        ["10-Q/10-K", "Oracle Corp", "10-Q 10-K", "2026-10-12", "YYYY-MM-DD", "TSLA", "CIK", "SEC"]
+        + ["10-Q/A", "10-K/A", "SC 13D", "DEF 14A", "N-PORT", "1-A", "EFFECT"]
+    ),
 )
-def test_prop_malformed_forms_never_reach_listing_or_read(form: str, tool: str) -> None:
-    """Generated prose/date forms either repair to valid lists or drop; /A amendments survive."""
+def test_prop_generated_forms_are_never_substituted(form: str) -> None:
+    """Repair keeps generated forms verbatim; unknown forms fail before EDGAR, known forms reach it."""
+    from app import tools
+    from app.policy import Capability, RequestContext
+
     filled = sched._repair_tool_arguments(
-        tool,
-        ({"identifier": "ORCL", "forms": [form]} if tool == "list_sec_filings" else {"accession_no": "x"}),
+        "list_sec_filings",
+        {"identifier": "ORCL", "forms": [form]},
         "What is ORCL's latest revenue?",
         "s",
         "n",
     )
-    forms = filled.get("forms")
-    if tool == "list_sec_filings" and form in ("10-Q/A", "10-K/A"):
-        assert forms == [form]
-    elif tool == "list_sec_filings":
-        assert forms in (["10-Q", "10-K"], ["10-Q"], ["10-Q", "10-K", "8-K"])
-        assert filled.get("start_date") is None and filled.get("end_date") is None
+    assert filled["forms"] == [form]
+    calls: list[object] = []
+
+    def _provider(*args: object, **kwargs: object) -> list[object]:
+        calls.append(kwargs.get("forms"))
+        return []
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(tools.sec, "list_sec_filings", _provider)
+        result = tools.execute_tool(
+            "list_sec_filings",
+            dict[str, object](filled),
+            "test",
+            context=RequestContext("research", frozenset({Capability.RESEARCH})),
+        )
+    if form in ("10-Q/A", "10-K/A", "SC 13D", "DEF 14A", "N-PORT", "1-A", "EFFECT"):
+        assert "error" not in result and calls == [(form,)]
+    else:
+        assert result["error_type"] == "invalid_tool_arguments" and form in str(result["error"])
+        assert calls == []

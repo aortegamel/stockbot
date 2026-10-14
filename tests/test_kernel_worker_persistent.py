@@ -357,3 +357,52 @@ def test_route_served_while_run_in_flight(monkeypatch: pytest.MonkeyPatch) -> No
     rows = [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
     by_id = {row.get("id") for row in rows if isinstance(row, dict) and "id" in row}
     assert {"run1", "r1"} <= by_id  # ids still correlate under concurrency
+
+
+def test_watchlist_served_while_run_in_flight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A page-load watchlist op runs on its own worker: it never queues behind a blocked run."""
+    fake = _FakeJev()
+    entered = threading.Event()
+    release = threading.Event()
+    served = threading.Event()
+
+    def _blocked_run(req: object, **kwargs: object) -> dict[str, object]:
+        entered.set()
+        assert release.wait(timeout=10)
+        return _response_row("run1", "R")
+
+    def _watch(req: object) -> dict[str, object]:
+        assert isinstance(req, dict) and req.get("watchlist") == ["NVDA"]
+        served.set()
+        return {"id": "w1", "watchlist": []}
+
+    def _no_signal(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(kw, "_startup", lambda: fake)
+    monkeypatch.setattr(kw, "_run", _blocked_run)
+    monkeypatch.setattr(kw, "_watchlist", _watch)
+    monkeypatch.setattr(kw, "_shutdown", lambda: None)
+    monkeypatch.setattr("signal.signal", _no_signal)
+    body = (
+        json.dumps({"id": "run1", "op": "run", "prompt": "x"})
+        + "\n"
+        + json.dumps({"id": "w1", "op": "watchlist", "watchlist": ["NVDA"]})
+        + "\n"
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(body))
+    buf = io.StringIO()
+    real_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", buf)
+    worker = threading.Thread(target=kw.main, daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(timeout=5)
+        assert served.wait(timeout=5)  # answered while the run is still held
+        assert not release.is_set()
+    finally:
+        release.set()
+        worker.join(timeout=10)
+    monkeypatch.setattr(sys, "stdout", real_stdout)
+    rows = [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
+    assert {"run1", "w1"} <= {row.get("id") for row in rows if isinstance(row, dict)}

@@ -2,9 +2,23 @@ export type QuoteState = { price: number | null; retrieved_at?: string; error?: 
 
 export type NewsItem = { title: string; link: string; published: string; source: string };
 
-export type FilingItem = { title: string; link: string; published: string; summary: string };
+// filed: official SEC filing date (YYYY-MM-DD). updated: Atom <updated> verbatim, acceptance clock.
+export type FilingItem = { title: string; link: string; filed: string; updated: string; summary: string };
 
 export type SearchHit = { sym: string; name?: string; exchange?: string; type?: string };
+
+// One (symbol, source) outcome from the server fan-out. A failure never reads as "no records".
+export type SourceRow = {
+  symbol: string;
+  source: "sec_filings" | "finra_short_interest" | "finra_short_sale_volume" | "finra_threshold_list";
+  tool: string;
+  status: "ok" | "no_records" | "error" | "timeout";
+  as_of?: string;
+  returned_count?: number;
+  truncated?: boolean;
+  ref?: { record_id?: string; uri?: string; known_at?: string };
+  error?: string;
+};
 
 const API = "";
 
@@ -36,6 +50,15 @@ export function fetchFilings(sym: string, signal?: AbortSignal) {
 
 export function searchTickers(q: string, signal?: AbortSignal) {
   return getJSON<{ query: string; hits: SearchHit[] }>(`/api/search?q=${encodeURIComponent(q)}`, signal);
+}
+
+// Page-load fan-out for the whole watchlist: SEC filings + three FINRA datasets per symbol.
+// Same-origin Bun API (like /api/agent), never the market API base.
+export async function fetchWatchlistSources(symbols: string[], signal?: AbortSignal): Promise<SourceRow[]> {
+  const res = await fetch(`/api/watchlist?symbols=${encodeURIComponent(symbols.join(","))}`, { signal });
+  const body = (await res.json()) as { watchlist?: SourceRow[]; error?: string };
+  if (!res.ok || !Array.isArray(body.watchlist)) throw new Error(body.error ?? `request failed: ${res.status}`);
+  return body.watchlist;
 }
 
 // Read-only aggregate for the future agent loop: whatever ticker the viewer

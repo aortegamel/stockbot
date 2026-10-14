@@ -1,6 +1,9 @@
 """Kernel worker: stdin-JSONL bridge from the TS route to the Python scheduler.
 
-Request:  {"id", "op": "run", "prompt", "asOf"?, "deadlineAt"? (epoch ms), "sessionId"?, "gap"?}
+Request:  {"id", "op": "run", "prompt", "asOf"?, "deadlineAt"? (epoch ms), "sessionId"?, "gap"?,
+           "ticker"?, "watchlist"? ([tickers]: the user's watchlist request; replaces ticker scope)}
+          {"id", "op": "watchlist", "watchlist": [tickers], "deadlineAt"?} -> {"id", "watchlist": [rows]}
+          (read-only page-load fan-out: no session, no evidence; same tool handlers and caches as intake)
 Response: {"id", "objective", "evidence": [{id, content}],
            "nodes": [{node_id, question, status, depends_on}],
            "decisions": [...persisted JEV records...], "unresolved": [node_ids],
@@ -8,7 +11,7 @@ Response: {"id", "objective", "evidence": [{id, content}],
            "toolExecutions": [...] (canonical),
            "needleDecisions": [...] (legacy alias, same items),
            "toolCalls": [...], "failures": {}, "escalations": n,
-           "escalated": bool, "error"?, "terminal"?}
+           "escalated": bool, "watchlist"? [per-(symbol, source) rows], "error"?, "terminal"?}
 Never raises out of the worker: failures report as terminal provider_error.
 
 Human Decision Authority (code, not prose): the objective is persisted verbatim
@@ -217,6 +220,149 @@ _SCHEDULER_MIN_S = 50.0
 _SETUP_S = _RUN_WALL_S - _FINALIZE_S - _SCHEDULER_MIN_S
 _SETUP_RETRY_MIN_S = 15.0
 _SETUP_ROUND2_MIN_S = 25.0
+
+# Watchlist fan-out: one fixed-argument call per (symbol, source), all through
+# the existing tool handlers so page loading and agent requests share one
+# source path and its caches. SEC listings carry no forms filter, so fund forms
+# (SPY/QQQ) stay in. Each row keeps its own symbol, status, date, provenance.
+_WATCHLIST_SOURCES: dict[str, str] = {
+    "list_sec_filings": "sec_filings",
+    "get_short_interest": "finra_short_interest",
+    "get_reg_sho_volume": "finra_short_sale_volume",
+    "get_threshold_securities": "finra_threshold_list",
+}
+_WATCHLIST_MAX = 25
+
+
+def _request_watchlist(req: Mapping[str, JSONValue], where: str = "<worker>") -> list[str] | None:
+    """Validated watchlist context beside the verbatim prompt; None when absent, ValueError when malformed."""
+    from app.research.models import validate_ticker
+
+    raw = req.get("watchlist")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw or len(raw) > _WATCHLIST_MAX:
+        raise ValueError(f"{where}: 'watchlist' must be a list of 1-{_WATCHLIST_MAX} tickers")
+    out: list[str] = []
+    for item in raw:
+        sym = validate_ticker(item, f"{where}: 'watchlist'")
+        if sym is None:
+            raise ValueError(f"{where}: 'watchlist' entries must be nonblank tickers")
+        if sym not in out:
+            out.append(sym)
+    return out
+
+
+def _watchlist_args(tool: str, symbol: str) -> dict[str, object]:
+    """Fixed arguments; FINRA date scope stays the handler's own default."""
+    if tool == "list_sec_filings":
+        return {"identifier": symbol, "limit": _INTAKE_SEC_LIMIT}
+    return {"ticker": symbol}
+
+
+def _source_error_text(text: str) -> str:
+    """The failing source's own lines, without the shared unavailable-data frame."""
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.startswith(("The requested data is unavailable", "Next step:", "Tool: "))
+    ]
+    return " ".join(lines)[:300]
+
+
+def _source_outcome(symbol: str, tool: str, record: Mapping[str, object]) -> dict[str, JSONValue]:
+    """One (symbol, source) outcome: ok, no_records, error, or timeout. A failure never reads as no records."""
+    row: dict[str, JSONValue] = {"symbol": symbol, "source": _WATCHLIST_SOURCES[tool], "tool": tool}
+    result = record.get("result")
+    error = result.get("error") if isinstance(result, Mapping) and result.get("error") else record.get("error")
+    if error or not isinstance(result, Mapping):
+        text = str(error or "no result")
+        if record.get("error_type") == "timeout":
+            row["status"] = "timeout"
+        elif "No data found for " in text:
+            row["status"] = "no_records"
+        else:
+            row["status"] = "error"
+        row["error"] = _source_error_text(text) or text[:300]
+        return row
+    raw_meta = result.get("meta")
+    meta: Mapping[str, object] = raw_meta if isinstance(raw_meta, Mapping) else {}
+    row["status"] = "no_records" if meta.get("returned_count") == 0 else "ok"
+    for key in ("as_of", "returned_count", "truncated", "total"):
+        val = meta.get(key)
+        if isinstance(val, (str, int, float, bool)):
+            row[key] = val
+    refs = meta.get("source_refs")
+    if isinstance(refs, Mapping):
+        ref: dict[str, JSONValue] = {
+            k: v for k in ("record_id", "uri", "known_at") if isinstance(v := refs.get(k), str)
+        }
+        if ref:
+            row["ref"] = ref
+    eid = record.get("evidence_id")
+    if isinstance(eid, str) and eid:
+        row["evidence_id"] = eid
+    return row
+
+
+async def _watchlist_fetch(symbols: list[str], budget_s: float) -> list[dict[str, JSONValue]]:
+    """Read-only page-load fan-out: no session, no evidence, every call overlaps on the existing pools.
+
+    Calls past the budget are cancelled and reported as timeout rows, never dropped.
+    """
+    from app.research import scheduler
+    from app.tool_runtime import RuntimeToolSession, execute_agent_tool, outcome_from_result
+
+    session = RuntimeToolSession(session_id="watchlist")
+
+    async def _one(symbol: str, tool: str) -> dict[str, object]:
+        # Empty session/job ids keep the gateway unstaged: nothing persists.
+        result, _outcome = await scheduler._invoke_attempt_tool(
+            execute_agent_tool,
+            outcome_from_result,
+            tool,
+            _watchlist_args(tool, symbol),
+            session,
+            "watchlist",
+            "",
+            None,
+            "",
+        )
+        return {"result": result}
+
+    keys = [(symbol, tool) for symbol in symbols for tool in _WATCHLIST_SOURCES]
+    tasks = [asyncio.ensure_future(_one(symbol, tool)) for symbol, tool in keys]
+    done, _pending = await asyncio.wait(tasks, timeout=max(budget_s, 0.0))
+    rows: list[dict[str, JSONValue]] = []
+    for (symbol, tool), task in zip(keys, tasks):
+        record: Mapping[str, object]
+        if task not in done:
+            task.cancel()
+            record = {"error": f"no result within {budget_s:g}s", "error_type": "timeout"}
+        elif task.exception() is not None:
+            record = {"error": f"{type(task.exception()).__name__}: {task.exception()}"}
+        else:
+            record = task.result()
+        rows.append(_source_outcome(symbol, tool, record))
+    return rows
+
+
+def _watchlist(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+    """op:watchlist — page-load fan-out under the intake budget and the request deadline."""
+    raw_id = req.get("id")
+    rid = raw_id if isinstance(raw_id, str) else "?"
+    try:
+        symbols = _request_watchlist(req)
+    except ValueError as exc:
+        return {"id": rid, "error": str(exc)[:500]}
+    if symbols is None:
+        return {"id": rid, "error": "<worker>: 'watchlist' required"}
+    budget = _INTAKE_BUDGET_S
+    raw_deadline = req.get("deadlineAt")
+    if isinstance(raw_deadline, (int, float)) and not isinstance(raw_deadline, bool) and raw_deadline > 0:
+        budget = max(min(budget, raw_deadline / 1000.0 - time.time()), 0.0)
+    rows: list[JSONValue] = [*asyncio.run(_watchlist_fetch(symbols, budget))]
+    return {"id": rid, "watchlist": rows}
 
 
 def _intake_cik(ticker: str) -> str:
@@ -723,13 +869,14 @@ async def _intake_round(
     kernel: _Kernel,
     as_of: str | None,
     progress: ProgressFn | None = None,
+    watchlist: list[str] | None = None,
 ) -> tuple[list[dict[str, JSONValue]], list[dict[str, object]], dict[str, object]]:
-    """Fetch SEC + Exa in parallel; settle each with continuation=False. Returns (admitted, raw, stats)."""
+    """Fetch SEC + Exa (+ watchlist SEC/FINRA) in parallel; settle each with continuation=False. Returns (admitted, raw, stats)."""
     import time as _time
 
     from app.research import scheduler
 
-    async def _timed(tool: str, args: dict[str, object]) -> tuple[dict[str, object], float]:
+    async def _timed(tool: str, args: dict[str, object]) -> tuple[str, dict[str, object], dict[str, object], float]:
         start = _time.perf_counter()
         record: dict[str, object]
         try:
@@ -743,7 +890,7 @@ async def _intake_round(
             record = {"tool": tool, "arguments": dict(args), "error": "intake_timeout", "error_type": "timeout"}
         finally:
             taken = (_time.perf_counter() - start) * 1000.0
-        return record, taken
+        return tool, args, record, taken
 
     chains: list[asyncio.Task[object]] = []
     for ticker in tickers:
@@ -755,17 +902,23 @@ async def _intake_round(
                 )
             )
         )
-    web: list[asyncio.Task[tuple[dict[str, object], float]]] = []
+    web: list[asyncio.Task[tuple[str, dict[str, object], dict[str, object], float]]] = []
     if query_text is not None:
         web.append(asyncio.ensure_future(_timed("search_web", {"query": query_text})))
-    _notify(progress, "intake_start", {"calls": len(chains) + len(web)})
+    # One independent task per (symbol, source): a slow issuer or FINRA failure holds no sibling.
+    watch_keys = [(symbol, tool) for symbol in watchlist or [] for tool in _WATCHLIST_SOURCES]
+    watch = [asyncio.ensure_future(_timed(tool, _watchlist_args(tool, symbol))) for symbol, tool in watch_keys]
+    _notify(progress, "intake_start", {"calls": len(chains) + len(web) + len(watch)})
     # ponytail: overall budget keeps whatever finished; stragglers log as timeout.
-    all_tasks = [*chains, *web]
+    all_tasks = [*chains, *web, *watch]
     task_meta: dict[int, tuple[str, dict[str, object]]] = {}
     for task, ticker in zip(chains, tickers):
         task_meta[id(task)] = ("list_sec_filings", {"ticker": ticker})
     for task in web:
         task_meta[id(task)] = ("search_web", {"query": query_text or ""})
+    watch_records: dict[int, dict[str, object]] = {}
+    for task, (symbol, tool) in zip(watch, watch_keys):
+        task_meta[id(task)] = (tool, _watchlist_args(tool, symbol))
     wall_start = _time.perf_counter()
     done, _pending = await asyncio.wait(set(all_tasks), timeout=_INTAKE_BUDGET_S if all_tasks else 0.0)
     wall_ms = (_time.perf_counter() - wall_start) * 1000.0
@@ -789,15 +942,20 @@ async def _intake_round(
             if isinstance(res, list):
                 flat.extend(res)
             elif isinstance(res, tuple):
-                record, taken = res
-                flat.append(("search_web", {"query": query_text or ""}, record, taken))
+                flat.append(res)
+                watch_records[id(task)] = res[2]
         else:
             task.cancel()
             tool, args = task_meta.get(id(task), ("list_sec_filings", {}))
             logger.warning("intake budget timeout tool=%s budget_s=%s", tool, _INTAKE_BUDGET_S)
-            flat.append(
-                (tool, args, {"tool": tool, "arguments": args, "error": "intake_timeout", "error_type": "timeout"}, 0.0)
-            )
+            late: dict[str, object] = {
+                "tool": tool,
+                "arguments": args,
+                "error": "intake_timeout",
+                "error_type": "timeout",
+            }
+            flat.append((tool, args, late, 0.0))
+            watch_records[id(task)] = late
     calls = [(tool, args) for tool, args, _, _ in flat]
     timed = [(record, taken) for _, _, record, taken in flat]
     ms_total = sum(taken for _, _, _, taken in flat)
@@ -879,6 +1037,11 @@ async def _intake_round(
         "sec_ms": sec_ms,
         "web_ms": web_ms,
     }
+    if watch:
+        # Admitted rows carry their evidence_id; failures, no-record answers and timeouts stay explicit.
+        stats["watchlist"] = [
+            _source_outcome(symbol, tool, watch_records[id(task)]) for task, (symbol, tool) in zip(watch, watch_keys)
+        ]
     return admitted, raw, stats
 
 
@@ -892,8 +1055,12 @@ async def _graph_intake(
     kernel: _Kernel,
     progress: ProgressFn | None = None,
     setup_deadline: float | None = None,
+    watchlist: list[str] | None = None,
 ) -> list[dict[str, object]]:
-    """Intake rounds + Reasoner + escape hatch; logs each round as intake_digest. Returns proposals."""
+    """Intake rounds + Reasoner + escape hatch; logs each round as intake_digest. Returns proposals.
+
+    A watchlist fans out once, in round 1; its per-source rows persist in that round's intake_digest.
+    """
     import time as _time
 
     from app.research import scheduler
@@ -927,6 +1094,7 @@ async def _graph_intake(
             kernel,
             as_of,
             progress,
+            watchlist if rounds == 0 else None,
         )
         fetched_tickers.extend(t for t in tickers if t not in fetched_tickers)
         if query_text is not None and query_text not in fetched_queries:
@@ -1153,6 +1321,7 @@ def run_graph_prompt(
     progress: ProgressFn | None = None,
     setup_deadline: float | None = None,
     ticker: str | None = None,
+    watchlist: list[str] | None = None,
 ) -> str:
     """Shared graph entry: session + intake evidence + Reasoner proposals. Returns sid.
 
@@ -1188,7 +1357,7 @@ def run_graph_prompt(
         session = scheduler._load_session(sid, kernel)
         session.setdefault("session_id", sid)
         proposals: list[dict[str, object]] = asyncio.run(
-            _graph_intake(objective, as_of, sid, session, registry, client, kernel, progress, setup_deadline)
+            _graph_intake(objective, as_of, sid, session, registry, client, kernel, progress, setup_deadline, watchlist)
         )
         # ponytail: 4 concrete questions max; cap BEFORE JEV so disposition never judges
         # proposals that can't become nodes, and dropped deps never silently vanish.
@@ -1303,8 +1472,10 @@ def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[s
         return {"id": rid, "route": "research_required", "personas": None}
     try:
         ticker = _request_ticker(req)
+        # Watchlist scope rides as context: JEV decides the route with it, never a code override.
+        watchlist = _request_watchlist(req)
     except ValueError as exc:
-        logger.warning("toolflow route_deny rid=%s reason=bad-ticker", rid)
+        logger.warning("toolflow route_deny rid=%s reason=bad-scope", rid)
         return {"id": rid, "error": str(exc)[:500] or "bad ticker"}
     hint: str | None = None
     if _toolflow() not in ("catalog", "full", "whole", "direct"):
@@ -1313,15 +1484,18 @@ def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[s
         hint = programmatic_route(prompt.strip(), ticker=ticker)
     try:
         client = jev if jev is not None else _shared_jev()
-        routed = asyncio.run(client.route_entry(query_with_today_utc(prompt.strip()), route_hint=hint))
+        routed = asyncio.run(
+            client.route_entry(query_with_today_utc(prompt.strip()), route_hint=hint, watchlist=watchlist)
+        )
     except Exception as exc:
         logger.warning("toolflow route_fail rid=%s err_type=%s", rid, type(exc).__name__)
         return {"id": rid, "error": str(exc)[:500] or "route selection failed"}
     logger.info(
-        "toolflow route rid=%s route=%s personas=%s via=%s",
+        "toolflow route rid=%s route=%s personas=%s watchlist=%s via=%s",
         rid,
         routed.get("route"),
         routed.get("personas"),
+        len(watchlist) if watchlist else 0,
         "programmatic" if hint is not None else "jev",
     )
     return {"id": rid, "route": routed.get("route"), "personas": routed.get("personas")}
@@ -1678,6 +1852,7 @@ def _run(
         return _terminal(rid, "invalid_params", "prompt required")
     try:
         run_ticker = _request_ticker(req)
+        watchlist = _request_watchlist(req)
     except ValueError as exc:
         return _terminal(rid, "invalid_params", str(exc)[:500] or "bad ticker")
     raw_as_of = req.get("asOf")
@@ -1708,8 +1883,15 @@ def _run(
             return _terminal(rid, "provider_error", f"session setup failed: {exc}")
     else:
         try:
+            # A watchlist request never scopes its session to the selected ticker.
             sid = run_graph_prompt(
-                objective, as_of, jev=client, progress=progress, setup_deadline=setup_deadline, ticker=run_ticker
+                objective,
+                as_of,
+                jev=client,
+                progress=progress,
+                setup_deadline=setup_deadline,
+                ticker=None if watchlist else run_ticker,
+                watchlist=watchlist,
             )
         except RuntimeError as exc:
             logger.exception("kernel session setup failed rid=%s", rid)
@@ -1829,9 +2011,16 @@ def _run(
             }
         )
     decisions_payload: list[JSONValue] = []
+    watchlist_rows: list[JSONValue] = []
     for dec in decision_rows:
         dd = dec.to_dict()
         decisions_payload.append(dd)
+        # Per-source watchlist coverage comes from the persisted intake_digest, never from the client.
+        sel = dd.get("selected")
+        stats = sel.get("stats") if dd.get("decision_type") == "intake_digest" and isinstance(sel, dict) else None
+        rows = stats.get("watchlist") if isinstance(stats, dict) else None
+        if isinstance(rows, list):
+            watchlist_rows.extend(rows)
     unresolved: list[JSONValue] = [
         str(n["node_id"]) for n in nodes_payload if isinstance(n, dict) and n.get("status") != "resolved"
     ]
@@ -1861,6 +2050,8 @@ def _run(
         "escalated": escalated,
         "stalled": stalled,
     }
+    if watchlist_rows:
+        out["watchlist"] = watchlist_rows
     if stalled and stalled_reason is not None:
         out["stalled_reason"] = stalled_reason
     return out
@@ -1913,10 +2104,24 @@ def main() -> None:
             resp = _terminal(rid, "provider_error", f"worker failed: {exc}")
         _emit(resp)
 
+    def _do_watchlist(req: Mapping[str, JSONValue]) -> None:
+        raw_rid = req.get("id")
+        rid = raw_rid if isinstance(raw_rid, str) else "?"
+        try:
+            resp = _watchlist(req)
+        except Exception as exc:  # never raise out of the worker
+            logger.exception("kernel worker watchlist failed rid=%s", rid)
+            resp = {"id": rid, "error": f"worker failed: {exc}"[:500]}
+        _emit(resp)
+
     try:
         # Single run worker: a second op:run queues behind the in-flight one
         # while the main thread keeps reading stdin so op:route never waits.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="kernel-run") as pool:
+        # Page-load watchlist reads get their own worker, so they never queue behind a run.
+        with (
+            concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="kernel-run") as pool,
+            concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="kernel-watchlist") as watch_pool,
+        ):
             for line in sys.stdin:
                 line = line.strip()
                 if not line:
@@ -1926,22 +2131,18 @@ def main() -> None:
                 except ValueError:
                     _emit(_terminal("?", "invalid_params", "invalid JSON"))
                     continue
-                if not isinstance(parsed, dict) or parsed.get("op") not in (
+                ops = (
                     "run",
+                    "watchlist",
                     "route",
                     "arguments",
                     "assess_entry",
                     "assess_final_response",
                     "assess_final_claim",
-                ):
+                )
+                if not isinstance(parsed, dict) or parsed.get("op") not in ops:
                     rid = parsed.get("id") if isinstance(parsed, dict) and isinstance(parsed.get("id"), str) else "?"
-                    _emit(
-                        _terminal(
-                            rid,
-                            "invalid_params",
-                            "op must be 'run', 'route', 'arguments', 'assess_entry', 'assess_final_response', or 'assess_final_claim'",
-                        )
-                    )
+                    _emit(_terminal(rid, "invalid_params", f"op must be one of {', '.join(ops)}"))
                     continue
                 req: Mapping[str, JSONValue] = parsed
                 if req.get("op") in (
@@ -1968,6 +2169,8 @@ def main() -> None:
                         rid = raw_rid if isinstance(raw_rid, str) else "?"
                         logger.exception("kernel worker direct op failed rid=%s op=%s", rid, req.get("op"))
                         _emit(_terminal(rid, "provider_error", f"worker failed: {exc}"))
+                elif req.get("op") == "watchlist":
+                    watch_pool.submit(_do_watchlist, req)
                 else:
                     pool.submit(_do_run, req, jev)
     finally:

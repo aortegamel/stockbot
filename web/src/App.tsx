@@ -3,6 +3,7 @@ import { HarnessSessionViewer } from "./components/harness-viewer";
 import TradingChart from "./components/trading-chart";
 import {
   WatchlistPanel,
+  watchlistFor,
   FinancialsPanel,
   NewsPanel,
   AIPanel,
@@ -244,7 +245,8 @@ export default function App() {
       const response = await fetch("/api/agent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, ticker: selected }),
+        // Watchlist rides as separate context; the prompt stays verbatim and the server decides scope.
+        body: JSON.stringify({ prompt, ticker: selected, watchlist: watchlistFor(selected) }),
         signal: ctrl.signal,
       });
       if (!response.ok || !response.body) {

@@ -2,7 +2,7 @@ import { describe, expect, setSystemTime, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import fc from "fast-check";
-import { applyFinalGates, inventoryDefect, KernelRouter, parseTicker, REQUEST_WALL_MS, runKernelAgent, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
+import { applyFinalGates, asksWatchlist, inventoryDefect, KernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
 import { FINAL_PERSONAS, type AgentEvent, type Evidence, type FinalClaim, type Metrics, type Persona } from "./types";
 
 class FakeChild implements KernelChild {
@@ -101,6 +101,26 @@ describe("parseTicker", () => {
       "ABCDEFGHIJK", "1AB", "AB CD", "A-B-C-D-E-F-G-H-I-J-K", "NVDA!", ".AB", "-AB", "AB/C",
     ];
     for (const v of invalid) expect(parseTicker(v)).toBeUndefined();
+  });
+});
+
+describe("parseWatchlist / asksWatchlist", () => {
+  test("valid lists normalize and deduplicate in order; absent stays undefined", () => {
+    expect(parseWatchlist([" nvda", "QQQ", "nvda", "brk.b"])).toEqual(["NVDA", "QQQ", "BRK.B"]);
+    expect(parseWatchlist(undefined)).toBeUndefined();
+    expect(parseWatchlist(null)).toBeUndefined();
+  });
+
+  test("malformed lists reject whole, never shrink", () => {
+    for (const bad of ["NVDA", [], [7], ["NVDA", "SEC"], ["NVDA", ""], { 0: "NVDA" }, Array.from({ length: 26 }, (_, i) => `T${i}`)]) {
+      expect(parseWatchlist(bad)).toBeNull();
+    }
+    expect(parseWatchlist(Array.from({ length: 25 }, (_, i) => `T${i}`))?.length).toBe(25);
+  });
+
+  test("only prompts that name the watchlist take watchlist scope", () => {
+    for (const p of ["latest filings for my watchlist", "Watch list short interest?", "watch-lists summary", "WATCHLIST"]) expect(asksWatchlist(p)).toBe(true);
+    for (const p of ["NVDA risk factors?", "what should I watch?", "watchlistsX", "list watches"]) expect(asksWatchlist(p)).toBe(false);
   });
 });
 
@@ -259,6 +279,9 @@ describe("KernelRouter", () => {
 describe("runKernelAgent final personas", () => {
   const graphReply = (id: string): string =>
     `${JSON.stringify({ id, objective: "q", evidence: [{ id: "ev:1", content: "fact" }], nodes: [{ node_id: "n1", question: "q", status: "blocked", depends_on: [] }], decisions: [], unresolved: ["n1"], incomplete_guard: true, toolExecutions: [], toolCalls: [], failures: {}, escalations: 1, escalated: true })}\n`;
+  // Same shape with the session id a current worker reports: the gates need it.
+  const sessionGraphReply = (id: string): string =>
+    `${JSON.stringify({ id, objective: "q", sessionId: "rs:live", evidence: [{ id: "ev:1", content: "fact" }], nodes: [], decisions: [], unresolved: [], incomplete_guard: false, toolExecutions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false })}\n`;
   test("seed and follow-up evidence retain captures before the gated answer without changing model content", async () => {
     process.env.OPENCODE_MODEL = "test-model";
     const events: AgentEvent[] = [];
@@ -397,6 +420,7 @@ describe("runKernelAgent final personas", () => {
     deadlineAt?: number;
     signal?: AbortSignal;
     ticker?: string;
+    watchlist?: readonly string[];
     // Injects only spawnFn+reason so the router falls back to its default python/worker path.
     spawnOnly?: boolean;
   }): Promise<{ events: AgentEvent[]; calls: Call[]; bodies: Record<string, unknown>[]; gates: Record<string, unknown>[]; maxInFlight: number; runTimeouts: (number | undefined)[]; spawns: { cmd: string; args: string[] }[] }> {
@@ -453,6 +477,7 @@ describe("runKernelAgent final personas", () => {
           ...(opts.personas ? { personas: opts.personas } : {}),
           ...(opts.signal ? { signal: opts.signal } : {}),
           ...(opts.ticker !== undefined ? { ticker: opts.ticker } : {}),
+          ...(opts.watchlist !== undefined ? { watchlist: opts.watchlist } : {}),
           deps: {
             ...(opts.spawnOnly ? {} : { python: "py", workerPath: "w" }),
             spawnFn: spawn,
@@ -966,6 +991,49 @@ describe("runKernelAgent final personas", () => {
     expect(answers(events)).toEqual([trioAnswer(1)]);
   });
 
+  test("gate bodies carry the run session id on both ops", async () => {
+    const claim = "bearbot p1";
+    const { gates } = await runFinal({
+      personas: ["bearbot"],
+      reply: (_p, id) => sessionGraphReply(id),
+      decide: () => ({ text: `keep ${claim}`, claims: [{ text: claim, claimType: "inference", evidenceIds: ["ev:1"] }] }),
+      gate: (body) => (body.op === "assess_final_response" ? { support_answer: "no" } : { support_answer: "yes" }),
+    });
+    expect(gates.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_claim"]);
+    // The worker keys gates by sessionId; without it, every gate fails closed on the numeric request id.
+    for (const g of gates) expect(g.sessionId).toBe("rs:live");
+  });
+
+  test("a gate error rejects a claim instead of keeping its ungraded text", async () => {
+    const claim = "bearbot claim here";
+    const { events, gates } = await runFinal({
+      personas: ["bearbot"],
+      reply: (_p, id) => sessionGraphReply(id),
+      decide: () => ({ text: `preamble ${claim} tail`, claims: [{ text: claim, claimType: "inference", evidenceIds: ["ev:1"] }] }),
+      gate: () => ({ error: "unknown session_id: '39'" }),
+    });
+    expect(gates.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_claim"]);
+    const out = answers(events);
+    expect(out.length).toBe(1);
+    expect(out[0]).toContain("preamble");
+    expect(out[0]).not.toContain(claim);
+    expect(events.some((e) => e.type === "failed")).toBe(false);
+  });
+
+  test("a gate error that leaves no prose fails closed as provider_error", async () => {
+    const { events } = await runFinal({
+      personas: ["bearbot"],
+      reply: (_p, id) => sessionGraphReply(id),
+      decide: () => ({
+        text: "bearbot claim here",
+        claims: [{ text: "bearbot claim here", claimType: "inference", evidenceIds: ["ev:1"] }],
+      }),
+      gate: () => ({ error: "unknown session_id: '39'" }),
+    });
+    expect(answers(events)).toEqual([]);
+    expect(failedCategory(events)).toBe("provider_error");
+  });
+
   test("whole-response reject runs per-claim gates and deletes only rejected substrings", async () => {
     const kept = "bearbot keeps this";
     const cut = "bearbot loses this";
@@ -1223,6 +1291,42 @@ describe("runKernelAgent final personas", () => {
     expect(runs[1]?.prompt).toBe("q\nStill missing: need doc X");
     expect(typeof runs[1]?.deadlineAt).toBe("number");
     for (const run of runs) expect(run.ticker).toBe("BRK.B");
+  });
+
+  test("watchlist rides every run body and replaces the selected ticker", async () => {
+    const { bodies } = await runFinal({
+      ticker: "nvda",
+      watchlist: ["NVDA", "QQQ"],
+      decide: (p, pass) => (pass === 1 && p === "bullbot" ? { missingEvidence: "need doc X" } : {}),
+    });
+    const runs = runBodies(bodies);
+    expect(runs.length).toBe(2);
+    for (const run of runs) {
+      expect(run.watchlist).toEqual(["NVDA", "QQQ"]);
+      expect("ticker" in run).toBe(false);
+      expect(run.prompt === "q" || run.prompt === "q\nStill missing: need doc X").toBe(true);
+    }
+  });
+
+  test("watchlist coverage reaches every persona prompt, failures disclosed, and an all-failed list never answers direct", async () => {
+    const rows = [
+      { symbol: "NVDA", source: "sec_filings", tool: "list_sec_filings", status: "ok", as_of: "2026-10-08", evidence_id: "ev:nvda" },
+      { symbol: "QQQ", source: "finra_threshold_list", tool: "get_threshold_securities", status: "no_records", error: "No data found for QQQ: thresholdList" },
+      { symbol: "AAPL", source: "finra_short_sale_volume", tool: "get_reg_sho_volume", status: "timeout", error: "intake_timeout" },
+      { symbol: 7, source: "junk", status: "ok" },
+    ];
+    const { calls } = await runFinal({
+      watchlist: ["NVDA", "QQQ", "AAPL"],
+      personas: ["stockbot"],
+      reply: (_p, id) => `${JSON.stringify({ id, evidence: [], nodes: [], unresolved: [], toolCalls: [], needleDecisions: [], watchlist: rows })}\n`,
+    });
+    const prompt = calls[0]?.input.prompt ?? "";
+    expect(calls[0]?.input.direct).toBe(false);
+    expect(prompt).toContain("WATCHLIST COVERAGE");
+    expect(prompt).toContain("NVDA sec_filings ok as_of=2026-10-08 evidence=ev:nvda");
+    expect(prompt).toContain('QQQ finra_threshold_list no_records error="No data found for QQQ: thresholdList"');
+    expect(prompt).toContain('AAPL finra_short_sale_volume timeout error="intake_timeout"');
+    expect(prompt).not.toContain("junk");
   });
 
   test("default deadline sits one research wall in the future", async () => {

@@ -839,7 +839,11 @@ def _normalize_record_text(value: object) -> str:
 
 
 def _finra_record_texts(result: Mapping[str, object]) -> list[str]:
-    """Citable texts of one persisted FINRA result: raw rows + briefing + metrics JSON."""
+    """Citable texts of one persisted FINRA result: raw rows, query, briefing, metrics JSON.
+
+    The query JSON is citable because the kernel's envelope identity for the analysis tools
+    (no rows) is built from it; a model citing that identity must still replay.
+    """
     texts: list[str] = []
     payload = result.get("result")
     payload = payload if isinstance(payload, Mapping) else result
@@ -848,6 +852,9 @@ def _finra_record_texts(result: Mapping[str, object]) -> list[str]:
         for row in records:
             if isinstance(row, Mapping):
                 texts.append(_normalize_record_text(json.dumps(row, sort_keys=True, default=str)))
+    query = payload.get("query")
+    if isinstance(query, Mapping):
+        texts.append(_normalize_record_text(json.dumps(query, sort_keys=True, default=str)))
     for key in ("briefing", "briefing_source"):
         texts.append(_normalize_record_text(payload.get(key)))
     metrics = payload.get("metrics")

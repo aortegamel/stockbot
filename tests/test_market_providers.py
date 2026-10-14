@@ -7,6 +7,7 @@ the network or cache.db.
 import json
 import sys
 import types
+from collections.abc import Iterator
 from typing import Self
 
 import pytest
@@ -68,12 +69,34 @@ def _rss(items: list[tuple[str, str, str]]) -> bytes:
     return f"<rss><channel>{rows}</channel></rss>".encode()
 
 
-def _atom(entries: list[tuple[str, str, str, str]]) -> bytes:
+def _atom(entries: list[tuple[str, str, str, str, str]]) -> bytes:
+    """EDGAR getcompany Atom: (title, href, updated, summary, filing-date) per entry."""
     rows = "".join(
-        f'<entry><title>{t}</title><link href="{h}"/><updated>{u}</updated><summary>{s}</summary></entry>'
-        for t, h, u, s in entries
+        f'<entry><content type="text/xml"><filing-date>{f}</filing-date></content>'
+        f'<title>{t}</title><link href="{h}"/><updated>{u}</updated><summary>{s}</summary></entry>'
+        for t, h, u, s, f in entries
     )
     return f'<feed xmlns="http://www.w3.org/2005/Atom">{rows}</feed>'.encode()
+
+
+@pytest.fixture
+def fund_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[list[object]]]:
+    """Stub SEC company_tickers_mf.json rows behind edgartools' real fund lookup."""
+    import edgar.reference.tickers as edgar_tickers
+
+    rows: list[list[object]] = []
+
+    def fake_download_json(url: str) -> dict[str, object]:
+        assert url.endswith("company_tickers_mf.json"), url
+        return {"fields": ["cik", "seriesId", "classId", "symbol"], "data": rows}
+
+    monkeypatch.setattr(edgar_tickers, "download_json", fake_download_json)
+    monkeypatch.setattr("app.sec.client.ensure_identity", lambda: None)
+    edgar_tickers.get_mutual_fund_tickers.cache_clear()
+    edgar_tickers.get_mutual_fund_lookup.cache_clear()
+    yield rows
+    edgar_tickers.get_mutual_fund_tickers.cache_clear()
+    edgar_tickers.get_mutual_fund_lookup.cache_clear()
 
 
 def test_parse_candles_normal_fills_gaps() -> None:
@@ -333,8 +356,16 @@ def test_news_cold_limit_stays_cached_for_larger_request(
         assert json.dumps(cold) == before
 
 
-def test_filings_atom_parses_entries(fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch) -> None:
-    universe = {"0": {"ticker": "NVDA", "cik_str": "1341439", "title": "NVIDIA Corp"}}
+def _universe_bytes(*rows: tuple[str, int, str]) -> bytes:
+    """Stub SEC company_tickers.json body."""
+    return json.dumps(
+        {str(i): {"ticker": t, "cik_str": str(c), "title": n} for i, (t, c, n) in enumerate(rows)}
+    ).encode()
+
+
+def test_filings_atom_parses_entries(
+    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch, fund_registry: list[list[object]]
+) -> None:
     atom = _atom(
         [
             (
@@ -342,19 +373,23 @@ def test_filings_atom_parses_entries(fake_cache: FakeCache, monkeypatch: pytest.
                 "https://sec.gov/a",
                 "2026-10-01T00:00:00Z",
                 "Quarterly report",
+                "2026-10-01",
             ),
             (
                 "NVIDIA files 8-K",
                 "https://sec.gov/b",
                 "2026-09-01T00:00:00Z",
                 "x" * 500,
+                "2026-09-01",
             ),
         ]
     )
+    urls: list[str] = []
 
     def fake_http(url: str, **kwargs: object) -> bytes:
+        urls.append(url)
         if "company_tickers.json" in url:
-            return json.dumps(universe).encode()
+            return _universe_bytes(("NVDA", 1341439, "NVIDIA Corp"))
         if "browse-edgar" in url:
             return atom
         raise AssertionError(url)
@@ -368,20 +403,88 @@ def test_filings_atom_parses_entries(fake_cache: FakeCache, monkeypatch: pytest.
     first, second = items
     assert isinstance(first, dict) and first["title"] == "NVIDIA files 10-Q"
     assert isinstance(first, dict) and first["link"] == "https://sec.gov/a"
+    assert isinstance(first, dict) and first["filed"] == "2026-10-01"
+    assert isinstance(first, dict) and first["updated"] == "2026-10-01T00:00:00Z"
+    assert isinstance(first, dict) and "published" not in first
     assert isinstance(second, dict) and len(str(second["summary"])) == 300
     assert "market_universe" in fake_cache.store
-    assert "filings:1341439" in fake_cache.store
+    assert "filings:v2:1341439" in fake_cache.store
+    atom_url = urls[-1]
+    assert "CIK=0001341439" in atom_url and "type=&" in atom_url
+    assert "owner=include" in atom_url and "count=40" in atom_url
+
+
+@pytest.mark.parametrize(
+    ("sym", "cik", "name", "filed", "updated"),
+    [
+        ("TSLA", 1318605, "Tesla, Inc.", "2026-07-23", "2026-07-22T18:05:11-04:00"),
+        ("SPY", 884394, "SPDR S&P 500 ETF TRUST", "2026-03-13", "2026-03-12T17:20:00-04:00"),
+    ],
+)
+def test_filings_filed_is_official_date_not_atom_updated(
+    fake_cache: FakeCache,
+    monkeypatch: pytest.MonkeyPatch,
+    fund_registry: list[list[object]],
+    sym: str,
+    cik: int,
+    name: str,
+    filed: str,
+    updated: str,
+) -> None:
+    atom = _atom([("10-Q  - Quarterly report", "https://sec.gov/a", updated, "report", filed)])
+
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        if "company_tickers.json" in url:
+            return _universe_bytes((sym, cik, name))
+        assert f"CIK={cik:010d}" in url
+        return atom
+
+    monkeypatch.setattr(mp, "_http_bytes", fake_http)
+    out = mp.get_filings(sym)
+    assert out["cik"] == cik
+    items = out["items"]
+    assert isinstance(items, list)
+    assert items[0]["filed"] == filed
+    assert items[0]["updated"] == updated
+
+
+def test_filings_fund_resolves_trust_cik_via_edgartools_registry(
+    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch, fund_registry: list[list[object]]
+) -> None:
+    fund_registry.extend(
+        [
+            [36405, "S000002277", "C000005765", "VFIAX"],
+            [1067839, "S000101292", "C000271435", "QQQ"],
+        ]
+    )
+    atom = _atom([("N-CEN  - Annual report", "https://sec.gov/q", "2026-08-12T16:02:11-04:00", "s", "2026-08-12")])
+    urls: list[str] = []
+
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        urls.append(url)
+        if "company_tickers.json" in url:
+            # Sponsor and sibling ETF present; QQQ itself absent from the company universe.
+            return _universe_bytes(("SPY", 884394, "SPDR S&P 500 ETF TRUST"), ("IVZ", 914208, "Invesco Ltd."))
+        return atom
+
+    monkeypatch.setattr(mp, "_http_bytes", fake_http)
+    out = mp.get_filings(" qqq ")
+    assert out["sym"] == "QQQ"
+    assert out["cik"] == 1067839
+    assert "CIK=0001067839" in urls[-1]
+    items = out["items"]
+    assert isinstance(items, list) and items[0]["filed"] == "2026-08-12"
 
 
 def test_filings_warm_cache_slices_and_preserves_alias(fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch) -> None:
     items = [
-        {"title": "Second filing", "published": "2026-10-02"},
-        {"title": "First filing", "published": "2026-10-01"},
-        {"title": "Fourth filing", "published": "2026-10-04"},
-        {"title": "Third filing", "published": "2026-10-03"},
+        {"title": "Second filing", "filed": "2026-10-02", "updated": "2026-10-01T18:00:00-04:00"},
+        {"title": "First filing", "filed": "2026-10-01", "updated": "2026-10-01T09:00:00-04:00"},
+        {"title": "Fourth filing", "filed": "2026-10-04", "updated": "2026-10-04T09:00:00-04:00"},
+        {"title": "Third filing", "filed": "2026-10-03", "updated": "2026-10-03T09:00:00-04:00"},
     ]
     cached = {"sym": "GOOG", "cik": 1652044, "items": items, "source": "cached filings"}
-    fake_cache.set("filings:1652044", cached)
+    fake_cache.set("filings:v2:1652044", cached)
     before = json.dumps(cached)
     calls: list[str] = []
 
@@ -399,26 +502,28 @@ def test_filings_warm_cache_slices_and_preserves_alias(fake_cache: FakeCache, mo
         out = mp.get_filings(" googl ", limit=limit)
         assert out == dict(cached, sym="GOOGL", items=items[:limit])
         assert out["items"] is not items
-        assert fake_cache.store["filings:1652044"] is cached
+        assert fake_cache.store["filings:v2:1652044"] is cached
         assert json.dumps(cached) == before
     assert calls == []
 
 
-def test_filings_cold_limit_stays_cached_for_larger_request(
+def test_filings_small_first_request_does_not_truncate_larger(
     fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    pre_v2 = {"sym": "GOOG", "cik": 1652044, "items": [{"title": "old", "published": "2026-10-04T00:00:00Z"}]}
+    fake_cache.set("filings:1652044", pre_v2)
     atom = _atom(
         [
-            ("10-Q", "https://sec.gov/a", "2026-10-04T00:00:00Z", "Quarterly report"),
-            ("8-K", "https://sec.gov/b", "2026-10-03T00:00:00Z", "Current report"),
-            ("10-K", "https://sec.gov/c", "2026-10-02T00:00:00Z", "Annual report"),
+            ("10-Q", "https://sec.gov/a", "2026-10-04T00:00:00Z", "Quarterly report", "2026-10-04"),
+            ("8-K", "https://sec.gov/b", "2026-10-03T00:00:00Z", "Current report", "2026-10-03"),
+            ("10-K", "https://sec.gov/c", "2026-10-02T00:00:00Z", "Annual report", "2026-10-02"),
         ]
     )
     calls: list[str] = []
 
     def fake_http(url: str, **kwargs: object) -> bytes:
         calls.append(url)
-        assert "browse-edgar" in url and "count=2" in url
+        assert "browse-edgar" in url and "count=40" in url
         return atom
 
     def fake_cik(ticker: str) -> int:
@@ -427,17 +532,39 @@ def test_filings_cold_limit_stays_cached_for_larger_request(
 
     monkeypatch.setattr(mp, "_http_bytes", fake_http)
     monkeypatch.setattr(mp, "cik_for_ticker", fake_cik)
-    cold = mp.get_filings("GOOG", limit=2)
-    items = cold["items"]
-    assert isinstance(items, list)
-    assert [item["title"] for item in items] == ["10-Q", "8-K"]
+    small = mp.get_filings("GOOG", limit=2)
+    small_items = small["items"]
+    assert isinstance(small_items, list)
+    assert [item["title"] for item in small_items] == ["10-Q", "8-K"]
+    cached = fake_cache.store["filings:v2:1652044"]
+    assert isinstance(cached, dict)
+    full = cached["items"]
+    assert isinstance(full, list) and [item["title"] for item in full] == ["10-Q", "8-K", "10-K"]
+    before = json.dumps(cached)
+    for limit in (1, 4, 40):
+        assert mp.get_filings("GOOGL", limit=limit) == dict(cached, sym="GOOGL", items=full[:limit])
+        assert json.dumps(cached) == before
     assert len(calls) == 1
-    before = json.dumps(cold)
-    for limit in (1, 4):
-        assert mp.get_filings("GOOGL", limit=limit) == dict(cold, sym="GOOGL", items=items[:limit])
-        assert len(calls) == 1
-        assert fake_cache.store["filings:1652044"] is cold
-        assert json.dumps(cold) == before
+    assert fake_cache.store["filings:1652044"] is pre_v2
+
+
+def test_filings_entry_without_filing_date_is_error_not_guess(
+    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    atom = _atom([("8-K", "https://sec.gov/b", "2026-10-03T18:00:00-04:00", "Current report", "")])
+
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        return atom
+
+    def fake_cik(ticker: str) -> int:
+        return 1652044
+
+    monkeypatch.setattr(mp, "_http_bytes", fake_http)
+    monkeypatch.setattr(mp, "cik_for_ticker", fake_cik)
+    out = mp.get_filings("GOOG")
+    assert out["items"] == []
+    assert "filing-date" in str(out.get("error"))
+    assert "filings:v2:1652044" not in fake_cache.store
 
 
 @pytest.mark.parametrize("payload", [{}, {"items": None}, {"items": {}}, {"items": "cached"}])
@@ -446,7 +573,7 @@ def test_warm_cache_without_list_items_preserves_payload(
 ) -> None:
     cached = dict(payload, sym="GOOG", error="cached error")
     fake_cache.set("news:GOOG", cached)
-    fake_cache.set("filings:1652044", cached)
+    fake_cache.set("filings:v2:1652044", cached)
 
     def fake_cik(ticker: str) -> int:
         assert ticker == "GOOGL"
@@ -467,18 +594,50 @@ def test_warm_cache_without_list_items_preserves_payload(
     assert calls == []
 
 
-def test_filings_no_cik_returns_error(fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch) -> None:
-    universe = {"0": {"ticker": "AAPL", "cik_str": "320193", "title": "Apple Inc"}}
+def test_filings_no_cik_returns_error(
+    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch, fund_registry: list[list[object]]
+) -> None:
+    fund_registry.append([1067839, "S000101292", "C000271435", "QQQ"])
 
     def fake_http(url: str, **kwargs: object) -> bytes:
         assert "company_tickers.json" in url
-        return json.dumps(universe).encode()
+        return _universe_bytes(("AAPL", 320193, "Apple Inc"))
 
     monkeypatch.setattr(mp, "_http_bytes", fake_http)
     out = mp.get_filings("NVDA")
     assert out["cik"] is None
     assert out["items"] == []
     assert "no SEC CIK" in str(out.get("error"))
+
+
+def test_filings_fund_registry_failure_surfaces_error(
+    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch, fund_registry: list[list[object]]
+) -> None:
+    import edgar.reference.tickers as edgar_tickers
+
+    def registry_down(url: str) -> dict[str, object]:
+        raise ConnectionError("SEC 503")
+
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        return _universe_bytes(("AAPL", 320193, "Apple Inc"))
+
+    monkeypatch.setattr(edgar_tickers, "download_json", registry_down)
+    monkeypatch.setattr(mp, "_http_bytes", fake_http)
+    out = mp.get_filings("QQQ")
+    assert out["cik"] is None and out["items"] == []
+    assert out["error"] == "filings unavailable: CIK lookup failed: SEC 503"
+
+
+def test_filings_universe_failure_surfaces_error_not_missing_cik(
+    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch, fund_registry: list[list[object]]
+) -> None:
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        raise ConnectionError("SEC 503")
+
+    monkeypatch.setattr(mp, "_http_bytes", fake_http)
+    out = mp.get_filings("TSLA")
+    assert out["cik"] is None and out["items"] == []
+    assert out["error"] == "filings unavailable: CIK lookup failed: universe unavailable: SEC 503"
 
 
 def test_newsquant_disabled_without_env(monkeypatch: pytest.MonkeyPatch) -> None:
