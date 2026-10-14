@@ -67,7 +67,7 @@ function isProb(v: unknown): v is number {
 
 export function parseNoulAnswer(name: string, id: string, ans: unknown): NoulDecision {
   if (!isObj(ans) || ans.type !== "noul" || typeof ans.noul !== "number")
-    throw new Error(`${name}: malformed_typesafe_answer for ${id}`);
+    throw new Error(`${name}: malformed_decision_answer for ${id}`);
   const probability = ans.noul;
   if (!isProb(probability)) throw new Error("invalid_probability");
   return { kind: "noul", probability };
@@ -79,7 +79,7 @@ export function parseChoiceAnswer(
   ans: unknown,
   options: Record<string, string>,
 ): ChoiceDecision {
-  const bad = (): Error => new Error(`${name}: malformed_typesafe_answer for ${id}`);
+  const bad = (): Error => new Error(`${name}: malformed_decision_answer for ${id}`);
   if (!isObj(ans) || ans.type !== "choice") throw bad();
   if (typeof ans.choice !== "string" || !Object.hasOwn(options, ans.choice)) throw bad();
   if (!isObj(ans.probabilities) || typeof ans.confidence !== "number") throw bad();
@@ -99,7 +99,7 @@ export function parseChoiceAnswer(
 }
 
 export function parseScoreAnswer(name: string, id: string, ans: unknown, maxScore?: number): ScoreDecision {
-  const bad = (): Error => new Error(`${name}: malformed_typesafe_answer for ${id}`);
+  const bad = (): Error => new Error(`${name}: malformed_decision_answer for ${id}`);
   if (!isObj(ans) || ans.type !== "score" || typeof ans.score !== "number") throw bad();
   const s = ans.score as number;
   if (!Number.isFinite(s)) throw bad();
@@ -179,7 +179,7 @@ function optionsFromQuestion(q: unknown): Record<string, string> {
   return {};
 }
 
-// Typed ask: preserves raw SDK output plus the parsed DecisionResult map, and
+// Typed ask: preserves raw decision output plus the parsed DecisionResult map, and
 // writes request/raw/policy files like the existing sequential caller. Policy
 // (the decisions map) stays separate from raw; noul yes/unsure/no is derived
 // by callers via classifyProbability, never collapsed here.
@@ -195,14 +195,15 @@ export async function askDecisions(
   try {
     raw = await systemOne(req);
   } catch (e) {
-    throw new Error(`${name}: typesafe_request_failed: ${e instanceof Error ? e.message : String(e)}`);
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`${name}: ${msg.startsWith("malformed_decision_response") ? msg : `decision_request_failed: ${msg}`}`);
   }
   await writeFile(join(dir, `raw-${name}.json`), JSON.stringify(raw, null, 2) + "\n");
   const ids = Object.keys(req.questions).sort();
-  if (!isObj(raw) || !isObj(raw.answers)) throw new Error(`${name}: malformed_typesafe_response`);
+  if (!isObj(raw) || !isObj(raw.answers)) throw new Error(`${name}: malformed_decision_response`);
   const got = Object.keys(raw.answers).sort();
   if (got.length !== ids.length || got.some((k, i) => k !== ids[i]))
-    throw new Error(`${name}: typesafe answers do not match questions`);
+    throw new Error(`${name}: decision answers do not match questions`);
   const decisions: Record<string, DecisionResult> = {};
   for (const id of ids) {
     const ans = (raw.answers as Record<string, unknown>)[id];

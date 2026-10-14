@@ -1,7 +1,7 @@
 // decision/runtime.ts — persistent JEV sidecar: JSONL stdin/stdout bridge.
 //
-// Transport only. Translates runtime-neutral decide requests into the TypeSafe
-// SDK via the existing SystemOneFn/createSystemOne, reusing the jev.ts
+// Transport only. Translates runtime-neutral decide requests into the
+// configured API format via SystemOneFn/createSystemOne, reusing the jev.ts
 // parsers + answer-shape validation. Never schedules, never knows
 // ResearchSession, never writes request-*/raw-*/policy-* files (experiment
 // path in run.ts untouched).
@@ -11,7 +11,7 @@
 //   {"id": str, "op": "decide", "state": unknown, "questions": Record<string, unknown>,
 //    "choiceOptions"?: Record<string, Record<string, string>>}
 //     -> {"id": str, "raw": unknown, "decisions": Record<string, DecisionResult>}
-//     -> {"id": str, "error": str} (malformed request, SDK failure, or
+//     -> {"id": str, "error": str} (malformed request, transport failure, or
 //        malformed answer — never crashes the loop)
 import { createInterface } from "node:readline";
 import {
@@ -20,7 +20,7 @@ import {
   parseScoreAnswer,
 } from "./jev.ts";
 import type { DecisionResult, SystemOneFn } from "./jev.ts";
-import { createSystemOne } from "./run.ts";
+import { createSystemOne } from "./client.ts";
 
 function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -68,13 +68,14 @@ export async function decideWithoutFs(
   try {
     raw = await systemOne(req);
   } catch (e) {
-    throw new Error(`${name}: typesafe_request_failed: ${e instanceof Error ? e.message : String(e)}`);
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`${name}: ${msg.startsWith("malformed_decision_response") ? msg : `decision_request_failed: ${msg}`}`);
   }
   const ids = Object.keys(req.questions).sort();
-  if (!isObj(raw) || !isObj(raw.answers)) throw new Error(`${name}: malformed_typesafe_response`);
+  if (!isObj(raw) || !isObj(raw.answers)) throw new Error(`${name}: malformed_decision_response`);
   const got = Object.keys(raw.answers).sort();
   if (got.length !== ids.length || got.some((k, i) => k !== ids[i]))
-    throw new Error(`${name}: typesafe answers do not match questions`);
+    throw new Error(`${name}: decision answers do not match questions`);
   const decisions: Record<string, DecisionResult> = {};
   for (const id of ids) {
     const ans = (raw.answers as Record<string, unknown>)[id];

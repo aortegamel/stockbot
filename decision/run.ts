@@ -1,6 +1,6 @@
 // decision/run.ts — minimal sequential caller for the API-only prompt-graph experiment.
 //
-// Owns: OpenCode Responses calls, TypeSafe/JEV typed relevance + adjudication,
+// Owns: OpenCode Responses calls, JEV typed relevance + adjudication,
 // strict contract validation, per-run artifacts under decision/results.
 // Consumes sibling-owned decision/scenarios.ts + decision/prompts.ts +
 // decision/jev.ts; evaluationCriteria is never sent to any provider.
@@ -10,8 +10,7 @@
 // only; JEV answers the actual DecisionNode via noul/choice/score.
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { getTypeSafeClient } from "./client.ts";
-import { TypeSafeClient, choice, noul, score } from "@typesafe-ai/sdk";
+import { createSystemOne } from "./client.ts";
 import { scenarios } from "./scenarios.ts";
 import { analyzePrompt, decomposePrompt, expandPrompt } from "./prompts.ts";
 import type { Analysis, EvidenceRequest, Proposal } from "./prompts.ts";
@@ -42,13 +41,6 @@ function requiredEnv(name: string): string {
   return value;
 }
 const RESULTS_ROOT = "decision/results";
-
-export function createSystemOne(fetchImpl?: typeof fetch): SystemOneFn {
-  return (req) => {
-    const client = fetchImpl ? new TypeSafeClient({ fetch: fetchImpl }) : getTypeSafeClient();
-    return client.systemOne(req as never, { retry: { maxRetries: 0 } } as never);
-  };
-}
 
 function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -276,10 +268,11 @@ export async function runScenario(
   // 2. disposition of initial proposals via JEV choice (mutually exclusive routing)
   const relevanceQuestions: Record<string, unknown> = {};
   for (const p of proposals)
-    relevanceQuestions[p.id] = choice(
-      `What should happen to this proposed question relative to the user's objective? Question: ${p.question}`,
-      DISPOSITION_OPTIONS,
-    );
+    relevanceQuestions[p.id] = {
+      type: "choice",
+      instructions: `What should happen to this proposed question relative to the user's objective? Question: ${p.question}`,
+      criteria: DISPOSITION_OPTIONS,
+    };
   const relevance = proposals.length
     ? await askDecisions(
       dir, "relevance",
@@ -353,9 +346,17 @@ export async function runScenario(
       objective: scenario.objective, proposal: p, analysis: a, evidence: subset, dependencyDecisions,
     });
     const questions: Record<string, unknown> = {
-      truth: noul(`Do the available facts support that ${p.question}`),
-      evidence_state: choice("What best characterizes the evidence state for this node?", EVIDENCE_STATE_OPTIONS),
-      materiality: score("How material is resolving this uncertainty to answering the user's objective?", MATERIALITY_LEVELS),
+      truth: { type: "noul", instructions: `Do the available facts support that ${p.question}` },
+      evidence_state: {
+        type: "choice",
+        instructions: "What best characterizes the evidence state for this node?",
+        criteria: EVIDENCE_STATE_OPTIONS,
+      },
+      materiality: {
+        type: "score",
+        instructions: "How material is resolving this uncertainty to answering the user's objective?",
+        criteria: MATERIALITY_LEVELS,
+      },
     };
     const name = `decide-${slug(a.nodeId)}`;
     const r = await askDecisions(dir, name, { state, questions }, systemOne, {
@@ -405,10 +406,11 @@ export async function runScenario(
   // 6. disposition of expanded proposals (non-authoritative until JEV admits)
   const expandedQuestions: Record<string, unknown> = {};
   for (const p of expanded)
-    expandedQuestions[p.id] = choice(
-      `What should happen to this expanded question relative to the user's objective? Question: ${p.question}`,
-      DISPOSITION_OPTIONS,
-    );
+    expandedQuestions[p.id] = {
+      type: "choice",
+      instructions: `What should happen to this expanded question relative to the user's objective? Question: ${p.question}`,
+      criteria: DISPOSITION_OPTIONS,
+    };
   const expandedRelevance = expanded.length
     ? await askDecisions(
       dir, "relevance-expanded",

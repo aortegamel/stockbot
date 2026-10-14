@@ -90,38 +90,38 @@ test("choice winner must be declared; distribution exactly matches options", () 
 
 test("choice rejects malformed answer and probability shapes", () => {
   for (const ans of [null, ["choice"], "choice"])
-    expect(() => parseChoiceAnswer("n", "id", ans, DISPOSITION_OPTIONS)).toThrow("n: malformed_typesafe_answer for id");
+    expect(() => parseChoiceAnswer("n", "id", ans, DISPOSITION_OPTIONS)).toThrow("n: malformed_decision_answer for id");
   expect(() => parseChoiceAnswer("n", "id", {
     type: "noul", choice: "analyze", probabilities: dispProbs, confidence: 0.8,
-  }, DISPOSITION_OPTIONS)).toThrow("n: malformed_typesafe_answer for id");
+  }, DISPOSITION_OPTIONS)).toThrow("n: malformed_decision_answer for id");
   for (const probabilities of [null, ["x"], "x"])
     expect(() => parseChoiceAnswer("n", "id", {
       type: "choice", choice: "analyze", probabilities, confidence: 0.8,
-    }, DISPOSITION_OPTIONS)).toThrow("n: malformed_typesafe_answer for id");
+    }, DISPOSITION_OPTIONS)).toThrow("n: malformed_decision_answer for id");
   expect(() => parseChoiceAnswer("n", "id", {
     type: "choice", choice: "analyze",
     probabilities: { analyze: 0.7, gather_evidence: 0.2, bogus: 0.1 }, confidence: 0.8,
-  }, DISPOSITION_OPTIONS)).toThrow("n: malformed_typesafe_answer for id");
+  }, DISPOSITION_OPTIONS)).toThrow("n: malformed_decision_answer for id");
 });
 
 test("choice rejects non-number confidence with the existing error shape", () => {
   for (const confidence of ["0.8", null])
     expect(() => parseChoiceAnswer("n", "id", {
       type: "choice", choice: "analyze", probabilities: dispProbs, confidence,
-    }, DISPOSITION_OPTIONS)).toThrow("n: malformed_typesafe_answer for id");
+    }, DISPOSITION_OPTIONS)).toThrow("n: malformed_decision_answer for id");
 });
 
 test("choice rejects inherited labels with the existing error shape", () => {
   for (const choice of ["toString", "constructor", "__proto__"]) {
     expect(() => parseChoiceAnswer("n", "id", {
       type: "choice", choice, probabilities: { safe: 0.7 }, confidence: 0.8,
-    }, { safe: "Configured choice" })).toThrow("n: malformed_typesafe_answer for id");
+    }, { safe: "Configured choice" })).toThrow("n: malformed_decision_answer for id");
   }
   const options = { safe: "Configured choice" };
   Object.setPrototypeOf(options, { inherited: "Not an own choice" });
   expect(() => parseChoiceAnswer("n", "id", {
     type: "choice", choice: "inherited", probabilities: { safe: 0.7 }, confidence: 0.8,
-  }, options)).toThrow("n: malformed_typesafe_answer for id");
+  }, options)).toThrow("n: malformed_decision_answer for id");
 });
 
 test("choice retains explicitly configured prototype-like labels and raw probabilities", () => {
@@ -183,7 +183,7 @@ test("choice rejects arbitrary unknown and inherited labels", () => {
     (choice, probability) => {
       expect(() => parseChoiceAnswer("n", "id", {
         type: "choice", choice, probabilities: { safe: probability }, confidence: 0.8,
-      }, { safe: "Configured choice" })).toThrow("n: malformed_typesafe_answer for id");
+      }, { safe: "Configured choice" })).toThrow("n: malformed_decision_answer for id");
     },
   ), { seed: 20261009, numRuns: 100 });
 });

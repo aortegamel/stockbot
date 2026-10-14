@@ -1,13 +1,18 @@
-// Focused tests for decision/run.ts typed JEV loop. No live calls: OpenCode
-// fetch is stubbed and systemOne is an in-process stub inspecting each
-// question body. Each run writes to a temp dir; no .env reads.
+// Focused tests for decision/run.ts typed JEV loop and the decision/client.ts
+// Chat Completions and native Decisions transports. No live calls: OpenCode and
+// decision fetches are stubbed, and systemOne is an in-process stub inspecting
+// each question body. Each run writes to a temp dir; no .env reads.
 import { expect, test } from "bun:test";
+import fc from "fast-check";
 import { mkdtemp, readdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyProbability, runScenario } from "./run.ts";
 import type { SystemOneFn } from "./run.ts";
-import { resetTypeSafeClientForTest } from "./client.ts";
+import { createSystemOne } from "./client.ts";
+import { handleDecide } from "./runtime.ts";
+import type { DecideOk, DecideResponse } from "./runtime.ts";
+import { MATERIALITY_LEVELS } from "./jev.ts";
 import { scenarios } from "./scenarios.ts";
 
 const OBJ = scenarios[0].objective.id;
@@ -90,7 +95,7 @@ function stubSystemOne(): SystemOneFn {
   };
 }
 
-async function successDir(secret: string): Promise<string> {
+async function successDir(secret: string, systemOne: SystemOneFn = stubSystemOne()): Promise<string> {
   process.env.OPENCODE_API_KEY = secret;
   process.env.OPENCODE_MODEL = "test-model";
   process.env.OPENCODE_URL = "https://opencode.test/responses";
@@ -119,13 +124,9 @@ async function successDir(secret: string): Promise<string> {
       ],
     });
   }) as unknown as typeof fetch;
-  try {
-    const out = await runScenario(scenarios[0].id, { fetchFn, systemOne: stubSystemOne(), outDir: dir });
-    expect(out).toBe(dir);
-    return dir;
-  } finally {
-    resetTypeSafeClientForTest();
-  }
+  const out = await runScenario(scenarios[0].id, { fetchFn, systemOne, outDir: dir });
+  expect(out).toBe(dir);
+  return dir;
 }
 
 async function expectRunError(secret: string, fetchFn: typeof fetch, contains: string, systemOne?: SystemOneFn): Promise<string> {
@@ -138,8 +139,6 @@ async function expectRunError(secret: string, fetchFn: typeof fetch, contains: s
     await runScenario(scenarios[0].id, { fetchFn, systemOne: systemOne ?? stubSystemOne(), outDir: dir });
   } catch (e) {
     err = e;
-  } finally {
-    resetTypeSafeClientForTest();
   }
   expect(String(err)).toContain(contains);
   return dir;
@@ -311,4 +310,461 @@ test("decide request carries only the analysis evidence subset", async () => {
   const ids = (body.state.evidence as { id: string }[]).map((e) => e.id);
   expect(ids).toContain("s1-ev3");
   expect(ids).not.toContain("s1-ev1");
+});
+
+const DECISION_ENV = {
+  DECISION_API_FORMAT: "chat_completions",
+  DECISION_API_URL: "https://decision.test/custom/chat/completions",
+  DECISION_API_KEY: "sk-decision-test-key",
+  DECISION_MODEL: "decision-test-model",
+};
+
+// Native Decisions configuration for the reported model. The host is fake; fetch is always stubbed.
+const NATIVE_ENV = {
+  DECISION_API_FORMAT: "decisions",
+  DECISION_API_URL: "https://decision.test/api/alpha/decisions",
+  DECISION_MODEL: "typesafe/jev-1.13",
+};
+
+function setDecisionEnv(overrides: Record<string, string> = {}): void {
+  Object.assign(process.env, DECISION_ENV, overrides);
+}
+
+function chat(body: unknown, status = 200): Response {
+  return new Response(typeof body === "string" ? body : JSON.stringify(body), { status });
+}
+
+function completion(content: unknown, extra: Record<string, unknown> = {}, finish_reason = "stop"): Record<string, unknown> {
+  return { choices: [{ index: 0, message: { role: "assistant", content }, finish_reason }], ...extra };
+}
+
+type FetchCall = { url: string; init: RequestInit };
+
+function recordingFetch(calls: FetchCall[], respond: (init: RequestInit) => Response | Promise<Response>): typeof fetch {
+  return (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return respond(init);
+  }) as unknown as typeof fetch;
+}
+
+const Q = {
+  truth: { type: "noul", instructions: "Is it true?" },
+  route: { type: "choice", instructions: "Route?", criteria: { a: "Route A", b: "Route B" } },
+};
+const GOOD = {
+  truth: { type: "noul", noul: 0.7 },
+  route: { type: "choice", choice: "a", probabilities: { a: 0.6, b: 0.4 }, confidence: 0.6 },
+};
+
+function decide(fetchFn: typeof fetch, questions: Record<string, unknown> = Q): Promise<DecideResponse> {
+  return handleDecide({ id: "r1", op: "decide", state: { s: 1 }, questions }, createSystemOne(fetchFn));
+}
+
+async function decideError(body: unknown, status = 200): Promise<string> {
+  setDecisionEnv();
+  const res = await decide(recordingFetch([], () => chat(body, status)));
+  if (!("error" in res)) throw new Error(`expected decide error, got ${JSON.stringify(res)}`);
+  expect(res.id).toBe("r1");
+  return res.error;
+}
+
+test("decision transport keeps the SDK question guards before any request", async () => {
+  setDecisionEnv();
+  const score = (criteria: unknown) => ({ m: { type: "score", instructions: "How material?", criteria } });
+  const cases: [Record<string, unknown>, string][] = [
+    [{}, "At least one question is required."],
+    [score(["Low"]), 'Score question "m" has 1 criteria; at least two scores are required.'],
+    [score([]), 'Score question "m" has 0 criteria; at least two scores are required.'],
+    [{ m: { type: "score", instructions: "How material?", levels: ["Low", "High"] } },
+      'Score question "m" has criteria that are not a list; score criteria must be a list of descriptions indexed by score from zero.'],
+    [score({ low: "Low", high: "High" }),
+      'Score question "m" has criteria that are not a list; score criteria must be a list of descriptions indexed by score from zero.'],
+  ];
+  for (const [questions, message] of cases) {
+    const calls: FetchCall[] = [];
+    const res = await decide(recordingFetch(calls, () => chat(completion("{}"))), questions);
+    expect(res).toEqual({ id: "r1", error: `decide: decision_request_failed: ${message}` });
+    expect(calls).toHaveLength(0);
+  }
+  const calls: FetchCall[] = [];
+  const res = (await decide(recordingFetch(calls, () =>
+    chat(completion(JSON.stringify({ answers: { m: { type: "score", score: 1 } } })))), score(["Low", null]))) as DecideOk;
+  expect(calls).toHaveLength(1);
+  expect(res.decisions.m).toEqual({ kind: "score", score: 1 });
+});
+
+test("decision transport posts the configured Chat Completions request and normalizes usage", async () => {
+  setDecisionEnv();
+  const calls: FetchCall[] = [];
+  const usage = { prompt_tokens: 12, completion_tokens: 5, total_tokens: 17 };
+  const res = (await decide(recordingFetch(calls, () =>
+    chat(completion(JSON.stringify({ answers: GOOD }), { model: "provider-model", usage }))))) as DecideOk;
+  expect(calls).toHaveLength(1);
+  expect(calls[0].url).toBe(DECISION_ENV.DECISION_API_URL);
+  expect(calls[0].init.method).toBe("POST");
+  expect(calls[0].init.headers).toEqual({
+    Authorization: `Bearer ${DECISION_ENV.DECISION_API_KEY}`,
+    "Content-Type": "application/json",
+  });
+  const body = JSON.parse(String(calls[0].init.body));
+  expect(Object.keys(body).sort()).toEqual(["messages", "model", "stream"]);
+  expect(body.model).toBe("decision-test-model");
+  expect(body.stream).toBe(false);
+  expect(body.messages.map((m: { role: string }) => m.role)).toEqual(["system", "user"]);
+  expect(typeof body.messages[0].content).toBe("string");
+  expect(JSON.parse(body.messages[1].content)).toEqual({ state: { s: 1 }, questions: Q });
+  expect(res.raw).toEqual({ answers: GOOD, model: "provider-model", usage: { input_tokens: 12, output_tokens: 5 } });
+  expect(res.decisions.truth).toEqual({ kind: "noul", probability: 0.7 });
+  expect(res.decisions.route).toEqual({ kind: "choice", choice: "a", probabilities: { a: 0.6, b: 0.4 }, confidence: 0.6 });
+});
+
+test("decision transport records DECISION_MODEL and no usage when the provider omits them", async () => {
+  setDecisionEnv();
+  const res = (await decide(recordingFetch([], () => chat(completion(JSON.stringify({ answers: GOOD })))))) as DecideOk;
+  expect(res.raw).toEqual({ answers: GOOD, model: "decision-test-model" });
+});
+
+test("decision transport fails before any request when configuration is blank", async () => {
+  for (const name of Object.keys(DECISION_ENV)) {
+    for (const blank of ["", "   "]) {
+      setDecisionEnv({ [name]: blank });
+      const calls: FetchCall[] = [];
+      const res = await decide(recordingFetch(calls, () => chat(completion(JSON.stringify({ answers: GOOD })))));
+      expect(res).toEqual({ id: "r1", error: `decide: decision_request_failed: missing ${name}` });
+      expect(calls).toHaveLength(0);
+    }
+  }
+});
+
+test("decision provider failures are request failures and never echo the key", async () => {
+  const err = await decideError({ error: { message: "bad key sk-decision-test-key" } }, 401);
+  expect(err).toStartWith("decide: decision_request_failed: HTTP 401: ");
+  expect(err).not.toContain(DECISION_ENV.DECISION_API_KEY);
+  setDecisionEnv();
+  const res = await decide((async () => {
+    throw new Error("connection refused");
+  }) as unknown as typeof fetch);
+  expect(res).toEqual({ id: "r1", error: "decide: decision_request_failed: connection refused" });
+  const leaky = await decide((async (_url: string, init: RequestInit) => {
+    throw new TypeError(`invalid header value ${JSON.stringify(init.headers)}`);
+  }) as unknown as typeof fetch);
+  if (!("error" in leaky)) throw new Error("expected decide error");
+  expect(leaky.error).toStartWith("decide: decision_request_failed: invalid header value ");
+  expect(leaky.error).toContain("Bearer [redacted]");
+  expect(leaky.error).not.toContain(DECISION_ENV.DECISION_API_KEY);
+});
+
+test("malformed decision responses are rejected", async () => {
+  const answers = JSON.stringify({ answers: GOOD });
+  const cases: [unknown, string][] = [
+    ["not json", "body is not JSON"],
+    [{}, "missing choices"],
+    [{ choices: [] }, "missing choices"],
+    [completion(answers, {}, "length"), "truncated output"],
+    [{ choices: [{ message: { role: "assistant", content: null, refusal: "I cannot help." }, finish_reason: "stop" }] }, "refusal"],
+    [completion(null), "content must be a nonempty string"],
+    [completion("  "), "content must be a nonempty string"],
+    [completion("```json\n{}\n```"), "content is not JSON"],
+    [completion("[]"), "content is not a JSON object"],
+  ];
+  for (const [body, reason] of cases)
+    expect(await decideError(body)).toBe(`decide: malformed_decision_response: ${reason}`);
+  for (const content of ["{}", JSON.stringify({ answers: [] })])
+    expect(await decideError(completion(content))).toBe("decide: malformed_decision_response");
+});
+
+test("null response parts are malformed responses, not request failures", async () => {
+  const msg = (message: unknown) => ({ choices: [{ index: 0, message, finish_reason: "stop" }] });
+  for (const body of ["null", { choices: null }, { choices: [null] }, msg(null), msg([])])
+    expect(await decideError(body)).toStartWith("decide: malformed_decision_response");
+});
+
+test("refusal follows truthiness: empty refusals pass, any truthy refusal fails", async () => {
+  const content = JSON.stringify({ answers: GOOD });
+  const withRefusal = (refusal: unknown) => ({
+    choices: [{ index: 0, message: { role: "assistant", content, refusal }, finish_reason: "stop" }],
+  });
+  for (const refusal of [null, "", false, 0, {}, []]) {
+    setDecisionEnv();
+    const res = await decide(recordingFetch([], () => chat(withRefusal(refusal))));
+    expect(res).toMatchObject({ id: "r1", decisions: { truth: { kind: "noul", probability: 0.7 } } });
+  }
+  for (const refusal of ["I cannot help.", true, 1, { reason: "policy" }, ["policy"]])
+    expect(await decideError(withRefusal(refusal))).toStartWith("decide: malformed_decision_response");
+});
+
+test("invalid provider model values fall back to DECISION_MODEL", async () => {
+  for (const model of [null, "", 42, true, { id: "m" }, ["m"]]) {
+    setDecisionEnv();
+    const res = (await decide(recordingFetch([], () =>
+      chat(completion(JSON.stringify({ answers: GOOD }), { model }))))) as DecideOk;
+    expect(res.raw).toMatchObject({ model: DECISION_ENV.DECISION_MODEL });
+  }
+});
+
+test("usage keeps only integer token counts", async () => {
+  const rawWith = async (usage: unknown) => {
+    setDecisionEnv();
+    const res = (await decide(recordingFetch([], () =>
+      chat(completion(JSON.stringify({ answers: GOOD }), { usage }))))) as DecideOk;
+    return res.raw;
+  };
+  expect(await rawWith({ prompt_tokens: 1.5, completion_tokens: true })).toHaveProperty("usage", {});
+  expect(await rawWith({ prompt_tokens: "12", completion_tokens: null })).toHaveProperty("usage", {});
+  expect(await rawWith({ prompt_tokens: false, completion_tokens: 0 })).toHaveProperty("usage", { output_tokens: 0 });
+  expect(await rawWith({ prompt_tokens: 7 })).toHaveProperty("usage", { input_tokens: 7 });
+  expect(await rawWith({ input_tokens: 9, output_tokens: 4 })).toHaveProperty("usage", {});
+  expect(await rawWith(null)).not.toHaveProperty("usage");
+  expect(await rawWith([1, 2])).not.toHaveProperty("usage");
+});
+
+// Request and 200 response examples from the OpenRouter "Submit a Decisions request" reference.
+const DOC_Q = {
+  is_bug: {
+    type: "noul",
+    instructions: "Is the customer reporting a software defect?",
+    criteria: {
+      false: "The customer is asking a question or requesting a feature.",
+      true: "The customer describes broken or unexpected product behavior.",
+    },
+  },
+  team: {
+    type: "choice",
+    instructions: "Which team should own this ticket?",
+    criteria: {
+      account: "Login, permissions, or profile issues.",
+      frontend: "Rendering, layout, or browser compatibility issues.",
+      payments: "Checkout, billing, or payment processing issues.",
+    },
+  },
+  urgency: {
+    type: "score",
+    instructions: "How urgent is this ticket?",
+    criteria: ["Can wait for the next release", "Should be fixed this week", "Blocking revenue right now"],
+  },
+};
+const DOC_STATE = {
+  customer_tier: "enterprise",
+  ticket: "My checkout page shows a blank screen after I click Pay. I have tried two browsers.",
+};
+const DOC_LEGEND = { 0: "Can wait for the next release", 1: "Should be fixed this week", 2: "Blocking revenue right now" };
+const DOC_ANSWERS = {
+  is_bug: { noul: 0.96, type: "noul" },
+  team: { choice: "payments", confidence: 0.75, probabilities: { account: 0, frontend: 0.16, payments: 0.84 }, type: "choice" },
+  urgency: { confidence: 0.99, legend: DOC_LEGEND, probabilities: { 0: 0, 1: 0.01, 2: 0.99 }, score: 1.99, type: "score" },
+};
+function nativeResponse(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    answers: DOC_ANSWERS,
+    id: "gen-dec-1789738314-X5e5eKGQdvR9rblyX250",
+    model: "typesafe/jev-1.13-20260917",
+    provider: "TypeSafe",
+    usage: { cost: 0.000019992, input_tokens: 476, output_tokens: 70 },
+    ...extra,
+  };
+}
+
+function nativeDecide(fetchFn: typeof fetch, questions: Record<string, unknown> = DOC_Q): Promise<DecideResponse> {
+  setDecisionEnv(NATIVE_ENV);
+  return handleDecide({ id: "r1", op: "decide", state: DOC_STATE, questions }, createSystemOne(fetchFn));
+}
+
+async function nativeError(body: unknown, status = 200): Promise<string> {
+  const res = await nativeDecide(recordingFetch([], () => chat(body, status)));
+  if (!("error" in res)) throw new Error(`expected decide error, got ${JSON.stringify(res)}`);
+  expect(res.id).toBe("r1");
+  return res.error;
+}
+
+test("native Decisions format posts {model,state,questions} for typesafe/jev-1.13 and keeps document answers", async () => {
+  const calls: FetchCall[] = [];
+  const res = (await nativeDecide(recordingFetch(calls, () => chat(nativeResponse())))) as DecideOk;
+  expect(calls).toHaveLength(1);
+  expect(calls[0].url).toBe(NATIVE_ENV.DECISION_API_URL);
+  expect(calls[0].init.method).toBe("POST");
+  expect(calls[0].init.headers).toEqual({
+    Authorization: `Bearer ${DECISION_ENV.DECISION_API_KEY}`,
+    "Content-Type": "application/json",
+  });
+  // The reported HTTP 400 came from Chat Completions fields on the native endpoint.
+  expect(JSON.parse(String(calls[0].init.body))).toEqual({ model: "typesafe/jev-1.13", state: DOC_STATE, questions: DOC_Q });
+  expect(res.raw).toEqual({
+    answers: DOC_ANSWERS,
+    model: "typesafe/jev-1.13-20260917",
+    usage: { input_tokens: 476, output_tokens: 70 },
+  });
+  expect(res.decisions).toEqual({
+    is_bug: { kind: "noul", probability: 0.96 },
+    team: { kind: "choice", choice: "payments", probabilities: { account: 0, frontend: 0.16, payments: 0.84 }, confidence: 0.75 },
+    urgency: { kind: "score", score: 1.99, confidence: 0.99, probabilities: { 0: 0, 1: 0.01, 2: 0.99 }, raw: DOC_LEGEND },
+  });
+});
+
+test("DECISION_API_FORMAT alone selects the wire format, never the URL or model", async () => {
+  const chatCalls: FetchCall[] = [];
+  setDecisionEnv({ DECISION_API_URL: NATIVE_ENV.DECISION_API_URL, DECISION_MODEL: NATIVE_ENV.DECISION_MODEL });
+  const chatRes = (await decide(recordingFetch(chatCalls, () => chat(completion(JSON.stringify({ answers: GOOD })))))) as DecideOk;
+  expect(Object.keys(JSON.parse(String(chatCalls[0].init.body))).sort()).toEqual(["messages", "model", "stream"]);
+  expect(chatRes.raw).toEqual({ answers: GOOD, model: "typesafe/jev-1.13" });
+  const nativeCalls: FetchCall[] = [];
+  setDecisionEnv({ DECISION_API_FORMAT: "decisions" });
+  const nativeRes = (await decide(recordingFetch(nativeCalls, () => chat({ answers: GOOD })))) as DecideOk;
+  expect(nativeCalls[0].url).toBe(DECISION_ENV.DECISION_API_URL);
+  expect(JSON.parse(String(nativeCalls[0].init.body))).toEqual({ model: "decision-test-model", state: { s: 1 }, questions: Q });
+  expect(nativeRes.raw).toEqual({ answers: GOOD, model: "decision-test-model" });
+});
+
+test("missing or unsupported DECISION_API_FORMAT fails before any request", async () => {
+  const attempt = async (format: string | undefined): Promise<DecideResponse> => {
+    setDecisionEnv();
+    if (format === undefined) delete process.env.DECISION_API_FORMAT;
+    else process.env.DECISION_API_FORMAT = format;
+    const calls: FetchCall[] = [];
+    const res = await decide(recordingFetch(calls, () => chat(nativeResponse())));
+    expect(calls).toHaveLength(0);
+    return res;
+  };
+  expect(await attempt(undefined)).toEqual({ id: "r1", error: "decide: decision_request_failed: missing DECISION_API_FORMAT" });
+  for (const format of ["DECISIONS", "Chat_Completions", "chat", "responses", "auto", "decisions,chat_completions"])
+    expect(await attempt(format)).toEqual({ id: "r1", error: "decide: decision_request_failed: unsupported DECISION_API_FORMAT" });
+});
+
+test("malformed native Decisions envelopes are rejected", async () => {
+  expect(await nativeError("not json")).toBe("decide: malformed_decision_response: body is not JSON");
+  for (const body of ["null", "[]", "42", '"answers"'])
+    expect(await nativeError(body)).toBe("decide: malformed_decision_response: body is not a JSON object");
+  // A Chat Completions envelope carries no top-level answers.
+  const chatShaped = completion(JSON.stringify({ answers: DOC_ANSWERS }), { model: "m" });
+  for (const body of [{}, { answers: null }, { answers: [] }, { answers: "x" }, chatShaped])
+    expect(await nativeError(body)).toBe("decide: malformed_decision_response");
+  // A native envelope is not a Chat Completions response.
+  expect(await decideError({ answers: GOOD })).toBe("decide: malformed_decision_response: missing choices");
+  const err = await nativeError({ error: { code: 400, message: "bad sk-decision-test-key" } }, 400);
+  expect(err).toStartWith("decide: decision_request_failed: HTTP 400: ");
+  expect(err).not.toContain(DECISION_ENV.DECISION_API_KEY);
+});
+
+test("native Decisions answers keep exact question, option, and probability validation", async () => {
+  const reply = (answers: Record<string, unknown>) => nativeResponse({ answers });
+  expect(await nativeError(reply({ ...DOC_ANSWERS, extra: { type: "noul", noul: 0.5 } })))
+    .toBe("decide: decision answers do not match questions");
+  expect(await nativeError(reply({ is_bug: DOC_ANSWERS.is_bug, team: DOC_ANSWERS.team })))
+    .toBe("decide: decision answers do not match questions");
+  expect(await nativeError(reply({ ...DOC_ANSWERS, is_bug: { type: "noul", noul: 1.0001 } }))).toBe("invalid_probability");
+  const team = DOC_ANSWERS.team;
+  for (const bad of [
+    { ...team, choice: "legal" },
+    { ...team, probabilities: { account: 0, payments: 1 } },
+    { ...team, probabilities: { ...team.probabilities, frontend: -0.01 } },
+    { ...team, confidence: 1.5 },
+  ])
+    expect(await nativeError(reply({ ...DOC_ANSWERS, team: bad }))).toBe("decide: malformed_decision_answer for team");
+  const urgency = DOC_ANSWERS.urgency;
+  for (const bad of [{ ...urgency, score: 2.01 }, { ...urgency, probabilities: { ...urgency.probabilities, 2: 1.2 } }])
+    expect(await nativeError(reply({ ...DOC_ANSWERS, urgency: bad }))).toBe("decide: malformed_decision_answer for urgency");
+});
+
+test("native Decisions metadata keeps a valid model and only integer native token counts", async () => {
+  const rawWith = async (extra: Record<string, unknown>) =>
+    ((await nativeDecide(recordingFetch([], () => chat(nativeResponse(extra))))) as DecideOk).raw;
+  for (const model of [null, "", 42, true, { id: "m" }, ["m"]])
+    expect(await rawWith({ model })).toMatchObject({ model: NATIVE_ENV.DECISION_MODEL });
+  expect(await rawWith({ model: undefined })).toMatchObject({ model: NATIVE_ENV.DECISION_MODEL });
+  expect(await rawWith({ usage: { input_tokens: 1.5, output_tokens: true } })).toHaveProperty("usage", {});
+  expect(await rawWith({ usage: { input_tokens: "12", output_tokens: null } })).toHaveProperty("usage", {});
+  expect(await rawWith({ usage: { input_tokens: false, output_tokens: 0 } })).toHaveProperty("usage", { output_tokens: 0 });
+  expect(await rawWith({ usage: { input_tokens: 7, cost: 0.1 } })).toHaveProperty("usage", { input_tokens: 7 });
+  expect(await rawWith({ usage: { prompt_tokens: 3, completion_tokens: 4 } })).toHaveProperty("usage", {});
+  expect(await rawWith({ usage: null })).not.toHaveProperty("usage");
+  expect(await rawWith({ usage: [1, 2] })).not.toHaveProperty("usage");
+  expect(await rawWith({ usage: undefined })).not.toHaveProperty("usage");
+});
+
+test("both formats preserve arbitrary probabilities and integer token counts", async () => {
+  await fc.assert(fc.asyncProperty(
+    fc.constantFrom("chat_completions", "decisions"),
+    fc.double({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true }),
+    fc.nat(),
+    fc.nat(),
+    async (format, p, inTokens, outTokens) => {
+      const answers = { truth: { type: "noul", noul: p }, route: { ...GOOD.route, probabilities: { a: p, b: 1 - p } } };
+      const body = format === "decisions"
+        ? { answers, usage: { input_tokens: inTokens, output_tokens: outTokens } }
+        : completion(JSON.stringify({ answers }), { usage: { prompt_tokens: inTokens, completion_tokens: outTokens } });
+      setDecisionEnv({ DECISION_API_FORMAT: format });
+      const res = (await decide(recordingFetch([], () => chat(body))));
+      if (!("raw" in res)) throw new Error(`expected decide success, got ${JSON.stringify(res)}`);
+      expect(res.raw).toEqual({ answers, model: DECISION_ENV.DECISION_MODEL, usage: { input_tokens: inTokens, output_tokens: outTokens } });
+      expect(res.decisions.truth).toEqual({ kind: "noul", probability: p });
+      expect(res.decisions.route).toMatchObject({ probabilities: { a: p, b: 1 - p } });
+    },
+  ), { seed: 20261013, numRuns: 100 });
+});
+
+test("HTTP error bodies are capped at 300 characters", async () => {
+  const err = await decideError("x".repeat(1000), 500);
+  expect(err).toStartWith("decide: decision_request_failed: HTTP 500: ");
+  expect(err).toContain("x".repeat(300));
+  expect(err).not.toContain("x".repeat(301));
+});
+
+test("decision answers keep exact question and option validation", async () => {
+  const reply = (a: Record<string, unknown>) => completion(JSON.stringify({ answers: a }));
+  expect(await decideError(reply({ ...GOOD, extra: { type: "noul", noul: 0.5 } })))
+    .toBe("decide: decision answers do not match questions");
+  expect(await decideError(reply({ truth: GOOD.truth })))
+    .toBe("decide: decision answers do not match questions");
+  expect(await decideError(reply({ ...GOOD, route: { ...GOOD.route, choice: "c" } })))
+    .toBe("decide: malformed_decision_answer for route");
+  expect(await decideError(reply({ ...GOOD, route: { ...GOOD.route, probabilities: { a: 1 } } })))
+    .toBe("decide: malformed_decision_answer for route");
+  expect(await decideError(reply({ ...GOOD, truth: { type: "noul", noul: 1.0001 } }))).toBe("invalid_probability");
+  for (const noul of [0, 1]) {
+    setDecisionEnv();
+    const res = (await decide(recordingFetch([], () => chat(reply({ ...GOOD, truth: { type: "noul", noul } }))))) as DecideOk;
+    expect(res.decisions.truth).toEqual({ kind: "noul", probability: noul });
+  }
+});
+
+test("experiment path sends direct question objects through the decision transport", async () => {
+  setDecisionEnv();
+  const calls: FetchCall[] = [];
+  const stub = stubSystemOne();
+  const chatFetch = recordingFetch(calls, async (init) => {
+    const user = JSON.parse(JSON.parse(String(init.body)).messages[1].content);
+    const out = (await stub(user)) as { answers: unknown };
+    return chat(completion(JSON.stringify({ answers: out.answers })));
+  });
+  const dir = await successDir("sk-test-transport-key", createSystemOne(chatFetch));
+  expect(calls.map((c) => c.url)).toEqual(Array(3).fill(DECISION_ENV.DECISION_API_URL));
+  const final = JSON.parse(await readFile(join(dir, "final.json"), "utf8"));
+  expect(final.reasoning[0].materialityScore).toBe(3);
+  expect(final.jev.relevance.model).toBe("decision-test-model");
+  const files = await readdir(dir);
+  const decideReq = JSON.parse(await readFile(join(dir, files.find((f) => f.startsWith("request-decide-")) as string), "utf8"));
+  expect(decideReq.questions.truth.type).toBe("noul");
+  expect(decideReq.questions.evidence_state.type).toBe("choice");
+  expect(decideReq.questions.materiality).toMatchObject({ type: "score", criteria: [...MATERIALITY_LEVELS] });
+  for (const name of files)
+    expect(await readFile(join(dir, name), "utf8")).not.toContain(DECISION_ENV.DECISION_API_KEY);
+});
+
+test("experiment path sends direct question objects through the native Decisions transport", async () => {
+  setDecisionEnv(NATIVE_ENV);
+  const calls: FetchCall[] = [];
+  const stub = stubSystemOne();
+  const nativeFetch = recordingFetch(calls, async (init) => {
+    const body = JSON.parse(String(init.body));
+    expect(Object.keys(body).sort()).toEqual(["model", "questions", "state"]);
+    expect(body.model).toBe(NATIVE_ENV.DECISION_MODEL);
+    const out = (await stub(body)) as { answers: unknown };
+    return chat({ answers: out.answers, usage: { input_tokens: 9, output_tokens: 2 } });
+  });
+  const dir = await successDir("sk-test-transport-key", createSystemOne(nativeFetch));
+  expect(calls.map((c) => c.url)).toEqual(Array(3).fill(NATIVE_ENV.DECISION_API_URL));
+  const final = JSON.parse(await readFile(join(dir, "final.json"), "utf8"));
+  expect(final.reasoning[0].materialityScore).toBe(3);
+  expect(final.jev.relevance.model).toBe(NATIVE_ENV.DECISION_MODEL);
+  for (const name of await readdir(dir))
+    expect(await readFile(join(dir, name), "utf8")).not.toContain(DECISION_ENV.DECISION_API_KEY);
 });

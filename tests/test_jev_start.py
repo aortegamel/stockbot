@@ -440,6 +440,50 @@ def test_outer_cancel_waiter_leaves_holder_sidecar_alive(tmp_path: Path, monkeyp
     asyncio.run(_scenario())
 
 
+_DECISION_URL = "https://decisions.test/v1/chat/completions"
+_DECISION_KEY = "sk-test-decision-key"
+_DECISION_MODEL = "test-decision-model"
+_NATIVE_URL = "https://decisions.test/api/alpha/decisions"
+_NATIVE_MODEL = "typesafe/jev-1.13"
+_FORMATS = ("chat_completions", "decisions")
+
+
+def _decision_env(monkeypatch: pytest.MonkeyPatch, api_format: str = "chat_completions") -> None:
+    native = api_format == "decisions"
+    monkeypatch.setenv("DECISION_API_FORMAT", api_format)
+    monkeypatch.setenv("DECISION_API_URL", _NATIVE_URL if native else _DECISION_URL)
+    monkeypatch.setenv("DECISION_API_KEY", _DECISION_KEY)
+    monkeypatch.setenv("DECISION_MODEL", _NATIVE_MODEL if native else _DECISION_MODEL)
+
+
+def _chat_body(content: object, **extra: object) -> bytes:
+    """One Chat Completions response; dict/list content is JSON-encoded like a model reply."""
+    text = content if isinstance(content, str) or content is None else json.dumps(content)
+    message: dict[str, object] = {"role": "assistant", "content": text}
+    choice: dict[str, object] = {"index": 0, "message": message, "finish_reason": "stop"}
+    body: dict[str, object] = {"choices": [choice], **extra}
+    return json.dumps(body).encode()
+
+
+def _native_body(answers: object, **extra: object) -> bytes:
+    """One native Decisions response: answers sit at the top level beside model/usage."""
+    return json.dumps({"answers": answers, **extra}).encode()
+
+
+def _body(api_format: str, answers: object, **extra: object) -> bytes:
+    if api_format == "decisions":
+        return _native_body(answers, **extra)
+    return _chat_body({"answers": answers}, **extra)
+
+
+def _provider_usage(api_format: str, usage: Mapping[str, object]) -> dict[str, object]:
+    """Chat-shaped token counts in the wire keys of the selected format."""
+    if api_format == "chat_completions":
+        return dict(usage)
+    names = {"prompt_tokens": "input_tokens", "completion_tokens": "output_tokens"}
+    return {names.get(k, k): v for k, v in usage.items()}
+
+
 class _BlockingHttpResp:
     """urlopen response whose read blocks until close releases it."""
 
@@ -464,7 +508,7 @@ class _BlockingHttpResp:
         assert self._release.wait(timeout=10), "http release never set"
         if self.closed.is_set():
             raise OSError("closed")
-        return b'{"answers": {"q": {"type": "noul", "noul": 0.5}}}'
+        return _chat_body({"answers": {"q": {"type": "noul", "noul": 0.5}}})
 
     def close(self) -> None:
         self.closed.set()
@@ -493,7 +537,7 @@ def test_outer_cancel_stops_hung_http_fallback(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(client, "_persist", _noop)
     monkeypatch.setattr(client, "_sidecar_roundtrip", _missing)
     monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
-    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    _decision_env(monkeypatch)
 
     async def _scenario() -> None:
         call = asyncio.ensure_future(
@@ -596,12 +640,513 @@ def test_http_fallback_runs_on_client_pool(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setattr(client, "_persist", _noop)
     monkeypatch.setattr(client, "_sidecar_roundtrip", _missing)
     monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
-    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    _decision_env(monkeypatch)
     assert asyncio.run(_run_and_close()) is client._http_pool
 
 
+_HTTP_QUESTIONS: dict[str, JSONValue] = {
+    "q": {"type": "noul", "instructions": "Estimate whether the proposition holds."},
+    "pick": {"type": "choice", "instructions": "Select a label.", "criteria": {"a": "A", "b": "B"}},
+}
+_HTTP_ANSWERS: dict[str, JSONValue] = {
+    "q": {"type": "noul", "noul": 0.75},
+    "pick": {"type": "choice", "choice": "b", "probabilities": {"a": 0.2, "b": 0.8}, "confidence": 0.8},
+}
+
+
+def _http_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: bytes, api_format: str = "chat_completions"
+) -> tuple[JevClient, dict[str, object]]:
+    import urllib.request
+
+    from app.decision_client import _SidecarUnavailable
+
+    _decision_env(monkeypatch, api_format)
+    seen: dict[str, object] = {}
+    client = JevClient(data_root=tmp_path, runtime_path=tmp_path / "no-runtime.ts")
+
+    def _missing(payload: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        raise _SidecarUnavailable("no sidecar")
+
+    def _urlopen(request: urllib.request.Request, *, timeout: float) -> io.BytesIO:
+        seen["request"] = request
+        seen["timeout"] = timeout
+        return io.BytesIO(body)
+
+    def _persist(**kwargs: object) -> None:
+        seen["persist"] = kwargs
+
+    monkeypatch.setattr(client, "_sidecar_roundtrip", _missing)
+    monkeypatch.setattr(client, "_persist", _persist)
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    return client, seen
+
+
+def _http_run(
+    client: JevClient, questions: Mapping[str, JSONValue] = _HTTP_QUESTIONS
+) -> dict[str, dict[str, JSONValue]]:
+    return asyncio.run(client.decide({"source": "test evidence"}, questions, decision_type="t", session_id="s"))
+
+
+def test_http_decision_uses_configured_chat_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import urllib.request
+
+    client, seen = _http_client(
+        tmp_path,
+        monkeypatch,
+        _chat_body(
+            {"answers": _HTTP_ANSWERS}, model="provider-revision", usage={"prompt_tokens": 12, "completion_tokens": 7}
+        ),
+    )
+    out = _http_run(client)
+    assert out == {
+        "pick": {"kind": "choice", "choice": "b", "probabilities": {"a": 0.2, "b": 0.8}, "confidence": 0.8},
+        "q": {"kind": "noul", "probability": 0.75},
+    }
+    req = seen["request"]
+    assert isinstance(req, urllib.request.Request)
+    assert req.full_url == _DECISION_URL
+    assert req.get_method() == "POST"
+    assert req.get_header("Authorization") == f"Bearer {_DECISION_KEY}"
+    assert req.get_header("Content-type") == "application/json"
+    assert isinstance(req.data, bytes)
+    body = json.loads(req.data)
+    assert set(body) == {"model", "messages", "stream"}
+    assert body["model"] == _DECISION_MODEL and body["stream"] is False
+    assert len(body["messages"]) == 2
+    system, user = body["messages"]
+    assert system["role"] == "system" and system["content"].startswith("You are the decision authority.")
+    assert user["role"] == "user"
+    assert json.loads(user["content"]) == {"state": {"source": "test evidence"}, "questions": _HTTP_QUESTIONS}
+    persisted = seen["persist"]
+    assert isinstance(persisted, dict)
+    assert persisted["via"] == "http"
+    assert persisted["jev_in"] == 12 and persisted["jev_out"] == 7
+    assert persisted["jev_model"] == "provider-revision"
+    assert persisted["raw"] == {
+        "answers": _HTTP_ANSWERS,
+        "model": "provider-revision",
+        "usage": {"input_tokens": 12, "output_tokens": 7},
+    }
+    assert seen["timeout"] == 60.0
+
+
+# Request and 200 response examples from the OpenRouter alpha Decisions API reference.
+_NATIVE_QUESTIONS: dict[str, JSONValue] = {
+    "is_bug": {
+        "criteria": {
+            "false": "The customer is asking a question or requesting a feature.",
+            "true": "The customer describes broken or unexpected product behavior.",
+        },
+        "instructions": "Is the customer reporting a software defect?",
+        "type": "noul",
+    },
+    "team": {
+        "criteria": {
+            "account": "Login, permissions, or profile issues.",
+            "frontend": "Rendering, layout, or browser compatibility issues.",
+            "payments": "Checkout, billing, or payment processing issues.",
+        },
+        "instructions": "Which team should own this ticket?",
+        "type": "choice",
+    },
+    "urgency": {
+        "criteria": ["Can wait for the next release", "Should be fixed this week", "Blocking revenue right now"],
+        "instructions": "How urgent is this ticket?",
+        "type": "score",
+    },
+}
+_NATIVE_LEGEND: dict[str, JSONValue] = {
+    "0": "Can wait for the next release",
+    "1": "Should be fixed this week",
+    "2": "Blocking revenue right now",
+}
+_NATIVE_ANSWERS: dict[str, JSONValue] = {
+    "is_bug": {"noul": 0.96, "type": "noul"},
+    "team": {
+        "choice": "payments",
+        "confidence": 0.75,
+        "probabilities": {"account": 0, "frontend": 0.16, "payments": 0.84},
+        "type": "choice",
+    },
+    "urgency": {
+        "confidence": 0.99,
+        "legend": _NATIVE_LEGEND,
+        "probabilities": {"0": 0, "1": 0.01, "2": 0.99},
+        "score": 1.99,
+        "type": "score",
+    },
+}
+
+
+def test_http_decision_uses_configured_native_decisions_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import urllib.request
+
+    client, seen = _http_client(
+        tmp_path,
+        monkeypatch,
+        _native_body(
+            _NATIVE_ANSWERS,
+            id="gen-dec-1789738314-X5e5eKGQdvR9rblyX250",
+            model="typesafe/jev-1.13-20260917",
+            provider="TypeSafe",
+            usage={"cost": 0.000019992, "input_tokens": 476, "output_tokens": 70},
+        ),
+        "decisions",
+    )
+    state: dict[str, JSONValue] = {
+        "customer_tier": "enterprise",
+        "ticket": "My checkout page shows a blank screen after I click Pay. I have tried two browsers.",
+    }
+    out = asyncio.run(client.decide(state, _NATIVE_QUESTIONS, decision_type="t", session_id="s"))
+    assert out == {
+        "is_bug": {"kind": "noul", "probability": 0.96},
+        "team": {
+            "kind": "choice",
+            "choice": "payments",
+            "probabilities": {"account": 0.0, "frontend": 0.16, "payments": 0.84},
+            "confidence": 0.75,
+        },
+        "urgency": {
+            "kind": "score",
+            "score": 1.99,
+            "confidence": 0.99,
+            "probabilities": {"0": 0.0, "1": 0.01, "2": 0.99},
+            "raw": _NATIVE_LEGEND,
+        },
+    }
+    req = seen["request"]
+    assert isinstance(req, urllib.request.Request)
+    assert req.full_url == _NATIVE_URL
+    assert req.get_method() == "POST"
+    assert req.get_header("Authorization") == f"Bearer {_DECISION_KEY}"
+    assert req.get_header("Content-type") == "application/json"
+    assert isinstance(req.data, bytes)
+    assert json.loads(req.data) == {"model": _NATIVE_MODEL, "state": state, "questions": _NATIVE_QUESTIONS}
+    persisted = seen["persist"]
+    assert isinstance(persisted, dict)
+    assert persisted["via"] == "http"
+    assert persisted["jev_in"] == 476 and persisted["jev_out"] == 70
+    assert persisted["jev_model"] == "typesafe/jev-1.13-20260917"
+    assert persisted["raw"] == {
+        "answers": _NATIVE_ANSWERS,
+        "model": "typesafe/jev-1.13-20260917",
+        "usage": {"input_tokens": 476, "output_tokens": 70},
+    }
+    assert seen["timeout"] == 60.0
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
+def test_http_decision_format_comes_only_from_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str
+) -> None:
+    """The native URL path and model name never override the configured format."""
+    import urllib.request
+
+    client, seen = _http_client(tmp_path, monkeypatch, _body(api_format, _HTTP_ANSWERS), api_format)
+    monkeypatch.setenv("DECISION_API_URL", _NATIVE_URL)
+    monkeypatch.setenv("DECISION_MODEL", _NATIVE_MODEL)
+    _http_run(client)
+    req = seen["request"]
+    assert isinstance(req, urllib.request.Request) and isinstance(req.data, bytes)
+    assert req.full_url == _NATIVE_URL
+    body = json.loads(req.data)
+    expected = {"model", "state", "questions"} if api_format == "decisions" else {"model", "messages", "stream"}
+    assert set(body) == expected and body["model"] == _NATIVE_MODEL
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
+@pytest.mark.parametrize("reported", [None, "", 7, ["provider-revision"]])
+@pytest.mark.parametrize("usage", [None, {"prompt_tokens": "12", "completion_tokens": True}, {"prompt_tokens": 0}])
+def test_http_decision_does_not_invent_usage_or_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str, reported: object, usage: object
+) -> None:
+    extra: dict[str, object] = {}
+    if isinstance(usage, dict):
+        extra["usage"] = _provider_usage(api_format, usage)
+    if reported is not None:
+        extra["model"] = reported
+    client, seen = _http_client(tmp_path, monkeypatch, _body(api_format, _HTTP_ANSWERS, **extra), api_format)
+    _http_run(client)
+    persisted = seen["persist"]
+    assert isinstance(persisted, dict)
+    configured = _NATIVE_MODEL if api_format == "decisions" else _DECISION_MODEL
+    assert persisted["jev_model"] == configured
+    assert persisted["jev_out"] is None
+    assert persisted["jev_in"] == (0 if usage == {"prompt_tokens": 0} else None)
+    raw = persisted["raw"]
+    assert isinstance(raw, dict)
+    assert raw["model"] == configured
+    no_usage: dict[str, JSONValue] | None = None if usage is None else {}
+    assert raw.get("usage") == ({"input_tokens": 0} if usage == {"prompt_tokens": 0} else no_usage)
+
+
+_MALFORMED_CHAT: list[bytes] = [
+    b"not JSON",
+    b"[]",
+    b'{"choices":[]}',
+    b'{"choices":[{}]}',
+    b'{"choices":[{"message":{"content":{}}}]}',
+    b'{"choices":[{"message":{"content":" "}}]}',
+    b'{"choices":[{"message":{"content":"{}","refusal":"denied"}}]}',
+    b'{"choices":[{"message":{"content":"{}"},"finish_reason":"length"}]}',
+    _chat_body("not JSON"),
+    _chat_body([]),
+    _chat_body({"answers": []}),
+    _chat_body('{"answers":{"q":{"type":"noul","noul":NaN}}}'),
+    _chat_body('{"answers":{"q":{"type":"noul","noul":Infinity}}}'),
+    _chat_body('{"answers":{"q":{"type":"noul","noul":-Infinity}}}'),
+    _native_body(_HTTP_ANSWERS),
+]
+_MALFORMED_NATIVE: list[bytes] = [
+    b"not JSON",
+    b"[]",
+    b'"answers"',
+    b"{}",
+    b'{"answers":null}',
+    _native_body([]),
+    _native_body("answers"),
+    b'{"answers":{"q":{"type":"noul","noul":NaN}}}',
+    b'{"answers":{"q":{"type":"noul","noul":Infinity}}}',
+    b'{"answers":{"q":{"type":"noul","noul":-Infinity}}}',
+    _chat_body({"answers": _HTTP_ANSWERS}),
+]
+
+
+@pytest.mark.parametrize(
+    ("api_format", "body"),
+    [("chat_completions", b) for b in _MALFORMED_CHAT] + [("decisions", b) for b in _MALFORMED_NATIVE],
+)
+def test_http_decision_rejects_malformed_provider_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str, body: bytes
+) -> None:
+    client, seen = _http_client(tmp_path, monkeypatch, body, api_format)
+    with pytest.raises(TypeError, match="malformed_decision_response"):
+        _http_run(client)
+    assert "persist" not in seen
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
+@pytest.mark.parametrize(
+    ("answers", "error"),
+    [
+        ({"q": {"type": "noul", "noul": 0.5}}, "decision answers do not match questions"),
+        (
+            {**_HTTP_ANSWERS, "extra": {"type": "noul", "noul": 0.5}},
+            "decision answers do not match questions",
+        ),
+        (
+            {
+                **_HTTP_ANSWERS,
+                "pick": {"type": "choice", "choice": "c", "probabilities": {"a": 0.2, "b": 0.8}, "confidence": 0.8},
+            },
+            "malformed_decision_answer for pick",
+        ),
+        (
+            {
+                **_HTTP_ANSWERS,
+                "pick": {"type": "choice", "choice": "a", "probabilities": {"a": -0.1, "b": 1.1}, "confidence": 0.8},
+            },
+            "malformed_decision_answer for pick",
+        ),
+        (
+            {
+                **_HTTP_ANSWERS,
+                "pick": {"type": "choice", "choice": "a", "probabilities": {"a": 1.0}, "confidence": 1.0},
+            },
+            "malformed_decision_answer for pick",
+        ),
+        (
+            {**_HTTP_ANSWERS, "q": {"type": "noul", "noul": -0.001}},
+            "malformed_decision_answer for q",
+        ),
+        (
+            {**_HTTP_ANSWERS, "q": {"type": "noul", "noul": 1.001}},
+            "malformed_decision_answer for q",
+        ),
+        (
+            {**_HTTP_ANSWERS, "q": {"type": "noul", "noul": True}},
+            "malformed_decision_answer for q",
+        ),
+    ],
+)
+def test_http_decision_preserves_answer_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str, answers: object, error: str
+) -> None:
+    client, seen = _http_client(tmp_path, monkeypatch, _body(api_format, answers), api_format)
+    with pytest.raises(ValueError, match=error):
+        _http_run(client)
+    assert "persist" not in seen
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
+@settings(max_examples=30, derandomize=True, deadline=None)
+@given(
+    st.one_of(
+        st.just(0.0), st.just(1.0), st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False)
+    )
+)
+def test_prop_http_noul_probability_roundtrip(api_format: str, probability: float) -> None:
+    # Each example owns its monkeypatch; no network or mutable pytest fixture crosses examples.
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        client, _ = _http_client(
+            Path("/tmp"), monkeypatch, _body(api_format, {"q": {"type": "noul", "noul": probability}}), api_format
+        )
+        try:
+            assert _http_run(client, {"q": {"type": "noul"}}) == {"q": {"kind": "noul", "probability": probability}}
+        finally:
+            client._http_pool.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
+@pytest.mark.parametrize("setting", ["DECISION_API_FORMAT", "DECISION_API_URL", "DECISION_API_KEY", "DECISION_MODEL"])
+@pytest.mark.parametrize("value", [None, " \t"])
+def test_http_decision_requires_each_live_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str, setting: str, value: str | None
+) -> None:
+    client, seen = _http_client(tmp_path, monkeypatch, _body(api_format, _HTTP_ANSWERS), api_format)
+    if value is None:
+        monkeypatch.delenv(setting)
+    else:
+        monkeypatch.setenv(setting, value)
+    with pytest.raises(RuntimeError, match=f"decision_request_failed: missing {setting}"):
+        _http_run(client)
+    assert "request" not in seen and "persist" not in seen
+
+
+@pytest.mark.parametrize(
+    "value", ["openai", "chat", "decision", "Decisions", "responses", "chat_completions,decisions"]
+)
+def test_http_decision_rejects_unsupported_format(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    client, seen = _http_client(tmp_path, monkeypatch, _native_body(_HTTP_ANSWERS), "decisions")
+    monkeypatch.setenv("DECISION_API_FORMAT", value)
+    with pytest.raises(RuntimeError, match="decision_request_failed: unsupported DECISION_API_FORMAT"):
+        _http_run(client)
+    assert "request" not in seen and "persist" not in seen
+
+
+def test_http_decision_redacts_key_from_provider_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import urllib.error
+    import urllib.request
+    from email.message import Message
+
+    client, seen = _http_client(tmp_path, monkeypatch, b"")
+
+    def _error(request: urllib.request.Request, *, timeout: float) -> io.BytesIO:
+        raise urllib.error.HTTPError(
+            _DECISION_URL, 401, "Unauthorized", Message(), io.BytesIO(f"invalid {_DECISION_KEY}".encode())
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", _error)
+    with pytest.raises(RuntimeError, match=r"decision_request_failed: HTTP 401: invalid \[redacted\]") as exc:
+        _http_run(client)
+    assert _DECISION_KEY not in str(exc.value)
+    assert "persist" not in seen
+
+
+def test_http_decision_redacts_key_from_network_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import urllib.request
+
+    client, _ = _http_client(tmp_path, monkeypatch, b"")
+
+    def _error(request: urllib.request.Request, *, timeout: float) -> io.BytesIO:
+        raise OSError(f"network error {_DECISION_KEY}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _error)
+    with pytest.raises(RuntimeError, match=r"decision_request_failed: network error \[redacted\]") as exc:
+        _http_run(client)
+    assert _DECISION_KEY not in str(exc.value)
+    assert exc.value.__suppress_context__ is True
+
+
+@pytest.mark.parametrize(("via", "api_format"), [("http", "chat_completions"), ("http", "decisions"), ("stub", None)])
+@pytest.mark.parametrize(("input_tokens", "output_tokens"), [(12, 7), (None, None), (0, None), (None, 0)])
+def test_decision_persists_model_and_endpoint_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    via: str,
+    api_format: str | None,
+    input_tokens: int | None,
+    output_tokens: int | None,
+) -> None:
+    from types import SimpleNamespace
+
+    model = "provider-revision"
+    raw: dict[str, JSONValue] = {"answers": _HTTP_ANSWERS, "model": model}
+    normalized: dict[str, JSONValue] = {}
+    usage: dict[str, object] = {}
+    if input_tokens is not None:
+        normalized["input_tokens"] = input_tokens
+        usage["prompt_tokens"] = input_tokens
+    if output_tokens is not None:
+        normalized["output_tokens"] = output_tokens
+        usage["completion_tokens"] = output_tokens
+    if normalized:
+        raw["usage"] = normalized
+    if api_format is not None:
+        extra: dict[str, object] = {"model": model}
+        if usage:
+            extra["usage"] = _provider_usage(api_format, usage)
+        client, _ = _http_client(tmp_path, monkeypatch, _body(api_format, _HTTP_ANSWERS, **extra), api_format)
+        monkeypatch.setattr(client, "_persist", JevClient._persist.__get__(client, JevClient))
+    else:
+
+        def _transport(state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+            return raw
+
+        client = JevClient(transport=_transport, data_root=tmp_path)
+    monkeypatch.setenv("DECISION_API_URL", "https://user:secret@decisions.test:8443/custom/chat?secret=query#fragment")
+    domain: dict[str, object] = {}
+    events: list[dict[str, object]] = []
+    models: list[dict[str, object]] = []
+
+    def _domain(record: object, **kwargs: object) -> None:
+        domain.update(kwargs)
+
+    def _event(event_type: str, **kwargs: object) -> None:
+        events.append({"event_type": event_type, **kwargs})
+
+    def _model(**kwargs: object) -> float:
+        models.append(kwargs)
+        return 0.0
+
+    recorder = SimpleNamespace(enabled=True, record_event=_event, record_model_call=_model)
+    monkeypatch.setattr(client, "_persist_domain", _domain)
+    monkeypatch.setattr("app.decision_client.get_current_recorder", lambda: recorder)
+    _http_run(client)
+    provider = "https://decisions.test:8443/custom/chat" if via == "http" else None
+    assert domain["provider"] == provider
+    assert events[0]["event_type"] == "jev_decision"
+    assert events[0]["model"] == model
+    metadata = events[0]["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["provider"] == provider and metadata["via"] == via
+    assert metadata["model"] == model
+    assert metadata["usage"] == {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    if via == "http":
+        assert len(models) == 1
+        assert models[0]["provider"] == provider and models[0]["model"] == model
+        if input_tokens is not None and output_tokens is not None:
+            usage["total_tokens"] = input_tokens + output_tokens
+        assert models[0]["usage"] == (usage or None)
+    else:
+        assert models == []
+    encoded = json.dumps({"events": events, "models": models, "domain": domain})
+    assert _DECISION_KEY not in encoded
+    assert "user:secret" not in encoded and "secret=query" not in encoded
+
+
+def test_injected_transport_needs_no_live_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in ("DECISION_API_FORMAT", "DECISION_API_URL", "DECISION_API_KEY", "DECISION_MODEL"):
+        monkeypatch.delenv(key, raising=False)
+    client, _ = _capturing_client(tmp_path, monkeypatch)
+    assert _http_run(client, {"q": {"type": "noul"}}) == {"q": {"kind": "noul", "probability": 0.5}}
+
+
 def _answers(questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
-    """Stub SystemOne answers: first sorted option wins each choice. Noul 0.5."""
+    """Stub decision answers: first sorted option wins each choice. Noul 0.5."""
     out: dict[str, JSONValue] = {}
     for qid, q in questions.items():
         criteria = q.get("criteria") if isinstance(q, dict) else None

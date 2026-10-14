@@ -46,9 +46,6 @@
     "llama": "llama-server --models-dir ${HOME}/.cache/huggingface/hub --models-preset ${HOME}/.config/llama-server/presets.ini --models-max 1 --host 127.0.0.1 --port 8080",
     "lint": "venv/bin/ruff check . && venv/bin/ruff format --check . && (cd needle-harness && bun run typecheck) && (cd web && bunx tsc --noEmit)"
   },
-  "dependencies": {
-    "@typesafe-ai/sdk": "^0.6.0"
-  },
   "devDependencies": {
     "@stryker-mutator/core": "^10.0.0",
     "@stryker-mutator/typescript-checker": "^10.0.0",
