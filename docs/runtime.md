@@ -337,13 +337,24 @@ JEV calls one configured decision endpoint. `DECISION_API_FORMAT` selects the pr
 The `decision/runtime.ts` sidecar and the direct HTTP path in `app/decision_client.py` read the same settings:
 
 - `DECISION_API_FORMAT`: required. Accepted values are `chat_completions` and `decisions`.
-- `DECISION_API_URL`: the full endpoint URL. Stockbot sends each `POST` to this URL verbatim and appends no path.
+- `DECISION_API_URL`: the full HTTPS endpoint URL. Stockbot sends each `POST` to this URL verbatim and appends no path.
 - `DECISION_API_KEY`: the credential. Stockbot sends it as `Authorization: Bearer <key>`.
 - `DECISION_MODEL`: the one model for every existing JEV operation. These operations include entry routing, proposal disposition, tool selection, result assessment, and adjudication.
 
 Set these values in the root `.env` to select the protocol, endpoint, key, and model. No code change is necessary.
 The code supplies no format, URL, or model default. A live call fails when a value is blank.
 A missing, blank, or unsupported `DECISION_API_FORMAT` fails before any HTTP request.
+Both transports reject a non-HTTPS `DECISION_API_URL` before network access, including HTTP on loopback.
+Both transports reject every non-HTTPS redirect before the next request, including loopback HTTP.
+Relative redirects resolve against the current HTTPS URL.
+urllib follows POST 301/302/303 as GET.
+It rejects POST 307/308.
+Fetch follows POST 301/302/303 as GET and preserves POST bodies for 307/308.
+
+Fetch removes Authorization on redirects to another origin.
+urllib retains its native HTTPS redirect headers.
+Python retains urllib's redirect-loop limits and the caller's total timeout.
+Fetch permits at most 20 redirects within one shared 10-second timeout.
 Stockbot never infers the format from the key, model name, host, or URL path.
 Tests inject fake values.
 
@@ -422,6 +433,14 @@ FINRA freshness tests freeze the local date that the FINRA client reads.
 They check records at 90 and 91 days, including a year boundary.
 SEC facts tests freeze the UTC clock.
 They check that an omitted `as_of` uses the UTC date when the local date differs.
+
+Scheduler scope tests and the intake subject test replace company resolution with local doubles.
+They require no SEC lookup.
+
+Caller-disconnect tests run real workers with provider stubs.
+Coverage must collect child processes through `COVERAGE_PROCESS_START`.
+Use branch and parallel coverage for both parent and child processes.
+Parent-only coverage does not measure the watcher.
 
 The live judge runs each scenario through `create_research`, `create_node`,
 and `run_node` in an isolated per-attempt store. JEV, tool invocation, and the

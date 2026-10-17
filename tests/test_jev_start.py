@@ -14,12 +14,13 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Executor
+from http.client import HTTPMessage
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Self, override
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import given, seed, settings
 from hypothesis import strategies as st
 
 from app.decision_client import REASON_SENTINEL, RESOLVED_SENTINEL, JevClient
@@ -542,7 +543,7 @@ def test_outer_cancel_stops_hung_http_fallback(tmp_path: Path, monkeypatch: pyte
 
     monkeypatch.setattr(client, "_persist", _noop)
     monkeypatch.setattr(client, "_sidecar_roundtrip", _missing)
-    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    monkeypatch.setattr(client._http_opener, "open", _urlopen)
     _decision_env(monkeypatch)
 
     async def _scenario() -> None:
@@ -645,7 +646,7 @@ def test_http_fallback_runs_on_client_pool(tmp_path: Path, monkeypatch: pytest.M
 
     monkeypatch.setattr(client, "_persist", _noop)
     monkeypatch.setattr(client, "_sidecar_roundtrip", _missing)
-    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    monkeypatch.setattr(client._http_opener, "open", _urlopen)
     _decision_env(monkeypatch)
     assert asyncio.run(_run_and_close()) is client._http_pool
 
@@ -661,7 +662,7 @@ _HTTP_ANSWERS: dict[str, JSONValue] = {
 
 
 def _http_client(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: bytes, api_format: str = "chat_completions"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: bytes | None, api_format: str = "chat_completions"
 ) -> tuple[JevClient, dict[str, object]]:
     import urllib.request
 
@@ -677,6 +678,7 @@ def _http_client(
     def _urlopen(request: urllib.request.Request, *, timeout: float) -> io.BytesIO:
         seen["request"] = request
         seen["timeout"] = timeout
+        assert body is not None
         return io.BytesIO(body)
 
     def _persist(**kwargs: object) -> None:
@@ -684,7 +686,8 @@ def _http_client(
 
     monkeypatch.setattr(client, "_sidecar_roundtrip", _missing)
     monkeypatch.setattr(client, "_persist", _persist)
-    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    if body is not None:
+        monkeypatch.setattr(client._http_opener, "open", _urlopen)
     return client, seen
 
 
@@ -692,6 +695,169 @@ def _http_run(
     client: JevClient, questions: Mapping[str, JSONValue] = _HTTP_QUESTIONS
 ) -> dict[str, dict[str, JSONValue]]:
     return asyncio.run(client.decide({"source": "test evidence"}, questions, decision_type="t", session_id="s"))
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
+@pytest.mark.parametrize("host", ["decision.test", "localhost", "127.0.0.1", "[::1]"])
+def test_http_decision_rejects_http_before_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str, host: str
+) -> None:
+    client, seen = _http_client(tmp_path, monkeypatch, _body(api_format, _HTTP_ANSWERS), api_format)
+    monkeypatch.setenv("DECISION_API_URL", f"http://{host}/v1/decide?token={_DECISION_KEY}")
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            _http_run(client)
+        assert str(exc.value) == "decide: decision_request_failed: DECISION_API_URL must use HTTPS"
+        assert _DECISION_KEY not in str(exc.value)
+        assert seen == {}
+    finally:
+        client._http_pool.shutdown(wait=True)
+
+
+class _RedirectHttpResp(io.BytesIO):
+    """HTTP response at urllib's socket boundary; the real opener handles redirects."""
+
+    def __init__(self, body: bytes, code: int, location: str | None) -> None:
+        super().__init__(body)
+        self.code = code
+        self.msg = "test response"
+        self.headers = HTTPMessage()
+        if location is not None:
+            self.headers["Location"] = location
+
+    def info(self) -> HTTPMessage:
+        return self.headers
+
+
+def _redirect_http_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    api_format: str,
+    replies: Sequence[tuple[int, str | None]],
+) -> tuple[JevClient, dict[str, object], list[object], list[_RedirectHttpResp]]:
+    import urllib.request
+
+    client, seen = _http_client(tmp_path, monkeypatch, None, api_format)
+    requests: list[object] = []
+    responses: list[_RedirectHttpResp] = []
+
+    def _open(_handler: urllib.request.AbstractHTTPHandler, request: urllib.request.Request) -> _RedirectHttpResp:
+        assert len(requests) < len(replies), "unexpected redirect transport call"
+        code, location = replies[len(requests)]
+        requests.append(request)
+        body = _body(api_format, _HTTP_ANSWERS) if code == 200 else f"redirect {_DECISION_KEY}".encode()
+        response = _RedirectHttpResp(body, code, location)
+        responses.append(response)
+        return response
+
+    monkeypatch.setattr(urllib.request.HTTPSHandler, "https_open", _open)
+    monkeypatch.setattr(urllib.request.HTTPHandler, "http_open", _open)
+    return client, seen, requests, responses
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
+@pytest.mark.parametrize("host", ["decision.test", "localhost", "127.0.0.1", "[::1]"])
+@pytest.mark.parametrize("secure_hop", [False, True])
+def test_http_decision_rejects_redirect_downgrade_before_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str, host: str, secure_hop: bool
+) -> None:
+    import urllib.request
+
+    replies: list[tuple[int, str | None]] = [(302, "/secure")] if secure_hop else []
+    replies.append((302, f"http://{host}/decide?token={_DECISION_KEY}"))
+    client, seen, requests, responses = _redirect_http_client(tmp_path, monkeypatch, api_format, replies)
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            _http_run(client)
+        assert str(exc.value) == "decide: decision_request_failed: decision redirects must use HTTPS"
+        assert _DECISION_KEY not in str(exc.value)
+        assert len(requests) == (2 if secure_hop else 1)
+        for request in requests:
+            assert isinstance(request, urllib.request.Request)
+            assert request.full_url.startswith("https://")
+        assert all(response.closed for response in responses)
+        assert "persist" not in seen
+    finally:
+        client._http_pool.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
+@pytest.mark.parametrize("status", [301, 302, 303])
+@pytest.mark.parametrize("location", ["/resolved", "https://decision.test/resolved", "https://other.test/resolved"])
+def test_http_decision_follows_secure_redirect_with_native_request_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str, status: int, location: str
+) -> None:
+    import urllib.parse
+    import urllib.request
+
+    client, seen, requests, responses = _redirect_http_client(
+        tmp_path, monkeypatch, api_format, [(status, location), (200, None)]
+    )
+    try:
+        assert _http_run(client)["q"] == {"kind": "noul", "probability": 0.75}
+        assert len(requests) == 2
+        first, redirected = requests
+        assert isinstance(first, urllib.request.Request)
+        assert isinstance(redirected, urllib.request.Request)
+        assert first.get_method() == "POST"
+        assert isinstance(first.data, bytes)
+        body = json.loads(first.data)
+        state = {"source": "test evidence"}
+        if api_format == "decisions":
+            assert first.full_url == _NATIVE_URL
+            assert body == {"model": _NATIVE_MODEL, "state": state, "questions": _HTTP_QUESTIONS}
+        else:
+            assert first.full_url == _DECISION_URL
+            assert set(body) == {"model", "messages", "stream"}
+            assert body["model"] == _DECISION_MODEL and body["stream"] is False
+            system, user = body["messages"]
+            assert system["role"] == "system" and system["content"].startswith("You are the decision authority.")
+            assert user["role"] == "user"
+            assert json.loads(user["content"]) == {"state": state, "questions": _HTTP_QUESTIONS}
+        assert first.get_header("Authorization") == f"Bearer {_DECISION_KEY}"
+        assert first.get_header("Content-type") == "application/json"
+        assert redirected.full_url == urllib.parse.urljoin(first.full_url, location)
+        assert redirected.get_method() == "GET" and redirected.data is None
+        assert redirected.get_header("Authorization") == f"Bearer {_DECISION_KEY}"
+        assert redirected.get_header("Content-type") is None
+        assert redirected.get_header("Content-length") is None
+        assert all(response.closed for response in responses)
+        assert "persist" in seen
+    finally:
+        client._http_pool.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
+@pytest.mark.parametrize("status", [307, 308])
+def test_http_decision_retains_urllib_post_redirect_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str, status: int
+) -> None:
+    client, seen, requests, _ = _redirect_http_client(tmp_path, monkeypatch, api_format, [(status, "/secure")])
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            _http_run(client)
+        assert str(exc.value) == f"decide: decision_request_failed: HTTP {status}: redirect [redacted]"
+        assert _DECISION_KEY not in str(exc.value)
+        assert len(requests) == 1
+        assert "persist" not in seen
+    finally:
+        client._http_pool.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
+def test_http_decision_secure_redirect_loop_stops_at_urllib_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str
+) -> None:
+    client, seen, requests, _ = _redirect_http_client(tmp_path, monkeypatch, api_format, [(302, "/loop")] * 5)
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            _http_run(client)
+        assert str(exc.value) == "decide: decision_request_failed: HTTP 302: redirect [redacted]"
+        assert _DECISION_KEY not in str(exc.value)
+        assert len(requests) == 5
+        assert "persist" not in seen
+    finally:
+        client._http_pool.shutdown(wait=True)
 
 
 def test_http_decision_uses_configured_chat_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1021,6 +1187,42 @@ def test_prop_http_noul_probability_roundtrip(api_format: str, probability: floa
 
 
 @pytest.mark.parametrize("api_format", _FORMATS)
+@seed(20261017)
+@settings(max_examples=60, deadline=None)
+@given(
+    scheme=st.one_of(
+        st.sampled_from(["https", "HTTPS", "hTtPs", "http", "HTTP", "ftp", "file", "ws", "wss"]),
+        st.from_regex(r"[A-Za-z][A-Za-z0-9+.-]{0,12}", fullmatch=True),
+    ),
+    host=st.sampled_from(["decision.test", "localhost", "127.0.0.1", "[::1]"]),
+)
+def test_prop_http_decision_accepts_only_https(api_format: str, scheme: str, host: str) -> None:
+    import urllib.request
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        client, seen = _http_client(Path("/tmp"), monkeypatch, _body(api_format, _HTTP_ANSWERS), api_format)
+        url = f"{scheme}://{host}/v1/decide"
+        monkeypatch.setenv("DECISION_API_URL", url)
+        try:
+            if scheme.lower() == "https":
+                out = _http_run(client)
+                assert out["q"] == {"kind": "noul", "probability": 0.75}
+                request = seen["request"]
+                assert isinstance(request, urllib.request.Request)
+                assert request.full_url == url
+                assert request.get_header("Authorization") == f"Bearer {_DECISION_KEY}"
+                assert "persist" in seen
+            else:
+                with pytest.raises(RuntimeError) as exc:
+                    _http_run(client)
+                assert str(exc.value) == "decide: decision_request_failed: DECISION_API_URL must use HTTPS"
+                assert _DECISION_KEY not in str(exc.value)
+                assert seen == {}
+        finally:
+            client._http_pool.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
 @pytest.mark.parametrize("setting", ["DECISION_API_FORMAT", "DECISION_API_URL", "DECISION_API_KEY", "DECISION_MODEL"])
 @pytest.mark.parametrize("value", [None, " \t"])
 def test_http_decision_requires_each_live_setting(
@@ -1059,7 +1261,7 @@ def test_http_decision_redacts_key_from_provider_error(tmp_path: Path, monkeypat
             _DECISION_URL, 401, "Unauthorized", Message(), io.BytesIO(f"invalid {_DECISION_KEY}".encode())
         )
 
-    monkeypatch.setattr(urllib.request, "urlopen", _error)
+    monkeypatch.setattr(client._http_opener, "open", _error)
     with pytest.raises(RuntimeError, match=r"decision_request_failed: HTTP 401: invalid \[redacted\]") as exc:
         _http_run(client)
     assert _DECISION_KEY not in str(exc.value)
@@ -1074,7 +1276,7 @@ def test_http_decision_redacts_key_from_network_error(tmp_path: Path, monkeypatc
     def _error(request: urllib.request.Request, *, timeout: float) -> io.BytesIO:
         raise OSError(f"network error {_DECISION_KEY}")
 
-    monkeypatch.setattr(urllib.request, "urlopen", _error)
+    monkeypatch.setattr(client._http_opener, "open", _error)
     with pytest.raises(RuntimeError, match=r"decision_request_failed: network error \[redacted\]") as exc:
         _http_run(client)
     assert _DECISION_KEY not in str(exc.value)

@@ -30,9 +30,10 @@ import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from http.client import HTTPMessage
 from itertools import combinations
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn, Protocol, TypeGuard, runtime_checkable
+from typing import IO, TYPE_CHECKING, NoReturn, Protocol, TypeGuard, override, runtime_checkable
 
 from app.child_spawn import registering_child
 from app.config import get_data_root
@@ -1080,6 +1081,25 @@ def _http_error_text(exc: urllib.error.HTTPError, key: str) -> str:
     return text.replace(key, "[redacted]")[:300]
 
 
+class _HttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Retain urllib's redirect semantics, but never open a non-HTTPS target."""
+
+    @override
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        if urllib.parse.urlsplit(newurl).scheme != "https":
+            fp.close()
+            raise ValueError("decision redirects must use HTTPS")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _envelope_error(reason: str) -> TypeError:
     """One error shape for every rejected provider body."""
     return TypeError(f"decide: malformed_decision_response: {reason}")
@@ -1442,6 +1462,7 @@ class JevClient:
         # ponytail: own HTTP pool, never the loop default executor, so a
         # cancelled asyncio.run never waits for a stuck urlopen thread.
         self._http_pool = _futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="jev-http")
+        self._http_opener = urllib.request.build_opener(_HttpsRedirectHandler())
         root = Path(__file__).resolve().parent.parent
         self._runtime_ts = Path(runtime_path) if runtime_path is not None else root / "decision" / "runtime.ts"
         self._repo_root = root
@@ -1634,7 +1655,9 @@ class JevClient:
         )
         token = _INVOKE_TOKEN.get()
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout_s) as resp:
+            if urllib.parse.urlsplit(url).scheme != "https":
+                raise ValueError("DECISION_API_URL must use HTTPS")
+            with self._http_opener.open(req, timeout=self._timeout_s) as resp:
                 if token is not None:
                     with self._cancel_guard:
                         self._http_live[token] = resp.close

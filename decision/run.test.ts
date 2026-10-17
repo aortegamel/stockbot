@@ -2,7 +2,7 @@
 // Chat Completions and native Decisions transports. No live calls: OpenCode and
 // decision fetches are stubbed, and systemOne is an in-process stub inspecting
 // each question body. Each run writes to a temp dir; no .env reads.
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import fc from "fast-check";
 import { mkdtemp, readdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -706,6 +706,278 @@ async function decideError(body: unknown, status = 200): Promise<string> {
   return res.error;
 }
 
+test("both decision formats reject HTTP before transport, including loopback", async () => {
+  for (const format of ["chat_completions", "decisions"]) {
+    for (const host of ["decision.test", "localhost", "127.0.0.1", "[::1]"]) {
+      setDecisionEnv({
+        DECISION_API_FORMAT: format,
+        DECISION_API_URL: `http://${host}/v1/decide?token=${DECISION_ENV.DECISION_API_KEY}`,
+      });
+      const calls: FetchCall[] = [];
+      const res = await decide(recordingFetch(calls, () => chat({ answers: GOOD })));
+      expect(res).toEqual({ id: "r1", error: "decide: decision_request_failed: DECISION_API_URL must use HTTPS" });
+      expect(JSON.stringify(res)).not.toContain(DECISION_ENV.DECISION_API_KEY);
+      expect(calls).toHaveLength(0);
+    }
+  }
+});
+
+test("both decision formats accept only HTTPS schemes", async () => {
+  await fc.assert(fc.asyncProperty(
+    fc.oneof(
+      fc.constantFrom("https", "HTTPS", "hTtPs", "http", "HTTP", "ftp", "file", "ws", "wss"),
+      fc.stringMatching(/^[A-Za-z][A-Za-z0-9+.-]{0,12}$/),
+    ),
+    fc.constantFrom("decision.test", "localhost", "127.0.0.1", "[::1]"),
+    async (scheme, host) => {
+      for (const format of ["chat_completions", "decisions"]) {
+        const url = `${scheme}://${host}/v1/decide`;
+        setDecisionEnv({ DECISION_API_FORMAT: format, DECISION_API_URL: url });
+        const body = format === "decisions" ? { answers: GOOD } : completion(JSON.stringify({ answers: GOOD }));
+        const calls: FetchCall[] = [];
+        const res = await decide(recordingFetch(calls, () => chat(body)));
+        if (scheme.toLowerCase() === "https") {
+          expect(calls).toHaveLength(1);
+          expect(calls[0].url).toBe(url);
+          expect(calls[0].init.headers).toEqual({
+            Authorization: `Bearer ${DECISION_ENV.DECISION_API_KEY}`,
+            "Content-Type": "application/json",
+          });
+          expect(res).toHaveProperty("decisions.truth", { kind: "noul", probability: 0.7 });
+        } else {
+          expect(res).toEqual({ id: "r1", error: "decide: decision_request_failed: DECISION_API_URL must use HTTPS" });
+          expect(JSON.stringify(res)).not.toContain(DECISION_ENV.DECISION_API_KEY);
+          expect(calls).toHaveLength(0);
+        }
+      }
+    },
+  ), { seed: 20261017, numRuns: 60 });
+});
+
+test("both formats reject non-HTTPS redirects before contacting any target", async () => {
+  for (const format of ["chat_completions", "decisions"]) {
+    for (const status of [301, 302, 303, 307, 308]) {
+      for (const target of [
+        "http://decision.test", "http://localhost", "http://127.0.0.1", "http://[::1]",
+        "ftp://decision.test", "file:///tmp/decision", "ws://decision.test", "wss://decision.test",
+      ]) {
+        for (const secureHop of [false, true]) {
+          setDecisionEnv({ DECISION_API_FORMAT: format });
+          const calls: FetchCall[] = [];
+          let released = 0;
+          const res = await decide(recordingFetch(calls, () => new Response(new ReadableStream({
+            cancel() { released++; },
+          }), {
+            status,
+            headers: {
+              Location: secureHop && calls.length === 1
+                ? "/secure-hop"
+                : `${target}/decide?token=${DECISION_ENV.DECISION_API_KEY}`,
+            },
+          })));
+          expect(res).toEqual({ id: "r1", error: "decide: decision_request_failed: DECISION_API_URL redirect must use HTTPS" });
+          expect(JSON.stringify(res)).not.toContain(DECISION_ENV.DECISION_API_KEY);
+          expect(calls.map((call) => call.url)).toEqual(secureHop
+            ? [DECISION_ENV.DECISION_API_URL, "https://decision.test/secure-hop"]
+            : [DECISION_ENV.DECISION_API_URL]);
+          expect(calls.every((call) => call.init.redirect === "manual")).toBe(true);
+          expect(released).toBe(calls.length);
+        }
+      }
+    }
+  }
+});
+
+test("secure relative redirects preserve both wire formats, headers, and the initial endpoint string", async () => {
+  for (const format of ["chat_completions", "decisions"]) {
+    const endpoint = "HTTPS://Decision.TEST:443/api/alpha/decisions?escaped=%2f";
+    setDecisionEnv({ DECISION_API_FORMAT: format, DECISION_API_URL: endpoint });
+    const calls: FetchCall[] = [];
+    const locations = ["../next?escaped=%2f", "?page=2", "//decision.test/final", ""];
+    let released = 0;
+    const body = format === "decisions" ? { answers: GOOD } : completion(JSON.stringify({ answers: GOOD }));
+    const res = await decide(recordingFetch(calls, (init) => {
+      if (calls.length <= locations.length) {
+        expect(released).toBe(calls.length - 1);
+        return new Response(new ReadableStream({ cancel() { released++; } }), {
+          status: calls.length % 2 ? 307 : 308,
+          headers: { Location: locations[calls.length - 1] },
+        });
+      }
+      expect(released).toBe(locations.length);
+      expect(init.signal).toBe(calls[0].init.signal);
+      return chat(body);
+    }));
+    expect(res).toHaveProperty("decisions.truth", { kind: "noul", probability: 0.7 });
+    expect(calls.map((call) => call.url)).toEqual([
+      endpoint, "https://decision.test/api/next?escaped=%2f", "https://decision.test/api/next?page=2",
+      "https://decision.test/final", "https://decision.test/final",
+    ]);
+    for (const { init } of calls) {
+      expect(init.method).toBe("POST");
+      expect(init.redirect).toBe("manual");
+      expect(init.signal).toBeInstanceOf(AbortSignal);
+      expect(init.signal).toBe(calls[0].init.signal);
+      expect(init.headers).toEqual({
+        Authorization: `Bearer ${DECISION_ENV.DECISION_API_KEY}`,
+        "Content-Type": "application/json",
+      });
+      expect(init.body).toBe(calls[0].init.body);
+      const request = JSON.parse(String(init.body));
+      if (format === "decisions") {
+        expect(request).toEqual({ model: DECISION_ENV.DECISION_MODEL, state: { s: 1 }, questions: Q });
+      } else {
+        expect(Object.keys(request).sort()).toEqual(["messages", "model", "stream"]);
+        expect(request.model).toBe(DECISION_ENV.DECISION_MODEL);
+        expect(request.stream).toBe(false);
+        expect(request.messages.map((message: { role: string }) => message.role)).toEqual(["system", "user"]);
+        expect(typeof request.messages[0].content).toBe("string");
+        expect(JSON.parse(request.messages[1].content)).toEqual({ state: { s: 1 }, questions: Q });
+      }
+    }
+  }
+});
+
+test("both formats follow Fetch method and body rules for every redirect status", async () => {
+  for (const format of ["chat_completions", "decisions"]) {
+    for (const status of [301, 302, 303, 307, 308]) {
+      setDecisionEnv({ DECISION_API_FORMAT: format });
+      const calls: FetchCall[] = [];
+      const body = format === "decisions" ? { answers: GOOD } : completion(JSON.stringify({ answers: GOOD }));
+      const res = await decide(recordingFetch(calls, () => calls.length < 3
+        ? new Response(null, { status: calls.length === 1 ? status : 303, headers: { Location: "/next" } })
+        : chat(body)));
+      expect(res).toHaveProperty("decisions.truth", { kind: "noul", probability: 0.7 });
+      expect(calls).toHaveLength(3);
+      expect(calls[0].init.method).toBe("POST");
+      expect(calls[0].init.body).toBeString();
+      expect(new Headers(calls[0].init.headers).get("Content-Type")).toBe("application/json");
+      const retainsBody = status === 307 || status === 308;
+      expect(calls[1].init.method).toBe(retainsBody ? "POST" : "GET");
+      expect(calls[1].init.body).toBe(retainsBody ? calls[0].init.body : undefined);
+      expect(new Headers(calls[1].init.headers).get("Content-Type")).toBe(retainsBody ? "application/json" : null);
+      expect(calls[2].init.method).toBe("GET");
+      expect(calls[2].init.body).toBeUndefined();
+      expect(new Headers(calls[2].init.headers).get("Content-Type")).toBeNull();
+      for (const { init } of calls) {
+        expect(new Headers(init.headers).get("Authorization")).toBe(`Bearer ${DECISION_ENV.DECISION_API_KEY}`);
+        expect(init.redirect).toBe("manual");
+      }
+    }
+  }
+});
+
+test("both formats strip Authorization across origins without restoring it on return", async () => {
+  for (const format of ["chat_completions", "decisions"]) {
+    for (const target of ["https://other.test/next", "https://decision.test:444/next"]) {
+      setDecisionEnv({ DECISION_API_FORMAT: format });
+      const calls: FetchCall[] = [];
+      const body = format === "decisions" ? { answers: GOOD } : completion(JSON.stringify({ answers: GOOD }));
+      const res = await decide(recordingFetch(calls, () => calls.length < 3
+        ? new Response(null, { status: 307, headers: { Location: calls.length === 1 ? target : DECISION_ENV.DECISION_API_URL } })
+        : chat(body)));
+      expect(res).toHaveProperty("decisions.truth", { kind: "noul", probability: 0.7 });
+      expect(calls.map((call) => call.url)).toEqual([DECISION_ENV.DECISION_API_URL, target, DECISION_ENV.DECISION_API_URL]);
+      expect(new Headers(calls[0].init.headers).get("Authorization")).toBe(`Bearer ${DECISION_ENV.DECISION_API_KEY}`);
+      for (const { init } of calls.slice(1)) {
+        expect(new Headers(init.headers).has("Authorization")).toBe(false);
+        expect(new Headers(init.headers).get("Content-Type")).toBe("application/json");
+        expect(init.method).toBe("POST");
+        expect(init.body).toBe(calls[0].init.body);
+      }
+    }
+  }
+});
+
+test("both formats allow 20 redirects but release and reject the next redirect", async () => {
+  for (const format of ["chat_completions", "decisions"]) {
+    for (const exhaust of [false, true]) {
+      setDecisionEnv({ DECISION_API_FORMAT: format });
+      const calls: FetchCall[] = [];
+      let released = 0;
+      const body = format === "decisions" ? { answers: GOOD } : completion(JSON.stringify({ answers: GOOD }));
+      const res = await decide(recordingFetch(calls, () => {
+        if (!exhaust && calls.length === 21) return chat(body);
+        return new Response(new ReadableStream({ cancel() { released++; } }), {
+          status: 308, headers: { Location: DECISION_ENV.DECISION_API_URL },
+        });
+      }));
+      expect(calls).toHaveLength(21);
+      expect(released).toBe(exhaust ? 21 : 20);
+      if (exhaust) {
+        expect(res).toEqual({ id: "r1", error: "decide: decision_request_failed: DECISION_API_URL exceeded 20 redirects" });
+      } else {
+        expect(res).toHaveProperty("decisions.truth", { kind: "noul", probability: 0.7 });
+      }
+    }
+  }
+});
+
+test("both formats create one timeout for all redirect hops and the final body", async () => {
+  for (const format of ["chat_completions", "decisions"]) {
+    setDecisionEnv({ DECISION_API_FORMAT: format });
+    const controller = new AbortController();
+    const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+    try {
+      const calls: FetchCall[] = [];
+      const body = format === "decisions" ? { answers: GOOD } : completion(JSON.stringify({ answers: GOOD }));
+      let readBody = false;
+      const res = await decide(recordingFetch(calls, (init) => {
+        expect(init.signal).toBe(controller.signal);
+        if (calls.length === 1) return new Response(null, { status: 307, headers: { Location: "/next" } });
+        return new Response(new ReadableStream({
+          pull(stream) {
+            expect(init.signal).toBe(controller.signal);
+            expect(timeout).toHaveBeenCalledTimes(1);
+            readBody = true;
+            stream.enqueue(new TextEncoder().encode(JSON.stringify(body)));
+            stream.close();
+          },
+        }));
+      }));
+      expect(res).toHaveProperty("decisions.truth", { kind: "noul", probability: 0.7 });
+      expect(readBody).toBe(true);
+      expect(calls).toHaveLength(2);
+      expect(timeout).toHaveBeenCalledTimes(1);
+      expect(timeout).toHaveBeenCalledWith(10_000);
+    } finally {
+      timeout.mockRestore();
+    }
+  }
+});
+
+test("both formats redact redirect parsing, cancellation, fetch, and body errors", async () => {
+  for (const format of ["chat_completions", "decisions"]) {
+    for (const failure of ["location", "cancel", "fetch", "body"]) {
+      setDecisionEnv({ DECISION_API_FORMAT: format });
+      const calls: FetchCall[] = [];
+      let released = false;
+      const message = `redirect failed for ${DECISION_ENV.DECISION_API_KEY}`;
+      const res = await decide(recordingFetch(calls, () => {
+        if (calls.length === 1) {
+          return new Response(new ReadableStream({
+            cancel() {
+              released = true;
+              if (failure === "cancel") throw new Error(message);
+            },
+          }), {
+            status: 307,
+            headers: { Location: failure === "location" ? `https://[${DECISION_ENV.DECISION_API_KEY}` : "/next" },
+          });
+        }
+        if (failure === "fetch") throw new Error(message);
+        return new Response(new ReadableStream({ start(stream) { stream.error(new Error(message)); } }));
+      }));
+      expect(released).toBe(true);
+      expect(calls).toHaveLength(failure === "location" || failure === "cancel" ? 1 : 2);
+      if (!("error" in res)) throw new Error("expected decide error");
+      expect(res.error).toStartWith("decide: decision_request_failed:");
+      expect(res.error).not.toContain(DECISION_ENV.DECISION_API_KEY);
+      if (failure !== "location") expect(res.error).toContain("redirect failed for [redacted]");
+    }
+  }
+});
+
 test("decision transport keeps the SDK question guards before any request", async () => {
   setDecisionEnv();
   const score = (criteria: unknown) => ({ m: { type: "score", instructions: "How material?", criteria } });
@@ -754,6 +1026,22 @@ test("decision transport posts the configured Chat Completions request and norma
   expect(res.raw).toEqual({ answers: GOOD, model: "provider-model", usage: { input_tokens: 12, output_tokens: 5 } });
   expect(res.decisions.truth).toEqual({ kind: "noul", probability: 0.7 });
   expect(res.decisions.route).toEqual({ kind: "choice", choice: "a", probabilities: { a: 0.6, b: 0.4 }, confidence: 0.6 });
+});
+test("successful 200 responses ignore a Location header", async () => {
+  for (const format of ["chat_completions", "decisions"] as const) {
+    setDecisionEnv({ DECISION_API_FORMAT: format });
+    const calls: FetchCall[] = [];
+    const body = format === "decisions" ? { answers: GOOD } : completion(JSON.stringify({ answers: GOOD }));
+    const res = (await decide(recordingFetch(calls, () => new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { Location: "https://decision.test/not-a-redirect" },
+    })))) as DecideOk;
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe(DECISION_ENV.DECISION_API_URL);
+    expect(res.decisions.truth).toEqual({ kind: "noul", probability: 0.7 });
+    expect(res.decisions.route).toEqual({ kind: "choice", choice: "a", probabilities: { a: 0.6, b: 0.4 }, confidence: 0.6 });
+    expect(res.raw).toMatchObject({ answers: GOOD });
+  }
 });
 
 test("decision transport records DECISION_MODEL and no usage when the provider omits them", async () => {

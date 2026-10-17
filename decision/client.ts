@@ -75,21 +75,45 @@ export function createSystemOne(fetchImpl: typeof fetch = fetch): SystemOneFn {
     let res: Response;
     let text: string;
     try {
-      res = await fetchImpl(url, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify(native
-          ? { model, state: req.state, questions: req.questions }
-          : {
-            model,
-            messages: [
-              { role: "system", content: SYSTEM_PROMPT },
-              { role: "user", content: JSON.stringify({ state: req.state, questions: req.questions }) },
-            ],
-            stream: false,
-          }),
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-      });
+      let current = new URL(url);
+      if (current.protocol !== "https:") throw new Error("DECISION_API_URL must use HTTPS");
+      let endpoint = url;
+      let method = "POST";
+      let headers: Record<string, string> = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+      let body: string | undefined = JSON.stringify(native
+        ? { model, state: req.state, questions: req.questions }
+        : {
+          model,
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            { role: "user", content: JSON.stringify({ state: req.state, questions: req.questions }) },
+          ],
+          stream: false,
+        });
+      const signal = AbortSignal.timeout(TIMEOUT_MS);
+      for (let redirects = 0; ; redirects++) {
+        res = await fetchImpl(endpoint, { method, headers, body, redirect: "manual", signal });
+        if (res.status !== 301 && res.status !== 302 && res.status !== 303
+          && res.status !== 307 && res.status !== 308) break;
+        const location = res.headers.get("Location");
+        if (location === null) break;
+        await res.body?.cancel();
+        if (redirects === 20) throw new Error("DECISION_API_URL exceeded 20 redirects");
+        const next = new URL(location, current);
+        if (next.protocol !== "https:") throw new Error("DECISION_API_URL redirect must use HTTPS");
+        const changesOrigin = next.origin !== current.origin;
+        const dropsBody = ((res.status === 301 || res.status === 302) && method === "POST")
+          || (res.status === 303 && method !== "GET");
+        if (changesOrigin || dropsBody) headers = { ...headers };
+        if (changesOrigin) delete headers.Authorization;
+        if (dropsBody) {
+          method = "GET";
+          body = undefined;
+          delete headers["Content-Type"];
+        }
+        current = next;
+        endpoint = next.href;
+      }
       text = await res.text();
     } catch (e) {
       // Fetch errors can quote header values (e.g. an invalid Authorization header).
