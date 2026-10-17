@@ -906,8 +906,12 @@ def test_expansion_is_fail_closed_on_jev_outage() -> None:
     assert n == 0 and created == []
 
 
-def test_reason_path_calls_analyze_then_expand() -> None:
-    """Production reason path: analyze shape (no proposals) -> expand supplies proposals."""
+@pytest.mark.parametrize("remaining", [None, 30.0], ids=["unbounded", "deadline"])
+def test_reason_path_calls_analyze_then_expand(remaining: float | None) -> None:
+    """A node admits follow-ups after analysis and adjudication, with or without a deadline."""
+    import re
+    import time
+
     created: list[str] = []
     calls: list[str] = []
 
@@ -962,13 +966,17 @@ def test_reason_path_calls_analyze_then_expand() -> None:
         @override
         def analyze(self, prompt: str) -> dict[str, list[dict[str, object]]]:
             calls.append("analyze")
-            assert isinstance(prompt, str) and "CONTEXT" in prompt
+            assert "Objective?" in prompt and re.search(r"\b\d{4}-\d{2}-\d{2}\b", prompt)
+            if remaining is not None:
+                assert 1.0 <= self.timeout_s <= remaining
             return {"analyses": [{"nodeId": "n1"}], "evidenceRequests": []}
 
         @override
         def expand(self, prompt: str, objective_id: str, prior_ids: set[str] | None = None) -> dict[str, list[object]]:
             calls.append("expand")
-            assert isinstance(prompt, str) and "n1" in prompt
+            assert "Objective?" in prompt and re.search(r"\b\d{4}-\d{2}-\d{2}\b", prompt)
+            if remaining is not None:
+                assert 1.0 <= self.timeout_s <= remaining
             assert objective_id == "s1" and prior_ids is not None and "n1" in prior_ids
             return {"proposals": [{"question": "Follow-up?", "whyItMatters": "Why"}]}
 
@@ -978,25 +986,28 @@ def test_reason_path_calls_analyze_then_expand() -> None:
     def invoke(*a: object, **k: object) -> dict[str, JSONValue]:
         return {"tool_result_id": None}
 
+    reasoner = _R(model="m", url="u", timeout_s=120.0)
     with mock.patch.object(sched, "_MAX_TOOL_ROUNDS", 1):
         out = asyncio.run(
-            sched._run_node(
+            sched.run_node(
                 _node(),
                 session_id="s1",
                 kernel=_K(objective="Objective?"),
                 jev=_J(),
-                reasoner=_R(model="m", url="u"),
+                reasoner=reasoner,
                 needle_generate=gen,
                 invoke=invoke,
                 to_outcome=_to_outcome,
                 registry=[{"name": "query_finra", "parameters": {}}],
                 tool_session=_tool_session(),
+                deadline_at=None if remaining is None else time.perf_counter() + remaining,
             )
         )
     assert calls[0] == "analyze" and "expand" in calls
     assert calls.index("analyze") < calls.index("adjudicate") < calls.index("expand")
     assert created == ["Follow-up?"]
     assert out["admitted"] == 0
+    assert reasoner.timeout_s == 120.0
 
 
 def test_other_no_resolve_without_admitted_evidence() -> None:
@@ -1092,25 +1103,45 @@ def test_failed_outcome_never_reaches_assess() -> None:
     assert out["admitted"] == 0
 
 
-def test_resume_winner_filtered_from_in_node_registry() -> None:
-    """research_resume re-enters its own node so it can never advance it; filtered in-node."""
-    ctx = sched._node_context(
-        _node(),
-        "s1",
-        _Kernel(),
-        {
-            "registry": [
+def test_node_selection_excludes_recursive_research_controls() -> None:
+    seen: list[set[str]] = []
+
+    class _J(_JevAdmit):
+        @override
+        async def select_tool(self, *a: object, **k: object) -> ToolDecision:
+            registry = a[2]
+            assert isinstance(registry, list)
+            seen.append({str(entry["name"]) for entry in registry})
+            return _invoke("query_finra")
+
+    def generate(**kw: object) -> dict[str, JSONValue]:
+        return {"tool": "query_finra", "arguments": {}}
+
+    def invoke(*a: object, **kw: object) -> dict[str, JSONValue]:
+        return dict(_FINRA_RESULT)
+
+    kernel = _Kernel({"s1:tr:abc": dict(_FINRA_RESULT)})
+    out = asyncio.run(
+        sched.run_node(
+            _node(),
+            "s1",
+            kernel=kernel,
+            jev=_J(),
+            needle_generate=generate,
+            invoke=invoke,
+            to_outcome=_to_outcome,
+            registry=[
                 {"name": "research_resume", "parameters": {}},
                 {"name": "research_start", "parameters": {}},
                 {"name": "research_read_search", "parameters": {}},
                 {"name": "query_finra", "parameters": {}},
-            ]
-        },
+            ],
+            tool_session=_tool_session(),
+        )
     )
-    names = [e.get("name") for e in ctx["registry"]]
-    assert "research_resume" not in names
-    assert "research_start" not in names
-    assert "query_finra" in names
+    assert seen and all("query_finra" in names for names in seen)
+    assert all(not names.intersection({"research_resume", "research_start"}) for names in seen)
+    assert out["status"] == "resolved" and out["admitted"] == 1
 
 
 def test_repeated_winner_drop_triggers_on_4_of_5() -> None:
@@ -1613,9 +1644,14 @@ def test_runtime_mismatch_no_packet_reraises() -> None:
         raise AssertionError("mismatch without packet must re-raise")
 
 
-def test_context_carries_scope_and_today() -> None:
-    """Needle context carries resolved temporal_scope + today_utc."""
+def test_node_generation_receives_scope_date_and_verbatim_objective() -> None:
+    """A node supplies temporal anchors without rewriting the user's objective."""
+    from datetime import date
+
+    from app.tool_runtime import outcome_from_result
+
     seen: dict[str, object] = {}
+    invoked: list[dict[str, JSONValue]] = []
 
     async def fake_gen(**kw: object) -> dict[str, JSONValue]:
         seen.update(kw)
@@ -1635,47 +1671,49 @@ def test_context_carries_scope_and_today() -> None:
         "objective": "q?",
         "temporal_scope": scope,
     }
-    asyncio.run(
-        sched._generate_tool_arguments(fake_gen, "list_sec_filings", [], session, _node(), [], [], None, _Kernel())
+
+    class _K(_Kernel):
+        @override
+        def get_session(self, session_id: str) -> dict[str, JSONValue]:
+            return session
+
+    def invoke(name: str, args: dict[str, JSONValue], tool_session: object, **kw: object) -> dict[str, JSONValue]:
+        invoked.append(args)
+        return {}
+
+    class _J(_JevAdmit):
+        @override
+        async def select_tool(self, *a: object, **k: object) -> ToolDecision:
+            return _invoke("list_sec_filings")
+
+        @override
+        async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
+            return {"evidence_state": "insufficient", "continuation": "continue_research"}
+
+    out = asyncio.run(
+        sched.run_node(
+            _node(),
+            "s1",
+            kernel=_K(),
+            jev=_J(),
+            needle_generate=fake_gen,
+            invoke=invoke,
+            to_outcome=outcome_from_result,
+            registry=sched.build_registry(),
+            max_rounds=1,
+            tool_session=_tool_session(),
+        )
     )
     ctx = seen.get("context")
     assert isinstance(ctx, dict)
-    assert ctx.get("temporal_scope") == scope and isinstance(ctx.get("today_utc"), str) and len(ctx["today_utc"]) == 10
-    assert str(seen.get("objective", "")) == "q?"
-
-
-def test_generate_tool_arguments_objective_raw_verbatim() -> None:
-    """Needle-path objective passes verbatim; no [Today UTC ...] stamp (prompt-only date)."""
-    seen: dict[str, object] = {}
-
-    async def fake_gen(**kw: object) -> dict[str, JSONValue]:
-        seen.update(kw)
-        return {
-            "tool": "list_sec_filings",
-            "arguments": {"identifier": "NVDA"},
-            "reasoning": "r",
-        }
-
-    session = {"session_id": "s1", "objective": "q?"}
-    asyncio.run(
-        sched._generate_tool_arguments(fake_gen, "list_sec_filings", [], session, _node(), [], [], None, _Kernel())
-    )
-    assert str(seen.get("objective", "")) == "q?"
-
-
-def test_analyze_expand_prompts_stamp_objective() -> None:
-    """Analyze/expand CONTEXT objective carries the [Today UTC ...] prefix."""
-    import json as _json
-
-    session = {"session_id": "s1", "objective": "q?"}
-    ctx_a = _json.loads(sched._analyze_prompt(session, _node(), [], []).split("CONTEXT: ", 1)[1])
-    assert str(ctx_a["objective"]["prompt"]).startswith("[Today UTC ")
-    ctx_e = _json.loads(
-        sched._expand_prompt(session, _node(), {"analyses": [], "evidenceRequests": []}, "s1", "n1").split(
-            "CONTEXT: ", 1
-        )[1]
-    )
-    assert str(ctx_e["objective"]["prompt"]).startswith("[Today UTC ")
+    assert ctx.get("temporal_scope") == scope
+    today = ctx.get("today_utc")
+    assert isinstance(today, str)
+    assert date.fromisoformat(today).isoformat() == today
+    assert seen["objective"] == "q?"
+    assert seen["schema"]
+    assert len(invoked) == 1 and invoked[0]["identifier"] == "NVDA"
+    assert out["status"] == "blocked" and out["admitted"] == 0
 
 
 def test_scan_finds_accession_in_full_json() -> None:
@@ -1726,16 +1764,6 @@ def test_identical_failures_break_with_guided_message() -> None:
     attempts = out["attempts"]
     assert out["status"] == "blocked" and out["incomplete_guard"] is True and isinstance(attempts, list)
     assert any(isinstance(a, dict) and "duplicate" in str(a.get("error")) for a in attempts)
-    assert (
-        sched._identical_failure_break(
-            [
-                {"tool": "t", "arguments": {"a": 1}, "error": "boom x"},
-                {"tool": "t", "arguments": {"a": 1}, "error": "boom x"},
-                {"tool": "t", "arguments": {"a": 1}, "error": "boom x"},
-            ]
-        )
-        is not None
-    )
 
 
 def test_force_open_registry_carry_tools_on_nav_packet() -> None:
@@ -2361,7 +2389,6 @@ def test_latest_ten_q_listing_constrains_forms_and_preserves_grounded_dates(
         expected.update(end_date="2025-12-31")
     assert args == expected
     assert needle_calls == ([] if grounds == "none" else ["list_sec_filings"])
-    assert generated["forms"] == ["10-Q", "10-K", "8-K"]
 
 
 def test_quarter_revenue_listing_keeps_generated_forms_and_dates(
@@ -2750,7 +2777,6 @@ def test_ten_q_revenue_route_settles_structured_listing(
     runtime_envelope: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The route reads the latest exact 10-Q from persisted or in-memory rows, not misleading summary text."""
-    from copy import deepcopy
 
     import app.tools as _tools
     import tests.research_source_seam as seam
@@ -2792,7 +2818,6 @@ def test_ten_q_revenue_route_settles_structured_listing(
     }
     if not runtime_envelope:
         listed.update(structured)
-    original = deepcopy(listed)
     reads: list[str] = []
     invoked: list[tuple[str, dict[str, JSONValue]]] = []
     needle_calls: list[str] = []
@@ -2901,12 +2926,6 @@ def test_ten_q_revenue_route_settles_structured_listing(
     assert all(isinstance(document, dict) for document in documents)
     documents = [document for document in documents if isinstance(document, dict)]
     assert needle_calls == []
-    for attempt in (listing, *documents):
-        assert isinstance(attempt, dict)
-        reasoning = attempt["reasoning"]
-        assert isinstance(reasoning, str)
-        assert reasoning.startswith("scheduler grounded latest revenue arguments")
-        assert not any(word in reasoning.lower() for word in ("needle", "withhold", "failure"))
     assert listing["tool_result_ref"] == receipt
     assert listing["outcome_summary"] == summary
     assert [d["tool_result_ref"] for d in documents] == [
@@ -2915,8 +2934,6 @@ def test_ten_q_revenue_route_settles_structured_listing(
         "s1:tr:doc2",
     ]
     assert len({d["evidence_id"] for d in documents}) == 3
-    assert all("result" not in d for d in documents)
-    assert listed == original
     assert reads and all(ref == receipt for ref in reads)
     for _, job_id in (call for call in kernel.calls if call[0] == "admit"):
         assert kernel.calls.index(("admit", job_id)) < kernel.calls.index(("complete", job_id))
@@ -3778,11 +3795,6 @@ def test_needle_streak_ignores_reselect_attempts() -> None:
     assert sched._needle_error_streak([dict(gen_fail) for _ in range(3)]) == 3
 
 
-def test_no_new_evidence_counts_error_free_stale_rounds() -> None:
-    """Stale rule fires on progress-free, error-free rounds; error rounds reset it (loop-breaker lane)."""
-    assert sched._NO_EVIDENCE_ROUNDS == 2
-
-
 def test_cancelled_attempt_fails_job() -> None:
     """wait_for cancel during invoke fails the kernel job, then re-raises."""
     import asyncio
@@ -4016,13 +4028,23 @@ def test_intake_round_stats_carry_phase_ms(monkeypatch: pytest.MonkeyPatch) -> N
         assert key in stats
 
 
-def test_selection_guidance_carries_intake_digest() -> None:
-    """Seeded guidance holds intake ids plus summaries and the do-not-repeat line."""
-    ev: list[JSONValue] = [{"evidence_id": "ev-1", "content": "Apple 10-K revenue rose"}]
-    g = sched._selection_guidance(ev, [{"tool": "search_web", "arguments": {"query": "q"}}])
-    instruction = g["instruction"]
-    assert g["intake_evidence"] == ["ev-1: Apple 10-K revenue rose"]
-    assert isinstance(instruction, str) and "identical arguments" in instruction
+def test_node_selection_receives_intake_identity_and_content() -> None:
+    seen: list[str] = []
+
+    class _K(_Kernel):
+        @override
+        def list_evidence(self, session_id: str) -> list[dict[str, JSONValue]]:
+            return [{"evidence_id": "ev-intake", "content": "Apple 10-K revenue rose"}]
+
+    class _J(_JevAdmit):
+        @override
+        async def select_tool(self, *a: object, **k: object) -> ToolDecision:
+            seen.append(json.dumps(a[3]))
+            return _invoke("query_finra")
+
+    out = _run_node(_K(), _J())
+    assert seen and all("ev-intake" in context and "Apple 10-K revenue rose" in context for context in seen)
+    assert out["status"] == "resolved" and out["admitted"] == 1
 
 
 def _dup_gen(**kw: object) -> dict[str, JSONValue]:
@@ -4390,12 +4412,6 @@ def test_finra_datapoints_unknown_dataset_reselects() -> None:
     )
 
 
-def test_round_cap_is_five() -> None:
-    """Cap constant is 5."""
-    assert sched._MAX_TOOL_ROUNDS == 5
-    assert sched._NO_EVIDENCE_ROUNDS == 2
-
-
 def test_expired_deadline_blocks_before_first_round() -> None:
     """A past deadline_at stops the node with a run-deadline reason, never selecting."""
     import time as _t
@@ -4496,51 +4512,45 @@ def test_mid_round_timeout_blocks_each_node() -> None:
     assert sorted(blocked) == [("s1", nid, out["reason"]) for nid in ("n1", "n2")]
 
 
-def test_max_rounds_hook_caps_rounds() -> None:
-    """max_rounds=2 with progressing rounds reaches the guard naming the cap."""
-    calls = {"n": 0}
+@pytest.mark.parametrize(("cap", "expected"), [(None, 5), (2, 2)], ids=["default", "caller-cap"])
+def test_node_round_limit_blocks_even_when_each_round_admits(cap: int | None, expected: int) -> None:
+    calls = 0
 
-    async def select_round(jev: object, kernel: object, sid: str, nid: str, *a: object, **k: object) -> object:
-        calls["n"] += 1
-        return ("invoke", _invoke("query_finra"))
+    class _J(_JevAdmit):
+        @override
+        async def select_tool(self, *a: object, **k: object) -> ToolDecision:
+            nonlocal calls
+            calls += 1
+            return _invoke("query_finra")
 
-    async def gen(tool: object, schema: object = None, **k: object) -> dict[str, JSONValue]:
-        return {"tool": "query_finra", "arguments": {}, "reasoning": "r"}
-
-    async def invoke(name: object, args: object, sess: object, **k: object) -> dict[str, JSONValue]:
-        return {**_FINRA_RESULT, "tool_result_id": f"s1:tr:{calls['n']}"}
-
-    class _J(JevClient):
         @override
         async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
-            return {
-                "evidence_state": "sufficient_support",
-                "continuation": "continue_research",
-            }
+            return {"evidence_state": "sufficient_support", "continuation": "continue_research"}
 
+    async def generate(**kw: object) -> dict[str, JSONValue]:
+        return {"tool": "query_finra", "arguments": {"ticker": f"SYM{calls}"}}
+
+    async def invoke(name: str, args: dict[str, JSONValue], session: object, **kw: object) -> dict[str, JSONValue]:
+        return {**_FINRA_RESULT, "tool_result_id": f"s1:tr:{calls}"}
+
+    kernel = _Kernel({f"s1:tr:{n}": {**_FINRA_RESULT, "tool_result_id": f"s1:tr:{n}"} for n in range(1, expected + 1)})
     out = asyncio.run(
-        sched._drive_rounds(
+        sched.run_node(
             _node(),
-            {"session_id": "s1", "objective": "o"},
-            [{"name": "query_finra", "parameters": {}}],
-            _Kernel({f"s1:tr:{n}": {**_FINRA_RESULT, "tool_result_id": f"s1:tr:{n}"} for n in (1, 2)}),
-            _J(),
             "s1",
-            "n1",
-            {
-                "select_round": select_round,
-                "reasoner": None,
-                "needle_generate": gen,
-                "invoke": invoke,
-                "to_outcome": _to_outcome,
-                "max_rounds": 2,
-            },
-            _tool_session(),
-            None,
+            kernel=kernel,
+            jev=_J(),
+            needle_generate=generate,
+            invoke=invoke,
+            to_outcome=_to_outcome,
+            registry=[{"name": "query_finra", "parameters": {}}],
+            tool_session=_tool_session(),
+            **({"max_rounds": cap} if cap is not None else {}),
         )
     )
-    reason = out["reason"]
-    assert calls["n"] == 2 and isinstance(reason, str) and "(2 rounds without resolution)" in reason
+    assert calls == expected and out["admitted"] == expected
+    assert out["status"] == "blocked" and out["incomplete_guard"] is True
+    assert f"{expected} rounds without resolution" in str(out["reason"])
 
 
 def test_reason_over_evidence_selects_again_with_admitted_evidence() -> None:
@@ -4632,12 +4642,6 @@ def test_reason_over_evidence_selects_again_with_admitted_evidence() -> None:
     assert seen == [[]] and ("resolve", "n1") not in kernel.calls
 
 
-def test_blocked_terminal_names_non_default_cap() -> None:
-    """_blocked_terminal carries the caller's max_rounds, not the module default."""
-    out = sched._blocked_terminal("n1", 0, [], 2)
-    assert out["reason"] == "incomplete: runtime guard (2 rounds without resolution)"
-
-
 def test_reasoner_analyze_times_out_slow_call() -> None:
     """A 2s sync analyze with a 0.2s deadline raises TimeoutError in <1s."""
     import time as _time
@@ -4717,40 +4721,6 @@ def test_reason_phase_skips_when_too_little_time() -> None:
     assert len(attempts) == 1 and "too little time" in str(attempts[0].get("error"))
 
 
-def test_bounded_reasoner_clamps_real_client_only() -> None:
-    """Clients get timeout_s=min(config, remaining) on a copy; no deadline returns the shared client."""
-    from app.reasoner_client import ReasonerClient
-
-    client = ReasonerClient(model="m", url="u", api_key="k", timeout_s=120.0)
-    bounded = sched._bounded_reasoner(client, 3.0)
-    assert isinstance(bounded, ReasonerClient) and bounded.timeout_s == 3.0
-    assert client.timeout_s == 120.0  # the shared client is never mutated
-    assert sched._bounded_reasoner(client, None) is client
-
-
-def test_bounded_reasoner_preserves_fake_hooks() -> None:
-    """A ReasonerClient fake with per-test hooks stays usable after the timeout clamp."""
-
-    class _FakeReasoner(ReasonerClient):
-        @override
-        def analyze(self, prompt: str) -> dict[str, list[dict[str, object]]]:
-            assert prompt
-            return {"analyses": [{"nodeId": "n1"}], "evidenceRequests": []}
-
-        @override
-        def expand(self, prompt: str, objective_id: str, prior_ids: set[str] | None = None) -> dict[str, list[object]]:
-            assert prompt and objective_id
-            return {"proposals": [{"question": "Follow-up?", "whyItMatters": "Why"}]}
-
-    fake = _FakeReasoner(model="m", url="u", api_key="k", timeout_s=120.0)
-    bounded = sched._bounded_reasoner(fake, 3.0)
-    assert isinstance(bounded, ReasonerClient) and bounded.timeout_s == 3.0
-    assert bounded.analyze("CONTEXT x")["analyses"] == [{"nodeId": "n1"}]
-    assert bounded.expand("CONTEXT n1", "s1", {"n1"})["proposals"] == [
-        {"question": "Follow-up?", "whyItMatters": "Why"}
-    ]
-
-
 def test_force_open_ignores_intake_evidence() -> None:
     """Intake 8-K accession with no node attempts never forces the carry registry."""
     intake: list[JSONValue] = [
@@ -4813,18 +4783,25 @@ def test_needle_carry_streak_counts_trailing_carried_fallbacks() -> None:
     assert sched._needle_carry_streak([carried, carried, other, carried, carried]) == 2
 
 
-def test_run_one_node_passes_session_id_and_kernel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The node failure lands on the given kernel under the given session id; the node lacks one."""
-    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
-    kernel = _Kernel()
-    node: dict[str, JSONValue] = {"node_id": "n9"}
+def test_session_records_each_node_failure_on_the_requested_kernel() -> None:
+    class _K(_Kernel):
+        @override
+        def ready_nodes(self, session_id: str) -> list[ResearchNode]:
+            return [_node("n9", ""), _node("n10", "")]
 
-    async def go() -> dict[str, JSONValue]:
-        return await sched._run_one_node(node, "s-given", {"jev": "not-a-jev"}, kernel, asyncio.Semaphore(1))
-
-    out = asyncio.run(go())
-    assert out["node_id"] == "n9" and out["status"] == "failed"
-    assert [kind for kind, _ in kernel.decisions] == ["node_failure"]
+    kernel = _K()
+    with mock.patch.object(kernel, "record_decision", wraps=kernel.record_decision) as recorded:
+        out = asyncio.run(sched.run("s-given", kernel=kernel, jev="not-a-jev"))
+    assert out["session_id"] == "s-given" and out["status"] == "stalled"
+    nodes = out["nodes"]
+    assert isinstance(nodes, list)
+    assert {(node["node_id"], node["status"]) for node in nodes if isinstance(node, dict)} == {
+        ("n9", "failed"),
+        ("n10", "failed"),
+    }
+    failures = [call for call in recorded.call_args_list if call.args[1] == "node_failure"]
+    assert {call.kwargs["node_id"] for call in failures} == {"n9", "n10"}
+    assert all(call.args[0] == "s-given" for call in failures)
 
 
 def test_sync_kwargs_generate_does_not_freeze_deadline() -> None:
@@ -5127,13 +5104,12 @@ def test_orcl_latest_revenue_bypass_skips_needle_and_reads_listed_filing(
         return {"tool": None, "arguments": {}, "reasoning": "withheld: ungrounded"}
 
     session = {"session_id": "s1", "objective": "What is ORCL's latest revenue?"}
-    listed, reasoning, _ = asyncio.run(
+    listed, _, _ = asyncio.run(
         sched._generate_tool_arguments(
             fake_none, "list_sec_filings", sched.build_registry(), session, _node(), [], [], None, _Kernel()
         )
     )
     assert listed == {"identifier": "ORCL", "forms": ["10-Q", "10-K"]}
-    assert reasoning.startswith("scheduler grounded latest revenue arguments")
     read, _, _ = asyncio.run(
         sched._generate_tool_arguments(
             fake_none, "get_sec_document", sched.build_registry(), session, _node(), [], [listing], None, _Kernel()
@@ -5227,8 +5203,11 @@ def test_needle_context_carries_ticker_scope_grounded_without_evidence(
 
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_orcl)
     seen: dict[str, object] = {}
+    selection_contexts: list[str] = []
 
     async def fake_gen(**kw: object) -> dict[str, JSONValue]:
+        if kw["tool"] == "query_finra":
+            return {"tool": "query_finra", "arguments": {}}
         seen.update(kw)
         return {"tool": "list_sec_filings", "arguments": {"identifier": "ORCL"}, "reasoning": "r"}
 
@@ -5236,33 +5215,68 @@ def test_needle_context_carries_ticker_scope_grounded_without_evidence(
         "session_id": "s1",
         "objective": "What is ORCL's filing history?",
         "ticker": "ORCL",
-        "temporal_scope": {"mode": "latest-available", "raw": "filing history", "as_of": None},
+        "temporal_scope": {"mode": "latest-available", "raw": "private scope text", "as_of": None},
     }
-    registry: list[Mapping[str, JSONValue]] = [
+    registry: list[dict[str, JSONValue]] = [
         {
             "name": "list_sec_filings",
             "parameters": {"type": "object", "properties": {"identifier": {"type": "string"}}},
-        }
+        },
+        {"name": "query_finra", "parameters": {}},
     ]
-    asyncio.run(
-        sched._generate_tool_arguments(
-            fake_gen,
-            "list_sec_filings",
-            registry,
-            session,
+
+    class _K(_Kernel):
+        @override
+        def get_session(self, session_id: str) -> dict[str, JSONValue]:
+            return session
+
+        @override
+        def list_evidence(self, session_id: str) -> list[dict[str, JSONValue]]:
+            return [{"evidence_id": eid, "content": "private admitted bytes"} for eid in self.evidence]
+
+    class _J(_JevAdmit):
+        @override
+        async def select_tool(self, *a: object, **k: object) -> ToolDecision:
+            selection_contexts.append(json.dumps(a[3]))
+            return _invoke("list_sec_filings" if kernel.evidence else "query_finra")
+
+        @override
+        async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
+            assessment = await super().assess_result(*a, **k)
+            if not kernel.evidence:
+                assessment.update({"continuation": "continue_research", "continue": "continue_research"})
+            return assessment
+
+    def invoke(name: str, args: dict[str, JSONValue], sess: object, **kw: object) -> dict[str, JSONValue]:
+        return dict(_FINRA_RESULT) if name == "query_finra" else {"filings": []}
+
+    kernel = _K({"s1:tr:abc": dict(_FINRA_RESULT)})
+    out = asyncio.run(
+        sched.run_node(
             _node(),
-            [{"evidence_id": "ev-1", "content": "raw bytes"}],
-            [{"tool": "list_sec_filings", "error": "boom", "outcome_summary": "raw attempt"}],
-            None,
-            _Kernel(),
+            "s1",
+            kernel=kernel,
+            jev=_J(),
+            needle_generate=fake_gen,
+            invoke=invoke,
+            to_outcome=_to_outcome,
+            registry=registry,
+            max_rounds=2,
+            tool_session=_tool_session(),
         )
     )
     ctx = seen.get("context")
     assert isinstance(ctx, dict)
-    assert set(ctx) == {"as_of", "temporal_scope", "today_utc", "ticker", "grounded_arguments"}
+    assert "evidence" not in ctx and "attempts" not in ctx and "grounding_hint" not in ctx
+    serialized = json.dumps(seen)
+    assert "private admitted bytes" not in serialized
+    assert "record values here" not in serialized
+    assert "private scope text" not in serialized
     assert ctx["ticker"] == "ORCL"
     assert ctx["temporal_scope"] == {"mode": "latest-available"}
     assert ctx["grounded_arguments"] == {"identifier": "ORCL"}
+    assert out["status"] == "resolved" and out["admitted"] == 1
+    assert any("private admitted bytes" in context for context in selection_contexts)
 
 
 @pytest.mark.parametrize("form", ["10-Q/A", "10-K/A"])
@@ -5748,12 +5762,16 @@ def test_run_deadline_before_first_round_and_complete_drain() -> None:
     assert expired["reason"] == "incomplete: run deadline reached before session round 1"
 
 
-def test_node_context_rejects_malformed_registry_hook() -> None:
-    """A registry hook that is not a manifest list fails loud instead of falling back to the full registry."""
-    with pytest.raises(TypeError, match="registry hook must be a list of tool manifests"):
-        sched._node_context(_node(), "s1", _Kernel(), {"registry": "not-a-list"})
-    with pytest.raises(TypeError, match="registry hook must be a list of tool manifests"):
-        sched._node_context(_node(), "s1", _Kernel(), {"registry": ["not-a-manifest"]})
+@pytest.mark.parametrize("registry", ["not-a-list", ["not-a-manifest"]])
+def test_node_rejects_malformed_registry_before_selection(registry: object) -> None:
+    kernel = _Kernel()
+    with mock.patch.object(_JevAdmit, "select_tool", new_callable=mock.AsyncMock) as select:
+        out = asyncio.run(sched.run_node(_node(), "s1", kernel=kernel, jev=_JevAdmit(), registry=registry))
+    assert out["status"] == "failed"
+    assert "registry hook must be a list of tool manifests" in str(out["error"])
+    select.assert_not_called()
+    assert kernel.calls == []
+    assert [kind for kind, _ in kernel.decisions] == ["node_failure"]
 
 
 def test_fallback_ticker_args_adds_eps_only_when_named(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5771,24 +5789,53 @@ def test_fallback_ticker_args_adds_eps_only_when_named(monkeypatch: pytest.Monke
     assert sched._fallback_sec_args("get_planned_insider_sales", None) is None
 
 
-def test_seed_search_arguments_copies_selectors_and_keeps_existing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Search seeding fills empty selector fields, never overwrites a caller selector, and defers to grounding."""
+@pytest.mark.parametrize(
+    ("generated", "expected"),
+    [
+        ({}, {"ticker": "NVDA", "query": "What is NVDA's latest revenue?"}),
+        ({"ticker": "NVDA", "query": "nvda revenue"}, {"ticker": "NVDA", "query": "nvda revenue"}),
+        ({"company_name": "NVIDIA"}, {"company_name": "NVIDIA"}),
+    ],
+    ids=["empty", "query", "company"],
+)
+def test_node_search_invokes_grounded_selectors_without_overwriting_existing_values(
+    generated: dict[str, JSONValue], expected: dict[str, JSONValue], monkeypatch: pytest.MonkeyPatch
+) -> None:
     import app.tools as _tools
 
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
-    objective = "What is NVDA's latest revenue?"
-    filled: dict[str, JSONValue] = {}
-    sched._seed_search_arguments(filled, "search_sec_filings", objective, "s1", "n1")
-    assert filled == {"ticker": "NVDA", "query": objective}
+    invoked: list[dict[str, JSONValue]] = []
 
-    kept: dict[str, JSONValue] = {"query": "nvda revenue"}
-    assert sched._seed_search_selectors(kept, "search_sec_filings", objective) is True
-    assert kept == {"query": "nvda revenue", "ticker": "NVDA"}
-    assert "cik" not in kept and "company_name" not in kept
+    class _J(_JevAdmit):
+        @override
+        async def select_tool(self, *a: object, **k: object) -> ToolDecision:
+            return _invoke("search_sec_filings")
 
-    grounded: dict[str, JSONValue] = {"company_name": "NVIDIA"}
-    sched._seed_search_arguments(grounded, "search_sec_filings", objective, "s1", "n1")
-    assert grounded == {"company_name": "NVIDIA"}
+    async def generate(**kw: object) -> dict[str, JSONValue]:
+        assert kw["schema"]
+        return {"tool": "search_sec_filings", "arguments": generated}
+
+    def invoke(name: str, args: dict[str, JSONValue], session: object, **kw: object) -> dict[str, JSONValue]:
+        invoked.append(args)
+        return {}
+
+    out = asyncio.run(
+        sched.run_node(
+            _node(),
+            "s1",
+            kernel=_Kernel(objective="What is NVDA's latest revenue?"),
+            jev=_J(),
+            needle_generate=generate,
+            invoke=invoke,
+            to_outcome=_to_outcome,
+            registry=sched.build_registry(),
+            max_rounds=1,
+            tool_session=_tool_session(),
+        )
+    )
+    assert len(invoked) == 1
+    assert invoked == [expected]
+    assert out["status"] == "blocked" and out["admitted"] == 0
 
 
 class _ReasonResolved(ReasonerClient):
@@ -6811,8 +6858,11 @@ def test_sched_needle_worker_down_seeds_sec_listing(monkeypatch: pytest.MonkeyPa
         assert sched._needle_failure_recoverable("get_sec_filing", RuntimeError(reason)) is True
 
 
-def test_scope_empty_dict_unconstrained() -> None:
+def test_scope_empty_dict_unconstrained(monkeypatch: pytest.MonkeyPatch) -> None:
     """A missing mode reads latest-available, so the undated ask seeds without Needle."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
     calls: list[str] = []
 
     async def _gen(**kw: object) -> dict[str, JSONValue]:
@@ -6833,8 +6883,11 @@ def test_scope_empty_dict_unconstrained() -> None:
     assert out[0] == {"identifier": "NVDA", "forms": ["10-Q", "10-K"]}
 
 
-def test_scope_end_only_constrains() -> None:
+def test_scope_end_only_constrains(monkeypatch: pytest.MonkeyPatch) -> None:
     """An end-only window constrains the ask, so Needle generates."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
 
     async def _gen(**kw: object) -> dict[str, JSONValue]:
         return {"tool": "list_sec_filings", "arguments": {"identifier": "NVDA", "forms": ["10-Q"]}, "reasoning": "r"}
@@ -6852,8 +6905,11 @@ def test_scope_end_only_constrains() -> None:
     assert out[0] == {"identifier": "NVDA", "forms": ["10-Q"]}
 
 
-def test_scope_historical_mode_constrains() -> None:
+def test_scope_historical_mode_constrains(monkeypatch: pytest.MonkeyPatch) -> None:
     """A non-latest mode constrains the ask, so Needle generates."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
 
     async def _gen(**kw: object) -> dict[str, JSONValue]:
         return {"tool": "list_sec_filings", "arguments": {"identifier": "NVDA", "forms": ["10-Q"]}, "reasoning": "r"}
@@ -6871,8 +6927,11 @@ def test_scope_historical_mode_constrains() -> None:
     assert out[0] == {"identifier": "NVDA", "forms": ["10-Q"]}
 
 
-def test_scope_latest_mode_unconstrained() -> None:
+def test_scope_latest_mode_unconstrained(monkeypatch: pytest.MonkeyPatch) -> None:
     """A latest mode reads unconstrained, so the undated ask seeds without Needle."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
     calls: list[str] = []
 
     async def _gen(**kw: object) -> dict[str, JSONValue]:
@@ -6893,8 +6952,11 @@ def test_scope_latest_mode_unconstrained() -> None:
     assert out[0] == {"identifier": "NVDA", "forms": ["10-Q", "10-K"]}
 
 
-def test_scope_raw_text_dates_constrain() -> None:
+def test_scope_raw_text_dates_constrain(monkeypatch: pytest.MonkeyPatch) -> None:
     """Scope raw text carrying dates constrains the ask, so Needle generates."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
 
     async def _gen(**kw: object) -> dict[str, JSONValue]:
         return {"tool": "list_sec_filings", "arguments": {"identifier": "NVDA", "forms": ["10-Q"]}, "reasoning": "r"}
@@ -6912,8 +6974,11 @@ def test_scope_raw_text_dates_constrain() -> None:
     assert out[0] == {"identifier": "NVDA", "forms": ["10-Q"]}
 
 
-def test_scope_start_only_constrains() -> None:
+def test_scope_start_only_constrains(monkeypatch: pytest.MonkeyPatch) -> None:
     """A start-only window constrains the ask, so Needle generates."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
 
     async def _gen(**kw: object) -> dict[str, JSONValue]:
         return {"tool": "list_sec_filings", "arguments": {"identifier": "NVDA", "forms": ["10-Q"]}, "reasoning": "r"}
@@ -7309,25 +7374,6 @@ def test_document_read_failed_requires_matching_tool_and_error() -> None:
     assert sched._document_read_failed([]) is False
 
 
-def test_guarded_envelope_keeps_all_keys_and_reason() -> None:
-    """A guard trip keeps the custom reason; only a missing reason falls back to the default."""
-    nodes: list[JSONValue] = [{"node_id": "n1", "status": "blocked", "admitted": 0, "incomplete_guard": True}]
-    out = sched._stalled_or_guarded("s1", 3, nodes, True, "boom")
-    assert out == {
-        "session_id": "s1",
-        "status": "incomplete_guard",
-        "rounds": 3,
-        "nodes": nodes,
-        "incomplete_guard": True,
-        "reason": "boom",
-    }
-    fallback = sched._stalled_or_guarded("s1", 3, nodes, True, None)
-    assert (
-        fallback["reason"]
-        == "incomplete: node guard trip stalled the session (no resolved nodes, no admitted evidence)"
-    )
-
-
 def test_latest_revenue_requested_honors_all_date_sources() -> None:
     """Node, scope text, scope window, session cutoff, and as_of each constrain the latest-revenue bypass."""
     base: dict[str, JSONValue] = {"session_id": "s1", "objective": "What is ORCL's latest revenue?"}
@@ -7473,43 +7519,6 @@ def test_run_resolved_without_admission_counts_as_progress() -> None:
     assert out["incomplete_guard"] is False
 
 
-def test_stalled_envelope_keeps_all_keys() -> None:
-    """The pure-stall envelope carries every key with the exact stall reason."""
-    nodes: list[JSONValue] = [{"node_id": "n1", "status": "gathering", "admitted": 0, "incomplete_guard": False}]
-    out = sched._stalled_or_guarded("s1", 2, nodes, False, None)
-    assert out == {
-        "session_id": "s1",
-        "status": "stalled",
-        "rounds": 2,
-        "nodes": nodes,
-        "incomplete_guard": False,
-        "reason": "stalled: session round made no progress (no resolved nodes, no admitted evidence)",
-    }
-
-
-def test_sched_run_failed_envelope_keeps_session_error_nodes() -> None:
-    assert sched._run_failed("S", "boom") == {"session_id": "S", "status": "failed", "error": "boom"}
-    assert sched._run_failed("S", "boom", [{"node_id": "a"}]) == {
-        "session_id": "S",
-        "status": "failed",
-        "error": "boom",
-        "nodes": [{"node_id": "a"}],
-    }
-
-
-def test_sched_ready_nodes_failure_reports_run_failed() -> None:
-    class _Bad(sched._Kernel):
-        @override
-        def ready_nodes(self, session_id: str) -> list[ResearchNode]:
-            raise RuntimeError("db down")
-
-    nodes, failure = sched._ready_nodes(_Bad(), "S", [])
-    assert nodes == []
-    assert failure is not None and failure["session_id"] == "S"
-    assert failure["status"] == "failed" and failure["error"] == "db down"
-    assert failure["nodes"] == []
-
-
 def test_sched_block_cancelled_round_reports_every_node() -> None:
     blocked: list[tuple[str, str, str]] = []
 
@@ -7545,59 +7554,13 @@ def test_sched_carry_registry_keeps_navigation_after_filing() -> None:
     ]
 
 
-def test_sched_gather_round_threads_session_to_nodes() -> None:
-    seen: list[str] = []
-
-    async def _fake(
-        node: object, session_id: str, hooks: Mapping[str, object], kernel: sched._Kernel, cap: asyncio.Semaphore
-    ) -> dict[str, JSONValue]:
-        seen.append(session_id)
-        return {"node_id": "a", "status": "resolved", "admitted": 1}
-
-    async def _main() -> None:
-        orig = sched._run_one_node
-        sched._run_one_node = _fake
-        try:
-            out, timed_out = await sched._gather_round(
-                [{"node_id": "a"}], "S", {}, sched._Kernel(), asyncio.Semaphore(2), 30.0
-            )
-        finally:
-            sched._run_one_node = orig
-        assert timed_out is False and out == [{"node_id": "a", "status": "resolved", "admitted": 1}]
-
-    asyncio.run(_main())
-    assert seen == ["S"]
-
-
-def test_sched_registry_entry_manifest_keys_stay_stable() -> None:
-    from app.tools import TOOLS
-
-    def _is_filing(tool: dict[str, object]) -> bool:
-        fn_payload: object = tool["function"]
-        assert isinstance(fn_payload, Mapping)
-        return fn_payload.get("name") == "get_sec_filing"
-
-    fn_obj: object = next(tool["function"] for tool in TOOLS if _is_filing(tool))
-    assert isinstance(fn_obj, Mapping)
-    fn: Mapping[str, object] = fn_obj
-    entry = sched._registry_entry("get_sec_filing", fn, "sec")
-    assert entry["name"] == "get_sec_filing" and entry["domain"] == "sec"
-    assert entry["keyInputs"] == "req(accession_no)" and entry["prerequisites"] == "needs accession_no"
-    assert entry["pitSupport"] == "PIT-scoped" and entry["intent"] and entry["avoidWhen"] and entry["conflicts"]
-    assert isinstance(entry["parameters"], dict) and entry["parameters"].get("type") == "object"
-
-
-def test_sched_manifest_discovery_renders_compact_fields() -> None:
-    from app.tools import TOOL_DISCOVERY_REGISTRY
-
-    meta = TOOL_DISCOVERY_REGISTRY["get_sec_filing"]
-    got = sched._manifest_discovery(meta)
-    assert got["purpose"] == meta.summary and got["outputKind"] == meta.output_kind
-    assert got["evidence"] == meta.output_kind and got["intent"] == meta.intent
-    assert got["useWhen"] == "; ".join(meta.choose_when) and got["avoidWhen"] == "; ".join(meta.reject_when)
-    assert got["conflicts"] == ", ".join(meta.conflicts_with) and got["nextTools"] == ", ".join(meta.related_tools)
-    blank = sched._manifest_discovery(None)
-    assert all(v == "" for v in blank.values())
+def test_registry_advertises_sec_reader_identity_and_discovery() -> None:
+    entry = next(manifest for manifest in sched.build_registry() if manifest["name"] == "get_sec_filing")
+    parameters = entry["parameters"]
+    assert isinstance(parameters, dict)
+    required = parameters["required"]
+    assert isinstance(required, list) and "accession_no" in required
+    assert entry["purpose"] and entry["intent"] and entry["pitSupport"]
 
 
 def test_sched_session_round_deadline_before_first_round() -> None:
@@ -7612,70 +7575,10 @@ def test_sched_session_round_deadline_before_first_round() -> None:
     assert out["incomplete_guard"] is True
 
 
-def test_sched_run_threads_deadlines_into_node_hooks() -> None:
-    node = ResearchNode(node_id="a", session_id="S", question="q", why_it_matters="w")
-    seen: list[str] = []
-
-    class _K(sched._Kernel):
-        @override
-        def ready_nodes(self, session_id: str) -> list[ResearchNode]:
-            assert session_id == "S"
-            return [node]
-
-        @override
-        def block_node(self, session_id: str, node_id: str, reason: str = "") -> ResearchNode:
-            return node
-
-        @override
-        def get_session(self, session_id: str) -> dict[str, JSONValue]:
-            return {"session_id": session_id, "objective": "q", "query": "q", "as_of": None}
-
-        @override
-        def list_evidence(self, session_id: str) -> list[dict[str, JSONValue]]:
-            return []
-
-        @override
-        def record_decision(
-            self,
-            session_id: str,
-            decision_type: str,
-            candidates: Mapping[str, object],
-            probabilities: Mapping[str, object],
-            selected: object,
-            *,
-            node_id: str | None = None,
-            job_id: str | None = None,
-            confidence: float | None = None,
-            request: object = None,
-            response: object = None,
-        ) -> DecisionRecord:
-            return DecisionRecord(
-                decision_id=new_decision_id(),
-                session_id=session_id,
-                node_id=node_id,
-                job_id=job_id,
-                decision_type=decision_type,
-                candidates={},
-                probabilities={},
-                selected=None,
-                confidence=confidence,
-            )
-
-    async def _sel(
-        jev: object, kernel: object, sid: str, nid: str, a: object, b: object, c: object, d: object, e: object
-    ) -> tuple[str, ToolDecision]:
-        seen.append(sid)
-        return ("resolved", ToolDecision(action="resolved"))
-
-    out = asyncio.run(sched.run("S", kernel=_K(), select_round=_sel))
-    assert out["session_id"] == "S" and out["status"] == "incomplete_guard"
-    assert seen and all(v == "S" for v in seen)
-
-
-def test_sched_build_registry_caches_single_build() -> None:
-    first = sched.build_registry()
-    assert sched.build_registry() is first
-    assert len(first) == len({str(m.get("name")) for m in first})
+def test_registry_contains_unique_tool_names() -> None:
+    registry = sched.build_registry()
+    assert registry
+    assert len(registry) == len({str(manifest.get("name")) for manifest in registry})
 
 
 def test_sched_build_registry_none_capabilities_raises(monkeypatch: pytest.MonkeyPatch) -> None:

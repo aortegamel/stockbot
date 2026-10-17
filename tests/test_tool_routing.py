@@ -727,7 +727,11 @@ def test_select_round_forwards_full_context_to_jev() -> None:
     assert action == "reason" and decision.tool_name is None
     assert jev.seen["session_id"] == "s1"
     assert jev.seen["registry"] == registry
-    assert list(jev.seen["attempts"]) == attempts  # type: ignore[union-attr]
-    assert list(jev.seen["evidence"]) == evidence  # type: ignore[union-attr]
+    seen_attempts = jev.seen["attempts"]
+    seen_evidence = jev.seen["evidence"]
+    assert isinstance(seen_attempts, Sequence)
+    assert isinstance(seen_evidence, Sequence)
+    assert list(seen_attempts) == attempts
+    assert list(seen_evidence) == evidence
     assert "halp money stuff" in str(jev.seen["objective"])
     assert jev.seen["node"] is not None

@@ -7202,47 +7202,86 @@ def test_session_preserves_original_question_text() -> None:
     assert round_tripped.ticker == "NVDA"
 
 
-def test_needle_execution_context_excludes_raw_evidence() -> None:
-    """Scheduler Needle context carries anchors and grounded values, never session evidence."""
+def test_needle_execution_context_excludes_raw_evidence(tmp_path: Path) -> None:
+    """A repository-backed node supplies anchors without disclosing stored evidence to Needle."""
     import asyncio as _asyncio
+    import json as _json
+    from typing import override
 
+    from app.decision_client import JevClient
     from app.research import scheduler as _sched
+    from app.research import service as _svc
+    from app.research.models import ToolDecision
+    from app.tool_runtime import outcome_from_result
 
+    repo = ResearchRepository(data_root=tmp_path)
+    objective = "What is ORCL's filing history?"
+    sid = _svc.create_research(objective, ticker="ORCL", repo=repo)
+    source_job = repo.list_jobs(sid)[0].job_id
+    _svc.record_evidence(
+        sid,
+        source_job,
+        _svc_item(
+            f"{sid}:ev:private",
+            passage="private stored passage",
+            content="private stored content",
+            claim_text="private stored claim",
+        ),
+        repo=repo,
+    )
+    assert any("private stored passage" in str(row) for row in repo.list_evidence(sid))
+    node = _svc.create_node(sid, objective, "Check filing history.", repo=repo)
     seen: dict[str, object] = {}
+    invoked: list[dict[str, JSONValue]] = []
+
+    class _Jev(JevClient):
+        @override
+        async def select_tool(self, *args: object, **kwargs: object) -> ToolDecision:
+            return ToolDecision(action="invoke", tool_name="list_sec_filings", tool_names=("list_sec_filings",))
+
+        @override
+        async def assess_result(self, *args: object, **kwargs: object) -> dict[str, JSONValue]:
+            return {"evidence_state": "insufficient", "continuation": "continue_research"}
 
     async def _generate(**kwargs: object) -> dict[str, object]:
         seen.update(kwargs)
         return {"tool": "list_sec_filings", "arguments": {"identifier": "ORCL"}, "reasoning": "", "withheld": False}
 
-    session: dict[str, JSONValue] = {
-        "session_id": "sched-boundary",
-        "objective": "What is ORCL's filing history?",
-        "query": "What is ORCL's filing history?",
-        "temporal_scope": {"mode": "latest-available", "raw": "filing history"},
-    }
-    registry: list[dict[str, JSONValue]] = [
-        {"name": "list_sec_filings", "parameters": {"type": "object", "properties": {"identifier": {"type": "string"}}}}
-    ]
-    filled, _, _ = _asyncio.run(
-        _sched._generate_tool_arguments(
-            _generate,
-            "list_sec_filings",
-            registry,
-            session,
-            {"node_id": "n1", "question": "What is ORCL's filing history?"},
-            [{"evidence_id": "EV-1", "content": "oversized raw bytes"}],
-            [{"tool": "list_sec_filings", "error": "boom", "outcome_summary": "raw attempt bytes"}],
-            None,
-            _sched._default_kernel(),
+    def _invoke(name: str, arguments: dict[str, JSONValue], session: object, **kwargs: object) -> dict[str, object]:
+        invoked.append(arguments)
+        return {"filings": []}
+
+    out = _asyncio.run(
+        _sched.run_node(
+            node,
+            sid,
+            repo=repo,
+            jev=_Jev(),
+            needle_generate=_generate,
+            invoke=_invoke,
+            to_outcome=outcome_from_result,
+            registry=[
+                {
+                    "name": "list_sec_filings",
+                    "parameters": {"type": "object", "properties": {"identifier": {"type": "string"}}},
+                }
+            ],
+            max_rounds=1,
         )
     )
-    assert filled["identifier"] == "ORCL"
+    assert invoked and invoked[0]["identifier"] == "ORCL"
+    assert out["status"] == "blocked" and out["admitted"] == 0
+    assert len(repo.list_evidence(sid)) == 1
     context = seen["context"]
     assert isinstance(context, dict)
-    assert set(context) <= {"as_of", "temporal_scope", "today_utc", "ticker", "grounded_arguments"}
     assert "evidence" not in context and "attempts" not in context and "grounding_hint" not in context
+    serialized = _json.dumps(seen)
+    assert "private stored passage" not in serialized
+    assert "private stored content" not in serialized
+    assert "private stored claim" not in serialized
     assert context["ticker"] == "ORCL"
-    assert context["temporal_scope"] == {"mode": "latest-available"}
+    scope = context["temporal_scope"]
+    assert isinstance(scope, dict) and scope["mode"] == "latest-available" and "raw" not in scope
     assert context["grounded_arguments"] == {"identifier": "ORCL"}
 
 
@@ -8913,8 +8952,10 @@ def test_create_node_rejects_null_nonstring_question(tmp_path: Path, monkeypatch
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     repo = ResearchRepository()
     sid, _ = _svc_sid(repo, "first question?")
+    # Malformed inputs intentionally sit outside the static signature.
+    create_untyped: Callable[..., object] = _svc.create_node
     bad_questions: list[object] = [None, 123]
     for bad_question in bad_questions:
         with pytest.raises(ValueError, match="'question' must be a non-empty string"):
-            _svc.create_node(sid, bad_question, "why it matters", repo=repo)  # type: ignore[arg-type]
+            create_untyped(sid, bad_question, "why it matters", repo=repo)
     assert repo.list_nodes(sid) == []
