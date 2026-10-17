@@ -40,16 +40,42 @@ insider_ownership: insider_shares / shares_outstanding
 """
 
 __all__ = [
-    "roe", "roa", "gross_profitability", "cash_roa", "total_accruals",
-    "accrual_ratio", "cfo_margin", "fcf_margin", "asset_growth",
-    "investment_measure", "net_issuance", "gross_margin",
-    "operating_margin", "ebitda_margin", "net_margin", "roce",
-    "net_debt", "debt_to_equity", "net_debt_to_ebitda",
-    "interest_coverage", "current_ratio", "quick_ratio", "cash_ratio",
-    "asset_turnover", "inventory_turnover", "receivables_turnover",
-    "dso", "cash_conversion_cycle", "beneish_m_score", "cash_conversion",
-    "margin_change", "roa_change", "turnover_change", "buyback_yield",
-    "shareholder_yield", "insider_ownership",
+    "accrual_ratio",
+    "asset_growth",
+    "asset_turnover",
+    "beneish_m_score",
+    "buyback_yield",
+    "cash_conversion",
+    "cash_conversion_cycle",
+    "cash_ratio",
+    "cash_roa",
+    "cfo_margin",
+    "current_ratio",
+    "debt_to_equity",
+    "dso",
+    "ebitda_margin",
+    "fcf_margin",
+    "gross_margin",
+    "gross_profitability",
+    "insider_ownership",
+    "interest_coverage",
+    "inventory_turnover",
+    "investment_measure",
+    "margin_change",
+    "net_debt",
+    "net_debt_to_ebitda",
+    "net_issuance",
+    "net_margin",
+    "operating_margin",
+    "quick_ratio",
+    "receivables_turnover",
+    "roa",
+    "roa_change",
+    "roce",
+    "roe",
+    "shareholder_yield",
+    "total_accruals",
+    "turnover_change",
 ]
 
 
@@ -240,14 +266,44 @@ def dso(receivables: float, revenue: float, days_per_year: float) -> float:
     return receivables / revenue * days_per_year
 
 
-def cash_conversion_cycle(days_sales_outstanding: float, days_inventory_outstanding: float, days_payable_outstanding: float) -> float:
+def cash_conversion_cycle(
+    days_sales_outstanding: float, days_inventory_outstanding: float, days_payable_outstanding: float
+) -> float:
     """Cash tied up in days: dso + dio - dpo."""
     return days_sales_outstanding + days_inventory_outstanding - days_payable_outstanding
 
 
-def beneish_m_score(dsri: float, gmi: float, aqi: float, sgi: float, depi: float, sgai: float, lvgi: float, tata: float, intercept: float, w_dsri: float, w_gmi: float, w_aqi: float, w_sgi: float, w_depi: float, w_sgai: float, w_lvgi: float, w_tata: float) -> float:
+def beneish_m_score(
+    dsri: float,
+    gmi: float,
+    aqi: float,
+    sgi: float,
+    depi: float,
+    sgai: float,
+    lvgi: float,
+    tata: float,
+    intercept: float,
+    w_dsri: float,
+    w_gmi: float,
+    w_aqi: float,
+    w_sgi: float,
+    w_depi: float,
+    w_sgai: float,
+    w_lvgi: float,
+    w_tata: float,
+) -> float:
     """Manipulation score: intercept + sum of each weighted 8-variable component."""
-    return intercept + w_dsri * dsri + w_gmi * gmi + w_aqi * aqi + w_sgi * sgi + w_depi * depi + w_sgai * sgai + w_lvgi * lvgi + w_tata * tata
+    return (
+        intercept
+        + w_dsri * dsri
+        + w_gmi * gmi
+        + w_aqi * aqi
+        + w_sgi * sgi
+        + w_depi * depi
+        + w_sgai * sgai
+        + w_lvgi * lvgi
+        + w_tata * tata
+    )
 
 
 def cash_conversion(operating_cash_flow: float, operating_income: float) -> float:

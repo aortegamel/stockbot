@@ -25,25 +25,25 @@ Formulas (one line each):
 import math
 
 __all__ = [
-    "sharpe_ratio",
-    "sortino_ratio",
-    "treynor_ratio",
-    "information_ratio",
+    "brier_score",
     "calmar_ratio",
-    "jensen_alpha",
+    "deflated_sharpe",
     "hit_rate",
+    "incentive_fee",
+    "information_ratio",
+    "jensen_alpha",
+    "management_fee",
+    "money_weighted_irr_objective",
+    "newey_west_variance",
+    "omega_ratio",
     "payoff_ratio",
     "profit_factor",
-    "omega_ratio",
-    "time_weighted_return",
-    "money_weighted_irr_objective",
-    "management_fee",
-    "incentive_fee",
-    "newey_west_variance",
-    "deflated_sharpe",
-    "brier_score",
-    "walk_forward_split",
     "purged_split",
+    "sharpe_ratio",
+    "sortino_ratio",
+    "time_weighted_return",
+    "treynor_ratio",
+    "walk_forward_split",
 ]
 
 
@@ -81,9 +81,7 @@ def _norm_ppf(p: float, lower: float, upper: float, iterations: int) -> float:
     return (lo + hi) / 2
 
 
-def sharpe_ratio(
-    returns: list[float], risk_free_rate: float, periods_per_year: float
-) -> float:
+def sharpe_ratio(returns: list[float], risk_free_rate: float, periods_per_year: float) -> float:
     """Mean per-period excess over stdev, scaled to caller periods per year."""
     excess = [r - risk_free_rate for r in returns]
     mean_excess = _mean(excess)
@@ -93,22 +91,16 @@ def sharpe_ratio(
     return mean_excess / vol * math.sqrt(periods_per_year)
 
 
-def sortino_ratio(
-    returns: list[float], target_return: float, periods_per_year: float
-) -> float:
+def sortino_ratio(returns: list[float], target_return: float, periods_per_year: float) -> float:
     """Mean excess over target over downside deviation, scaled to caller periods."""
     mean_return = _mean(returns)
-    downside = math.sqrt(
-        sum(min(0, r - target_return) ** 2 for r in returns) / len(returns)
-    )
+    downside = math.sqrt(sum(min(0, r - target_return) ** 2 for r in returns) / len(returns))
     if downside == 0:
         raise ValueError("zero downside deviation")
     return (mean_return - target_return) / downside * math.sqrt(periods_per_year)
 
 
-def treynor_ratio(
-    portfolio_return: float, risk_free_rate: float, beta: float
-) -> float:
+def treynor_ratio(portfolio_return: float, risk_free_rate: float, beta: float) -> float:
     """Mean excess return over beta."""
     if beta == 0:
         raise ValueError("zero beta")
@@ -145,9 +137,7 @@ def jensen_alpha(
     beta: float,
 ) -> float:
     """Portfolio return minus CAPM expected return."""
-    return portfolio_return - (
-        risk_free_rate + beta * (benchmark_return - risk_free_rate)
-    )
+    return portfolio_return - (risk_free_rate + beta * (benchmark_return - risk_free_rate))
 
 
 def hit_rate(returns: list[float]) -> float:
@@ -198,9 +188,7 @@ def time_weighted_return(period_returns: list[float]) -> float:
     return total - 1
 
 
-def money_weighted_irr_objective(
-    cash_flows: list[float], rate: float
-) -> float:
+def money_weighted_irr_objective(cash_flows: list[float], rate: float) -> float:
     """Net present value of cash flows at caller rate."""
     if len(cash_flows) == 0:
         raise ValueError("empty series")
@@ -209,9 +197,7 @@ def money_weighted_irr_objective(
     return sum(cf / ((1 + rate) ** t) for t, cf in enumerate(cash_flows))
 
 
-def management_fee(
-    fee_rate: float, assets_under_management: float, period_fraction: float
-) -> float:
+def management_fee(fee_rate: float, assets_under_management: float, period_fraction: float) -> float:
     """Fee rate times aum times period fraction."""
     return fee_rate * assets_under_management * period_fraction
 
@@ -232,13 +218,7 @@ def newey_west_variance(returns: list[float], lag: int) -> float:
     demeaned = [r - mean_return for r in returns]
     var = sum(d * d for d in demeaned) / count
     for lag_index in range(1, lag + 1):
-        cov = (
-            sum(
-                demeaned[t] * demeaned[t - lag_index]
-                for t in range(lag_index, count)
-            )
-            / count
-        )
+        cov = sum(demeaned[t] * demeaned[t - lag_index] for t in range(lag_index, count)) / count
         var = var + 2 * (1 - lag_index / (lag + 1)) * cov
     return var / count
 
@@ -265,14 +245,10 @@ def deflated_sharpe(
     else:
         expected_max = (1 - euler_gamma) * _norm_ppf(
             1 - 1 / num_trials, ppf_lower, ppf_upper, ppf_iterations
-        ) + euler_gamma * _norm_ppf(
-            1 - 1 / (num_trials * math.e), ppf_lower, ppf_upper, ppf_iterations
-        )
+        ) + euler_gamma * _norm_ppf(1 - 1 / (num_trials * math.e), ppf_lower, ppf_upper, ppf_iterations)
     null_sharpe = sharpe_std * expected_max
     tail = (kurtosis - 1) / 2
-    var = (
-        1 - skew * null_sharpe + tail / 2 * null_sharpe * null_sharpe
-    ) / num_observations
+    var = (1 - skew * null_sharpe + tail / 2 * null_sharpe * null_sharpe) / num_observations
     if var <= 0:
         raise ValueError("nonpositive sharpe variance")
     return _norm_cdf((observed_sharpe - null_sharpe) / math.sqrt(var))
@@ -290,9 +266,7 @@ def brier_score(probabilities: list[float], outcomes: list[float]) -> float:
     for o in outcomes:
         if o not in (0, 1):
             raise ValueError("nonbinary outcome")
-    return sum((p - o) ** 2 for p, o in zip(probabilities, outcomes)) / len(
-        probabilities
-    )
+    return sum((p - o) ** 2 for p, o in zip(probabilities, outcomes)) / len(probabilities)
 
 
 def walk_forward_split(
@@ -308,9 +282,7 @@ def walk_forward_split(
     start = 0
     while start + train_length + test_length <= num_observations:
         train_windows.append(list(range(start, start + train_length)))
-        test_windows.append(
-            list(range(start + train_length, start + train_length + test_length))
-        )
+        test_windows.append(list(range(start + train_length, start + train_length + test_length)))
         start = start + step
     if len(train_windows) == 0:
         raise ValueError("no walk-forward windows")
@@ -339,7 +311,6 @@ def purged_split(
     train = [
         i
         for i in range(len(event_start_times))
-        if event_end_times[i] < test_start
-        or event_start_times[i] > test_end + embargo
+        if event_end_times[i] < test_start or event_start_times[i] > test_end + embargo
     ]
     return {"train": train, "test": test}

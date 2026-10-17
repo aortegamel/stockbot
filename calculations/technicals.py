@@ -36,14 +36,36 @@ signed_trade_imbalance: (buy minus sell) over (buy plus sell)
 import math
 
 __all__ = [
-    "simple_return", "log_return", "excess_return", "cumulative_return",
-    "annualized_return", "sma", "ema", "macd", "macd_signal",
-    "rate_of_change", "rsi", "stochastic_k", "stochastic_d",
-    "bollinger_bands", "bandwidth", "true_range", "average_true_range",
-    "parkinson_variance", "garman_klass_variance", "on_balance_volume",
-    "money_flow_index", "accumulation_distribution", "high_52w_proximity",
-    "overnight_return", "intraday_return", "gap", "advance_decline_line",
-    "breadth_ratio", "new_high_low_ratio", "signed_trade_imbalance",
+    "accumulation_distribution",
+    "advance_decline_line",
+    "annualized_return",
+    "average_true_range",
+    "bandwidth",
+    "bollinger_bands",
+    "breadth_ratio",
+    "cumulative_return",
+    "ema",
+    "excess_return",
+    "gap",
+    "garman_klass_variance",
+    "high_52w_proximity",
+    "intraday_return",
+    "log_return",
+    "macd",
+    "macd_signal",
+    "money_flow_index",
+    "new_high_low_ratio",
+    "on_balance_volume",
+    "overnight_return",
+    "parkinson_variance",
+    "rate_of_change",
+    "rsi",
+    "signed_trade_imbalance",
+    "simple_return",
+    "sma",
+    "stochastic_d",
+    "stochastic_k",
+    "true_range",
 ]
 
 
@@ -129,7 +151,7 @@ def sma(prices: list[float], window: int) -> list[float]:
     out: list[float] = []
     for i in range(len(prices)):
         if i + 1 >= window:
-            out.append(_mean(prices[i - window + 1: i + 1]))
+            out.append(_mean(prices[i - window + 1 : i + 1]))
     return out
 
 
@@ -151,7 +173,11 @@ def macd(prices: list[float], fast_window: int, slow_window: int, signal_window:
         macd_line.append(fast_line[i] - slow_line[i])
     signal_line = _ema_series(macd_line, 2 / (signal_window + 1))
     last = len(macd_line) - 1
-    return {"macd_line": macd_line[last], "signal_line": signal_line[last], "histogram": macd_line[last] - signal_line[last]}
+    return {
+        "macd_line": macd_line[last],
+        "signal_line": signal_line[last],
+        "histogram": macd_line[last] - signal_line[last],
+    }
 
 
 def macd_signal(macd_line: list[float], signal_window: int) -> list[float]:
@@ -182,8 +208,8 @@ def rsi(gains: list[float], losses: list[float], period: int, scale: float) -> f
         raise ValueError("empty series")
     if period < 1 or period > len(gains):
         raise ValueError("bad period")
-    avg_gain = _mean(gains[len(gains) - period: len(gains)])
-    avg_loss = _mean(losses[len(losses) - period: len(losses)])
+    avg_gain = _mean(gains[len(gains) - period : len(gains)])
+    avg_loss = _mean(losses[len(losses) - period : len(losses)])
     if avg_gain == 0 and avg_loss == 0:
         return scale / 2
     if avg_loss == 0:
@@ -212,7 +238,7 @@ def bollinger_bands(prices: list[float], window: int, num_std: float) -> dict[st
         raise ValueError("bad window")
     if num_std < 0:
         raise ValueError("negative num_std")
-    recent = prices[len(prices) - window: len(prices)]
+    recent = prices[len(prices) - window : len(prices)]
     middle = _mean(recent)
     spread = _std(recent, middle)
     return {"middle": middle, "upper": middle + num_std * spread, "lower": middle - num_std * spread}
@@ -241,7 +267,7 @@ def average_true_range(true_ranges: list[float], period: int) -> float:
         raise ValueError("empty series")
     if period < 1 or period > len(true_ranges):
         raise ValueError("bad period")
-    return _mean(true_ranges[len(true_ranges) - period: len(true_ranges)])
+    return _mean(true_ranges[len(true_ranges) - period : len(true_ranges)])
 
 
 def parkinson_variance(highs: list[float], lows: list[float]) -> float:
@@ -297,7 +323,9 @@ def on_balance_volume(closes: list[float], volumes: list[float]) -> list[float]:
     return out
 
 
-def money_flow_index(highs: list[float], lows: list[float], closes: list[float], volumes: list[float], period: int, scale: float) -> float:
+def money_flow_index(
+    highs: list[float], lows: list[float], closes: list[float], volumes: list[float], period: int, scale: float
+) -> float:
     """Buying versus selling pressure over period, scaled."""
     if not (len(highs) == len(lows) == len(closes) == len(volumes)):
         raise ValueError("length mismatch")
@@ -323,7 +351,9 @@ def money_flow_index(highs: list[float], lows: list[float], closes: list[float],
     return scale - scale / (1 + ratio)
 
 
-def accumulation_distribution(highs: list[float], lows: list[float], closes: list[float], volumes: list[float]) -> list[float]:
+def accumulation_distribution(
+    highs: list[float], lows: list[float], closes: list[float], volumes: list[float]
+) -> list[float]:
     """Cumulative money-flow multiplier times volume."""
     if not (len(highs) == len(lows) == len(closes) == len(volumes)):
         raise ValueError("length mismatch")
@@ -348,7 +378,7 @@ def high_52w_proximity(prices: list[float], lookback: int, scale: float) -> floa
         raise ValueError("empty series")
     if lookback < 1 or lookback > len(prices):
         raise ValueError("bad lookback")
-    recent = prices[len(prices) - lookback: len(prices)]
+    recent = prices[len(prices) - lookback : len(prices)]
     peak = max(recent)
     if peak == 0:
         raise ValueError("zero high")

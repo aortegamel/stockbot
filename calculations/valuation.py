@@ -35,14 +35,36 @@ tobins_q: (equity_mv + debt_mv) / replacement_cost
 """
 
 __all__ = [
-    "ddm_value", "fcff", "fcff_value", "fcfe", "fcfe_value",
-    "residual_income", "residual_income_value", "oj_value",
-    "pe", "earnings_yield", "peg", "pb", "ps",
-    "enterprise_value", "ev_ebitda", "ev_ebit", "ev_sales",
-    "sustainable_growth", "dupont_roe", "dividend_yield",
-    "payout_ratio", "retention_ratio", "fcf_yield", "cfo_yield",
-    "ev_fcf", "ev_invested_capital", "eva", "roic",
-    "economic_spread", "tobins_q",
+    "cfo_yield",
+    "ddm_value",
+    "dividend_yield",
+    "dupont_roe",
+    "earnings_yield",
+    "economic_spread",
+    "enterprise_value",
+    "ev_ebit",
+    "ev_ebitda",
+    "ev_fcf",
+    "ev_invested_capital",
+    "ev_sales",
+    "eva",
+    "fcf_yield",
+    "fcfe",
+    "fcfe_value",
+    "fcff",
+    "fcff_value",
+    "oj_value",
+    "payout_ratio",
+    "pb",
+    "pe",
+    "peg",
+    "ps",
+    "residual_income",
+    "residual_income_value",
+    "retention_ratio",
+    "roic",
+    "sustainable_growth",
+    "tobins_q",
 ]
 
 
@@ -82,7 +104,9 @@ def residual_income(eps1: float, required_return: float, book_value: float) -> f
     return eps1 - required_return * book_value
 
 
-def residual_income_value(book_value: float, residual_income_next: float, required_return: float, growth: float) -> float:
+def residual_income_value(
+    book_value: float, residual_income_next: float, required_return: float, growth: float
+) -> float:
     """Equity value: book0 + ri_next / (r - g)."""
     if required_return <= growth:
         raise ValueError("required return must exceed growth")
@@ -95,7 +119,9 @@ def oj_value(eps1: float, eps2: float, dividend_next: float, required_return: fl
         raise ValueError("required return must be positive")
     if gamma < 0 or gamma >= required_return:
         raise ValueError("gamma must satisfy 0 <= gamma < required return")
-    return eps1 / required_return + (eps2 - eps1 - required_return * (eps1 - dividend_next)) / (required_return * (required_return - gamma))
+    return eps1 / required_return + (eps2 - eps1 - required_return * (eps1 - dividend_next)) / (
+        required_return * (required_return - gamma)
+    )
 
 
 def pe(price: float, eps: float) -> float:

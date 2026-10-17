@@ -1,21 +1,21 @@
 """Equity calculation package: pure parameterized functions, stdlib only."""
 
 from calculations import (
-    valuation,
-    fundamentals,
-    factors,
-    technicals,
-    portfolio_risk,
     execution,
+    factors,
+    fundamentals,
     performance,
+    portfolio_risk,
+    technicals,
+    valuation,
 )
-from calculations.valuation import *
-from calculations.fundamentals import *
-from calculations.factors import *
-from calculations.technicals import *
-from calculations.portfolio_risk import *
 from calculations.execution import *
+from calculations.factors import *
+from calculations.fundamentals import *
 from calculations.performance import *
+from calculations.portfolio_risk import *
+from calculations.technicals import *
+from calculations.valuation import *
 
 __all__ = list(
     dict.fromkeys(

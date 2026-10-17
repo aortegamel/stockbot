@@ -51,46 +51,46 @@ from __future__ import annotations
 import math
 
 __all__ = [
-    "mean_variance_objective",
-    "unconstrained_mv_weights",
-    "minimum_variance_objective",
-    "marginal_risk_contribution",
+    "active_share",
+    "active_weights",
+    "beta_adjusted_net",
+    "cap_weights",
     "component_risk_contribution",
-    "portfolio_variance",
-    "systematic_variance",
+    "component_var",
+    "diversification_ratio",
+    "equal_weights",
+    "ewma_cov_update",
+    "excess_kurtosis",
+    "expected_shortfall",
     "garch_update",
     "garch_variance",
-    "volatility_target_scale",
     "gross_exposure",
-    "net_exposure",
-    "beta_adjusted_net",
-    "equal_weights",
-    "cap_weights",
-    "score_weights",
     "inverse_vol_weights",
-    "diversification_ratio",
-    "tracking_error",
-    "active_weights",
-    "portfolio_turnover",
     "kelly_binary",
     "kelly_objective",
-    "sample_covariance",
-    "sample_correlation",
-    "ewma_cov_update",
+    "marginal_risk_contribution",
+    "marginal_var",
+    "max_drawdown",
+    "mean_variance_objective",
+    "minimum_variance_objective",
+    "net_exposure",
+    "portfolio_turnover",
+    "portfolio_variance",
     "realized_volatility_hf",
+    "sample_correlation",
+    "sample_covariance",
+    "score_weights",
     "shrinkage_covariance",
     "skewness",
-    "excess_kurtosis",
-    "active_share",
+    "stress_pnl",
+    "systematic_variance",
+    "tail_risk_measure",
+    "time_under_water",
+    "tracking_error",
+    "unconstrained_mv_weights",
     "value_at_risk_historical",
     "value_at_risk_parametric",
-    "expected_shortfall",
-    "max_drawdown",
-    "time_under_water",
-    "stress_pnl",
-    "tail_risk_measure",
-    "marginal_var",
-    "component_var",
+    "volatility_target_scale",
 ]
 
 
@@ -139,23 +139,17 @@ def unconstrained_mv_weights(
     return [x / risk_aversion for x in _matvec(inv_cov, expected_returns)]
 
 
-def minimum_variance_objective(
-    weights: list[float], cov: list[list[float]]
-) -> float:
+def minimum_variance_objective(weights: list[float], cov: list[list[float]]) -> float:
     """w'Sw."""
     return _quad(weights, cov)
 
 
-def portfolio_variance(
-    weights: list[float], cov: list[list[float]]
-) -> float:
+def portfolio_variance(weights: list[float], cov: list[list[float]]) -> float:
     """w'Sw."""
     return _quad(weights, cov)
 
 
-def marginal_risk_contribution(
-    weights: list[float], cov: list[list[float]]
-) -> list[float]:
+def marginal_risk_contribution(weights: list[float], cov: list[list[float]]) -> list[float]:
     """Sw / sqrt(w'Sw)."""
     var = _quad(weights, cov)
     if var <= 0:
@@ -164,13 +158,9 @@ def marginal_risk_contribution(
     return [x / vol for x in _matvec(cov, weights)]
 
 
-def component_risk_contribution(
-    weights: list[float], cov: list[list[float]]
-) -> list[float]:
+def component_risk_contribution(weights: list[float], cov: list[list[float]]) -> list[float]:
     """w * (Sw / sqrt(w'Sw)); sums to portfolio volatility."""
-    return [
-        w * m for w, m in zip(weights, marginal_risk_contribution(weights, cov))
-    ]
+    return [w * m for w, m in zip(weights, marginal_risk_contribution(weights, cov))]
 
 
 def systematic_variance(
@@ -190,9 +180,7 @@ def systematic_variance(
     return _dot(exposures, _matvec(factor_cov, exposures))
 
 
-def garch_update(
-    omega: float, alpha: float, beta: float, prev_var: float, shock: float
-) -> float:
+def garch_update(omega: float, alpha: float, beta: float, prev_var: float, shock: float) -> float:
     """omega + alpha shock^2 + beta prev_var."""
     if omega < 0:
         raise ValueError("negative omega")
@@ -221,9 +209,7 @@ def garch_variance(
     return out
 
 
-def volatility_target_scale(
-    target_vol: float, forecast_vol: float, cap: float
-) -> float:
+def volatility_target_scale(target_vol: float, forecast_vol: float, cap: float) -> float:
     """min(target_vol / forecast_vol, cap)."""
     if target_vol <= 0:
         raise ValueError("nonpositive target vol")
@@ -269,29 +255,37 @@ def cap_weights(weights: list[float], cap: float) -> list[float]:
         return [0] * len(weights)
     if cap * len(weights) < budget:
         raise ValueError("infeasible cap for budget")
+    return [min(w, cap) for w in _water_fill(weights, cap, budget)]
+
+
+def _water_fill(weights: list[float], cap: float, budget: float) -> list[float]:
+    """Pin names above cap at cap and spread the leftover budget over the rest until none exceed it."""
     tolerance = cap * 1e-09
     out = list(weights)
-    capped = [False] * len(out)
-    for _ in range(len(out) + 1):
-        free = [i for i in range(len(out)) if not capped[i]]
-        if not free:
-            break
-        remaining = budget - sum(out[i] for i in range(len(out)) if capped[i])
-        total_free = sum(out[i] for i in free)
-        if total_free == 0:
-            share = remaining / len(free)
-            for i in free:
-                out[i] = share
-        else:
-            for i in free:
-                out[i] = out[i] / total_free * remaining
+    free = list(range(len(out)))
+    pinned: list[int] = []
+    while free:
+        _spread_budget(out, free, budget - sum(out[i] for i in pinned))
         over = [i for i in free if out[i] > cap + tolerance]
         if not over:
             break
         for i in over:
             out[i] = cap
-            capped[i] = True
-    return [min(w, cap) for w in out]
+        pinned += over
+        free = [i for i in free if i not in over]
+    return out
+
+
+def _spread_budget(out: list[float], free: list[int], remaining: float) -> None:
+    """Rescale free names pro rata to the remaining budget; split it equally when all are zero."""
+    total_free = sum(out[i] for i in free)
+    if total_free == 0:
+        share = remaining / len(free)
+        for i in free:
+            out[i] = share
+    else:
+        for i in free:
+            out[i] = out[i] / total_free * remaining
 
 
 def score_weights(scores: list[float]) -> list[float]:
@@ -313,9 +307,7 @@ def inverse_vol_weights(vols: list[float]) -> list[float]:
     return [x / total for x in inv]
 
 
-def diversification_ratio(
-    weights: list[float], vols: list[float], cov: list[list[float]]
-) -> float:
+def diversification_ratio(weights: list[float], vols: list[float], cov: list[list[float]]) -> float:
     """sum(w v) / sqrt(w'Sw)."""
     if len(weights) != len(vols):
         raise ValueError("length mismatch")
@@ -341,9 +333,7 @@ def tracking_error(
     return math.sqrt(var) * annualization
 
 
-def active_weights(
-    portfolio_weights: list[float], benchmark_weights: list[float]
-) -> list[float]:
+def active_weights(portfolio_weights: list[float], benchmark_weights: list[float]) -> list[float]:
     """w_port - w_bench."""
     if len(portfolio_weights) != len(benchmark_weights):
         raise ValueError("length mismatch")
@@ -352,9 +342,7 @@ def active_weights(
     return [p - b for p, b in zip(portfolio_weights, benchmark_weights)]
 
 
-def portfolio_turnover(
-    new_weights: list[float], old_weights: list[float]
-) -> float:
+def portfolio_turnover(new_weights: list[float], old_weights: list[float]) -> float:
     """sum |new - old| / 2."""
     if len(new_weights) != len(old_weights):
         raise ValueError("length mismatch")
@@ -374,22 +362,16 @@ def kelly_binary(prob: float, win: float, loss: float) -> float:
     return prob / loss - (1 - prob) / win
 
 
-def kelly_objective(
-    fraction: float, prob: float, win: float, loss: float
-) -> float:
+def kelly_objective(fraction: float, prob: float, win: float, loss: float) -> float:
     """prob log(1 + f win) + (1 - prob) log(1 - f loss)."""
     if 1 + fraction * win <= 0:
         raise ValueError("nonpositive 1 + fraction * win")
     if 1 - fraction * loss <= 0:
         raise ValueError("nonpositive 1 - fraction * loss")
-    return prob * math.log(1 + fraction * win) + (1 - prob) * math.log(
-        1 - fraction * loss
-    )
+    return prob * math.log(1 + fraction * win) + (1 - prob) * math.log(1 - fraction * loss)
 
 
-def sample_covariance(
-    series_a: list[float], series_b: list[float], ddof: int
-) -> float:
+def sample_covariance(series_a: list[float], series_b: list[float], ddof: int) -> float:
     """sum((a - ma)(b - mb)) / (n - ddof)."""
     if len(series_a) != len(series_b):
         raise ValueError("length mismatch")
@@ -397,14 +379,10 @@ def sample_covariance(
         raise ValueError("nonpositive degrees of freedom")
     mean_a = _mean(series_a)
     mean_b = _mean(series_b)
-    return sum(
-        (a - mean_a) * (b - mean_b) for a, b in zip(series_a, series_b)
-    ) / (len(series_a) - ddof)
+    return sum((a - mean_a) * (b - mean_b) for a, b in zip(series_a, series_b)) / (len(series_a) - ddof)
 
 
-def sample_correlation(
-    series_a: list[float], series_b: list[float]
-) -> float:
+def sample_correlation(series_a: list[float], series_b: list[float]) -> float:
     """cov / (std_a std_b)."""
     if len(series_a) != len(series_b):
         raise ValueError("length mismatch")
@@ -420,9 +398,7 @@ def sample_correlation(
     return _dot(dev_a, dev_b) / math.sqrt(denom)
 
 
-def ewma_cov_update(
-    prev_cov: list[list[float]], asset_returns: list[float], decay: float
-) -> list[list[float]]:
+def ewma_cov_update(prev_cov: list[list[float]], asset_returns: list[float], decay: float) -> list[list[float]]:
     """decay prev + (1 - decay) r r'."""
     if len(asset_returns) == 0 or len(prev_cov) == 0:
         raise ValueError("empty series")
@@ -434,37 +410,25 @@ def ewma_cov_update(
     if any(len(row) != n for row in prev_cov):
         raise ValueError("shape mismatch")
     return [
-        [
-            decay * p + (1 - decay) * ri * rj
-            for p, rj in zip(row, asset_returns)
-        ]
+        [decay * p + (1 - decay) * ri * rj for p, rj in zip(row, asset_returns)]
         for row, ri in zip(prev_cov, asset_returns)
     ]
 
 
-def realized_volatility_hf(
-    returns: list[float], annualization: float
-) -> float:
+def realized_volatility_hf(returns: list[float], annualization: float) -> float:
     """sqrt(sum r^2) * annualization."""
     if len(returns) == 0:
         raise ValueError("empty series")
     return math.sqrt(sum(r * r for r in returns)) * annualization
 
 
-def shrinkage_covariance(
-    sample_cov: list[list[float]], target: list[list[float]], delta: float
-) -> list[list[float]]:
+def shrinkage_covariance(sample_cov: list[list[float]], target: list[list[float]], delta: float) -> list[list[float]]:
     """delta target + (1 - delta) sample, elementwise."""
     if not 0 <= delta <= 1:
         raise ValueError("delta out of range")
-    if len(sample_cov) != len(target) or any(
-        len(s_row) != len(t_row) for s_row, t_row in zip(sample_cov, target)
-    ):
+    if len(sample_cov) != len(target) or any(len(s_row) != len(t_row) for s_row, t_row in zip(sample_cov, target)):
         raise ValueError("shape mismatch")
-    return [
-        [delta * t + (1 - delta) * s for s, t in zip(s_row, t_row)]
-        for s_row, t_row in zip(sample_cov, target)
-    ]
+    return [[delta * t + (1 - delta) * s for s, t in zip(s_row, t_row)] for s_row, t_row in zip(sample_cov, target)]
 
 
 def skewness(returns: list[float]) -> float:
@@ -489,9 +453,7 @@ def excess_kurtosis(returns: list[float]) -> float:
     return m4 / (m2 * m2) - (1 + 2)
 
 
-def active_share(
-    portfolio_weights: list[float], benchmark_weights: list[float]
-) -> float:
+def active_share(portfolio_weights: list[float], benchmark_weights: list[float]) -> float:
     """sum |w_port - w_bench| / 2."""
     if len(portfolio_weights) != len(benchmark_weights):
         raise ValueError("length mismatch")
@@ -500,9 +462,7 @@ def active_share(
     return sum(abs(p - b) for p, b in zip(portfolio_weights, benchmark_weights)) / 2
 
 
-def value_at_risk_historical(
-    returns: list[float], confidence: float
-) -> float:
+def value_at_risk_historical(returns: list[float], confidence: float) -> float:
     """-(1 - confidence) quantile of returns."""
     if len(returns) == 0:
         raise ValueError("empty series")
@@ -574,9 +534,7 @@ def tail_risk_measure(cutoffs: list[float], shortfalls: list[float]) -> float:
     return sum(s - c for s, c in zip(shortfalls, cutoffs)) / len(shortfalls)
 
 
-def marginal_var(
-    weights: list[float], cov: list[list[float]], z_score: float
-) -> list[float]:
+def marginal_var(weights: list[float], cov: list[list[float]], z_score: float) -> list[float]:
     """z_score Sw / sqrt(w'Sw)."""
     var = _quad(weights, cov)
     if var <= 0:
@@ -585,8 +543,6 @@ def marginal_var(
     return [z_score * x / vol for x in _matvec(cov, weights)]
 
 
-def component_var(
-    weights: list[float], cov: list[list[float]], z_score: float
-) -> list[float]:
+def component_var(weights: list[float], cov: list[list[float]], z_score: float) -> list[float]:
     """w * marginal_var; sums to parametric portfolio VaR."""
     return [w * m for w, m in zip(weights, marginal_var(weights, cov, z_score))]

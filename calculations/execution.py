@@ -47,47 +47,47 @@ iv_term_slope: far-minus-near IV over maturity gap.
 import math
 
 __all__ = [
-    "quoted_spread",
-    "midpoint",
-    "relative_spread",
-    "effective_spread",
-    "realized_spread",
+    "almgren_chriss_cost",
     "amihud_illiquidity",
+    "average_daily_volume",
+    "black_scholes_greeks",
     "book_depth",
     "book_imbalance",
-    "cumulative_depth",
-    "vwap",
-    "twap",
-    "implementation_shortfall",
-    "sqrt_market_impact",
-    "almgren_chriss_cost",
-    "pair_distance",
-    "spread_zscore",
-    "hedge_spread",
-    "cointegration_residual",
-    "event_ar",
-    "event_car",
-    "event_caar",
-    "standardized_surprise",
-    "merger_spread_annualized",
-    "ex_rights_price",
-    "t_statistic",
-    "information_coefficient",
-    "cross_section_rank",
-    "winsorize",
-    "robust_zscore",
-    "turnover_rate",
-    "average_daily_volume",
-    "participation_rate",
-    "short_interest_pct",
-    "days_to_cover",
-    "utilization",
     "borrow_cost",
-    "put_call_ratio",
+    "cointegration_residual",
+    "cross_section_rank",
+    "cumulative_depth",
+    "days_to_cover",
+    "effective_spread",
+    "event_ar",
+    "event_caar",
+    "event_car",
+    "ex_rights_price",
+    "hedge_spread",
+    "implementation_shortfall",
+    "information_coefficient",
     "iv_premium",
-    "black_scholes_greeks",
     "iv_skew",
     "iv_term_slope",
+    "merger_spread_annualized",
+    "midpoint",
+    "pair_distance",
+    "participation_rate",
+    "put_call_ratio",
+    "quoted_spread",
+    "realized_spread",
+    "relative_spread",
+    "robust_zscore",
+    "short_interest_pct",
+    "spread_zscore",
+    "sqrt_market_impact",
+    "standardized_surprise",
+    "t_statistic",
+    "turnover_rate",
+    "twap",
+    "utilization",
+    "vwap",
+    "winsorize",
 ]
 
 
@@ -206,9 +206,7 @@ def implementation_shortfall(
     )
 
 
-def sqrt_market_impact(
-    volatility: float, quantity: float, adv: float, coeff: float, exponent: float
-) -> float:
+def sqrt_market_impact(volatility: float, quantity: float, adv: float, coeff: float, exponent: float) -> float:
     if quantity < 0:
         raise ValueError("negative quantity")
     if adv <= 0:
@@ -275,9 +273,7 @@ def merger_spread_annualized(
     return (offer_price - market_price) / market_price * days_per_year / days_to_close
 
 
-def ex_rights_price(
-    cum_price: float, subscription_price: float, old_shares: float, new_shares: float
-) -> float:
+def ex_rights_price(cum_price: float, subscription_price: float, old_shares: float, new_shares: float) -> float:
     if old_shares < 0 or new_shares < 0:
         raise ValueError("negative shares")
     if old_shares + new_shares == 0:
@@ -319,7 +315,7 @@ def winsorize(values: list[float], lower: float, upper: float) -> list[float]:
         raise ValueError("empty series")
     if lower > upper:
         raise ValueError("lower above upper")
-    return [lower if v < lower else upper if v > upper else v for v in values]
+    return [lower if v < lower else min(v, upper) for v in values]
 
 
 def robust_zscore(value: float, median: float, mad: float, scale: float) -> float:
@@ -339,7 +335,7 @@ def average_daily_volume(volumes: list[float], window: int) -> float:
         raise ValueError("empty series")
     if window < 1:
         raise ValueError("nonpositive window")
-    tail = volumes[max(len(volumes) - window, 0):]
+    tail = volumes[max(len(volumes) - window, 0) :]
     return sum(tail) / len(tail)
 
 
@@ -423,9 +419,7 @@ def iv_skew(put_iv: float, call_iv: float, scale: float) -> float:
     return (put_iv - call_iv) * scale
 
 
-def iv_term_slope(
-    near_iv: float, far_iv: float, near_maturity: float, far_maturity: float
-) -> float:
+def iv_term_slope(near_iv: float, far_iv: float, near_maturity: float, far_maturity: float) -> float:
     if far_maturity == near_maturity:
         raise ValueError("equal maturities")
     return (far_iv - near_iv) / (far_maturity - near_maturity)

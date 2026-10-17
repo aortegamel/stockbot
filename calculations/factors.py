@@ -34,34 +34,34 @@ Formulas (one line each):
 import math
 
 __all__ = [
+    "abnormal_return",
     "beta",
+    "book_to_market",
+    "cma_spread",
+    "composite_alpha",
+    "cumulative_abnormal_return",
     "downside_beta",
+    "earnings_surprise",
+    "eps_revision",
+    "factor_expected_return",
+    "hml_spread",
+    "idiosyncratic_volatility",
+    "industry_zscore",
+    "investment_rate",
+    "lasso_objective",
+    "long_reversal_score",
+    "ml_feature_row",
+    "momentum_12_2",
+    "operating_profitability",
+    "piotroski_f_score",
+    "realized_volatility",
+    "residual_momentum",
+    "rmw_spread",
+    "short_reversal_score",
     "size_log",
     "smb_spread",
-    "book_to_market",
-    "hml_spread",
-    "operating_profitability",
-    "rmw_spread",
-    "investment_rate",
-    "cma_spread",
-    "momentum_12_2",
-    "short_reversal_score",
-    "long_reversal_score",
-    "realized_volatility",
-    "idiosyncratic_volatility",
-    "turnover_liquidity",
     "standardized_unexpected_earnings",
-    "piotroski_f_score",
-    "factor_expected_return",
-    "residual_momentum",
-    "industry_zscore",
-    "composite_alpha",
-    "eps_revision",
-    "earnings_surprise",
-    "abnormal_return",
-    "cumulative_abnormal_return",
-    "ml_feature_row",
-    "lasso_objective",
+    "turnover_liquidity",
 ]
 
 
@@ -79,10 +79,7 @@ def beta(stock_returns: list[float], market_returns: list[float]) -> float:
         raise ValueError("empty series")
     mean_stock = _mean(stock_returns)
     mean_market = _mean(market_returns)
-    cov = sum(
-        (s - mean_stock) * (m - mean_market)
-        for s, m in zip(stock_returns, market_returns)
-    ) / len(stock_returns)
+    cov = sum((s - mean_stock) * (m - mean_market) for s, m in zip(stock_returns, market_returns)) / len(stock_returns)
     var = sum((m - mean_market) ** 2 for m in market_returns) / len(market_returns)
     if var == 0:
         raise ValueError("zero market variance")
@@ -97,20 +94,14 @@ def downside_beta(
     """downside beta = cov / var over periods where market trails threshold."""
     if len(stock_returns) != len(market_returns):
         raise ValueError("length mismatch")
-    pairs = [
-        (s, m)
-        for s, m in zip(stock_returns, market_returns)
-        if m < threshold_return
-    ]
+    pairs = [(s, m) for s, m in zip(stock_returns, market_returns) if m < threshold_return]
     if len(pairs) == 0:
         raise ValueError("no downside observations")
     down_stock = [s for s, _ in pairs]
     down_market = [m for _, m in pairs]
     mean_stock = _mean(down_stock)
     mean_market = _mean(down_market)
-    cov = sum(
-        (s - mean_stock) * (m - mean_market) for s, m in pairs
-    ) / len(pairs)
+    cov = sum((s - mean_stock) * (m - mean_market) for s, m in pairs) / len(pairs)
     var = sum((m - mean_market) ** 2 for m in down_market) / len(pairs)
     if var == 0:
         raise ValueError("zero downside market variance")
@@ -167,9 +158,7 @@ def cma_spread(conservative_return: float, aggressive_return: float) -> float:
     return conservative_return - aggressive_return
 
 
-def momentum_12_2(
-    cum_return_long_window: float, cum_return_recent_window: float
-) -> float:
+def momentum_12_2(cum_return_long_window: float, cum_return_recent_window: float) -> float:
     """momentum = long-window cumulative return minus recent skip-window return."""
     return cum_return_long_window - cum_return_recent_window
 
@@ -197,9 +186,7 @@ def realized_volatility(returns: list[float], periods_per_year: float) -> float:
     return math.sqrt(var * periods_per_year)
 
 
-def idiosyncratic_volatility(
-    residuals: list[float], periods_per_year: float
-) -> float:
+def idiosyncratic_volatility(residuals: list[float], periods_per_year: float) -> float:
     """idiosyncratic vol = residual stdev scaled to caller periods per year."""
     if periods_per_year <= 0:
         raise ValueError("nonpositive periods per year")
@@ -208,9 +195,7 @@ def idiosyncratic_volatility(
     return math.sqrt(var * periods_per_year)
 
 
-def turnover_liquidity(
-    volumes: list[float], shares_outstanding: float, periods_per_year: float
-) -> float:
+def turnover_liquidity(volumes: list[float], shares_outstanding: float, periods_per_year: float) -> float:
     """liquidity = mean volume over shares out, scaled to caller periods."""
     if shares_outstanding <= 0:
         raise ValueError("nonpositive shares outstanding")
@@ -219,9 +204,7 @@ def turnover_liquidity(
     return _mean(volumes) / shares_outstanding * periods_per_year
 
 
-def standardized_unexpected_earnings(
-    actual_eps: float, expected_eps: float, surprise_scale: float
-) -> float:
+def standardized_unexpected_earnings(actual_eps: float, expected_eps: float, surprise_scale: float) -> float:
     """SUE = eps surprise over caller dispersion scale."""
     if surprise_scale <= 0:
         raise ValueError("nonpositive surprise scale")
@@ -267,9 +250,7 @@ def piotroski_f_score(
     )
 
 
-def factor_expected_return(
-    factor_betas: list[float], factor_premia: list[float]
-) -> float:
+def factor_expected_return(factor_betas: list[float], factor_premia: list[float]) -> float:
     """expected return = dot product of betas and factor premia."""
     if len(factor_betas) != len(factor_premia):
         raise ValueError("length mismatch")
@@ -283,36 +264,28 @@ def residual_momentum(cum_residual_return: float, scale: float) -> float:
     return cum_residual_return / scale
 
 
-def industry_zscore(
-    stock_value: float, industry_mean: float, industry_std: float
-) -> float:
+def industry_zscore(stock_value: float, industry_mean: float, industry_std: float) -> float:
     """industry z-score = value minus industry mean over industry std."""
     if industry_std <= 0:
         raise ValueError("nonpositive industry std")
     return (stock_value - industry_mean) / industry_std
 
 
-def composite_alpha(
-    factor_scores: list[float], factor_weights: list[float]
-) -> float:
+def composite_alpha(factor_scores: list[float], factor_weights: list[float]) -> float:
     """composite alpha = dot product of factor scores and caller weights."""
     if len(factor_scores) != len(factor_weights):
         raise ValueError("length mismatch")
     return sum(s * w for s, w in zip(factor_scores, factor_weights))
 
 
-def eps_revision(
-    new_estimate: float, old_estimate: float, revision_scale: float
-) -> float:
+def eps_revision(new_estimate: float, old_estimate: float, revision_scale: float) -> float:
     """EPS revision = estimate change over caller scale."""
     if revision_scale <= 0:
         raise ValueError("nonpositive revision scale")
     return (new_estimate - old_estimate) / revision_scale
 
 
-def earnings_surprise(
-    actual_eps: float, consensus_estimate: float, surprise_scale: float
-) -> float:
+def earnings_surprise(actual_eps: float, consensus_estimate: float, surprise_scale: float) -> float:
     """earnings surprise = actual minus consensus over caller scale."""
     if surprise_scale <= 0:
         raise ValueError("nonpositive surprise scale")
@@ -348,22 +321,16 @@ def ml_feature_row(
         if lower_limits[key] > upper_limits[key]:
             raise ValueError(f"inverted limits for feature: {key}")
         clipped = val
-        if clipped < lower_limits[key]:
-            clipped = lower_limits[key]
-        if clipped > upper_limits[key]:
-            clipped = upper_limits[key]
+        clipped = max(clipped, lower_limits[key])
+        clipped = min(clipped, upper_limits[key])
         if scales[key] == 0:
             raise ValueError("zero feature scale")
         out[key] = (clipped - centers[key]) / scales[key]
     return out
 
 
-def lasso_objective(
-    residuals: list[float], coefficients: list[float], lambda_penalty: float
-) -> float:
+def lasso_objective(residuals: list[float], coefficients: list[float], lambda_penalty: float) -> float:
     """lasso objective = sum of squared residuals plus penalty over abs coefs."""
     if lambda_penalty < 0:
         raise ValueError("negative lambda penalty")
-    return sum(r * r for r in residuals) + lambda_penalty * sum(
-        abs(c) for c in coefficients
-    )
+    return sum(r * r for r in residuals) + lambda_penalty * sum(abs(c) for c in coefficients)
