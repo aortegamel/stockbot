@@ -86,6 +86,46 @@ def _known_as_of_filing(filing: Filing, as_of: str | None) -> bool:
     return value is not None and value[:10] <= as_of
 
 
+def _check_filing_filters(start_date: object, end_date: object, forms: object) -> None:
+    """Date-window and form-list validation for live filing reads."""
+    if start_date is not None:
+        _validate_date(start_date, "start_date")
+    if end_date is not None:
+        _validate_date(end_date, "end_date")
+    if forms is None:
+        return
+    if not isinstance(forms, list):
+        raise TypeError(f"forms must be a list of strings, got {forms!r}")
+    for entry in forms:
+        if not isinstance(entry, str):
+            raise TypeError(f"forms must be a list of strings, got {entry!r}")
+
+
+def _accession_filing(accession: object, bound: str | None) -> list[Filing]:
+    """One accession via the gateway; unknown-as-of reads as empty."""
+    if not isinstance(accession, str):
+        raise TypeError(f"accession must be a string, got {accession!r}")
+    from ..data_sources import SourceGateway as _Gateway
+
+    try:
+        filing = _Gateway().get_filing(accession, as_of=bound)
+    except ValueError as exc:
+        if "not known as of" in str(exc):
+            return []
+        raise
+    return [filing] if _known_as_of_filing(filing, bound) else []
+
+
+def _filing_cik(cik: object) -> int:
+    """Typed CIK filter as an int; bools and unparseable strings rejected."""
+    if isinstance(cik, bool) or not isinstance(cik, (int, str)):
+        raise TypeError(f"cik must be int or str, got {cik!r}")
+    try:
+        return int(str(cik).strip())
+    except ValueError:
+        raise ValueError(f"invalid cik: {cik!r}") from None
+
+
 # Live reads: SourceGateway + normalization; NOTE warehouse slots behind these names.
 def query_filings(
     *,
@@ -101,38 +141,14 @@ def query_filings(
     """Live filing reads as typed ``Filing`` objects (no warehouse)."""
     del root
     bound = _check_as_of_opt(as_of)
-    if start_date is not None:
-        _validate_date(start_date, "start_date")
-    if end_date is not None:
-        _validate_date(end_date, "end_date")
-    if forms is not None:
-        if not isinstance(forms, list):
-            raise TypeError(f"forms must be a list of strings, got {forms!r}")
-        for entry in forms:
-            if not isinstance(entry, str):
-                raise TypeError(f"forms must be a list of strings, got {entry!r}")
+    _check_filing_filters(start_date, end_date, forms)
     if accession is not None:
-        if not isinstance(accession, str):
-            raise TypeError(f"accession must be a string, got {accession!r}")
-        from ..data_sources import SourceGateway as _Gateway
-
-        try:
-            filing = _Gateway().get_filing(accession, as_of=bound)
-        except ValueError as exc:
-            if "not known as of" in str(exc):
-                return []
-            raise
-        return [filing] if _known_as_of_filing(filing, bound) else []
+        return _accession_filing(accession, bound)
     if cik is None:
         return []
-    if isinstance(cik, bool) or not isinstance(cik, (int, str)):
-        raise TypeError(f"cik must be int or str, got {cik!r}")
+    cik_int = _filing_cik(cik)
     from .filings import list_sec_filings as _live_list
 
-    try:
-        cik_int = int(str(cik).strip())
-    except ValueError:
-        raise ValueError(f"invalid cik: {cik!r}") from None
     want = {f.strip().upper() for f in (forms or []) if f.strip()}
     filings = _live_list(
         cik_int, forms=list(want) or None, start_date=start_date, end_date=end_date, as_of=bound, limit=limit
@@ -407,38 +423,48 @@ def query_coverage(*args: object, **kwargs: object) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     root_arg = _check_query_root(kwargs.get("root"))
     for job in list_jobs(status="complete", root=root_arg):
-        job_form = str(job.get("form") or "")
-        job_source = str(job.get("source") or "")
-        if isinstance(form, str) and job_form != form:
-            continue
-        if isinstance(source, str) and job_source != source:
-            continue
-        partition = f"{job.get('start_date')}:{job.get('end_date')}"
-        if isinstance(date_partition, str) and partition != date_partition:
-            continue
-        rows.append(
-            {
-                "source": job_source,
-                "form": job_form,
-                "date_partition": partition,
-                "status": "complete",
-                "last_key": job.get("last_key"),
-            }
-        )
+        row = _coverage_row(job, source, form, date_partition)
+        if row is not None:
+            rows.append(row)
     return rows if cap is None else rows[:cap]
+
+
+def _coverage_row(
+    job: Mapping[str, object], source: object, form: object, date_partition: object
+) -> dict[str, object] | None:
+    """Coverage row for one complete job, or None when a string filter excludes it."""
+    job_form = str(job.get("form") or "")
+    job_source = str(job.get("source") or "")
+    partition = f"{job.get('start_date')}:{job.get('end_date')}"
+    if isinstance(form, str) and job_form != form:
+        return None
+    if isinstance(source, str) and job_source != source:
+        return None
+    if isinstance(date_partition, str) and partition != date_partition:
+        return None
+    return {
+        "source": job_source,
+        "form": job_form,
+        "date_partition": partition,
+        "status": "complete",
+        "last_key": job.get("last_key"),
+    }
+
+
+def _job_covers_partition(job: Mapping[str, object], source: str, form: str, date_partition: str) -> bool:
+    """Same source/form, and the partition equals the job range or either range end."""
+    start = str(job.get("start_date") or "")
+    end = str(job.get("end_date") or "")
+    if str(job.get("source") or "") != source or str(job.get("form") or "") != form:
+        return False
+    return f"{start}:{end}" == date_partition or start == date_partition or end == date_partition
 
 
 def is_partition_covered(source: str, form: str, date_partition: str, *, root: Path | str | None = None) -> bool:
     """True when a ``complete`` job covers the partition (job ledger is the coverage source)."""
-    jobs = list_jobs(status="complete", root=root)
-    for job in jobs:
-        start = str(job.get("start_date") or "")
-        end = str(job.get("end_date") or "")
-        if str(job.get("source") or "") != source or str(job.get("form") or "") != form:
-            continue
-        if f"{start}:{end}" == date_partition or start == date_partition or end == date_partition:
-            return True
-    return False
+    return any(
+        _job_covers_partition(job, source, form, date_partition) for job in list_jobs(status="complete", root=root)
+    )
 
 
 # Job ledger (SQLite ops ledger): coverage reads here; NOTE warehouse slots apart from this.

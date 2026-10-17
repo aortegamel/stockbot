@@ -108,6 +108,54 @@ def _cik_of(entity_id: str) -> int | None:
         return None
 
 
+def _settlement_page(
+    settlement_date: str, name: str, offset: int, total: int | None
+) -> tuple[list[dict[str, object]], int]:
+    """Fetch one page and validate its completeness header."""
+    time.sleep(0.2)  # politeness pacing, same interval as the ingestion path
+    payload: dict[str, object] = {
+        "limit": finra_client.MAX_LIMIT,
+        "offset": offset,
+        "fields": list(_SHORT_FIELDS),
+        "compareFilters": [
+            {
+                "compareType": "EQUAL",
+                "fieldName": "settlementDate",
+                "fieldValue": settlement_date,
+            }
+        ],
+    }
+    _content, rows, headers = finra_client.ingestion_post_query("otcMarket", name, payload)
+    raw_total = headers.get("record-total")
+    if raw_total is None:
+        raise ValueError("FINRA omitted Record-Total; cannot prove the short-interest snapshot is complete.")
+    page_total = int(str(raw_total))
+    if total is not None and page_total != total:
+        raise ValueError("FINRA Record-Total changed while paging the snapshot.")
+    page_rows: list[dict[str, object]] = (
+        [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    )
+    return page_rows, page_total
+
+
+def _settlement_snapshot(settlement_date: str, name: str) -> list[dict[str, object]]:
+    """Collect every page and reject truncated or oversized snapshots."""
+    all_rows: list[dict[str, object]] = []
+    total: int | None = None
+    offset = 0
+    while True:
+        page_rows, total = _settlement_page(settlement_date, name, offset, total)
+        if not page_rows and len(all_rows) < total:
+            raise ValueError("FINRA pagination ended before the complete short-interest snapshot was retrieved.")
+        all_rows.extend(page_rows)
+        offset += len(page_rows)
+        if len(all_rows) >= total:
+            break
+    if len(all_rows) != total:
+        raise ValueError("FINRA pagination returned an incomplete short-interest snapshot.")
+    return all_rows
+
+
 def _fetch_settlement_rows(settlement_date: str) -> list[dict[str, object]]:
     """Live FINRA snapshot for one settlement date, normalized in memory.
 
@@ -118,42 +166,7 @@ def _fetch_settlement_rows(settlement_date: str) -> list[dict[str, object]]:
     """
     name = "consolidatedShortInterest" + ("Mock" if finra_use_mock() else "")
     url = f"{finra_client.FINRA_API_BASE}/data/group/otcMarket/name/{name}"
-    all_rows: list[dict[str, object]] = []
-    total: int | None = None
-    offset = 0
-    while True:
-        time.sleep(0.2)  # politeness pacing, same interval as the ingestion path
-        payload: dict[str, object] = {
-            "limit": finra_client.MAX_LIMIT,
-            "offset": offset,
-            "fields": list(_SHORT_FIELDS),
-            "compareFilters": [
-                {
-                    "compareType": "EQUAL",
-                    "fieldName": "settlementDate",
-                    "fieldValue": settlement_date,
-                }
-            ],
-        }
-        _content, rows, headers = finra_client.ingestion_post_query("otcMarket", name, payload)
-        raw_total = headers.get("record-total")
-        if raw_total is None:
-            raise ValueError("FINRA omitted Record-Total; cannot prove the short-interest snapshot is complete.")
-        page_total = int(str(raw_total))
-        if total is not None and page_total != total:
-            raise ValueError("FINRA Record-Total changed while paging the snapshot.")
-        total = page_total
-        page_rows: list[dict[str, object]] = (
-            [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
-        )
-        if not page_rows and len(all_rows) < total:
-            raise ValueError("FINRA pagination ended before the complete short-interest snapshot was retrieved.")
-        all_rows.extend(page_rows)
-        offset += len(page_rows)
-        if len(all_rows) >= total:
-            break
-    if len(all_rows) != total:
-        raise ValueError("FINRA pagination returned an incomplete short-interest snapshot.")
+    all_rows = _settlement_snapshot(settlement_date, name)
     retrieved_at = datetime.now(UTC).isoformat()
     snapshot_hash = hashlib.sha256(
         json.dumps(all_rows, sort_keys=True, separators=(",", ":"), default=str).encode()
@@ -195,12 +208,9 @@ def latest_settlement_date(as_of: str | None = None, data_root: Path | None = No
     knowable on or before ``as_of``."""
     del data_root
     resolved = _resolve_as_of(as_of)
-    for candidate in _candidate_settlement_dates(date.fromisoformat(resolved)):
-        try:
-            if _probe_published_rows(candidate) > 0:
-                return candidate
-        except OSError, ValueError, RuntimeError:
-            continue
+    published = _discover_latest_published_settlement_date(date.fromisoformat(resolved))
+    if published is not None:
+        return published
     horizon = f" knowable on or before {resolved}" if as_of else ""
     raise ValueError(f"No FINRA short interest cycle is published{horizon}.")
 
@@ -229,6 +239,43 @@ def _screen_resolutions(symbols: list[str], as_of: str, gateway: SourceGateway) 
     return resolutions
 
 
+def _entity_security_type(securities: object, entity_id: str) -> str | None:
+    """Read the last matching classification in provider order."""
+    security_type = None
+    if isinstance(securities, list):
+        for sec in securities:
+            if isinstance(sec, dict) and str(sec.get("entity_id") or "") == entity_id:
+                security_type = str(sec.get("security_type") or "unknown")
+    return security_type
+
+
+def _entity_shares_facts(raw_facts: object) -> list[dict[str, object]]:
+    """Select shares facts and preserve the newest-first join order."""
+    entity_facts = [
+        fact
+        for fact in (raw_facts if isinstance(raw_facts, list) else [])
+        if isinstance(fact, dict) and fact.get("concept") == _SHARES_CONCEPT
+    ]
+    entity_facts.sort(key=_shares_fact_key, reverse=True)
+    return entity_facts
+
+
+def _entity_screen_inputs(
+    entity_id: str, as_of: str, gateway: SourceGateway
+) -> tuple[str | None, list[dict[str, object]]]:
+    """Fetch one entity without letting provider failures block its siblings."""
+    cik = _cik_of(entity_id)
+    if cik is None:
+        return "unknown", []
+    try:
+        facts: dict[str, object] = gateway.company_facts(cik, as_of=as_of)
+    except OSError, ValueError, RuntimeError:
+        facts = {}
+    securities = facts.get("securities") if isinstance(facts, dict) else None
+    raw_facts = facts.get("financial_facts") if isinstance(facts, dict) else None
+    return _entity_security_type(securities, entity_id), _entity_shares_facts(raw_facts)
+
+
 def _screen_inputs(symbols: list[str], as_of: str, gateway: SourceGateway) -> _ScreenInputs:
     """Point-in-time resolution/classification/fact maps (existing boundary).
 
@@ -247,27 +294,9 @@ def _screen_inputs(symbols: list[str], as_of: str, gateway: SourceGateway) -> _S
     security_types: dict[str, str] = {}
     facts_by_entity: dict[str, list[dict[str, object]]] = {}
     for entity_id in sorted(resolved_ids):
-        cik = _cik_of(entity_id)
-        if cik is None:
-            security_types[entity_id] = "unknown"
-            facts_by_entity[entity_id] = []
-            continue
-        try:
-            facts: dict[str, object] = gateway.company_facts(cik, as_of=as_of)
-        except OSError, ValueError, RuntimeError:
-            facts = {}
-        securities = facts.get("securities") if isinstance(facts, dict) else None
-        if isinstance(securities, list):
-            for sec in securities:
-                if isinstance(sec, dict) and str(sec.get("entity_id") or "") == entity_id:
-                    security_types[entity_id] = str(sec.get("security_type") or "unknown")
-        raw_facts = facts.get("financial_facts") if isinstance(facts, dict) else None
-        entity_facts = [
-            fact
-            for fact in (raw_facts if isinstance(raw_facts, list) else [])
-            if isinstance(fact, dict) and fact.get("concept") == _SHARES_CONCEPT
-        ]
-        entity_facts.sort(key=_shares_fact_key, reverse=True)
+        security_type, entity_facts = _entity_screen_inputs(entity_id, as_of, gateway)
+        if security_type is not None:
+            security_types[entity_id] = security_type
         facts_by_entity[entity_id] = entity_facts
     return _ScreenInputs(resolutions, security_types, facts_by_entity)
 
@@ -648,27 +677,31 @@ def _cycle_entities(
     classifications knowable on/before ``as_of`` are used, and only entities
     classified as common equity rank.
     """
-    from ..domain.market.securities import SecurityResolution
-
     result: dict[str, _CycleItem] = {}
     for row in rows:
         symbol = str(row["symbol_code"])
-        short_shares = row.get("short_position")
-        if short_shares is None:
-            continue
-        resolution = inputs.resolutions.get(symbol)
-        if not isinstance(resolution, SecurityResolution) or not resolution.resolved or not resolution.entity_id:
-            continue
-        entity_id = resolution.entity_id
-        if inputs.security_types.get(entity_id) != _COMMON_EQUITY:
-            continue
-        fact = _select_fact_for_period(
-            inputs.facts_by_entity.get(entity_id) or [], str(row.get("settlement_date") or "")
-        )
-        if fact is None:
-            continue
-        result[symbol] = {"row": row, "entity_id": entity_id, "fact": fact}
+        item = _cycle_item(symbol, row, inputs)
+        if item is not None:
+            result[symbol] = item
     return result
+
+
+def _cycle_item(symbol: str, row: dict[str, object], inputs: _ScreenInputs) -> _CycleItem | None:
+    """One ranked row: short position, resolved common equity, and period fact required."""
+    from ..domain.market.securities import SecurityResolution
+
+    if row.get("short_position") is None:
+        return None
+    resolution = inputs.resolutions.get(symbol)
+    if not isinstance(resolution, SecurityResolution) or not resolution.resolved or not resolution.entity_id:
+        return None
+    entity_id = resolution.entity_id
+    if inputs.security_types.get(entity_id) != _COMMON_EQUITY:
+        return None
+    fact = _select_fact_for_period(inputs.facts_by_entity.get(entity_id) or [], str(row.get("settlement_date") or ""))
+    if fact is None:
+        return None
+    return {"row": row, "entity_id": entity_id, "fact": fact}
 
 
 def _select_fact_for_period(facts: list[dict[str, object]], settlement_date: str) -> dict[str, object] | None:

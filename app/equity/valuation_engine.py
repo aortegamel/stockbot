@@ -101,6 +101,22 @@ def _dcf_equity_value(fcf: float, g1: float, g2: float, gt: float, wacc: float, 
     return max(pv * _EQUITY_FACTOR, 0.0)
 
 
+def _target_multiple(target_multiple: object, positive: list[float]) -> float | None:
+    """Positive override multiple, else the history mean (None when neither exists)."""
+    override = _num(target_multiple)
+    if override is not None and override > 0:
+        return override
+    return statistics.mean(positive) if positive else None
+
+
+def _history_stdev(positive: list[float]) -> float:
+    """Sample stdev of the multiple history (0.0 below two points)."""
+    try:
+        return statistics.stdev(positive) if len(positive) >= 2 else 0.0
+    except statistics.StatisticsError:
+        return 0.0
+
+
 def financial_data_from_evidence(
     valuation_metrics: dict[str, object] | None = None,
     dividend_fundamentals: dict[str, object] | None = None,
@@ -194,10 +210,7 @@ class ValuationEngine:
         shares = self._shares()
         history = _num_list(self.financial_data.get("ev_ebitda_history"))
         positive = [m for m in history if m > 0]
-        override = _num(target_multiple)
-        multiple = (
-            override if override is not None and override > 0 else (statistics.mean(positive) if positive else None)
-        )
+        multiple = _target_multiple(target_multiple, positive)
         base_assumptions = {
             "net_debt_pct_of_ev": NET_DEBT_PCT_OF_EV,
             "net_debt_note": "net debt assumed 10% of EV (equity = 0.9 * EV); no balance-sheet input",
@@ -209,10 +222,7 @@ class ValuationEngine:
                 "Missing EBITDA, shares outstanding, or EV/EBITDA multiple.",
                 {**base_assumptions, "target_multiple": multiple},
             )
-        try:
-            stdev = statistics.stdev(positive) if len(positive) >= 2 else 0.0
-        except statistics.StatisticsError:
-            stdev = 0.0
+        stdev = _history_stdev(positive)
         low_m = max(multiple - stdev, 0.0)
         return ValuationResult(
             method=EV_EBITDA_METHOD,

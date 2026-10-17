@@ -673,6 +673,20 @@ def _store_fact_text_row(row: dict[str, object]) -> dict[str, object]:
     return out
 
 
+def _mentions_obligation_concept(row: dict[str, object]) -> bool:
+    """Provider row whose concept matches an obligation XBRL concept."""
+    concept = str(row.get("concept") or "")
+    return any(n in concept for n in _XBRL_OBLIGATION_CONCEPTS)
+
+
+def _obligation_gateway_rows(facts: object) -> list[dict[str, object]]:
+    """Gateway companyfacts rows narrowed to obligation concepts (trust boundary)."""
+    rows = facts.get("financial_facts") if isinstance(facts, dict) else None
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict) and _mentions_obligation_concept(row)]
+
+
 def _xbrl_gateway_facts(ticker: str) -> list[FinancialFactRow]:
     """Normalized gateway facts for obligation concepts (PIT provenance).
 
@@ -690,12 +704,8 @@ def _xbrl_gateway_facts(ticker: str) -> list[FinancialFactRow]:
         return []
     today = datetime.now(UTC).date().isoformat()
     facts = SourceGateway().company_facts(cik, as_of=today)
-    rows = facts.get("financial_facts") if isinstance(facts, dict) else None
-    needles = tuple(_XBRL_OBLIGATION_CONCEPTS)
     validated: list[FinancialFactRow] = []
-    for row in rows if isinstance(rows, list) else []:
-        if not isinstance(row, dict) or not any(n in str(row.get("concept") or "") for n in needles):
-            continue
+    for row in _obligation_gateway_rows(facts):
         fact = _sec_facts._validated_fact_row(_store_fact_text_row(row))
         if fact is not None:
             validated.append(fact)

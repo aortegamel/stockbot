@@ -1545,6 +1545,28 @@ def _fetch_typed(
     return out[:cap], False, 1
 
 
+def _live_batch_years(qs: str, qe: str) -> list[int] | None:
+    """Inclusive year span covering the query window; None when empty."""
+    year_qs, year_qe = int(qs[:4]), int(qe[:4])
+    return list(range(min(year_qs, year_qe), max(year_qs, year_qe) + 1)) or None
+
+
+def _live_batch_forms(form: str) -> list[int | str]:
+    """Amendments always included: an /A request stays single-form."""
+    return [form] if form.endswith("/A") else [form, f"{form}/A"]
+
+
+def _within_live_window(filing: Filing, qs: str, qe: str, as_of: str | None) -> bool:
+    """Filed inside the window and, when bounded, known by ``as_of``."""
+    day = (filing.filed_at or filing.known_at or "")[:10]
+    if day and not qs <= day <= qe:
+        return False
+    if as_of is None:
+        return True
+    value, _basis = pit_of(filing)
+    return value is not None and value[:10] <= as_of
+
+
 def _live_filing_batch(
     form: str, qs: str, qe: str, *, as_of: str | None = None, limit: int | None = None
 ) -> tuple[list[Filing], bool, str | None]:
@@ -1557,20 +1579,13 @@ def _live_filing_batch(
     from ..client import get_global_filings
 
     try:
-        year_qs, year_qe = int(qs[:4]), int(qe[:4])
-        years = list(range(min(year_qs, year_qe), max(year_qs, year_qe) + 1)) or None
-        filings = get_global_filings(years, form=[form] if form.endswith("/A") else [form, f"{form}/A"])
+        filings = get_global_filings(_live_batch_years(qs, qe), form=_live_batch_forms(form))
     except (ConnectionError, TimeoutError, OSError) as exc:
         return [], False, str(exc)
     out: list[Filing] = []
     for filing in filings or []:
-        day = (filing.filed_at or filing.known_at or "")[:10]
-        if day and not qs <= day <= qe:
+        if not _within_live_window(filing, qs, qe, as_of):
             continue
-        if as_of is not None:
-            value, _basis = pit_of(filing)
-            if value is None or value[:10] > as_of:
-                continue
         out.append(filing)
         if limit is not None and len(out) >= limit:
             break
@@ -2804,6 +2819,26 @@ def _hit_embed_text(hit: SECTextHit) -> str:
     )[:_EMBED_TIEBREAK_MAX_CHARS]
 
 
+def _rank_runs(keys: list[tuple[int, ...]]) -> list[tuple[int, int]]:
+    """Contiguous ``[start, end)`` spans sharing one rank key, in order."""
+    runs: list[tuple[int, int]] = []
+    start = 0
+    while start < len(keys):
+        end = start + 1
+        while end < len(keys) and keys[end] == keys[start]:
+            end += 1
+        runs.append((start, end))
+        start = end
+    return runs
+
+
+def _reordered_run(run: list[SECTextHit], order: list[int] | None) -> list[SECTextHit]:
+    """One equal-rank run in embedding order; unchanged when the order is unusable."""
+    if order is None:
+        return run
+    return [run[i] for i in order]
+
+
 def _embedding_tiebreak(ranked: tuple[SECTextHit, ...], key: _RankKey, query: str | None) -> tuple[SECTextHit, ...]:
     """Embedding order within equal deterministic ranks; input order on any failure."""
     if not isinstance(query, str) or not query.strip() or len(ranked) < 2:
@@ -2812,22 +2847,17 @@ def _embedding_tiebreak(ranked: tuple[SECTextHit, ...], key: _RankKey, query: st
         from ...needle_client import similarity_order
     except ImportError:
         return ranked
-    keys = [key(hit) for hit in ranked]
     out = list(ranked)
-    start = 0
-    while start < len(out):
-        end = start + 1
-        while end < len(out) and keys[end] == keys[start]:
-            end += 1
-        if end - start > 1:
-            run = out[start:end]
-            try:
-                order = similarity_order([_hit_embed_text(hit) for hit in run], query)
-            except Exception:  # noqa: BLE001 - embedding is a tiebreak; failure keeps deterministic order
-                order = None
-            if order is not None:
-                out[start:end] = [run[i] for i in order]
-        start = end
+    keys = [key(hit) for hit in out]
+    for start, end in _rank_runs(keys):
+        if end - start <= 1:
+            continue
+        run = out[start:end]
+        try:
+            order = similarity_order([_hit_embed_text(hit) for hit in run], query)
+        except Exception:  # noqa: BLE001 - embedding is a tiebreak; failure keeps deterministic order
+            order = None
+        out[start:end] = _reordered_run(run, order)
     return tuple(out)
 
 

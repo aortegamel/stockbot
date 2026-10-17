@@ -534,6 +534,33 @@ def test_load_sector_map_dedups_entity(monkeypatch: pytest.MonkeyPatch):
     assert seen == [320193]
 
 
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ({"sic_description": "  Semiconductors  ", "sic": "3674"}, "Semiconductors"),
+        ({"sic_description": "  ", "sic": "  3674  "}, "3674"),
+        ({"sic_description": 3674, "sic": 3674}, None),
+        ({}, None),
+        (None, None),
+    ],
+)
+def test_load_sector_map_uses_provider_metadata(
+    monkeypatch: pytest.MonkeyPatch, metadata: object, expected: str | None
+) -> None:
+    seen: list[int] = []
+
+    def submissions(cik: int) -> object:
+        seen.append(cik)
+        return metadata
+
+    monkeypatch.setattr("app.sec.client.get_submissions_metadata", submissions)
+    entity_id = "sec:cik:0000320193"
+    sectors = risk_service.load_sector_map(_positions(entity_id))
+
+    assert sectors == ({} if expected is None else {entity_id: expected})
+    assert seen == [320193]
+
+
 # ---------------------------------------------------------------------------
 # CLI command
 # ---------------------------------------------------------------------------

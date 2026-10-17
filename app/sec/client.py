@@ -1004,6 +1004,37 @@ def _store_lookup_frame(frame: _FrameRows) -> None:
         _lookup_cached_at = time.monotonic()
 
 
+def _wait_lookup_frame(flight: _LookupFlight, query: str) -> _FrameRows:
+    """Wait for the joined flight, then return its frame or raise its failure."""
+    flight.done.wait(timeout=_LOOKUP_FLIGHT_WAIT_S)
+    hit = _cached_lookup_frame()
+    if hit is not None:
+        return hit
+    if flight.error is not None:
+        raise flight.error
+    raise SECClientError(f"cik lookup fetch failed for {query!r}: leader timed out")
+
+
+def _leader_lookup_frame(query: str, flight: _LookupFlight) -> _FrameRows:
+    """Fetch and cache under the leader flight; failure is remembered for waiters."""
+    try:
+        ensure_identity()
+        from edgar.entity.tickers import get_cik_lookup_data
+
+        frame: object = get_cik_lookup_data()
+        if not isinstance(frame, _FrameRows):
+            raise SECClientError(f"cik lookup parse failed for {query!r}: bad frame")
+        _store_lookup_frame(frame)
+        return frame
+    except SECClientError as exc:
+        flight.error = exc
+        raise
+    except Exception as exc:
+        wrapped = SECClientError(f"cik lookup fetch failed for {query!r}: {exc}")
+        flight.error = wrapped
+        raise wrapped from exc
+
+
 def _fetch_lookup_frame(query: str) -> _FrameRows:
     """CIK lookup dataset, one-day process cache; fetch failure raises (never zero-result)."""
     global _lookup_flight
@@ -1022,29 +1053,9 @@ def _fetch_lookup_frame(query: str) -> _FrameRows:
             flight = _lookup_flight
             leader = False
     if not leader:
-        flight.done.wait(timeout=_LOOKUP_FLIGHT_WAIT_S)
-        hit = _cached_lookup_frame()
-        if hit is not None:
-            return hit
-        if flight.error is not None:
-            raise flight.error
-        raise SECClientError(f"cik lookup fetch failed for {query!r}: leader timed out")
+        return _wait_lookup_frame(flight, query)
     try:
-        ensure_identity()
-        from edgar.entity.tickers import get_cik_lookup_data
-
-        frame: object = get_cik_lookup_data()
-        if not isinstance(frame, _FrameRows):
-            raise SECClientError(f"cik lookup parse failed for {query!r}: bad frame")
-        _store_lookup_frame(frame)
-        return frame
-    except SECClientError as exc:
-        flight.error = exc
-        raise
-    except Exception as exc:
-        wrapped = SECClientError(f"cik lookup fetch failed for {query!r}: {exc}")
-        flight.error = wrapped
-        raise wrapped from exc
+        return _leader_lookup_frame(query, flight)
     finally:
         with _lookup_lock:
             if _lookup_flight is flight:

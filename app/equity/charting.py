@@ -164,8 +164,6 @@ def render_svg_series(
     """Minimal ``<svg>`` polyline chart ("" when nothing plottable, never raises)."""
     del labels  # x geometry comes from series positions; labels serve the markdown fallback
     data = _plot_values(_as_dict(series))
-    if not data:
-        return ""
     bounds = _plot_bounds(data)
     if bounds is None:
         return ""
@@ -183,8 +181,6 @@ def render_svg_series(
                     f'<polyline points="{" ".join(run)}" fill="none" '
                     f'stroke="{color}" stroke-width="2"><title>{escape(name)}</title></polyline>'
                 )
-    if not shapes:
-        return ""
     legend = "".join(
         f'<text x="{_WIDTH - _PAD_RIGHT - 8}" y="{_PAD_TOP + 14 * i}" '
         f'text-anchor="end" font-size="11" fill="{_COLORS[i % len(_COLORS)]}">{escape(name)}</text>'
@@ -208,22 +204,27 @@ def _md_escape(text: str) -> str:
     return text.replace("|", "\\|")
 
 
+def _series_rows(data: dict[str, list[object]], names: list[str], labels: list[object]) -> list[str]:
+    """Format aligned series rows with positional labels and ``n/a`` gaps."""
+    count = max(len(values) for values in data.values())
+    rows: list[str] = []
+    for i in range(count):
+        label = _md_escape(_cell(labels[i])) if i < len(labels) else str(i)
+        cells = [_fmt_value(values[i]) if i < len(values) else "n/a" for values in (data[n] for n in names)]
+        rows.append("| " + label + " | " + " | ".join(cells) + " |")
+    return rows
+
+
 def _series_table(series: Mapping[str, object], labels: object, title: object) -> str:
     """Markdown table over named series (one row per index, gaps are "n/a")."""
     data = _plot_values(series)
     if not data:
         return ""
     names = sorted(data)
-    count = max(len(values) for values in data.values())
-    label_rows = _as_list(labels)
     head = f"## {_cell(title).strip()}\n\n" if _cell(title).strip() else ""
     header = "| label | " + " | ".join(_md_escape(n) for n in names) + " |"
     divider = "| --- | " + " | ".join("---" for _ in names) + " |"
-    rows: list[str] = []
-    for i in range(count):
-        label = _md_escape(_cell(label_rows[i])) if i < len(label_rows) else str(i)
-        cells = [_fmt_value(values[i]) if i < len(values) else "n/a" for values in (data[n] for n in names)]
-        rows.append("| " + label + " | " + " | ".join(cells) + " |")
+    rows = _series_rows(data, names, _as_list(labels))
     return head + "\n".join([header, divider, *rows])
 
 

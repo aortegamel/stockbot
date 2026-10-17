@@ -1236,3 +1236,41 @@ def test_xbrl_gateway_long_null_prefix_keeps_duration_debt(monkeypatch: pytest.M
     snapshot = result["current_snapshot"]
     assert isinstance(snapshot, list)
     assert [s["amount_billions"] for s in snapshot] == [pytest.approx(5.0)]
+
+
+def test_xbrl_gateway_facts_narrows_provider_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Obligation concepts only; unresolved tickers and absent rows report an empty gap."""
+    resolved: list[str] = []
+    provider_calls: list[int] = []
+
+    def unresolved(ticker: str) -> None:
+        resolved.append(ticker)
+
+    def company_facts(self: object, cik: int, *, as_of: str | None = None) -> dict[str, object]:
+        provider_calls.append(cik)
+        raise AssertionError("an unresolved ticker must not request company facts")
+
+    monkeypatch.setattr("app.sec.client.resolve_cik", unresolved)
+    monkeypatch.setattr("app.data_sources.SourceGateway.company_facts", company_facts)
+    assert obligations._xbrl_gateway_facts("ZZZ") == []
+    assert resolved == ["ZZZ"]
+    assert provider_calls == []
+
+    def resolved_cik(ticker: str) -> int:
+        assert ticker == "SYN"
+        return 320193
+
+    payloads: list[object] = [
+        {"financial_facts": None},
+        {"financial_facts": [{"concept": "us-gaap-Revenue", "value": 1}]},
+    ]
+
+    def resolved_company_facts(self: object, cik: int, *, as_of: str | None = None) -> object:
+        assert cik == 320193
+        return payloads.pop(0)
+
+    monkeypatch.setattr("app.sec.client.resolve_cik", resolved_cik)
+    monkeypatch.setattr("app.data_sources.SourceGateway.company_facts", resolved_company_facts)
+    assert obligations._xbrl_gateway_facts("syn") == []
+    assert obligations._xbrl_gateway_facts("SYN") == []
+    assert payloads == []
