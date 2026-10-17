@@ -8,7 +8,10 @@ alias and dispatch behavior.  Live edgar_client fallbacks are monkeypatched.
 """
 
 from collections.abc import Iterable, Mapping
-from datetime import date
+from datetime import date, datetime, tzinfo
+from types import SimpleNamespace
+from typing import Self, override
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -302,6 +305,7 @@ def test_eps_live_fallback_when_store_empty(gateway: _Gateway, monkeypatch: pyte
 
 def test_eps_omitted_as_of_defaults_to_today_live(gateway: _Gateway, monkeypatch: pytest.MonkeyPatch) -> None:
     _seed_ticker(gateway, NVDA_CIK, "NVDA")
+    monkeypatch.setattr(sec_facts, "_today", lambda: date(2026, 8, 10))
 
     def _fake_get(ticker: str, metric: str):
         return _live_eps(ticker)
@@ -313,7 +317,37 @@ def test_eps_omitted_as_of_defaults_to_today_live(gateway: _Gateway, monkeypatch
     )
     result = sec_facts.get_fundamentals("NVDA", "eps")
     assert result["data_source"] == "live"
-    assert result["as_of_date"] == date.today().isoformat()  # noqa: DTZ011 - trading-calendar local date has no tz meaning
+    assert result["as_of_date"] == "2026-08-10"
+    assert "requested_as_of" not in result
+
+
+def test_eps_omitted_as_of_uses_utc_day_across_local_year_boundary(
+    gateway: _Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """New York is still 2025-12-31 at 23:30, but the omitted as_of resolves to the UTC day."""
+    _seed_ticker(gateway, NVDA_CIK, "NVDA", retrieved_at="2025-06-01T00:00:00Z")
+    new_york = ZoneInfo("America/New_York")
+    instant = datetime(2025, 12, 31, 23, 30, tzinfo=new_york)
+
+    class _Clock(datetime):
+        """Wall clock fixed at instant; a naive now() reads New York local time."""
+
+        @classmethod
+        @override
+        def now(cls, tz: tzinfo | None = None) -> Self:
+            moment = cls.fromtimestamp(instant.timestamp(), tz or new_york)
+            return moment if tz else moment.replace(tzinfo=None)
+
+    # Scoped copy of the datetime module: only sec_facts sees the fixed clock.
+    monkeypatch.setattr(sec_facts, "_dt", SimpleNamespace(**{**vars(sec_facts._dt), "datetime": _Clock}))
+
+    def _fake_get(ticker: str, metric: str):
+        return _live_eps(ticker)
+
+    monkeypatch.setattr(sec_facts.edgar_client, "get_fundamentals", _fake_get)
+    result = sec_facts.get_fundamentals("NVDA", "eps")
+    assert result["data_source"] == "live"
+    assert result["as_of_date"] == "2026-01-01"
     assert "requested_as_of" not in result
 
 

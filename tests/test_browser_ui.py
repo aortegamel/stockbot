@@ -452,7 +452,8 @@ def test_agent_transcript_scrolls_inside_panel(
     content = browser.find_element(By.CSS_SELECTOR, '[aria-label="Captured source content"]')
     mark = content.find_element(By.TAG_NAME, "mark")
     settle(browser, content)
-    assert visible(browser, mark), "The cited passage is not visible."
+    # activateQuote scrolls smoothly; a loaded machine can delay the animation past settle's window.
+    WebDriverWait(browser, 10).until(lambda _: visible(browser, mark), "The cited passage is not visible.")
     assert browser.execute_script("return arguments[0].scrollHeight > arguments[0].clientHeight + 1", content)
     box = mark.rect
     wheel_until(

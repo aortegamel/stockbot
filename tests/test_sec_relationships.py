@@ -912,6 +912,208 @@ def test_hydrate_amendment_forms_use_base_parsers(tmp_path: Path, monkeypatch: p
     assert "unsupported form" not in (err or "") and n == 1 and seenhf["form"] == "13F-HR/A"
 
 
+def test_live_filing_batch_window_pit_limit_and_form_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.sec.client as _client
+
+    seen: list[tuple[object, object]] = []
+
+    def _filing(accession: str, day: str | None) -> Filing:
+        return Filing(
+            accession_no=accession,
+            form="4",
+            filed_at=day or "",
+            filer_cik=1,
+            filer_name="F",
+            accepted_at=None,
+            known_at=day or "",
+            report_period=None,
+            primary_document="primary",
+            is_amendment=False,
+            amendment_of=None,
+            source="http://x",
+        )
+
+    def _fake_global(years: object, *, form: object = None) -> list[Filing]:
+        seen.append((years, form))
+        return [
+            _filing("in", "2024-02-15"),
+            _filing("out-of-window", "2024-06-15"),
+            _filing("boundary", "2024-02-20"),
+            _filing("undated", None),
+            _filing("late", "2024-02-25"),
+        ]
+
+    monkeypatch.setattr(_client, "get_global_filings", _fake_global)
+    rows, exhausted, error = disc._live_filing_batch("4", "2024-01-01", "2024-03-31", as_of="2024-02-20")
+    assert [f.accession_no for f in rows] == ["in", "boundary"]
+    assert exhausted is True and error is None
+    assert seen == [([2024], ["4", "4/A"])]
+    capped, _exhausted, _error = disc._live_filing_batch("4", "2024-01-01", "2024-03-31", limit=1)
+    assert [f.accession_no for f in capped] == ["in"]
+    unbounded, _exhausted, _error = disc._live_filing_batch("4", "2024-01-01", "2024-03-31")
+    assert [f.accession_no for f in unbounded] == ["in", "boundary", "undated", "late"]
+    disc._live_filing_batch("4/A", "2024-01-01", "2024-03-31")
+    assert seen[3] == ([2024], ["4/A"])
+    disc._live_filing_batch("4", "2025-06-30", "2024-01-01")
+    assert seen[4] == ([2024, 2025], ["4", "4/A"])
+
+
+def test_rank_hits_embedding_tiebreak_reorders_and_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.needle_client as needle
+    from app.sec.models import SECTextHit
+
+    def _hit(accession: str, snippet: str) -> SECTextHit:
+        return SECTextHit(
+            search_id="s1",
+            attempt_id="s1-efts-1",
+            query="MSFT OpenAI",
+            accession_no=accession,
+            form="10-K",
+            filed_at="2026-02-14",
+            filer_cik=789790,
+            filer_name="Microsoft Corp",
+            matched_document="primary.htm",
+            file_type="10-K",
+            snippet=snippet,
+            score=1.0,
+        )
+
+    def _rank(query: str = "MSFT OpenAI") -> tuple[SECTextHit, ...]:
+        return disc.rank_hits(
+            (
+                _hit("0000950170-26-001234", "plain earnings summary"),
+                _hit("0000950170-26-009999", "zebra disclosure"),
+            ),
+            verified_ciks=(789790,),
+            verified_names=("Microsoft Corp",),
+            relevant_forms=("10-K",),
+            query=query,
+        )
+
+    def _reversed(texts: object, reference: object, **kwargs: object) -> list[int]:
+        return [1, 0]
+
+    def _boom(texts: object, reference: object, **kwargs: object) -> NoReturn:
+        raise RuntimeError("needle down")
+
+    def _none(texts: object, reference: object, **kwargs: object) -> None:
+        return None
+
+    base = _rank()
+    assert [hit.accession_no for hit in base] == ["0000950170-26-001234", "0000950170-26-009999"]
+    monkeypatch.setattr(needle, "similarity_order", _reversed)
+    assert [hit.accession_no for hit in _rank()] == ["0000950170-26-009999", "0000950170-26-001234"]
+    monkeypatch.setattr(needle, "similarity_order", _boom)
+    assert _rank() == base
+    monkeypatch.setattr(needle, "similarity_order", _none)
+    assert _rank() == base
+    # A blank query disables the embedding pass (no exact/topic reasons fire).
+    monkeypatch.setattr(needle, "similarity_order", _reversed)
+    blank = _rank(query="   ")
+    assert [(hit.accession_no, hit.relevance_reason) for hit in blank] == [
+        ("0000950170-26-001234", ("issuer-match", "requested-form", "priority-form")),
+        ("0000950170-26-009999", ("issuer-match", "requested-form", "priority-form")),
+    ]
+    # A missing worker module keeps the deterministic order: the installed
+    # reordering stub stays unused and no import error escapes.
+    import sys
+
+    with pytest.MonkeyPatch.context() as unavailable:
+        unavailable.setitem(sys.modules, "app.needle_client", None)
+        assert [hit.accession_no for hit in _rank()] == [
+            "0000950170-26-001234",
+            "0000950170-26-009999",
+        ]
+
+
+def test_hydrate_offering_forms_count_normalized_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.sec.archive as sec_archive
+    import app.sec.documents as sec_docs
+    import app.sec.offerings as sec_offerings
+
+    def _fake_doc(accession_no: str, document_name: str | None = None, **kwargs: object) -> dict[str, object]:
+        return {"text": "t", "document_name": "primary", "url": "http://x"}
+
+    def _fake_archive(*args: object, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(payload_path="/tmp/p", retrieved_at="r", sha256="h")
+
+    monkeypatch.setattr(sec_docs, "get_sec_document", _fake_doc)
+    monkeypatch.setattr(sec_archive, "archive_sec_document", _fake_archive)
+
+    seen: dict[str, object] = {}
+
+    def _fake_load_terms(accession: str) -> dict[str, object]:
+        return {"shares": 5}
+
+    monkeypatch.setattr(sec_offerings, "load_terms", _fake_load_terms)
+
+    def _fake_normalize(accession: str, form: str, **kwargs: object) -> SimpleNamespace:
+        seen.update(accession=accession, form=form, terms=kwargs.get("terms"), issuer=kwargs.get("issuer"))
+        return SimpleNamespace(accession_no=accession)
+
+    def _fake_edgar(accession: str) -> SimpleNamespace:
+        return SimpleNamespace(obj=lambda: object())
+
+    def _reject(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(sec_docs, "get_by_accession_number", _fake_edgar)
+    monkeypatch.setattr(sec_offerings, "normalize_offering", _fake_normalize)
+    filing = Filing(
+        form="S-1/A",
+        accession_no="ACC-S1A",
+        filed_at="2024-01-01",
+        filer_cik=123,
+        filer_name="Issuer",
+        accepted_at=None,
+        known_at="2024-01-01",
+        report_period=None,
+        primary_document="primary",
+        is_amendment=True,
+        amendment_of=None,
+        source="http://x",
+    )
+    n, ok, err = disc._hydrate_relationship_filing(filing, data_root=tmp_path)
+    assert (n, ok, err) == (1, True, None)
+    assert seen == {"accession": "ACC-S1A", "form": "S-1/A", "terms": {"shares": 5}, "issuer": "Issuer"}
+    # A rejected row counts zero, never an error, and never raises.
+    monkeypatch.setattr(sec_offerings, "normalize_offering", _reject)
+    assert disc._hydrate_relationship_filing(filing, data_root=tmp_path) == (0, True, None)
+
+
+def test_rel_workflow_route_keeps_rows_and_records_statuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec import store
+
+    state = disc._RelState({"supplier_of"})
+
+    def _evidence(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        return [{"relationship_id": "rel:1"}, {"relationship_id": "rel:2"}, {"relationship_id": None}]
+
+    def _kept(*args: object, **kwargs: object) -> bool:
+        return True
+
+    monkeypatch.setattr(disc, "_rel_workflow_evidence", _evidence)
+    monkeypatch.setattr(disc, "_rel_workflow_row", _kept)
+    disc._rel_workflow_route(state, store, ["1"], None, tmp_path, False, 50)
+    attempt = next(a for a in state.attempts if a["backend"] == "local-workflow")
+    assert attempt["status"] == "complete" and attempt["found"] == 2
+    assert state.workflow == []
+
+    monkeypatch.setattr(disc, "_LOCAL_EXHAUSTIVE_GUARD", 2)
+    disc._rel_workflow_route(state, store, ["1"], None, tmp_path, True, 50)
+    capped = [a for a in state.attempts if a["backend"] == "local-workflow"][-1]
+    assert capped["status"] == "partial" and capped["found"] == 2
+
+    def _boom(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        raise ConnectionError("ledger down")
+
+    monkeypatch.setattr(disc, "_rel_workflow_evidence", _boom)
+    disc._rel_workflow_route(state, store, ["1"], None, tmp_path, False, 50)
+    failed = [a for a in state.attempts if a["backend"] == "local-workflow"][-1]
+    assert failed["status"] == "failed"
+    assert any("local-workflow failed: ledger down" in e for e in state.errors)
+
+
 def test_int_confidence_and_forward_prices_keep_float_semantics() -> None:
     rel = _proposed(rid="rel:intconf")
     ev = R.attach_relationship_evidence(

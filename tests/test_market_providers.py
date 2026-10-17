@@ -1072,3 +1072,176 @@ def test_api_root_reports_supervised_port(monkeypatch: pytest.MonkeyPatch) -> No
     assert client.get("/").json()["ui"] == "http://localhost:3002"
     monkeypatch.delenv("PORT", raising=False)
     assert client.get("/").json()["ui"] == "http://localhost:5173"
+
+
+@pytest.mark.parametrize(
+    ("payload", "detail"),
+    [
+        ({"chart": None}, "no data"),
+        ({"chart": {"result": "bad", "error": {"description": "provider detail"}}}, "provider detail"),
+        ({"chart": {"result": [], "error": "bad"}}, "no data"),
+        ({"chart": {"result": [None]}}, "all bars empty"),
+        ({"chart": {"result": [{"timestamp": [123], "indicators": {"quote": [None]}}]}}, "all bars empty"),
+    ],
+)
+def test_candles_malformed_chart_returns_provider_error(
+    fake_cache: FakeCache,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, object],
+    detail: str,
+) -> None:
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        return json.dumps(payload).encode()
+
+    monkeypatch.setattr(mp, "_http_bytes", fake_http)
+    assert mp.get_candles(" nvda ") == {"error": f"candles unavailable for NVDA: {detail}"}
+    assert fake_cache.store == {}
+
+
+def test_candles_public_preserves_timestamps_and_sparse_columns(
+    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = {
+        "chart": {
+            "result": [
+                {
+                    "timestamp": [3000, 1000, 2000, 4000],
+                    "indicators": {
+                        "quote": [
+                            {
+                                "open": [None],
+                                "high": "bad",
+                                "low": None,
+                                "close": [8, None, 6],
+                                "volume": [None],
+                            }
+                        ]
+                    },
+                    "meta": {"regularMarketPrice": 7},
+                }
+            ]
+        }
+    }
+
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        return json.dumps(payload).encode()
+
+    monkeypatch.setattr(mp, "_http_bytes", fake_http)
+    assert mp.get_candles(" nvda ", range_="1mo", interval="1h") == {
+        "sym": "NVDA",
+        "range": "1mo",
+        "interval": "1h",
+        "price": 7,
+        "delayed": True,
+        "candles": [
+            {"t": 3000, "open": None, "high": 8, "low": 8, "close": 8, "vol": 0},
+            {"t": 2000, "open": 6, "high": 6, "low": 6, "close": 6, "vol": 0},
+        ],
+    }
+
+
+@settings(max_examples=100, derandomize=True)
+@given(
+    st.lists(
+        st.one_of(st.none(), st.floats(min_value=0.01, max_value=10000, allow_nan=False, allow_infinity=False)),
+        min_size=1,
+        max_size=8,
+    )
+)
+def test_prop_candles_public_retains_present_close_order(closes: list[float | None]) -> None:
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        return json.dumps(_payload(closes)).encode()
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(mp, "cache", FakeCache())
+        patch.setattr(mp, "_http_bytes", fake_http)
+        out = mp.get_candles("NVDA")
+    expected = [value for value in closes if value is not None]
+    if not expected:
+        assert out == {"error": "candles unavailable for NVDA: all bars empty"}
+        return
+    rows = out["candles"]
+    assert isinstance(rows, list)
+    assert [row["close"] for row in rows] == expected
+    assert [row["t"] for row in rows] == [1700000000 + index for index, value in enumerate(closes) if value is not None]
+
+
+def test_news_missing_links_dedup_by_title_preserves_first_source(
+    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feed = _rss([("NVDA headline", "", "Tue, 06 Oct 2026 10:00:00 GMT")])
+
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        return feed
+
+    monkeypatch.setattr(mp, "_http_bytes", fake_http)
+    monkeypatch.setenv("STOCKBOT_NEWSQUANT", "0")
+    assert mp.get_news(" nvda ") == {
+        "sym": "NVDA",
+        "items": [
+            {
+                "title": "NVDA headline",
+                "link": "",
+                "published": "Tue, 06 Oct 2026 10:00:00 GMT",
+                "source": "Google News",
+            }
+        ],
+    }
+
+
+def test_filings_missing_optional_fields_preserves_official_date(
+    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    atom = (
+        b'<feed xmlns="http://www.w3.org/2005/Atom"><entry>'
+        b"<content><filing-date> 2026-10-03 </filing-date></content>"
+        b"</entry></feed>"
+    )
+
+    def fake_cik(ticker: str) -> int:
+        return 1341439
+
+    def fake_http(url: str, **kwargs: object) -> bytes:
+        return atom
+
+    monkeypatch.setattr(mp, "cik_for_ticker", fake_cik)
+    monkeypatch.setattr(mp, "_http_bytes", fake_http)
+    assert mp.get_filings(" nvda ") == {
+        "sym": "NVDA",
+        "cik": 1341439,
+        "items": [{"title": "", "link": "", "filed": "2026-10-03", "updated": "", "summary": ""}],
+    }
+
+
+def test_viewer_context_preserves_call_order_clock_and_numeric_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def quote(sym: str) -> dict[str, object]:
+        calls.append(f"quote:{sym}")
+        return {"sym": sym, "price": 10, "retrieved_at": "quote timestamp"}
+
+    def candles(sym: str) -> dict[str, object]:
+        calls.append(f"candles:{sym}")
+        return {"candles": ["bad", {"close": "2"}, {"close": True}, {"close": 3}, {"close": 2.5}]}
+
+    def news(sym: str) -> dict[str, object]:
+        calls.append(f"news:{sym}")
+        return {"items": None}
+
+    def filings(sym: str) -> dict[str, object]:
+        calls.append(f"filings:{sym}")
+        return {"items": "bad", "cik": 1341439}
+
+    monkeypatch.setattr(mp, "get_quote", quote)
+    monkeypatch.setattr(mp, "get_candles", candles)
+    monkeypatch.setattr(mp, "get_news", news)
+    monkeypatch.setattr(mp, "get_filings", filings)
+    monkeypatch.setattr(mp.time, "gmtime", lambda: mp.time.struct_time((2026, 10, 6, 11, 30, 0, 1, 279, 0)))
+    out = mp.get_viewer_context(" nvda ")
+    assert calls == ["quote:NVDA", "candles:NVDA", "news:NVDA", "filings:NVDA"]
+    assert out["as_of"] == "2026-10-06T11:30:00Z"
+    assert out["quote"] == {"sym": "NVDA", "price": 10, "retrieved_at": "quote timestamp"}
+    assert out["window"] == {"bars": 3, "last": 2.5, "first": 1.0, "high": 3.0, "low": 1.0, "change_pct": 150.0}
+    assert out["news"] == []
+    assert out["filings"] == []
+    assert out["cik"] == 1341439

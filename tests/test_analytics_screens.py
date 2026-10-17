@@ -17,10 +17,13 @@ stubbed to serve it.  Nothing is persisted.
 Warehouse-removal seam: live providers (SourceGateway + normalization + raw_archive) serve reads, nothing is persisted; a future warehouse slots in behind the gateway.
 """
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, tzinfo
 from pathlib import Path
+from typing import Self, override
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from app.analytics import screens
 from app.data_sources import TickerAlias
@@ -1100,3 +1103,193 @@ def test_live_fetch_failure_returns_error_not_raise(
     error = result["error"]
     assert isinstance(error, str)
     assert "network down" in error
+
+
+class _FrozenScreenDatetime(datetime):
+    @classmethod
+    @override
+    def now(cls, tz: tzinfo | None = None) -> Self:
+        return cls(2026, 8, 30, 12, tzinfo=UTC).astimezone(tz)
+
+
+def _skip_screen_sleep(seconds: float) -> None:
+    del seconds
+
+
+@pytest.mark.parametrize("failure", [OSError("offline"), ValueError("bad total"), RuntimeError("down")])
+def test_latest_settlement_date_skips_failed_and_empty_probes(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    calls: list[str] = []
+
+    def probe(candidate: str) -> int:
+        calls.append(candidate)
+        if len(calls) == 1:
+            raise failure
+        return 0 if len(calls) == 2 else 4
+
+    monkeypatch.setattr(screens, "_probe_published_rows", probe)
+    result = screens.latest_settlement_date(as_of="2026-08-21")
+    assert result == calls[2]
+    assert result <= "2026-08-21"
+    assert calls == sorted(calls, reverse=True)
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("as_of", [None, "2026-08-21"])
+def test_latest_settlement_date_reports_empty_horizon(monkeypatch: pytest.MonkeyPatch, as_of: str | None) -> None:
+    def probe(candidate: str) -> int:
+        del candidate
+        return 0
+
+    monkeypatch.setattr(screens, "datetime", _FrozenScreenDatetime)
+    monkeypatch.setattr(screens, "_probe_published_rows", probe)
+    horizon = "" if as_of is None else " knowable on or before 2026-08-21"
+    with pytest.raises(ValueError) as exc:
+        screens.latest_settlement_date(as_of=as_of)
+    assert str(exc.value) == f"No FINRA short interest cycle is published{horizon}."
+
+
+def test_change_slice_excludes_missing_positions_classifications_and_period_facts(
+    seeds: _Seeds, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_tickers(seeds, tickers=("AAA", "BBB", "CCC", "DDD"))
+    _seed_facts(
+        seeds,
+        {
+            1: _default_facts()[1],
+            2: [{"end": "2026-09-01", "val": 200, "accn": "b1", "filed": "2026-08-20"}],
+            3: _default_facts()[3],
+        },
+    )
+    rows = _default_rows()
+    rows[2]["currentShortPositionQuantity"] = None
+    rows.extend(
+        [
+            {"symbolCode": "DDD", "currentShortPositionQuantity": 4},
+            {"symbolCode": "EEE", "currentShortPositionQuantity": 5},
+        ]
+    )
+    _seed_cycle(seeds, SETTLEMENT, rows)
+    _seed_cycle(seeds, PRIOR_SETTLEMENT, _prior_rows())
+    _install(monkeypatch, seeds)
+    result = screens.short_interest_change_screen("2026-08-30")
+    entries = result["entries"]
+    assert isinstance(entries, list)
+    assert [entry["ticker"] for entry in entries] == ["AAA"]
+    assert entries[0]["short_shares_current"] == 20
+    assert entries[0]["short_shares_prior"] == 10
+    assert result["unresolved"] == ["EEE"]
+    assert result["coverage"] == {"current_finra_rows": 1, "eligible_rows": 1}
+
+
+@settings(derandomize=True, max_examples=25, deadline=None)
+@given(count=st.integers(min_value=1, max_value=30), page_size=st.integers(min_value=1, max_value=7))
+def test_screen_paging_preserves_complete_snapshot(count: int, page_size: int) -> None:
+    rows: list[dict[str, object]] = [
+        {"symbolCode": f"T{index}", "currentShortPositionQuantity": index} for index in range(count)
+    ]
+    offsets: list[int] = []
+
+    def query(
+        group: str, name: str, payload: dict[str, object]
+    ) -> tuple[bytes, list[dict[str, object]], dict[str, str]]:
+        offset = int(str(payload["offset"]))
+        offsets.append(offset)
+        return b"[]", rows[offset : offset + page_size], {"record-total": str(count)}
+
+    with pytest.MonkeyPatch.context() as patch:
+        _install_gateway(patch, _Seeds())
+        patch.setattr(screens.finra_client, "ingestion_post_query", query)
+        patch.setattr(screens.time, "sleep", _skip_screen_sleep)
+        patch.setattr(screens, "datetime", _FrozenScreenDatetime)
+        result = screens.get_short_interest_leaderboard(settlement_date=SETTLEMENT, as_of="2026-08-30")
+    assert "error" not in result
+    coverage = result["coverage"]
+    assert isinstance(coverage, dict)
+    assert coverage["finra_rows"] == count
+    assert result["unresolved"] == sorted(str(row["symbolCode"]) for row in rows)
+    assert offsets == list(range(0, count, page_size))
+
+
+@pytest.mark.parametrize(
+    ("pages", "message"),
+    [
+        ([([], {})], "FINRA omitted Record-Total"),
+        ([([{"symbolCode": "AAA"}], {"record-total": "2"}), ([], {"record-total": "3"})], "Record-Total changed"),
+        ([([{"symbolCode": "AAA"}], {"record-total": "2"}), ([], {"record-total": "2"})], "pagination ended"),
+        ([(None, {"record-total": "1"})], "pagination ended"),
+        ([([{"symbolCode": "AAA"}], {"record-total": "0"})], "incomplete short-interest snapshot"),
+    ],
+)
+def test_screen_rejects_unproven_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+    pages: list[tuple[object, dict[str, str]]],
+    message: str,
+) -> None:
+    scripted = iter(pages)
+
+    def query(group: str, name: str, payload: dict[str, object]) -> tuple[bytes, object, dict[str, str]]:
+        rows, headers = next(scripted)
+        return b"[]", rows, headers
+
+    monkeypatch.setattr(screens.finra_client, "ingestion_post_query", query)
+    monkeypatch.setattr(screens.time, "sleep", _skip_screen_sleep)
+    result = screens.get_short_interest_leaderboard(settlement_date=SETTLEMENT, as_of="2026-08-30")
+    assert message in str(result["error"])
+
+
+def _zeta_row() -> list[dict[str, object]]:
+    return [
+        {
+            "symbolCode": "ZZZ",
+            "issueName": "Zeta",
+            "settlementDate": SETTLEMENT,
+            "currentShortPositionQuantity": 7,
+        }
+    ]
+
+
+class _FailingFactsGateway(_FakeGateway):
+    """Live-provider double whose companyfacts provider is down for one CIK."""
+
+    @override
+    def company_facts(self, cik: int, as_of: str | None = None) -> dict[str, object]:
+        if int(cik) == 1:
+            raise RuntimeError("SEC unavailable")
+        return super().company_facts(cik, as_of=as_of)
+
+
+def test_screen_inputs_reports_non_sec_identity_and_survives_provider_failure(
+    seeds: _Seeds, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One failing CIK never blocks its siblings; a non-SEC identity reads unclassified."""
+    _seed_default(seeds)
+    seeds.aliases.append(
+        TickerAlias(
+            alias_type="ticker",
+            alias_value="ZZZ",
+            entity_id="finra:symbol:ZZZ",
+            security_id=None,
+            source="provider-test",
+            valid_from=None,
+            valid_to=None,
+            known_at="2026-08-10T12:00:00Z",
+            retrieved_at="2026-08-10T12:00:00Z",
+        )
+    )
+    _seed_short_interest(seeds, _default_rows() + _zeta_row(), content_hash="zeta-snapshot")
+    _install(monkeypatch, seeds)  # FINRA seams; the SEC gateway below is the failing double
+    monkeypatch.setattr(screens, "_gateway", lambda: _FailingFactsGateway(seeds))
+
+    result = screens.materialize_short_interest_screen(SETTLEMENT, as_of="2026-08-30")
+    entries = result["entries"]
+    assert isinstance(entries, list)
+    assert [entry["ticker"] for entry in entries] == ["CCC", "BBB"]
+    coverage = result["coverage"]
+    assert isinstance(coverage, dict)
+    exclusions = coverage["exclusions"]
+    assert isinstance(exclusions, dict)
+    assert exclusions["not_classified_common_equity"] == 2
+    assert exclusions["missing_shares_outstanding"] == 0
+    assert result["unresolved"] == []

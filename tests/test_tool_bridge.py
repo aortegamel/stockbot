@@ -338,3 +338,51 @@ def test_direct_bridge_search_supports_session_scoped_read_after_restart(
     raw_hits = page["hits"]
     assert isinstance(raw_hits, list)
     assert [hit["accession_no"] for hit in raw_hits if isinstance(hit, dict)] == ["0000000001-26-000003"]
+
+
+def test_bridge_main_preserves_jsonl_envelopes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from io import StringIO
+
+    stdin = StringIO('\nnot json\n[]\n{}\n{"id":"x","op":"unknown"}\n{"id":"end","op":"tool.session.end"}\n')
+    stdout = StringIO()
+    monkeypatch.setattr(tool_bridge.sys, "stdin", stdin)
+    monkeypatch.setattr(tool_bridge.sys, "stdout", stdout)
+    tool_bridge.main()
+    assert [json.loads(line) for line in stdout.getvalue().splitlines()] == [
+        {"error": "bad_request"},
+        {"error": "bad_request"},
+        {"error": "missing_arg"},
+        {"id": "x", "error": "unknown_op"},
+        {"id": "end", "error": "missing_arg"},
+    ]
+
+
+@pytest.mark.parametrize("value,expected", [(None, None), ("", None), (7, None), (" value ", " value ")])
+def test_invoke_optional_strings_keep_transport_values(
+    value: object, expected: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[dict[str, object]] = []
+
+    def execute(
+        name: str, arguments: dict[str, object], session: AgentToolSession, **kwargs: object
+    ) -> dict[str, object]:
+        seen.append(kwargs)
+        return {"content": "ok"}
+
+    monkeypatch.setattr(tool_bridge, "execute_agent_tool", execute)
+    try:
+        response = tool_bridge.handle(
+            {
+                "id": "optional",
+                "op": "tool.invoke",
+                "name": "search_web",
+                "session_id": "optional-strings",
+                "tool_call_id": value,
+                "data_root": value,
+                "as_of": value,
+            }
+        )
+        assert response == {"id": "optional", "result": {"content": "ok"}}
+        assert seen == [{"tool_call_id": expected, "protocol_id": "optional", "data_root": expected, "as_of": expected}]
+    finally:
+        tool_bridge._sessions.pop("optional-strings", None)

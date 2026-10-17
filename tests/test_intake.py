@@ -5,10 +5,10 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast, override
+from typing import override
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import given, seed, settings
 from hypothesis import strategies as st
 
 from app.decision_client import JevClient
@@ -734,7 +734,7 @@ def test_reasoner_quota_no_retry(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_reasoner_rate_limit_retries_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A 429 Go usage window retries once; a spent window fails again as failed_twice."""
+    """A 429 Go usage window retries once and reports the rate-limited resend."""
     calls = {"n": 0}
     good: dict[str, object] = {
         "id": "rs:t-q1",
@@ -751,9 +751,39 @@ def test_reasoner_rate_limit_retries_once(monkeypatch: pytest.MonkeyPatch) -> No
         return {"proposals": [good]}
 
     monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", fake_decompose)
-    proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "")
+    events: list[tuple[str, dict[str, object] | None]] = []
+
+    def progress(stage: str, detail: dict[str, object] | None = None) -> None:
+        events.append((stage, detail))
+
+    proposals, hints = kw._reasoner_decompose_with_retry("q?", None, "rs:t", "", progress=progress)
     assert calls["n"] == 2 and [p["id"] for p in proposals] == ["rs:t-q1"]
     assert "fallback" not in hints
+    assert ("reasoner_retry", {"attempt": 2, "reason": "rate_limited"}) in events
+    assert events[-1] == ("reasoner_done", {"proposals": 1})
+
+
+def test_reasoner_rate_limit_twice_fails_twice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A spent usage window fails again: two calls, two rate-limited resends, then failed twice."""
+    calls = {"n": 0}
+
+    def fake_decompose(self: object, prompt: str, objective_id: str) -> dict[str, object]:
+        calls["n"] += 1
+        raise RuntimeError("429 Go usage limit exceeded, monthly window")
+
+    monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", fake_decompose)
+    events: list[tuple[str, dict[str, object] | None]] = []
+
+    def progress(stage: str, detail: dict[str, object] | None = None) -> None:
+        events.append((stage, detail))
+
+    with pytest.raises(RuntimeError, match="^reasoner decompose failed twice without proposals$"):
+        kw._reasoner_decompose_with_retry("q?", None, "rs:t", "", progress=progress)
+    assert calls["n"] == 2
+    assert [e for e in events if e[0] == "reasoner_retry"] == [
+        ("reasoner_retry", {"attempt": 2, "reason": "rate_limited"}),
+        ("reasoner_retry", {"attempt": 2, "reason": "rate_limited"}),
+    ]
 
 
 def test_reasoner_transient_retries_once(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1046,7 +1076,7 @@ def _watch_symbol(args: Mapping[str, object]) -> str:
     return str(args.get("identifier") or args.get("ticker"))
 
 
-def _rows(value: JSONValue) -> list[dict[str, JSONValue]]:
+def _rows(value: object) -> list[dict[str, JSONValue]]:
     """Narrow a worker watchlist reply to its row dicts."""
     assert isinstance(value, list) and all(isinstance(r, dict) for r in value), value
     return [r for r in value if isinstance(r, dict)]
@@ -1239,10 +1269,6 @@ def test_watchlist_intake_admits_one_finra_row_per_symbol_and_dedupes_repeats(
     monkeypatch.setattr(kw, "_intake_attempt", _fake_attempt)
     _admitted, _raw, stats = asyncio.run(kw._intake_round(None, [], sid, {}, [], None, kernel, None, None, symbols))
 
-    def _watch_rows(value: object) -> list[dict[str, JSONValue]]:
-        assert isinstance(value, list), value
-        return _rows(cast(JSONValue, value))
-
     expected = len(symbols) * len(finra_sources)
     assert stats["outcomes"] == {
         "admitted": expected,
@@ -1251,7 +1277,7 @@ def test_watchlist_intake_admits_one_finra_row_per_symbol_and_dedupes_repeats(
         "error": len(symbols),
         "timeout": 0,
     }
-    all_rows = _watch_rows(stats["watchlist"])
+    all_rows = _rows(stats["watchlist"])
     rows = [r for r in all_rows if r["tool"] in finra_sources]
     assert [(r["symbol"], r["tool"]) for r in rows] == [(symbol, tool) for symbol in symbols for tool in finra_sources]
     ids = [r["evidence_id"] for r in rows]
@@ -1281,7 +1307,7 @@ def test_watchlist_intake_admits_one_finra_row_per_symbol_and_dedupes_repeats(
         "error": len(symbols),
         "timeout": 0,
     }
-    assert [r["evidence_id"] for r in _watch_rows(stats2["watchlist"]) if r["tool"] in finra_sources] == ids
+    assert [r["evidence_id"] for r in _rows(stats2["watchlist"]) if r["tool"] in finra_sources] == ids
     assert {str(e["evidence_id"]) for e in store.list_evidence(sid)} == set(ids)
 
 
@@ -1415,3 +1441,209 @@ def test_watchlist_page_load_reuses_finra_cache_until_ttl(monkeypatch: pytest.Mo
         finra_client.reset_token_cache()
         finra_client.reset_discovery_cache()
         finra_client.reset_partitions_cache()
+
+
+# --- reasoner intake: hint/proposal/response boundaries + real transport ----
+def _reasoner_response(text: str) -> dict[str, object]:
+    return {"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]}
+
+
+@pytest.mark.parametrize(
+    ("value", "error", "message"),
+    [
+        ([], TypeError, "malformed_opencode_json"),
+        ({}, ValueError, "unexpected fields"),
+        ({"proposals": [], "extra": 1}, ValueError, "unexpected fields"),
+        ({"proposals": [], "tickers": "NVDA"}, ValueError, "tickers must be string"),
+        ({"proposals": [], "tickers": [1]}, ValueError, "tickers must be string"),
+        ({"proposals": [], "tickers": [" "]}, ValueError, "tickers must be string"),
+        ({"proposals": [], "corrected_query": 1}, ValueError, "corrected_query must be"),
+        ({"proposals": [], "corrected_query": " "}, ValueError, "corrected_query must be"),
+    ],
+)
+def test_reasoner_hint_boundaries(value: object, error: type[Exception], message: str) -> None:
+    with pytest.raises(error, match=message):
+        check_decompose_hints("decompose", value)
+
+
+def test_reasoner_null_hints_omit_optional_fields() -> None:
+    assert check_decompose_hints("decompose", {"proposals": [], "tickers": None, "corrected_query": None}) == {
+        "proposals": []
+    }
+    hints = check_decompose_hints(
+        "decompose", {"proposals": [], "tickers": [" nvda ", "aapl"], "corrected_query": " q "}
+    )
+    assert hints == {"proposals": [], "tickers": ["NVDA", "AAPL"], "corrected_query": "q"}
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"id": "wrong"}, "must start with"),
+        ({"objectiveId": "other"}, "references wrong objective"),
+        ({"question": ""}, "proposal.question must be"),
+        ({"whyItMatters": ""}, "proposal.whyItMatters must be"),
+        ({"dependsOn": "s-a"}, "dependsOn must be string"),
+        ({"dependsOn": [1]}, "dependsOn must be string"),
+        ({"dependsOn": ["s-a"]}, "depends on itself"),
+        ({"dependsOn": ["unknown"]}, "references unknown id"),
+        ({"extra": True}, "unexpected fields"),
+    ],
+)
+def test_reasoner_proposal_boundaries(change: dict[str, object], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        check_proposals("decompose", [{**_proposal("s-a", "s"), **change}], "s", set())
+
+
+def test_reasoner_proposal_batch_validation_precedes_dependencies() -> None:
+    bad_dependency = {**_proposal("s-a", "s"), "dependsOn": ["unknown"]}
+    with pytest.raises(ValueError, match="proposal must be an object"):
+        check_proposals("decompose", [bad_dependency, None], "s", set())
+    proposal = _proposal("s-a", "s")
+    with pytest.raises(ValueError, match="duplicate proposal id"):
+        check_proposals("decompose", [proposal, proposal], "s", set())
+    with pytest.raises(ValueError, match="reused proposal id"):
+        check_proposals("decompose", [proposal], "s", {"s-a"})
+    with pytest.raises(TypeError, match="proposals must be an array"):
+        check_proposals("decompose", {}, "s", set())
+    forward = [{**_proposal("s-b", "s"), "dependsOn": ["s-a"]}, _proposal("s-a", "s")]
+    assert [p["id"] for p in check_proposals("decompose", forward, "s", set())] == ["s-b", "s-a"]
+    prior = {**_proposal("s-b", "s"), "dependsOn": ["s-prior"]}
+    assert check_proposals("decompose", [prior], "s", {"s-prior"}) == [prior]
+
+
+@seed(431207)
+@settings(max_examples=40, deadline=None)
+@given(st.lists(st.text(min_size=1, max_size=16), max_size=5))
+def test_reasoner_split_text_roundtrips_valid_proposals(questions: list[str]) -> None:
+    proposals = [{**_proposal(f"s-{i}", "s"), "question": question} for i, question in enumerate(questions)]
+    text = json.dumps({"proposals": proposals}, ensure_ascii=True)
+    parts: list[dict[str, object]] = [
+        {"type": "output_text", "text": text[: len(text) // 2]},
+        {"type": "ignored", "text": "not JSON"},
+        {"type": "output_text", "text": 17},
+        {"type": "output_text", "text": text[len(text) // 2 :]},
+    ]
+    response: dict[str, object] = {
+        "output": [
+            None,
+            {"type": "reasoning"},
+            {"type": "message", "content": None},
+            {"type": "message", "content": [None, *parts]},
+        ]
+    }
+    calls: list[tuple[str, str]] = []
+
+    def post(prompt: str, model: str) -> dict[str, object]:
+        calls.append((prompt, model))
+        return response
+
+    assert ReasonerClient(model="m", url="u", post=post).decompose("prompt\nbytes", "s") == {"proposals": proposals}
+    assert calls == [("prompt\nbytes", "m")]
+
+
+@pytest.mark.parametrize(
+    ("response", "error", "message"),
+    [
+        ({}, TypeError, "malformed_opencode_response"),
+        ({"output": {}}, TypeError, "malformed_opencode_response"),
+        ({"output": []}, ValueError, "malformed_opencode_response"),
+        (_reasoner_response("{"), ValueError, "malformed_opencode_json"),
+        (_reasoner_response("[]"), TypeError, "malformed_opencode_json"),
+        (_reasoner_response('{"extra":1}'), ValueError, "unexpected fields"),
+    ],
+)
+def test_reasoner_response_boundaries(response: dict[str, object], error: type[Exception], message: str) -> None:
+    def post(prompt: str, model: str) -> dict[str, object]:
+        return response
+
+    with pytest.raises(error, match=message):
+        ReasonerClient(model="m", url="u", post=post).decompose("prompt", "s")
+
+
+def test_reasoner_expand_preserves_prior_dependencies_and_filters_requests() -> None:
+    proposal = {**_proposal("s-new", "s"), "dependsOn": ["s-prior"]}
+    body: dict[str, object] = {"proposals": [proposal], "evidenceRequests": [{"nodeId": "s-new"}, 4]}
+
+    def post(prompt: str, model: str) -> dict[str, object]:
+        return _reasoner_response(json.dumps(body))
+
+    client = ReasonerClient(model="m", url="u", post=post)
+    assert client.expand("prompt", "s", {"s-prior"}) == {
+        "proposals": [proposal],
+        "evidenceRequests": [{"nodeId": "s-new"}],
+    }
+    body["evidenceRequests"] = None
+    assert client.expand("prompt", "s", {"s-prior"})["evidenceRequests"] == []
+    with pytest.raises(ValueError, match="reused proposal id"):
+        client.expand("prompt", "s", {"s-prior", "s-new"})
+
+
+def test_reasoner_real_transport_sends_exact_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+    from urllib.request import Request
+
+    from app import reasoner_client as rc
+
+    requests: list[tuple[Request, float]] = []
+
+    def urlopen(request: Request, timeout: float) -> io.BytesIO:
+        requests.append((request, timeout))
+        return io.BytesIO(json.dumps(_reasoner_response('{"proposals":[]}')).encode())
+
+    monkeypatch.setattr(rc._urlrequest, "urlopen", urlopen)
+    assert ReasonerClient(model="m", url="http://opencode.invalid", api_key="secret", timeout_s=7).decompose(
+        "raw\nprompt", "s"
+    ) == {"proposals": []}
+    request, timeout = requests[0]
+    assert request.full_url == "http://opencode.invalid"
+    data = request.data
+    assert isinstance(data, bytes)
+    assert json.loads(data) == {"model": "m", "input": "raw\nprompt"}
+    assert request.get_header("Authorization") == "Bearer secret"
+    assert timeout == 7
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (b"detail", "opencode_request_failed: 429 detail"),
+        (b"", "opencode_request_failed: 429"),
+    ],
+)
+def test_reasoner_http_error_detail(monkeypatch: pytest.MonkeyPatch, body: bytes, expected: str) -> None:
+    import io
+    from email.message import Message
+    from urllib.error import HTTPError
+
+    from app import reasoner_client as rc
+
+    def urlopen(request: object, timeout: float) -> object:
+        raise HTTPError("http://opencode.invalid", 429, "limited", Message(), io.BytesIO(body))
+
+    monkeypatch.setattr(rc._urlrequest, "urlopen", urlopen)
+    with pytest.raises(RuntimeError) as exc:
+        ReasonerClient(model="m", url="http://opencode.invalid", api_key="k").decompose("prompt", "s")
+    assert str(exc.value) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "error", "message"),
+    [
+        (b"[]", TypeError, "non-object response"),
+        (b"{", RuntimeError, "opencode_request_failed"),
+    ],
+)
+def test_reasoner_transport_response_shape(
+    monkeypatch: pytest.MonkeyPatch, raw: bytes, error: type[Exception], message: str
+) -> None:
+    import io
+
+    from app import reasoner_client as rc
+
+    def urlopen(request: object, timeout: float) -> io.BytesIO:
+        return io.BytesIO(raw)
+
+    monkeypatch.setattr(rc._urlrequest, "urlopen", urlopen)
+    with pytest.raises(error, match=message):
+        ReasonerClient(model="m", url="http://opencode.invalid", api_key="k").decompose("prompt", "s")

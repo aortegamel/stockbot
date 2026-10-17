@@ -2,8 +2,11 @@
 
 from collections.abc import Callable
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from app.sec.archive import archive_sec_filing, find_archived
 from app.sec.models import Filing
@@ -402,3 +405,154 @@ def test_typed_stub_row_rejects_bad_shapes() -> None:
         _typed_stub_row(object())
     with pytest.raises(TypeError):
         _typed_stub_row(_Bad())
+
+
+@pytest.mark.parametrize("payload", [None, [], {"text": 7}])
+def test_document_text_rejects_provider_payloads(monkeypatch: pytest.MonkeyPatch, payload: object) -> None:
+    from app.sec import documents, store
+
+    def provider(accession: str, name: str | None = None, **kwargs: object) -> object:
+        return payload
+
+    monkeypatch.setattr(documents, "get_sec_document", provider)
+    with pytest.raises(TypeError, match="document"):
+        store.query_document_text(accession="ACC")
+
+
+@pytest.mark.parametrize("payload", [{}, {"text": None}, {"text": ""}])
+def test_document_text_empty_payloads(monkeypatch: pytest.MonkeyPatch, payload: dict[str, object]) -> None:
+    from app.sec import documents, store
+
+    def provider(accession: str, name: str | None = None, **kwargs: object) -> dict[str, object]:
+        assert (accession, name, kwargs["as_of"]) == ("ACC", "primary.htm", "2024-04-01")
+        return payload
+
+    monkeypatch.setattr(documents, "get_sec_document", provider)
+    assert store.query_document_text(accession="ACC", document_name="primary.htm", as_of="2024-04-01") == []
+
+
+def test_document_text_preserves_metadata_and_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec import documents, store
+
+    payload: dict[str, object] = {
+        "text": "filing text",
+        "accession": "ACC",
+        "document_name": "primary.htm",
+        "known_at": "2024-01-01",
+    }
+
+    def provider(accession: str, name: str | None = None, **kwargs: object) -> dict[str, object]:
+        return payload
+
+    monkeypatch.setattr(documents, "get_sec_document", provider)
+    assert store.query_document_text(accession="ACC", limit=None) == [payload]
+    assert store.query_document_text(accession="ACC", limit=0) == []
+
+
+def test_coverage_filters_and_range_endpoints(tmp_path: Path) -> None:
+    from app.sec import store
+
+    jobs = [
+        ("sec-global", "10-K", "2024-01-01", "2024-03-31"),
+        ("other", "10-K", "2024-01-01", "2024-03-31"),
+        ("sec-global", "4", "2024-01-01", "2024-03-31"),
+        ("sec-global", "10-K", "2024-04-01", "2024-06-30"),
+    ]
+    for source, form, start, end in jobs:
+        job = store.enqueue_backfill_job(source, form, start, end, root=tmp_path)
+        store.complete_job(job, last_key="ACC", root=tmp_path)
+    queued = store.enqueue_backfill_job("sec-global", "10-K", "2024-07-01", "2024-09-30", root=tmp_path)
+    assert queued
+    rows = store.query_coverage(source="sec-global", form="10-K", date_partition="2024-01-01:2024-03-31", root=tmp_path)
+    assert rows == [
+        {
+            "source": "sec-global",
+            "form": "10-K",
+            "date_partition": "2024-01-01:2024-03-31",
+            "status": "complete",
+            "last_key": "ACC",
+        }
+    ]
+    assert len(store.query_coverage(root=tmp_path, limit=1)) == 1
+    assert len(store.query_coverage(root=tmp_path)) == 4
+    assert store.query_coverage(root=tmp_path, source="absent") == []
+    assert store.query_coverage(root=tmp_path, form="absent") == []
+    assert store.query_coverage(root=tmp_path, date_partition="absent") == []
+    for partition in ("2024-01-01:2024-03-31", "2024-01-01", "2024-03-31"):
+        assert store.is_partition_covered("sec-global", "10-K", partition, root=tmp_path)
+    assert not store.is_partition_covered("sec-global", "10-K", "2024-02-01", root=tmp_path)
+    assert not store.is_partition_covered("absent", "10-K", "2024-01-01", root=tmp_path)
+    assert not store.is_partition_covered("sec-global", "absent", "2024-01-01", root=tmp_path)
+    assert not store.is_partition_covered("sec-global", "10-K", "2024-07-01", root=tmp_path)
+
+
+@settings(derandomize=True, max_examples=15, deadline=None)
+@given(forms=st.lists(st.sampled_from(["10-K", "4", "13F-HR"]), min_size=1, max_size=8))
+def test_partition_coverage_is_monotonic(forms: list[str]) -> None:
+    from app.sec import store
+
+    with TemporaryDirectory() as directory:
+        completed: set[str] = set()
+        for form in forms:
+            job = store.enqueue_backfill_job("sec-global", form, "2024-01-01", "2024-03-31", root=directory)
+            store.complete_job(job, root=directory)
+            completed.add(form)
+            for wanted in completed:
+                assert store.is_partition_covered("sec-global", wanted, "2024-01-01:2024-03-31", root=directory)
+                assert len(store.query_coverage(source="sec-global", form=wanted, root=directory)) == 1
+
+
+@settings(derandomize=True, max_examples=20)
+@given(
+    cik=st.integers(min_value=1, max_value=9999999999), forms=st.lists(st.sampled_from(["10-k", " 4 ", "", "13F-HR"]))
+)
+def test_query_filings_normalizes_provider_filters(cik: int, forms: list[str]) -> None:
+    from unittest.mock import patch
+
+    seen: list[tuple[int, object]] = []
+    filing = _filing("ACC")
+
+    def provider(cik_value: int, **kwargs: object) -> list[Filing]:
+        seen.append((cik_value, kwargs["forms"]))
+        return [filing]
+
+    with patch("app.sec.filings.list_sec_filings", provider):
+        assert query_filings(cik=f"  {cik:010d}  ", forms=forms, limit=None) == [filing]
+    assert seen[0][0] == cik
+    passed_forms = seen[0][1]
+    expected = {form.strip().upper() for form in forms if form.strip()}
+    if expected:
+        assert isinstance(passed_forms, list)
+        assert set(passed_forms) == expected
+    else:
+        assert passed_forms is None
+
+
+def test_accession_filing_pit_and_error_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.data_sources import SourceGateway
+
+    filing = _filing("ACC", known_at="2024-02-01")
+
+    def provider(self: object, accession: str, *, as_of: str | None = None) -> Filing:
+        assert accession == "ACC"
+        return filing
+
+    monkeypatch.setattr(SourceGateway, "get_filing", provider)
+    assert query_filings(accession="ACC", as_of="2024-01-31") == []
+    assert query_filings(accession="ACC", as_of="2024-02-01") == [filing]
+    assert query_filings(accession="ACC", cik="invalid") == [filing]
+    with pytest.raises(ValueError, match="start_date"):
+        query_filings(accession="ACC", start_date="invalid")
+
+    def unknown(self: object, accession: str, *, as_of: str | None = None) -> Filing:
+        raise ValueError("filing not known as of cutoff")
+
+    monkeypatch.setattr(SourceGateway, "get_filing", unknown)
+    assert query_filings(accession="ACC", as_of="2024-01-31") == []
+
+    def invalid(self: object, accession: str, *, as_of: str | None = None) -> Filing:
+        raise ValueError("bad accession")
+
+    monkeypatch.setattr(SourceGateway, "get_filing", invalid)
+    with pytest.raises(ValueError, match="bad accession"):
+        query_filings(accession="ACC")

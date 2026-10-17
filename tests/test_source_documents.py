@@ -103,20 +103,10 @@ def test_capture_web_result_archives_only_success_rows(tmp_path: Path, monkeypat
     }
 
 
-class _MemoryStore:
-    """Minimal tool-result store for the provenance replay test."""
-
-    def __init__(self, result: object) -> None:
-        self._result = result
-
-    def get_tool_result(self, tool_result_id: str) -> object:
-        assert tool_result_id == "tr-1"
-        return {"tool_name": "search_web", "session_id": "s", "result": self._result}
-
-
 def test_web_provenance_pins_provider_content(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
     from app.research import service as _svc
+    from app.research.repository import ResearchRepository
 
     result = {
         "result_type": "web_search",
@@ -133,10 +123,12 @@ def test_web_provenance_pins_provider_content(tmp_path: Path, monkeypatch: pytes
             }
         ],
     }
+    store = ResearchRepository(tmp_path / "research.sqlite")
+    store.save_tool_result(
+        {"tool_result_id": "tr-1", "session_id": "s", "job_id": "j", "tool_name": "search_web", "result": result}
+    )
     provenance = _svc._web_provenance(
-        {"tool_result_id": "tr-1", "matching_passage": "quoted passage"},
-        store=_MemoryStore(result),  # type: ignore[arg-type]
-        session_id="s",
+        {"tool_result_id": "tr-1", "matching_passage": "quoted passage"}, store=store, session_id="s"
     )
     assert provenance["source_content"] == "longer provider extraction quoted passage tail"
     assert provenance["source_representation"] == "text"
@@ -954,3 +946,21 @@ def test_sec_capture_uses_exact_full_document_window(tmp_path: Path, monkeypatch
         capture_result("get_sec_document", result)
     document = read_source_document(sources[0]["id"], data_root=tmp_path)
     assert document["location"] == {"offset": 4, "end": 10, "basis": "rendered"}
+
+
+def test_reader_rejects_store_missing_tool_result_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both store reads are required: a double with only get_evidence falls back to the configured database."""
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("RESEARCH_DB_PATH", raising=False)
+    digest = sec_archive.archive_sec_document(
+        ACC, DOC, b"plain quoted passage", url="https://www.sec.gov/d", metadata={}, root=tmp_path / "raw"
+    ).sha256
+    record = _sec_evidence("ev-half", digest, "quoted passage", 6, "text")
+
+    class _OnlyEvidence:
+        def get_evidence(self, evidence_id: str) -> dict[str, object]:
+            assert evidence_id == "ev-half"
+            return record
+
+    with pytest.raises(KeyError):
+        read_source_document("evidence:ev-half", data_root=tmp_path, repo=_OnlyEvidence())

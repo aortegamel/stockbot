@@ -735,3 +735,112 @@ def test_empty_cusip_is_none() -> None:
         source_row=1,
     )
     assert empty.cusip is None
+
+
+def test_person_transactions_preserve_owner_scope_and_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import dataclass
+
+    from app.sec import insider
+    from app.sec.models import InsiderTransaction
+
+    @dataclass(frozen=True)
+    class OwnerTransaction(InsiderTransaction):
+        owner_cik: str | None = None
+
+    records: list[InsiderTransaction] = [
+        OwnerTransaction("Alice", "7", "Issuer", "4", "2024-01-01", "match", owner_cik=" 7 "),
+        OwnerTransaction("Bob", "8", "Issuer", "4", "2024-01-01", "other", owner_cik="8"),
+        OwnerTransaction("Alice", "7", "Issuer", "4", "2024-01-01", "empty", owner_cik=None),
+        InsiderTransaction("Alice", "7", "Issuer", "4", "2024-01-01", "missing"),
+    ]
+    calls: list[tuple[object, object, object]] = []
+
+    def provider(owner: object, *, as_of: str | None = None, limit: int = 200) -> list[InsiderTransaction]:
+        calls.append((owner, as_of, limit))
+        return records
+
+    monkeypatch.setattr(insider, "get_insider_activity", provider)
+    assert [rec.accession_no for rec in insider.query_person_transactions(" 7 ", as_of="2024-02-01", limit=2)] == [
+        "match",
+        "empty",
+    ]
+    assert calls == [(" 7 ", "2024-02-01", 2)]
+    assert [rec.accession_no for rec in insider.query_person_transactions(7)] == ["match", "empty", "missing"]
+    assert insider.query_person_transactions(7, limit=0) == []
+    with pytest.raises(ValueError, match="invalid as_of"):
+        insider.query_person_transactions(7, as_of="invalid")
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("table_attribute", ["infotable", "information_table", "holdings", "info_table"])
+def test_manager_holdings_and_security_managers_live_pit_scope(
+    monkeypatch: pytest.MonkeyPatch, table_attribute: str
+) -> None:
+    from app.sec import documents, filings, insider
+    from app.sec.models import Filing
+
+    def filing(accession: str, day: str) -> Filing:
+        return Filing(
+            accession_no=accession,
+            form="13F-HR/A",
+            filer_cik=7,
+            filer_name="Manager",
+            filed_at=day,
+            accepted_at=None,
+            known_at=day,
+            report_period="2023-12-31",
+            primary_document="info.xml",
+            is_amendment=True,
+            amendment_of=None,
+            subject_cik=None,
+            subject_name=None,
+            source="https://www.sec.gov/filing",
+        )
+
+    rows = [filing("old", "2024-01-01"), filing("future", "2024-03-01"), filing("empty", "2024-01-01")]
+    calls: list[tuple[object, object, object, object]] = []
+    table = [
+        {"Cusip": "037833100", "Issuer": "Apple", "SharesPrnAmount": 1000, "Value": 50000},
+        {"Cusip": "594918104", "Issuer": "Microsoft", "SharesPrnAmount": 2000, "Value": 60000},
+    ]
+
+    def list_provider(manager: object, **kwargs: object) -> list[Filing]:
+        calls.append((manager, kwargs["forms"], kwargs["as_of"], kwargs["limit"]))
+        return rows
+
+    def document_provider(accession: str) -> SimpleNamespace:
+        inner = SimpleNamespace() if accession == "empty" else SimpleNamespace(**{table_attribute: table})
+        return SimpleNamespace(obj=lambda: inner)
+
+    monkeypatch.setattr(filings, "list_sec_filings", list_provider)
+    monkeypatch.setattr(documents, "get_by_accession_number", document_provider)
+    holdings = insider.query_manager_holdings(7, as_of="2024-02-01", limit=1)
+    assert [(rec.accession_no, rec.manager_cik, rec.cusip, rec.shares) for rec in holdings] == [
+        ("old", "7", "037833100", 1000),
+    ]
+    assert calls[0][0] == 7
+    assert isinstance(calls[0][1], list)
+    assert set(calls[0][1]) == {"13F-HR", "13F-HR/A"}
+    assert calls[0][2:] == ("2024-02-01", 1)
+    matches = insider.query_security_managers(" 037833100 ", as_of="2024-02-01", limit=5)
+    assert [(rec.accession_no, rec.cusip) for rec in matches] == [("old", "037833100")]
+    assert calls[1][0] == " 037833100 "
+    assert calls[1][2:] == ("2024-02-01", None)
+    assert len(insider.query_manager_holdings(7)) == 4
+    assert insider.query_security_managers(" ") == []
+    assert len(calls) == 3
+    with pytest.raises(ValueError, match="invalid as_of"):
+        insider.query_security_managers(" ", as_of="invalid")
+
+
+def test_manager_holdings_propagate_live_provider_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec import filings, insider
+
+    def provider(manager: object, **kwargs: object) -> list[object]:
+        raise ConnectionError("SEC unavailable")
+
+    monkeypatch.setattr(filings, "list_sec_filings", provider)
+    with pytest.raises(ConnectionError, match="SEC unavailable"):
+        insider.query_manager_holdings(7)
+    with pytest.raises(ConnectionError, match="SEC unavailable"):
+        insider.query_security_managers("037833100")

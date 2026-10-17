@@ -1,5 +1,7 @@
 """Synthetic-trace unit tests for scripts/verify_judge (no Pi, no network)."""
 
+from pathlib import Path
+
 import pytest
 
 from scripts.verify_judge import (
@@ -915,3 +917,161 @@ def test_pit_filing_irrelevant_search_does_not_satisfy() -> None:
     )
     ok, reason = check(t)
     assert not ok and "missing evidence" in reason
+
+
+def test_load_evidence_keeps_texts_and_dates() -> None:
+    import sqlite3
+
+    from scripts import verify_judge as J
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE evidence (tool_call_id TEXT, rendered_text TEXT)")
+    conn.executemany(
+        "INSERT INTO evidence VALUES (?, ?)",
+        [
+            ("", "no tool call id"),
+            ("blank", None),
+            ("undated", "no dates in this rendering"),
+            ("dated", "Retrieved: 2026-09-01\nFiled: 2023-10-26"),
+            ("dated", "Filed: 2024-05-01"),
+        ],
+    )
+    texts, known = J._load_evidence(conn, "", ())
+    assert set(texts) == {"undated", "dated"}
+    assert texts["undated"] == "no dates in this rendering"
+    assert texts["dated"] == "Filed: 2024-05-01"
+    assert sorted(known["dated"]) == ["2023-10-26", "2024-05-01"]
+    assert "undated" not in known and "blank" not in texts
+    conn.close()
+
+
+def test_load_evidence_reads_missing_table_as_nothing() -> None:
+    import sqlite3
+
+    from scripts import verify_judge as J
+
+    conn = sqlite3.connect(":memory:")
+    assert J._load_evidence(conn, "", ()) == ({}, {})
+    conn.close()
+
+
+def _attempt_create_research() -> object:
+    """Session-creating stand-in for service.create_research bound to the attempt repo."""
+
+    def _create(
+        question: str,
+        objective: str | None = None,
+        *,
+        as_of: str | None = None,
+        policy: object = None,
+        repo: object = None,
+        ticker: str | None = None,
+    ) -> str:
+        from app.research import session as research_session
+        from app.research.repository import ResearchRepository
+
+        session = research_session.create_session(question, objective or question)
+        assert isinstance(repo, ResearchRepository)
+        repo.save_session(session)
+        return session.session_id
+
+    return _create
+
+
+async def _attempt_run_node(*args: object, **kwargs: object) -> None:
+    pass
+
+
+class _AttemptJev:
+    def __init__(self, data_root: object = None) -> None:
+        self.data_root = data_root
+
+    def close(self) -> None:
+        pass
+
+
+def test_run_kernel_attempt_stores_empty_terminal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.decision_client as decision
+    from app.research import scheduler, service
+    from app.research.repository import ResearchRepository
+    from scripts import verify_judge as J
+
+    store_dir = tmp_path / "store"
+    repo = ResearchRepository(data_root=store_dir)
+    terminals: list[str] = []
+
+    def _create_node(*args: object, **kwargs: object) -> object:
+        return object()
+
+    def _repo_for(store: object) -> ResearchRepository:
+        return repo
+
+    def _store_terminal(attempt_repo: ResearchRepository, session_id: str) -> None:
+        terminals.append(session_id)
+
+    monkeypatch.setattr(service, "create_research", _attempt_create_research())
+    monkeypatch.setattr(service, "create_node", _create_node)
+    monkeypatch.setattr(scheduler, "run_node", _attempt_run_node)
+    monkeypatch.setattr(decision, "JevClient", _AttemptJev)
+    monkeypatch.setattr(J, "_kernel_repo", _repo_for)
+    monkeypatch.setattr(J, "_store_empty_terminal", _store_terminal)
+
+    result = J._run_kernel_attempt("prompt?", tmp_path / "runs.sqlite", tmp_path, stockbot_store=store_dir)
+    assert result == (0, False, "", "", False)
+    assert store_dir.is_dir()
+    assert terminals == [J._latest_session_id(repo)]
+
+
+def test_run_kernel_attempt_skips_empty_terminal_when_evidence_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.decision_client as decision
+    from app.research import scheduler, service
+    from app.research.models import JSONValue
+    from app.research.repository import ResearchRepository
+    from scripts import verify_judge as J
+
+    store_dir = tmp_path / "store"
+    repo = ResearchRepository(data_root=store_dir)
+    terminals: list[str] = []
+
+    def _create_node(*args: object, **kwargs: object) -> object:
+        return object()
+
+    def _one_evidence(session_id: str) -> list[dict[str, JSONValue]]:
+        return [{"evidence_id": "e1"}]
+
+    def _repo_for(store: object) -> ResearchRepository:
+        return repo
+
+    def _store_terminal(attempt_repo: ResearchRepository, session_id: str) -> None:
+        terminals.append(session_id)
+
+    monkeypatch.setattr(service, "create_research", _attempt_create_research())
+    monkeypatch.setattr(service, "create_node", _create_node)
+    monkeypatch.setattr(scheduler, "run_node", _attempt_run_node)
+    monkeypatch.setattr(decision, "JevClient", _AttemptJev)
+    monkeypatch.setattr(J, "_kernel_repo", _repo_for)
+    monkeypatch.setattr(J, "_store_empty_terminal", _store_terminal)
+    monkeypatch.setattr(repo, "list_evidence", _one_evidence)
+
+    result = J._run_kernel_attempt("prompt?", tmp_path / "runs.sqlite", tmp_path, stockbot_store=store_dir)
+    assert result == (0, False, "", "", False)
+    assert terminals == []
+
+
+def test_run_kernel_attempt_reports_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.research import service
+    from app.research.repository import ResearchRepository
+    from scripts import verify_judge as J
+
+    def _boom(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("no kernel")
+
+    def _repo_for(store: object) -> ResearchRepository:
+        return ResearchRepository(data_root=tmp_path / "unused")
+
+    monkeypatch.setattr(service, "create_research", _boom)
+    monkeypatch.setattr(J, "_kernel_repo", _repo_for)
+    # stockbot_store=None resolves against the working directory; nothing is written there.
+    assert J._run_kernel_attempt("p", tmp_path / "runs.sqlite", tmp_path) == (1, False, "", "no kernel", False)

@@ -6,13 +6,14 @@ network. Forms validation reads only the installed edgartools registries.
 
 import json
 import string
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import NoReturn, cast
+from typing import NoReturn
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import given, seed, settings
 from hypothesis import strategies as st
 
 from app import tools
@@ -1978,6 +1979,301 @@ def test_passage_term_keeps_whole_amounts_clause_meaning_and_no_heading_echo() -
     assert term(file_description="SUBSIDIARIES OF THE REGISTRANT", query="subsidiaries") == "SUBSIDIARIES"
 
 
+@seed(20261014)
+@settings(max_examples=80, derandomize=True, deadline=None)
+@given(
+    value=st.integers(min_value=1, max_value=999999),
+    currency=st.sampled_from(["$", "€", "R$"]),
+    qualifier=st.sampled_from(["", "up to ", "approximately ", "no more than "]),
+    scale=st.sampled_from(["million", "billion"]),
+    tail=st.lists(st.sampled_from(["alpha", "beta", "gamma"]), min_size=0, max_size=15),
+)
+def test_money_term_preserves_amount_at_eight_word_boundary(
+    value: int, currency: str, qualifier: str, scale: str, tail: list[str]
+) -> None:
+    amount = f"{qualifier}{currency}{value} {scale}"
+    snippet = " ".join([amount, *tail])
+    term = tools._passage_term({"snippet": snippet})
+    assert term is not None and term == " ".join(snippet.split()[:8])
+    assert amount in term
+
+
+@seed(20261015)
+@settings(max_examples=40, derandomize=True, deadline=None)
+@given(gap=st.integers(min_value=0, max_value=15), value=st.integers(min_value=1, max_value=9999))
+def test_money_window_never_truncates_clause_negation(gap: int, value: int) -> None:
+    amount = f"${value} million"
+    snippet = " ".join(["not", *(["alpha"] * gap), amount])
+    start = snippet.index("$")
+    windows = tools._term_window(snippet, start, len(snippet), "", False)
+    if len(snippet.split()) > 8:
+        assert windows == ()
+    else:
+        assert windows[0] == snippet
+        assert all("not" in window.split() and amount in window for window in windows)
+
+
+def test_term_windows_preserve_order_and_first_word_comma_clause() -> None:
+    text = "$100 million alpha beta gamma delta epsilon zeta eta theta"
+    assert tools._term_window(text, 0, len("$100 million"), "", False) == (
+        "$100 million alpha beta gamma delta epsilon zeta",
+        "$100 million alpha beta gamma delta epsilon zeta",
+        "$100 million alpha beta gamma delta epsilon",
+        "$100 million alpha beta gamma delta",
+        "$100 million alpha beta gamma",
+        "$100 million alpha beta",
+        "$100 million alpha",
+        "$100 million",
+    )
+    text = "contracts, services increased"
+    assert tools._term_window(text, 0, len("contracts"), "", True)[0] == text
+    assert tools._term_window(text, len(text) + 1, len(text) + 2, "", False) == ()
+
+
+def test_packet_term_reconstructs_only_string_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec.discovery import service as disc
+
+    def display(hit: SECTextHit) -> dict[str, object]:
+        assert (hit.search_id, hit.attempt_id, hit.query, hit.accession_no, hit.form, hit.filed_at) == (
+            "7",
+            "",
+            "",
+            "",
+            "",
+            "",
+        )
+        assert hit.filer_name is None
+        assert hit.matched_document is None
+        assert hit.file_type is None
+        assert hit.file_description is None
+        assert hit.snippet == "supplier"
+        return {"term": "supplier"}
+
+    monkeypatch.setattr(disc, "packet_display_fields", display)
+    assert (
+        tools._hit_packet_term(
+            {"search_id": 7, "filer_name": 3, "matched_document": [], "file_type": False, "snippet": "supplier"}
+        )
+        == "supplier"
+    )
+
+
+@pytest.mark.parametrize("term", [None, "", 3])
+def test_packet_term_rejects_non_string_or_empty_labels(monkeypatch: pytest.MonkeyPatch, term: object) -> None:
+    from app.sec.discovery import service as disc
+
+    def display(hit: SECTextHit) -> dict[str, object]:
+        assert hit.snippet == "supplier"
+        return {"term": term}
+
+    monkeypatch.setattr(disc, "packet_display_fields", display)
+    assert tools._hit_packet_term({"snippet": "supplier"}) is None
+
+
+def test_packet_term_returns_none_on_constructor_or_extractor_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec.discovery import service as disc
+
+    class InvalidText:
+        def __str__(self) -> str:
+            raise TypeError("invalid stored identity")
+
+    assert tools._hit_packet_term({"search_id": InvalidText()}) is None
+
+    def unavailable(hit: SECTextHit) -> NoReturn:
+        raise RuntimeError("extractor unavailable")
+
+    monkeypatch.setattr(disc, "packet_display_fields", unavailable)
+    assert tools._hit_packet_term({"snippet": "supplier"}) is None
+
+
+def test_packet_term_returns_none_when_discovery_dependencies_are_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unimportable discovery module or SEC model drops the display term instead of failing the packet."""
+    with monkeypatch.context() as scoped:
+        scoped.setitem(sys.modules, "app.sec.discovery.service", None)
+        assert tools._hit_packet_term({"snippet": "supplier"}) is None
+
+    with monkeypatch.context() as scoped:
+        scoped.setitem(sys.modules, "app.sec.models", None)
+        assert tools._hit_packet_term({"snippet": "supplier"}) is None
+
+
+def test_diff_sec_filings_passes_validated_accession_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A valid pair reaches the SEC diff with surrounding blanks stripped and the section passed through."""
+    seen: dict[str, object] = {}
+
+    def _fake_diff(current: str, previous: str, section: str | None = None) -> dict[str, object]:
+        seen.update(current=current, previous=previous, section=section)
+        return {"sections": []}
+
+    monkeypatch.setattr(tools.sec, "diff_filings", _fake_diff)
+    result = tools.execute_tool(
+        "diff_sec_filings",
+        {
+            "current_accession": " 0000320193-25-000079 ",
+            "previous_accession": "000032019325000080",
+            "section": "Risk Factors",
+        },
+        "test",
+        context=_research_context(),
+    )
+    assert result == {"sections": []}
+    assert seen == {"current": "0000320193-25-000079", "previous": "000032019325000080", "section": "Risk Factors"}
+
+
+def test_diff_accession_values_reject_blanks_non_strings_and_failed_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blank/non-string diff accessions and normalize failures stay guided, never a provider call."""
+    context = _research_context()
+    blank = tools.execute_tool(
+        "diff_sec_filings",
+        {"current_accession": "  ", "previous_accession": "0000320193-25-000079"},
+        "test",
+        context=context,
+    )
+    assert blank["error_type"] == "invalid_tool_arguments", blank
+    assert "current_accession" in str(blank["error"]) and "0001628280-26-044069" in str(blank["error"])
+
+    assert tools._diff_accession_value({}, "diff_sec_filings", "previous_accession") == (None, None)
+    value, err = tools._diff_accession_value({"previous_accession": 3}, "diff_sec_filings", "previous_accession")
+    assert value is None and err is not None
+    assert "previous_accession" in str(err["error"])
+
+    def _reject(raw: object) -> NoReturn:
+        raise ValueError(f"invalid accession number: {raw!r}")
+
+    monkeypatch.setattr(tools.sec, "normalize_accession_no", _reject)
+    failed = tools.execute_tool(
+        "diff_sec_filings",
+        {"current_accession": "0000320193-25-000079", "previous_accession": "0000320193-25-000080"},
+        "test",
+        context=context,
+    )
+    assert failed["error_type"] == "invalid_tool_arguments", failed
+    assert "invalid current_accession" in str(failed["error"])
+
+
+def test_get_sec_filing_bad_as_of_and_provider_failure_are_guided(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A calendar-invalid as_of and a provider lookup failure both answer with guided errors."""
+    bad_date = tools.execute_tool(
+        "get_sec_filing",
+        {"accession_no": "0000320193-25-000079", "as_of": "2024-13-40"},
+        "test",
+        context=_research_context(),
+    )
+    assert bad_date["error_type"] == "invalid_tool_arguments", bad_date
+    assert "as_of" in str(bad_date["error"]) and "YYYY-MM-DD" in str(bad_date["error"])
+
+    def _missing(*args: object, **kwargs: object) -> NoReturn:
+        raise KeyError("no such accession")
+
+    monkeypatch.setattr(tools.sec, "get_sec_filing", _missing)
+    unknown = tools.execute_tool(
+        "get_sec_filing", {"accession_no": "0000320193-25-000079"}, "test", context=_research_context()
+    )
+    assert unknown["error_type"] == "invalid_tool_arguments", unknown
+    assert unknown["tool"] == "get_sec_filing" and "no such accession" in str(unknown["error"])
+
+
+def test_get_material_events_argument_paths_stay_guided(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Blank since, calendar-invalid as_of, missing subject, and unknown company stay guided."""
+    context = _research_context()
+    blank_since = tools.execute_tool("get_material_events", {"ticker": "AMD", "since": " "}, "test", context=context)
+    assert blank_since["error_type"] == "invalid_tool_arguments", blank_since
+    assert "since" in str(blank_since["error"])
+
+    bad_since = tools.execute_tool(
+        "get_material_events", {"ticker": "AMD", "since": "2024-13-40"}, "test", context=context
+    )
+    assert bad_since["error_type"] == "invalid_tool_arguments", bad_since
+    assert "since" in str(bad_since["error"]) and "YYYY-MM-DD" in str(bad_since["error"])
+
+    bad_as_of = tools.execute_tool(
+        "get_material_events",
+        {"ticker": "AMD", "since": "2026-01-01", "as_of": "2024-13-40"},
+        "test",
+        context=context,
+    )
+    assert bad_as_of["error_type"] == "invalid_tool_arguments", bad_as_of
+    assert "as_of" in str(bad_as_of["error"])
+
+    no_subject = tools.execute_tool(
+        "get_material_events", {"ticker": " ", "since": "2026-01-01"}, "test", context=context
+    )
+    assert no_subject["error_type"] == "invalid_tool_arguments", no_subject
+    assert "company_name" in str(no_subject["error"])
+
+    def _no_company(_name: str) -> None:
+        return None
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _no_company)
+    unknown = tools.execute_tool(
+        "get_material_events",
+        {"ticker": " ", "company_name": "Sunset Cam", "since": "2026-01-01"},
+        "test",
+        context=context,
+    )
+    assert unknown["error_type"] == "invalid_tool_arguments", unknown
+    assert "Sunset Cam" in str(unknown["error"])
+
+
+def test_get_material_events_reraises_unrecognized_provider_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only 'not found' is guided; other provider failures surface as errors, never an empty event list."""
+
+    def _broken(*args: object, **kwargs: object) -> NoReturn:
+        raise ValueError("upstream connection reset")
+
+    monkeypatch.setattr(tools.sec, "get_material_events", _broken)
+    result = tools.execute_tool(
+        "get_material_events", {"ticker": "AMD", "since": "2026-01-01"}, "test", context=_research_context()
+    )
+    assert "upstream connection reset" in str(result["error"]), result
+    assert "events" not in result, result
+
+
+def test_get_beneficial_ownership_wraps_records_for_resolved_ticker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A resolved company name reaches the SEC provider and the records come back wrapped."""
+    seen: dict[str, object] = {}
+
+    def _fake_records(ticker: object, **kwargs: object) -> list[SimpleNamespace]:
+        seen["ticker"] = ticker
+        seen.update(kwargs)
+        return [SimpleNamespace(to_dict=lambda: {"holder": "Acme Fund", "percent": 7.5})]
+
+    monkeypatch.setattr(tools.sec, "get_beneficial_ownership", _fake_records)
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_aapl)
+    result = tools.execute_tool(
+        "get_beneficial_ownership",
+        {"ticker": " ", "company_name": "Apple", "as_of": "2026-03-02", "limit": 5},
+        "test",
+        context=_research_context(),
+    )
+    assert result["subject"] == "AAPL" and result["count"] == 1, result
+    assert result["source"] == "SEC EDGAR"
+    assert _as_dict(_as_seq(result["records"])[0]) == {"holder": "Acme Fund", "percent": 7.5}
+    assert seen == {"ticker": "AAPL", "as_of": "2026-03-02", "limit": 5}
+
+    no_subject = tools.execute_tool("get_beneficial_ownership", {"ticker": " "}, "test", context=_research_context())
+    assert no_subject["error_type"] == "invalid_tool_arguments", no_subject
+    assert "company_name" in str(no_subject["error"])
+
+    bad_as_of = tools.execute_tool(
+        "get_beneficial_ownership",
+        {"ticker": " ", "company_name": "Apple", "as_of": "2024-13-40"},
+        "test",
+        context=_research_context(),
+    )
+    assert bad_as_of["error_type"] == "invalid_tool_arguments", bad_as_of
+    assert "as_of" in str(bad_as_of["error"])
+
+
+def test_gate_leaves_undeclared_argument_keys_to_the_handler() -> None:
+    """The schema gate checks only declared properties, so an extra key is not pattern/enum rejected here."""
+    assert tools._validate_tool_arguments("search_web", {"query": "AMD news", "undeclared": 1}) is None
+
+
 def test_edgar_alias_expansion_validated_keeps_provenance_no_false_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2273,7 +2569,7 @@ def test_saved_search_storage_is_idempotent_and_immutable(tmp_path: Path, hit_co
 
 def test_saved_search_defaults_and_validation_contract(tmp_path: Path) -> None:
     """The stored-search reader pins its page defaults and its error messages."""
-    from app.research.repository import ResearchRepository
+    from app.research.repository import ResearchRepository, _search_page_args
 
     record = _seed_read_search_ledger(tmp_path, hits=_read_search_hits())
     repository = ResearchRepository(data_root=tmp_path)
@@ -2285,15 +2581,22 @@ def test_saved_search_defaults_and_validation_contract(tmp_path: Path) -> None:
     assert [hit["accession_no"] for hit in _as_seq(page["hits"])] == [hit["accession_no"] for hit in stored]
 
     offset_error = "search offset must be an integer >= 0"
-    for bad_offset in (-1, 1.5, True):
+    for bad_offset in (-1, True):
         with pytest.raises(ValueError) as offset_exc:
-            repository.read_search(_READ_SEARCH, offset=cast("int", bad_offset))
+            repository.read_search(_READ_SEARCH, offset=bad_offset)
         assert str(offset_exc.value) == offset_error
+    with pytest.raises(ValueError) as offset_guard_exc:
+        _search_page_args(1.5, 50)
+    assert str(offset_guard_exc.value) == offset_error
     limit_error = "search limit must be an integer from 1 to 500"
-    for bad_limit in (0, 501, 0.5, True, "5"):
+    for bad_limit in (0, 501, True):
         with pytest.raises(ValueError) as limit_exc:
-            repository.read_search(_READ_SEARCH, limit=cast("int", bad_limit))
+            repository.read_search(_READ_SEARCH, limit=bad_limit)
         assert str(limit_exc.value) == limit_error
+    for wrong_type in (0.5, "5"):
+        with pytest.raises(ValueError) as guard_exc:
+            _search_page_args(0, wrong_type)
+        assert str(guard_exc.value) == limit_error
 
     search_id_error = "<research.sqlite>: search: 'search_id' must be a non-empty string"
     for bad_search_id in ("", 123):

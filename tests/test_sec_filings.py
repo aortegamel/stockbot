@@ -1586,3 +1586,75 @@ def test_insider_share_target_wrong_type_raises() -> None:
 
     with pytest.raises(TypeError):
         insider._share_target_in(["price", 42])
+
+
+def test_lookup_candidates_cache_expiry_and_provider_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    from edgar.entity import tickers
+
+    from app.sec import client
+
+    calls: list[str] = []
+
+    class Frame:
+        def itertuples(self) -> list[object]:
+            return [SimpleNamespace(cik="123", name="Acme")]
+
+    def provider() -> Frame:
+        calls.append("fetch")
+        return Frame()
+
+    now = 1000.0
+    monkeypatch.setattr(client.time, "monotonic", lambda: now)
+    monkeypatch.setattr(client, "ensure_identity", lambda: None)
+    monkeypatch.setattr(client, "_lookup_cached_frame", None)
+    monkeypatch.setattr(client, "_lookup_cached_index", None)
+    monkeypatch.setattr(client, "_lookup_cached_at", 0.0)
+    monkeypatch.setattr(client, "_lookup_flight", None)
+    monkeypatch.setattr(tickers, "get_cik_lookup_data", provider)
+    expected: list[dict[str, object]] = [{"name": "Acme", "cik": 123, "tickers": [], "exchange": None}]
+    assert client.get_cik_lookup_candidates("Acme") == expected
+    assert client.get_cik_lookup_candidates("Acme") == expected
+    assert calls == ["fetch"]
+    # The cache expires exactly at its TTL, independent of host uptime.
+    now += client._LOOKUP_TTL_S
+    assert client.get_cik_lookup_candidates("Acme") == expected
+    assert calls == ["fetch", "fetch"]
+    now += client._LOOKUP_TTL_S
+    monkeypatch.setattr(tickers, "get_cik_lookup_data", lambda: object())
+    with pytest.raises(client.SECClientError, match="parse failed.*bad frame"):
+        client.get_cik_lookup_candidates("Acme")
+
+
+def test_lookup_joined_completed_flight_without_result_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec import client
+
+    flight = client._LookupFlight()
+    flight.done.set()
+    monkeypatch.setattr(client, "_lookup_cached_frame", None)
+    monkeypatch.setattr(client, "_lookup_cached_index", None)
+    monkeypatch.setattr(client, "_lookup_flight", flight)
+    with pytest.raises(client.SECClientError, match="leader timed out"):
+        client.get_cik_lookup_candidates("Acme")
+
+
+def test_lookup_cached_index_rejects_missing_or_expired_dataset(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec import client
+
+    class Frame:
+        def itertuples(self) -> list[object]:
+            return []
+
+    now = 1000.0
+    monkeypatch.setattr(client.time, "monotonic", lambda: now)
+    index = [("acme", "Acme", 123)]
+    monkeypatch.setattr(client, "_lookup_cached_index", None)
+    monkeypatch.setattr(client, "_lookup_cached_frame", Frame())
+    monkeypatch.setattr(client, "_lookup_cached_at", now)
+    assert client._cached_lookup_index() is None  # frame cached before the index exists
+    monkeypatch.setattr(client, "_lookup_cached_index", index)
+    assert client._cached_lookup_index() == index
+    monkeypatch.setattr(client, "_lookup_cached_frame", None)
+    assert client._cached_lookup_index() is None  # frame dropped, index unusable
+    monkeypatch.setattr(client, "_lookup_cached_frame", Frame())
+    now += client._LOOKUP_TTL_S
+    assert client._cached_lookup_index() is None  # exactly at the one-day TTL

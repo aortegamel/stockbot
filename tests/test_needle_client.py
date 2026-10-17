@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 import types
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import ClassVar, override
@@ -61,14 +61,16 @@ class _FakeProc:
         _FakeProc.instances.append(self)
         self.cmd: object = args[0] if args else None
         self.written: list[str] = []
-        self.stdin = _FakeProc._In(self)
-        self.stdout = _FakeProc._Out(self)
-        self.stderr = io.StringIO("")
+        self.stdin: _FakeProc._In | None = _FakeProc._In(self)
+        self.stdout: _FakeProc._Out | None = _FakeProc._Out(self)
+        self.stderr: io.StringIO | None = io.StringIO("")
         self.returncode: int | None = None
         self.wait_timeouts: list[float | None] = []
 
     def _write(self, s: str) -> None:
         if _FakeProc.behavior == "broken-once" and len(_FakeProc.instances) == 1:
+            raise BrokenPipeError(32, "Broken pipe")
+        if _FakeProc.behavior == "broken-always":
             raise BrokenPipeError(32, "Broken pipe")
         self.written.append(s)
 
@@ -438,85 +440,116 @@ def test_real_worker_cleanup_kills_owned_descendants(
         nc.close()
 
 
-def _load_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> types.ModuleType:
-    """Import server.py with the needle extension stubbed (venv has no needle pkg)."""
-    import importlib.util
+def _stub_needle(monkeypatch: pytest.MonkeyPatch) -> type:
+    """Install a scriptable needle stub module (the venv has no needle package)."""
     import sys
 
     stub = types.ModuleType("needle")
 
     class _FakeNeedle:
         instances: ClassVar[list[object]] = []
+        calls: ClassVar[list[tuple[str, object]]] = []
+        envelope: ClassVar[dict[str, object]] = {"type": "none"}
+        vector: ClassVar[object] = [0.1, 0.2, 0.3]
 
         def __init__(self, **kwargs: object) -> None:
             self.kwargs = kwargs
             _FakeNeedle.instances.append(self)
 
-        def complete(self, *args: object, **kwargs: object) -> dict[str, object]:
-            return {"type": "none"}
+        def complete(self, text: str, max_new_tokens: int = 512) -> dict[str, object]:
+            _FakeNeedle.calls.append(("complete", (text, max_new_tokens)))
+            return dict(_FakeNeedle.envelope)
 
         def reset(self) -> None:
-            return None
+            _FakeNeedle.calls.append(("reset", None))
 
         def close(self) -> None:
-            return None
+            _FakeNeedle.calls.append(("close", None))
 
-        def embed(self, text: str) -> list[float]:
+        def embed(self, text: str) -> object:
             assert text
-            return [0.1, 0.2, 0.3]
+            _FakeNeedle.calls.append(("embed", text))
+            return _FakeNeedle.vector
 
     monkeypatch.setattr(stub, "Needle", _FakeNeedle, raising=False)
     monkeypatch.setitem(sys.modules, "needle", stub)
-    catalog = [
-        {
-            "name": "get_sec_filing",
-            "description": (
-                "Returns one filing's record (filer, subject when known, form, filed/accepted/known "
-                "dates, period, primary document, amendment link, source URL) by accession number. "
-                "When the accession number is unknown, find it with list_sec_filings or "
-                "search_sec_filings first; never invent it from a ticker or company name."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "accession_no": {
-                        "type": "string",
-                        "description": "SEC accession number, e.g. 0000320193-25-000079. Named accession_no, not accession_number.",
-                        "pattern": "^\\d{10}-\\d{2}-\\d{6}$",
-                    },
-                    "as_of": {
-                        "type": "string",
-                        "description": "Point-in-time date YYYY-MM-DD.",
-                    },
-                },
-                "required": ["accession_no"],
-            },
-        },
-        {
-            "name": "get_reg_sho_volume",
-            "description": "Self-contained daily short-sale volume by venue for one ticker over the rolling 12 months.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ticker": {"type": "string"},
-                    "tradeDate": {
-                        "type": "string",
-                        "description": "Optional trade date YYYY-MM-DD.",
-                        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
-                    },
-                },
-                "required": ["ticker"],
-            },
-        },
-    ]
-    path = tmp_path / ".needle-catalog.json"
-    path.write_text(json.dumps(catalog))
-    monkeypatch.setenv("NEEDLE_CATALOG", str(path))
-    spec = importlib.util.spec_from_file_location("needle_server_under_test", "needle-harness/lib/needle/server.py")
+    return _FakeNeedle
+
+
+def _import_server() -> types.ModuleType:
+    import importlib.util
+
+    # Match the module key that mutmut derives from the source path.
+    spec = importlib.util.spec_from_file_location(
+        "needle-harness.lib.needle.server", "needle-harness/lib/needle/server.py"
+    )
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+_CATALOG = [
+    {
+        "name": "get_sec_filing",
+        "description": (
+            "Returns one filing's record (filer, subject when known, form, filed/accepted/known "
+            "dates, period, primary document, amendment link, source URL) by accession number. "
+            "When the accession number is unknown, find it with list_sec_filings or "
+            "search_sec_filings first; never invent it from a ticker or company name."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "accession_no": {
+                    "type": "string",
+                    "description": "SEC accession number, e.g. 0000320193-25-000079. Named accession_no, not accession_number.",
+                    "pattern": "^\\d{10}-\\d{2}-\\d{6}$",
+                },
+                "as_of": {
+                    "type": "string",
+                    "description": "Point-in-time date YYYY-MM-DD.",
+                },
+            },
+            "required": ["accession_no"],
+        },
+    },
+    {
+        "name": "get_reg_sho_volume",
+        "description": "Self-contained daily short-sale volume by venue for one ticker over the rolling 12 months.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ticker": {"type": "string"},
+                "tradeDate": {
+                    "type": "string",
+                    "description": "Optional trade date YYYY-MM-DD.",
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                },
+            },
+            "required": ["ticker"],
+        },
+    },
+]
+
+
+def _load_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> types.ModuleType:
+    """Import server.py with the needle extension stubbed (venv has no needle pkg)."""
+    _stub_needle(monkeypatch)
+    path = tmp_path / ".needle-catalog.json"
+    path.write_text(json.dumps(_CATALOG))
+    monkeypatch.setenv("NEEDLE_CATALOG", str(path))
+    return _import_server()
+
+
+def _import_server_with_catalog(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str | None) -> types.ModuleType:
+    """Import server.py against one catalog file; None leaves the file missing."""
+    _stub_needle(monkeypatch)
+    path = tmp_path / ".needle-catalog.json"
+    if text is not None:
+        path.write_text(text)
+    monkeypatch.setenv("NEEDLE_CATALOG", str(path))
+    return _import_server()
 
 
 def test_bound_entry_keeps_full_params_and_description(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1280,3 +1313,692 @@ def test_handle_passes_raw_request_text_to_complete(monkeypatch: pytest.MonkeyPa
     )
     assert out["arguments"] == {"identifier": "AAPL"}
     assert seen["text"] == "fallback objective"
+
+
+def _run_operation(operation: str) -> object:
+    """Run one public client operation that talks to the worker."""
+    if operation == "generate":
+        return nc.generate_arguments(tool="search_sec_filings")
+    if operation == "extract":
+        return nc.extract_fields({"name": "web_row"}, "some passage")
+    return nc.embed("some passage")
+
+
+def _script_replies(monkeypatch: pytest.MonkeyPatch, reply: Callable[[dict[str, object]], str]) -> None:
+    """Answer pings normally; answer every other action with the raw line `reply`."""
+
+    def _fake_readline(proc: _FakeProc, timeout_s: float) -> str:
+        request: object = json.loads(proc.written[-1])
+        assert isinstance(request, dict)
+        if request.get("action") == "ping":
+            return json.dumps({"id": request.get("id"), "ready": True}) + "\n"
+        return reply(request)
+
+    monkeypatch.setattr(nc, "_readline", _fake_readline)
+
+
+def _echo_id(tail: dict[str, object]) -> Callable[[dict[str, object]], str]:
+    """Reply carrying the request id plus `tail`."""
+
+    def _reply(request: dict[str, object]) -> str:
+        return json.dumps({"id": request.get("id"), **tail}) + "\n"
+
+    return _reply
+
+
+def test_spawn_failure_fails_closed(worker: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A refused spawn raises the OS reason and owns no child afterwards."""
+
+    def _refuse_spawn(*args: object, **kwargs: object) -> None:
+        raise OSError(2, "No such file or directory")
+
+    monkeypatch.setattr(subprocess, "Popen", _refuse_spawn)
+    with pytest.raises(RuntimeError, match="needle spawn failed: .*No such file or directory"):
+        nc.embed("some passage")
+    assert nc._PROC is None
+
+
+def test_spawn_without_pipes_fails_closed(worker: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A child missing any pipe is destroyed and never registered as owned."""
+    killed: list[object] = []
+
+    class _NoPipesProc(_FakeProc):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            self.stdin = None
+            self.stdout = None
+            self.stderr = None
+
+        @override
+        def kill(self) -> None:
+            killed.append(self)
+            super().kill()
+
+    monkeypatch.setattr(subprocess, "Popen", _NoPipesProc)
+    with pytest.raises(RuntimeError, match="missing pipes"):
+        nc.embed("some passage")
+    assert len(killed) == 1
+    assert nc._PROC is None
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [
+        ("generate", "needle arguments.generate failed for 'search_sec_filings': server stdin missing"),
+        ("extract", "needle extract failed for 'web_row': server stdin missing"),
+        ("embed", "needle embed failed: server stdin missing"),
+    ],
+)
+def test_exchange_without_stdin_fails_closed(worker: None, operation: str, expected: str) -> None:
+    """A live child that lost its stdin fails each exchange before writing."""
+    _run_operation(operation)
+    _FakeProc.instances[0].stdin = None
+    with pytest.raises(RuntimeError, match=re.escape(expected)):
+        _run_operation(operation)
+
+
+_MALFORMED_REPLIES: dict[str, Callable[[dict[str, object]], str]] = {
+    "non-json": lambda request: "not json\n",
+    "json-list": lambda request: json.dumps([1, 2]) + "\n",
+    "json-string": lambda request: json.dumps("ok") + "\n",
+    "json-number": lambda request: json.dumps(7) + "\n",
+    "json-null": lambda request: json.dumps(None) + "\n",
+    "wrong-id": lambda request: json.dumps({"id": "needle:wrong", "ready": True}) + "\n",
+    "error-envelope": lambda request: json.dumps({"id": request.get("id"), "error": "boom"}) + "\n",
+}
+
+
+@pytest.mark.parametrize("operation", ["generate", "extract", "embed"])
+@pytest.mark.parametrize("reply_name", sorted(_MALFORMED_REPLIES))
+def test_malformed_server_responses_fail_closed(
+    worker: None, monkeypatch: pytest.MonkeyPatch, operation: str, reply_name: str
+) -> None:
+    """Undecodable, uncorrelated, or error envelopes fail every exchange with its own label."""
+    _script_replies(monkeypatch, _MALFORMED_REPLIES[reply_name])
+    expected = "boom" if reply_name == "error-envelope" else "malformed server response"
+    with pytest.raises(RuntimeError, match=expected):
+        _run_operation(operation)
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [
+        ("extract", "needle extract for 'web_row' timed out after 120s"),
+        ("embed", "needle embed timed out after 120s"),
+    ],
+)
+def test_silent_server_reaps_worker(
+    worker: None, monkeypatch: pytest.MonkeyPatch, operation: str, expected: str
+) -> None:
+    """A silent child is killed and reaped, and the failure names the operation and budget."""
+
+    def _silent_after_ping(proc: _FakeProc, timeout_s: float) -> str:
+        request: object = json.loads(proc.written[-1])
+        assert isinstance(request, dict)
+        if request.get("action") == "ping":
+            return proc._readline()
+        assert timeout_s == nc._TIMEOUT_S
+        raise TimeoutError("silence")
+
+    monkeypatch.setattr(nc, "_readline", _silent_after_ping)
+    with pytest.raises(RuntimeError, match=re.escape(expected)):
+        _run_operation(operation)
+    assert nc._PROC is None
+    assert _FakeProc.instances[0].returncode is not None
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [
+        ("generate", "needle arguments.generate failed for 'search_sec_filings': server unavailable"),
+        ("extract", "needle extract for 'web_row' failed: server unavailable"),
+        ("embed", "needle embed failed: server unavailable"),
+    ],
+)
+def test_persistent_broken_pipe_gives_up_after_one_restart(worker: None, operation: str, expected: str) -> None:
+    """A second broken pipe reports the server as unavailable instead of looping."""
+    _FakeProc.behavior = "broken-always"
+    with pytest.raises(RuntimeError, match=re.escape(expected)):
+        _run_operation(operation)
+    assert len(_FakeProc.instances) == 2
+    assert _FakeProc.instances[1].returncode is not None
+    assert nc._PROC is None
+
+
+def test_generate_arguments_request_forms(worker: None) -> None:
+    """One positional request dict or kwargs; any other call shape fails before spawning."""
+    with pytest.raises(ValueError, match="tool must be a nonempty tool name"):
+        nc.generate_arguments()
+    with pytest.raises(ValueError, match="tool must be a nonempty tool name"):
+        nc.generate_arguments(tool="")
+    with pytest.raises(ValueError, match="tool must be a nonempty tool name"):
+        nc.generate_arguments(tool=["search_sec_filings"])
+    with pytest.raises(TypeError, match="pass kwargs"):
+        nc.generate_arguments("search_sec_filings")
+    with pytest.raises(TypeError, match="pass kwargs"):
+        nc.generate_arguments({"tool": "search_sec_filings"}, {"tool": "other"})
+    with pytest.raises(TypeError, match="pass kwargs"):
+        nc.generate_arguments({"tool": "search_sec_filings"}, schema={})
+    assert _FakeProc.instances == []
+    out = nc.generate_arguments({"tool": "search_sec_filings", "objective": "objective text"})
+    assert out["tool"] == "search_sec_filings"
+    sent: object = json.loads(_FakeProc.instances[0].written[-1])
+    assert isinstance(sent, dict) and sent["objective"] == "objective text"
+
+
+def test_missing_server_and_weights_fail_loudly(worker: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A missing server file or missing weights raises before any spawn."""
+    monkeypatch.setattr(nc, "_server", lambda: tmp_path / "server.py")
+    with pytest.raises(RuntimeError, match="needle arguments.generate unavailable"):
+        nc.generate_arguments(tool="search_sec_filings")
+    with pytest.raises(RuntimeError, match="needle extract unavailable"):
+        nc.extract_fields({"name": "web_row"}, "some passage")
+    with pytest.raises(RuntimeError, match="needle embed unavailable"):
+        nc.embed("some passage")
+    assert _FakeProc.instances == []
+
+    def _no_weights() -> None:
+        raise RuntimeError("needle weights missing: /nowhere/needle3.cact")
+
+    monkeypatch.setattr(nc, "_ensure_weights", _no_weights)
+    monkeypatch.setattr(nc, "_server", lambda: Path(nc.__file__))
+    for operation in ("generate", "extract", "embed"):
+        with pytest.raises(RuntimeError, match="needle weights missing"):
+            _run_operation(operation)
+    assert _FakeProc.instances == []
+
+
+def test_extract_options_validation_and_wire_payload(worker: None) -> None:
+    """Decoding options are validated before spawn and travel verbatim on the wire."""
+    with pytest.raises(TypeError, match="max_new_tokens must be an int in 1..4096"):
+        nc.extract_fields({"name": "web_row"}, "some passage", max_new_tokens=0)
+    with pytest.raises(TypeError, match="max_new_tokens must be an int in 1..4096"):
+        nc.extract_fields({"name": "web_row"}, "some passage", max_new_tokens=4097)
+    with pytest.raises(TypeError, match="max_new_tokens must be an int in 1..4096"):
+        nc.extract_fields({"name": "web_row"}, "some passage", max_new_tokens=True)
+    with pytest.raises(TypeError, match="system must be a string or None"):
+        nc._check_extract_options(512, 5, True)
+    with pytest.raises(TypeError, match="strict must be a bool"):
+        nc._check_extract_options(512, None, "yes")
+    with pytest.raises(ValueError, match="record must carry a nonempty name"):
+        nc.extract_fields({"name": ""}, "some passage")
+    with pytest.raises(ValueError, match="passage must be a nonempty string"):
+        nc.extract_fields({"name": "web_row"}, "  ")
+    assert _FakeProc.instances == []
+    out = nc.extract_fields({"name": "web_row"}, "some passage", system="custom", max_new_tokens=1, strict=False)
+    assert out["record"] == "web_row"
+    sent: object = json.loads(_FakeProc.instances[0].written[-1])
+    assert isinstance(sent, dict)
+    assert sent["system"] == "custom" and sent["max_new_tokens"] == 1 and sent["strict"] is False
+
+
+def test_generate_response_shapes(worker: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing or foreign tool, a non-mapping arguments value, and odd flags fail or normalize."""
+    _script_replies(monkeypatch, _echo_id({"arguments": {"q": 1}}))
+    with pytest.raises(ValueError, match="needle tool mismatch"):
+        nc.generate_arguments(tool="search_sec_filings")
+
+    _script_replies(monkeypatch, _echo_id({"tool": "other", "arguments": {}}))
+    with pytest.raises(ValueError, match="needle tool mismatch"):
+        nc.generate_arguments(tool="search_sec_filings")
+
+    _script_replies(monkeypatch, _echo_id({"tool": "search_sec_filings", "arguments": "x"}))
+    with pytest.raises(TypeError, match="must be a mapping"):
+        nc.generate_arguments(tool="search_sec_filings")
+
+    _script_replies(
+        monkeypatch,
+        _echo_id({"tool": "search_sec_filings", "arguments": {}, "withheld": "yes", "reasoning": 5}),
+    )
+    out = nc.generate_arguments(tool="search_sec_filings")
+    assert out["withheld"] is False and out["reasoning"] == "5" and out["confidence"] is None
+    assert out["arguments"] == {}
+
+
+def test_extract_response_shapes(worker: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Null records pass through; a foreign record name or non-mapping fields fail closed."""
+    _script_replies(monkeypatch, _echo_id({"fields": "x"}))
+    with pytest.raises(TypeError, match="must be a mapping"):
+        _run_operation("extract")
+
+    _script_replies(monkeypatch, _echo_id({"record": None}))
+    out = nc.extract_fields({"name": "web_row"}, "some passage")
+    assert out["record"] is None and out["fields"] == {} and out["reasoning"] == ""
+
+    _script_replies(monkeypatch, _echo_id({"record": "other", "fields": {}}))
+    with pytest.raises(RuntimeError, match="malformed server response"):
+        nc.extract_fields({"name": "web_row"}, "some passage")
+
+
+@pytest.mark.parametrize(
+    "embedding",
+    [[], "abc", {"a": 1}, [1, True], ["1"], [None], [[1.0]], 7, None],
+)
+def test_embed_rejects_malformed_vectors(worker: None, monkeypatch: pytest.MonkeyPatch, embedding: object) -> None:
+    """Only a non-empty list of JSON numbers becomes a vector; nothing else passes."""
+    _script_replies(monkeypatch, _echo_id({"embedding": embedding}))
+    with pytest.raises((RuntimeError, TypeError), match="malformed server response"):
+        nc.embed("some passage")
+
+
+def test_embed_accepts_json_numbers(worker: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Integer and float JSON numbers become floats in reply order."""
+    _script_replies(monkeypatch, _echo_id({"embedding": [1, 2.5, -3]}))
+    assert nc.embed("some passage") == [1.0, 2.5, -3.0]
+
+
+def test_similarity_order_paths(worker: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Blank references, short or over-cap sets, and embed failures keep the caller's order."""
+    assert nc.similarity_order(["a", "b"], "  ") is None
+    assert nc._nonblank_reference(5) is False
+    assert nc.similarity_order(["only"], "reference") is None
+    assert nc.similarity_order([], "reference") is None
+    assert nc.similarity_order(["a", "b", "c"], "reference", max_texts=2) is None
+    assert _FakeProc.instances == []
+
+    def _embed(text: str) -> list[float]:
+        assert text.strip()
+        return [1.0, 0.0] if text.startswith("near") else [0.0, 1.0]
+
+    monkeypatch.setattr(nc, "embed", _embed)
+    assert nc.similarity_order(["far", "near"], "reference") == [0, 1]
+    assert nc.similarity_order(["near", "far"], "reference") == [1, 0]
+    assert nc.similarity_order(("near", "far"), "reference") == [1, 0]
+    # Blank texts sink below every embedded text; equal scores keep input order.
+    assert nc.similarity_order(["  ", "far", "near"], "reference") == [1, 2, 0]
+    assert nc.similarity_order(["far", "far"], "reference") == [0, 1]
+
+    def _broken_embed(text: str) -> list[float]:
+        raise RuntimeError("embed down")
+
+    monkeypatch.setattr(nc, "embed", _broken_embed)
+    assert nc.similarity_order(["far", "near"], "reference") is None
+
+
+_JSON_SCALARS = (
+    st.none()
+    | st.booleans()
+    | st.integers(min_value=-(10**9), max_value=10**9)
+    | st.floats(allow_nan=False, allow_infinity=False)
+    | st.text(max_size=12)
+)
+_JSON_VALUES = st.recursive(
+    _JSON_SCALARS,
+    lambda children: st.lists(children, max_size=3) | st.dictionaries(st.text(max_size=6), children, max_size=3),
+    max_leaves=6,
+)
+
+
+def test_prop_generate_arguments_shapes_replies_or_fails_closed() -> None:
+    """Every JSON reply either yields the fixed result shape for the requested tool or raises."""
+    with pytest.MonkeyPatch.context() as mp:
+        nc.close()
+        _FakeProc.instances.clear()
+        _FakeProc.behavior = "echo"
+        mp.setattr(subprocess, "Popen", _FakeProc)
+        mp.setattr(nc, "_ensure_weights", lambda: None)
+        reply_body: dict[str, dict[str, object]] = {"body": {}}
+        reply_flags: dict[str, bool] = {"match_id": True}
+
+        def _fake_readline(proc: _FakeProc, timeout_s: float) -> str:
+            request: object = json.loads(proc.written[-1])
+            assert isinstance(request, dict)
+            if request.get("action") == "ping":
+                return json.dumps({"id": request.get("id"), "ready": True}) + "\n"
+            body = dict(reply_body["body"])
+            body["id"] = request.get("id") if reply_flags["match_id"] else "needle:wrong"
+            return json.dumps(body) + "\n"
+
+        mp.setattr(nc, "_readline", _fake_readline)
+
+        @seed(20261014)
+        @settings(max_examples=200, derandomize=True)
+        @given(
+            st.dictionaries(st.text(max_size=6), _JSON_VALUES, max_size=4),
+            st.booleans(),
+            st.booleans(),
+        )
+        def check(payload: dict[str, object], match_id: bool, tool_matches: bool) -> None:
+            body = {key: value for key, value in payload.items() if key not in ("id", "tool")}
+            if tool_matches:
+                body["tool"] = "search_sec_filings"
+            reply_body["body"] = body
+            reply_flags["match_id"] = match_id
+            try:
+                out = nc.generate_arguments(tool="search_sec_filings")
+            except (RuntimeError, TypeError, ValueError) as exc:
+                assert str(exc)
+                return
+            assert set(out) == {"tool", "arguments", "withheld", "reasoning", "confidence"}
+            assert out["tool"] == "search_sec_filings"
+            assert isinstance(out["arguments"], dict) and isinstance(out["withheld"], bool)
+            assert isinstance(out["reasoning"], str)
+
+        check()
+        nc.close()
+        _FakeProc.instances.clear()
+
+
+def test_prop_embed_shapes_vector_replies_or_fails_closed() -> None:
+    """A non-empty list of JSON numbers becomes floats; any other reply shape raises."""
+    with pytest.MonkeyPatch.context() as mp:
+        nc.close()
+        _FakeProc.instances.clear()
+        _FakeProc.behavior = "echo"
+        mp.setattr(subprocess, "Popen", _FakeProc)
+        mp.setattr(nc, "_ensure_weights", lambda: None)
+        reply_body: dict[str, dict[str, object]] = {"body": {}}
+
+        def _fake_readline(proc: _FakeProc, timeout_s: float) -> str:
+            request: object = json.loads(proc.written[-1])
+            assert isinstance(request, dict)
+            if request.get("action") == "ping":
+                return json.dumps({"id": request.get("id"), "ready": True}) + "\n"
+            return json.dumps({"id": request.get("id"), **reply_body["body"]}) + "\n"
+
+        mp.setattr(nc, "_readline", _fake_readline)
+
+        @seed(20261014)
+        @settings(max_examples=200, derandomize=True)
+        @given(
+            st.one_of(
+                st.lists(
+                    st.integers(min_value=-(10**6), max_value=10**6) | st.floats(allow_nan=False, allow_infinity=False),
+                    min_size=1,
+                    max_size=4,
+                ),
+                st.lists(
+                    st.booleans() | st.none() | st.text(max_size=4) | st.lists(st.integers(max_value=9), max_size=2),
+                    max_size=3,
+                ),
+                st.sampled_from(["abc", {"a": 1}, 7, None, [[1.0]]]),
+            )
+        )
+        def check(embedding: object) -> None:
+            reply_body["body"] = {"embedding": embedding}
+            numeric = (
+                isinstance(embedding, list)
+                and bool(embedding)
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in embedding)
+            )
+            if numeric:
+                assert nc.embed("some passage") == [float(v) for v in embedding]
+                return
+            with pytest.raises((RuntimeError, TypeError)):
+                nc.embed("some passage")
+
+        check()
+        nc.close()
+        _FakeProc.instances.clear()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        "not json at all",
+        '{"tools": []}',
+        "[]",
+        "null",
+        '[5, "junk", {"description": "no name"}]',
+    ],
+)
+def test_load_catalog_exits_on_unusable_catalog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raw: str | None
+) -> None:
+    """A missing, unreadable, non-list, or nameless catalog stops the server before weights load."""
+    with pytest.raises(SystemExit):
+        _import_server_with_catalog(monkeypatch, tmp_path, raw)
+
+
+def test_load_catalog_slims_usable_entries(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The shared catalog keeps names, truncates descriptions, and drops parameter schemas."""
+    catalog = [
+        "junk",
+        5,
+        {"description": "no name"},
+        {
+            "name": "blank_desc",
+            "description": "   ",
+            "parameters": {"type": "object", "properties": {"a": {"type": "string"}}},
+        },
+        {"name": "long_desc", "description": "x" * 400},
+    ]
+    srv = _import_server_with_catalog(monkeypatch, tmp_path, json.dumps(catalog))
+    assert [entry["name"] for entry in srv.TOOLS] == ["blank_desc", "long_desc"]
+    assert srv.TOOLS[0]["description"] == "blank_desc"
+    assert srv.TOOLS[1]["description"] == "x" * 150
+    assert all(entry["parameters"] == {"type": "object"} for entry in srv.TOOLS)
+
+
+def test_handle_rejects_malformed_requests(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Unparsable, untagged, oversized, and unknown-action lines answer instead of raising."""
+    srv = _load_server(monkeypatch, tmp_path)
+    assert srv.handle("not json") == {"id": "?", "error": "bad_request"}
+    assert srv.handle("[1, 2]") == {"id": "?", "error": "bad_request"}
+    assert srv.handle(json.dumps({"action": "ping"})) == {"id": "?", "error": "bad_request"}
+    assert srv.handle(json.dumps({"id": 5, "action": "ping"})) == {"id": "?", "error": "bad_request"}
+    assert srv.handle("x" * (srv.MAX_LINE_CHARS + 1)) == {"id": "?", "error": "bad_request"}
+    assert srv.handle(json.dumps({"id": "p1", "action": "ping"})) == {"id": "p1", "ready": True}
+    assert srv.handle(json.dumps({"id": "u1", "action": "nope"})) == {"id": "u1", "error": "bad_action"}
+    assert srv.handle(json.dumps({"id": "u2"})) == {"id": "u2", "error": "bad_action"}
+    assert srv.handle(json.dumps({"id": "u3", "action": ["ping"]})) == {"id": "u3", "error": "bad_action"}
+    assert srv.handle(json.dumps({"id": "g1", "action": "arguments.generate"}))["error"] == "bad tool"
+
+
+def test_handle_legacy_start_and_step_return_decisions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Legacy start/step still run on the shared agent and answer with one decision shape."""
+    srv = _load_server(monkeypatch, tmp_path)
+    srv.needle.Needle.envelope = {
+        "type": "call",
+        "function_calls": [{"name": "list_sec_filings", "arguments": {"identifier": "AAPL"}}],
+        "confidence": 0.7,
+        "reasoning": "AAPL from the request",
+    }
+    assert srv.handle(json.dumps({"id": "s1", "action": "start", "prompt": "AAPL 10-Q filings"})) == {
+        "id": "s1",
+        "tool": "list_sec_filings",
+        "arguments": {"identifier": "AAPL"},
+        "withheld": False,
+        "confidence": 0.7,
+        "reasoning": "AAPL from the request",
+    }
+    assert srv.handle(json.dumps({"id": "s2", "action": "step", "result": {"a": 1}}))["tool"] == "list_sec_filings"
+    assert srv.handle(json.dumps({"id": "s3", "action": "start", "prompt": 5}))["error"] == "bad prompt"
+    texts = [payload[0] for name, payload in srv.needle.Needle.calls if name == "complete"]
+    assert texts == ["AAPL 10-Q filings", json.dumps({"a": 1})]
+    assert ("reset", None) in srv.needle.Needle.calls
+
+
+def test_handle_extract_binds_one_record_and_honours_strict(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Extract binds one record shape, carries the custom system, and keeps strict gating."""
+    srv = _load_server(monkeypatch, tmp_path)
+    srv.needle.Needle.envelope = {
+        "type": "call",
+        "function_calls": [{"name": "web_row", "arguments": {"u": "x"}}],
+        "confidence": 0.5,
+        "reasoning": "one row",
+    }
+    record = {"name": "web_row", "parameters": {"type": "object"}}
+    out = srv.handle(
+        json.dumps(
+            {
+                "id": "x1",
+                "action": "extract",
+                "record": record,
+                "passage": "NVDA news up 5%",
+                "system": "custom extraction system",
+                "max_new_tokens": 8,
+            }
+        )
+    )
+    assert out["record"] == "web_row" and out["fields"] == {"u": "x"} and out["withheld"] is False
+    bound = srv.needle.Needle.instances[-1]
+    assert bound.kwargs["system"] == "custom extraction system" and bound.kwargs["tools"] == [record]
+    assert ("complete", ("NVDA news up 5%", 8)) in srv.needle.Needle.calls
+
+    srv.needle.Needle.envelope = {
+        "type": "call",
+        "function_calls": [{"name": "web_row", "arguments": {"u": "hallucinated"}}],
+        "validation": {"ungrounded": ["web_row.u"], "negation": False},
+    }
+    for strict in (True, "nope"):
+        flagged = srv.handle(
+            json.dumps(
+                {
+                    "id": "x2",
+                    "action": "extract",
+                    "record": record,
+                    "passage": "NVDA news",
+                    "strict": strict,
+                }
+            )
+        )
+        assert "not grounded" in str(flagged["error"])
+    assert srv.handle(
+        json.dumps({"id": "x3", "action": "extract", "record": record, "passage": "NVDA news", "strict": False})
+    )["fields"] == {"u": "hallucinated"}
+
+
+def test_handle_embed_returns_and_rejects_vectors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The shared agent vector passes through; empty, non-list, and non-numeric vectors fail."""
+    srv = _load_server(monkeypatch, tmp_path)
+    srv.needle.Needle.vector = [1, 2.5]
+    assert srv.handle(json.dumps({"id": "m1", "action": "embed", "text": "NVDA revenue"})) == {
+        "id": "m1",
+        "embedding": [1, 2.5],
+    }
+    bad_vectors: tuple[object, ...] = ([], "abc", [1, True], [None])
+    for vector in bad_vectors:
+        srv.needle.Needle.vector = vector
+        out = srv.handle(json.dumps({"id": "m2", "action": "embed", "text": "NVDA revenue"}))
+        assert out["error"] == "bad embedding"
+
+
+def test_read_line_returns_one_line_and_reports_overlong(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """One line per call; an overlong line is drained and reported once, keeping later lines."""
+    srv = _load_server(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "MAX_LINE_CHARS", 8)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("12345678\n123456789\n\nok\ntail"))
+    assert srv._read_line() == ("12345678\n", False)
+    assert srv._read_line() == (None, True)
+    assert srv._read_line() == ("\n", False)
+    assert srv._read_line() == ("ok\n", False)
+    assert srv._read_line() == ("tail", False)
+    assert srv._read_line() == ("", False)
+
+
+def test_read_line_drains_overlong_line_across_chunks(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """An overlong line longer than one read chunk is drained to its newline, not left for later."""
+    srv = _load_server(monkeypatch, tmp_path)
+    monkeypatch.setattr(srv, "MAX_LINE_CHARS", 8)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("x" * 70_000 + "\n" + "next\n"))
+    assert srv._read_line() == (None, True)
+    assert srv._read_line() == ("next\n", False)
+    assert srv._read_line() == ("", False)
+
+
+def test_main_answers_every_line_until_eof(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """main() writes exactly one JSON line per request, skipping blanks, until EOF."""
+    srv = _load_server(monkeypatch, tmp_path)
+    lines = [
+        json.dumps({"id": "p1", "action": "ping"}),
+        "",
+        "not json",
+        json.dumps({"id": "u1", "action": "nope"}),
+        json.dumps({"id": "e1", "action": "embed", "text": "NVDA revenue"}),
+    ]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(lines) + "\n"))
+    srv.main()
+    assert [json.loads(line) for line in capsys.readouterr().out.splitlines()] == [
+        {"id": "p1", "ready": True},
+        {"id": "?", "error": "bad_request"},
+        {"id": "u1", "error": "bad_action"},
+        {"id": "e1", "embedding": [0.1, 0.2, 0.3]},
+    ]
+    ping = json.dumps({"id": "p2", "action": "ping"})
+    # The cap admits the follow-up request, so the drained overlong line must not eat it.
+    monkeypatch.setattr(srv, "MAX_LINE_CHARS", len(ping))
+    monkeypatch.setattr(sys, "stdin", io.StringIO("x" * 60 + "\n" + ping + "\n"))
+    srv.main()
+    assert [json.loads(line) for line in capsys.readouterr().out.splitlines()] == [
+        {"id": "?", "error": "bad_request"},
+        {"id": "p2", "ready": True},
+    ]
+
+
+def test_extract_decision_rejects_non_mapping_arguments(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A call with non-mapping arguments, or no mapping at all, fails instead of returning fields."""
+    srv = _load_server(monkeypatch, tmp_path)
+    for arguments in ("x", [1]):
+        with pytest.raises(TypeError, match="extract fields must be a mapping"):
+            srv._extract_decision("web_row", {"function_calls": [{"name": "web_row", "arguments": arguments}]})
+    with pytest.raises(ValueError, match="mismatch"):
+        srv._extract_decision("web_row", {"function_calls": ["nope"]})
+
+
+def test_decision_ignores_malformed_call_entries(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A non-mapping call entry yields no tool and never a withheld decision."""
+    srv = _load_server(monkeypatch, tmp_path)
+    plain = srv._decision({"type": "call", "function_calls": ["nope"]}, "t")
+    assert plain["tool"] is None and plain["arguments"] == {} and plain["withheld"] is False
+    withheld = srv._decision({"type": "withheld", "function_calls": [], "suppressed_calls": ["nope"]}, "t")
+    assert withheld["tool"] is None and withheld["withheld"] is False
+
+
+def test_prop_handle_always_answers_with_id_tagged_mapping() -> None:
+    """Any stdin line yields a JSON-ready mapping tagged with an id; handle never raises."""
+    with pytest.MonkeyPatch.context() as mp, tempfile.TemporaryDirectory() as tmp:
+        srv = _load_server(mp, Path(tmp))
+
+        @seed(20261014)
+        @settings(max_examples=200, derandomize=True)
+        @given(
+            st.one_of(
+                st.text(max_size=40),
+                st.dictionaries(
+                    st.sampled_from(
+                        [
+                            "id",
+                            "action",
+                            "tool",
+                            "record",
+                            "passage",
+                            "text",
+                            "prompt",
+                            "schema",
+                            "node",
+                            "objective",
+                            "context",
+                            "strict",
+                            "max_new_tokens",
+                            "result",
+                        ]
+                    ),
+                    _JSON_VALUES,
+                    max_size=6,
+                ),
+            )
+        )
+        def check(line: object) -> None:
+            raw = line if isinstance(line, str) else json.dumps(line)
+            out = srv.handle(raw)
+            assert isinstance(out, dict) and isinstance(out.get("id"), str)
+            assert json.dumps(out)
+
+        check()
+
+
+def test_requested_limit_reads_node_question_without_objective(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A blank objective falls back to the node question; a limit-less schema requests nothing."""
+    srv = _load_server(monkeypatch, tmp_path)
+    schema = _production_schema("list_sec_filings")
+    assert srv._requested_limit(None, {"question": "Show TSLA's latest 5 filings"}, {}, schema) == 5
+    assert srv._requested_limit("   ", {"question": "Show TSLA's latest 5 filings"}, {}, schema) == 5
+    assert srv._requested_limit("Show TSLA filings", {"question": "Show TSLA's latest 5 filings"}, {}, schema) is None
+    assert srv._requested_limit("Show TSLA's latest 5 filings", {}, {}, {"type": "object"}) is None
+    assert srv._requested_limit("Show TSLA's latest 5 filings", {}, {"grounded_arguments": {"limit": 5}}, schema) == 5
+    with pytest.raises(ValueError, match="conflicting explicit counts"):
+        srv._requested_limit("Show TSLA's latest 5 filings", {}, {"grounded_arguments": {"limit": 10}}, schema)

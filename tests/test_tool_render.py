@@ -6,7 +6,12 @@ renderer unit tests. Offline and deterministic.
 """
 
 import re
+from copy import deepcopy
 from datetime import UTC, datetime
+
+import pytest
+from hypothesis import given, seed, settings
+from hypothesis import strategies as st
 
 from app.tool_render import (
     MAX_TOOL_MESSAGE_BYTES,
@@ -827,3 +832,322 @@ def test_saved_hit_keys_chain_offsets_and_show_stable_continuation():
         _read_search_result(more=False, hits=[], offset=3, total=3)
     )
     assert "continuation unavailable (offset missing)" in render_tool_result(_read_search_result(offset=None, hits=[]))
+
+
+def test_final_coverage_preserves_scope_order_filters_and_separators():
+    result = {
+        "executive_summary": "answer",
+        "coverage": {
+            "web": {"complete": False},
+            "finra": {"summary": " queried|once\nonly "},
+            "sec": {
+                "z_scope": [" 10-K ", "", "  ", None, 0],
+                "a_scope": ["issuer"],
+                "empty": ["", "  "],
+                "wrong": "not a list",
+                "source_domain": ["hidden"],
+                "source_sufficiency": ["hidden"],
+                "useful_for_question": ["hidden"],
+                "complete": ["hidden"],
+                "detail": " detail|text\nnow ",
+                "summary": "not selected",
+            },
+        },
+    }
+    assert render_tool_result(result) == (
+        "Bottom line: answer\n\n## Coverage\n\n"
+        "- SEC — a_scope: issuer; z_scope: 10-K, None, 0 — detail\\|text now\n\n"
+        "- FINRA — queried\\|once only\n\n- WEB\n\nScope: SEC sources only."
+    )
+
+
+@pytest.mark.parametrize("coverage", [None, [], "bad", {}, {"sec": {}, "finra": [], "web": None}])
+def test_final_coverage_skips_missing_and_mistyped_sections(coverage: object):
+    assert render_tool_result({"executive_summary": "answer", "coverage": coverage}) == (
+        "Bottom line: answer\n\nScope: SEC sources only."
+    )
+
+
+@pytest.mark.parametrize(
+    ("section", "expected"),
+    [
+        ({"forms": ["10-Q"]}, "- SEC — forms: 10-Q"),
+        ({"detail": "detail"}, "- SEC — detail"),
+        ({"detail": "", "summary": "fallback"}, "- SEC — fallback"),
+        ({"forms": [], "detail": "  "}, "- SEC"),
+    ],
+)
+def test_final_coverage_handles_scope_only_detail_only_and_empty_fields(section: dict[str, object], expected: str):
+    assert render_tool_result({"executive_summary": "answer", "coverage": {"sec": section}}) == (
+        f"Bottom line: answer\n\n## Coverage\n\n{expected}\n\nScope: SEC sources only."
+    )
+
+
+def test_final_sources_preserve_aliases_defaults_and_evidence_suffixes():
+    assert render_tool_result(
+        {
+            "executive_summary": "answer",
+            "sources": [
+                None,
+                {},
+                {"evidence_id": "SOURCE"},
+                {"domain": " sec ", "integrity_class": " raw ", "document": " Filing|A\nB ", "evidence_id": "e1"},
+                {"domain": "web", "integrity": "derived", "source_name": "News", "evidence_id": "e2"},
+                {"domain": "FINRA", "document": "table"},
+                {"domain": [], "document": 0, "source_name": "fallback"},
+            ],
+        }
+    ) == (
+        "Bottom line: answer\n\n## Sources\n\n- SOURCE\n\n- SOURCE\n\n- SOURCE\n\n"
+        "- SEC [RAW] Filing\\|A B [e1]\n\n- WEB [DERIVED] News [e2]\n\n"
+        "- FINRA table\n\n- [] fallback\n\nScope: SEC sources only."
+    )
+
+
+@pytest.mark.parametrize("sources", [None, [], {}, "not a list"])
+def test_final_sources_skip_mistyped_or_empty_lists(sources: object):
+    assert render_tool_result({"executive_summary": "answer", "sources": sources}) == (
+        "Bottom line: answer\n\nScope: SEC sources only."
+    )
+
+
+def test_document_header_keeps_identity_references_and_continuation_in_order():
+    assert render_tool_result(
+        {
+            "ticker": "A|B",
+            "form_type": "10-K",
+            "item": 1,
+            "statement_type": ["income"],
+            "concept_searched": True,
+            "filed": "2026-01-01",
+            "source": "EDGAR",
+            "accession_no": "a",
+            "document_name": "d",
+            "next_cursor": 0,
+            "source_handle": {"id": "h|1\n2"},
+            "source_refs": [None, "bad", {}, {"id": "e|1\n2"}],
+            "continuation": " more|text\nnow ",
+            "text": "body",
+        }
+    ) == (
+        "Ticker: A|B\nform_type: 10-K\nitem: 1\nstatement_type: ['income']\n"
+        "concept_searched: True\nFiled: 2026-01-01\nSource: EDGAR\n"
+        "accession_no: a\ndocument_name: d\nnext_cursor: 0\n"
+        "source_handle: id: h\\|1 2\nsource_ref: \nsource_ref: id: e\\|1 2\n"
+        "Continue: call get_sec_document with accession_no=a, document_name=d, cursor=0.\n"
+        "Preserve section, query, and raw settings.\ncontinuation: more\\|text now\n\nbody"
+    )
+
+
+_PAGE_FIELDS_BEFORE_CURSOR = (
+    "accession_no",
+    "document_name",
+    "source_uri",
+    "view",
+    "section",
+    "query",
+    "cursor",
+    "end_cursor",
+)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "accession_no",
+        "document_name",
+        "source_uri",
+        "view",
+        "section",
+        "query",
+        "cursor",
+        "end_cursor",
+        "offset",
+        "end_offset",
+        "total_chars",
+        "more_available",
+        "next_offset",
+        "total_count",
+        "returned_count",
+        "limit",
+        "page_size",
+    ],
+)
+@pytest.mark.parametrize(("value", "rendered"), [(None, "none"), (0, "0"), (False, "False"), ("a|b\nc", "a\\|b c")])
+def test_document_header_keeps_present_falsey_and_escaped_page_fields(key: str, value: object, rendered: str):
+    """Present page fields keep header order, render falsey values, and spell None as 'none'."""
+    field = f"{key}: {rendered}"
+    ordered = (field, "next_cursor: none") if key in _PAGE_FIELDS_BEFORE_CURSOR else ("next_cursor: none", field)
+    assert render_tool_result({"text": "body", "next_cursor": None, key: value}) == "\n".join(ordered) + "\n\nbody"
+
+
+@pytest.mark.parametrize("bad_refs", [None, "bad", {}, []])
+def test_document_header_skips_falsey_identity_and_mistyped_references(bad_refs: object):
+    assert (
+        render_tool_result(
+            {
+                "text": "body",
+                "next_cursor": None,
+                "ticker": None,
+                "form_type": "",
+                "item": 0,
+                "statement_type": [],
+                "concept_searched": False,
+                "filed": {},
+                "source": "",
+                "source_handle": bad_refs,
+                "source_refs": bad_refs,
+                "continuation": False,
+            }
+        )
+        == "next_cursor: none\n\nbody"
+    )
+
+
+def test_document_header_renders_cursor_without_document_identity():
+    assert render_tool_result({"text": "body", "next_cursor": []}) == (
+        "next_cursor: []\nContinue: call get_sec_document with cursor=[].\n"
+        "Preserve section, query, and raw settings.\n\nbody"
+    )
+
+
+def test_document_header_can_be_empty_for_long_text():
+    body = "body " * 81
+    assert render_tool_result({"text": body}) == "\n\n" + body
+
+
+def test_insider_body_preserves_fields_and_stops_after_transaction_overflow():
+    assert render_tool_result(
+        {
+            "ticker": "TSLA",
+            "source": "SEC",
+            "concept_searched": "ownership",
+            "tags": ["a"],
+            "metadata": {"verified": False},
+            "ignored": None,
+            "transactions": [
+                False,
+                {"transaction_code": "S", "shares": 0},
+                {"transaction_code": "X" * 1000},
+                {"transaction_code": "P"},
+            ],
+        },
+        max_bytes=256,
+    ) == (
+        "ticker: TSLA\nsource: SEC\nconcept_searched: ownership\n  - a\nmetadata: verified: False\n"
+        f"  - transaction_code S, shares 0\n{TRUNCATED_MARKER} (Omitted rows: 1 in transactions)"
+    )
+
+
+def test_insider_keeps_empty_mapping_rows_but_skips_non_mapping_rows():
+    assert (
+        render_tool_result({"transactions": [False, {}, {"transaction_code": None, "transaction_kind": ""}]})
+        == "  - \n  - "
+    )
+
+
+def test_insider_uses_minimal_output_when_no_line_fits():
+    assert render_tool_result({"transactions": [{"transaction_code": "X" * 1000}]}, max_bytes=16) == (
+        "Source: tool res"
+    )
+
+
+@pytest.mark.parametrize(
+    ("series", "expected"),
+    [
+        ([], "series: none"),
+        ([{}], "series: "),
+        ([{"observations": "wrong"}], "series: "),
+        ([{"observations": {}}], "series: "),
+        (
+            [
+                None,
+                False,
+                [],
+                {"provider": "A", "ignored": None, "observations": [None, [], {}, {"date": "d", "value": 0}]},
+            ],
+            "series: provider: A\n  - date: , value: \n  - date: d, value: 0",
+        ),
+        (
+            [{"unit": "", "observations": [{"value": "a|b\nc"}]}],
+            "series: unit: \n  - date: , value: a\\|b c, unit: ",
+        ),
+        (
+            [{"unit": None, "observations": [{"date": 0}]}],
+            "series: \n  - date: 0, value: ",
+        ),
+    ],
+)
+def test_generic_series_handles_empty_partial_and_mistyped_rows(series: list[object], expected: str):
+    assert render_tool_result({"series": series}) == expected
+
+
+def test_generic_series_without_mapping_rows_uses_minimal_output():
+    assert render_tool_result({"series": [None, False, [], "wrong"]}) == (f"Source: tool result | {TRUNCATED_MARKER}")
+
+
+def test_generic_series_context_overflow_stops_the_outer_list():
+    assert (
+        render_tool_result(
+            {"series": [{"provider": "X" * 1000}, {"provider": "not rendered"}]},
+            max_bytes=128,
+        )
+        == f"{TRUNCATED_MARKER} (Omitted rows: 1 in series)"
+    )
+
+
+def test_generic_series_observation_overflow_preserves_the_next_series():
+    assert render_tool_result(
+        {
+            "series": [
+                {"provider": "A", "observations": [{"date": "1", "value": "X" * 1000}, {"value": "not rendered"}]},
+                {"provider": "B", "observations": [{"date": "2", "value": 3}]},
+            ]
+        },
+        max_bytes=256,
+    ) == (
+        "series: provider: A\nseries: provider: B\n  - date: 2, value: 3\n"
+        f"{TRUNCATED_MARKER} (Omitted rows: 1 in series)"
+    )
+
+
+def test_generic_lists_preserve_scalar_cells_and_mapping_summaries():
+    assert (
+        render_tool_result(
+            {"items": ["x|y\nz", None, 2, False, [], {"name": "N", "value": 0, "ignored": "x"}, {"other": "O"}]}
+        )
+        == "  - x\\|y z\n  - \n  - 2\n  - False\n  - []\n  - name N, value 0\n  - other O"
+    )
+    assert render_tool_result({"items": []}) == "items: none"
+    assert render_tool_result({"items": []}, max_bytes=1) == "S"
+
+
+def test_generic_list_overflow_marks_the_key_without_rendering_later_rows():
+    assert render_tool_result({"items": ["first", "X" * 1000, "not rendered"]}, max_bytes=128) == (
+        f"  - first\n{TRUNCATED_MARKER} (Omitted rows: 1 in items)"
+    )
+
+
+_JSON_RENDER_VALUES = st.recursive(
+    st.none() | st.booleans() | st.integers() | st.floats(allow_nan=False, allow_infinity=False) | st.text(),
+    lambda children: st.lists(children, max_size=4) | st.dictionaries(st.text(), children, max_size=4),
+    max_leaves=20,
+)
+
+
+@seed(20261014)
+@settings(max_examples=100, deadline=None, derandomize=True)
+@given(
+    key=st.sampled_from(["items", "series"]),
+    values=st.lists(_JSON_RENDER_VALUES, max_size=8),
+    budget=st.integers(min_value=1, max_value=512),
+)
+def test_generic_json_lists_always_render_within_the_utf8_budget_without_mutation(
+    key: str, values: list[object], budget: int
+):
+    result = {key: values}
+    before = deepcopy(result)
+    rendered = render_tool_result(result, max_bytes=budget)
+    assert rendered
+    assert len(rendered.encode("utf-8")) <= budget
+    assert result == before

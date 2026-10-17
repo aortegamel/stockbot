@@ -41,6 +41,7 @@ class FakeRepo(ResearchRepository):
         evidence: list[dict[str, JSONValue]] | None = None,
         freezes: dict[str, dict[str, JSONValue]] | None = None,
         dossiers: list[dict[str, JSONValue]] | None = None,
+        sessions: list[dict[str, object]] | None = None,
         raise_session: bool = False,
         raise_jobs: bool = False,
         raise_evidence: bool = False,
@@ -51,6 +52,7 @@ class FakeRepo(ResearchRepository):
         self._evidence: list[dict[str, JSONValue]] = evidence if evidence is not None else []
         self._freezes: dict[str, dict[str, JSONValue]] = freezes if freezes is not None else {}
         self._dossiers: list[dict[str, JSONValue]] = dossiers if dossiers is not None else []
+        self._sessions: list[dict[str, object]] = sessions if sessions is not None else []
         self._raise_session = raise_session
         self._raise_jobs = raise_jobs
         self._raise_evidence = raise_evidence
@@ -93,6 +95,20 @@ class FakeRepo(ResearchRepository):
         if self._raise_dossiers:
             raise RuntimeError("no dossiers")
         return self._dossiers
+
+    @override
+    def list_sessions(self, limit: int = 20) -> list[dict[str, object]]:
+        return self._sessions[:limit]
+
+
+class _MalformedSessionsRepo:
+    """Repository double whose list_sessions rows break the dict-row contract."""
+
+    def __init__(self, sessions: list[object]) -> None:
+        self._sessions = sessions
+
+    def list_sessions(self, limit: int = 20) -> list[object]:
+        return self._sessions[:limit]
 
 
 def _json_value(value: object) -> JSONValue:
@@ -2573,3 +2589,693 @@ def test_kernel_final_answer_branches(tmp_path: Path, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(repo, "get_session", _nondict_session)
     assert J._kernel_final_answer(repo, sess.session_id) == ""
+
+
+# ---- slice_hedgefund_live_tests.py ----
+"""Offline structural checks for scripts/verify_hedgefund_live.py (fake repo, no network)."""
+
+
+from scripts import verify_hedgefund_live as hl
+
+_GOLDEN_ANSWER = "SEC, FINRA, and web evidence agree on the growth thesis for this golden run."
+
+_GOLDEN_JOBS = (("j1", "SEC", "stockbot"), ("j2", "FINRA", "bullbot"), ("j3", "WEB", "bearbot"))
+
+_GOLDEN_FINAL: dict[str, JSONValue] = {
+    "answer": _GOLDEN_ANSWER,
+    "coverage": {"status": "full"},
+    "disagreements": ["margin path"],
+    "claims": [{"evidence_ids": ["e1"]}],
+}
+
+
+def _g_job(job_id: str, domain: str, job_type: str = "research") -> Job:
+    return Job(
+        job_id=job_id,
+        session_id="s1",
+        wave_id=1,
+        parent_job_id=None,
+        job_type=job_type,
+        owner="agent",
+        source_domain=domain,
+        status="done",
+    )
+
+
+def _g_evidence(eid: str, domain: str, kind: str = "sec_record", record_kind: str = "record") -> dict[str, JSONValue]:
+    return {"evidence_id": eid, "domain": domain, "record_kind": record_kind, "provenance": {"kind": kind}}
+
+
+def _golden_repo(
+    sess: object = None,
+    jobs: list[Job] | None = None,
+    evidence: list[dict[str, JSONValue]] | None = None,
+    freezes: dict[str, dict[str, JSONValue]] | None = None,
+    sessions: list[dict[str, object]] | None = None,
+) -> FakeRepo:
+    """Complete golden session: three source domains, one shared trio freeze, substantive answer."""
+    return FakeRepo(
+        sess=_sess(
+            status="completed",
+            freeze_ids=["f1"],
+            committee_runs=[{"freeze_id": "f1", "jobs": ["j1", "j2", "j3"]}],
+            final_result=dict(_GOLDEN_FINAL),
+        )
+        if sess is None
+        else sess,
+        jobs=[_g_job(*args) for args in _GOLDEN_JOBS] if jobs is None else jobs,
+        evidence=[
+            _g_evidence("e1", "SEC"),
+            _g_evidence("e2", "FINRA", "finra_record"),
+            _g_evidence("e3", "WEB", "web_source"),
+        ]
+        if evidence is None
+        else evidence,
+        freezes={"f1": {"evidence_ids": ["e1", "e2", "e3"]}} if freezes is None else freezes,
+        sessions=sessions,
+    )
+
+
+def _stub_repository(monkeypatch: pytest.MonkeyPatch, repo: object) -> list[object]:
+    """Bind every ResearchRepository(...) construction to one fake; record the path argument."""
+    paths: list[object] = []
+
+    def _factory(*args: object, **kwargs: object) -> object:
+        paths.append(args[0] if args else None)
+        return repo
+
+    monkeypatch.setattr("app.research.repository.ResearchRepository", _factory)
+    return paths
+
+
+def test_golden_structure_passes_complete_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _stub_repository(monkeypatch, _golden_repo())
+    ok, failures, summary = hl.golden_structure("s1", tmp_path / "research.sqlite")
+    assert (ok, failures) == (True, [])
+    assert paths == [tmp_path / "research.sqlite"]
+    assert summary == {
+        "session_id": "s1",
+        "status": "completed",
+        "source_domains": ["FINRA", "SEC", "WEB"],
+        "freeze_domains": ["FINRA", "SEC", "WEB"],
+        "source_job_counts": {"SEC": 1, "FINRA": 1, "WEB": 1},
+        "frozen_evidence_counts": {"SEC": 1, "FINRA": 1, "WEB": 1},
+        "trio_freeze": "f1",
+        "evidence_count": 3,
+        "answer_chars": len(_GOLDEN_ANSWER),
+    }
+
+
+def test_golden_structure_defaults_to_env_db_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "custom.sqlite"))
+    paths = _stub_repository(monkeypatch, _golden_repo())
+    ok, _failures, _summary = hl.golden_structure("s1")
+    assert ok is True
+    assert paths == [tmp_path / "custom.sqlite"]
+
+
+def test_golden_db_path_defaults_under_data_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RESEARCH_DB_PATH", raising=False)
+    assert hl._golden_db_path().name == "research.sqlite"
+
+
+def test_golden_structure_reports_missing_requirements_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = FakeRepo(
+        sess=_sess(
+            status="open",
+            freeze_ids=["f1"],
+            committee_runs=[],
+            final_result={"answer": "too short", "claims": [{"evidence_ids": ["e9"]}]},
+        ),
+        jobs=[_g_job("j1", "SEC", "stockbot")],
+        evidence=[_g_evidence("e1", "SEC")],
+        freezes={"f1": {"evidence_ids": ["e1"]}},
+    )
+    _stub_repository(monkeypatch, repo)
+    ok, failures, _summary = hl.golden_structure("s1", tmp_path / "research.sqlite")
+    assert ok is False
+    assert failures == [
+        "source domains ran ['SEC']; want ['SEC', 'FINRA', 'WEB']",
+        "freeze holds ['SEC']; want ['SEC', 'FINRA', 'WEB']",
+        "trio shares no single freeze (runs=[])",
+        "session status 'open'; want 'completed'",
+        "source domain FINRA has no jobs",
+        "source domain WEB has no jobs",
+        "freeze holds no FINRA evidence",
+        "freeze holds no WEB evidence",
+        "claims cite unfrozen evidence ['e9']",
+        "coverage empty",
+        "disagreements/uncertainties empty",
+        "final answer not substantive",
+    ]
+
+
+def test_golden_structure_flags_trio_freeze_and_provenance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = FakeRepo(
+        sess=_sess(
+            status="completed",
+            freeze_ids=["f1", "missing"],
+            committee_runs=[{"freeze_id": "f9", "jobs": ["j1", "j2", "j3"]}],
+            final_result=dict(_GOLDEN_FINAL),
+        ),
+        jobs=[_g_job(*args) for args in _GOLDEN_JOBS],
+        evidence=[
+            _g_evidence("e1", "SEC"),
+            _g_evidence("e2", "FINRA", record_kind="discovery"),
+            _g_evidence("e3", "WEB", "search_run"),
+        ],
+        freezes={"f1": {"evidence_ids": ["e1", "e2", "e3"]}},
+    )
+    _stub_repository(monkeypatch, repo)
+    ok, failures, summary = hl.golden_structure("s1", tmp_path / "research.sqlite")
+    assert ok is False
+    assert failures == [
+        "freeze holds ['SEC', 'WEB']; want ['SEC', 'FINRA', 'WEB']",
+        "trio freeze 'f9' not in session freezes",
+        "frozen evidence 'e3' has provenance 'search_run'",
+        "freeze holds no FINRA evidence",
+    ]
+    assert summary["frozen_evidence_counts"] == {"SEC": 1, "FINRA": 0, "WEB": 1}
+
+
+def test_golden_structure_reports_trio_roles_when_roles_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _golden_repo(
+        sess=_sess(
+            status="completed",
+            freeze_ids=["f1"],
+            committee_runs=[
+                "junk",
+                {"freeze_id": "f1", "jobs": ["j1", "j2"]},
+                {"freeze_id": "f1", "jobs": ["j1", "j2", "j3"]},
+                {"freeze_id": "f1", "jobs": ["j1", 5, "j3"]},
+            ],
+            final_result=dict(_GOLDEN_FINAL),
+        ),
+        jobs=[
+            _g_job("j1", "SEC", "source_agent"),
+            _g_job("j2", "FINRA", "scout"),
+            _g_job("j3", "WEB", "synthesis"),
+        ],
+    )
+    _stub_repository(monkeypatch, repo)
+    ok, failures, _summary = hl.golden_structure("s1", tmp_path / "research.sqlite")
+    assert ok is False
+    assert len(failures) == 1
+    assert failures[0].startswith("trio shares no single freeze (runs=[])")
+    assert "trio roles" in failures[0]
+    assert "want ['stockbot', 'bullbot', 'bearbot']" in failures[0]
+    assert "scout" in failures[0] and "synthesis" in failures[0]
+
+
+def test_golden_structure_requires_one_shared_trio_freeze(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _golden_repo(
+        sess=_sess(
+            status="completed",
+            freeze_ids=["f1", "f2"],
+            committee_runs=[
+                {"freeze_id": "f1", "jobs": ["j1", "j2", "j3"]},
+                {"freeze_id": "f2", "jobs": ["j1", "j2", "j3"]},
+            ],
+            final_result=dict(_GOLDEN_FINAL),
+        ),
+    )
+    _stub_repository(monkeypatch, repo)
+    ok, failures, summary = hl.golden_structure("s1", tmp_path / "research.sqlite")
+    assert ok is False
+    assert failures == ["trio shares no single freeze (runs=['f1', 'f2'])"]
+    assert summary["trio_freeze"] is None
+
+
+def test_evidence_domain_reads_row_then_provenance() -> None:
+    assert hl._evidence_domain({"domain": " finra "}) == "FINRA"
+    assert hl._evidence_domain({"source_domain": "web"}) == "WEB"
+    assert hl._evidence_domain({"domain": "other", "provenance": {"kind": "web_source"}}) == "WEB"
+    assert hl._evidence_domain({"provenance": {"kind": "none"}}) == "SEC"
+    assert hl._evidence_domain({"provenance": "not-a-mapping"}) == "SEC"
+    assert hl._evidence_domain({}) == "SEC"
+    assert hl._evidence_domain(object()) == "SEC"
+
+
+def test_freeze_domains_skips_unmatched_and_discovery_rows() -> None:
+    rows = [
+        object(),
+        {"evidence_id": "e1", "domain": "SEC", "record_kind": "discovery"},
+        {"evidence_id": "e1", "domain": "SEC"},
+        {"evidence_id": "e2", "domain": "FINRA", "provenance": {"kind": "finra_record"}},
+        {"evidence_id": "e3", "domain": "WEB"},
+    ]
+    assert hl._freeze_domains(rows, {"e1", "e2"}) == {"SEC", "FINRA"}
+    assert hl._freeze_domains(None, {"e1"}) == set()
+    assert hl._freeze_domains("nope", {"e1"}) == set()
+
+
+def test_job_role_map_reads_dicts_and_objects() -> None:
+    jobs: list[object] = [
+        {"job_id": "j1", "job_type": "stockbot"},
+        {"job_id": "j2", "job_type": 5},
+        SimpleNamespace(job_id="j3", job_type="bullbot"),
+        object(),
+    ]
+    assert hl._job_role_map(jobs) == {"j1": "stockbot", "j3": "bullbot"}
+    assert hl._job_role_map(None) == {}
+
+
+def test_trio_freezes_reads_tuples_and_rejects_shapes() -> None:
+    runs = (
+        "junk",
+        {"freeze_id": 5, "jobs": ["a", "b", "c"]},
+        {"freeze_id": "f1", "jobs": ["a", "b"]},
+        {"freeze_id": "f1", "jobs": "abc"},
+        {"freeze_id": "f1", "jobs": [1, 2, 3]},
+        {"freeze_id": "f1", "jobs": ["a", "b", "c"]},
+    )
+    # Without a job map, every three-job run counts as a trio.
+    assert hl._trio_freezes(runs) == ["f1", "f1"]
+    assert hl._trio_freezes(None) == []
+    jobs = [
+        {"job_id": "a", "job_type": "stockbot"},
+        {"job_id": "b", "job_type": "bullbot"},
+        {"job_id": "c", "job_type": "bearbot"},
+    ]
+    assert hl._trio_freezes(runs, jobs) == ["f1"]
+    assert hl._trio_freezes(runs, [{"job_id": "a", "job_type": "stockbot"}]) == []
+
+
+def test_source_job_counts_ignores_unknown_labels() -> None:
+    failures: list[str] = []
+    jobs: list[object] = [
+        _g_job("j1", "SEC"),
+        SimpleNamespace(source_domain=None),
+        SimpleNamespace(source_domain="other"),
+    ]
+    assert hl._source_job_counts(jobs, failures) == {"SEC": 1, "FINRA": 0, "WEB": 0}
+    assert failures == ["source domain FINRA has no jobs", "source domain WEB has no jobs"]
+    assert hl._source_job_counts(None, []) == {"SEC": 0, "FINRA": 0, "WEB": 0}
+
+
+def test_frozen_evidence_counts_tolerates_malformed_rows() -> None:
+    failures: list[str] = []
+    assert hl._frozen_evidence_counts(None, {"e1"}, failures) == {"SEC": 0, "FINRA": 0, "WEB": 0}
+    assert failures == [
+        "freeze holds no SEC evidence",
+        "freeze holds no FINRA evidence",
+        "freeze holds no WEB evidence",
+    ]
+    failures = []
+    rows = [object(), {"evidence_id": "e1", "domain": "SEC", "provenance": {"kind": "sec_record"}}]
+    assert hl._frozen_evidence_counts(rows, {"e1"}, failures) == {"SEC": 1, "FINRA": 0, "WEB": 0}
+    assert failures == ["freeze holds no FINRA evidence", "freeze holds no WEB evidence"]
+    failures = []
+    hl._frozen_evidence_counts([{"evidence_id": "e1", "provenance": "not-a-mapping"}], {"e1"}, failures)
+    assert failures[0] == "frozen evidence 'e1' has provenance None"
+
+
+def test_frozen_evidence_counts_skips_rows_outside_the_freeze_scope() -> None:
+    """Reader-less rows, frozen discovery rows, and unfrozen rows are skipped whole."""
+    failures: list[str] = []
+    rows: list[object] = [
+        object(),
+        {"evidence_id": "e1", "domain": "SEC", "provenance": {"kind": "sec_record"}},
+        {"evidence_id": "e2", "domain": "FINRA", "record_kind": "discovery", "provenance": {"kind": "search_run"}},
+        {"evidence_id": "e3", "domain": "WEB", "provenance": {"kind": "search_run"}},
+    ]
+    assert hl._frozen_evidence_counts(rows, {"e1", "e2"}, failures) == {"SEC": 1, "FINRA": 0, "WEB": 0}
+    assert failures == ["freeze holds no FINRA evidence", "freeze holds no WEB evidence"]
+
+
+def test_claimed_ids_reads_both_claim_keys() -> None:
+    assert hl._claimed_ids({"claims": [{"evidence_ids": ["e1", 5]}, "junk", {"evidence_ids": "e3"}]}) == {"e1"}
+    assert hl._claimed_ids({"claims": [{"evidence_ids": ["e1"]}], "grounded_claims": [{"evidence_ids": ["e2"]}]}) == {
+        "e1",
+        "e2",
+    }
+    assert hl._claimed_ids({}) == set()
+    assert hl._str_list(["a", 5, None]) == ["a"]
+    assert hl._str_list("nope") == []
+
+
+def test_missing_env_lists_credentials_then_missing_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (*hl.REQUIRED_ENV, "EXA_ENABLED"):
+        monkeypatch.delenv(name, raising=False)
+    assert hl._missing_env() == [*hl.REQUIRED_ENV, "EXA_ENABLED=1"]
+    for name in hl.REQUIRED_ENV:
+        monkeypatch.setenv(name, " set ")
+    for enabled in ("1", "TRUE", "yes", " Yes "):
+        monkeypatch.setenv("EXA_ENABLED", enabled)
+        assert hl._missing_env() == []
+    monkeypatch.setenv("EXA_ENABLED", "0")
+    assert hl._missing_env() == ["EXA_ENABLED=1"]
+
+
+def test_hedgefund_parse_args_defaults() -> None:
+    args = hl.parse_args([])
+    assert args.scenario == hl.GOLDEN_SCENARIO
+    assert args.prompt_version == "v1"
+    assert args.json is False
+    assert args.model is None and args.provider is None and args.model_timeout is None
+
+
+def test_hedgefund_main_requires_opt_in(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.delenv("HEDGEFUND_LIVE", raising=False)
+    assert hl.main([]) == 2
+    assert "HEDGEFUND_LIVE=1" in capsys.readouterr().err
+
+
+def test_hedgefund_main_reports_missing_credentials(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HEDGEFUND_LIVE", "1")
+    for name in (*hl.REQUIRED_ENV, "EXA_ENABLED"):
+        monkeypatch.delenv(name, raising=False)
+    assert hl.main([]) == 2
+    assert "missing SEC_EDGAR_IDENTITY, FINRA_CLIENT_ID, FINRA_CLIENT_SECRET, EXA_API_KEY, EXA_ENABLED=1" in (
+        capsys.readouterr().err
+    )
+
+
+def _live_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEDGEFUND_LIVE", "1")
+    monkeypatch.setenv("EXA_ENABLED", "1")
+    for name in hl.REQUIRED_ENV:
+        monkeypatch.setenv(name, "live-test")
+
+
+def _live_provider_model(provider: str | None, model: str | None, env: object = None) -> tuple[str, str]:
+    return ("anthropic", "claude")
+
+
+def _live_model_timeout(raw: str | None, env: object = None) -> int:
+    return 42
+
+
+def _golden_scenario_map() -> dict[str, object]:
+    return {hl.GOLDEN_SCENARIO: "scenario"}
+
+
+def _empty_scenario_map() -> dict[str, object]:
+    return {}
+
+
+def _no_violations(name: str) -> list[str]:
+    return []
+
+
+def _one_violation(name: str) -> list[str]:
+    return ["golden-no-session-persisted"]
+
+
+def _stub_live_verdict(
+    monkeypatch: pytest.MonkeyPatch, passed: bool, violations: tuple[str, ...]
+) -> list[tuple[object, ...]]:
+    import scripts.verify_agent_scenarios as live_mod
+
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(live_mod, "resolve_provider_model", _live_provider_model)
+    monkeypatch.setattr(live_mod, "resolve_model_timeout", _live_model_timeout)
+    monkeypatch.setattr(live_mod, "_scenario_map", _golden_scenario_map)
+
+    def _eval(
+        scenario_name: str, by_name: object, provider: str, model: str, prompt_version: str, timeout_s: int
+    ) -> object:
+        calls.append((scenario_name, by_name, provider, model, prompt_version, timeout_s))
+        return SimpleNamespace(scenario_name=scenario_name, passed=passed, violations=violations)
+
+    monkeypatch.setattr(live_mod, "_eval_one_scenario", _eval)
+    return calls
+
+
+def test_hedgefund_main_records_pass_and_prints_json(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import scripts.export_harness_viewer as viewer_mod
+
+    _live_env(monkeypatch)
+    calls = _stub_live_verdict(monkeypatch, True, ())
+    monkeypatch.setattr(hl, "_live_structural", _no_violations)
+    exported: list[object] = []
+
+    def _export(argv: list[str] | None = None) -> int:
+        exported.append(argv)
+        return 0
+
+    monkeypatch.setattr(viewer_mod, "main", _export)
+
+    assert hl.main(["--json", "--prompt-version", "v2"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith(f"PASS {hl.GOLDEN_SCENARIO} (live golden via real SEC/FINRA/Exa)")
+    assert json.loads(out[out.index("{") :]) == {"scenario": hl.GOLDEN_SCENARIO, "passed": True, "violations": []}
+    assert calls == [(hl.GOLDEN_SCENARIO, {hl.GOLDEN_SCENARIO: "scenario"}, "anthropic", "claude", "v2", 42)]
+    assert exported == [[]]
+
+
+def test_hedgefund_main_reports_failures_and_survives_export_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import scripts.export_harness_viewer as viewer_mod
+
+    _live_env(monkeypatch)
+    _stub_live_verdict(monkeypatch, False, ("bad-answer",))
+    monkeypatch.setattr(hl, "_live_structural", _one_violation)
+
+    def _boom(argv: list[str] | None = None) -> int:
+        raise RuntimeError("no viewer")
+
+    monkeypatch.setattr(viewer_mod, "main", _boom)
+    assert hl.main([]) == 1
+    captured = capsys.readouterr()
+    assert captured.out.startswith(f"FAIL {hl.GOLDEN_SCENARIO}")
+    assert "violations: bad-answer, golden-no-session-persisted" in captured.err
+    assert "viewer export failed: no viewer" in captured.err
+
+
+def test_hedgefund_main_rejects_unknown_scenario(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import scripts.verify_agent_scenarios as live_mod
+
+    _live_env(monkeypatch)
+    monkeypatch.setattr(live_mod, "resolve_provider_model", _live_provider_model)
+    monkeypatch.setattr(live_mod, "resolve_model_timeout", _live_model_timeout)
+    monkeypatch.setattr(live_mod, "_scenario_map", _empty_scenario_map)
+    assert hl.main(["--scenario", "nope"]) == 2
+    assert "unknown scenario: 'nope'" in capsys.readouterr().err
+
+
+def test_live_structural_skips_other_scenarios(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _unreachable(*args: object, **kwargs: object) -> object:
+        raise AssertionError("repository must not be built for another scenario")
+
+    monkeypatch.setattr("app.research.repository.ResearchRepository", _unreachable)
+    assert hl._live_structural("another-scenario") == []
+
+
+def test_live_structural_reports_unreadable_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(*args: object, **kwargs: object) -> object:
+        raise sqlite3.OperationalError("no such table: sessions")
+
+    monkeypatch.setattr("app.research.repository.ResearchRepository", _boom)
+    assert hl._live_structural(hl.GOLDEN_SCENARIO) == ["golden-no-session-persisted"]
+
+
+def test_live_structural_needs_a_persisted_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "research.sqlite"))
+    _stub_repository(monkeypatch, _golden_repo(sessions=[]))
+    assert hl._live_structural(hl.GOLDEN_SCENARIO) == ["golden-no-session-persisted"]
+    _stub_repository(monkeypatch, _golden_repo(sessions=[{"session_id": ""}]))
+    assert hl._live_structural(hl.GOLDEN_SCENARIO) == ["golden-no-session-persisted"]
+    _stub_repository(monkeypatch, _golden_repo(sessions=[{"session_id": None}]))
+    assert hl._live_structural(hl.GOLDEN_SCENARIO) == ["golden-no-session-persisted"]
+    _stub_repository(monkeypatch, _MalformedSessionsRepo(["junk"]))
+    assert hl._live_structural(hl.GOLDEN_SCENARIO) == ["golden-no-session-persisted"]
+
+
+def test_live_structural_reads_and_prefixes_golden_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "research.sqlite"))
+    _stub_repository(monkeypatch, _golden_repo(sessions=[{"session_id": "s1"}]))
+    assert hl._live_structural(hl.GOLDEN_SCENARIO) == []
+    printed = capsys.readouterr().out
+    assert printed.startswith("golden structure: ")
+    assert json.loads(printed.removeprefix("golden structure: "))["trio_freeze"] == "f1"
+
+    _stub_repository(monkeypatch, _golden_repo(sess=_sess(), sessions=[{"session_id": "s1"}]))
+    violations = hl._live_structural(hl.GOLDEN_SCENARIO)
+    assert violations[0] == "golden-freeze holds []; want ['SEC', 'FINRA', 'WEB']"
+    assert "golden-session status 'open'; want 'completed'" in violations
+
+
+# ---- slice_export_final_tests.py ----
+"""scripts/export_harness_viewer._collect_final viewer-shape projection."""
+
+
+def test_collect_final_rejects_missing_and_mistyped_results() -> None:
+    assert exh_viewer._collect_final(_sess(final_result=None)) is None
+    assert exh_viewer._collect_final(SimpleNamespace(final_result=["not-a-dict"])) is None
+
+    class Bad:
+        @property
+        def final_result(self) -> object:
+            raise RuntimeError("boom")
+
+    assert exh_viewer._collect_final(Bad()) is None
+
+
+def test_collect_final_maps_structured_final_result() -> None:
+    sess = _sess(
+        final_result={
+            "content": "answer text",
+            "executive_summary": "summary text",
+            "consensus": "agree",
+            "base_case": "base case",
+            "bull_case": {"summary": "bull summary"},
+            "bear_case": "bear text",
+            "critical_disagreements": ["d1", 5, "", " d2 "],
+            "positioning": ["long"],
+            "catalysts": [" earn "],
+            "uncertainties": ["fx"],
+            "what_would_change": ["guidance"],
+            "evidence_limitations": ["thin"],
+            "claims": [{"text": "c1", "evidence_ids": ["e1", 2]}],
+            "sources": [{"id": "s1"}],
+            "coverage": {"status": "full"},
+            "research_scope": {"allowed_sources": [" sec ", 7]},
+            "freeze_id": "f1",
+            "as_of": "2026-09-01",
+        }
+    )
+    assert exh_viewer._collect_final(sess) == {
+        "answer": "answer text",
+        "executiveSummary": "summary text",
+        "consensus": "agree",
+        "baseCase": "base case",
+        "bullCase": "bull summary",
+        "bearCase": "bear text",
+        "disagreements": ["d1", "d2"],
+        "positioning": ["long"],
+        "catalysts": ["earn"],
+        "uncertainties": ["fx"],
+        "whatChangesTheView": ["guidance"],
+        "limitations": ["thin"],
+        "claims": [{"text": "c1", "evidenceIds": ["e1"]}],
+        "sources": [{"id": "s1"}],
+        "coverage": {"status": "full"},
+        "allowedSources": ["sec"],
+        "freezeId": "f1",
+        "asOf": "2026-09-01",
+    }
+
+
+def test_collect_final_falls_back_to_legacy_keys_and_drops_mistyped_fields() -> None:
+    sess = _sess(
+        final_result={
+            "answer": "legacy answer",
+            "executive_summary": "",
+            "grounded_claims": [{"text": "gc", "evidence_ids": ["e2"]}],
+            "what_changes_the_view": ["rates"],
+            "limitations": ["l1"],
+            "disagreements": ["old"],
+            "sources": {"not": "a list"},
+            "coverage": "full",
+            "research_scope": "unknown",
+            "bull_case": {"no_summary": True},
+            "bear_case": None,
+        }
+    )
+    out = exh_viewer._collect_final(sess)
+    assert out is not None
+    assert out["answer"] == "legacy answer"
+    assert out["executiveSummary"] == "legacy answer"
+    assert out["claims"] == [{"text": "gc", "evidenceIds": ["e2"]}]
+    assert out["whatChangesTheView"] == ["rates"]
+    assert out["limitations"] == ["l1"]
+    assert out["disagreements"] == ["old"]
+    assert out["sources"] == [] and out["coverage"] == {} and out["allowedSources"] == []
+    assert out["bullCase"] == "None" and out["bearCase"] == ""
+    assert out["freezeId"] == "" and out["asOf"] == ""
+
+
+# ---- slice_agent_kernel_scenario_tests.py ----
+"""scripts/verify_agent_scenarios._run_kernel_scenario: production kernel path, fakes only."""
+
+
+def test_run_kernel_scenario_records_kernel_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    from app.research import scheduler, service
+
+    sc = _g2_scenario(name="kernel-live", question="What drove NVDA?", notes="nvda notes")
+    calls: list[tuple[object, ...]] = []
+    eval_calls: list[tuple[Scenario, dict[str, object], float, int]] = []
+    closed: list[str] = []
+    node = SimpleNamespace(session_id="", question="", why_it_matters="")
+
+    def _create_research(
+        question: str,
+        objective: str | None = None,
+        *,
+        as_of: str | None = None,
+        policy: object = None,
+        repo: object = None,
+        ticker: str | None = None,
+    ) -> str:
+        calls.append(("research", question, objective, as_of, repo, ticker))
+        return "sid-1"
+
+    def _create_node(
+        session_id: str, question: str, why_it_matters: str, depends_on: object = None, *, repo: object = None
+    ) -> SimpleNamespace:
+        calls.append(("node", session_id, question, why_it_matters, depends_on, repo))
+        node.session_id = session_id
+        node.question = question
+        node.why_it_matters = why_it_matters
+        return node
+
+    async def _run_node(*args: object, **kwargs: object) -> None:
+        calls.append(("run", *args, kwargs))
+
+    sentinel = vas._crash_eval_input(sc, 1.0)
+
+    def _record_eval(scenario: Scenario, out: dict[str, object], wall_ms: float, tool_call_cap: int = 0) -> object:
+        eval_calls.append((scenario, out, wall_ms, tool_call_cap))
+        return sentinel
+
+    monkeypatch.setattr(service, "create_research", _create_research)
+    monkeypatch.setattr(service, "create_node", _create_node)
+    monkeypatch.setattr(scheduler, "run_node", _run_node)
+    monkeypatch.setattr(vas, "_close_bootstrap_jobs", closed.append)
+    monkeypatch.setattr(vas, "evaluate_and_record", _record_eval)
+    before_db = os.environ.get("RESEARCH_DB_PATH")
+
+    assert vas._run_kernel_scenario(sc, "p", "m", "v1", 300) is sentinel
+    assert closed == ["sid-1"]
+    assert os.environ.get("RESEARCH_DB_PATH") == before_db
+    assert calls[0] == ("research", "What drove NVDA?", "nvda notes", None, None, None)
+    assert calls[1][:4] == ("node", "sid-1", "What drove NVDA?", "Route question.")
+    assert calls[2][0] == "run" and calls[2][1] is node
+    [(eval_scenario, out, wall_ms, cap)] = eval_calls
+    assert eval_scenario is sc
+    assert out == {"session_id": "sid-1", "evidence_ids": []}
+    # 0 = unlimited: kernel research has no static tool-call cap.
+    assert cap == 0 and wall_ms >= 0.0
+
+
+def test_run_kernel_scenario_reports_crash(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from app.research import service
+
+    sc = _g2_scenario(name="kernel-crash", requires_evidence=False)
+
+    def _boom(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("no kernel")
+
+    monkeypatch.setattr(service, "create_research", _boom)
+    result = vas._run_kernel_scenario(sc, "p", "m", "v1", 300)
+    assert result.scenario_name == "kernel-crash"
+    assert result.scenario_crashed is True
+    assert result.failed_count == 1 and result.answer_text == ""
+    assert result.requires_evidence is False
+    assert "CRASH RuntimeError: no kernel" in capsys.readouterr().err

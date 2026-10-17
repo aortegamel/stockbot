@@ -6,6 +6,7 @@ import asyncio
 import copy
 import io
 import json
+import math
 import select
 import shutil
 import subprocess
@@ -14,14 +15,14 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Executor
 from pathlib import Path
-from types import TracebackType
-from typing import Self, cast, override
+from types import SimpleNamespace, TracebackType
+from typing import Self, override
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from app.decision_client import JevClient
+from app.decision_client import REASON_SENTINEL, RESOLVED_SENTINEL, JevClient
 from app.research.models import JSONValue
 
 
@@ -157,6 +158,11 @@ def test_runtime_ping_over_bun() -> None:
         assert proc.poll() is None
     finally:
         proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
 
 
 def test_tool_options_prompt_keeps_last_three_failures() -> None:
@@ -929,6 +935,20 @@ def test_http_decision_rejects_malformed_provider_response(
 
 
 @pytest.mark.parametrize("api_format", _FORMATS)
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-32"])
+def test_http_decision_rejects_non_utf8_provider_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str, encoding: str
+) -> None:
+    """Invalid UTF-8, including a well-formed UTF-16/32 body, is the existing malformed-body error."""
+    for body in (b"\xff", _body(api_format, _HTTP_ANSWERS).decode().encode(encoding)):
+        client, seen = _http_client(tmp_path, monkeypatch, body, api_format)
+        with pytest.raises(TypeError, match=r"^decide: malformed_decision_response: body is not JSON$") as exc:
+            _http_run(client)
+        assert exc.value.__suppress_context__ is True
+        assert "persist" not in seen
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
 @pytest.mark.parametrize(
     ("answers", "error"),
     [
@@ -1353,28 +1373,12 @@ def test_select_tool_compacts_tuple_evidence_and_attempts(tmp_path: Path, monkey
 
 
 @pytest.mark.parametrize("field", ["evidence", "attempts"])
-def test_select_tool_rejects_mapping_before_request(
-    field: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A dict for evidence/attempts is a caller defect: TypeError, no JEV request."""
-    client, seen = _capturing_client(tmp_path, monkeypatch)
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
-    # cast: deliberately violates the Sequence contract to prove runtime rejection.
-    bad = cast(Sequence[JSONValue], {"evidence_id": "ev-1"})
-    evidence = bad if field == "evidence" else None
-    attempts = bad if field == "attempts" else None
+def test_records_rejects_mapping(field: str) -> None:
+    """A dict for evidence/attempts is a caller defect: TypeError before select_tool/assess_result request JEV."""
+    from app.decision_client import _records
+
     with pytest.raises(TypeError, match=f"jev {field} must be a sequence of records, not a mapping"):
-        asyncio.run(client.select_tool("obj", node, [{"name": "a"}], evidence, attempts, session_id="s"))
-    assert seen == []
-
-
-def test_assess_result_rejects_mapping_evidence_before_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    client, seen = _capturing_client(tmp_path, monkeypatch)
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
-    bad = cast(Sequence[JSONValue], {"evidence_id": "ev-1"})  # contract violation on purpose
-    with pytest.raises(TypeError, match="jev evidence must be a sequence of records, not a mapping"):
-        asyncio.run(client.assess_result(node, {"content": "x"}, bad, session_id="s"))
-    assert seen == []
+        _records({"evidence_id": "ev-1"}, field)
 
 
 def test_select_tool_none_context_sends_empty_lists(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1728,3 +1732,1355 @@ def test_assess_final_ops_shape_and_alias(tmp_path: Path) -> None:
         jev=client,
     )
     assert claim["id"] == "c3" and claim["support_answer"] == "yes" and "error" not in claim
+
+
+def _noop_persist(**kwargs: object) -> None:
+    return None
+
+
+def _runtime_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "decision" / "runtime.ts"
+
+
+class _PipeStdin(io.StringIO):
+    """stdin that fails its first writes with a broken pipe, then accepts the retry."""
+
+    def __init__(self, *, fail_writes: int = 0) -> None:
+        super().__init__()
+        self.writes: list[dict[str, object]] = []
+        self._fails = fail_writes
+
+    @override
+    def write(self, s: str, /) -> int:
+        if self._fails > 0:
+            self._fails -= 1
+            raise BrokenPipeError("sidecar pipe closed")
+        self.writes.append(json.loads(s))
+        return len(s)
+
+    @override
+    def flush(self) -> None:
+        pass
+
+
+class _ReplyStdout(io.StringIO):
+    """readline returns a canned reply line, a ping ack for the last request, or "" for EOF."""
+
+    def __init__(self, stdin: _PipeStdin, reply: str | None) -> None:
+        super().__init__()
+        self._stdin = stdin
+        self._reply = reply
+
+    @override
+    def readline(self, size: int | None = -1, /) -> str:
+        if self._reply is not None:
+            return self._reply
+        if not self._stdin.writes:
+            return ""
+        return json.dumps({"id": self._stdin.writes[-1]["id"], "ready": True}) + "\n"
+
+
+class _ScriptedProc(subprocess.Popen[str]):
+    """Scripted sidecar handle: canned reply line, optional broken write, kill/terminate flags."""
+
+    def __init__(self, reply: str | None = None, *, fail_writes: int = 0) -> None:
+        self.stdin = _PipeStdin(fail_writes=fail_writes)
+        self.stdout = _ReplyStdout(self.stdin, reply)
+        self.killed = False
+        self.terminated = False
+
+    @override
+    def poll(self) -> None:
+        return None
+
+    @override
+    def terminate(self) -> None:
+        self.terminated = True
+
+    @override
+    def kill(self) -> None:
+        self.killed = True
+
+
+def test_sidecar_restarts_once_after_broken_pipe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dead write pipe is discarded and the call retries on a fresh sidecar process."""
+    import app.decision_client as dc
+
+    dead = _ScriptedProc(fail_writes=1)
+    fresh = _ScriptedProc()
+    client = JevClient(data_root=tmp_path, runtime_path=_runtime_path())
+    monkeypatch.setattr(client, "_proc", dead)
+
+    def _spawn(*args: object, **kwargs: object) -> _ScriptedProc:
+        return fresh
+
+    monkeypatch.setattr(dc.subprocess, "Popen", _spawn)
+
+    client.start()
+
+    assert dead.killed and not dead.terminated
+    assert client._proc is fresh
+    assert isinstance(fresh.stdin, _PipeStdin)
+    assert [w.get("op") for w in fresh.stdin.writes] == ["ping"]
+
+
+def test_sidecar_eof_raises_unavailable_and_discards_handle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sidecar that closes without answering reports unavailable and drops the dead handle."""
+    from app.decision_client import _LIVE_PROCS, _SidecarUnavailable
+
+    proc = _ScriptedProc("")
+    client = JevClient(data_root=tmp_path, runtime_path=_runtime_path())
+    monkeypatch.setattr(client, "_proc", proc)
+    _LIVE_PROCS.add(proc)
+
+    try:
+        with pytest.raises(_SidecarUnavailable, match="sidecar closed"):
+            client.start()
+    finally:
+        _LIVE_PROCS.discard(proc)
+
+    assert proc.killed
+    assert client._proc is None
+
+
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    [("not json\n", RuntimeError), ("[1, 2]\n", TypeError), ('"text"\n', TypeError)],
+)
+def test_sidecar_rejects_unusable_reply_lines(
+    reply: str, error: type[Exception], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reply line that is not a JSON object fails the call and keeps the live handle."""
+    proc = _ScriptedProc(reply)
+    client = JevClient(data_root=tmp_path, runtime_path=_runtime_path())
+    monkeypatch.setattr(client, "_proc", proc)
+
+    with pytest.raises(error, match="malformed sidecar response"):
+        client.start()
+
+    assert not proc.killed and client._proc is proc
+
+
+def _sidecar_answering(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, response: Mapping[str, object]) -> JevClient:
+    """Client whose sidecar answers each request with the canned reply, keeping the request id."""
+    client = JevClient(data_root=tmp_path, runtime_path=tmp_path / "no-runtime.ts")
+
+    def _roundtrip(payload: Mapping[str, JSONValue]) -> dict[str, object]:
+        return {"id": payload["id"], **dict(response)}
+
+    monkeypatch.setattr(client, "_sidecar_roundtrip", _roundtrip)
+    monkeypatch.setattr(client, "_persist", _noop_persist)
+    return client
+
+
+@pytest.mark.parametrize(
+    ("response", "error", "match"),
+    [
+        (
+            {"id": "other", "raw": {}, "decisions": {"q": {"kind": "noul", "probability": 0.5}}},
+            TypeError,
+            "malformed sidecar response",
+        ),
+        ({"error": "boom", "raw": {}, "decisions": {}}, RuntimeError, "decide: boom"),
+        ({"raw": {}}, TypeError, "malformed sidecar response"),
+        ({"raw": {}, "decisions": {}}, TypeError, "malformed sidecar response"),
+        ({"raw": {}, "decisions": {"q": "not-a-decision"}}, TypeError, "malformed sidecar response"),
+        ({"raw": set(), "decisions": {"q": {"kind": "noul"}}}, ValueError, "not a JSON value"),
+    ],
+)
+def test_decide_rejects_unusable_sidecar_replies(
+    response: Mapping[str, object],
+    error: type[Exception],
+    match: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sidecar reply must carry this request's id, no error, and per-question decision objects."""
+    client = _sidecar_answering(tmp_path, monkeypatch, response)
+
+    with pytest.raises(error, match=match):
+        asyncio.run(client.decide({"s": 1}, {"q": {"type": "noul"}}, decision_type="t", session_id="s"))
+
+
+@pytest.mark.parametrize(
+    ("decision_type", "session_id", "questions", "message"),
+    [
+        ("", "s", {"q": {"type": "noul"}}, "decision_type required"),
+        ("t", "", {"q": {"type": "noul"}}, "session_id required"),
+        ("t", "s", {}, "missing_questions"),
+    ],
+)
+def test_decide_rejects_bad_request_before_transport(
+    decision_type: str,
+    session_id: str,
+    questions: Mapping[str, JSONValue],
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blank type or session and empty questions fail before any transport call."""
+    client, seen = _capturing_client(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(client.decide({"s": 1}, questions, decision_type=decision_type, session_id=session_id))
+
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    ("decision_type", "session_id", "questions", "message"),
+    [
+        (7, "s", {"q": {"type": "noul"}}, "decision_type required"),
+        ("t", None, {"q": {"type": "noul"}}, "session_id required"),
+        ("t", "s", [], "missing_questions"),
+    ],
+)
+def test_require_decision_request_rejects_non_text_and_non_mapping(
+    decision_type: object, session_id: object, questions: object, message: str
+) -> None:
+    """A non-text type or session and non-mapping questions are rejected by the request guard."""
+    from app.decision_client import _require_decision_request
+
+    with pytest.raises(ValueError, match=message):
+        _require_decision_request(decision_type, session_id, questions)
+
+
+def test_decide_rejects_unserializable_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A state json cannot encode fails as unserializable before any transport call."""
+    client, seen = _capturing_client(tmp_path, monkeypatch)
+
+    with pytest.raises(TypeError, match="unserializable request"):
+        asyncio.run(client.decide({"bad": object()}, {"q": {"type": "noul"}}, decision_type="t", session_id="s"))
+
+    assert seen == []
+
+
+def _choice_transport(
+    picks: Mapping[str, str],
+    probabilities: Mapping[str, Mapping[str, float]] | None = None,
+) -> Callable[[object, Mapping[str, JSONValue]], dict[str, JSONValue]]:
+    """Stub answer envelope: pick the named label per question, with optional explicit probabilities."""
+
+    def _run(_state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        answers: dict[str, JSONValue] = {}
+        for qid, question in questions.items():
+            criteria = question.get("criteria") if isinstance(question, dict) else None
+            labels: list[str] = sorted(criteria) if isinstance(criteria, dict) else []
+            chosen = picks[qid]
+            assert chosen in labels, (qid, chosen)
+            given: Mapping[str, float] | None = probabilities.get(qid) if probabilities else None
+            rest = 0.1 / max(len(labels) - 1, 1)
+            probs: dict[str, JSONValue] = {}
+            for label in labels:
+                probs[label] = given[label] if given is not None else (0.9 if label == chosen else rest)
+            answers[qid] = {"type": "choice", "choice": chosen, "probabilities": probs, "confidence": 0.9}
+        return {"answers": answers}
+
+    return _run
+
+
+def _stub_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transport: Callable[..., object]) -> JevClient:
+    client = JevClient(transport=transport, data_root=tmp_path)
+    monkeypatch.setattr(client, "_persist", _noop_persist)
+    return client
+
+
+@pytest.mark.parametrize(
+    ("pick", "action"),
+    [("alpha", "invoke"), (REASON_SENTINEL, "reason"), (RESOLVED_SENTINEL, "resolved")],
+)
+def test_adjudicate_maps_sidecar_choice_to_tool_decision(
+    pick: str, action: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adjudication over the whole registry returns invoke, reason, or resolved for the winner."""
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
+    registry: list[dict[str, JSONValue]] = [{"name": "alpha"}]
+    client = _stub_client(tmp_path, monkeypatch, _choice_transport({"tool_selection": pick}))
+
+    out = asyncio.run(client.adjudicate({"analyses": []}, node, session_id="s", registry=registry))
+
+    assert out.action == action
+    assert out.tool_name == ("alpha" if action == "invoke" else None)
+    assert out.tool_names == (("alpha",) if action == "invoke" else ())
+    assert out.confidence == 0.9
+
+
+def test_adjudicate_fans_out_close_runner_ups(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runner-ups above the parallel floor and inside the window join the fan-out, capped at three."""
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
+    registry: list[dict[str, JSONValue]] = [
+        {"name": "alpha"},
+        {"name": "beta"},
+        {"name": "gamma"},
+        {"name": "delta"},
+    ]
+    scores = {
+        "tool_selection": {
+            "alpha": 0.60,
+            "beta": 0.55,
+            "gamma": 0.50,
+            "delta": 0.20,
+            REASON_SENTINEL: 0.05,
+            RESOLVED_SENTINEL: 0.05,
+        }
+    }
+    client = _stub_client(tmp_path, monkeypatch, _choice_transport({"tool_selection": "alpha"}, scores))
+
+    out = asyncio.run(client.adjudicate({"analyses": []}, node, session_id="s", registry=registry))
+
+    assert out.action == "invoke" and out.tool_name == "alpha"
+    assert out.tool_names[0] == "alpha"
+    assert out.tool_names == ("alpha", "beta", "gamma")
+
+
+def test_select_tool_rejects_sidecar_decision_defects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sidecar decision that is not a choice, not in the registry, or not numeric fails the selection."""
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
+    registry: list[dict[str, JSONValue]] = [{"name": "alpha"}]
+    cases: list[tuple[JSONValue, type[Exception], str]] = [
+        ({"kind": "noul", "probability": 0.5}, TypeError, "malformed tool_selection decision"),
+        ({"kind": "choice", "choice": "alpha"}, TypeError, "malformed tool_selection decision"),
+        ({"kind": "choice", "choice": "outside", "probabilities": {"outside": 0.9}}, ValueError, "not in registry"),
+        (
+            {"kind": "choice", "choice": "alpha", "probabilities": {"alpha": "x"}, "confidence": 0.9},
+            TypeError,
+            "malformed tool_selection probabilities",
+        ),
+    ]
+
+    for decision, error, match in cases:
+        client = _sidecar_answering(tmp_path, monkeypatch, {"raw": {}, "decisions": {"tool_selection": decision}})
+        with pytest.raises(error, match=match):
+            asyncio.run(client.select_tool("obj", node, registry, session_id="s"))
+
+
+@pytest.mark.parametrize(
+    ("decision", "match"),
+    [
+        # A non-mapping decision fails the sidecar response typing before the kind check,
+        # so that defect names the response, not the selection (app/decision_client.py:1173).
+        (None, "malformed sidecar response"),
+        ({}, "malformed tool_selection decision"),
+        ({"choice": []}, "malformed tool_selection decision"),
+        ({"kind": "choice", "choice": []}, "malformed tool_selection decision"),
+    ],
+)
+def test_select_tool_rejects_missing_sidecar_decision(
+    decision: JSONValue, match: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing or shapeless tool_selection decision never becomes a ToolDecision."""
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
+    client = _sidecar_answering(tmp_path, monkeypatch, {"raw": {}, "decisions": {"tool_selection": decision}})
+
+    with pytest.raises(TypeError, match=match):
+        asyncio.run(client.select_tool("obj", node, [{"name": "alpha"}], session_id="s"))
+
+
+# --- decision answer parsing boundaries ---------------------------------------------------------
+
+_CHOICE_QUESTIONS: dict[str, JSONValue] = {"pick": {"type": "choice", "criteria": {"alpha": "A", "beta": "B"}}}
+_SCORE_QUESTIONS: dict[str, JSONValue] = {"s": {"type": "score", "criteria": ["low", "mid", "high"]}}
+_BOUNDARY_FLOATS = st.one_of(
+    st.just(0.0),
+    st.just(1.0),
+    st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False),
+    st.floats(min_value=-1.0, max_value=2.0, allow_nan=False, allow_infinity=False),
+    # NaN and the infinities carry no range, so they come from their own branch: the bounded
+    # branches above cannot mix them with min_value/max_value.
+    st.sampled_from((math.nan, math.inf, -math.inf)),
+)
+
+
+def test_parse_decisions_requires_an_answers_envelope() -> None:
+    """The response envelope must be an object whose answers field is an object."""
+    from app.decision_client import parse_decisions
+
+    questions: dict[str, JSONValue] = {"q": {"type": "noul"}}
+    raws: tuple[object, ...] = (None, [], "{}", {}, {"answers": None}, {"answers": []}, {"answers": "x"})
+    for raw in raws:
+        with pytest.raises(TypeError, match="malformed_decision_response"):
+            parse_decisions(questions, raw)
+
+
+def test_parse_decisions_requires_matching_answer_ids() -> None:
+    """Answers must cover exactly the supplied question ids."""
+    from app.decision_client import parse_decisions
+
+    questions: dict[str, JSONValue] = {"q": {"type": "noul"}, "other": {"type": "noul"}}
+    answer: JSONValue = {"type": "noul", "noul": 0.5}
+    with pytest.raises(ValueError, match="decision answers do not match questions"):
+        parse_decisions(questions, {"answers": {"q": answer}})
+    with pytest.raises(ValueError, match="decision answers do not match questions"):
+        parse_decisions(questions, {"answers": {"q": answer, "other": answer, "extra": answer}})
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        None,
+        [],
+        "noul",
+        {},
+        {"type": "choice"},
+        {"type": "noul"},
+        {"type": "noul", "noul": "0.5"},
+        {"type": "noul", "noul": True},
+        {"type": "noul", "noul": -0.01},
+        {"type": "noul", "noul": 1.01},
+        {"type": "noul", "noul": float("nan")},
+        {"type": "noul", "noul": float("inf")},
+    ],
+)
+def test_parse_noul_rejects_malformed_answers(answer: JSONValue) -> None:
+    """A noul answer is a probability in [0,1]; any other shape is malformed."""
+    from app.decision_client import parse_decisions
+
+    with pytest.raises(ValueError, match="malformed_decision_answer for q"):
+        parse_decisions({"q": {"type": "noul"}}, {"answers": {"q": answer}})
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        None,
+        {},
+        {"type": "choice"},
+        {"type": "choice", "choice": "alpha"},
+        {"type": "choice", "choice": "gamma", "probabilities": {"alpha": 0.5, "beta": 0.5}, "confidence": 0.5},
+        {"type": "choice", "choice": "alpha", "probabilities": [], "confidence": 0.5},
+        {"type": "choice", "choice": "alpha", "probabilities": {"alpha": 0.5}, "confidence": 0.5},
+        {
+            "type": "choice",
+            "choice": "alpha",
+            "probabilities": {"alpha": 0.5, "beta": 0.5, "gamma": 0.0},
+            "confidence": 0.5,
+        },
+        {"type": "choice", "choice": "alpha", "probabilities": {"alpha": 0.5, "beta": 1.5}, "confidence": 0.5},
+        {"type": "choice", "choice": "alpha", "probabilities": {"alpha": 0.5, "beta": 0.5}, "confidence": True},
+        {"type": "choice", "choice": "alpha", "probabilities": {"alpha": 0.5, "beta": 0.5}, "confidence": 1.5},
+    ],
+)
+def test_parse_choice_rejects_malformed_answers(answer: JSONValue) -> None:
+    """A choice answer declares a listed label, its exact probability map, and an in-range confidence."""
+    from app.decision_client import parse_decisions
+
+    with pytest.raises(ValueError, match="malformed_decision_answer for pick"):
+        parse_decisions(_CHOICE_QUESTIONS, {"answers": {"pick": answer}})
+
+
+def test_parse_choice_orders_probabilities_by_label() -> None:
+    """The stored probability map lists the declared labels in label order, whatever order the provider used."""
+    from app.decision_client import parse_decisions
+
+    answer: JSONValue = {
+        "type": "choice",
+        "choice": "beta",
+        "probabilities": {"beta": 0.8, "alpha": 0.2},
+        "confidence": 0.8,
+    }
+    out = parse_decisions(_CHOICE_QUESTIONS, {"answers": {"pick": answer}})
+
+    assert out == {
+        "pick": {
+            "kind": "choice",
+            "choice": "beta",
+            "probabilities": {"alpha": 0.2, "beta": 0.8},
+            "confidence": 0.8,
+        }
+    }
+    probabilities = out["pick"]["probabilities"]
+    assert isinstance(probabilities, dict)
+    assert list(probabilities) == ["alpha", "beta"]
+
+
+def test_parse_decisions_prefers_supplied_choice_options() -> None:
+    """Supplied choice options replace the question criteria; an empty entry falls back to the criteria."""
+    from app.decision_client import parse_decisions
+
+    questions: dict[str, JSONValue] = {"pick": {"type": "choice", "criteria": {"alpha": "A"}}}
+    raw: JSONValue = {
+        "answers": {"pick": {"type": "choice", "choice": "gamma", "probabilities": {"gamma": 1.0}, "confidence": 1.0}}
+    }
+
+    assert parse_decisions(questions, raw, {"pick": {"gamma": "G"}}) == {
+        "pick": {
+            "kind": "choice",
+            "choice": "gamma",
+            "probabilities": {"gamma": 1.0},
+            "confidence": 1.0,
+        }
+    }
+    with pytest.raises(ValueError, match="malformed_decision_answer for pick"):
+        parse_decisions(questions, raw, {"pick": {}})
+
+
+def test_parse_score_keeps_optional_fields_and_legend() -> None:
+    """A score answer keeps its score, distribution, confidence, and legend in that order."""
+    from app.decision_client import parse_decisions
+
+    answer: JSONValue = {
+        "type": "score",
+        "score": 1.5,
+        "confidence": 0.99,
+        "probabilities": {"0": 0.0, "1": 0.5, "2": 0.5},
+        "legend": {"0": "low"},
+    }
+
+    assert parse_decisions(_SCORE_QUESTIONS, {"answers": {"s": answer}}) == {
+        "s": {
+            "kind": "score",
+            "score": 1.5,
+            "confidence": 0.99,
+            "probabilities": {"0": 0.0, "1": 0.5, "2": 0.5},
+            "raw": {"0": "low"},
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        None,
+        {"type": "score"},
+        {"type": "score", "score": True},
+        {"type": "score", "score": "1"},
+        {"type": "score", "score": float("nan")},
+        {"type": "score", "score": float("inf")},
+        {"type": "score", "score": 3.0},
+        {"type": "score", "score": -0.5},
+        {"type": "score", "score": 1.0, "confidence": 1.2},
+        {"type": "score", "score": 1.0, "probabilities": []},
+        {"type": "score", "score": 1.0, "probabilities": {"0": 2.0}},
+    ],
+)
+def test_parse_score_rejects_malformed_answers(answer: JSONValue) -> None:
+    """A score answer is a finite number inside the rubric range, with optional valid extras."""
+    from app.decision_client import parse_decisions
+
+    with pytest.raises(ValueError, match="malformed_decision_answer for s"):
+        parse_decisions(_SCORE_QUESTIONS, {"answers": {"s": answer}})
+
+
+def test_parse_score_range_comes_from_criteria_or_levels() -> None:
+    """The rubric is the question's criteria or levels array; anything shorter leaves the range open."""
+    from app.decision_client import parse_decisions
+
+    for key in ("criteria", "levels"):
+        questions: dict[str, JSONValue] = {"s": {"type": "score", key: ["a", "b"]}}
+        assert parse_decisions(questions, {"answers": {"s": {"type": "score", "score": 1}}}) == {
+            "s": {"kind": "score", "score": 1}
+        }
+        with pytest.raises(ValueError, match="malformed_decision_answer for s"):
+            parse_decisions(questions, {"answers": {"s": {"type": "score", "score": 2}}})
+    single: dict[str, JSONValue] = {"s": {"type": "score", "criteria": ["only"]}}
+    assert parse_decisions(single, {"answers": {"s": {"type": "score", "score": 7}}}) == {
+        "s": {"kind": "score", "score": 7}
+    }
+
+
+def test_parse_decisions_infers_kind_from_the_answer_type() -> None:
+    """An undeclared question type falls back to the answer's own type tag."""
+    from app.decision_client import parse_decisions
+
+    out = parse_decisions(
+        {"s": {"instructions": "score it"}},
+        {"answers": {"s": {"type": "score", "score": 2, "confidence": 0.5}}},
+    )
+
+    assert out == {"s": {"kind": "score", "score": 2, "confidence": 0.5}}
+
+
+@settings(max_examples=60, derandomize=True, deadline=None)
+@given(_BOUNDARY_FLOATS)
+def test_prop_noul_probability_boundary(probability: float) -> None:
+    """A noul probability round-trips inside [0,1]; NaN, infinities, and outliers are malformed."""
+    from app.decision_client import parse_decisions
+
+    raw = {"answers": {"q": {"type": "noul", "noul": probability}}}
+    if 0.0 <= probability <= 1.0:
+        assert parse_decisions({"q": {"type": "noul"}}, raw) == {"q": {"kind": "noul", "probability": probability}}
+    else:
+        with pytest.raises(ValueError, match="malformed_decision_answer for q"):
+            parse_decisions({"q": {"type": "noul"}}, raw)
+
+
+@settings(max_examples=60, derandomize=True, deadline=None)
+@given(_BOUNDARY_FLOATS, _BOUNDARY_FLOATS, _BOUNDARY_FLOATS)
+def test_prop_choice_probability_boundary(alpha: float, beta: float, confidence: float) -> None:
+    """A choice answer needs every declared label and an in-range confidence; in-range values round-trip."""
+    from app.decision_client import parse_decisions
+
+    raw = {
+        "answers": {
+            "pick": {
+                "type": "choice",
+                "choice": "alpha",
+                "probabilities": {"alpha": alpha, "beta": beta},
+                "confidence": confidence,
+            }
+        }
+    }
+    if 0.0 <= alpha <= 1.0 and 0.0 <= beta <= 1.0 and 0.0 <= confidence <= 1.0:
+        assert parse_decisions(_CHOICE_QUESTIONS, raw) == {
+            "pick": {
+                "kind": "choice",
+                "choice": "alpha",
+                "probabilities": {"alpha": alpha, "beta": beta},
+                "confidence": confidence,
+            }
+        }
+    else:
+        with pytest.raises(ValueError, match="malformed_decision_answer for pick"):
+            parse_decisions(_CHOICE_QUESTIONS, raw)
+
+
+@settings(max_examples=60, derandomize=True, deadline=None)
+@given(_BOUNDARY_FLOATS)
+def test_prop_score_range_boundary(score: float) -> None:
+    """A score round-trips inside the rubric range; non-finite and out-of-range scores are malformed."""
+    from app.decision_client import parse_decisions
+
+    raw = {"answers": {"s": {"type": "score", "score": score}}}
+    if 0.0 <= score <= 2.0:
+        assert parse_decisions(_SCORE_QUESTIONS, raw) == {"s": {"kind": "score", "score": score}}
+    else:
+        with pytest.raises(ValueError, match="malformed_decision_answer for s"):
+            parse_decisions(_SCORE_QUESTIONS, raw)
+
+
+@settings(max_examples=60, derandomize=True, deadline=None)
+@given(st.sampled_from(_FORMATS), _BOUNDARY_FLOATS)
+def test_prop_envelope_rejects_non_finite_probability_bodies(api_format: str, probability: float) -> None:
+    """NaN and Infinity are not JSON: those bodies are rejected; finite probabilities round-trip."""
+    from app.decision_client import _decision_envelope
+
+    answers = {"q": {"type": "noul", "noul": probability}}
+    body = _body(api_format, answers)
+    if math.isfinite(probability):
+        assert _decision_envelope(body, "configured", api_format) == {"answers": answers, "model": "configured"}
+    else:
+        with pytest.raises(TypeError, match="malformed_decision_response"):
+            _decision_envelope(body, "configured", api_format)
+
+
+def test_decision_envelope_normalizes_usage_keys_per_format() -> None:
+    """Each protocol's token counts land in the envelope's own keys; the configured model is the fallback."""
+    from app.decision_client import _decision_envelope
+
+    chat = _chat_body({"answers": {}}, model="reported", usage={"prompt_tokens": 3, "completion_tokens": 4, "cost": 1})
+    native = _native_body({}, model="reported", usage={"input_tokens": 5, "output_tokens": 6, "cost": 1})
+
+    chat_out = _decision_envelope(chat, "configured", "chat_completions")
+    native_out = _decision_envelope(native, "configured", "decisions")
+
+    assert chat_out == {"answers": {}, "model": "reported", "usage": {"input_tokens": 3, "output_tokens": 4}}
+    assert native_out == {"answers": {}, "model": "reported", "usage": {"input_tokens": 5, "output_tokens": 6}}
+    usage = chat_out["usage"]
+    assert isinstance(usage, dict)
+    assert list(usage) == ["input_tokens", "output_tokens"]
+    assert _decision_envelope(_chat_body({"answers": {}}), "configured", "chat_completions") == {
+        "answers": {},
+        "model": "configured",
+    }
+    assert _decision_envelope(_native_body({}), "configured", "decisions") == {"answers": {}, "model": "configured"}
+
+
+def test_decision_envelope_rejects_chat_defects() -> None:
+    """A body without a usable choice, or with a refused, truncated, or empty message, is rejected."""
+    from app.decision_client import _decision_envelope
+
+    bodies = [
+        b'{"choices": []}',
+        b'{"choices": [{}]}',
+        b'{"choices": [{"message": {"content": {}}}]}',
+        b'{"choices": [{"message": {"refusal": "no"}}]}',
+        b'{"choices": [{"message": {"content": "{}"}, "finish_reason": "length"}]}',
+        b'{"choices": [{"message": {"content": " "}}]}',
+        _chat_body("not JSON"),
+        _chat_body([1, 2]),
+    ]
+    for body in bodies:
+        with pytest.raises(TypeError, match="malformed_decision_response"):
+            _decision_envelope(body, "configured", "chat_completions")
+    with pytest.raises(TypeError, match="malformed_decision_response"):
+        _decision_envelope(b"[]", "configured", "decisions")
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
+def test_decision_envelope_accepts_utf8_non_ascii_body(api_format: str) -> None:
+    """A raw UTF-8 non-ASCII body decodes; the reported model keeps its characters."""
+    from app.decision_client import _decision_envelope
+
+    choice: JSONValue = {"message": {"content": '{"answers": {}}'}, "finish_reason": "stop"}
+    fields: dict[str, JSONValue] = {"answers": {}} if api_format == "decisions" else {"choices": [choice]}
+    body = json.dumps({**fields, "model": "modèle-é"}, ensure_ascii=False).encode()
+    assert b"\\u" not in body
+    assert _decision_envelope(body, "configured", api_format) == {"answers": {}, "model": "modèle-é"}
+
+
+# --- registry resolution ------------------------------------------------------------------------
+
+
+def test_auto_registry_prefers_scheduler_manifests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-empty scheduler registry is returned as-is; the degraded build never runs."""
+    import app.decision_client as dc
+
+    manifest: list[dict[str, JSONValue]] = [{"name": "alpha"}]
+
+    def _unused() -> list[dict[str, JSONValue]]:
+        raise AssertionError("fallback ran for a healthy scheduler registry")
+
+    monkeypatch.setattr("app.research.scheduler.build_registry", lambda: manifest)
+    monkeypatch.setattr(dc, "_fallback_registry", _unused)
+
+    assert dc._auto_registry() is manifest
+
+
+def test_auto_registry_falls_back_when_scheduler_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A scheduler that raises, or returns nothing, yields the degraded canonical registry."""
+    import app.decision_client as dc
+    from app.research.scheduler import build_registry
+
+    def _boom() -> list[dict[str, JSONValue]]:
+        raise AttributeError("build_registry is gone")
+
+    monkeypatch.setattr("app.research.scheduler.build_registry", _boom)
+    fallback = dc._auto_registry()
+
+    assert fallback and all(isinstance(entry.get("name"), str) for entry in fallback)
+    assert list(fallback[0]) == list(build_registry()[0])
+
+    monkeypatch.setattr("app.research.scheduler.build_registry", list)
+    assert [entry["name"] for entry in dc._auto_registry()] == [entry["name"] for entry in fallback]
+
+
+def test_fallback_registry_renders_discovery_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A known tool carries its discovery metadata and declared prerequisites; unknown names stay blank."""
+    import app.decision_client as dc
+    import app.tools
+    from app.research.scheduler import _HANDLE_PARAMS
+    from app.tools import TOOL_DISCOVERY_REGISTRY
+
+    known = next(iter(TOOL_DISCOVERY_REGISTRY))
+    handle = next(iter(sorted(_HANDLE_PARAMS)))
+    unknown = "zz_not_a_canonical_tool"
+
+    def _tools(*args: object, **kwargs: object) -> list[object]:
+        return [
+            "not-a-tool",
+            {},
+            {"function": "not-a-mapping"},
+            {"function": {"name": ""}},
+            {"function": {"name": 7}},
+            {"function": {"name": known, "parameters": {"required": [handle, 7]}}},
+            {"function": {"name": unknown, "description": "described", "parameters": "not-a-mapping"}},
+        ]
+
+    monkeypatch.setattr(app.tools, "tools_for_capabilities", _tools)
+    entries = dc._fallback_registry()
+    meta = TOOL_DISCOVERY_REGISTRY[known]
+
+    assert [entry["name"] for entry in entries] == [known, unknown]
+    assert entries[0]["purpose"] == meta.summary
+    assert entries[0]["useWhen"] == "; ".join(meta.choose_when)
+    assert entries[0]["avoidWhen"] == "; ".join(meta.reject_when)
+    assert entries[0]["conflicts"] == ", ".join(meta.conflicts_with)
+    assert entries[0]["nextTools"] == ", ".join(meta.related_tools)
+    assert entries[0]["evidence"] == meta.output_kind
+    assert entries[0]["prerequisites"] == f"needs {handle}"
+    assert entries[0]["parameters"] == {"required": [handle, 7]}
+    assert entries[1]["description"] == "described"
+    assert entries[1]["domain"] == "unknown"
+    assert entries[1]["purpose"] == "" and entries[1]["prerequisites"] == ""
+    assert entries[1]["nextTools"] == "" and entries[1]["keyInputs"] == "req()"
+    assert entries[1]["parameters"] == {}
+
+
+def test_fallback_registry_survives_missing_scheduler_constants(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the scheduler handle and blind lists the degraded manifest stays conservative."""
+    import app.decision_client as dc
+
+    monkeypatch.delattr("app.research.scheduler._HANDLE_PARAMS")
+    monkeypatch.delattr("app.research.scheduler._PIT_BLIND_TOOLS")
+
+    assert dc._scheduler_metadata() == (frozenset(), frozenset())
+    entries = dc._fallback_registry()
+    assert entries
+    assert all(entry["pitSupport"] == "PIT-scoped" for entry in entries)
+    assert all(entry["prerequisites"] == "" for entry in entries)
+
+
+# --- persistence: domain record plus run recording ----------------------------------------------
+
+
+def _persist_call(
+    client: JevClient,
+    decisions: dict[str, dict[str, JSONValue]],
+    *,
+    questions: dict[str, JSONValue] | None = None,
+    raw: object = None,
+    via: str = "http",
+    jev_in: int | None = None,
+    jev_out: int | None = None,
+    jev_model: str | None = None,
+) -> None:
+    client._persist(
+        decision_type="tool_selection",
+        session_id="s1",
+        node_id="n1",
+        job_id=None,
+        questions=questions if questions is not None else {"q": {"type": "noul"}},
+        decisions=decisions,
+        raw=raw,
+        via=via,
+        latency_ms=1.5,
+        started_at="2026-10-14T00:00:00+00:00",
+        completed_at="2026-10-14T00:00:01+00:00",
+        jev_in=jev_in,
+        jev_out=jev_out,
+        jev_model=jev_model,
+    )
+
+
+def test_persist_projects_every_decision_kind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each answer kind lands in the record's probabilities projection; the run event keeps the round."""
+    from types import SimpleNamespace
+
+    from app.decision_client import _decision_record
+    from app.research.models import DecisionRecord
+
+    seen: dict[str, object] = {}
+    client = JevClient(data_root=tmp_path)
+
+    def _record_domain(record: object, **kwargs: object) -> None:
+        seen.update({"record": record, "domain": kwargs})
+
+    def _record_event(*args: object, **kwargs: object) -> None:
+        seen.update({"event": kwargs})
+
+    def _record_model_call(**kwargs: object) -> None:
+        seen.update({"model": kwargs})
+
+    monkeypatch.setattr(client, "_persist_domain", _record_domain)
+    monkeypatch.setattr(
+        "app.decision_client.get_current_recorder",
+        lambda: SimpleNamespace(enabled=True, record_event=_record_event, record_model_call=_record_model_call),
+    )
+    monkeypatch.setenv("DECISION_API_URL", "https://decisions.test/v1/chat")
+    decisions: dict[str, dict[str, JSONValue]] = {
+        "n": {"kind": "noul", "probability": 0.5},
+        "c": {"kind": "choice", "choice": "a", "probabilities": {"a": 1.0}},
+        "s": {"kind": "score", "score": 2, "probabilities": {"a": 0.5}, "confidence": 0.7},
+        "u": {"kind": "other", "note": "kept"},
+    }
+
+    _persist_call(client, decisions, raw={"answers": {}}, jev_in=3, jev_out=4, jev_model="m")
+
+    record = seen["record"]
+    assert isinstance(record, DecisionRecord)
+    assert record.probabilities == {
+        "n": {"probability": 0.5},
+        "c": {"a": 1.0},
+        "s": {"score": 2, "a": 0.5, "confidence": 0.7},
+        "u": {"kind": "other", "note": "kept"},
+    }
+    assert record.selected == decisions
+    assert record.confidence is None
+    assert record.candidates == {"q": {"type": "noul"}}
+    domain = seen["domain"]
+    assert isinstance(domain, dict)
+    assert domain["provider"] == "https://decisions.test/v1/chat"
+    assert domain["request"] == {"state": None, "questions": {"q": {"type": "noul"}}}
+    event = seen["event"]
+    assert isinstance(event, dict)
+    assert event["model"] == "m" and event["success"] is True and event["duration_ms"] == 1.5
+    metadata = event["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["usage"] == {"input_tokens": 3, "output_tokens": 4}
+    assert metadata["session_id"] == "s1" and metadata["node_id"] == "n1"
+    assert event["result_summary"] == json.dumps(decisions, sort_keys=True)
+    model_call = seen["model"]
+    assert isinstance(model_call, dict)
+    assert model_call["usage"] == {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+    assert model_call["provider"] == "https://decisions.test/v1/chat"
+    junk: dict[str, object] = {**decisions, "junk": "not-a-decision"}
+    with_junk = _decision_record(
+        decision_type="tool_selection",
+        session_id="s1",
+        node_id="n1",
+        job_id=None,
+        questions={"q": {"type": "noul"}},
+        decisions=junk,
+    )
+    assert with_junk.probabilities == record.probabilities
+    assert with_junk.selected == junk
+
+
+def test_persist_sole_decision_carries_its_confidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A single-decision round keeps its confidence when it is a probability."""
+    from app.decision_client import _decision_record
+    from app.research.models import DecisionRecord
+
+    seen: dict[str, object] = {}
+    client = JevClient(data_root=tmp_path)
+
+    def _record_domain(record: object, **kwargs: object) -> None:
+        seen.update({"record": record})
+
+    monkeypatch.setattr(client, "_persist_domain", _record_domain)
+    monkeypatch.setattr("app.decision_client.get_current_recorder", lambda: None)
+
+    _persist_call(client, {"q": {"kind": "choice", "choice": "a", "probabilities": {"a": 1.0}, "confidence": 0.4}})
+    record = seen["record"]
+    assert isinstance(record, DecisionRecord)
+    assert record.confidence == 0.4
+
+    _persist_call(client, {"q": {"kind": "choice", "choice": "a", "probabilities": {"a": 1.0}, "confidence": 1.4}})
+    record = seen["record"]
+    assert isinstance(record, DecisionRecord)
+    assert record.confidence is None
+
+    non_decision = _decision_record(
+        decision_type="tool_selection",
+        session_id="s1",
+        node_id="n1",
+        job_id=None,
+        questions={"q": {"type": "noul"}},
+        decisions={"q": "not-a-decision"},
+    )
+    assert non_decision.confidence is None
+
+
+@pytest.mark.parametrize(
+    ("jev_in", "jev_out", "expected"),
+    [
+        (3, 4, {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}),
+        (3, None, {"prompt_tokens": 3}),
+        (None, 4, {"completion_tokens": 4}),
+        (None, None, None),
+    ],
+)
+def test_persist_runs_records_usage_variants(
+    jev_in: int | None,
+    jev_out: int | None,
+    expected: dict[str, object] | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the counts the provider reported reach the recorded model call."""
+    from types import SimpleNamespace
+
+    seen: dict[str, object] = {}
+    client = JevClient(data_root=tmp_path)
+
+    def _record_domain(record: object, **kwargs: object) -> None:
+        return None
+
+    def _record_event(*args: object, **kwargs: object) -> None:
+        seen.update({"event": kwargs})
+
+    def _record_model_call(**kwargs: object) -> None:
+        seen.update({"model": kwargs})
+
+    monkeypatch.setattr(client, "_persist_domain", _record_domain)
+    monkeypatch.setattr(
+        "app.decision_client.get_current_recorder",
+        lambda: SimpleNamespace(enabled=True, record_event=_record_event, record_model_call=_record_model_call),
+    )
+    monkeypatch.setenv("DECISION_API_URL", "https://decisions.test/v1/chat")
+
+    _persist_call(client, {"q": {"kind": "noul", "probability": 0.5}}, jev_in=jev_in, jev_out=jev_out, jev_model="m")
+
+    model_call = seen.get("model")
+    assert isinstance(model_call, dict)
+    assert model_call["usage"] == expected
+
+
+@pytest.mark.parametrize("recorder", [None, SimpleNamespace(enabled=False), SimpleNamespace(enabled=None)])
+def test_persist_runs_skips_without_an_enabled_recorder(
+    recorder: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No recorder, a disabled recorder, and a stub round record no events, but still store the record."""
+    seen: dict[str, object] = {}
+    client = JevClient(data_root=tmp_path)
+
+    def _record_domain(record: object, **kwargs: object) -> None:
+        seen.update({"domain": 1})
+
+    monkeypatch.setattr(client, "_persist_domain", _record_domain)
+    monkeypatch.setattr("app.decision_client.get_current_recorder", lambda: recorder)
+
+    _persist_call(client, {"q": {"kind": "noul", "probability": 0.5}}, via="stub")
+
+    assert seen == {"domain": 1}
+
+
+def test_persist_skips_unserializable_decisions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A decision that is not a JSON value is skipped: no record, no run event, no raise."""
+    from app.decision_client import _decision_record
+
+    seen: dict[str, object] = {}
+    client = JevClient(data_root=tmp_path)
+
+    def _record_domain(record: object, **kwargs: object) -> None:
+        seen.update({"domain": 1})
+
+    monkeypatch.setattr(client, "_persist_domain", _record_domain)
+    monkeypatch.setattr("app.decision_client.get_current_recorder", lambda: seen.update({"recorder": 1}))
+
+    _persist_call(client, {"q": {"kind": "other", "bad": math.nan}})
+
+    assert seen == {}
+    with pytest.raises(ValueError, match="not a JSON value"):
+        _decision_record(
+            decision_type="tool_selection",
+            session_id="s1",
+            node_id="n1",
+            job_id=None,
+            questions={"q": {"type": "noul"}},
+            decisions={"q": {"kind": "other", "bad": object()}},
+        )
+
+
+def test_persist_swallows_domain_and_runs_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failing domain store or recorder never breaks the decision call."""
+    from types import SimpleNamespace
+
+    def _domain_boom(record: object, **kwargs: object) -> None:
+        raise OSError("disk gone")
+
+    def _event_boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("recorder gone")
+
+    def _model_boom(**kwargs: object) -> None:
+        raise ValueError("usage rejected")
+
+    client = JevClient(data_root=tmp_path)
+    monkeypatch.setattr(client, "_persist_domain", _domain_boom)
+    monkeypatch.setattr(
+        "app.decision_client.get_current_recorder",
+        lambda: SimpleNamespace(enabled=True, record_event=_event_boom, record_model_call=_model_boom),
+    )
+    monkeypatch.setenv("DECISION_API_URL", "https://decisions.test/v1/chat")
+
+    _persist_call(client, {"q": {"kind": "noul", "probability": 0.5}}, jev_in=1, jev_out=2, jev_model="m")
+
+
+def test_persist_swallows_a_failing_model_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A recorder that rejects the model call still keeps the decision round."""
+    from types import SimpleNamespace
+
+    seen: dict[str, object] = {}
+    client = JevClient(data_root=tmp_path)
+
+    def _record_domain(record: object, **kwargs: object) -> None:
+        seen.update({"domain": 1})
+
+    def _record_event(*args: object, **kwargs: object) -> None:
+        seen.update({"event": 1})
+
+    def _record_model_call(**kwargs: object) -> None:
+        raise ValueError("usage rejected")
+
+    monkeypatch.setattr(client, "_persist_domain", _record_domain)
+    monkeypatch.setattr(
+        "app.decision_client.get_current_recorder",
+        lambda: SimpleNamespace(enabled=True, record_event=_record_event, record_model_call=_record_model_call),
+    )
+    monkeypatch.setenv("DECISION_API_URL", "https://decisions.test/v1/chat")
+
+    _persist_call(client, {"q": {"kind": "noul", "probability": 0.5}}, jev_in=1, jev_out=2, jev_model="m")
+
+    assert seen == {"domain": 1, "event": 1}
+
+
+# --- post-tool verdict, prompt phases, and logging projections ----------------------------------
+
+_ENTRY_REGISTRY: list[dict[str, JSONValue]] = [{"name": "get_current_time"}]
+
+
+def test_assess_entry_tool_rejects_defective_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A blank prompt, a missing tool name, or a defective registry fails before any decision call."""
+    from app.decision_client import _assess_text
+
+    client, seen = _capturing_client(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="blank prompt"):
+        asyncio.run(client.assess_entry_tool("   ", "get_current_time"))
+    with pytest.raises(ValueError, match="tool required"):
+        asyncio.run(client.assess_entry_tool("what time is it?", ""))
+    assert seen == []
+    with pytest.raises(ValueError, match="blank prompt"):
+        _assess_text(7, "get_current_time")
+    with pytest.raises(ValueError, match="tool required"):
+        _assess_text("what time is it?", 7)
+
+    monkeypatch.setattr("app.decision_client._auto_registry", list)
+    with pytest.raises(ValueError, match="empty registry"):
+        asyncio.run(client.assess_entry_tool("what time is it?", "get_current_time"))
+
+    cases: list[tuple[list[dict[str, JSONValue]], str]] = [
+        ([{}], "needs a name"),
+        ([{"name": ""}], "needs a name"),
+        ([{"name": REASON_SENTINEL}], "duplicate tool"),
+    ]
+    for registry, error in cases:
+        monkeypatch.setattr("app.decision_client._auto_registry", lambda registry=registry: registry)
+        with pytest.raises(ValueError, match=error):
+            asyncio.run(client.assess_entry_tool("what time is it?", "get_current_time"))
+
+    assert seen == []
+
+
+def test_assess_entry_tool_returns_the_winner_and_shapes_the_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The post-tool verdict returns a declared winner and shows the clipped outcome in the question."""
+    monkeypatch.setattr("app.decision_client._auto_registry", lambda: _ENTRY_REGISTRY)
+    client, seen = _capturing_client(tmp_path, monkeypatch)
+
+    verdict = asyncio.run(
+        client.assess_entry_tool(
+            "what time is it?",
+            "get_current_time",
+            {"tz": "UTC"},
+            {"ok": True, "content": "x" * 4000, "error": "e" * 900, "category": "time"},
+        )
+    )
+
+    assert verdict == "get_current_time"
+    state, questions = seen[0]
+    assert isinstance(state, dict)
+    assert state["tool"] == "get_current_time" and state["arguments"] == {"tz": "UTC"}
+    outcome = state["outcome"]
+    assert isinstance(outcome, str)
+    assert outcome.startswith("tool get_current_time ok=True category='time'")
+    assert f"content={'x' * 1500!r}" in outcome and f"error={'e' * 500!r}" in outcome
+    assess = questions["assess"]
+    assert isinstance(assess, dict)
+    criteria = assess["criteria"]
+    assert isinstance(criteria, dict)
+    assert set(criteria) == {
+        "get_current_time",
+        REASON_SENTINEL,
+        RESOLVED_SENTINEL,
+        "research_required",
+    }
+    instructions = assess["instructions"]
+    assert isinstance(instructions, str)
+    assert "the one registry tool to run next." in instructions
+    assert "decode relative dates before choosing" in instructions
+
+
+def test_assess_entry_tool_rejects_a_winner_outside_the_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sidecar verdict outside the declared options is a defect, never a guessed tool."""
+    monkeypatch.setattr("app.decision_client._auto_registry", lambda: _ENTRY_REGISTRY)
+    decisions: dict[str, JSONValue] = {"assess": {"kind": "choice", "choice": "nope", "probabilities": {"nope": 1.0}}}
+    client = _sidecar_answering(tmp_path, monkeypatch, {"raw": {}, "decisions": decisions})
+
+    with pytest.raises(ValueError, match="winner 'nope' not in options"):
+        asyncio.run(client.assess_entry_tool("what time is it?", "get_current_time"))
+
+
+def test_node_dict_reads_dataclasses_to_dict_and_attributes() -> None:
+    """Node projections come from a mapping, a to_dict method, dataclass fields, or plain attributes."""
+    from dataclasses import dataclass
+
+    from app.decision_client import _node_dict
+
+    @dataclass
+    class _Node:
+        node_id: str
+        question: str
+
+    class _ToDict:
+        def to_dict(self) -> object:
+            return {"id": "n2", "question": "why?"}
+
+    class _NotAMapping:
+        def to_dict(self) -> object:
+            return "nope"
+
+    class _Attrs:
+        node_id = "n3"
+        question = "how?"
+        depends_on = ("a", "b")
+
+    assert _node_dict({"node_id": "n1", "question": "q?", "unlisted": 1}) == {"node_id": "n1", "question": "q?"}
+    assert _node_dict(_Node(node_id="n4", question="q4?")) == {"node_id": "n4", "question": "q4?"}
+    assert _node_dict(_ToDict()) == {"id": "n2", "question": "why?"}
+    assert _node_dict(_NotAMapping()) == {}
+    assert _node_dict(_Attrs()) == {"node_id": "n3", "question": "how?", "depends_on": ["a", "b"]}
+    assert _node_dict(object()) == {}
+
+
+class _HostileDict(dict[str, JSONValue]):
+    """Mapping whose lookups always fail, standing in for a corrupt decision payload."""
+
+    @override
+    def get(self, *args: object, **kwargs: object) -> JSONValue:
+        raise TypeError("boom")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, (None, None, None)),
+        ({}, (None, None, None)),
+        ({"model": ""}, (None, None, None)),
+        ({"model": "m"}, (None, None, "m")),
+        ({"model": "m", "usage": {"input_tokens": 3, "output_tokens": 4}}, (3, 4, "m")),
+        ({"model": "m", "usage": {"input_tokens": True, "output_tokens": "4"}}, (None, None, "m")),
+        ({"model": 7, "usage": {"input_tokens": 0}}, (0, None, None)),
+    ],
+)
+def test_jev_usage_reads_only_wire_token_counts(
+    raw: JSONValue, expected: tuple[int | None, int | None, str | None]
+) -> None:
+    """Usage extraction keeps integer token counts and a non-empty model name, and nothing else."""
+    from app.decision_client import _jev_usage
+
+    assert _jev_usage(raw) == expected
+
+
+def test_logging_projections_never_raise_on_hostile_mappings() -> None:
+    """Usage and choice summaries are logging-only: a hostile mapping yields the fallback text."""
+    from app.decision_client import _choice_summary, _jev_usage
+
+    assert _jev_usage(_HostileDict()) == (None, None, None)
+    assert _choice_summary(_HostileDict()) == "winner=? conf=? top3=[] margin=?"
+
+
+def test_choice_summary_shapes_winner_top3_and_margin() -> None:
+    """The logging one-liner reports the winner, its confidence, the top three, and the margin."""
+    from app.decision_client import _choice_summary
+
+    assert _choice_summary(None) == "winner=- conf=- top3=[] margin=0.00"
+    assert _choice_summary(
+        {"choice": "a", "confidence": 0.5, "probabilities": {"a": 0.9, "b": 0.6, "c": 0.2, "d": 0.1}}
+    ) == ("winner=a conf=0.50 top3=[a:0.90,b:0.60,c:0.20] margin=0.30")
+    assert _choice_summary({"choice": "a", "confidence": 1.5, "probabilities": {"a": 2.0, "b": "x"}}) == (
+        "winner=a conf=1.50 top3=[] margin=0.00"
+    )
+    assert _choice_summary({"choice": "", "confidence": True, "probabilities": [1]}) == (
+        "winner=- conf=- top3=[] margin=0.00"
+    )
+
+
+def test_observation_lines_caps_at_five_recent_records() -> None:
+    """Only the last ten records are inspected and at most five observation lines come back."""
+    from app.decision_client import _observation_lines
+
+    assert _observation_lines(None) == []
+    assert _observation_lines({"a": 1}) == []
+    many: list[JSONValue] = [{"tool": f"t{i}", "outcome_summary": "s"} for i in range(12)]
+
+    assert _observation_lines(many) == [f"t{i}: s" for i in range(2, 7)]
+
+
+def test_tool_options_prompt_rejects_defective_input() -> None:
+    """An empty registry, a nameless node, and a duplicate or colliding entry are defects."""
+    from app.decision_client import _registry_options, _tool_options_prompt
+
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
+    registry: list[dict[str, JSONValue]] = [{"name": "a"}]
+
+    with pytest.raises(ValueError, match="empty registry"):
+        _tool_options_prompt([], node, [], [])
+    bad_nodes: tuple[Mapping[str, JSONValue], ...] = ({}, {"node_id": "n1"}, {"question": "q?"}, {"id": ""})
+    for bad_node in bad_nodes:
+        with pytest.raises(ValueError, match="needs nodeId and question"):
+            _tool_options_prompt(registry, bad_node, [], [])
+    with pytest.raises(ValueError, match="needs a name"):
+        _tool_options_prompt([{}], node, [], [])
+    with pytest.raises(ValueError, match="tool_selection: registry entry needs a name"):
+        _registry_options(["junk"], {}, "tool_selection")
+    with pytest.raises(ValueError, match="duplicate tool a"):
+        _tool_options_prompt([{"name": "a"}, {"name": "a"}], node, [], [])
+    with pytest.raises(ValueError, match="collides with sentinel"):
+        _tool_options_prompt([{"name": REASON_SENTINEL}], node, [], [])
+
+
+def test_tool_options_prompt_renders_evidence_observations_and_why() -> None:
+    """The question text carries the node question, why-it-matters, evidence ids, and observations."""
+    from app.decision_client import _SENTINEL_DESCRIPTIONS, _tool_options_prompt
+
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?", "why_it_matters": " because "}
+    evidence: list[JSONValue] = [
+        {"evidence_id": "ev-1", "claim_text": "c"},
+        {"tool": "t", "tool_result_ref": "r", "outcome_summary": "  one   two  "},
+        {"tool": "u", "outcome_summary": "x", "error": "  boom  "},
+        {"evidence_id": "ev-2"},
+        {"id": "ev-3"},
+        "junk",
+        {"outcome_summary": "   "},
+    ]
+
+    options, prompt = _tool_options_prompt(
+        [{"name": "a"}], node, evidence, [{"tool": "b"}, "junk", {"tool": "c", "error": ""}]
+    )
+
+    assert options == {
+        "a": "a",
+        REASON_SENTINEL: _SENTINEL_DESCRIPTIONS[REASON_SENTINEL],
+        RESOLVED_SENTINEL: _SENTINEL_DESCRIPTIONS[RESOLVED_SENTINEL],
+    }
+    assert prompt.startswith("Which single tool runs next for research node n1? Question: [Today UTC ")
+    assert " Why it matters:  because " in prompt
+    assert " Evidence on hand: 7 item(s) [ev-1,r,ev-2,ev-3]." in prompt
+    assert " Observed t ref=r: one two." in prompt
+    assert " Observed u FAILED: boom." in prompt
+    assert "Prior attempt" not in prompt
+
+    _, number_prompt = _tool_options_prompt([{"name": "a"}], {"node_id": "n1", "question": 7}, [], [])
+    assert "Question: 7" in number_prompt and "Latest revenue" not in number_prompt
+
+
+def test_assess_final_response_states_declared_claim_types(tmp_path: Path) -> None:
+    """The whole-response question states the declared claim count and its sorted, unique types."""
+    client = _final_client(tmp_path, 0.9, "sufficient_support")
+
+    asyncio.run(
+        client.assess_final_response(
+            "WSJ reported X; if Y then Z.",
+            [],
+            session_id="s1",
+            claims=[
+                {"claim_type": "conditional_risk"},
+                {"claim_type": "attributed_report"},
+                {"claim_type": "attributed_report"},
+                "junk",
+            ],
+        )
+    )
+
+    support = client.decide_types[0][1]["support"]
+    assert isinstance(support, dict)
+    instructions = support["instructions"]
+    assert isinstance(instructions, str)
+    assert " Declared claims: 4 (types: attributed_report,conditional_risk)." in instructions
+    assert "Cited evidence: 0 item(s)." in instructions
+
+
+def test_assess_final_response_requires_text_and_bounds_confidence(tmp_path: Path) -> None:
+    """A blank or non-text response is rejected; a confidence outside [0,1] is not carried."""
+    from app.decision_client import _checked_excerpt
+
+    client = _final_client(tmp_path, 0.9, "insufficient")
+
+    with pytest.raises(ValueError, match="assess_final_response: text required"):
+        asyncio.run(client.assess_final_response("  ", [], session_id="s1"))
+    for text in (7, None):
+        with pytest.raises(ValueError, match="assess_final_response: text required"):
+            _checked_excerpt(text, "assess_final_response")
+
+    out = asyncio.run(client.assess_final_response("Growth maybe.", None, session_id="s1", confidence=1.5))
+
+    assert out["confidence"] is None
+    support = client.decide_types[0][1]["support"]
+    assert isinstance(support, dict)
+    instructions = support["instructions"]
+    assert isinstance(instructions, str)
+    assert " Declared claims: 0." in instructions and "(types:" not in instructions

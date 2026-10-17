@@ -3,6 +3,8 @@ from datetime import UTC
 from pathlib import Path
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 import tests.research_source_seam as seam
 from app.research.evals.evaluators import EvalInput, eval_input_from_fixture, evaluate
@@ -1421,3 +1423,223 @@ def test_promotion_scoped_absence_is_not_universal_claim() -> None:
     outcome = eval_input_from_fixture(_trace_fixture(trace))
     assert outcome.universal_absence_claims == ()
     assert evaluate(outcome).passed
+
+
+@pytest.mark.parametrize(
+    ("coverage", "expected"),
+    [
+        ({"sec": {}, "finra": 7}, ["SEC"]),
+        ({"sec": {"detail": "read"}}, ["SEC —  — read"]),
+        ({"web": {"queries": ["one"], "detail": "read"}}, ["WEB — queries: oneread"]),
+        ({"finra": {"datasets": ["short"]}, "gaps": ["pending"]}, ["FINRA — datasets: short", "gaps: pending"]),
+    ],
+)
+def test_final_coverage_rendering_preserves_separators(coverage: dict[str, object], expected: list[str]) -> None:
+    from app.research.synthesis.final import _coverage_lines
+
+    assert _coverage_lines(coverage) == expected
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        ({}, "SOURCE"),
+        ({"evidence_id": "SOURCE"}, "SOURCE"),
+        ({"evidence_id": "E1"}, "SOURCE [E1]"),
+        (
+            {"evidence_id": "E1", "domain": "sec", "integrity": "primary_document", "source_name": "10-K"},
+            "SEC [PRIMARY_DOCUMENT] 10-K [E1]",
+        ),
+    ],
+)
+def test_final_source_rendering_preserves_labels(row: dict[str, object], expected: str) -> None:
+    from app.research.synthesis.final import _source_line
+
+    assert _source_line(row) == expected
+
+
+def test_final_sources_keep_first_rows_and_canonical_fallbacks() -> None:
+    from app.research.agents import GroundedClaim
+    from app.research.synthesis.final import _caller_source_rows, _normalize_sources, _source_observations_by_id
+
+    observations: list[dict[str, object]] = [
+        {},
+        {"evidence_id": " E1 ", "domain": "SEC", "integrity_class": "PRIMARY_DOCUMENT", "source_name": "first"},
+        {"evidence_id": "E1", "domain": "WEB", "integrity_class": "EXTERNAL_SOURCE", "source_name": "second"},
+        {"evidence_id": "E2", "domain": "FINRA", "integrity_class": "CANONICAL_STRUCTURED", "document": "dataset"},
+    ]
+    sources: list[dict[str, object]] = [
+        {},
+        {"evidence_id": " "},
+        {"evidence_id": " E1 ", "domain": "source", "integrity": "invalid", "source_name": "caller"},
+        {"evidence_id": "E1", "domain": "WEB", "document": "ignored"},
+        {"evidence_id": "E2", "domain": "custom", "integrity_class": "CANONICAL_STRUCTURED"},
+        {"evidence_id": "E3"},
+    ]
+    caller_rows = [
+        {"evidence_id": "E1", "domain": "SEC", "document": "caller", "integrity_class": "PRIMARY_DOCUMENT"},
+        {"evidence_id": "E2", "domain": "CUSTOM", "document": "", "integrity_class": "CANONICAL_STRUCTURED"},
+        {"evidence_id": "E3", "domain": "SOURCE", "document": "", "integrity_class": "EXTERNAL_SOURCE"},
+    ]
+    by_id = _source_observations_by_id([None, *observations])
+    assert by_id == {"E1": observations[1], "E2": observations[3]}
+    assert _caller_source_rows([None, *sources], by_id) == caller_rows
+    assert _normalize_sources(sources, [], observations) == caller_rows
+    claims = [GroundedClaim(text="claim", evidence_ids=[" E1 ", "", "E1", "E2", "missing"])]
+    assert _normalize_sources([{}], claims, observations) == [
+        {"evidence_id": "E1", "domain": "SEC", "document": "first", "integrity_class": "PRIMARY_DOCUMENT"},
+        {"evidence_id": "E2", "domain": "FINRA", "document": "dataset", "integrity_class": "CANONICAL_STRUCTURED"},
+        {"evidence_id": "missing", "domain": "SOURCE", "document": "", "integrity_class": "EXTERNAL_SOURCE"},
+    ]
+
+
+@settings(derandomize=True, max_examples=60)
+@given(st.lists(st.text(alphabet=" abCE12", max_size=12), max_size=20))
+def test_final_source_normalization_is_idempotent_and_ordered(identifiers: list[str]) -> None:
+    from app.research.synthesis.final import _normalize_sources
+
+    sources: list[dict[str, object]] = [{"evidence_id": identifier} for identifier in identifiers]
+    normalized = _normalize_sources(sources, [], [])
+    assert [row["evidence_id"] for row in normalized] == list(
+        dict.fromkeys(identifier.strip() for identifier in identifiers if identifier.strip())
+    )
+    assert _normalize_sources(normalized, [], []) == normalized
+
+
+def test_final_synthesis_serialization_keeps_aliases_and_copies_rows() -> None:
+    from app.research.agents import GroundedClaim
+    from app.research.agents.bearbot import BearAnalysis
+    from app.research.agents.bullbot import BullAnalysis
+    from app.research.agents.stockbot import StockbotAnalysis
+    from app.research.synthesis.committee import CommitteeDisagreement
+    from app.research.synthesis.final import synthesize_final
+
+    claim = GroundedClaim(text="growth", claim_type="inference", evidence_ids=["E1"])
+    stock = StockbotAnalysis(
+        session_id="s",
+        wave_id=1,
+        freeze_id="F",
+        as_of="2025-01-01",
+        question="q",
+        answer="a",
+        base_case="base",
+        claims=[claim],
+        evidence_ids=["E1"],
+    )
+    bull = BullAnalysis(
+        session_id="s",
+        wave_id=1,
+        freeze_id="F",
+        as_of="2025-01-01",
+        question="q",
+        stance="bull",
+        bull_case="up",
+        claims=[claim],
+        evidence_ids=["E1"],
+    )
+    bear = BearAnalysis(
+        session_id="s",
+        wave_id=1,
+        freeze_id="F",
+        as_of="2025-01-01",
+        question="q",
+        stance="bear",
+        bear_case="down",
+        claims=[claim],
+        evidence_ids=["E1"],
+    )
+    synthesis = synthesize_final(
+        "q",
+        session_id="s",
+        wave_id=1,
+        freeze_id="F",
+        as_of="2025-01-01",
+        stock=stock,
+        bull=bull,
+        bear=bear,
+        disagreement=CommitteeDisagreement(session_id="s", wave_id=1, freeze_id="F"),
+        observations=[{"evidence_id": "E1", "domain": "SEC", "integrity_class": "PRIMARY_DOCUMENT", "content": "raw"}],
+        coverage={"sec": {"forms": ["10-K"]}, "gaps": ["private"]},
+    )
+    payload = synthesis.to_dict()
+    assert payload["major_evidence"] == payload["direct_evidence"] == synthesis.direct_evidence
+    assert (
+        payload["claims"]
+        == payload["grounded_claims"]
+        == [{"text": "growth", "claim_type": "inference", "evidence_ids": ["E1"]}]
+    )
+    assert "SEC — forms: 10-K" in synthesis.answer
+    assert "gaps: private" in synthesis.answer
+    assert "SEC [PRIMARY_DOCUMENT] [E1]" in synthesis.answer
+    synthesis.direct_evidence[0]["text"] = "changed"
+    synthesis.sources[0]["document"] = "changed"
+    assert payload["direct_evidence"] != synthesis.direct_evidence
+    assert payload["sources"] != synthesis.sources
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_promotion_preserves_provenance_order_and_explicit_empty_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    from app.research.evals.regression import promote_to_fixture
+    from app.research.models import JSONValue
+    from app.research.repository import ResearchRepository
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _gs_sid(repo)
+    provenances: list[JSONValue] = [
+        None,
+        {"kind": "web_source"},
+        {"kind": "sec_source", "accession_no": ""},
+        {"kind": "sec_source", "accession_no": 1},
+        {"kind": "sec_source", "accession_no": "A", "document_name": "one"},
+        {"kind": "sec_source", "accession_no": "A", "document_name": "one"},
+        {"kind": "sec_source", "accession_no": "A", "document_name": "two"},
+        {"kind": "sec_source", "accession_no": "B", "document_name": ""},
+        {"kind": "sec_source", "accession_no": "C", "document_name": 7},
+    ]
+    for index, provenance in enumerate(provenances):
+        repo.save_evidence({"session_id": sid, "evidence_id": f"E{index}", "provenance": provenance})
+    repo.save_job(replace(repo.get_job(src), diagnostics={"tool_name": "custom_tool"}))
+    repo.save_session(
+        replace(
+            repo.get_session(sid),
+            freeze_ids=["F1", "F2"],
+            final_result={"answer": 7},
+            committee_runs=[
+                None,
+                {},
+                {"freeze_id": 7, "jobs": []},
+                {"freeze_id": "F2", "jobs": "bad"},
+                {"freeze_id": "F2", "jobs": ["j1", 7, "j2"]},
+            ],
+        )
+    )
+    path = promote_to_fixture(session_id=sid, scenario_name="gs-openai-sec-only", fixtures_dir=tmp_path, repo=repo)
+    promoted = load_fixture("gs-openai-sec-only", tmp_path)
+    assert promoted["answer_excerpt"] == ""
+    assert promoted["tool_calls"] == ["custom_tool"]
+    assert promoted["trace"]["filings_opened"] == ["A", "B", "C"]
+    assert promoted["trace"]["documents_opened"] == ["A|one", "A|two", "B|"]
+    assert promoted["trace"]["committee_freeze_ids"] == ["F2", "F2"]
+    assert promoted["trace"]["waves"] == ["F1", "F2"]
+    assert promoted["freeze_before"] == promoted["freeze_after"] == "F2"
+    assert json.loads(path.read_text(encoding="utf-8")) == promoted
+    promote_to_fixture(
+        session_id=sid,
+        scenario_name="gs-openai-sec-only",
+        question="",
+        as_of="",
+        tool_calls=(),
+        evidence_ids=(),
+        known_ats=(),
+        answer_excerpt="",
+        fixtures_dir=tmp_path,
+        repo=repo,
+    )
+    overridden = load_fixture("gs-openai-sec-only", tmp_path)
+    assert overridden["question"] == overridden["as_of"] == overridden["answer_excerpt"] == ""
+    assert overridden["tool_calls"] == overridden["evidence_ids"] == overridden["known_ats"] == []

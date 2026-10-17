@@ -8,11 +8,14 @@ stub the screens seams (``_fetch_settlement_rows`` + ``_gateway``).
 """
 
 import json
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
+from typing import Self, override
 
 import pytest
 
 import cli
+from app import data_sources
 from app.analytics import screens
 from app.domain.market.securities import TickerAlias
 from app.normalization import (
@@ -486,6 +489,45 @@ def test_ticker_candidates_reads_snapshot_history(tmp_path: Path, monkeypatch: p
     assert [a.entity_id for a in _ds.SourceGateway().ticker_candidates("AAA", late)] == ["sec:cik:0000000222"]
 
 
+def test_ticker_candidates_degrade_to_live_universe_on_corrupt_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupt archived snapshot reads as no snapshot: the live universe still answers."""
+    from types import SimpleNamespace
+
+    from app import data_sources as _ds
+    from app.domain.market.identity import resolve_ticker_aliases
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    raw_archive.archive(
+        "sec",
+        "company_tickers",
+        "company_tickers",
+        b"{not json",
+        url="https://www.sec.gov/files/company_tickers.json",
+        retrieved_at="2026-05-01T00:00:00Z",
+        root=tmp_path / "raw",
+    )
+    live = {"0": {"cik_str": 333, "ticker": "AAA", "title": "Live AAA"}}
+
+    def _live_get(url: str) -> object:
+        del url
+        return SimpleNamespace(content=json.dumps(live).encode())
+
+    def _live_inspect(response: object) -> None:
+        del response
+
+    monkeypatch.setattr(_ds._sec, "ensure_identity", lambda: None)
+    monkeypatch.setattr("edgar.httprequests.get_with_retry", _live_get)
+    monkeypatch.setattr("edgar.httprequests.inspect_response", _live_inspect)
+
+    aliases = _ds.SourceGateway().ticker_candidates("AAA", datetime(2026, 6, 1, tzinfo=UTC))
+
+    assert [a.entity_id for a in aliases] == ["sec:cik:0000000333"]
+    # The live fallback is now-stamped, so a historical horizon reads unresolved.
+    assert resolve_ticker_aliases("AAA", aliases, as_of=datetime(2026, 6, 1, tzinfo=UTC)).resolved is False
+
+
 def test_refresh_sec_company_facts_archives_and_returns_inline_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     payload = json.dumps(_facts_payload(320193, 100)).encode()
 
@@ -658,6 +700,23 @@ def test_replay_sec_facts_isolates_corrupt_payloads(tmp_path: Path):
     assert normalized_rows > 0  # the valid payload still processed
 
 
+def test_replay_sec_facts_ignores_other_archive_kinds(tmp_path: Path) -> None:
+    empty: dict[str, object] = {
+        "source": "sec",
+        "kind": "companyfacts",
+        "archived_payloads": 0,
+        "written_rows": 0,
+        "normalized_rows": 0,
+        "failed": [],
+    }
+    assert research_data.replay_sec_facts_from_archive(data_root=tmp_path) == empty
+
+    (tmp_path / "raw" / "sec" / "cik0000000007" / "filing_text").mkdir(parents=True)
+    (tmp_path / "raw" / "sec" / "not-a-cik.txt").write_text("not a payload")
+
+    assert research_data.replay_sec_facts_from_archive(data_root=tmp_path) == empty
+
+
 def test_iter_archive_company_facts_propagates_corrupt_payload(tmp_path: Path):
     raw_archive.archive(
         "sec",
@@ -778,3 +837,92 @@ def test_refresh_late_null_metadata_survives_archive_normalize(tmp_path: Path, m
         for r in rows
         if str(r.get("accession")).startswith("instant-")
     )
+
+
+class _GatewayDatetime(datetime):
+    @classmethod
+    @override
+    def now(cls, tz: tzinfo | None = None) -> Self:
+        return cls(2026, 8, 30, 12, tzinfo=UTC).astimezone(tz)
+
+
+@pytest.mark.parametrize("mock", [False, True])
+def test_short_interest_gateway_normalizes_groups_caches_and_gates_knowledge(
+    monkeypatch: pytest.MonkeyPatch, mock: bool
+) -> None:
+    monkeypatch.setenv("FINRA_USE_MOCK", "1" if mock else "0")
+    monkeypatch.setattr(data_sources, "datetime", _GatewayDatetime)
+    monkeypatch.setattr(research_data, "_GATEWAY", None)
+    records: list[object] = [
+        {"symbolCode": "AAA", "settlementDate": "2026-08-12", "currentShortPositionQuantity": 10},
+        {"symbolCode": "AAA", "settlementDate": SETTLEMENT, "currentShortPositionQuantity": 20},
+        "malformed",
+        {"symbolCode": "AAA", "settlementDate": SETTLEMENT, "currentShortPositionQuantity": -1},
+        {"symbolCode": "AAA"},
+    ]
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def datapoints(dataset: str, **kwargs: object) -> dict[str, object]:
+        calls.append((dataset, kwargs))
+        return {"records": records}
+
+    monkeypatch.setattr(data_sources._finra, "get_finra_datapoints", datapoints)
+    rows = research_data.short_interest_for_symbol(" aaa ")
+    assert [row["settlement_date"] for row in rows] == [SETTLEMENT, SETTLEMENT, "2026-08-12"]
+    assert [row["short_position"] for row in rows] == [20.0, None, 10.0]
+    assert {row["known_at"] for row in rows} == {"2026-08-30T12:00:00Z"}
+    assert {row["retrieved_at"] for row in rows} == {"2026-08-30T12:00:00Z"}
+    suffix = "consolidatedShortInterestMock" if mock else "consolidatedShortInterest"
+    assert all(str(row["source_url"]).endswith(f"/name/{suffix}") for row in rows)
+    assert [row["source_record_id"] for row in rows] == [
+        f"otcMarket/consolidatedShortInterest:{SETTLEMENT}",
+        f"otcMarket/consolidatedShortInterest:{SETTLEMENT}",
+        "otcMarket/consolidatedShortInterest:2026-08-12",
+    ]
+    assert rows[0]["content_hash"] == rows[1]["content_hash"]
+    assert rows[0]["row_id"] == rows[1]["row_id"]
+    assert research_data.short_interest_for_symbol("AAA", as_of="2026-08-29") == []
+    assert research_data.short_interest_for_symbol("AAA", as_of="2026-08-30") == rows
+    # Caller mutation of a returned list never corrupts the run cache.
+    rows.clear()
+    assert len(research_data.short_interest_for_symbol("AAA")) == 3
+    assert len(calls) == 1
+    dataset, request = calls[0]
+    assert dataset == "otcMarket/consolidatedShortInterest"
+    assert request["ticker"] == "AAA"
+    assert request["sort_fields"] == ["-settlementDate"]
+    assert request["limit"] == 25
+    assert request["fields"] == [
+        "symbolCode",
+        "issueName",
+        "settlementDate",
+        "currentShortPositionQuantity",
+        "previousShortPositionQuantity",
+        "averageDailyVolumeQuantity",
+        "daysToCoverQuantity",
+    ]
+
+
+@pytest.mark.parametrize("payload", [None, {}, {"records": None}, {"records": [None, {}, "bad"]}])
+def test_short_interest_gateway_caches_empty_provider_records(monkeypatch: pytest.MonkeyPatch, payload: object) -> None:
+    monkeypatch.setattr(data_sources, "datetime", _GatewayDatetime)
+    calls: list[str] = []
+
+    def datapoints(dataset: str, **kwargs: object) -> object:
+        calls.append(dataset)
+        return payload
+
+    monkeypatch.setattr(data_sources._finra, "get_finra_datapoints", datapoints)
+    gateway = data_sources.SourceGateway()
+    assert gateway.short_interest("AAA") == []
+    assert gateway.short_interest(" aaa ", as_of="2026-08-30") == []
+    assert calls == ["otcMarket/consolidatedShortInterest"]
+
+
+def test_short_interest_gateway_preserves_provider_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    def datapoints(dataset: str, **kwargs: object) -> dict[str, object]:
+        raise RuntimeError("FINRA unavailable")
+
+    monkeypatch.setattr(data_sources._finra, "get_finra_datapoints", datapoints)
+    with pytest.raises(RuntimeError, match="FINRA unavailable"):
+        data_sources.SourceGateway().short_interest("AAA", as_of="2026-08-30")

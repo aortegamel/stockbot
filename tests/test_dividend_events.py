@@ -803,3 +803,41 @@ def test_lifecycle_regular_basis_growth_needs_five_consecutive_years() -> None:
     short = _lifecycle.analyze_dividends(paid_events=four_years, as_of="2026-02-01")
     assert short["regular_basis_growth"] is None
     assert short["growth_basis"] == "total_aggregates"
+
+
+def test_provider_without_event_rows_reports_no_events(gateway: _Gateway, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A companyfacts payload with no dividend_events key reads as absent, never as an error."""
+    _fail_on_price(monkeypatch)
+    _seed_quarters(gateway)
+    # The provider payload omits the key entirely: no event rows were published.
+    del gateway.facts_by_cik[KO_CIK]["dividend_events"]
+    assert "dividend_events" not in gateway.facts_by_cik[KO_CIK]
+
+    result = sec_facts.get_fundamentals("KO", "dividends", as_of=AS_OF)
+
+    assert result["last_dividend"] is None
+    assert result["next_declared_dividend"] is None
+    assert result["past_events"] == []
+    assert result["events_coverage"] == "no_structured_events"
+
+
+def test_unvalidated_event_rows_never_reach_the_payload(gateway: _Gateway, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rows the provider did not normalize are dropped instead of surfacing as events."""
+    _fail_on_price(monkeypatch)
+    _seed_quarters(gateway)
+    valid = _event(
+        KO_CIK, "ev-valid", 0.51, decl="2026-06-15", record="2026-06-30", pay="2026-07-01", accn="0000000001"
+    )
+    no_id = _event(KO_CIK, "ev-no-id", 0.99, pay="2026-07-15", accn="0000000002")
+    del no_id["dividend_event_id"]
+    raw_events: list[object] = ["not-a-row", {"entity_id": None}, no_id, valid]
+
+    def raw_company_facts(cik: int, *, as_of: str | None = None) -> dict[str, object]:
+        return {**gateway.facts_by_cik[cik], "dividend_events": raw_events}
+
+    monkeypatch.setattr(gateway, "company_facts", raw_company_facts)
+    result = sec_facts.get_fundamentals("KO", "dividends", as_of=AS_OF)
+
+    assert result["last_dividend"] == {"amount_per_share": 0.51, "payment_date": "2026-07-01", "type": "regular"}
+    assert result["next_declared_dividend"] is None
+    assert result["events_coverage"] == "structured_only"

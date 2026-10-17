@@ -9,14 +9,17 @@ Warehouse-removal seam: live providers (SourceGateway + normalization + raw_arch
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import override
 
 import pytest
+from hypothesis import given, seed, settings
+from hypothesis import strategies as st
 
 from app.data_sources import SourceGateway
 from app.domain.portfolio import PortfolioSnapshot, Position
+from app.normalization import normalize_finra_short_interest
 from app.services.portfolio_research import (
     SEC_CONCEPTS,
     PortfolioResearchPosition,
@@ -331,6 +334,13 @@ def test_finra_newest_revision_visible(gateway: _Gateway) -> None:
         prev_position=1_000_000,
         retrieved_at="2026-08-17T12:30:00Z",
     )
+    _seed_short_interest(
+        gateway,
+        settlement_date="2026-08-14",
+        short_position=1_150_000,
+        prev_position=1_000_000,
+        retrieved_at="2026-08-15T12:00:00Z",
+    )
 
     research = enrich_portfolio_research(_snapshot([_position(entity_id=None)]), gateway=gateway)[0]
 
@@ -407,6 +417,81 @@ def test_finra_same_instant_ingestion_across_settlements_is_not_conflict(gateway
     # settlement wins with real metrics.
     assert research.latest_finra_metrics["settlement_date"] == "2026-08-29"
     assert research.latest_finra_metrics["short_position"] == Decimal(900000)
+
+
+@pytest.mark.parametrize(
+    ("as_of", "settlement", "short_position", "known_at"),
+    [
+        pytest.param(date(2026, 8, 20), "2026-08-07", 1_000_000, "2026-08-14T12:00:00Z", id="settled-not-published"),
+        pytest.param(date(2026, 8, 21), "2026-08-07", 1_000_000, "2026-08-14T12:00:00Z", id="day-before-publication"),
+        pytest.param(
+            date(2026, 8, 22), "2026-08-14", 1_150_000, "2026-08-22T12:00:00Z", id="publication-day-inclusive"
+        ),
+    ],
+)
+def test_finra_cycle_waits_for_publication_known_at(
+    monkeypatch: pytest.MonkeyPatch, as_of: date, settlement: str, short_position: int, known_at: str
+) -> None:
+    # Producer-normalized cycles behind the real SourceGateway publication filter;
+    # only the provider fetch is replaced, so no store or network is touched.
+    rows = [
+        row
+        for cycle, position, published, retrieved in (
+            ("2026-08-07", 1_000_000, "2026-08-14T12:00:00Z", "2026-08-14T12:00:00Z"),
+            ("2026-08-14", 1_150_000, "2026-08-22T12:00:00Z", RETRIEVED_AT),
+        )
+        for row in normalize_finra_short_interest(
+            [{"symbolCode": "AMD", "settlementDate": cycle, "currentShortPositionQuantity": position}],
+            settlement_date=cycle,
+            known_at=published,
+            retrieved_at=retrieved,
+            content_hash=f"snapshot-{cycle}",
+            source_url="https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest",
+            source_record_id=f"otcMarket/consolidatedShortInterest:{cycle}",
+        )["short_interest"]
+    ]
+
+    def fetched(symbol: str) -> list[dict[str, object]]:
+        return rows if symbol == "AMD" else []
+
+    live = SourceGateway()
+    monkeypatch.setattr(live, "_short_interest_rows", fetched)
+
+    research = enrich_portfolio_research(_snapshot([_position(entity_id=None)]), as_of=as_of, gateway=live)[0]
+
+    assert research.latest_finra_metrics["settlement_date"] == settlement
+    assert research.latest_finra_metrics["short_position"] == Decimal(short_position)
+    assert research.latest_finra_metrics["known_at"] == known_at
+    assert research.research_data_freshness["finra_settlement_date"] == date.fromisoformat(settlement)
+
+
+def test_finra_settlement_on_as_of_is_eligible_when_published_same_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Producer accepts known_at on the settlement day itself (known_at >= settlement, <= retrieved_at),
+    # so settlement_date == as_of is reachable through the real publication filter.
+    rows = normalize_finra_short_interest(
+        [{"symbolCode": "AMD", "settlementDate": "2026-08-14", "currentShortPositionQuantity": 1_150_000}],
+        settlement_date="2026-08-14",
+        known_at="2026-08-14T20:00:00Z",
+        retrieved_at="2026-08-14T21:00:00Z",
+        content_hash="snapshot-2026-08-14",
+        source_url="https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest",
+        source_record_id="otcMarket/consolidatedShortInterest:2026-08-14",
+    )["short_interest"]
+
+    def fetched(symbol: str) -> list[dict[str, object]]:
+        return rows if symbol == "AMD" else []
+
+    live = SourceGateway()
+    monkeypatch.setattr(live, "_short_interest_rows", fetched)
+
+    research = enrich_portfolio_research(_snapshot([_position(entity_id=None)]), as_of=date(2026, 8, 14), gateway=live)[
+        0
+    ]
+
+    assert research.latest_finra_metrics["settlement_date"] == "2026-08-14"
+    assert research.latest_finra_metrics["short_position"] == Decimal(1150000)
+    assert research.latest_finra_metrics["known_at"] == "2026-08-14T20:00:00Z"
+    assert research.research_data_freshness["finra_settlement_date"] == date(2026, 8, 14)
 
 
 def test_no_data_reports_empty_metrics_without_raising(gateway: _Gateway) -> None:
@@ -512,3 +597,84 @@ def test_latest_doc_respects_cutoff_not_newest_ingested(gateway: _Gateway) -> No
     at_cutoff = enrich_portfolio_research(_snapshot([_position()]), as_of=date(2026, 8, 14), gateway=gateway)[0]
     assert _metric(at_cutoff, "LongTermDebt")["accession"] == "accn-cutoff"
     assert at_cutoff.research_data_freshness["sec_latest_filed_at"] == date(2026, 5, 5)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_date", "expected_instant"),
+    [
+        (date(2026, 8, 14), "2026-08-14", "2026-08-14"),
+        (datetime.fromisoformat("2026-08-14T23:30:00"), "2026-08-14", "2026-08-14T23:30:00Z"),
+        (
+            datetime(2026, 8, 14, 1, 30, tzinfo=timezone(timedelta(hours=2))),
+            "2026-08-13",
+            "2026-08-13T23:30:00Z",
+        ),
+        (None, "", ""),
+        (7, "7", "7"),
+    ],
+)
+def test_enrichment_normalizes_provider_dates(
+    gateway: _Gateway, value: object, expected_date: str, expected_instant: str
+) -> None:
+    _seed_fact(gateway, "Revenue", 100, "2026-06-30", "2026-08-05", "acc-date")
+    gateway.facts[0]["period_end"] = value
+    gateway.facts[0]["filed_at"] = value
+    _seed_short_interest(gateway, "2026-08-14", 100, "2026-08-20T12:00:00Z")
+    gateway.shorts[0]["known_at"] = value
+    gateway.shorts[0]["retrieved_at"] = value
+
+    research = enrich_portfolio_research(_snapshot([_position()]), as_of=date(2026, 8, 25), gateway=gateway)[0]
+
+    fact = _metric(research, "Revenue")
+    assert fact["period_end"] == expected_date
+    assert fact["filed_at"] == expected_date
+    assert research.latest_finra_metrics["known_at"] == expected_date
+    assert research.latest_finra_metrics["retrieved_at"] == expected_instant
+
+
+def test_finra_provider_failure_keeps_sec_enrichment(gateway: _Gateway, monkeypatch: pytest.MonkeyPatch) -> None:
+    _seed_fact(gateway, "Revenue", 100, "2026-06-30", "2026-08-05", "acc-revenue")
+
+    def unavailable(symbol: str, *, as_of: str | None = None) -> list[dict[str, object]]:
+        raise OSError("provider unavailable")
+
+    monkeypatch.setattr(gateway, "short_interest", unavailable)
+    research = enrich_portfolio_research(_snapshot([_position()]), as_of=date(2026, 8, 25), gateway=gateway)[0]
+
+    assert _metric(research, "Revenue")["value"] == Decimal(100)
+    assert research.latest_finra_metrics == {}
+    assert research.research_data_freshness["finra_settlement_date"] is None
+
+
+@pytest.mark.parametrize("payload", [None, {"rows": []}, "unavailable", []])
+def test_finra_invalid_response_reports_absent_metrics(
+    gateway: _Gateway, monkeypatch: pytest.MonkeyPatch, payload: object
+) -> None:
+    def invalid_response(symbol: str, *, as_of: str | None = None) -> object:
+        return payload
+
+    monkeypatch.setattr(gateway, "short_interest", invalid_response)
+    position = _position(entity_id=None)
+    research = enrich_portfolio_research(_snapshot([position]), as_of=date(2026, 8, 25), gateway=gateway)[0]
+    assert research.latest_finra_metrics == {}
+    assert research.research_data_freshness["finra_retrieved_at"] is None
+
+
+@seed(20261014)
+@settings(max_examples=40, derandomize=True, deadline=None)
+@given(
+    short_position=st.integers(min_value=0, max_value=10**9),
+    previous=st.integers(min_value=0, max_value=10**9),
+)
+def test_prop_finra_change_metrics_preserve_decimal_arithmetic(short_position: int, previous: int) -> None:
+    gateway = _Gateway()
+    _seed_short_interest(gateway, "2026-08-14", short_position, "2026-08-20T12:00:00Z", prev_position=previous)
+    position = _position(entity_id=None)
+    research = enrich_portfolio_research(_snapshot([position]), as_of=date(2026, 8, 25), gateway=gateway)[0]
+    metrics = research.latest_finra_metrics
+    change = Decimal(short_position) - Decimal(previous)
+    expected_pct = None if previous == 0 else Decimal(100) * change / Decimal(previous)
+    assert metrics["short_position"] == Decimal(short_position)
+    assert metrics["prev_position"] == Decimal(previous)
+    assert metrics["short_interest_change"] == change
+    assert metrics["short_interest_change_pct"] == expected_pct

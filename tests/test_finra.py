@@ -7,8 +7,9 @@ opt-in via tests/test_finra_smoke.py (pytest -m finra_smoke).
 
 import json
 from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
+from typing import Self, override
 from unittest.mock import MagicMock
 
 import pytest
@@ -246,17 +247,32 @@ def test_short_interest_payload(http: dict[str, MagicMock]) -> None:
     ]
 
 
-def test_latest_short_interest_rejects_stale_production_data(
-    http: dict[str, MagicMock], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    stale_date = (datetime.now(UTC).date() - timedelta(days=finra_client.STALE_AFTER_DAYS + 1)).isoformat()
+FINRA_TODAY = date(2026, 10, 14)
+
+
+def _freeze_finra_today(monkeypatch: pytest.MonkeyPatch, frozen: date) -> None:
+    """Freeze the local trading date that finra_client reads through date.today()."""
+
+    class _FrozenDate(date):
+        @classmethod
+        @override
+        def today(cls) -> Self:
+            return cls(frozen.year, frozen.month, frozen.day)
+
+    monkeypatch.setattr(finra_client, "date", _FrozenDate)
+
+
+def _latest_short_interest(
+    http: dict[str, MagicMock], monkeypatch: pytest.MonkeyPatch, settlement_date: str
+) -> dict[str, object]:
+    """Run the no-date get_short_interest tool over one record dated settlement_date."""
     http["post"].side_effect = [
         _token_response(),
         _response(
             [
                 {
                     "symbolCode": "AAPL",
-                    "settlementDate": stale_date,
+                    "settlementDate": settlement_date,
                     "currentShortPositionQuantity": 100,
                 }
             ]
@@ -264,7 +280,7 @@ def test_latest_short_interest_rejects_stale_production_data(
     ]
 
     def _fake_partitions(*args: object) -> tuple[list[dict[str, str]], dict[str, object], int, bool]:
-        return ([{"settlementDate": stale_date}], {}, 1, False)
+        return ([{"settlementDate": settlement_date}], {}, 1, False)
 
     monkeypatch.setattr(
         finra_client,
@@ -272,11 +288,54 @@ def test_latest_short_interest_rejects_stale_production_data(
         _fake_partitions,
     )
 
-    result = execute_tool("get_short_interest", {"ticker": "AAPL"}, model="test", context=LOCAL_CONTEXT)
+    return execute_tool("get_short_interest", {"ticker": "AAPL"}, model="test", context=LOCAL_CONTEXT)
+
+
+def test_latest_short_interest_rejects_stale_production_data(
+    http: dict[str, MagicMock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _freeze_finra_today(monkeypatch, FINRA_TODAY)
+    stale_date = (FINRA_TODAY - timedelta(days=finra_client.STALE_AFTER_DAYS + 1)).isoformat()
+
+    result = _latest_short_interest(http, monkeypatch, stale_date)
 
     assert "error" in result
     assert "Current FINRA short interest is unavailable" in _error(result)
     assert stale_date in _error(result)
+
+
+@pytest.mark.parametrize(
+    ("today", "settlement_date", "stale"),
+    [
+        pytest.param(date(2026, 10, 14), "2026-07-16", False, id="90-days-current"),
+        pytest.param(date(2026, 10, 14), "2026-07-15", True, id="91-days-stale"),
+        # Local date 10-13 while UTC is already 10-14: freshness counts local
+        # days (90 here), so the record stays current.
+        pytest.param(date(2026, 10, 13), "2026-07-15", False, id="local-date-before-utc-rollover-current"),
+        pytest.param(date(2026, 1, 1), "2025-10-03", False, id="year-boundary-90-days-current"),
+        pytest.param(date(2026, 1, 1), "2025-10-02", True, id="year-boundary-91-days-stale"),
+    ],
+)
+def test_latest_short_interest_stale_threshold(
+    http: dict[str, MagicMock],
+    monkeypatch: pytest.MonkeyPatch,
+    today: date,
+    settlement_date: str,
+    stale: bool,
+) -> None:
+    """Records over STALE_AFTER_DAYS local days old fail closed; 90 days stays current."""
+    _freeze_finra_today(monkeypatch, today)
+
+    result = _latest_short_interest(http, monkeypatch, settlement_date)
+
+    if stale:
+        assert "Current FINRA short interest is unavailable" in _error(result)
+        assert settlement_date in _error(result)
+    else:
+        assert "error" not in result, result
+        assert result["data_freshness"] == "current"
+        assert result["as_of_date"] == settlement_date
+        assert not any("STALE" in str(w) for w in _as_seq(result["warnings"]))
 
 
 # ---------------------------------------------------------------------------

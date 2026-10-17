@@ -102,6 +102,34 @@ def test_search_web_dispatcher_passes_optional_args(monkeypatch: pytest.MonkeyPa
     assert kwargs["start_published_date"] == "2026-07-01"
 
 
+def test_search_web_domain_filters_coerce_arrays_and_dates_stay_guided(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Domain filters accept arrays only; calendar-invalid dates answer before any provider call."""
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def fake_search(query: str, **kwargs: object) -> dict[str, object]:
+        calls.append((query, kwargs))
+        return {"result_type": "web_search", "query": query, "evidence": list[dict[str, object]]()}
+
+    monkeypatch.setattr(tools.exa_client, "search", fake_search)
+    tools.execute_tool(
+        "search_web",
+        {"query": "AMD", "include_domains": "amd.com", "exclude_domains": ["reddit.com"]},
+        model="test",
+        context=RESEARCH_CONTEXT,
+    )
+    _query, kwargs = calls[0]
+    assert kwargs["include_domains"] is None
+    assert kwargs["exclude_domains"] == ["reddit.com"]
+
+    for key in ("start_published_date", "end_published_date"):
+        result = tools.execute_tool(
+            "search_web", {"query": "AMD", key: "2024-13-40"}, model="test", context=RESEARCH_CONTEXT
+        )
+        assert result["error_type"] == "invalid_tool_arguments", (key, result)
+        assert key in str(result["error"]) and "YYYY-MM-DD" in str(result["error"])
+    assert len(calls) == 1  # both rejected dates stopped before the provider
+
+
 def test_search_web_disabled_is_soft(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("EXA_ENABLED", raising=False)
     monkeypatch.delenv("EXA_API_KEY", raising=False)
