@@ -7202,17 +7202,23 @@ def test_session_preserves_original_question_text() -> None:
     assert round_tripped.ticker == "NVDA"
 
 
-def test_needle_execution_context_excludes_raw_evidence(tmp_path: Path) -> None:
+def test_needle_execution_context_excludes_raw_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A repository-backed node supplies anchors without disclosing stored evidence to Needle."""
     import asyncio as _asyncio
     import json as _json
     from typing import override
 
+    import app.tools as _tools
     from app.decision_client import JevClient
     from app.research import scheduler as _sched
     from app.research import service as _svc
     from app.research.models import ToolDecision
     from app.tool_runtime import outcome_from_result
+
+    def _orcl(name: str) -> str | None:
+        return {"ORCL": "ORCL"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _orcl)
 
     repo = ResearchRepository(data_root=tmp_path)
     objective = "What is ORCL's filing history?"

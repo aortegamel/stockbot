@@ -783,7 +783,7 @@ def test_http_decision_rejects_redirect_downgrade_before_transport(
 
 @pytest.mark.parametrize("api_format", _FORMATS)
 @pytest.mark.parametrize("status", [301, 302, 303])
-@pytest.mark.parametrize("location", ["/resolved", "https://decision.test/resolved", "https://other.test/resolved"])
+@pytest.mark.parametrize("location", ["/resolved", "https://decisions.test/resolved", "https://other.test/resolved"])
 def test_http_decision_follows_secure_redirect_with_native_request_semantics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str, status: int, location: str
 ) -> None:
@@ -818,7 +818,16 @@ def test_http_decision_follows_secure_redirect_with_native_request_semantics(
         assert first.get_header("Content-type") == "application/json"
         assert redirected.full_url == urllib.parse.urljoin(first.full_url, location)
         assert redirected.get_method() == "GET" and redirected.data is None
-        assert redirected.get_header("Authorization") == f"Bearer {_DECISION_KEY}"
+
+        def _origin(url: str) -> tuple[str, str, int | None]:
+            parts = urllib.parse.urlsplit(url)
+            default = 443 if parts.scheme == "https" else 80 if parts.scheme == "http" else None
+            return (parts.scheme.lower(), (parts.hostname or "").lower(), parts.port or default)
+
+        if _origin(redirected.full_url) == _origin(first.full_url):
+            assert redirected.get_header("Authorization") == f"Bearer {_DECISION_KEY}"
+        else:
+            assert redirected.get_header("Authorization") is None
         assert redirected.get_header("Content-type") is None
         assert redirected.get_header("Content-length") is None
         assert all(response.closed for response in responses)

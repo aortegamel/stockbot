@@ -1097,7 +1097,23 @@ class _HttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
         if urllib.parse.urlsplit(newurl).scheme != "https":
             fp.close()
             raise ValueError("decision redirects must use HTTPS")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        old = urllib.parse.urlsplit(req.full_url)
+        target = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, newurl))
+
+        def _key(parts: urllib.parse.SplitResult) -> tuple[str, str, int | None]:
+            scheme = parts.scheme.lower()
+            host = (parts.hostname or "").lower()
+            port = parts.port
+            if port is None:
+                port = 443 if scheme == "https" else 80 if scheme == "http" else None
+            return (scheme, host, port)
+
+        if _key(old) != _key(target):
+            redirected.remove_header("Authorization")
+        return redirected
 
 
 def _envelope_error(reason: str) -> TypeError:
