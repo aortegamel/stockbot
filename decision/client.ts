@@ -29,7 +29,7 @@ function malformed(reason: string): Error {
   return new Error(`malformed_decision_response: ${reason}`);
 }
 
-function contentObject(body: unknown): Record<string, unknown> {
+function completionMessage(body: unknown): Record<string, unknown> {
   const first = isObj(body) && Array.isArray(body.choices) ? body.choices[0] : undefined;
   if (!isObj(first)) throw malformed("missing choices");
   if (first.finish_reason === "length") throw malformed("truncated output");
@@ -38,6 +38,11 @@ function contentObject(body: unknown): Record<string, unknown> {
   // Python truthiness, matching app/decision_client.py: empty objects/arrays are not refusals.
   const refusal = message.refusal;
   if (refusal && !(typeof refusal === "object" && Object.keys(refusal).length === 0)) throw malformed("refusal");
+  return message;
+}
+
+function contentObject(body: unknown): Record<string, unknown> {
+  const message = completionMessage(body);
   if (typeof message.content !== "string" || !message.content.trim()) throw malformed("content must be a nonempty string");
   let parsed: unknown;
   try {

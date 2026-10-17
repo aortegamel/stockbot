@@ -17,6 +17,8 @@ import { scenarios } from "./scenarios.ts";
 
 const OBJ = scenarios[0].objective.id;
 const P = (suffix: string) => `${OBJ}-${suffix}`;
+// Longer than any filename allows, so decide artifacts must use a bounded slug.
+const LONG_ID = P("r".repeat(300));
 
 test("classifyProbability boundaries match approved policy", () => {
   expect(classifyProbability(1)).toBe("yes");
@@ -47,6 +49,7 @@ const DISPOSITION_OF: Record<string, string> = {
   [P("collateral")]: "gather_evidence",
   [P("lunch")]: "reject",
   [P("packwell")]: "analyze",
+  [LONG_ID]: "analyze",
 };
 
 const DISPOSITION_FULL: Record<string, Record<string, number>> = {
@@ -129,7 +132,7 @@ async function successDir(secret: string, systemOne: SystemOneFn = stubSystemOne
   return dir;
 }
 
-async function expectRunError(secret: string, fetchFn: typeof fetch, contains: string, systemOne?: SystemOneFn): Promise<string> {
+async function expectRunError(secret: string, fetchFn: typeof fetch, contains?: string, systemOne?: SystemOneFn): Promise<string> {
   process.env.OPENCODE_API_KEY = secret;
   process.env.OPENCODE_MODEL = "test-model";
   process.env.OPENCODE_URL = "https://opencode.test/responses";
@@ -140,9 +143,167 @@ async function expectRunError(secret: string, fetchFn: typeof fetch, contains: s
   } catch (e) {
     err = e;
   }
-  expect(String(err)).toContain(contains);
+  if (contains === undefined) expect(err).toBeInstanceOf(Error);
+  else expect(String(err)).toContain(contains);
   return dir;
 }
+
+function analysisFetch(analysisOut: unknown, proposals: unknown = PROPOSALS): typeof fetch {
+  let step = 0;
+  return (async () => {
+    if (step++ === 0) return responsesPayload({ proposals });
+    if (step === 2) return responsesPayload(analysisOut);
+    return responsesPayload({ proposals: [], evidenceRequests: [] });
+  }) as unknown as typeof fetch;
+}
+
+const VALID_ANALYSIS = {
+  nodeId: P("repayment"), objectiveId: OBJ,
+  interpretation: "Repayment history is strong.", evidenceRefs: ["s1-ev3"],
+};
+const GATHER_REQUEST = {
+  nodeId: P("collateral"), objectiveId: OBJ, missingEvidence: "Independent valuation.",
+};
+
+test("analysis numbers and assumptions reach final artifacts without losing evidence links", async () => {
+  process.env.OPENCODE_API_KEY = "sk-test-analysis";
+  process.env.OPENCODE_MODEL = "test-model";
+  process.env.OPENCODE_URL = "https://opencode.test/responses";
+  const dir = await mkdtemp(join(tmpdir(), "run-analysis-"));
+  const analysis = {
+    ...VALID_ANALYSIS,
+    numbers: [{ value: "12", evidenceId: "s1-ev3", quote: "12" }],
+    assumptions: [{ assumptionId: "a1", text: "The historical terms remain comparable." }],
+  };
+  await runScenario(scenarios[0].id, {
+    outDir: dir, systemOne: stubSystemOne(),
+    fetchFn: analysisFetch({ analyses: [analysis], evidenceRequests: [GATHER_REQUEST] }),
+  });
+  const final = JSON.parse(await readFile(join(dir, "final.json"), "utf8"));
+  expect(final.reasoning[0]).toMatchObject(analysis);
+  const context = JSON.parse(await readFile(join(dir, "eval-context.json"), "utf8"));
+  expect(context.analyses).toEqual([analysis]);
+});
+
+test("analysis validation rejects malformed numbers, assumptions, and evidence before adjudication", async () => {
+  const number = { value: "12", evidenceId: "s1-ev3", quote: "12" };
+  const assumption = { assumptionId: "a1", text: "Comparable terms." };
+  const cases: [Record<string, unknown>, string][] = [
+    [{ numbers: null }, "numbers must be an array"],
+    [{ numbers: [null] }, "number must be an object"],
+    [{ numbers: [{ ...number, extra: 1 }] }, "unexpected fields"],
+    [{ numbers: [{ ...number, value: "" }] }, "analysis.number.value must be a nonempty string"],
+    [{ numbers: [{ ...number, evidenceId: "" }] }, "analysis.number.evidenceId must be a nonempty string"],
+    [{ numbers: [{ ...number, quote: "" }] }, "analysis.number.quote must be a nonempty string"],
+    [{ numbers: [{ ...number, evidenceId: "s1-ev1" }] }, "number references unknown evidence s1-ev1"],
+    [{ assumptions: null }, "assumptions must be an array"],
+    [{ assumptions: [null] }, "assumption must be an object"],
+    [{ assumptions: [{ ...assumption, extra: 1 }] }, "unexpected fields"],
+    [{ assumptions: [{ ...assumption, assumptionId: "" }] }, "analysis.assumption.assumptionId must be a nonempty string"],
+    [{ assumptions: [{ ...assumption, text: "" }] }, "analysis.assumption.text must be a nonempty string"],
+    [{ assumptions: [assumption, assumption] }, "duplicate assumptionId a1"],
+    [{ evidenceRefs: null }, "evidenceRefs must be string[]"],
+    [{ evidenceRefs: [1] }, "evidenceRefs must be string[]"],
+    [{ evidenceRefs: ["missing"] }, "references unknown evidence missing"],
+    [{ objectiveId: "wrong" }, "references wrong objective"],
+    [{ nodeId: P("missing") }, "references unknown proposal"],
+    [{ interpretation: "" }, "analysis.interpretation must be a nonempty string"],
+    [{ evidenceRefs: undefined }, "unexpected fields"],
+    [{ numbers: null, assumptions: null }, "numbers must be an array"],
+  ];
+  for (const [patch, message] of cases) {
+    const dir = await expectRunError("sk-test-invalid-analysis", analysisFetch({
+      analyses: [{ ...VALID_ANALYSIS, ...patch }], evidenceRequests: [GATHER_REQUEST],
+    }), message);
+    expect(await readdir(dir)).not.toContain("final.json");
+    expect((await readdir(dir)).some((f) => f.startsWith("request-decide-"))).toBe(false);
+  }
+  for (const [analyses, message] of [
+    [null, "analyses must be an array"],
+    [[null], "analysis must be an object"],
+    [[{ nodeId: P("repayment") }], "unexpected fields"],
+    [[{ ...VALID_ANALYSIS, extra: true }], "unexpected fields"],
+    [[VALID_ANALYSIS, VALID_ANALYSIS], "duplicate analysis"],
+  ] as const) {
+    await expectRunError("sk-test-analysis-shape", analysisFetch({ analyses, evidenceRequests: [GATHER_REQUEST] }), message);
+  }
+  for (const bad of [
+    { ...GATHER_REQUEST, nodeId: P("lunch") },
+    { ...GATHER_REQUEST, objectiveId: "other" },
+  ]) {
+    const dir = await expectRunError("sk-test-bad-request", analysisFetch({
+      analyses: [VALID_ANALYSIS], evidenceRequests: [GATHER_REQUEST, bad],
+    }));
+    expect((await readdir(dir)).some((f) => f.startsWith("request-decide-"))).toBe(false);
+  }
+});
+
+test("analysis accounting rejects both and neither, but admits evidence requests without analysis", async () => {
+  for (const analyses of [[], [VALID_ANALYSIS]]) {
+    const evidenceRequests = analyses.length ? [
+      GATHER_REQUEST, { nodeId: P("repayment"), objectiveId: OBJ, missingEvidence: "History." },
+    ] : [GATHER_REQUEST];
+    await expectRunError("sk-test-accounting", analysisFetch({ analyses, evidenceRequests }), "requires exactly one");
+  }
+  process.env.OPENCODE_API_KEY = "sk-test-accounting";
+  process.env.OPENCODE_MODEL = "test-model";
+  process.env.OPENCODE_URL = "https://opencode.test/responses";
+  const dir = await mkdtemp(join(tmpdir(), "run-accounting-"));
+  await runScenario(scenarios[0].id, {
+    outDir: dir, systemOne: stubSystemOne(), fetchFn: analysisFetch({
+      analyses: [], evidenceRequests: [
+        GATHER_REQUEST, { nodeId: P("repayment"), objectiveId: OBJ, missingEvidence: "History." },
+      ],
+    }),
+  });
+  const final = JSON.parse(await readFile(join(dir, "final.json"), "utf8"));
+  expect(final.reasoning).toEqual([]);
+  expect(final.unresolved).toEqual([
+    { nodeId: P("collateral"), reason: "gather_evidence" },
+    { nodeId: P("repayment"), reason: "awaiting_evidence" },
+  ]);
+});
+
+test("Responses parsing concatenates text fragments and ignores non-message parts", async () => {
+  const output = [
+    null, { type: "reasoning", content: [] }, { type: "reasoning", content: [{ type: "output_text", text: "x" }] },
+    { type: "message", content: null },
+    { type: "message", content: [null, { type: "refusal", text: "ignored" }, { type: "output_text", text: 7 }, { type: "output_text", text: '{"pro' }] },
+    { type: "message", content: [{ type: "output_text", text: 'posals":[]}' }] },
+  ];
+  let calls = 0;
+  const fetchFn = (async () => {
+    if (calls++ === 0) return chat({ output });
+    if (calls === 2) return responsesPayload({ analyses: [], evidenceRequests: [] });
+    return responsesPayload({ proposals: [], evidenceRequests: [] });
+  }) as unknown as typeof fetch;
+  // The fragments concatenate to {"proposals":[]}, so the chain completes with no proposals.
+  process.env.OPENCODE_API_KEY = "sk-test-fragments";
+  process.env.OPENCODE_MODEL = "test-model";
+  process.env.OPENCODE_URL = "https://opencode.test/responses";
+  const dir = await mkdtemp(join(tmpdir(), "run-fragments-"));
+  await runScenario(scenarios[0].id, { outDir: dir, systemOne: stubSystemOne(), fetchFn });
+  expect(calls).toBe(3);
+  expect(JSON.parse(await readFile(join(dir, "final.json"), "utf8")).proposals).toEqual([]);
+  expect(await readdir(dir)).toContain("raw-decompose.json");
+  // An empty proposal list never reaches JEV, which rejects requests without questions.
+  expect(await readdir(dir)).not.toContain("request-relevance.json");
+});
+
+test("Responses parsing distinguishes malformed envelopes from malformed JSON", async () => {
+  for (const [body, message] of [
+    [null, "malformed_opencode_response"],
+    [{ output: null }, "malformed_opencode_response"],
+    [{ output: [{ type: "message", content: [{ type: "output_text", text: "" }] }] }, "malformed_opencode_response"],
+    [{ output: [{ type: "message", content: [{ type: "output_text", text: "{" }] }] }, "malformed_opencode_json"],
+    [{ output: [{ type: "message", content: [{ type: "output_text", text: "[]" }] }] }, "malformed_opencode_json"],
+  ] as const) {
+    const fetchFn = (async () => chat(body)) as unknown as typeof fetch;
+    const dir = await expectRunError("sk-test-response-boundary", fetchFn, message);
+    expect(await readdir(dir)).toContain("raw-decompose.json");
+    expect(await readdir(dir)).not.toContain("request-relevance.json");
+  }
+});
 
 test("full sequence: relevance, analysis, adjudication, expansion, artifacts", async () => {
   const dir = await successDir("sk-test-success-key");
@@ -165,6 +326,11 @@ test("full sequence: relevance, analysis, adjudication, expansion, artifacts", a
   expect(final.reasoning[0].materialityScore).toBe(3);
   expect(final.unresolved).toContainEqual({ nodeId: P("collateral"), reason: "gather_evidence" });
   expect(final.evidenceRequests).toHaveLength(2);
+  expect(final.unresolved).toEqual([{ nodeId: P("collateral"), reason: "gather_evidence" }]);
+  expect(final.proposals.map((p: { stage: string }) => p.stage)).toEqual(["initial", "initial", "initial", "expanded"]);
+  expect(final.evidenceRequests.map((r: { nodeId: string; stage: string }) => [r.nodeId, r.stage])).toEqual(
+    [[P("collateral"), "analyze"], [P("packwell"), "expand"]],
+  );
   // Parsed decisions carry native kinds per stage.
   expect(final.decisions.relevance[P("repayment")].kind).toBe("choice");
   expect(final.decisions.relevance[P("repayment")].choice).toBe("analyze");
@@ -245,6 +411,16 @@ test("duplicate proposal ids are rejected", async () => {
     "duplicate proposal id",
     (async () => ({ answers: {} })) as unknown as SystemOneFn,
   );
+  const replies = [
+    { proposals: PROPOSALS },
+    { analyses: [VALID_ANALYSIS], evidenceRequests: [GATHER_REQUEST] },
+    { proposals: [PROPOSALS[0]], evidenceRequests: [] },
+  ];
+  const dir = await expectRunError(
+    "sk-test-reused-key",
+    (async () => responsesPayload(replies.shift())) as unknown as typeof fetch,
+  );
+  expect(await readdir(dir)).not.toContain("request-relevance-expanded.json");
 });
 
 test("self-dependency is rejected", async () => {
@@ -281,6 +457,20 @@ test("non-authoritative OpenCode decision field is rejected", async () => {
   );
 });
 
+test("malformed or misreferenced proposals are rejected before JEV relevance", async () => {
+  const cases = [
+    { proposals: [{ ...PROPOSALS[0], id: `${OBJ}repayment` }] },
+    { proposals: [{ ...PROPOSALS[0], objectiveId: "other" }] },
+    { proposals: [{ ...PROPOSALS[0], dependsOn: [P("missing")] }] },
+    { proposals: [{ ...PROPOSALS[0], dependsOn: "" }] },
+    { proposals: PROPOSALS, extra: 1 },
+  ];
+  for (const reply of cases) {
+    const dir = await expectRunError("sk-test-bad-proposal", (async () => responsesPayload(reply)) as unknown as typeof fetch);
+    expect(await readdir(dir)).not.toContain("request-relevance.json");
+  }
+});
+
 test("no secrets or evaluation criteria leak into request artifacts", async () => {
   const secret = `sk-test-secret-${Date.now()}`;
   const dir = await successDir(secret);
@@ -310,6 +500,154 @@ test("decide request carries only the analysis evidence subset", async () => {
   const ids = (body.state.evidence as { id: string }[]).map((e) => e.id);
   expect(ids).toContain("s1-ev3");
   expect(ids).not.toContain("s1-ev1");
+});
+
+test("each analyzed node keeps its own verdict, dependency dispositions, unresolved reason, and decide file", async () => {
+  const packwell = {
+    id: P("packwell"), objectiveId: OBJ, question: "What if Packwell packaging fails?",
+    dependsOn: [P("repayment")], whyItMatters: "Indirect exposure via sole supplier.",
+  };
+  const verdict: Record<string, [number, string]> = {
+    [P("repayment")]: [0.2, "insufficient"],
+    [P("packwell")]: [0.6, "conflicted"],
+  };
+  const stub = stubSystemOne();
+  const systemOne: SystemOneFn = async (req) => {
+    const out = (await stub(req)) as { answers: Record<string, Record<string, unknown>> };
+    const { state } = req;
+    const proposal = typeof state === "object" && state !== null && "proposal" in state ? state.proposal : undefined;
+    const id = typeof proposal === "object" && proposal !== null && "id" in proposal ? proposal.id : undefined;
+    const node = typeof id === "string" ? verdict[id] : undefined;
+    if (node) {
+      out.answers.truth.noul = node[0];
+      out.answers.evidence_state.choice = node[1];
+    }
+    return out;
+  };
+  process.env.OPENCODE_API_KEY = "sk-test-nodes";
+  process.env.OPENCODE_MODEL = "test-model";
+  process.env.OPENCODE_URL = "https://opencode.test/responses";
+  const dir = await mkdtemp(join(tmpdir(), "run-nodes-"));
+  await runScenario(scenarios[0].id, {
+    outDir: dir, systemOne, fetchFn: analysisFetch({
+      analyses: [VALID_ANALYSIS, {
+        nodeId: P("packwell"), objectiveId: OBJ, interpretation: "Packwell is the sole supplier.", evidenceRefs: ["s1-ev4"],
+      }],
+      evidenceRequests: [],
+    }, [PROPOSALS[0], packwell]),
+  });
+  const final = JSON.parse(await readFile(join(dir, "final.json"), "utf8"));
+  expect(final.reasoning.map((r: { nodeId: string; truthProbability: number; evidenceState: string }) =>
+    [r.nodeId, r.truthProbability, r.evidenceState])).toEqual([
+      [P("repayment"), 0.2, "insufficient"],
+      [P("packwell"), 0.6, "conflicted"],
+    ]);
+  expect(final.unresolved).toEqual([
+    { nodeId: P("repayment"), reason: "insufficient" },
+    { nodeId: P("packwell"), reason: "conflicted" },
+  ]);
+  const decideFiles = (await readdir(dir)).filter((f) => f.startsWith("request-decide-"));
+  expect(decideFiles).toHaveLength(2);
+  const packwellRequest = JSON.parse(await readFile(join(dir, decideFiles.find((f) => f.includes("packwell")) as string), "utf8"));
+  expect(packwellRequest.state.dependencyDecisions).toEqual([{ proposalId: P("repayment"), disposition: "analyze" }]);
+});
+
+test("a proposal id longer than a filename still gets its decide request file", async () => {
+  process.env.OPENCODE_API_KEY = "sk-test-long-id";
+  process.env.OPENCODE_MODEL = "test-model";
+  process.env.OPENCODE_URL = "https://opencode.test/responses";
+  const dir = await mkdtemp(join(tmpdir(), "run-long-id-"));
+  await runScenario(scenarios[0].id, {
+    outDir: dir, systemOne: stubSystemOne(), fetchFn: analysisFetch(
+      { analyses: [{ ...VALID_ANALYSIS, nodeId: LONG_ID }], evidenceRequests: [] },
+      [{ ...PROPOSALS[0], id: LONG_ID }],
+    ),
+  });
+  expect((await readdir(dir)).filter((f) => f.startsWith("request-decide-"))).toHaveLength(1);
+  expect(JSON.parse(await readFile(join(dir, "final.json"), "utf8")).reasoning[0].nodeId).toBe(LONG_ID);
+});
+
+test("non-2xx OpenCode responses are request failures without raw artifacts", async () => {
+  const fetchFn = (async () => chat({ error: { message: "invalid key" } }, 401)) as unknown as typeof fetch;
+  const dir = await expectRunError("sk-test-status-key", fetchFn);
+  expect(await readdir(dir)).not.toContain("raw-decompose.json");
+});
+
+test("unknown scenarios and blank OpenCode configuration fail before any request", async () => {
+  const calls: FetchCall[] = [];
+  const fetchFn = recordingFetch(calls, () => responsesPayload({ proposals: PROPOSALS }));
+  const attempt = async (scenarioId: string) =>
+    runScenario(scenarioId, { fetchFn, systemOne: stubSystemOne(), outDir: await mkdtemp(join(tmpdir(), "run-config-")) });
+  await expect(attempt("no-such-scenario")).rejects.toThrow();
+  for (const name of ["OPENCODE_MODEL", "OPENCODE_URL", "OPENCODE_API_KEY"]) {
+    for (const blank of ["", "   "]) {
+      process.env.OPENCODE_API_KEY = "sk-test-config";
+      process.env.OPENCODE_MODEL = "test-model";
+      process.env.OPENCODE_URL = "https://opencode.test/responses";
+      process.env[name] = blank;
+      await expect(attempt(scenarios[0].id)).rejects.toThrow();
+    }
+  }
+  expect(calls).toHaveLength(0);
+});
+
+test("a loopback Responses server accepts every OpenCode request and the run completes", async () => {
+  const replies = [
+    { proposals: PROPOSALS },
+    { analyses: [VALID_ANALYSIS], evidenceRequests: [GATHER_REQUEST] },
+    { proposals: [], evidenceRequests: [] },
+  ];
+  // Like a real Responses endpoint, the server answers only authenticated JSON POSTs of {model, input}.
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    async fetch(req) {
+      const body: unknown = await req.json().catch(() => null);
+      const ok = req.method === "POST"
+        && req.headers.get("content-type") === "application/json"
+        && req.headers.get("authorization") === "Bearer sk-test-loopback"
+        && typeof body === "object" && body !== null && Object.keys(body).sort().join() === "input,model"
+        && "model" in body && body.model === "test-model"
+        && "input" in body && typeof body.input === "string" && body.input.length > 0;
+      return ok ? responsesPayload(replies.shift()) : new Response("bad request", { status: 400 });
+    },
+  });
+  // run.ts owns its fetch options, so NO_PROXY keeps ambient proxy variables off the loopback hop.
+  const proxyEnv = { NO_PROXY: process.env.NO_PROXY, no_proxy: process.env.no_proxy };
+  try {
+    process.env.NO_PROXY = "127.0.0.1";
+    process.env.no_proxy = "127.0.0.1";
+    process.env.OPENCODE_API_KEY = "sk-test-loopback";
+    process.env.OPENCODE_MODEL = "test-model";
+    process.env.OPENCODE_URL = `http://127.0.0.1:${server.port}/responses`;
+    const dir = await mkdtemp(join(tmpdir(), "run-loopback-"));
+    await runScenario(scenarios[0].id, { outDir: dir, systemOne: stubSystemOne() });
+    // stubSystemOne answers truth 0.85, sufficient_support at confidence 0.8, and materiality 3.
+    expect(JSON.parse(await readFile(join(dir, "final.json"), "utf8")).reasoning).toEqual([{
+      ...VALID_ANALYSIS,
+      truthProbability: 0.85, truthPolicy: "yes",
+      evidenceState: "sufficient_support", evidenceProbabilities: EVIDENCE_STATE_FULL, evidenceConfidence: 0.8,
+      materialityScore: 3,
+    }]);
+  } finally {
+    server.stop(true);
+    for (const [name, value] of Object.entries(proxyEnv)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
+test("CLI exits 2 for usage, 1 for a failed run, and 0 when listing scenario ids", () => {
+  // A temp cwd keeps Bun from loading any repository .env file.
+  const cli = (...args: string[]) =>
+    Bun.spawnSync([process.execPath, join(import.meta.dir, "run.ts"), ...args], { cwd: tmpdir() });
+  expect(cli().exitCode).toBe(2);
+  const failed = cli("no-such-scenario");
+  expect(failed.exitCode).toBe(1);
+  const list = cli("--list");
+  expect(list.exitCode).toBe(0);
+  expect(list.stdout.toString().trim().split("\n").map((line) => line.split("\t")[0])).toEqual(scenarios.map((s) => s.id));
 });
 
 const DECISION_ENV = {
@@ -461,6 +799,9 @@ test("malformed decision responses are rejected", async () => {
     [{}, "missing choices"],
     [{ choices: [] }, "missing choices"],
     [completion(answers, {}, "length"), "truncated output"],
+    [{ choices: [{ finish_reason: "stop" }] }, "missing message"],
+    [{ choices: [{ finish_reason: "length", message: null }] }, "truncated output"],
+    [{ choices: [{ message: { content: null, refusal: ["blocked"] } }] }, "refusal"],
     [{ choices: [{ message: { role: "assistant", content: null, refusal: "I cannot help." }, finish_reason: "stop" }] }, "refusal"],
     [completion(null), "content must be a nonempty string"],
     [completion("  "), "content must be a nonempty string"],

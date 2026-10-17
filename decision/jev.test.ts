@@ -6,7 +6,7 @@
 // (each id its own probability, no cross-id winner); ordinal judgments →
 // score (never deterministic calcs).
 import { expect, test } from "bun:test";
-import { mkdtemp, readdir } from "node:fs/promises";
+import { mkdtemp, readdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
@@ -24,7 +24,9 @@ import {
   scopeNodeState,
   TOOL_SELECTION_SENTINELS,
 } from "./jev.ts";
+import type { DecisionResult } from "./jev.ts";
 import { analyzePrompt, decomposePrompt, expandPrompt } from "./prompts.ts";
+import { handleDecide } from "./runtime.ts";
 
 test("noul preserves probability exactly; policy stays in classifyProbability", () => {
   for (const p of [0, 0.5, 0.6999, 0.7, 0.85, 1]) {
@@ -281,6 +283,122 @@ test("mixed askDecisions parses noul+choice+score from one shared state", async 
     longErr = e;
   }
   expect(String(longErr)).toContain("do not match");
+});
+
+test("experiment and sidecar consumers enforce the same envelope and question boundaries", async () => {
+  const questions = { q: { type: "noul" } };
+  const runBoth = async (asked: Record<string, unknown>, raw: unknown) => {
+    const dir = await mkdtemp(join(tmpdir(), "jev-parity-"));
+    const req = { state: {}, questions: asked };
+    const systemOne = async () => raw;
+    const sidecar = await handleDecide({ id: "r", op: "decide", ...req }, systemOne);
+    let err: unknown = null;
+    let decisions: Record<string, DecisionResult> | null = null;
+    try {
+      decisions = (await askDecisions(dir, "decide", req, systemOne)).decisions;
+    } catch (e) {
+      err = e;
+    }
+    expect(JSON.parse(await readFile(join(dir, "raw-decide.json"), "utf8"))).toEqual(raw);
+    return { dir, sidecar, err, decisions };
+  };
+  const rejected: [Record<string, unknown>, unknown, string][] = [
+    ...[null, [], { answers: null }, { answers: [] }, { answers: "x" }].map((raw) => [
+      questions, raw, "decide: malformed_decision_response",
+    ] as [Record<string, unknown>, unknown, string]),
+    ...[{}, { other: { type: "noul", noul: 1 } }, { q: { type: "noul", noul: 1 }, extra: {} }].map((answers) => [
+      questions, { answers }, "decide: decision answers do not match questions",
+    ] as [Record<string, unknown>, unknown, string]),
+    [questions, { answers: { q: null } }, "decide: malformed_decision_answer for q"],
+    [questions, { answers: { q: { type: "noul", noul: -Number.EPSILON } } }, "invalid_probability"],
+    [questions, { answers: { q: { type: "noul", noul: 1 + Number.EPSILON } } }, "invalid_probability"],
+    [
+      { q: { type: "score", criteria: ["Low", "High"] } },
+      { answers: { q: { type: "noul", noul: 1 } } },
+      "decide: malformed_decision_answer for q",
+    ],
+    [
+      { q: { type: "score", criteria: ["Low", "High"] } },
+      { answers: { q: { type: "score", score: 1 + Number.EPSILON } } },
+      "decide: malformed_decision_answer for q",
+    ],
+    [
+      { q: { type: "choice" } },
+      { answers: { q: { type: "choice", choice: "x", probabilities: {}, confidence: 0 } } },
+      "decide: malformed_decision_answer for q",
+    ],
+    [
+      { q: { type: "choice", criteria: { only: "Only" } } },
+      { answers: { q: { type: "noul", noul: 1 } } },
+      "decide: malformed_decision_answer for q",
+    ],
+  ];
+  for (const [asked, raw, error] of rejected) {
+    const { dir, sidecar, err, decisions } = await runBoth(asked, raw);
+    expect(sidecar).toEqual({ id: "r", error });
+    expect(String(err)).toContain(error);
+    expect(decisions).toBeNull();
+    expect(await readdir(dir)).not.toContain("policy-decide.json");
+  }
+  const accepted: [Record<string, unknown>, unknown, Record<string, DecisionResult>][] = [
+    ...[0, 1].map((probability) => [
+      questions,
+      { answers: { q: { type: "noul", noul: probability } } },
+      { q: { kind: "noul", probability } },
+    ] as [Record<string, unknown>, unknown, Record<string, DecisionResult>]),
+    [
+      { q: { type: "choice", criteria: { only: "Only" } } },
+      { answers: { q: { type: "choice", choice: "only", confidence: 0, probabilities: { only: 1 } } } },
+      { q: { kind: "choice", choice: "only", confidence: 0, probabilities: { only: 1 } } },
+    ],
+    [
+      { q: null },
+      { answers: { q: { type: "score", score: -10 } } },
+      { q: { kind: "score", score: -10 } },
+    ],
+    [
+      { q: { type: "score" } },
+      { answers: { q: { type: "score", score: 100 } } },
+      { q: { kind: "score", score: 100 } },
+    ],
+  ];
+  for (const [asked, raw, expected] of accepted) {
+    const { dir, sidecar, err, decisions } = await runBoth(asked, raw);
+    expect(err).toBeNull();
+    expect(sidecar).toEqual({ id: "r", raw, decisions: expected });
+    expect(decisions).toEqual(expected);
+    expect(JSON.parse(await readFile(join(dir, "policy-decide.json"), "utf8"))).toEqual(expected);
+  }
+});
+
+test("both decision consumers preserve request errors and stop before raw artifacts", async () => {
+  for (const [failure, expected] of [
+    [new Error("offline"), "decide: decision_request_failed: offline"],
+    ["offline", "decide: decision_request_failed: offline"],
+    [new Error("malformed_decision_response: missing choices"), "decide: malformed_decision_response: missing choices"],
+  ] as const) {
+    const dir = await mkdtemp(join(tmpdir(), "jev-error-"));
+    const req = { state: {}, questions: { q: { type: "noul" } } };
+    const systemOne = async () => { throw failure; };
+    expect(await handleDecide({ id: "r", op: "decide", ...req }, systemOne)).toEqual({ id: "r", error: expected });
+    let err: unknown = null;
+    try {
+      await askDecisions(dir, "decide", req, systemOne);
+    } catch (e) {
+      err = e;
+    }
+    expect(String(err)).toContain(expected);
+    expect(await readdir(dir)).toEqual(["request-decide.json"]);
+  }
+});
+
+test("score rejects invalid rubrics and malformed optional distributions", () => {
+  for (const maxScore of [NaN, Infinity, -Infinity, -1])
+    expect(() => parseScoreAnswer("n", "m", { type: "score", score: 0 }, maxScore)).toThrow("n: malformed_decision_answer for m");
+  for (const probabilities of [null, [], "x"])
+    expect(() => parseScoreAnswer("n", "m", { type: "score", score: 0, probabilities })).toThrow("n: malformed_decision_answer for m");
+  for (const score of [0, 1])
+    expect(parseScoreAnswer("n", "m", { type: "score", score, confidence: score }, 1)).toEqual({ kind: "score", score, confidence: score });
 });
 
 test("assertAcyclic rejects self and indirect cycles, accepts diamonds", () => {

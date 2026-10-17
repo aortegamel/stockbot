@@ -84,43 +84,61 @@ export function parseChoiceAnswer(
   if (typeof ans.choice !== "string" || !Object.hasOwn(options, ans.choice)) throw bad();
   if (!isObj(ans.probabilities) || typeof ans.confidence !== "number") throw bad();
   if (!isProb(ans.confidence)) throw bad();
+  const probabilities = choiceProbabilities(ans.probabilities, options, bad);
+  return { kind: "choice", choice: ans.choice as string, probabilities, confidence: ans.confidence as number };
+}
+
+function choiceProbabilities(
+  source: Record<string, unknown>,
+  options: Record<string, string>,
+  bad: () => Error,
+): Record<string, number> {
   const want = Object.keys(options).sort();
-  const got = Object.keys(ans.probabilities).sort();
+  const got = Object.keys(source).sort();
   if (got.length !== want.length || got.some((k, i) => k !== want[i])) throw bad();
   const probabilities: Record<string, number> = {};
   for (const k of want) {
-    const v = (ans.probabilities as Record<string, unknown>)[k];
+    const v = source[k];
     if (!isProb(v)) throw bad();
     Object.defineProperty(probabilities, k, {
       value: v, enumerable: true, writable: true, configurable: true,
     });
   }
-  return { kind: "choice", choice: ans.choice as string, probabilities, confidence: ans.confidence as number };
+  return probabilities;
 }
 
-export function parseScoreAnswer(name: string, id: string, ans: unknown, maxScore?: number): ScoreDecision {
-  const bad = (): Error => new Error(`${name}: malformed_decision_answer for ${id}`);
+function scoreValue(ans: unknown, maxScore: number | undefined, bad: () => Error): Record<string, unknown> & { score: number } {
   if (!isObj(ans) || ans.type !== "score" || typeof ans.score !== "number") throw bad();
-  const s = ans.score as number;
-  if (!Number.isFinite(s)) throw bad();
+  if (!Number.isFinite(ans.score)) throw bad();
   if (maxScore !== undefined) {
-    if (!Number.isFinite(maxScore) || s < 0 || s > maxScore) throw bad();
+    if (!Number.isFinite(maxScore) || ans.score < 0 || ans.score > maxScore) throw bad();
   }
+  return ans as Record<string, unknown> & { score: number };
+}
+
+function scoreProbabilities(value: unknown, bad: () => Error): Record<string, number> {
+  if (!isObj(value)) throw bad();
+  const probs: Record<string, number> = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (!isProb(v)) throw bad();
+    probs[k] = v;
+  }
+  return probs;
+}
+
+export function parseScoreAnswer(name: string, id: string, answer: unknown, maxScore?: number): ScoreDecision {
+  const bad = (): Error => new Error(`${name}: malformed_decision_answer for ${id}`);
+  const ans = scoreValue(answer, maxScore, bad);
+  const s = ans.score;
   const out: ScoreDecision = { kind: "score", score: s };
   if (ans.confidence !== undefined) {
     if (!isProb(ans.confidence)) throw bad();
     out.confidence = ans.confidence as number;
   }
   if (ans.probabilities !== undefined) {
-    if (!isObj(ans.probabilities)) throw bad();
-    const probs: Record<string, number> = {};
-    for (const [k, v] of Object.entries(ans.probabilities)) {
-      if (!isProb(v)) throw bad();
-      probs[k] = v;
-    }
-    out.probabilities = probs;
+    out.probabilities = scoreProbabilities(ans.probabilities, bad);
   }
-  if (isObj(ans) && "legend" in ans) out.raw = ans.legend;
+  if ("legend" in ans) out.raw = ans.legend;
   return out;
 }
 
@@ -179,10 +197,55 @@ function optionsFromQuestion(q: unknown): Record<string, string> {
   return {};
 }
 
-// Typed ask: preserves raw decision output plus the parsed DecisionResult map, and
-// writes request/raw/policy files like the existing sequential caller. Policy
-// (the decisions map) stays separate from raw; noul yes/unsure/no is derived
-// by callers via classifyProbability, never collapsed here.
+// Both callers share transport errors and strict envelope parsing. The experiment
+// caller still saves the raw response before validation.
+export async function requestDecisions(
+  name: string,
+  req: { state: unknown; questions: Record<string, unknown> },
+  systemOne: SystemOneFn,
+): Promise<unknown> {
+  try {
+    return await systemOne(req);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`${name}: ${msg.startsWith("malformed_decision_response") ? msg : `decision_request_failed: ${msg}`}`);
+  }
+}
+
+function questionDecision(
+  name: string,
+  id: string,
+  q: unknown,
+  ans: unknown,
+  choiceOptions?: Record<string, string>,
+): DecisionResult {
+  const qType = isObj(q) ? q.type : undefined;
+  const aType = isObj(ans) ? ans.type : undefined;
+  const kind = qType === "choice" || qType === "score" ? qType : aType;
+  if (kind === "choice") return parseChoiceAnswer(name, id, ans, choiceOptions ?? optionsFromQuestion(q));
+  if (kind === "score") return parseScoreAnswer(name, id, ans, scoreMaxFromQuestion(q));
+  return parseNoulAnswer(name, id, ans);
+}
+
+export function parseDecisions(
+  name: string,
+  questions: Record<string, unknown>,
+  raw: unknown,
+  choiceOptions?: Record<string, Record<string, string>>,
+): Record<string, DecisionResult> {
+  const ids = Object.keys(questions).sort();
+  if (!isObj(raw) || !isObj(raw.answers)) throw new Error(`${name}: malformed_decision_response`);
+  const got = Object.keys(raw.answers).sort();
+  if (got.length !== ids.length || got.some((k, i) => k !== ids[i]))
+    throw new Error(`${name}: decision answers do not match questions`);
+  const decisions: Record<string, DecisionResult> = {};
+  for (const id of ids) {
+    decisions[id] = questionDecision(name, id, questions[id], raw.answers[id], choiceOptions?.[id]);
+  }
+  return decisions;
+}
+
+// Save request/raw/policy files. Callers apply noul policy separately.
 export async function askDecisions(
   dir: string,
   name: string,
@@ -191,34 +254,9 @@ export async function askDecisions(
   choiceOptions?: Record<string, Record<string, string>>,
 ): Promise<{ raw: unknown; decisions: Record<string, DecisionResult> }> {
   await writeFile(join(dir, `request-${name}.json`), JSON.stringify(req, null, 2) + "\n");
-  let raw: unknown;
-  try {
-    raw = await systemOne(req);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`${name}: ${msg.startsWith("malformed_decision_response") ? msg : `decision_request_failed: ${msg}`}`);
-  }
+  const raw = await requestDecisions(name, req, systemOne);
   await writeFile(join(dir, `raw-${name}.json`), JSON.stringify(raw, null, 2) + "\n");
-  const ids = Object.keys(req.questions).sort();
-  if (!isObj(raw) || !isObj(raw.answers)) throw new Error(`${name}: malformed_decision_response`);
-  const got = Object.keys(raw.answers).sort();
-  if (got.length !== ids.length || got.some((k, i) => k !== ids[i]))
-    throw new Error(`${name}: decision answers do not match questions`);
-  const decisions: Record<string, DecisionResult> = {};
-  for (const id of ids) {
-    const ans = (raw.answers as Record<string, unknown>)[id];
-    const q = req.questions[id];
-    const qType = isObj(q) ? q.type : undefined;
-    const aType = isObj(ans) ? ans.type : undefined;
-    const kind = qType === "choice" || qType === "score" ? qType : aType;
-    if (kind === "choice") {
-      decisions[id] = parseChoiceAnswer(name, id, ans, choiceOptions?.[id] ?? optionsFromQuestion(q));
-    } else if (kind === "score") {
-      decisions[id] = parseScoreAnswer(name, id, ans, scoreMaxFromQuestion(q));
-    } else {
-      decisions[id] = parseNoulAnswer(name, id, ans);
-    }
-  }
+  const decisions = parseDecisions(name, req.questions, raw, choiceOptions);
   await writeFile(join(dir, `policy-${name}.json`), JSON.stringify(decisions, null, 2) + "\n");
   return { raw, decisions };
 }
@@ -291,15 +329,7 @@ function withTodayUtc(text: string): string {
   return text.includes("[Today UTC ") ? text : `[Today UTC ${new Date().toISOString().slice(0, 10)}] ${text}`;
 }
 
-export function buildToolSelectionQuestion(
-  registry: ToolManifestEntry[],
-  node: ToolSelectionNode,
-  evidence?: unknown[],
-  attempts?: ToolSelectionAttempt[],
-): { id: "tool_selection"; prompt: string; options: Record<string, string> } {
-  if (!Array.isArray(registry) || registry.length === 0) throw new Error("tool_selection: empty registry");
-  if (!node || typeof node.nodeId !== "string" || !node.nodeId || typeof node.question !== "string" || !node.question)
-    throw new Error("tool_selection: node needs nodeId and question");
+function toolSelectionOptions(registry: ToolManifestEntry[]): Record<string, string> {
   const options: Record<string, string> = {};
   for (const entry of registry) {
     if (!entry || typeof entry.name !== "string" || !entry.name)
@@ -311,17 +341,45 @@ export function buildToolSelectionQuestion(
     if (k in options) throw new Error(`tool_selection: registry collides with sentinel ${k}`);
     options[k] = v;
   }
+  return options;
+}
+
+function attemptLines(attempts?: ToolSelectionAttempt[]): string {
+  let text = "";
+  for (const a of attempts ?? []) {
+    if (!a || typeof a.tool !== "string" || typeof a.error !== "string") continue;
+    text += ` Prior attempt ${a.tool} failed: ${a.error.slice(0, 200)}.`;
+  }
+  return text;
+}
+
+function toolSelectionContext(node: ToolSelectionNode, evidence?: unknown[], attempts?: ToolSelectionAttempt[]): string {
   let prompt = `Which single tool runs next for research node ${node.nodeId}? Question: ${node.question} JEV owns this selection and every transition over the whole canonical registry; Needle runs args only and never selects, chains, or judges. Choose exactly one winner.`;
   if (typeof node.whyItMatters === "string" && node.whyItMatters) prompt += ` Why it matters: ${node.whyItMatters}`;
   const ids = evidenceIds(evidence);
   prompt += ` Evidence on hand: ${Array.isArray(evidence) ? evidence.length : 0} item(s)${ids.length ? ` [${ids.join(", ")}]` : ""}.`;
-  for (const a of attempts ?? []) {
-    if (!a || typeof a.tool !== "string" || typeof a.error !== "string") continue;
-    prompt += ` Prior attempt ${a.tool} failed: ${a.error.slice(0, 200)}.`;
-  }
+  return prompt + attemptLines(attempts);
+}
+
+function revenueFilingHint(question: string): string {
+  if (/revenue/i.test(question) && /\b10-?\s?q\b/i.test(question) && /\b(?:latest|most recent)\b/i.test(question)) return ` Latest-10-Q revenue answers come from the 10-Q, not the 8-K: after the filing list, open the 10-Q accession via get_sec_document section reads (Item 1, Item 2, Item 1A) before re-reading any 8-K.`;
+  if (/revenue/i.test(question) && /quarter/i.test(question)) return ` Revenue-quarter answers come from the 10-Q (MD&A/segment revenue), not the 8-K: after the filing list, open the 10-Q accession via get_sec_document with a revenue query before re-reading any 8-K.`;
+  return "";
+}
+
+export function buildToolSelectionQuestion(
+  registry: ToolManifestEntry[],
+  node: ToolSelectionNode,
+  evidence?: unknown[],
+  attempts?: ToolSelectionAttempt[],
+): { id: "tool_selection"; prompt: string; options: Record<string, string> } {
+  if (!Array.isArray(registry) || registry.length === 0) throw new Error("tool_selection: empty registry");
+  if (!node || typeof node.nodeId !== "string" || !node.nodeId || typeof node.question !== "string" || !node.question)
+    throw new Error("tool_selection: node needs nodeId and question");
+  const options = toolSelectionOptions(registry);
+  let prompt = toolSelectionContext(node, evidence, attempts);
   prompt += ` Today UTC is ${new Date().toISOString().slice(0, 10)}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week' or 'today' or 'last quarter' as arg values.`;
   prompt += ` Search packets list candidates only — page with research_read_search beyond display_limit and open each accession via get_sec_filing/get_sec_document until answered or guard trips.`;
-  if (/revenue/i.test(node.question) && /\b10-?\s?q\b/i.test(node.question) && /\b(?:latest|most recent)\b/i.test(node.question)) prompt += ` Latest-10-Q revenue answers come from the 10-Q, not the 8-K: after the filing list, open the 10-Q accession via get_sec_document section reads (Item 1, Item 2, Item 1A) before re-reading any 8-K.`;
-  else if (/revenue/i.test(node.question) && /quarter/i.test(node.question)) prompt += ` Revenue-quarter answers come from the 10-Q (MD&A/segment revenue), not the 8-K: after the filing list, open the 10-Q accession via get_sec_document with a revenue query before re-reading any 8-K.`;
+  prompt += revenueFilingHint(node.question);
   return { id: "tool_selection", prompt: withTodayUtc(prompt), options };
 }

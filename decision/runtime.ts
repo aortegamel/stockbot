@@ -15,32 +15,14 @@
 //        malformed answer — never crashes the loop)
 import { createInterface } from "node:readline";
 import {
-  parseChoiceAnswer,
-  parseNoulAnswer,
-  parseScoreAnswer,
+  parseDecisions,
+  requestDecisions,
 } from "./jev.ts";
 import type { DecisionResult, SystemOneFn } from "./jev.ts";
 import { createSystemOne } from "./client.ts";
 
 function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-// Mirrors private helpers in jev.ts (not exported there); kept in sync by
-// construction, never diverged with new semantics.
-function scoreMaxFromQuestion(q: unknown): number | undefined {
-  if (!isObj(q)) return undefined;
-  const criteria = (q as Record<string, unknown>).criteria;
-  if (Array.isArray(criteria)) return criteria.length - 1;
-  const levels = (q as Record<string, unknown>).levels;
-  if (Array.isArray(levels)) return levels.length - 1;
-  return undefined;
-}
-
-function optionsFromQuestion(q: unknown): Record<string, string> {
-  if (isObj(q) && isObj(q.criteria))
-    return Object.fromEntries(Object.keys(q.criteria).map((k) => [k, k]));
-  return {};
 }
 
 export type DecideRequest = {
@@ -64,38 +46,19 @@ export async function decideWithoutFs(
   choiceOptions?: Record<string, Record<string, string>>,
   name = "decide",
 ): Promise<{ raw: unknown; decisions: Record<string, DecisionResult> }> {
-  let raw: unknown;
-  try {
-    raw = await systemOne(req);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`${name}: ${msg.startsWith("malformed_decision_response") ? msg : `decision_request_failed: ${msg}`}`);
-  }
-  const ids = Object.keys(req.questions).sort();
-  if (!isObj(raw) || !isObj(raw.answers)) throw new Error(`${name}: malformed_decision_response`);
-  const got = Object.keys(raw.answers).sort();
-  if (got.length !== ids.length || got.some((k, i) => k !== ids[i]))
-    throw new Error(`${name}: decision answers do not match questions`);
-  const decisions: Record<string, DecisionResult> = {};
-  for (const id of ids) {
-    const ans = (raw.answers as Record<string, unknown>)[id];
-    const q = req.questions[id];
-    const qType = isObj(q) ? q.type : undefined;
-    const aType = isObj(ans) ? ans.type : undefined;
-    const kind = qType === "choice" || qType === "score" ? qType : aType;
-    if (kind === "choice") {
-      decisions[id] = parseChoiceAnswer(name, id, ans, choiceOptions?.[id] ?? optionsFromQuestion(q));
-    } else if (kind === "score") {
-      decisions[id] = parseScoreAnswer(name, id, ans, scoreMaxFromQuestion(q));
-    } else {
-      decisions[id] = parseNoulAnswer(name, id, ans);
-    }
-  }
+  const raw = await requestDecisions(name, req, systemOne);
+  const decisions = parseDecisions(name, req.questions, raw, choiceOptions);
   return { raw, decisions };
 }
 
 function badId(): DecideErr {
   return { id: "", error: "bad_request" };
+}
+
+function requestChoiceOptions(req: Record<string, unknown>): DecideRequest["choiceOptions"] {
+  if (isObj(req.choiceOptions)) return req.choiceOptions as DecideRequest["choiceOptions"];
+  if (isObj(req.options)) return req.options as DecideRequest["choiceOptions"];
+  return undefined;
 }
 
 export async function handleDecide(req: unknown, systemOne: SystemOneFn): Promise<DecideResponse> {
@@ -106,9 +69,7 @@ export async function handleDecide(req: unknown, systemOne: SystemOneFn): Promis
   if (req.op !== "decide") return { id, error: "unknown_op" };
   if (!isObj(req.questions)) return { id, error: "decide: missing_questions" };
   const questions = req.questions as Record<string, unknown>;
-  const choiceOptions =
-    (isObj(req.choiceOptions) ? (req.choiceOptions as DecideRequest["choiceOptions"]) : undefined) ??
-    (isObj(req.options) ? (req.options as DecideRequest["choiceOptions"]) : undefined);
+  const choiceOptions = requestChoiceOptions(req);
   try {
     const { raw, decisions } = await decideWithoutFs({ state: req.state ?? null, questions }, systemOne, choiceOptions, "decide");
     return { id, raw, decisions };

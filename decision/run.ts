@@ -57,35 +57,89 @@ function nonEmpty(stage: string, v: unknown, what: string): string {
   return v;
 }
 
+function proposalId(stage: string, item: unknown, objectiveId: string): string {
+  if (!isObj(item)) throw new Error(`${stage}: proposal must be an object`);
+  exactKeys(stage, item, ["dependsOn", "id", "objectiveId", "question", "whyItMatters"]);
+  const id = nonEmpty(stage, item.id, "proposal.id");
+  if (!id.startsWith(`${objectiveId}-`)) throw new Error(`${stage}: proposal id ${id} must start with ${objectiveId}-`);
+  if (item.objectiveId !== objectiveId) throw new Error(`${stage}: proposal ${id} references wrong objective`);
+  nonEmpty(stage, item.question, "proposal.question");
+  nonEmpty(stage, item.whyItMatters, "proposal.whyItMatters");
+  return id;
+}
+
+function checkDependencies(stage: string, item: Record<string, unknown>, refs: Set<string>): void {
+  const id = item.id as string;
+  if (!Array.isArray(item.dependsOn) || item.dependsOn.some((d) => typeof d !== "string"))
+    throw new Error(`${stage}: proposal ${id} dependsOn must be string[]`);
+  for (const d of item.dependsOn as string[]) {
+    if (d === id) throw new Error(`${stage}: proposal ${id} depends on itself`);
+    if (!refs.has(d)) throw new Error(`${stage}: proposal ${id} references unknown id ${d}`);
+  }
+}
+
 // Proposed IDs are objective-scoped, nonempty, unique; deps reference existing or
 // co-proposed IDs, never self. Expand stage additionally rejects IDs reusing old ones.
 function checkProposals(stage: string, value: unknown, objectiveId: string, priorIds: Set<string>): Proposal[] {
   if (!Array.isArray(value)) throw new Error(`${stage}: proposals must be an array`);
   const ids = new Set<string>();
   for (const item of value) {
-    if (!isObj(item)) throw new Error(`${stage}: proposal must be an object`);
-    exactKeys(stage, item, ["dependsOn", "id", "objectiveId", "question", "whyItMatters"]);
-    const id = nonEmpty(stage, item.id, "proposal.id");
-    if (!id.startsWith(`${objectiveId}-`)) throw new Error(`${stage}: proposal id ${id} must start with ${objectiveId}-`);
-    if (item.objectiveId !== objectiveId) throw new Error(`${stage}: proposal ${id} references wrong objective`);
-    nonEmpty(stage, item.question, "proposal.question");
-    nonEmpty(stage, item.whyItMatters, "proposal.whyItMatters");
+    const id = proposalId(stage, item, objectiveId);
     if (ids.has(id)) throw new Error(`${stage}: duplicate proposal id ${id}`);
     if (priorIds.has(id)) throw new Error(`${stage}: reused proposal id ${id}`);
     ids.add(id);
   }
   const refs = new Set([...priorIds, ...ids]);
   for (const item of value) {
-    const r = item as Record<string, unknown>;
-    const id = r.id as string;
-    if (!Array.isArray(r.dependsOn) || r.dependsOn.some((d) => typeof d !== "string"))
-      throw new Error(`${stage}: proposal ${id} dependsOn must be string[]`);
-    for (const d of r.dependsOn as string[]) {
-      if (d === id) throw new Error(`${stage}: proposal ${id} depends on itself`);
-      if (!refs.has(d)) throw new Error(`${stage}: proposal ${id} references unknown id ${d}`);
-    }
+    checkDependencies(stage, item as Record<string, unknown>, refs);
   }
   return value as Proposal[];
+}
+
+function analysisFields(stage: string, item: unknown): Record<string, unknown> {
+  if (!isObj(item)) throw new Error(`${stage}: analysis must be an object`);
+  const names = Object.keys(item).sort();
+  for (const k of ["evidenceRefs", "interpretation", "nodeId", "objectiveId"])
+    if (!names.includes(k)) throw new Error(`${stage}: unexpected fields [${names.join(",")}]`);
+  for (const k of names)
+    if (!["assumptions", "evidenceRefs", "interpretation", "nodeId", "numbers", "objectiveId"].includes(k))
+      throw new Error(`${stage}: unexpected fields [${names.join(",")}]`);
+  return item;
+}
+
+function checkAnalysisEvidence(stage: string, item: Record<string, unknown>, nodeId: string, evidenceIds: Set<string>): Set<string> {
+  if (!Array.isArray(item.evidenceRefs) || item.evidenceRefs.some((e) => typeof e !== "string"))
+    throw new Error(`${stage}: analysis ${nodeId} evidenceRefs must be string[]`);
+  for (const e of item.evidenceRefs as string[])
+    if (!evidenceIds.has(e)) throw new Error(`${stage}: analysis ${nodeId} references unknown evidence ${e}`);
+  return new Set(item.evidenceRefs as string[]);
+}
+
+function checkAnalysisNumbers(stage: string, value: unknown, nodeId: string, refSet: Set<string>): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) throw new Error(`${stage}: analysis ${nodeId} numbers must be an array`);
+  for (const n of value) {
+    if (!isObj(n)) throw new Error(`${stage}: analysis ${nodeId} number must be an object`);
+    exactKeys(stage, n, ["evidenceId", "quote", "value"]);
+    nonEmpty(stage, n.value, "analysis.number.value");
+    const eid = nonEmpty(stage, n.evidenceId, "analysis.number.evidenceId");
+    nonEmpty(stage, n.quote, "analysis.number.quote");
+    if (!refSet.has(eid)) throw new Error(`${stage}: analysis ${nodeId} number references unknown evidence ${eid}`);
+  }
+}
+
+function checkAnalysisAssumptions(stage: string, value: unknown, nodeId: string): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) throw new Error(`${stage}: analysis ${nodeId} assumptions must be an array`);
+  const seen = new Set<string>();
+  for (const a of value) {
+    if (!isObj(a)) throw new Error(`${stage}: analysis ${nodeId} assumption must be an object`);
+    exactKeys(stage, a, ["assumptionId", "text"]);
+    const aid = nonEmpty(stage, a.assumptionId, "analysis.assumption.assumptionId");
+    nonEmpty(stage, a.text, "analysis.assumption.text");
+    if (seen.has(aid)) throw new Error(`${stage}: analysis ${nodeId} duplicate assumptionId ${aid}`);
+    seen.add(aid);
+  }
 }
 
 function checkAnalyses(
@@ -97,46 +151,15 @@ function checkAnalyses(
 ): Analysis[] {
   if (!Array.isArray(value)) throw new Error(`${stage}: analyses must be an array`);
   const seen = new Set<string>();
-  for (const item of value) {
-    if (!isObj(item)) throw new Error(`${stage}: analysis must be an object`);
-    const names = Object.keys(item).sort();
-    for (const k of ["evidenceRefs", "interpretation", "nodeId", "objectiveId"])
-      if (!names.includes(k)) throw new Error(`${stage}: unexpected fields [${names.join(",")}]`);
-    for (const k of names)
-      if (!["assumptions", "evidenceRefs", "interpretation", "nodeId", "numbers", "objectiveId"].includes(k))
-        throw new Error(`${stage}: unexpected fields [${names.join(",")}]`);
+  for (const valueItem of value) {
+    const item = analysisFields(stage, valueItem);
     const nodeId = nonEmpty(stage, item.nodeId, "analysis.nodeId");
     if (!proposalIds.has(nodeId)) throw new Error(`${stage}: analysis references unknown proposal ${nodeId}`);
     if (item.objectiveId !== objectiveId) throw new Error(`${stage}: analysis ${nodeId} references wrong objective`);
     nonEmpty(stage, item.interpretation, "analysis.interpretation");
-    if (!Array.isArray(item.evidenceRefs) || item.evidenceRefs.some((e) => typeof e !== "string"))
-      throw new Error(`${stage}: analysis ${nodeId} evidenceRefs must be string[]`);
-    for (const e of item.evidenceRefs as string[])
-      if (!evidenceIds.has(e)) throw new Error(`${stage}: analysis ${nodeId} references unknown evidence ${e}`);
-    const refSet = new Set(item.evidenceRefs as string[]);
-    if (item.numbers !== undefined) {
-      if (!Array.isArray(item.numbers)) throw new Error(`${stage}: analysis ${nodeId} numbers must be an array`);
-      for (const n of item.numbers) {
-        if (!isObj(n)) throw new Error(`${stage}: analysis ${nodeId} number must be an object`);
-        exactKeys(stage, n, ["evidenceId", "quote", "value"]);
-        nonEmpty(stage, n.value, "analysis.number.value");
-        const eid = nonEmpty(stage, n.evidenceId, "analysis.number.evidenceId");
-        nonEmpty(stage, n.quote, "analysis.number.quote");
-        if (!refSet.has(eid)) throw new Error(`${stage}: analysis ${nodeId} number references unknown evidence ${eid}`);
-      }
-    }
-    if (item.assumptions !== undefined) {
-      if (!Array.isArray(item.assumptions)) throw new Error(`${stage}: analysis ${nodeId} assumptions must be an array`);
-      const seenAssumption = new Set<string>();
-      for (const a of item.assumptions) {
-        if (!isObj(a)) throw new Error(`${stage}: analysis ${nodeId} assumption must be an object`);
-        exactKeys(stage, a, ["assumptionId", "text"]);
-        const aid = nonEmpty(stage, a.assumptionId, "analysis.assumption.assumptionId");
-        nonEmpty(stage, a.text, "analysis.assumption.text");
-        if (seenAssumption.has(aid)) throw new Error(`${stage}: analysis ${nodeId} duplicate assumptionId ${aid}`);
-        seenAssumption.add(aid);
-      }
-    }
+    const refSet = checkAnalysisEvidence(stage, item, nodeId, evidenceIds);
+    checkAnalysisNumbers(stage, item.numbers, nodeId, refSet);
+    checkAnalysisAssumptions(stage, item.assumptions, nodeId);
     if (seen.has(nodeId)) throw new Error(`${stage}: duplicate analysis for ${nodeId}`);
     seen.add(nodeId);
   }
@@ -162,17 +185,27 @@ function checkEvidenceRequests(
   return value as EvidenceRequest[];
 }
 
-// Extract concatenated output_text from a Responses API payload, then parse the
-// exact contract object. Raw payload is saved by the caller before this runs.
-function parseOpenCodeOutput(stage: string, raw: unknown, keys: string[]): Record<string, unknown> {
+function openCodeText(stage: string, raw: unknown): string {
   const output = isObj(raw) ? raw.output : undefined;
   if (!Array.isArray(output)) throw new Error(`${stage}: malformed_opencode_response`);
   let text = "";
   for (const item of output) {
     if (!isObj(item) || item.type !== "message" || !Array.isArray(item.content)) continue;
-    for (const part of item.content)
-      if (isObj(part) && part.type === "output_text" && typeof part.text === "string") text += part.text;
+    text += outputMessageText(item.content);
   }
+  return text;
+}
+
+function outputMessageText(content: unknown[]): string {
+  let text = "";
+  for (const part of content)
+    if (isObj(part) && part.type === "output_text" && typeof part.text === "string") text += part.text;
+  return text;
+}
+
+// Concatenate output_text before validating the exact Responses contract.
+function parseOpenCodeOutput(stage: string, raw: unknown, keys: string[]): Record<string, unknown> {
+  const text = openCodeText(stage, raw);
   if (!text) throw new Error(`${stage}: malformed_opencode_response`);
   let parsed: unknown;
   try {
@@ -237,6 +270,129 @@ function dispositionOf(decisions: Record<string, DecisionResult>, id: string): D
   return c;
 }
 
+function checkAnalysisAccounting(
+  analyses: Analysis[],
+  analyzeOnly: Proposal[],
+  gatherIds: Set<string>,
+  analysisIds: Set<string>,
+  requestIds: Set<string>,
+): void {
+  for (const a of analyses)
+    if (gatherIds.has(a.nodeId))
+      throw new Error(`analyze: gather_evidence proposal ${a.nodeId} must not be analyzed`);
+  for (const p of analyzeOnly) {
+    const hasA = analysisIds.has(p.id);
+    const hasR = requestIds.has(p.id);
+    if (hasA === hasR)
+      throw new Error(`analyze: proposal ${p.id} with disposition analyze requires exactly one of Analysis or EvidenceRequest`);
+  }
+  for (const id of gatherIds)
+    if (!requestIds.has(id)) throw new Error(`analyze: missing evidence request for gather_evidence proposal ${id}`);
+}
+
+function checkedNodeDecisions(nodeId: string, decisions: Record<string, DecisionResult>) {
+  const truth = decisions.truth;
+  const evidenceState = decisions.evidence_state;
+  const materiality = decisions.materiality;
+  if (!truth || truth.kind !== "noul") throw new Error(`decide: missing truth noul for ${nodeId}`);
+  if (!evidenceState || evidenceState.kind !== "choice") throw new Error(`decide: missing evidence_state choice for ${nodeId}`);
+  if (!materiality || materiality.kind !== "score") throw new Error(`decide: missing materiality score for ${nodeId}`);
+  return { truth, evidenceState, materiality };
+}
+
+// One relevance round: mutually exclusive disposition choice per proposal.
+async function dispositionRound(
+  dir: string,
+  name: string,
+  kind: "proposed" | "expanded",
+  state: { objective: unknown; fictional: true; proposals: Proposal[] },
+  systemOne: SystemOneFn,
+): Promise<{ raw: unknown; decisions: Record<string, DecisionResult> }> {
+  const { proposals } = state;
+  if (proposals.length === 0) return { raw: null, decisions: {} };
+  const questions: Record<string, unknown> = {};
+  for (const p of proposals)
+    questions[p.id] = {
+      type: "choice",
+      instructions: `What should happen to this ${kind} question relative to the user's objective? Question: ${p.question}`,
+      criteria: DISPOSITION_OPTIONS,
+    };
+  return askDecisions(
+    dir, name, { state, questions }, systemOne,
+    Object.fromEntries(proposals.map((p) => [p.id, DISPOSITION_OPTIONS])),
+  );
+}
+
+type NodeAdjudication = {
+  nodeId: string;
+  truth: NoulDecision;
+  truthPolicy: Decision;
+  evidenceState: ChoiceDecision;
+  materiality: ScoreDecision;
+};
+
+// Each analyzed node is adjudicated against its own evidence subset only:
+// truth noul (actual proposition) + evidence-state choice + materiality score.
+async function adjudicateAnalyses(args: {
+  dir: string;
+  objective: unknown;
+  fictional: true;
+  proposals: Proposal[];
+  analyses: Analysis[];
+  evidence: { id: string; text: string }[];
+  relevance: Record<string, DecisionResult>;
+  systemOne: SystemOneFn;
+}): Promise<{
+  raw: Record<string, unknown>;
+  decisions: Record<string, Record<string, DecisionResult>>;
+  results: NodeAdjudication[];
+}> {
+  const proposalById = new Map(args.proposals.map((p) => [p.id, p]));
+  const evidenceById = new Map(args.evidence.map((e) => [e.id, e]));
+  const raw: Record<string, unknown> = {};
+  const decisions: Record<string, Record<string, DecisionResult>> = {};
+  const results: NodeAdjudication[] = [];
+  for (const a of args.analyses) {
+    const p = proposalById.get(a.nodeId);
+    if (!p) throw new Error(`decide: unknown proposal ${a.nodeId}`);
+    const subset = a.evidenceRefs.map((id) => {
+      const e = evidenceById.get(id);
+      if (!e) throw new Error(`decide: unknown evidence ${id} for ${a.nodeId}`);
+      return e;
+    });
+    const dependencyDecisions = p.dependsOn.map((d) => ({
+      proposalId: d,
+      disposition: args.relevance[d]?.kind === "choice" ? (args.relevance[d] as ChoiceDecision).choice : "unknown",
+    }));
+    const state = scopeNodeState({
+      objective: args.objective, proposal: p, analysis: a, evidence: subset, dependencyDecisions,
+    });
+    const questions: Record<string, unknown> = {
+      truth: { type: "noul", instructions: `Do the available facts support that ${p.question}` },
+      evidence_state: {
+        type: "choice",
+        instructions: "What best characterizes the evidence state for this node?",
+        criteria: EVIDENCE_STATE_OPTIONS,
+      },
+      materiality: {
+        type: "score",
+        instructions: "How material is resolving this uncertainty to answering the user's objective?",
+        criteria: MATERIALITY_LEVELS,
+      },
+    };
+    const r = await askDecisions(args.dir, `decide-${slug(a.nodeId)}`, { state, questions }, args.systemOne, {
+      evidence_state: EVIDENCE_STATE_OPTIONS,
+    });
+    const { truth, evidenceState, materiality } = checkedNodeDecisions(a.nodeId, r.decisions);
+    raw[a.nodeId] = r.raw;
+    decisions[a.nodeId] = r.decisions;
+    results.push({
+      nodeId: a.nodeId, truth, truthPolicy: classifyProbability(truth.probability), evidenceState, materiality,
+    });
+  }
+  return { raw, decisions, results };
+}
+
 export async function runScenario(
   scenarioId: string,
   opts?: { fetchFn?: typeof fetch; systemOne?: SystemOneFn; outDir?: string; model?: string },
@@ -253,7 +409,6 @@ export async function runScenario(
 
   const objectiveId = scenario.objective.id;
   const evidenceIds = new Set(scenario.evidence.map((e) => e.id));
-  const evidenceById = new Map(scenario.evidence.map((e) => [e.id, e]));
   const base = { objective: scenario.objective, fictional: scenario.fictional, evidence: scenario.evidence };
 
   // 1. decompose (reasoner proposes, never decides)
@@ -266,21 +421,11 @@ export async function runScenario(
   assertAcyclic("decompose", proposals, () => undefined);
 
   // 2. disposition of initial proposals via JEV choice (mutually exclusive routing)
-  const relevanceQuestions: Record<string, unknown> = {};
-  for (const p of proposals)
-    relevanceQuestions[p.id] = {
-      type: "choice",
-      instructions: `What should happen to this proposed question relative to the user's objective? Question: ${p.question}`,
-      criteria: DISPOSITION_OPTIONS,
-    };
-  const relevance = proposals.length
-    ? await askDecisions(
-      dir, "relevance",
-      { state: { objective: scenario.objective, fictional: scenario.fictional, proposals }, questions: relevanceQuestions },
-      systemOne,
-      Object.fromEntries(proposals.map((p) => [p.id, DISPOSITION_OPTIONS])),
-    )
-    : { raw: null, decisions: {} as Record<string, DecisionResult> };
+  const relevance = await dispositionRound(
+    dir, "relevance", "proposed",
+    { objective: scenario.objective, fictional: scenario.fictional, proposals },
+    systemOne,
+  );
   const dispOf = (id: string): Disposition => dispositionOf(relevance.decisions, id);
   const analyzeOnly = proposals.filter((p) => dispOf(p.id) === "analyze");
   const gatherIds = new Set(proposals.filter((p) => dispOf(p.id) === "gather_evidence").map((p) => p.id));
@@ -306,74 +451,19 @@ export async function runScenario(
   const analyzeRequests = checkEvidenceRequests("analyze", analyzeOut.evidenceRequests, objectiveId, analyzableIds);
   const analysisIds = new Set(analyses.map((a) => a.nodeId));
   const requestIds = new Set(analyzeRequests.map((r) => r.nodeId));
-  for (const a of analyses)
-    if (gatherIds.has(a.nodeId))
-      throw new Error(`analyze: gather_evidence proposal ${a.nodeId} must not be analyzed`);
-  for (const p of analyzeOnly) {
-    const hasA = analysisIds.has(p.id);
-    const hasR = requestIds.has(p.id);
-    if (hasA === hasR)
-      throw new Error(`analyze: proposal ${p.id} with disposition analyze requires exactly one of Analysis or EvidenceRequest`);
-  }
-  for (const id of gatherIds)
-    if (!requestIds.has(id)) throw new Error(`analyze: missing evidence request for gather_evidence proposal ${id}`);
+  checkAnalysisAccounting(analyses, analyzeOnly, gatherIds, analysisIds, requestIds);
 
-  // 4. adjudicate each analyzed node against its own scoped evidence only:
-  // truth noul (actual proposition) + evidence-state choice + materiality score.
-  const proposalById = new Map(proposals.map((p) => [p.id, p]));
-  const decideRaw: Record<string, unknown> = {};
-  const decideAll: Record<string, Record<string, DecisionResult>> = {};
-  const nodeResults: {
-    nodeId: string;
-    truth: NoulDecision;
-    truthPolicy: Decision;
-    evidenceState: ChoiceDecision;
-    materiality: ScoreDecision;
-  }[] = [];
-  for (const a of analyses) {
-    const p = proposalById.get(a.nodeId);
-    if (!p) throw new Error(`decide: unknown proposal ${a.nodeId}`);
-    const subset = a.evidenceRefs.map((id) => {
-      const e = evidenceById.get(id);
-      if (!e) throw new Error(`decide: unknown evidence ${id} for ${a.nodeId}`);
-      return e;
-    });
-    const dependencyDecisions = p.dependsOn.map((d) => ({
-      proposalId: d,
-      disposition: relevance.decisions[d]?.kind === "choice" ? (relevance.decisions[d] as ChoiceDecision).choice : "unknown",
-    }));
-    const state = scopeNodeState({
-      objective: scenario.objective, proposal: p, analysis: a, evidence: subset, dependencyDecisions,
-    });
-    const questions: Record<string, unknown> = {
-      truth: { type: "noul", instructions: `Do the available facts support that ${p.question}` },
-      evidence_state: {
-        type: "choice",
-        instructions: "What best characterizes the evidence state for this node?",
-        criteria: EVIDENCE_STATE_OPTIONS,
-      },
-      materiality: {
-        type: "score",
-        instructions: "How material is resolving this uncertainty to answering the user's objective?",
-        criteria: MATERIALITY_LEVELS,
-      },
-    };
-    const name = `decide-${slug(a.nodeId)}`;
-    const r = await askDecisions(dir, name, { state, questions }, systemOne, {
-      evidence_state: EVIDENCE_STATE_OPTIONS,
-    });
-    const truth = r.decisions.truth;
-    const evidenceState = r.decisions.evidence_state;
-    const materiality = r.decisions.materiality;
-    if (!truth || truth.kind !== "noul") throw new Error(`decide: missing truth noul for ${a.nodeId}`);
-    if (!evidenceState || evidenceState.kind !== "choice") throw new Error(`decide: missing evidence_state choice for ${a.nodeId}`);
-    if (!materiality || materiality.kind !== "score") throw new Error(`decide: missing materiality score for ${a.nodeId}`);
-    decideRaw[a.nodeId] = r.raw;
-    decideAll[a.nodeId] = r.decisions;
-    nodeResults.push({
-      nodeId: a.nodeId, truth, truthPolicy: classifyProbability(truth.probability), evidenceState, materiality,
-    });
-  }
+  // 4. adjudicate each analyzed node against its own scoped evidence only.
+  const { raw: decideRaw, decisions: decideAll, results: nodeResults } = await adjudicateAnalyses({
+    dir,
+    objective: scenario.objective,
+    fictional: scenario.fictional,
+    proposals,
+    analyses,
+    evidence: scenario.evidence,
+    relevance: relevance.decisions,
+    systemOne,
+  });
   const unresolved: { nodeId: string; reason: string }[] = [
     ...[...gatherIds].map((nodeId) => ({ nodeId, reason: "gather_evidence" as const })),
     ...analyzeOnly.filter((p) => !analysisIds.has(p.id)).map((p) => ({ nodeId: p.id, reason: "awaiting_evidence" as const })),
@@ -390,7 +480,7 @@ export async function runScenario(
     })),
     evidenceRequests: analyzeRequests, unresolved, jev: { relevance: relevance.raw, decide: decideRaw },
     adjudication: { relevance: relevanceList, analysisDecisions: nodeResults.map((n) => n.nodeId) },
-    priorIds: [...proposalById.keys()], priorRefs: { proposalIds: [...proposalById.keys()] },
+    priorIds: proposals.map((p) => p.id), priorRefs: { proposalIds: proposals.map((p) => p.id) },
   };
   const expandRaw = await postOpenCode(
     dir, "expand", promptText("expand", expandPrompt, expandCtx), model, apiKey, fetchFn, url,
@@ -404,21 +494,11 @@ export async function runScenario(
   const expandRequests = checkEvidenceRequests("expand", expandOut.evidenceRequests, objectiveId, allNodeIds);
 
   // 6. disposition of expanded proposals (non-authoritative until JEV admits)
-  const expandedQuestions: Record<string, unknown> = {};
-  for (const p of expanded)
-    expandedQuestions[p.id] = {
-      type: "choice",
-      instructions: `What should happen to this expanded question relative to the user's objective? Question: ${p.question}`,
-      criteria: DISPOSITION_OPTIONS,
-    };
-  const expandedRelevance = expanded.length
-    ? await askDecisions(
-      dir, "relevance-expanded",
-      { state: { objective: scenario.objective, fictional: scenario.fictional, proposals: expanded }, questions: expandedQuestions },
-      systemOne,
-      Object.fromEntries(expanded.map((p) => [p.id, DISPOSITION_OPTIONS])),
-    )
-    : { raw: null, decisions: {} as Record<string, DecisionResult> };
+  const expandedRelevance = await dispositionRound(
+    dir, "relevance-expanded", "expanded",
+    { objective: scenario.objective, fictional: scenario.fictional, proposals: expanded },
+    systemOne,
+  );
 
   const withDisposition = (p: Proposal, stage: string, decisions: Record<string, DecisionResult>) => {
     const disposition = dispositionOf(decisions, p.id);
