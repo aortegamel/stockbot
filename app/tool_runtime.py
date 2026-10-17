@@ -352,11 +352,8 @@ class ToolOutcome:
 _RETRYABLE_ERROR_TYPES = frozenset({"tool_error"})
 
 
-def outcome_from_result(tool_name: str, result: dict[str, object]) -> ToolOutcome:
-    """Convert a tool result dict into a frozen scheduler-facing outcome."""
-    content = render_tool_result(result)
-    refs = _extract_source_refs(result)
-    source_refs = dict(refs) if refs else None
+def _outcome_source_handle(result: dict[str, object]) -> dict[str, object] | None:
+    """Resolve the direct handle before the handle in the runtime envelope."""
     raw_handle = result.get("source_handle")
     if not isinstance(raw_handle, dict) or not raw_handle:
         _meta = result.get("meta") if isinstance(result, dict) else None
@@ -364,12 +361,26 @@ def outcome_from_result(tool_name: str, result: dict[str, object]) -> ToolOutcom
             _mh = _meta.get("source_handle")
             if isinstance(_mh, dict) and _mh:
                 raw_handle = _mh
-    source_handle = dict(raw_handle) if isinstance(raw_handle, dict) and raw_handle else None
+    return dict(raw_handle) if isinstance(raw_handle, dict) and raw_handle else None
+
+
+def _outcome_error(result: dict[str, object]) -> tuple[str | None, str | None, bool]:
+    """Classify scheduler errors without treating false-valued errors as absent."""
     raw_error = result.get("error")
     error = str(raw_error) if raw_error is not None else None
     raw_etype = result.get("error_type")
     error_type = raw_etype if isinstance(raw_etype, str) else None
     retryable = error is not None and error_type in _RETRYABLE_ERROR_TYPES
+    return error, error_type, retryable
+
+
+def outcome_from_result(tool_name: str, result: dict[str, object]) -> ToolOutcome:
+    """Convert a tool result dict into a frozen scheduler-facing outcome."""
+    content = render_tool_result(result)
+    refs = _extract_source_refs(result)
+    source_refs = dict(refs) if refs else None
+    source_handle = _outcome_source_handle(result)
+    error, error_type, retryable = _outcome_error(result)
     return ToolOutcome(
         tool_name=tool_name,
         content=content,
@@ -740,6 +751,25 @@ def _dispatch_value_error(exc: ValueError) -> dict[str, object]:
     return {"error": str(exc)}
 
 
+def _dispatch_context_error(name: str, staged: _StagedContext) -> dict[str, object] | None:
+    """Attached dispatches persist against both staged IDs; the missing one is named."""
+    if not isinstance(staged.job_id, str) or not staged.job_id:
+        logger.warning(
+            "toolflow deny sid=%s tool=%s gate=dispatch-budget reason=no-job", staged.session_id or "-", name
+        )
+        return {
+            "error": f"Active research job is required for tool '{name}'",
+            "error_type": "invalid_research_context",
+        }
+    if not isinstance(staged.session_id, str) or not staged.session_id:
+        logger.warning("toolflow deny tool=%s gate=dispatch-budget reason=no-session", name)
+        return {
+            "error": f"Active research session is required for tool '{name}'",
+            "error_type": "invalid_research_context",
+        }
+    return None
+
+
 def _consume_dispatch_budget(
     name: str, staged: _StagedContext, arguments: dict[str, object]
 ) -> tuple[bool, dict[str, object] | None]:
@@ -751,20 +781,11 @@ def _consume_dispatch_budget(
     """
     if name not in DISPATCH_TOOLS or staged.store is None:
         return False, None
-    if not isinstance(staged.job_id, str) or not staged.job_id:
-        logger.warning(
-            "toolflow deny sid=%s tool=%s gate=dispatch-budget reason=no-job", staged.session_id or "-", name
-        )
-        return False, {
-            "error": f"Active research job is required for tool '{name}'",
-            "error_type": "invalid_research_context",
-        }
-    if not isinstance(staged.session_id, str) or not staged.session_id:
-        logger.warning("toolflow deny tool=%s gate=dispatch-budget reason=no-session", name)
-        return False, {
-            "error": f"Active research session is required for tool '{name}'",
-            "error_type": "invalid_research_context",
-        }
+    context_error = _dispatch_context_error(name, staged)
+    if context_error is not None:
+        return False, context_error
+    assert isinstance(staged.session_id, str)
+    assert isinstance(staged.job_id, str)
     try:
         from app.research import service as _svc
 
@@ -832,6 +853,15 @@ _REPLAYABLE_TOOL_RESULTS: frozenset[str] = frozenset(
 """Staged tools whose success payloads persist for kernel evidence replay."""
 
 
+def _can_persist_staged_result(name: str, staged: _StagedContext) -> bool:
+    """Require a replayable tool and both staged IDs before the best-effort write."""
+    if name not in _REPLAYABLE_TOOL_RESULTS or staged.store is None:
+        return False
+    if not isinstance(staged.session_id, str) or not staged.session_id:
+        return False
+    return isinstance(staged.job_id, str) and bool(staged.job_id)
+
+
 def _persist_staged_tool_result(
     name: str, result: dict[str, object], staged: _StagedContext, tool_call_id: str
 ) -> str | None:
@@ -842,12 +872,10 @@ def _persist_staged_tool_result(
     when it is absent). The id rides in the result payload so the desk can cite
     the exact bytes the kernel stored.
     """
-    if name not in _REPLAYABLE_TOOL_RESULTS or staged.store is None:
+    if not _can_persist_staged_result(name, staged):
         return None
-    if not isinstance(staged.session_id, str) or not staged.session_id:
-        return None
-    if not isinstance(staged.job_id, str) or not staged.job_id:
-        return None
+    assert isinstance(staged.session_id, str)
+    assert isinstance(staged.job_id, str)
     tool_result_id = f"{staged.session_id}:tr:{tool_call_id}" if tool_call_id else None
     try:
         from app.research import service as _svc
@@ -1274,29 +1302,8 @@ def _discovery_meta_names(result: object) -> tuple[list[str] | None, list[str] |
     return matches, tools
 
 
-def _success_meta(
-    name: str,
-    result: object,
-    meta: ToolResultMeta,
-    envelope: ContextEnvelope,
-    status: str,
-) -> dict[str, object]:
-    safe_meta: dict[str, object] = {
-        "row_count": meta.row_count,
-        "returned_count": meta.returned_count,
-        "truncated": meta.truncated,
-        "source": envelope.source,
-        "sensitivity": envelope.sensitivity.value,
-        "integrity": envelope.integrity.value,
-        "status": status,
-        "as_of": meta.as_of,
-    }
-    source_refs = _extract_source_refs(result)
-    if source_refs:
-        safe_meta["source_refs"] = source_refs
-    handle = result.get("source_handle") if isinstance(result, dict) else None
-    if isinstance(handle, dict) and handle:
-        safe_meta["source_handle"] = dict(handle)
+def _copy_navigation_meta(result: object, safe_meta: dict[str, object]) -> None:
+    """Copy bounded paging and continuation fields without changing their values."""
     if isinstance(result, dict):
         for key in (
             "search_id",
@@ -1322,6 +1329,32 @@ def _success_meta(
         ):
             if key in result:
                 safe_meta[key] = result[key]
+
+
+def _success_meta(
+    name: str,
+    result: object,
+    meta: ToolResultMeta,
+    envelope: ContextEnvelope,
+    status: str,
+) -> dict[str, object]:
+    safe_meta: dict[str, object] = {
+        "row_count": meta.row_count,
+        "returned_count": meta.returned_count,
+        "truncated": meta.truncated,
+        "source": envelope.source,
+        "sensitivity": envelope.sensitivity.value,
+        "integrity": envelope.integrity.value,
+        "status": status,
+        "as_of": meta.as_of,
+    }
+    source_refs = _extract_source_refs(result)
+    if source_refs:
+        safe_meta["source_refs"] = source_refs
+    handle = result.get("source_handle") if isinstance(result, dict) else None
+    if isinstance(handle, dict) and handle:
+        safe_meta["source_handle"] = dict(handle)
+    _copy_navigation_meta(result, safe_meta)
     if name in ("search_tools", "browse_tools") and isinstance(result, dict):
         # Deferred loading: the TS extension activates these schemas additively.
         # Names are already model-visible in content; meta carries them structured.
@@ -1490,6 +1523,82 @@ def _run_pre_gates(
     return staged, args_for_hash, dispatch_consumed
 
 
+def _handler_error_response(
+    name: str, result: object, failed_map: dict[str, object] | None, sid: str, t0: float
+) -> dict[str, object] | None:
+    """Return the handler failure response before persistence or evidence admission."""
+    if failed_map is not None:
+        _failed, soft, _denied, _status2, failed_error_type, _msg2 = _failure_outcome(failed_map)
+        logger.warning(
+            "toolflow handler_error sid=%s tool=%s err_type=%s dur_ms=%.1f",
+            sid,
+            name,
+            failed_error_type,
+            (time.perf_counter() - t0) * 1000.0,
+        )
+        return _failed_result_response(name, failed_map, failed_error_type, soft)
+    if not isinstance(result, dict):
+        logger.warning(
+            "toolflow handler_error sid=%s tool=%s err_type=tool_error dur_ms=%.1f",
+            sid,
+            name,
+            (time.perf_counter() - t0) * 1000.0,
+        )
+        return {
+            "error": _unavailable_data_response([(name, {"error": "empty tool result"})]),
+            "error_type": "tool_error",
+        }
+    return None
+
+
+def _finish_tool_result(
+    name: str,
+    result: object,
+    session: RuntimeToolSession,
+    staged: _StagedContext,
+    *,
+    t0: float,
+    run_id: str,
+    recorder: RunRecorder | None,
+    resolved_tc_id: str,
+    status: str,
+    meta: ToolResultMeta,
+) -> dict[str, object]:
+    """Classify the handler result, persist success, and apply the evidence gates."""
+    failed_map = _failed_dict(result)
+    sid = staged.session_id or session.session_id
+    error = _handler_error_response(name, result, failed_map, sid, t0)
+    if error is not None:
+        return error
+    assert isinstance(result, dict)
+    rid = _persist_staged_tool_result(name, result, staged, resolved_tc_id)
+
+    # Gate 5: ingress scan on the rendered evidence; quarantined or blocked
+    # results are withheld from the agent with a fixed placeholder.
+    # Gate 7 (success path): DLP over what the agent receives, then record evidence.
+    # Session lock covers guard_response + label/budget mutations only.
+    out = _finalize_success(
+        name,
+        result,
+        session,
+        run_id=run_id,
+        recorder=recorder,
+        resolved_tc_id=resolved_tc_id,
+        status=status,
+        meta=meta,
+    )
+    if rid is not None and isinstance(out, dict) and not out.get("error"):
+        out["tool_result_id"] = rid
+    dur_ms = (time.perf_counter() - t0) * 1000.0
+    if isinstance(out, dict) and out.get("error"):
+        logger.warning(
+            "toolflow deny sid=%s tool=%s gate=%s dur_ms=%.1f", sid, name, out.get("error_type") or "ingress", dur_ms
+        )
+    else:
+        logger.info("toolflow success sid=%s tool=%s dur_ms=%.1f", sid, name, dur_ms)
+    return out
+
+
 def _execute_agent_tool(
     name: str,
     arguments: dict[str, object],
@@ -1583,55 +1692,18 @@ def _execute_agent_tool(
         research_session_id=staged.session_id,
     )
 
-    failed_map = _failed_dict(result)
-    sid = staged.session_id or session.session_id
-    if failed_map is not None:
-        _failed, soft, _denied, _status2, failed_error_type, _msg2 = _failure_outcome(failed_map)
-        logger.warning(
-            "toolflow handler_error sid=%s tool=%s err_type=%s dur_ms=%.1f",
-            sid,
-            name,
-            failed_error_type,
-            (time.perf_counter() - t0) * 1000.0,
-        )
-        return _failed_result_response(name, failed_map, failed_error_type, soft)
-    if not isinstance(result, dict):
-        logger.warning(
-            "toolflow handler_error sid=%s tool=%s err_type=tool_error dur_ms=%.1f",
-            sid,
-            name,
-            (time.perf_counter() - t0) * 1000.0,
-        )
-        return {
-            "error": _unavailable_data_response([(name, {"error": "empty tool result"})]),
-            "error_type": "tool_error",
-        }
-    rid = _persist_staged_tool_result(name, result, staged, resolved_tc_id)
-
-    # Gate 5: ingress scan on the rendered evidence; quarantined or blocked
-    # results are withheld from the agent with a fixed placeholder.
-    # Gate 7 (success path): DLP over what the agent receives, then record evidence.
-    # Session lock covers guard_response + label/budget mutations only.
-    out = _finalize_success(
+    return _finish_tool_result(
         name,
         result,
         session,
+        staged,
+        t0=t0,
         run_id=run_id,
         recorder=recorder,
         resolved_tc_id=resolved_tc_id,
         status=status,
         meta=meta,
     )
-    if rid is not None and isinstance(out, dict) and not out.get("error"):
-        out["tool_result_id"] = rid
-    dur_ms = (time.perf_counter() - t0) * 1000.0
-    if isinstance(out, dict) and out.get("error"):
-        logger.warning(
-            "toolflow deny sid=%s tool=%s gate=%s dur_ms=%.1f", sid, name, out.get("error_type") or "ingress", dur_ms
-        )
-    else:
-        logger.info("toolflow success sid=%s tool=%s dur_ms=%.1f", sid, name, dur_ms)
-    return out
 
 
 # ponytail: alias shim, drop once callers use RuntimeToolSession directly.

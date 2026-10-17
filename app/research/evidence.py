@@ -311,13 +311,11 @@ def web_source_ref(
         text = _provenance_opt({key: value}, key)
         if text is not None:
             ref[key] = text
-    content = source_content.strip() if isinstance(source_content, str) and source_content.strip() else None
+    content = _provenance_opt({"source_content": source_content}, "source_content")
     if content is not None:
         ref["source_content"] = content[:12000]
         representation = (
-            source_representation.strip()
-            if isinstance(source_representation, str) and source_representation.strip()
-            else "text"
+            _provenance_opt({"source_representation": source_representation}, "source_representation") or "text"
         )
         ref["source_representation"] = representation
     return ref
@@ -863,6 +861,23 @@ def edgartools_version() -> str | None:
         return None
 
 
+def _bundle_accession(evidence: Evidence, prov: Mapping[str, object]) -> str:
+    """Prefer the provenance accession to the record identifier, without normalizing either."""
+    accession = evidence.source_record_id or ""
+    raw_accession = prov.get("accession_no")
+    if isinstance(raw_accession, str) and raw_accession:
+        accession = raw_accession
+    return accession
+
+
+def _bundle_document_name(evidence: Evidence, prov: Mapping[str, object]) -> str:
+    """Prefer the provenance document name to the metadata fallback."""
+    document = prov.get("document_name")
+    if not isinstance(document, str) or not document:
+        document = str(evidence.metadata.get("document_name", "") or "")
+    return document
+
+
 def _bundle_source_url(evidence: Evidence) -> str:
     """Canonical source URL: the explicit URI, else the SEC archive URL for the accession."""
     if isinstance(evidence.source_uri, str) and evidence.source_uri.strip():
@@ -871,11 +886,7 @@ def _bundle_source_url(evidence: Evidence) -> str:
     uri = prov.get("source_uri")
     if isinstance(uri, str) and uri.strip():
         return uri.strip()
-    accession = evidence.source_record_id or ""
-    raw_accession = prov.get("accession_no")
-    if isinstance(raw_accession, str) and raw_accession:
-        accession = raw_accession
-    bare = accession.replace("-", "")
+    bare = _bundle_accession(evidence, prov).replace("-", "")
     if bare:
         return f"https://www.sec.gov/Archives/edgar/data/{bare}"
     return ""
@@ -884,9 +895,7 @@ def _bundle_source_url(evidence: Evidence) -> str:
 def _bundle_locator(evidence: Evidence) -> dict[str, JSONValue]:
     """Source locator: document + kernel-materialized window coordinates (the reload recipe)."""
     prov = evidence.provenance if isinstance(evidence.provenance, Mapping) else {}
-    document = prov.get("document_name")
-    if not isinstance(document, str) or not document:
-        document = str(evidence.metadata.get("document_name", "") or "")
+    document = _bundle_document_name(evidence, prov)
     offset = prov.get("offset")
     end = prov.get("end")
     locator: dict[str, JSONValue] = {"document": document}
@@ -899,16 +908,10 @@ def _bundle_locator(evidence: Evidence) -> dict[str, JSONValue]:
 def evidence_bundle_entry(evidence: Evidence, *, accepted_at: str | None = None) -> dict[str, JSONValue]:
     """Per-session bundle evidence entry: the 12-file Contract fields with exact model-visible text."""
     prov = evidence.provenance if isinstance(evidence.provenance, Mapping) else {}
-    accession = evidence.source_record_id or ""
-    prov_accession = prov.get("accession_no")
-    if isinstance(prov_accession, str) and prov_accession:
-        accession = prov_accession
+    accession = _bundle_accession(evidence, prov)
     form = evidence.metadata.get("form") or evidence.metadata.get("filing_form")
     retrieved = evidence.retrieved_at.isoformat()
-    document = prov.get("document_name")
-    document_name = (
-        document if isinstance(document, str) and document else str(evidence.metadata.get("document_name", "") or "")
-    )
+    document_name = _bundle_document_name(evidence, prov)
     return {
         "evidence_id": evidence.evidence_id,
         "session_id": evidence.session_id,

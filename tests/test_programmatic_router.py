@@ -6,14 +6,19 @@ from types import SimpleNamespace
 from typing import override
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from app.decision_client import JevClient
 from app.research import scheduler
 from app.research.models import DecisionRecord, JSONValue, ToolDecision
 from app.research.programmatic_router import (
+    _ambiguous,
+    _margin_pick,
     _ranked,
     _registry_names,
     _router_pick,
+    _short_tool,
     _signals,
     programmatic_route,
     programmatic_select_round,
@@ -569,6 +574,247 @@ def test_prefixed_clock_routes_clock_with_ticker_channel() -> None:
     assert programmatic_route("should I buy NVDA", ticker="NVDA") == "reasoning_required"
 
 
+def test_advice_precedence_ignores_research_phrases_without_research_tokens() -> None:
+    """GME regression: "betting against" never overrides advice; a research token still does."""
+    advice = "Should I sell now that funds are betting against it"
+    assert programmatic_route(f"{advice}?", ticker="GME") == "reasoning_required"
+    assert programmatic_route(f"{advice} after the filing?", ticker="GME") == "research_required"
+
+
 def test_explicit_persona_market_research_keeps_ticker_grounding() -> None:
     """Explicit-persona market asks still resolve the ticker subject for research."""
     assert programmatic_route("Bullbot view on ORCL revenue", ticker="ORCL") == "research_required"
+
+
+# --- Rule-level branches: each ordered signal family and its membership gate ---
+
+_CARRY_ONLY = {"get_sec_document", "get_sec_filing", "list_sec_documents"}
+
+
+def _resolve_ticker(name: str) -> str | None:
+    """Deterministic ticker resolution: only the tickers named here resolve."""
+    return {"AAPL": "AAPL", "NVDA": "NVDA"}.get(name)
+
+
+_PACKET_10Q: dict[str, JSONValue] = {
+    "tool": "list_sec_filings",
+    "arguments": {"identifier": "NVDA"},
+    "error": None,
+    "outcome_summary": "filing 0001045810-26-000075 10-Q",
+}
+
+
+def _rule(
+    text: str, attempts: list[dict[str, JSONValue]] | None = None, names: set[str] | None = None
+) -> tuple[str, str] | None:
+    """`_router_pick` over the live registry, or over a caller-supplied name set."""
+    doubled = f"{text} {text}"
+    chosen = _registry_names(scheduler.build_registry()) if names is None else names
+    norm, toks = _signals(doubled)
+    return _router_pick(doubled, norm, toks, chosen, _ranked(norm, toks, chosen), attempts or [], [])
+
+
+@pytest.mark.parametrize(
+    ("ask", "expected"),
+    [
+        ("short pressure outstanding shares ratio", ("get_short_pressure_profile", "short-family")),
+        ("short interest trend coverage", ("query_finra", "short-family")),
+        ("most shorted stocks screen", ("get_short_interest_leaderboard", "short-family")),
+        ("What's AAPL's short interest?", ("get_short_interest", "short-family")),
+        ("Reg SHO daily short volume for AAPL", ("get_reg_sho_volume", "sho-explicit")),
+    ],
+)
+def test_short_family_dispatch_picks_by_signal(ask: str, expected: tuple[str, str]) -> None:
+    """Every short-family signal maps to its own member, with the explicit SHO ask first."""
+    assert _rule(ask) == expected
+
+
+def test_short_tool_requires_a_registered_member() -> None:
+    """Each short-family signal yields None when its member is not registered."""
+    assert _short_tool({"daily", "short", "volume"}, "short", set()) is None
+    assert _short_tool({"pressure", "outstanding", "short"}, "short", set()) is None
+    assert _short_tool({"trend", "short"}, "short", set()) is None
+    assert _short_tool({"screen", "leaderboard"}, "most shorted", set()) is None
+    assert _short_tool(set(), "short interest", set()) is None
+    assert _short_tool({"pressure", "short"}, "short", {"get_short_pressure_profile"}) == "get_short_pressure_profile"
+
+
+def test_planned_insider_notice_rule() -> None:
+    """Planned Form 144 wording without executed verbs selects the planned-sale tool."""
+    assert _rule("insider executive proposed 144 planned") == ("get_planned_insider_sales", "insider-planned")
+
+
+def test_carry_registry_opens_packet_accession() -> None:
+    """A carry-only registry opens the packet accession, and a listed-less revenue 10-Q ask does not."""
+    assert _rule("read the filing document section", [_PACKET_10Q], _CARRY_ONLY) == (
+        "get_sec_document",
+        "carry:packet-doc",
+    )
+    assert _rule("open the accession packet now", [_PACKET_10Q], _CARRY_ONLY) == (
+        "get_sec_filing",
+        "carry:packet-filing",
+    )
+    eight_k: dict[str, JSONValue] = {
+        "tool": "list_sec_filings",
+        "error": None,
+        "outcome_summary": "8-K accession 0001045810-26-000078",
+    }
+    assert _rule("revenue 10q", [eight_k], _CARRY_ONLY) is None
+
+
+def test_clock_rule_answers_pure_clock_ask() -> None:
+    """Pure clock tokens select the clock tool when the registry carries it."""
+    assert _rule("what time is it") == ("get_current_time", "time")
+
+
+def test_margin_rule_defers_on_ambiguity_and_thin_margin() -> None:
+    """Rule 9 needs a clear margin, and a conflict edge between the top two blocks the pick."""
+    assert _margin_pick([(9, "get_sec_document"), (2, "search_web")]) == ("get_sec_document", "scorer-margin")
+    assert _margin_pick([(9, "get_insider_activity"), (3, "get_planned_insider_sales")]) is None
+    assert _margin_pick([(5, "get_sec_document"), (4, "search_web")]) is None
+    assert _margin_pick([(5, "get_sec_document")]) is None
+    assert _margin_pick([]) is None
+    assert _ambiguous("get_sec_document", "search_web", ["get_sec_document", "search_web"]) is False
+    assert _ambiguous("get_sec_document", "get_sec_filing", ["get_sec_document", "get_sec_filing"]) is True
+
+
+def test_sec_list_rule_needs_resolved_subject(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Filing-list wording selects the lister only when the text resolves a ticker or company."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_ticker)
+    assert _rule("what filings did NVDA file recently") == ("list_sec_filings", "sec-list")
+    assert _rule("what filings were made recently") != ("list_sec_filings", "sec-list")
+
+
+def test_route_blank_accession_and_reg_sho_prompts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Blank prompts still need research, and accession or Reg SHO prompts never answer direct."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_ticker)
+    assert programmatic_route("") == "research_required"
+    assert programmatic_route(None) == "research_required"
+    assert programmatic_route("read accession 0000320193-25-000079 please") == "research_required"
+    assert programmatic_route("Reg SHO threshold list for AAPL") == "research_required"
+
+
+def test_clock_round_reads_objective_and_skips_non_text_questions() -> None:
+    """A blank or non-text node question never blocks a clock ask carried by the objective."""
+    reg = scheduler.build_registry()
+    for node in (_node(""), {"node_id": "n1", "question": 5}):
+        kernel = _Kernel()
+        act, dec = asyncio.run(
+            programmatic_select_round(
+                _BoomJev(),
+                kernel,
+                "s1",
+                "n1",
+                {"session_id": "s1", "objective": "what time is it"},
+                node,
+                reg,
+                [],
+                [],
+            )
+        )
+        assert isinstance(dec, ToolDecision)
+        assert (act, dec.tool_name) == ("invoke", "get_current_time")
+        assert kernel.recorded == [("tool_selection", "get_current_time")]
+
+
+def test_clock_round_defers_when_registry_lacks_the_clock_tool() -> None:
+    """Without get_current_time in the registry the clock ask falls through to JEV."""
+    reg = [entry for entry in scheduler.build_registry() if entry.get("name") != "get_current_time"]
+    seen: dict[str, int] = {}
+
+    class _J(JevClient):
+        @override
+        async def select_tool(
+            self,
+            objective: str,
+            node: object,
+            registry: Sequence[Mapping[str, JSONValue]] | None = None,
+            evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+            attempts: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+            *,
+            session_id: str,
+            job_id: str | None = None,
+        ) -> ToolDecision:
+            seen["n"] = len(registry or [])
+            return ToolDecision(action="reason", probabilities={}, confidence=None)
+
+    kernel = _Kernel()
+    act, dec = asyncio.run(
+        programmatic_select_round(
+            _J(),
+            kernel,
+            "s1",
+            "n1",
+            {"session_id": "s1", "objective": "what time is it"},
+            _node("what time is it"),
+            reg,
+            [],
+            [],
+        )
+    )
+    assert isinstance(dec, ToolDecision)
+    assert (act, dec.tool_name) == ("reason", None)
+    assert seen["n"] == len(reg)
+    assert kernel.recorded == [("tool_selection", None)]
+
+
+def test_non_text_objective_reads_empty_and_jev_decides() -> None:
+    """A non-string objective reads as empty, so no rule fires and JEV keeps the decision."""
+    seen: dict[str, int] = {}
+
+    class _J(JevClient):
+        @override
+        async def select_tool(
+            self,
+            objective: str,
+            node: object,
+            registry: Sequence[Mapping[str, JSONValue]] | None = None,
+            evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+            attempts: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+            *,
+            session_id: str,
+            job_id: str | None = None,
+        ) -> ToolDecision:
+            seen["n"] = len(registry or [])
+            return ToolDecision(action="reason", probabilities={}, confidence=None)
+
+    ask = "zqxj vbnm all companies qqqq"
+    kernel = _Kernel()
+    act, dec = asyncio.run(
+        programmatic_select_round(
+            _J(),
+            kernel,
+            "s1",
+            "n1",
+            {"session_id": "s1", "objective": 7, "query": ask},
+            _node(ask),
+            scheduler.build_registry(),
+            [],
+            [],
+        )
+    )
+    assert isinstance(dec, ToolDecision)
+    assert (act, dec.tool_name) == ("reason", None)
+    assert seen["n"] > 0
+    assert kernel.recorded == [("tool_selection", None)]
+
+
+@settings(derandomize=True, max_examples=60, deadline=None)
+@given(st.text(max_size=120))
+def test_prop_pick_is_deterministic_and_membership_gated(text: str) -> None:
+    """Any prompt: the pick repeats exactly, stays inside the live registry, and needs a registry."""
+    import app.tools as _tools
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_tools, "_resolve_company_to_ticker", _resolve_ticker)
+        names = _registry_names(scheduler.build_registry())
+        norm, toks = _signals(text)
+        ranked = _ranked(norm, toks, names)
+        pick = _router_pick(text, norm, toks, names, ranked, [], [])
+        assert pick == _router_pick(text, norm, toks, names, ranked, [], [])
+        assert pick is None or (pick[0] in names and bool(pick[1]))
+        assert _router_pick(text, norm, toks, set(), [], [], []) is None

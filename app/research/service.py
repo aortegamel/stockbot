@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from .agents.bullbot import BullAnalysis
     from .agents.stockbot import StockbotAnalysis
     from .director import Wave1Result, WaveDecision
+    from .evidence import EvidenceLedger
     from .models import Job
     from .synthesis.committee import CommitteeDisagreement
     from .synthesis.final import FinalSynthesis
@@ -411,6 +412,22 @@ def cancel_research(
     return out.to_dict()
 
 
+def _job_budget_identity(
+    details: dict[str, object], request_id: str | None, wave_id: int, model: str | None
+) -> tuple[str | None, int, str | None]:
+    """Resolve the request, wave, and model overrides before job creation."""
+    if request_id is None:
+        raw_request: object = details.get("request_id")
+        if isinstance(raw_request, str) and raw_request:
+            request_id = raw_request
+    wave_raw: object = details.get("wave_id", wave_id)
+    if isinstance(wave_raw, bool) or not isinstance(wave_raw, int):
+        raise ValueError(f"start_job: 'wave_id' must be an int, got {wave_raw!r}")  # noqa: TRY004 - public error contract pins ValueError, tests are oracle
+    model_raw: object = details.get("model")
+    model_arg = model if model is not None else (model_raw if isinstance(model_raw, str) else None)
+    return request_id, wave_raw, model_arg
+
+
 def start_job(
     session_id: str,
     type: str = "source_agent",
@@ -433,19 +450,10 @@ def start_job(
     found = _require_session(store, session_id)
     existing = store.list_jobs(session_id)
     details: dict[str, object] = dict(budget or {})
-    if request_id is None:
-        raw_request: object = details.get("request_id")
-        if isinstance(raw_request, str) and raw_request:
-            request_id = raw_request
+    request_id, wave_id_arg, model_arg = _job_budget_identity(details, request_id, wave_id, model)
     token_budget = details.get("token_budget")
     tool_budget = details.get("tool_budget")
     child_budget = details.get("child_budget")
-    wave_raw: object = details.get("wave_id", wave_id)
-    if isinstance(wave_raw, bool) or not isinstance(wave_raw, int):
-        raise ValueError(f"start_job: 'wave_id' must be an int, got {wave_raw!r}")  # noqa: TRY004 - public error contract pins ValueError, tests are oracle
-    wave_id_arg: int = wave_raw
-    model_raw: object = details.get("model")
-    model_arg: str | None = model if model is not None else (model_raw if isinstance(model_raw, str) else None)
     updated, job = _jobs.create_job(
         found,
         existing,
@@ -874,53 +882,47 @@ def _finra_known_at(result: Mapping[str, object]) -> str | None:
     return None
 
 
-def _finra_provenance(
-    data: Mapping[str, object],
-    job: Job | None = None,
-    *,
-    store: ResearchRepository | None = None,
-    session_id: str | None = None,
-) -> dict[str, JSONValue]:
-    """FinraRecordRef replayed against the persisted FINRA tool result."""
-    from .repository import ResearchRepository as _RR
-
-    ref_id = _tool_result_ref(data, "FINRA")
-    locator = _normalize_record_text(_first_text(data, (*_PASSAGE_KEYS, "record_identity")))
-    if not locator:
-        raise ValueError(
-            "record_evidence: ERR_RAW_SOURCE_REQUIRED (a FINRA citation names the persisted "
-            "tool result id plus the record values you are citing.)"
-        )
-    try:
-        repo = store if store is not None else _RR()
-        result = repo.get_tool_result(ref_id)
-    except KeyError:
-        raise ValueError(
-            "record_evidence: ERR_RAW_SOURCE_REQUIRED (unknown persisted FINRA tool result; "
-            "cite the tool_result_id the kernel returned for the response you read.)"
-        ) from None
+def _check_replay_session(result: Mapping[str, object], ref_id: str, session_id: str | None) -> None:
+    """Reject a persisted result from another named session."""
     other = result.get("session_id")
     if isinstance(session_id, str) and session_id and isinstance(other, str) and other and other != session_id:
         raise ValueError(
             f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} belongs to session {other!r}, not {session_id!r})"
         )
-    tool_name = str(result.get("tool_name") or "")
-    if tool_name not in _FINRA_EVIDENCE_TOOLS:
+
+
+def _replay_result(
+    store: ResearchRepository | None, ref_id: str, domain: str, session_id: str | None
+) -> tuple[ResearchRepository, dict[str, JSONValue]]:
+    """Load the persisted response before checking its session ownership."""
+    from .repository import ResearchRepository as _RR
+
+    try:
+        repo = store if store is not None else _RR()
+        result = repo.get_tool_result(ref_id)
+    except KeyError:
         raise ValueError(
-            f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} is {tool_name!r}, not FINRA records)"
-        )
+            f"record_evidence: ERR_RAW_SOURCE_REQUIRED (unknown persisted {domain} tool result; "
+            "cite the tool_result_id the kernel returned for the response you read.)"
+        ) from None
+    _check_replay_session(result, ref_id, session_id)
+    return repo, result
+
+
+def _check_replay_lane(repo: ResearchRepository, result: Mapping[str, object], ref_id: str, job: Job | None) -> None:
+    """Require the result to belong to the submitting wave-domain lane."""
     if job is not None:
         allowed = _submit_subtree_job_ids(repo, job)
         if str(result.get("job_id")) not in allowed:
             raise ValueError(
                 f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} not in wave {job.wave_id} {(job.source_domain or 'SEC').upper()} lane)"
             )
-    texts = _finra_record_texts(result)
-    if not any(locator in text for text in texts):
-        raise ValueError(
-            "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE (the cited record values do not appear "
-            "in the persisted FINRA tool result)"
-        )
+
+
+def _finra_replay_ref(
+    data: Mapping[str, object], result: Mapping[str, object], tool_name: str, locator: str, ref_id: str
+) -> dict[str, JSONValue]:
+    """Build a FINRA citation with the persisted dataset and availability."""
     payload = result.get("result")
     payload = payload if isinstance(payload, Mapping) else result
     dataset = payload.get("dataset_id") or payload.get("dataset")
@@ -932,6 +934,37 @@ def _finra_provenance(
         known_at=_finra_known_at(result),
         tool_result_id=ref_id,
     )
+
+
+def _finra_provenance(
+    data: Mapping[str, object],
+    job: Job | None = None,
+    *,
+    store: ResearchRepository | None = None,
+    session_id: str | None = None,
+) -> dict[str, JSONValue]:
+    """FinraRecordRef replayed against the persisted FINRA tool result."""
+    ref_id = _tool_result_ref(data, "FINRA")
+    locator = _normalize_record_text(_first_text(data, (*_PASSAGE_KEYS, "record_identity")))
+    if not locator:
+        raise ValueError(
+            "record_evidence: ERR_RAW_SOURCE_REQUIRED (a FINRA citation names the persisted "
+            "tool result id plus the record values you are citing.)"
+        )
+    repo, result = _replay_result(store, ref_id, "FINRA", session_id)
+    tool_name = str(result.get("tool_name") or "")
+    if tool_name not in _FINRA_EVIDENCE_TOOLS:
+        raise ValueError(
+            f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} is {tool_name!r}, not FINRA records)"
+        )
+    _check_replay_lane(repo, result, ref_id, job)
+    texts = _finra_record_texts(result)
+    if not any(locator in text for text in texts):
+        raise ValueError(
+            "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE (the cited record values do not appear "
+            "in the persisted FINRA tool result)"
+        )
+    return _finra_replay_ref(data, result, tool_name, locator, ref_id)
 
 
 def _sec_record_texts(result: Mapping[str, object]) -> list[str]:
@@ -964,6 +997,32 @@ def _sec_record_known_at(data: Mapping[str, object], payload: Mapping[str, objec
     return None
 
 
+def _sec_replay_source_uri(data: Mapping[str, object], payload: Mapping[str, object]) -> str | None:
+    """Use the declared URI first, then the persisted SEC source."""
+    source_uri = _svc_opt_str(data, "source_uri")
+    if source_uri is None:
+        raw_uri = payload.get("source") or payload.get("source_url")
+        if isinstance(raw_uri, str) and raw_uri.strip():
+            source_uri = raw_uri.strip()
+    return source_uri
+
+
+def _sec_replay_ref(
+    data: Mapping[str, object], result: Mapping[str, object], tool_name: str, locator: str, ref_id: str
+) -> dict[str, JSONValue]:
+    """Build a structured SEC citation from the persisted response fields."""
+    payload = result.get("result")
+    payload = payload if isinstance(payload, Mapping) else result
+    return sec_record_ref(
+        tool_name=tool_name,
+        record_identity=locator[:2000],
+        dataset=str(payload.get("subject") or payload.get("ticker") or "") or None,
+        source_uri=_sec_replay_source_uri(data, payload),
+        known_at=_sec_record_known_at(data, payload),
+        tool_result_id=ref_id,
+    )
+
+
 def _sec_record_provenance(
     data: Mapping[str, object],
     job: Job | None = None,
@@ -972,8 +1031,6 @@ def _sec_record_provenance(
     session_id: str | None = None,
 ) -> dict[str, JSONValue]:
     """SecRecordRef replayed against the persisted SEC structured tool result."""
-    from .repository import ResearchRepository as _RR
-
     ref_id = _tool_result_ref(data, "SEC")
     locator = _normalize_record_text(_first_text(data, (*_PASSAGE_KEYS, "record_identity")))
     if not locator:
@@ -981,50 +1038,44 @@ def _sec_record_provenance(
             "record_evidence: ERR_RAW_SOURCE_REQUIRED (an SEC citation names the persisted "
             "tool result id plus the record values you are citing.)"
         )
-    try:
-        repo = store if store is not None else _RR()
-        result = repo.get_tool_result(ref_id)
-    except KeyError:
-        raise ValueError(
-            "record_evidence: ERR_RAW_SOURCE_REQUIRED (unknown persisted SEC tool result; "
-            "cite the tool_result_id the kernel returned for the response you read.)"
-        ) from None
-    other = result.get("session_id")
-    if isinstance(session_id, str) and session_id and isinstance(other, str) and other and other != session_id:
-        raise ValueError(
-            f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} belongs to session {other!r}, not {session_id!r})"
-        )
+    repo, result = _replay_result(store, ref_id, "SEC", session_id)
     tool_name = str(result.get("tool_name") or "")
     if tool_name not in _SEC_REPLAY_TOOLS:
         raise ValueError(
             f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} is {tool_name!r}, not SEC records)"
         )
-    if job is not None:
-        allowed = _submit_subtree_job_ids(repo, job)
-        if str(result.get("job_id")) not in allowed:
-            raise ValueError(
-                f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} not in wave {job.wave_id} {(job.source_domain or 'SEC').upper()} lane)"
-            )
+    _check_replay_lane(repo, result, ref_id, job)
     texts = _sec_record_texts(result)
     if not any(locator in text for text in texts):
         raise ValueError(
             "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE (the cited record values do not appear "
             "in the persisted SEC tool result)"
         )
-    payload = result.get("result")
-    payload = payload if isinstance(payload, Mapping) else result
-    source_uri = _svc_opt_str(data, "source_uri")
-    if source_uri is None and isinstance(payload, Mapping):
-        raw_uri = payload.get("source") or payload.get("source_url")
-        if isinstance(raw_uri, str) and raw_uri.strip():
-            source_uri = raw_uri.strip()
-    return sec_record_ref(
-        tool_name=tool_name,
-        record_identity=locator[:2000],
-        dataset=str(payload.get("subject") or payload.get("ticker") or "") or None,
-        source_uri=source_uri,
-        known_at=_sec_record_known_at(data, payload if isinstance(payload, Mapping) else {}),
-        tool_result_id=ref_id,
+    return _sec_replay_ref(data, result, tool_name, locator, ref_id)
+
+
+def _web_result_row(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str, str] | None:
+    """Extract one citable web row with its stored source text; a blank url or highlight is not citable."""
+    url = _svc_opt_str(row, "url")
+    highlight = _svc_opt_str(row, "highlight")
+    url = url.strip() if url else ""
+    highlight = highlight.strip() if highlight else ""
+    if not url or not highlight:
+        return None
+    domain, title, published_at, retrieved_at = (
+        str(row.get(key) or "").strip() for key in ("source_domain", "title", "published_at", "retrieved_at")
+    )
+    content = row.get("source_content")
+    representation = row.get("source_representation")
+    return (
+        url,
+        domain,
+        title,
+        published_at,
+        retrieved_at,
+        highlight,
+        content.strip() if isinstance(content, str) else "",
+        representation.strip() if isinstance(representation, str) else "",
     )
 
 
@@ -1038,25 +1089,42 @@ def _web_result_texts(result: Mapping[str, object]) -> list[tuple[str, str, str,
         for row in rows:
             if not isinstance(row, Mapping):
                 continue
-            url = row.get("url")
-            highlight = row.get("highlight")
-            if not (isinstance(url, str) and url.strip() and isinstance(highlight, str) and highlight.strip()):
-                continue
-            content = row.get("source_content")
-            representation = row.get("source_representation")
-            out.append(
-                (
-                    url.strip(),
-                    str(row.get("source_domain") or "").strip(),
-                    str(row.get("title") or "").strip(),
-                    str(row.get("published_at") or "").strip(),
-                    str(row.get("retrieved_at") or "").strip(),
-                    highlight.strip(),
-                    content.strip() if isinstance(content, str) else "",
-                    representation.strip() if isinstance(representation, str) else "",
-                )
-            )
+            extracted = _web_result_row(row)
+            if extracted is not None:
+                out.append(extracted)
     return out
+
+
+def _web_replay_ref(row: tuple[str, str, str, str, str, str, str, str], ref_id: str) -> dict[str, JSONValue]:
+    """Build the citation from the matched persisted web row."""
+    row_url, domain, title, published_at, retrieved_at, highlight, content, representation = row
+    return web_source_ref(
+        url=row_url,
+        excerpt=highlight[:2000],
+        title=title or None,
+        domain=domain or None,
+        published_at=published_at or None,
+        retrieved_at=retrieved_at or None,
+        tool_result_id=ref_id,
+        source_content=content or None,
+        source_representation=representation or None,
+    )
+
+
+def _matched_web_ref(
+    rows: list[tuple[str, str, str, str, str, str, str, str]], url: object, locator: str, ref_id: str
+) -> dict[str, JSONValue]:
+    """Select the first persisted highlight that matches the citation."""
+    for row in rows:
+        if url is not None and url != row[0]:
+            continue
+        norm = _normalize_record_text(row[5])
+        if locator in norm:
+            return _web_replay_ref(row, ref_id)
+    raise ValueError(
+        "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE (the cited excerpt does not appear "
+        "in the persisted search_web result)"
+    )
 
 
 def _web_provenance(
@@ -1067,8 +1135,6 @@ def _web_provenance(
     session_id: str | None = None,
 ) -> dict[str, JSONValue]:
     """WebSourceRef replayed against the persisted search_web result."""
-    from .repository import ResearchRepository as _RR
-
     ref_id = _tool_result_ref(data, "WEB")
     locator = _normalize_record_text(_first_text(data, (*_PASSAGE_KEYS, "excerpt")))
     if not locator:
@@ -1076,51 +1142,15 @@ def _web_provenance(
             "record_evidence: ERR_RAW_SOURCE_REQUIRED (a web citation names the persisted "
             "search_web result id plus the highlight text you are citing.)"
         )
-    try:
-        repo = store if store is not None else _RR()
-        result = repo.get_tool_result(ref_id)
-    except KeyError:
-        raise ValueError(
-            "record_evidence: ERR_RAW_SOURCE_REQUIRED (unknown persisted web tool result; "
-            "cite the tool_result_id the kernel returned for the response you read.)"
-        ) from None
-    other = result.get("session_id")
-    if isinstance(session_id, str) and session_id and isinstance(other, str) and other and other != session_id:
-        raise ValueError(
-            f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} belongs to session {other!r}, not {session_id!r})"
-        )
+    repo, result = _replay_result(store, ref_id, "web", session_id)
     if str(result.get("tool_name") or "") != "search_web":
         raise ValueError(
             f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} is not a search_web result)"
         )
-    if job is not None:
-        allowed = _submit_subtree_job_ids(repo, job)
-        if str(result.get("job_id")) not in allowed:
-            raise ValueError(
-                f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} not in wave {job.wave_id} {(job.source_domain or 'SEC').upper()} lane)"
-            )
+    _check_replay_lane(repo, result, ref_id, job)
     rows = _web_result_texts(result)
     url = data.get("source_record_id") or data.get("url") or data.get("source_uri")
-    for row_url, domain, title, published_at, retrieved_at, highlight, content, representation in rows:
-        if url is not None and url != row_url:
-            continue
-        norm = _normalize_record_text(highlight)
-        if locator and locator in norm:
-            return web_source_ref(
-                url=row_url,
-                excerpt=highlight[:2000],
-                title=title or None,
-                domain=domain or None,
-                published_at=published_at or None,
-                retrieved_at=retrieved_at or None,
-                tool_result_id=ref_id,
-                source_content=content or None,
-                source_representation=representation or None,
-            )
-    raise ValueError(
-        "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE (the cited excerpt does not appear "
-        "in the persisted search_web result)"
-    )
+    return _matched_web_ref(rows, url, locator, ref_id)
 
 
 def _check_declared_ref(provenance: Mapping[str, object], *, accession: str | None, document: str | None) -> None:
@@ -1300,6 +1330,22 @@ def _resolve_source_bytes(accession: str, document: str, reloaded: Mapping[str, 
     return _exact_source_bytes(accession, document)
 
 
+def _verified_sec_window(reloaded: Mapping[str, object], text_hash: str) -> str:
+    """Require the archive text to match the cited window hash."""
+    window = reloaded.get("text")
+    if not isinstance(window, str):
+        raise ValueError(  # noqa: TRY004 - preserve the public ValueError contract
+            "record_evidence: ERR_SEC_HANDLE_UNREADABLE (the archive returned no document text)"
+        )
+    if sha256(window.encode("utf-8")).hexdigest() != text_hash:
+        raise ValueError(
+            "record_evidence: ERR_SEC_HANDLE_STALE "
+            "(the document window changed since the handle was issued; re-read the document "
+            "with get_sec_document and cite the new handle)"
+        )
+    return window
+
+
 def materialize_sec_passage(
     handle: Mapping[str, object], locator: object, *, as_of: datetime | str | None = None
 ) -> MaterializedEvidenceSource:
@@ -1320,17 +1366,7 @@ def materialize_sec_passage(
         )
     fields = _handle_fields(handle)
     reloaded = _reload_handle_window(fields, as_of)
-    window = reloaded.get("text")
-    if not isinstance(window, str):
-        raise ValueError(  # noqa: TRY004 - the public error contract pins ValueError, tests are oracle
-            "record_evidence: ERR_SEC_HANDLE_UNREADABLE (the archive returned no document text)"
-        )
-    if sha256(window.encode("utf-8")).hexdigest() != fields.text_hash:
-        raise ValueError(
-            "record_evidence: ERR_SEC_HANDLE_STALE "
-            "(the document window changed since the handle was issued; re-read the document "
-            "with get_sec_document and cite the new handle)"
-        )
+    window = _verified_sec_window(reloaded, fields.text_hash)
     start, end = _locate_passage(window, locator if isinstance(locator, str) else "")
     provenance = sec_source_ref(
         accession_no=fields.accession,
@@ -1634,6 +1670,19 @@ def _archive_materialized_source(
     )
 
 
+def _existing_evidence_ledger(store: ResearchRepository, session_id: str) -> EvidenceLedger:
+    """Rebuild the admission ledger, ignoring legacy rows that cannot decode."""
+    from .evidence import EvidenceLedger, evidence_from_dict
+
+    ledger = EvidenceLedger()
+    for existing in store.list_evidence(session_id):
+        try:
+            ledger.append(evidence_from_dict(existing))
+        except Exception:  # noqa: BLE001, S112 - preserve best-effort legacy row loading
+            continue
+    return ledger
+
+
 def _persist_evidence_record(
     store: ResearchRepository,
     session_id: str,
@@ -1644,16 +1693,7 @@ def _persist_evidence_record(
     source: MaterializedEvidenceSource,
 ) -> dict[str, JSONValue]:
     """PIT-gate + archive the full exact bytes before commit; missing bytes cannot arrive."""
-    from .evidence import EvidenceLedger
-
-    ledger = EvidenceLedger()
-    for existing in store.list_evidence(session_id):
-        try:
-            from .evidence import evidence_from_dict
-
-            ledger.append(evidence_from_dict(existing))
-        except Exception:  # noqa: BLE001, S112 - intentional best-effort boundary, never aborts
-            continue
+    ledger = _existing_evidence_ledger(store, session_id)
     ingest_evidence(
         ledger, record, as_of=found.as_of, on_reject=lambda event, payload: _emit(store, session_id, event, payload)
     )
@@ -1766,6 +1806,26 @@ def _persist_finra_web_record(
     return stored
 
 
+def _check_tool_result_domain(job: Job, job_id: str, tool_name: str) -> None:
+    """Admit only tools that can ground records in the job's source domain."""
+    from .agents.source_agent import is_finra_tool, is_sec_tool, is_web_tool
+
+    domain = (job.source_domain or "").upper()
+    if domain == "FINRA":
+        allowed = is_finra_tool(tool_name) and tool_name in _FINRA_EVIDENCE_TOOLS
+        kind = "FINRA evidence"
+    elif domain == "WEB":
+        allowed = is_web_tool(tool_name)
+        kind = "WEB evidence"
+    elif domain == "SEC":
+        allowed = is_sec_tool(tool_name) and tool_name in _SEC_REPLAY_TOOLS
+        kind = "SEC replay"
+    else:
+        raise ValueError(f"persist_tool_result: job {job_id!r} domain {job.source_domain!r} persists no tool results")
+    if not allowed:
+        raise ValueError(f"persist_tool_result: tool {tool_name!r} cannot ground {kind} for job {job_id!r}")
+
+
 def persist_tool_result(
     session_id: str,
     job_id: str,
@@ -1783,22 +1843,9 @@ def persist_tool_result(
     the archive instead. Resume is idempotent: a repeated persist of the same
     id keeps the first bytes and returns the same id.
     """
-    from .agents.source_agent import is_finra_tool, is_sec_tool, is_web_tool
-
     store = _repo(repo)
     _found, job = _live_evidence_job(store, session_id, job_id)
-    domain = (job.source_domain or "").upper()
-    if domain == "FINRA":
-        if not is_finra_tool(tool_name) or tool_name not in _FINRA_EVIDENCE_TOOLS:
-            raise ValueError(f"persist_tool_result: tool {tool_name!r} cannot ground FINRA evidence for job {job_id!r}")
-    elif domain == "WEB":
-        if not is_web_tool(tool_name):
-            raise ValueError(f"persist_tool_result: tool {tool_name!r} cannot ground WEB evidence for job {job_id!r}")
-    elif domain == "SEC":
-        if not is_sec_tool(tool_name) or tool_name not in _SEC_REPLAY_TOOLS:
-            raise ValueError(f"persist_tool_result: tool {tool_name!r} cannot ground SEC replay for job {job_id!r}")
-    else:
-        raise ValueError(f"persist_tool_result: job {job_id!r} domain {job.source_domain!r} persists no tool results")
+    _check_tool_result_domain(job, job_id, tool_name)
     rid = (
         tool_result_id.strip()
         if isinstance(tool_result_id, str) and tool_result_id.strip()
@@ -1922,6 +1969,16 @@ def _record_absence_artifact(
     }
 
 
+def _apply_materialized_fields(data: dict[str, object], source: MaterializedEvidenceSource) -> None:
+    """Replace caller timing and URL fields with the verified archive values."""
+    data["known_at"] = source.known_at.isoformat() if source.known_at else None
+    data["published_at"] = source.filed_at.isoformat() if source.filed_at else None
+    data["retrieved_at"] = source.retrieved_at.isoformat() if source.retrieved_at else None
+    data["source_uri"] = source.source_url or (
+        source.provenance.get("source_uri") if isinstance(source.provenance.get("source_uri"), str) else None
+    )
+
+
 def record_evidence(
     session_id: str,
     job_id: str,
@@ -1949,44 +2006,13 @@ def record_evidence(
     evidence_id, source_name, supports, contradicts = _evidence_ids_names(data, session_id, job)
     metadata, subject = _evidence_typed(data, found)
     observed = _observed_provenance(data, job, store=store, session_id=session_id, as_of=found.as_of)
-    if isinstance(observed, MaterializedEvidenceSource):
-        materialized = observed
-        provenance = materialized.provenance
-        identity_key = _evidence_identity(data, claim, subject, provenance)
-        hit = store.find_evidence_by_identity(session_id, identity_key)
-        if hit is not None:
-            return {"evidence_id": hit.get("evidence_id"), "accepted": False, "duplicate_of": hit.get("evidence_id")}
-        data["known_at"] = materialized.known_at.isoformat() if materialized.known_at else None
-        data["published_at"] = materialized.filed_at.isoformat() if materialized.filed_at else None
-        data["retrieved_at"] = materialized.retrieved_at.isoformat() if materialized.retrieved_at else None
-        data["source_uri"] = materialized.source_url or (
-            materialized.provenance.get("source_uri")
-            if isinstance(materialized.provenance.get("source_uri"), str)
-            else None
-        )
-        record = _build_evidence_record(
-            data,
-            session_id=session_id,
-            job_id=job_id,
-            wave=wave,
-            evidence_id=evidence_id,
-            source_name=source_name,
-            subject=subject,
-            claim=claim,
-            content=content,
-            supports=supports,
-            contradicts=contradicts,
-            metadata=metadata,
-            identity_key=identity_key,
-            claim_kind="observed_fact",
-            provenance=provenance,
-        )
-        return _persist_evidence_record(store, session_id, job_id, found, record, source=materialized)
-    provenance = observed
+    provenance = observed.provenance if isinstance(observed, MaterializedEvidenceSource) else observed
     identity_key = _evidence_identity(data, claim, subject, provenance)
     hit = store.find_evidence_by_identity(session_id, identity_key)
     if hit is not None:
         return {"evidence_id": hit.get("evidence_id"), "accepted": False, "duplicate_of": hit.get("evidence_id")}
+    if isinstance(observed, MaterializedEvidenceSource):
+        _apply_materialized_fields(data, observed)
     record = _build_evidence_record(
         data,
         session_id=session_id,
@@ -2004,6 +2030,8 @@ def record_evidence(
         claim_kind="observed_fact",
         provenance=provenance,
     )
+    if isinstance(observed, MaterializedEvidenceSource):
+        return _persist_evidence_record(store, session_id, job_id, found, record, source=observed)
     return _persist_finra_web_record(store, session_id, job_id, found, record)
 
 
@@ -2057,8 +2085,8 @@ def _sufficient_residuals(cov: dict[str, object], unresolved: list[str] | None) 
     return remaining
 
 
-def _sufficient_required(cov: dict[str, object], domain: str = "SEC") -> None:
-    """The full structured envelope for one source domain's slice."""
+def _sufficient_fields(cov: dict[str, object], domain: str) -> None:
+    """Validate the required domain fields before testing completed work."""
     work = (
         _SUFFICIENCY_FINRA_KEYS
         if domain == "FINRA"
@@ -2071,13 +2099,12 @@ def _sufficient_required(cov: dict[str, object], domain: str = "SEC") -> None:
         raise ValueError(f"submit_source_result: ERR_COVERAGE_REQUIRED (sufficient coverage missing {missing})")
     for key in work if domain in ("FINRA", "WEB") else _SUFFICIENCY_REQUIRED_KEYS:
         _submit_str_list_field(cov, key, required=True)
-    if domain in ("FINRA", "WEB"):
-        if not [b for b in _submit_str_list_field(cov, "covered_branches", required=True) if b.strip()]:
-            raise ValueError(
-                "submit_source_result: ERR_COVERAGE_REQUIRED (sufficient needs non-empty covered_branches)"
-            )
-        return
-    if not _submit_str_list_field(cov, "search_runs", required=True):
+
+
+def _sufficient_required(cov: dict[str, object], domain: str = "SEC") -> None:
+    """The full structured envelope for one source domain's slice."""
+    _sufficient_fields(cov, domain)
+    if domain not in ("FINRA", "WEB") and not _submit_str_list_field(cov, "search_runs", required=True):
         raise ValueError("submit_source_result: ERR_COVERAGE_REQUIRED (sufficient needs non-empty search_runs)")
     if not [b for b in _submit_str_list_field(cov, "covered_branches", required=True) if b.strip()]:
         raise ValueError("submit_source_result: ERR_COVERAGE_REQUIRED (sufficient needs non-empty covered_branches)")
@@ -2786,6 +2813,29 @@ def _wave_dossiers(store: ResearchRepository, session_id: str) -> list[dict[str,
     return wave_rows or [rows[-1]]
 
 
+def _merge_wave_coverage_lists(merged: dict[str, object], coverage: dict[str, object]) -> None:
+    """Merge non-empty coverage lists with their source-domain tags."""
+    domain = str(coverage.get("source_domain") or "").upper()
+    for key, value in coverage.items():
+        if not isinstance(value, list) or not value:
+            continue
+        prior = merged.get(key)
+        tagged = [f"[{domain}] {v}" if domain and isinstance(v, str) else v for v in value]
+        merged[key] = [*prior, *tagged] if isinstance(prior, list) else list(tagged)
+
+
+def _wave_dossier_details(rows: list[dict[str, object]]) -> tuple[list[dict[str, object]], list[str]]:
+    """Collect valid relationships and non-empty questions in dossier order."""
+    relationships: list[dict[str, object]] = []
+    questions: list[str] = []
+    for row in rows:
+        raw_rels = row.get("relationships")
+        if isinstance(raw_rels, list):
+            relationships.extend(dict(r) for r in raw_rels if isinstance(r, dict))
+        questions.extend(q for q in _str_list(row.get("open_questions")) if q)
+    return relationships, questions
+
+
 def _wave1_coverage(
     store: ResearchRepository, session_id: str
 ) -> tuple[dict[str, object] | None, list[dict[str, object]], list[str]]:
@@ -2799,18 +2849,10 @@ def _wave1_coverage(
     if not rows:
         return None, [], []
     merged: dict[str, object] = {}
-    rels: list[dict[str, object]] = []
-    open_q: list[str] = []
     for row in rows:
         coverage = row.get("coverage")
         if isinstance(coverage, dict):
-            domain = str(coverage.get("source_domain") or "").upper()
-            for key, value in coverage.items():
-                if not isinstance(value, list) or not value:
-                    continue
-                prior = merged.get(key)
-                tagged = [f"[{domain}] {v}" if domain and isinstance(v, str) else v for v in value]
-                merged[key] = [*prior, *tagged] if isinstance(prior, list) else list(tagged)
+            _merge_wave_coverage_lists(merged, coverage)
             verdict = coverage.get("useful_for_question")
             if (
                 isinstance(verdict, str)
@@ -2818,17 +2860,7 @@ def _wave1_coverage(
                 and merged.get("useful_for_question") != "insufficient"
             ):
                 merged["useful_for_question"] = verdict
-    for row in rows:
-        raw_rels = row.get("relationships")
-        if isinstance(raw_rels, list):
-            for r in raw_rels:
-                if isinstance(r, dict):
-                    rels.append(dict(r))
-        raw_open = row.get("open_questions")
-        if isinstance(raw_open, list):
-            for q in raw_open:
-                if isinstance(q, str) and q:
-                    open_q.append(q)
+    rels, open_q = _wave_dossier_details(rows)
     return (merged or None), rels, open_q
 
 
@@ -3657,10 +3689,8 @@ def _dossier_limitations(lims: list[str], dossier: Mapping[str, object]) -> None
     if not isinstance(coverage, dict):
         return
     for key in ("source_limitations", "gaps"):
-        raw = coverage.get(key)
-        if isinstance(raw, list):
-            for item in raw:
-                _append_unique(lims, item)
+        for item in _str_list(coverage.get(key)):
+            _append_unique(lims, item)
     if coverage.get("complete") is False:
         domain = str(coverage.get("source_domain") or "").upper()
         _append_unique(lims, f"{domain or 'Source'} coverage incomplete for this session")
@@ -3776,6 +3806,20 @@ def _finalize_absence_texts(store: ResearchRepository, session_id: str) -> list[
     return texts
 
 
+def _merge_final_coverage(out: dict[str, dict[str, list[str]]], coverage: object) -> None:
+    """Fold one known source's string lists into sorted, unique coverage fields."""
+    if not isinstance(coverage, dict):
+        return
+    domain = str(coverage.get("source_domain") or "").upper()
+    section = out.get(domain.lower())
+    if section is None:
+        return
+    for key, value in coverage.items():
+        items = [v.strip() for v in _str_list(value) if v.strip()]
+        if items:
+            section[key] = sorted(set(section.get(key, []) + items))
+
+
 def _finalize_coverage(store: ResearchRepository, session_id: str) -> dict[str, object]:
     """Per-source searched scope for the final render: one section per dossier domain.
 
@@ -3791,19 +3835,7 @@ def _finalize_coverage(store: ResearchRepository, session_id: str) -> dict[str, 
     except Exception:  # noqa: BLE001 - best-effort read; synthesis never fails on coverage
         return {}
     for dossier in dossiers:
-        coverage = dossier.get("coverage")
-        if not isinstance(coverage, dict):
-            continue
-        domain = str(coverage.get("source_domain") or "").upper()
-        section = out.get(domain.lower()) if domain.lower() in out else None
-        if section is None:
-            continue
-        for key, value in coverage.items():
-            if not isinstance(value, list) or not value:
-                continue
-            items = [v.strip() for v in value if isinstance(v, str) and v.strip()]
-            if items:
-                section[key] = sorted(set(section.get(key, []) + items))
+        _merge_final_coverage(out, dossier.get("coverage"))
     return {k: v for k, v in out.items() if v}
 
 
@@ -4058,6 +4090,29 @@ def _require_node(store: ResearchRepository, node_id: str) -> ResearchNode:
         raise ResearchNotFound(f"unknown node_id: {node_id!r}") from None
 
 
+def _non_empty_arg(value: object, label: str) -> str:
+    """Stripped non-blank string for one service argument (label names the field)."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty string")
+    return value.strip()
+
+
+def _node_dependencies(depends_on: Sequence[str] | None) -> tuple[str, ...]:
+    """Node dependency ids as a tuple; every id must be a non-empty string."""
+    deps = tuple(depends_on or ())
+    if any(not isinstance(d, str) or not d for d in deps):
+        raise ValueError("create_node: 'depends_on' must be a list of non-empty strings")
+    return deps
+
+
+def _require_deps_in_session(store: ResearchRepository, session_id: str, deps: tuple[str, ...]) -> None:
+    """Fail closed when one dependency is unknown or belongs to another session."""
+    for dep in deps:
+        dep_node = _require_node(store, dep)
+        if dep_node.session_id != session_id:
+            raise ValueError(f"create_node: depends_on {dep!r} belongs to another session")
+
+
 def create_node(
     session_id: str,
     question: str,
@@ -4067,24 +4122,17 @@ def create_node(
     repo: ResearchRepository | Path | str | None = None,
 ) -> ResearchNode:
     """Create one ResearchNode (what needs knowing); fail-closed on unknown session."""
-    if not isinstance(question, str) or not question.strip():
-        raise ValueError("create_node: 'question' must be a non-empty string")
-    if not isinstance(why_it_matters, str) or not why_it_matters.strip():
-        raise ValueError("create_node: 'why_it_matters' must be a non-empty string")
-    deps = tuple(depends_on or ())
-    if any(not isinstance(d, str) or not d for d in deps):
-        raise ValueError("create_node: 'depends_on' must be a list of non-empty strings")
+    question_text = _non_empty_arg(question, "create_node: 'question'")
+    why_text = _non_empty_arg(why_it_matters, "create_node: 'why_it_matters'")
+    deps = _node_dependencies(depends_on)
     store = _repo(repo)
     _require_session(store, session_id)
-    for dep in deps:
-        dep_node = _require_node(store, dep)
-        if dep_node.session_id != session_id:
-            raise ValueError(f"create_node: depends_on {dep!r} belongs to another session")
+    _require_deps_in_session(store, session_id, deps)
     node = ResearchNode(
         node_id=new_node_id(),
         session_id=session_id,
-        question=question.strip(),
-        why_it_matters=why_it_matters.strip(),
+        question=question_text,
+        why_it_matters=why_text,
         depends_on=deps,
     )
     node.validate("<service>")
@@ -4146,6 +4194,20 @@ def reject_node(session_id: str, node_id: str, *, repo: ResearchRepository | Pat
     return _transition_node(_repo(repo), session_id, node_id, "rejected", "node.rejected")
 
 
+def _require_decision_links(
+    store: ResearchRepository, session_id: str, node_id: str | None, job_id: str | None
+) -> None:
+    """Fail closed when a linked node/job is unknown or belongs to another session."""
+    if node_id is not None:
+        node = _require_node(store, node_id)
+        if node.session_id != session_id:
+            raise ResearchNotFound(f"unknown node_id: {node_id!r}")
+    if job_id is not None:
+        job = _require_job(store, job_id)
+        if job.session_id != session_id:
+            raise ResearchNotFound(f"unknown job_id: {job_id!r}")
+
+
 def record_decision(
     session_id: str,
     decision_type: str,
@@ -4163,24 +4225,16 @@ def record_decision(
     repo: ResearchRepository | Path | str | None = None,
 ) -> DecisionRecord:
     """Persist one JEV disposition: full candidate registry + probabilities + selected tool set."""
-    if not isinstance(decision_type, str) or not decision_type.strip():
-        raise ValueError("record_decision: 'decision_type' must be a non-empty string")
+    decision_text = _non_empty_arg(decision_type, "record_decision: 'decision_type'")
     store = _repo(repo)
     _require_session(store, session_id)
-    if node_id is not None:
-        node = _require_node(store, node_id)
-        if node.session_id != session_id:
-            raise ResearchNotFound(f"unknown node_id: {node_id!r}")
-    if job_id is not None:
-        job = _require_job(store, job_id)
-        if job.session_id != session_id:
-            raise ResearchNotFound(f"unknown job_id: {job_id!r}")
+    _require_decision_links(store, session_id, node_id, job_id)
     decision = DecisionRecord(
         decision_id=new_decision_id(),
         session_id=session_id,
         node_id=node_id,
         job_id=job_id,
-        decision_type=decision_type.strip(),
+        decision_type=decision_text,
         candidates=validate_json_mapping(dict(candidates), "<service>: 'candidates'"),
         probabilities=validate_json_mapping(dict(probabilities), "<service>: 'probabilities'"),
         selected=validate_json_value(selected, "<service>: 'selected'"),

@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol, TypeGuard
 from urllib.parse import quote, urlparse
 
 from app.config import get_data_root
@@ -334,7 +335,15 @@ def _sec_record(identity: Mapping[str, object], root: Path) -> raw_archive.Archi
     return record
 
 
-def _has_reads(candidate: object) -> bool:
+class _SourceStore(Protocol):
+    """Structural read seam: ResearchRepository or a test double."""
+
+    def get_evidence(self, evidence_id: str, /) -> Mapping[str, object]: ...
+
+    def get_tool_result(self, tool_result_id: str, /) -> object: ...
+
+
+def _has_reads(candidate: object) -> TypeGuard[_SourceStore]:
     get_evidence = getattr(candidate, "get_evidence", None)
     get_tool_result = getattr(candidate, "get_tool_result", None)
     return callable(get_evidence) and callable(get_tool_result)
@@ -520,7 +529,7 @@ def _resolve(source_id: str, root: Path, repo: object = None) -> dict[str, objec
     if source_id.startswith("capture:"):
         return _resolve_capture(source_id, root)
     store = repo if _has_reads(repo) else ResearchRepository(data_root=root)
-    evidence = store.get_evidence(source_id.removeprefix("evidence:"))  # type: ignore[union-attr]
+    evidence = store.get_evidence(source_id.removeprefix("evidence:"))
     kind, common = _evidence_provenance(evidence)
     provenance = evidence.get("provenance")
     assert isinstance(provenance, Mapping)

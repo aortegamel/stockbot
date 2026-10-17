@@ -53,7 +53,7 @@ from .services.portfolio_sync import read_latest_snapshot, sync_robinhood_portfo
 if TYPE_CHECKING:
     from .domain.risk.breaches import RiskBreach
     from .domain.risk.evaluation import EvaluationIssue, RiskEvaluation
-    from .sec.models import Filing
+    from .sec.models import Filing, SECTextHit
     from .thesis.intake import IntakeProposal
     from .thesis.models import (
         JSONValue,
@@ -2989,18 +2989,15 @@ def compare_robinhood_options(
     }
 
 
+def _search_domains(value: object) -> list[str] | None:
+    """Coerce each domain in an array, without accepting other containers."""
+    return [str(domain) for domain in value] if isinstance(value, list) else None
+
+
 def _search_web(args: dict[str, object], model: str) -> dict[str, object]:
     """Exa-backed web search; harness-level soft failures must not stop the run."""
-    raw_inc = args.get("include_domains")
-    if isinstance(raw_inc, list):
-        include_domains: list[str] | None = [str(x) for x in raw_inc]
-    else:
-        include_domains = None
-    raw_exc = args.get("exclude_domains")
-    if isinstance(raw_exc, list):
-        exclude_domains: list[str] | None = [str(x) for x in raw_exc]
-    else:
-        exclude_domains = None
+    include_domains = _search_domains(args.get("include_domains"))
+    exclude_domains = _search_domains(args.get("exclude_domains"))
     start, err = _finra_date(args.get("start_published_date"), "search_web", "start_published_date")
     if err is not None:
         return err
@@ -5018,6 +5015,11 @@ def _normalize_discovery_text(value: str) -> list[str]:
     )
     cleaned = "".join(c if c.isalnum() or c == " " else " " for c in lowered)
     raw = " ".join(cleaned.split()).split()
+    return [_discovery_singular(token) for token in _merge_discovery_forms(raw)]
+
+
+def _merge_discovery_forms(raw: list[str]) -> list[str]:
+    """Merge only adjacent SEC form tokens, before singularization."""
     merged: list[str] = []
     skip = False
     for i, token in enumerate(raw):
@@ -5026,20 +5028,22 @@ def _normalize_discovery_text(value: str) -> list[str]:
             continue
         nxt = raw[i + 1] if i + 1 < len(raw) else ""
         pair = (token, nxt.rstrip("s"))
-        if token in ("10", "8") and nxt and pair in (("10", "k"), ("10", "q"), ("8", "k")):
+        if pair in (("10", "k"), ("10", "q"), ("8", "k")):
             merged.append(pair[0] + pair[1])
             skip = True
         else:
             merged.append(token)
-    tokens: list[str] = []
-    for token in merged:
-        if len(token) > 3:
-            if token.endswith("ies"):
-                token = token[:-3] + "y"
-            elif token.endswith("s"):
-                token = token[:-1]
-        tokens.append(token)
-    return tokens
+    return merged
+
+
+def _discovery_singular(token: str) -> str:
+    """Apply the catalog's plural rules only to tokens longer than three characters."""
+    if len(token) > 3:
+        if token.endswith("ies"):
+            return token[:-3] + "y"
+        if token.endswith("s"):
+            return token[:-1]
+    return token
 
 
 # Generic stopwords for catalog search (standard filler, never domain/intent terms).
@@ -5561,88 +5565,122 @@ _MONTHS = frozenset(
 _TERM_MAX_WORDS = 8
 
 
-def _term_window(text: str, start: int, end: int, filer: str, modifier: bool) -> tuple[str, ...]:
-    """Whole-word windows of at most eight words around ``text[start:end]`` inside one clause, widest first.
-
-    An amount is one unit, so a window never splits it. Filer words bound the window.
-    A negation in the clause joins the core; when it does not fit, there is no window.
-    Exposure words (``modifier``) also take one leading modifier and the nearest capitalized
-    name. The narrow window extends right, the wide one then extends left, and shorter
-    right ends follow for headings that equal the section. Edge stopwords and mid-phrase
-    cuts (``with two``) drop unless they carry a name.
-
-    ponytail: word-window noun phrase, not a parser; swap for a chunker if labels need more.
-    """
+def _term_clause_units(text: str, start: int, end: int) -> list[list[int]]:
+    """Find the containing clause and group complete amounts into word units."""
     left = max((m.end() for m in _CLAUSE_BREAK_RE.finditer(text, 0, start)), default=0)
     stop = _CLAUSE_BREAK_RE.search(text, end)
     if stop and stop.group(0) == "," and not text[left:start].strip() and not text[end : stop.start()].strip():
         stop = _CLAUSE_BREAK_RE.search(text, stop.end())  # a lone first word before a comma heads a list
     right = stop.start() if stop else len(text)
     amounts = list(_AMOUNT_RE.finditer(text, left, right))
-    units: list[list[int]] = []  # [start, end, word count]
-    for w in _WORD_RE.finditer(text, left, right):
-        if units and any(a.start() < units[-1][1] and a.end() > w.start() for a in amounts):
-            units[-1][1:] = [w.end(), units[-1][2] + 1]
+    return _term_amount_units(text, left, right, amounts)
+
+
+def _term_amount_units(text: str, left: int, right: int, amounts: list[re.Match[str]]) -> list[list[int]]:
+    """Keep each amount intact while retaining its original word count."""
+    units: list[list[int]] = []
+    for word in _WORD_RE.finditer(text, left, right):
+        if units and any(a.start() < units[-1][1] and a.end() > word.start() for a in amounts):
+            units[-1][1:] = [word.end(), units[-1][2] + 1]
         else:
-            units.append([w.start(), w.end(), 1])
-    a = next((k for k, u in enumerate(units) if u[1] > start), None)
-    b = next((k for k, u in enumerate(units) if u[1] >= end), None)
-    if a is None or b is None:
-        return ()
+            units.append([word.start(), word.end(), 1])
+    return units
+
+
+def _term_word_flags(
+    text: str, units: list[list[int]], filer: str
+) -> tuple[list[str], list[bool], list[bool], list[bool], list[bool]]:
+    """Classify clause units for filer boundaries, phrase edges, names, and negation."""
     words = [text[s:e].strip("\"'“”‘’()[],.;:") for s, e, _ in units]
     filer_words = {w.strip(",.").casefold() for w in filer.split() if w.lower() not in _TERM_EDGE_WORDS}
     free = [w.casefold() not in filer_words for w in words]
     edge = [w.lower() in _TERM_EDGE_WORDS for w in words]
     named = [w[:1].isupper() and not e and w.lower() not in _MONTHS for w, e in zip(words, edge, strict=True)]
     negated = [bool(_NEGATION_RE.search(w)) for w in words]
+    return words, free, edge, named, negated
+
+
+def _term_window(text: str, start: int, end: int, filer: str, modifier: bool) -> tuple[str, ...]:
+    """Select whole-word clause windows, widest first, without splitting amounts or negation.
+
+    Exposure words also take one leading modifier and the nearest capitalized name.
+    Filer words bound the window. A clause negation joins the core, and when it does not
+    fit there is no window. Edge stopwords and unfinished phrases drop unless they carry a name.
+    ponytail: word-window noun phrase, not a parser. Use a chunker if labels need more.
+    """
+    units = _term_clause_units(text, start, end)
+    a = next((k for k, u in enumerate(units) if u[1] > start), None)
+    b = next((k for k, u in enumerate(units) if u[1] >= end), None)
+    if a is None or b is None:
+        return ()
+    words, free, edge, named, negated = _term_word_flags(text, units, filer)
     n = len(units)
 
     def size(i: int, j: int) -> int:
         return sum(u[2] for u in units[i : j + 1])
 
-    i, j = a, b
-    if modifier:
+    def modifier_start(i: int, j: int) -> int:
         if i and free[i - 1] and not edge[i - 1] and words[i - 1].isalpha():
             i -= 1
         for k in range(i - 1, 0, -1):  # the clause's first word is sentence case, not a name
             if not free[k]:
                 break
             if named[k]:
-                i = k if size(k, j) <= _TERM_MAX_WORDS else i
-                break
-    i = next((k for k in range(i) if negated[k]), i)
-    j = next((k for k in range(n - 1, j, -1) if negated[k]), j)
-    if size(i, j) > _TERM_MAX_WORDS or not all(free[i : j + 1]):
+                return k if size(k, j) <= _TERM_MAX_WORDS else i
+        return i
+
+    def core(i: int, j: int) -> tuple[int, int] | None:
+        if modifier:
+            i = modifier_start(i, j)
+        i = next((k for k in range(i) if negated[k]), i)
+        j = next((k for k in range(n - 1, j, -1) if negated[k]), j)
+        if size(i, j) > _TERM_MAX_WORDS or not all(free[i : j + 1]):
+            return None
+        return i, j
+
+    bounds = core(a, b)
+    if bounds is None:
         return ()
-    lo, hi = i, j
+    lo, hi = bounds
+
+    def cut_right(j: int) -> int:
+        if j + 1 < n and free[j + 1] and not edge[j + 1]:
+            k = max((k for k in range(hi + 1, j + 1) if edge[k]), default=None)
+            if k is not None and not any(named[k : j + 1]):
+                return k - 1
+        return j
+
+    def cut_left(i: int) -> int:
+        if i and free[i - 1] and not edge[i - 1]:
+            k = min((k for k in range(i, lo) if edge[k]), default=None)
+            if k is not None and not any(named[i : k + 1]):
+                return k + 1
+        return i
 
     def cut(i: int, j: int) -> tuple[int, int]:
         while i < lo and edge[i]:
             i += 1
         while j > hi and edge[j]:
             j -= 1
-        if j + 1 < n and free[j + 1] and not edge[j + 1]:
-            k = max((k for k in range(hi + 1, j + 1) if edge[k]), default=None)
-            if k is not None and not any(named[k : j + 1]):
-                j = k - 1
-                while j > hi and edge[j]:
-                    j -= 1
-        if i and free[i - 1] and not edge[i - 1]:
-            k = min((k for k in range(i, lo) if edge[k]), default=None)
-            if k is not None and not any(named[i : k + 1]):
-                i = k + 1
-                while i < lo and edge[i]:
-                    i += 1
+        j = cut_right(j)
+        i = cut_left(i)
+        while j > hi and edge[j]:
+            j -= 1
+        while i < lo and edge[i]:
+            i += 1
         return i, j
 
-    while j + 1 < n and free[j + 1] and size(i, j + 1) <= _TERM_MAX_WORDS:
-        j += 1
-    i, j = cut(i, j)
-    shorter = [cut(i, k) for k in range(j - 1, hi - 1, -1)]
-    narrow = (i, j)
-    while i and free[i - 1] and size(i - 1, j) <= _TERM_MAX_WORDS:
-        i -= 1
-    return tuple(text[units[s][0] : units[e][1]] for s, e in (cut(i, j), narrow, *shorter))
+    def windows(i: int, j: int) -> tuple[str, ...]:
+        while j + 1 < n and free[j + 1] and size(i, j + 1) <= _TERM_MAX_WORDS:
+            j += 1
+        i, j = cut(i, j)
+        shorter = [cut(i, k) for k in range(j - 1, hi - 1, -1)]
+        narrow = (i, j)
+        while i and free[i - 1] and size(i - 1, j) <= _TERM_MAX_WORDS:
+            i -= 1
+        return tuple(text[units[s][0] : units[e][1]] for s, e in (cut(i, j), narrow, *shorter))
+
+    return windows(lo, hi)
 
 
 def _passage_term(hit: dict[str, object], extracted: str | None = None) -> str | None:
@@ -5658,28 +5696,50 @@ def _passage_term(hit: dict[str, object], extracted: str | None = None) -> str |
     text = snippet or str(hit.get("file_description") or "")
     query = str(hit.get("query") or "").strip()
     filer = str(hit.get("filer_name") or "")
-    exposure = _EXPOSURE_RE.search(text)
-    amount = _AMOUNT_RE.search(text)
-    found = text.find(extracted) if extracted else -1
-    phrase = _term_window(text, exposure.start(), exposure.end(), filer, True) if exposure else ()
-    money = _term_window(text, amount.start(), amount.end(), filer, False) if amount else ()
-    needle = _term_window(text, found, found + len(extracted or ""), filer, False) if found >= 0 else ()
-    # ponytail: reading order inside one clause picks between the two grounded spans; no salience model.
-    money_first = amount is not None and (
+    candidates = _passage_candidates(text, snippet, query, filer, extracted)
+    return _first_passage_term(candidates, _hit_section(hit), filer)
+
+
+def _match_term_windows(text: str, match: re.Match[str] | None, filer: str, modifier: bool = False) -> tuple[str, ...]:
+    """Select clause windows for a matched span, or no windows when no span matches."""
+    if match is None:
+        return ()
+    return _term_window(text, match.start(), match.end(), filer, modifier)
+
+
+def _amount_leads_exposure(amount: re.Match[str] | None, exposure: re.Match[str] | None, text: str) -> bool:
+    """Prefer an earlier amount only when both anchors belong to the same clause."""
+    return amount is not None and (
         exposure is None
         or (amount.start() < exposure.start() and not _CLAUSE_BREAK_RE.search(text, amount.end(), exposure.start()))
     )
-    lead, trail = (money, phrase) if money_first else (phrase, money)
+
+
+def _passage_candidates(
+    text: str, snippet: str, query: str, filer: str, extracted: str | None
+) -> tuple[str | None, ...]:
+    """Order grounded exposure, money, extracted, and quoted-query candidates."""
+    exposure = _EXPOSURE_RE.search(text)
+    amount = _AMOUNT_RE.search(text)
+    found = text.find(extracted) if extracted else -1
+    phrase = _match_term_windows(text, exposure, filer, True)
+    money = _match_term_windows(text, amount, filer)
+    needle = _term_window(text, found, found + len(extracted or ""), filer, False) if found >= 0 else ()
+    # ponytail: reading order selects between grounded spans. No salience model is necessary.
+    lead, trail = (money, phrase) if _amount_leads_exposure(amount, exposure, text) else (phrase, money)
     quoted = re.search(rf"(?<!\w){re.escape(query)}(?!\w)", snippet, re.IGNORECASE) if query else None
-    query_windows = _term_window(text, quoted.start(), quoted.end(), filer, False) if quoted else ()
-    candidates = (
+    query_windows = _match_term_windows(text, quoted, filer)
+    return (
         *lead,
         exposure.group(0) if exposure and phrase and not _NEGATION_RE.search(phrase[0]) else None,
         *needle,
         *trail,
         *query_windows,
     )
-    section = _hit_section(hit)
+
+
+def _first_passage_term(candidates: tuple[str | None, ...], section: str | None, filer: str) -> str | None:
+    """Reject section echoes and filer mentions without changing candidate order."""
     return next(
         (c for c in candidates if c and c != section and not (filer and filer.casefold() in c.casefold())), None
     )
@@ -5695,6 +5755,27 @@ def _document_matches(hits: list[dict[str, object]]) -> list[dict[str, object]]:
     return [{"accession": accession, "matching_passages": passages} for accession, passages in grouped.items()]
 
 
+def _stored_hit_row(stored: dict[str, object], hit_type: type[SECTextHit]) -> SECTextHit:
+    """Reconstruct stored identity fields and optional text for display extraction."""
+    content = {
+        key: value if isinstance(value := stored.get(key), str) else None
+        for key in ("filer_name", "matched_document", "file_type", "file_description", "snippet")
+    }
+    return hit_type(
+        search_id=str(stored.get("search_id") or ""),
+        attempt_id=str(stored.get("attempt_id") or ""),
+        query=str(stored.get("query") or ""),
+        accession_no=str(stored.get("accession_no") or ""),
+        form=str(stored.get("form") or ""),
+        filed_at=str(stored.get("filed_at") or ""),
+        filer_name=content["filer_name"],
+        matched_document=content["matched_document"],
+        file_type=content["file_type"],
+        file_description=content["file_description"],
+        snippet=content["snippet"],
+    )
+
+
 def _hit_packet_term(stored: dict[str, object]) -> str | None:
     """Needle display term verified against stored content; None on any miss."""
     try:
@@ -5706,23 +5787,7 @@ def _hit_packet_term(stored: dict[str, object]) -> str | None:
     except ImportError:
         return None
     try:
-        row = _Hit(
-            search_id=str(stored.get("search_id") or ""),
-            attempt_id=str(stored.get("attempt_id") or ""),
-            query=str(stored.get("query") or ""),
-            accession_no=str(stored.get("accession_no") or ""),
-            form=str(stored.get("form") or ""),
-            filed_at=str(stored.get("filed_at") or ""),
-            filer_name=stored.get("filer_name") if isinstance(stored.get("filer_name"), str) else None,
-            matched_document=stored.get("matched_document")
-            if isinstance(stored.get("matched_document"), str)
-            else None,
-            file_type=stored.get("file_type") if isinstance(stored.get("file_type"), str) else None,
-            file_description=stored.get("file_description")
-            if isinstance(stored.get("file_description"), str)
-            else None,
-            snippet=stored.get("snippet") if isinstance(stored.get("snippet"), str) else None,
-        )
+        row = _stored_hit_row(stored, _Hit)
     except TypeError:
         return None
     try:
@@ -7327,7 +7392,11 @@ def _schema_value_mismatch(name: str, key: str, value: object, prop: object) -> 
         hit = _pattern_mismatch(name, key, value, pattern, prop)
         if hit is not None:
             return hit
-    allowed = prop.get("enum")
+    return _schema_enum_mismatch(name, key, value, prop.get("enum"))
+
+
+def _schema_enum_mismatch(name: str, key: str, value: object, allowed: object) -> str | None:
+    """Validate only nonempty string enums, as the schema gate requires."""
     if isinstance(allowed, list) and allowed and all(isinstance(v, str) for v in allowed):
         return _enum_mismatch(name, key, value, [str(v) for v in allowed])
     return None

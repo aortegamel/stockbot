@@ -100,21 +100,19 @@ class FinalSynthesis:
 
     def to_dict(self) -> dict[str, object]:
         """Deep FinalResearchResult dict (legacy answer/claims keys kept)."""
-        claim_rows = [
-            {"text": c.text, "claim_type": c.claim_type, "evidence_ids": list(c.evidence_ids)} for c in self.claims
-        ]
+        claim_rows = [_effect_row(c) for c in self.claims]
         return {
             "answer": self.answer,
             "executive_summary": self.executive_summary or self.answer,
             "consensus": self.consensus,
             "base_case": self.base_case,
-            "major_evidence": [dict(row) for row in self.direct_evidence],
-            "direct_evidence": [dict(row) for row in self.direct_evidence],
+            "major_evidence": _copy_rows(self.direct_evidence),
+            "direct_evidence": _copy_rows(self.direct_evidence),
             "bull_case": {"summary": self.bull_case, "evidence_ids": list(self.bull_evidence_ids)},
             "bear_case": {"summary": self.bear_case, "evidence_ids": list(self.bear_evidence_ids)},
-            "impact_channels": [dict(ch) for ch in self.impact_channels],
-            "first_order_effects": [dict(e) for e in self.first_order_effects],
-            "second_order_effects": [dict(e) for e in self.second_order_effects],
+            "impact_channels": _copy_rows(self.impact_channels),
+            "first_order_effects": _copy_rows(self.first_order_effects),
+            "second_order_effects": _copy_rows(self.second_order_effects),
             "disagreements": list(self.critical_disagreements),
             "critical_disagreements": list(self.critical_disagreements),
             "positioning": list(self.positioning),
@@ -126,15 +124,20 @@ class FinalSynthesis:
             "limitations": list(self.evidence_limitations),
             "evidence_limitations": list(self.evidence_limitations),
             "coverage": {k: list(v) if isinstance(v, list) else v for k, v in self.coverage.items()},
-            "sources": [dict(s) for s in self.sources],
-            "grounded_claims": [dict(r) for r in claim_rows],
-            "claims": [dict(r) for r in claim_rows],
+            "sources": _copy_rows(self.sources),
+            "grounded_claims": _copy_rows(claim_rows),
+            "claims": _copy_rows(claim_rows),
             "filing_references": list(self.filing_references),
             "evidence_refs": list(self.filing_references),
             "research_scope": dict(self.research_scope),
             "freeze_id": self.freeze_id,
             "as_of": self.as_of,
         }
+
+
+def _copy_rows(rows: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    """Copy report rows without sharing their mutable mappings."""
+    return [dict(row) for row in rows]
 
 
 def scoped_absence(text: str, domain: str | None = None) -> str:
@@ -494,6 +497,20 @@ def _coverage_scope_items(section: Mapping[str, object]) -> list[tuple[str, list
     return out
 
 
+def _coverage_line(key: str, section: Mapping[str, object]) -> str:
+    """Render one source's searched scope with the existing detail separators."""
+    parts = [f"{name}: {', '.join(items)}" for name, items in _coverage_scope_items(section)]
+    detail = _as_text(section.get("detail") or section.get("summary"))
+    if not parts and not detail:
+        return key.upper()
+    head = f"{key.upper()} — {'; '.join(parts)}"
+    if not detail:
+        return head
+    if not parts:
+        return f"{head} — {detail}"
+    return head + detail
+
+
 def _coverage_lines(coverage: Mapping[str, object]) -> list[str]:
     """Per-source coverage lines: every surviving scope key renders under its own name."""
     lines: list[str] = []
@@ -501,28 +518,26 @@ def _coverage_lines(coverage: Mapping[str, object]) -> list[str]:
         section = coverage.get(key)
         if not isinstance(section, Mapping):
             continue
-        parts = [f"{name}: {', '.join(items)}" for name, items in _coverage_scope_items(section)]
-        detail = _as_text(section.get("detail") or section.get("summary"))
-        head = f"{key.upper()}"
-        lines.append(
-            f"{head} — {'; '.join(parts)}{(' — ' + detail) if detail and not parts else (detail if detail else '')}"
-            if (parts or detail)
-            else head
-        )
+        lines.append(_coverage_line(key, section))
     extra = _strs(coverage.get("gaps"))
     if extra:
         lines.append(f"gaps: {', '.join(extra)}")
     return lines
 
 
-def _source_line(row: Mapping[str, object]) -> str:
-    """One source line: evidence id + domain + integrity class + document identity."""
-    evidence_id = _as_text(row.get("evidence_id"))
+def _source_label(row: Mapping[str, object]) -> str:
+    """Render the domain, integrity class, and document identity."""
     domain = _as_text(row.get("domain")).upper() or "SOURCE"
     integrity = _as_text(row.get("integrity_class") or row.get("integrity")).upper()
     document = _as_text(row.get("document") or row.get("source_name"))
     label = f"{domain} [{integrity}]" if integrity else domain
-    head = " ".join(part for part in (label, document) if part) or evidence_id or "source"
+    return " ".join(part for part in (label, document) if part)
+
+
+def _source_line(row: Mapping[str, object]) -> str:
+    """Render a source label with its evidence reference."""
+    evidence_id = _as_text(row.get("evidence_id"))
+    head = _source_label(row)
     return f"{head} [{evidence_id}]" if evidence_id and head != evidence_id else head
 
 
@@ -571,8 +586,15 @@ def _normalize_sources(
     the caller: explicit caller integrity wins only when it names the closed
     vocabulary, so §6/§10 labels survive to the report.
     """
-    rows: list[dict[str, object]] = []
-    seen: set[str] = set()
+    by_id = _source_observations_by_id(observations)
+    rows = _caller_source_rows(sources, by_id)
+    if rows:
+        return rows
+    return _cited_source_rows(claims, observations, by_id)
+
+
+def _source_observations_by_id(observations: Sequence[object]) -> dict[str, Mapping[str, object]]:
+    """Index the first canonical observation for each nonblank evidence identifier."""
     by_id: dict[str, Mapping[str, object]] = {}
     for row in observations or []:
         if not isinstance(row, Mapping):
@@ -580,6 +602,34 @@ def _normalize_sources(
         evidence_id = _as_text(row.get("evidence_id"))
         if evidence_id and evidence_id not in by_id:
             by_id[evidence_id] = row
+    return by_id
+
+
+def _caller_source_row(
+    item: Mapping[str, object], evidence_id: str, obs: Mapping[str, object] | None
+) -> dict[str, object]:
+    """Resolve one caller source against its canonical domain and integrity."""
+    domain = _as_text(item.get("domain")).upper()
+    if not domain or domain == "SOURCE":
+        domain = _observation_domain(obs) if obs is not None else "SOURCE"
+    integrity = _as_text(item.get("integrity_class") or item.get("integrity")).upper()
+    if integrity not in ("PRIMARY_DOCUMENT", "CANONICAL_STRUCTURED", "EXTERNAL_SOURCE"):
+        integrity = _observation_integrity(obs) if obs is not None else "EXTERNAL_SOURCE"
+    return {
+        "evidence_id": evidence_id,
+        "domain": domain,
+        "document": _as_text(item.get("document") or item.get("source_name")),
+        "integrity_class": integrity,
+    }
+
+
+def _caller_source_rows(
+    sources: Sequence[object] | None,
+    by_id: Mapping[str, Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Normalize caller sources in first-seen order, discarding invalid or duplicate identifiers."""
+    rows: list[dict[str, object]] = []
+    seen: set[str] = set()
     for item in sources or []:
         if not isinstance(item, Mapping):
             continue
@@ -587,23 +637,12 @@ def _normalize_sources(
         if not evidence_id or evidence_id in seen:
             continue
         seen.add(evidence_id)
-        obs = by_id.get(evidence_id)
-        domain = _as_text(item.get("domain")).upper()
-        if not domain or domain == "SOURCE":
-            domain = _observation_domain(obs) if obs is not None else "SOURCE"
-        integrity = _as_text(item.get("integrity_class") or item.get("integrity")).upper()
-        if integrity not in ("PRIMARY_DOCUMENT", "CANONICAL_STRUCTURED", "EXTERNAL_SOURCE"):
-            integrity = _observation_integrity(obs) if obs is not None else "EXTERNAL_SOURCE"
-        rows.append(
-            {
-                "evidence_id": evidence_id,
-                "domain": domain,
-                "document": _as_text(item.get("document") or item.get("source_name")),
-                "integrity_class": integrity,
-            }
-        )
-    if rows:
-        return rows
+        rows.append(_caller_source_row(item, evidence_id, by_id.get(evidence_id)))
+    return rows
+
+
+def _source_observation_classes(observations: Sequence[Mapping[str, object]]) -> tuple[dict[str, str], dict[str, str]]:
+    """Resolve canonical domain and integrity classes for each first-seen observation."""
     domains: dict[str, str] = {}
     integrity_by_id: dict[str, str] = {}
     for row in observations or []:
@@ -613,22 +652,41 @@ def _normalize_sources(
         if evidence_id and evidence_id not in domains:
             domains[evidence_id] = _observation_domain(row)
             integrity_by_id[evidence_id] = _observation_integrity(row)
+    return domains, integrity_by_id
+
+
+def _cited_source_row(
+    evidence_id: str,
+    obs: Mapping[str, object] | None,
+    domains: Mapping[str, str],
+    integrity_by_id: Mapping[str, str],
+) -> dict[str, object]:
+    """Build a cited source row, retaining external-source defaults when no observation exists."""
+    document = _as_text(obs.get("document") or obs.get("source_name")) if obs is not None else ""
+    return {
+        "evidence_id": evidence_id,
+        "domain": domains.get(evidence_id, "SOURCE"),
+        "document": document,
+        "integrity_class": integrity_by_id.get(evidence_id, "EXTERNAL_SOURCE"),
+    }
+
+
+def _cited_source_rows(
+    claims: Sequence[GroundedClaim],
+    observations: Sequence[Mapping[str, object]],
+    by_id: Mapping[str, Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Derive source rows from unique cited identifiers when caller sources supply none."""
+    rows: list[dict[str, object]] = []
+    seen: set[str] = set()
+    domains, integrity_by_id = _source_observation_classes(observations)
     for claim in claims:
         for evidence_id in claim.evidence_ids:
             clean = evidence_id.strip() if isinstance(evidence_id, str) else ""
             if not clean or clean in seen:
                 continue
             seen.add(clean)
-            obs = by_id.get(clean)
-            document = _as_text(obs.get("document") or obs.get("source_name")) if obs is not None else ""
-            rows.append(
-                {
-                    "evidence_id": clean,
-                    "domain": domains.get(clean, "SOURCE"),
-                    "document": document,
-                    "integrity_class": integrity_by_id.get(clean, "EXTERNAL_SOURCE"),
-                }
-            )
+            rows.append(_cited_source_row(clean, by_id.get(clean), domains, integrity_by_id))
     return rows
 
 
@@ -677,6 +735,21 @@ def _deep_answer(synth: FinalSynthesis) -> str:
     return "\n".join(out)
 
 
+def _synthesis_claims(
+    stock: StockbotAnalysis,
+    bull: BullAnalysis,
+    bear: BearAnalysis,
+    extra_claims: Sequence[GroundedClaim | dict[str, object]] | None,
+) -> list[GroundedClaim]:
+    """Merge committee claims and grounded caller claims without changing their precedence."""
+    return _merge_claims(
+        list(getattr(stock, "claims", []) or []),
+        list(getattr(bull, "claims", []) or []),
+        list(getattr(bear, "claims", []) or []),
+        _normalize_extra(extra_claims),
+    )
+
+
 def synthesize_final(
     question: str,
     *,
@@ -716,12 +789,7 @@ def synthesize_final(
     ``catalysts`` are caller-supplied grounded lines; ``sources`` lists the
     evidence behind the claims (derived from cited ids when omitted).
     """
-    claims = _merge_claims(
-        list(getattr(stock, "claims", []) or []),
-        list(getattr(bull, "claims", []) or []),
-        list(getattr(bear, "claims", []) or []),
-        _normalize_extra(extra_claims),
-    )
+    claims = _synthesis_claims(stock, bull, bear, extra_claims)
     scope = _normalize_scope(research_scope)
     first_order, second_order = _split_effects(claims)
     observations_list = [row for row in (observations or []) if isinstance(row, Mapping)]

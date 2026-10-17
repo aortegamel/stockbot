@@ -149,16 +149,17 @@ def _ambiguous(top: str, second: str, ranked: list[str]) -> bool:
 
 
 def _short_tool(toks: set[str], norm: str, names: set[str]) -> str | None:
-    """Short-family sub-dispatch; None when the right member is not registered."""
+    """Select the first short-family signal, even if its tool is unavailable."""
+    tool = "get_short_interest"
     if toks & {"daily", "volume", "venue", "sho", "reg"} or "reg sho" in norm:
-        return "get_reg_sho_volume" if "get_reg_sho_volume" in names else None
-    if toks & {"pressure", "outstanding", "relative", "ratio"}:
-        return "get_short_pressure_profile" if "get_short_pressure_profile" in names else None
-    if toks & {"trend", "distribution", "coverage", "briefing", "change"}:
-        return "query_finra" if "query_finra" in names else None
-    if toks & {"screen", "leaderboard"} or "most shorted" in norm:
-        return "get_short_interest_leaderboard" if "get_short_interest_leaderboard" in names else None
-    return "get_short_interest" if "get_short_interest" in names else None
+        tool = "get_reg_sho_volume"
+    elif toks & {"pressure", "outstanding", "relative", "ratio"}:
+        tool = "get_short_pressure_profile"
+    elif toks & {"trend", "distribution", "coverage", "briefing", "change"}:
+        tool = "query_finra"
+    elif toks & {"screen", "leaderboard"} or "most shorted" in norm:
+        tool = "get_short_interest_leaderboard"
+    return tool if tool in names else None
 
 
 def _has_accession(packets: Sequence[JSONValue]) -> bool:
@@ -176,6 +177,152 @@ def _has_accession(packets: Sequence[JSONValue]) -> bool:
     return False
 
 
+def _revenue_state(text: str, toks: set[str], attempts: _Attempts) -> tuple[bool, bool, dict[str, JSONValue] | None]:
+    """Reject a failed revenue read before scanning for the listed 10-Q."""
+    from app.research.scheduler import _carry_packet_accession
+
+    revenue_quarter = bool("revenue" in toks and toks & {"quarter", "10q"})
+    if revenue_quarter and any(a.get("tool") == "get_sec_document" and a.get("error") is not None for a in attempts):
+        return revenue_quarter, True, None
+    listed = _carry_packet_accession("get_sec_document", {}, [], attempts, text) if {"revenue", "10q"} <= toks else None
+    return revenue_quarter, False, listed
+
+
+def _carry_only(names: set[str], attempts: _Attempts, ctx_evidence: list[JSONValue]) -> bool:
+    """Carry-only registry holding an accession-like packet (force-open narrowed)."""
+    from app.research.scheduler import _ACCESSION_CARRY_TOOLS
+
+    return bool(names) and names <= _ACCESSION_CARRY_TOOLS and _has_accession([*attempts, *ctx_evidence])
+
+
+def _carry_pick(
+    toks: set[str],
+    names: set[str],
+    attempts: _Attempts,
+    ctx_evidence: list[JSONValue],
+    listed_10q: dict[str, JSONValue] | None,
+) -> tuple[str, str] | None:
+    """Open packet accessions only in a carry-only registry."""
+    if not _carry_only(names, attempts, ctx_evidence):
+        return None
+    if {"revenue", "10q"} <= toks and listed_10q is None:
+        return None
+    if "get_sec_document" in names and toks & _READ_TOKS:
+        return "get_sec_document", "carry:packet-doc"
+    if "get_sec_filing" in names:
+        return "get_sec_filing", "carry:packet-filing"
+    return None
+
+
+def _short_pick(norm: str, toks: set[str], names: set[str]) -> tuple[str, str] | None:
+    """Explicit daily SHO precedes the general short-family dispatch."""
+    if "get_reg_sho_volume" in names and (
+        "reg sho" in norm or {"reg", "sho"} <= toks or {"daily", "short", "volume"} <= toks
+    ):
+        return "get_reg_sho_volume", "sho-explicit"
+    if toks & _SHORT_TOKS or "betting against" in norm:
+        tool = _short_tool(toks, norm, names)
+        return (tool, "short-family") if tool is not None else None
+    return None
+
+
+def _insider_pick(norm: str, toks: set[str], names: set[str]) -> tuple[str, str] | None:
+    """Executed insider trades precede planned-sale notices."""
+    if not (toks & _INSIDER_TOKS or "form 4" in norm):
+        return None
+    if "get_insider_activity" in names and toks & _EXECUTED_TOKS:
+        return "get_insider_activity", "insider-executed"
+    if toks & _PLANNED_TOKS and "get_planned_insider_sales" in names:
+        return "get_planned_insider_sales", "insider-planned"
+    if "get_insider_activity" in names:
+        return "get_insider_activity", "insider"
+    return None
+
+
+def _mention_pick(norm: str, toks: set[str], names: set[str]) -> tuple[str, str] | None:
+    """Person mentions select the available exhaustive or bounded filing search."""
+    form = bool({"10k", "10q", "8k"} & toks)
+    if names & {"search_sec_filings", "search_sec_filings_bounded"} and (
+        (("filing" in toks or form) and "mention" in norm) or "who filed" in norm or "who actually filed" in norm
+    ):
+        return _pick_variant("search_sec_filings", norm, toks, names), "person-mention"
+    return None
+
+
+def _document_read(attempts: _Attempts) -> bool:
+    """Any successful get_sec_document attempt in the packet."""
+    return any(isinstance(a, dict) and a.get("tool") == "get_sec_document" and a.get("error") is None for a in attempts)
+
+
+def _revenue_read_pick(
+    toks: set[str], names: set[str], attempts: _Attempts, listed_10q: dict[str, JSONValue] | None
+) -> tuple[str, str] | None:
+    """Read the node's listed 10-Q, else any packet accession, when the registry carries the reader."""
+    if "get_sec_document" not in names:
+        return None
+    if listed_10q is not None if "10q" in toks else _has_accession(attempts):
+        return "get_sec_document", "revenue-quarter:doc"
+    return None
+
+
+def _revenue_pick(
+    toks: set[str],
+    names: set[str],
+    attempts: _Attempts,
+    revenue_quarter: bool,
+    listed_10q: dict[str, JSONValue] | None,
+) -> tuple[str, str] | None:
+    """List quarterly revenue filings before reading the node's listed document."""
+    if not revenue_quarter or _document_read(attempts):
+        return None
+    read = _revenue_read_pick(toks, names, attempts, listed_10q)
+    if read is not None:
+        return read
+    if "list_sec_filings" in names:
+        return "list_sec_filings", "revenue-quarter"
+    return None
+
+
+def _clock_ask(toks: set[str]) -> bool:
+    """Recognize pure clock tokens without research signals."""
+    return bool(toks and toks <= _TIME_TOKS and not (toks & _RESEARCH_TOKS))
+
+
+def _sec_list_pick(text: str, toks: set[str], names: set[str]) -> tuple[str, str] | None:
+    """Filing list for a resolved ticker or company subject."""
+    from app.research.scheduler import _objective_company, _objective_ticker
+
+    if (
+        "filing" in toks
+        and "list_sec_filings" in names
+        and (_objective_ticker(text) is not None or _objective_company(text) is not None)
+    ):
+        return "list_sec_filings", "sec-list"
+    return None
+
+
+def _clock_pick(toks: set[str], names: set[str]) -> tuple[str, str] | None:
+    """Clock question: generated trading words never divert it."""
+    if _clock_ask(toks) and "get_current_time" in names:
+        return "get_current_time", "time"
+    return None
+
+
+def _margin_pick(ranked: list[tuple[int, str]]) -> tuple[str, str] | None:
+    """Clear scorer winner outside any ambiguity group."""
+    if len(ranked) < 2 or ranked[0][0] - ranked[1][0] < _MARGIN:
+        return None
+    top = ranked[0][1]
+    if _ambiguous(top, ranked[1][1], [n for _, n in ranked[:_TOP_N]]):
+        return None
+    return top, "scorer-margin"
+
+
+def _general_pick(text: str, toks: set[str], names: set[str], ranked: list[tuple[int, str]]) -> tuple[str, str] | None:
+    """Resolved filing subjects precede clocks and an unambiguous scorer margin."""
+    return _sec_list_pick(text, toks, names) or _clock_pick(toks, names) or _margin_pick(ranked)
+
+
 def _router_pick(
     text: str,
     norm: str,
@@ -186,83 +333,19 @@ def _router_pick(
     ctx_evidence: list[JSONValue],
 ) -> tuple[str, str] | None:
     """(tool, reason) or None when JEV must decide. Membership-gated: never picks outside the live registry."""
-    from app.research.scheduler import (
-        _ACCESSION_CARRY_TOOLS,
-        _carry_packet_accession,
-        _objective_company,
-        _objective_ticker,
+    # Rule order: 1 carry-only registry, 2 explicit Reg SHO, 3 short family, 4 insider,
+    # 5 person mention, 6 revenue quarter, 7 filing list, 8 clock, 9 scorer margin.
+    revenue_quarter, blocked, listed_10q = _revenue_state(text, toks, attempts)
+    if blocked:
+        return None
+    return (
+        _carry_pick(toks, names, attempts, ctx_evidence, listed_10q)
+        or _short_pick(norm, toks, names)
+        or _insider_pick(norm, toks, names)
+        or _mention_pick(norm, toks, names)
+        or _revenue_pick(toks, names, attempts, revenue_quarter, listed_10q)
+        or _general_pick(text, toks, names, ranked)
     )
-
-    revenue_quarter = bool("revenue" in toks and toks & {"quarter", "10q"})
-    if revenue_quarter and any(a.get("tool") == "get_sec_document" and a.get("error") is not None for a in attempts):
-        return None  # JEV receives the rejected call through existing attempt feedback.
-    listed_10q = (
-        _carry_packet_accession("get_sec_document", {}, [], attempts, text)
-        if revenue_quarter and "10q" in toks
-        else None
-    )
-
-    # 1. Carry-only registry (force-open narrowed): open the packet accession.
-    if (
-        names
-        and names <= set(_ACCESSION_CARRY_TOOLS)
-        and _has_accession([*attempts, *ctx_evidence])
-        and (not revenue_quarter or "10q" not in toks or listed_10q is not None)
-    ):
-        if "get_sec_document" in names and toks & _READ_TOKS:
-            return "get_sec_document", "carry:packet-doc"
-        if "get_sec_filing" in names:
-            return "get_sec_filing", "carry:packet-filing"
-    # 2. Explicit Reg SHO daily volume.
-    if "get_reg_sho_volume" in names and (
-        "reg sho" in norm or ({"reg", "sho"} <= toks) or ({"daily", "short", "volume"} <= toks)
-    ):
-        return "get_reg_sho_volume", "sho-explicit"
-    # 3. Short family ("betting against" never means anything else here).
-    if toks & _SHORT_TOKS or "betting against" in norm:
-        tool = _short_tool(toks, norm, names)
-        if tool is not None:
-            return tool, "short-family"
-    # 4. Executed trades beat planned-sale notices unless planned is the ask.
-    if toks & _INSIDER_TOKS or "form 4" in norm:
-        if "get_insider_activity" in names and toks & _EXECUTED_TOKS:
-            return "get_insider_activity", "insider-executed"
-        if toks & _PLANNED_TOKS and "get_planned_insider_sales" in names:
-            return "get_planned_insider_sales", "insider-planned"
-        if "get_insider_activity" in names:
-            return "get_insider_activity", "insider"
-    # Form names tokenize to 10k/10q/8k; match merged tokens only.
-    _FORM = bool({"10k", "10q", "8k"} & toks)
-    if ("search_sec_filings" in names or "search_sec_filings_bounded" in names) and (
-        (("filing" in toks or _FORM) and "mention" in norm) or "who filed" in norm or "who actually filed" in norm
-    ):
-        return _pick_variant("search_sec_filings", norm, toks, names), "person-mention"
-    # 6. Quarterly/10-Q revenue starts from the filing list, then reads the document
-    # the node's own listing names (carry picks its 10-Q; intake accessions never skip
-    # the list, same as force-open). After one read, later rules/JEV decide.
-    if revenue_quarter and not any(
-        isinstance(a, dict) and a.get("tool") == "get_sec_document" and a.get("error") is None for a in attempts
-    ):
-        if "get_sec_document" in names and (listed_10q is not None if "10q" in toks else _has_accession(attempts)):
-            return "get_sec_document", "revenue-quarter:doc"
-        if "list_sec_filings" in names:
-            return "list_sec_filings", "revenue-quarter"
-    # 7. Filing list for a resolved ticker/company.
-    if (
-        "filing" in toks
-        and "list_sec_filings" in names
-        and (_objective_ticker(text) is not None or _objective_company(text) is not None)
-    ):
-        return "list_sec_filings", "sec-list"
-    # 8. Clock question on the original text: generated trading words never divert it.
-    if toks and toks <= _TIME_TOKS and "get_current_time" in names and not (toks & _RESEARCH_TOKS):
-        return "get_current_time", "time"
-    # 9. Clear scorer winner outside any ambiguity group.
-    if len(ranked) >= 2 and ranked[0][0] - ranked[1][0] >= _MARGIN:
-        top = ranked[0][1]
-        if not _ambiguous(top, ranked[1][1], [n for _, n in ranked[:_TOP_N]]):
-            return top, "scorer-margin"
-    return None
 
 
 def _SMALL_TALK(prompt: str) -> bool:
@@ -280,36 +363,98 @@ def _SMALL_TALK(prompt: str) -> bool:
     )
 
 
+def _advice_cue(norm: str, toks: set[str]) -> bool:
+    """Advice wording: should plus buy/sell/hold, or the good-investment phrase."""
+    return bool("should" in toks and toks & _ADVICE_VERBS) or "good investment" in norm
+
+
+def _research_cue(norm: str, toks: set[str]) -> bool:
+    """Wording that routes to research even when a subject resolves."""
+    return bool(toks & _RESEARCH_TOKS) or "reg sho" in norm or "betting against" in norm
+
+
+def _has_subject(prompt: str, ticker: str | None) -> bool:
+    """Subject present: explicit ticker token, for-company phrase, or the caller's ticker."""
+    from app.research.scheduler import _objective_company, _objective_ticker
+
+    return _objective_ticker(prompt) is not None or _objective_company(prompt) is not None or ticker is not None
+
+
+def _subject_route(prompt: str, norm: str, toks: set[str], ticker: str | None) -> str | None:
+    """Advice needs a resolved subject and no research token; a subject alone routes research."""
+    # Advice yields only to research tokens; "reg sho"/"betting against" phrases do not override it.
+    if _advice_cue(norm, toks) and _has_subject(prompt, ticker) and not (toks & _RESEARCH_TOKS):
+        return "reasoning_required"
+    if _has_subject(prompt, ticker):
+        return "research_required"
+    if _research_cue(norm, toks):
+        return "research_required"
+    return None
+
+
 def programmatic_route(prompt: object, ticker: str | None = None) -> str | None:
     """Entry fast-path: research signals -> research_required, else None (JEV decides)."""
-    from app.research.scheduler import (
-        _ACCESSION_TOKEN_RE,
-        _objective_company,
-        _objective_ticker,
-    )
+    from app.research.scheduler import _ACCESSION_TOKEN_RE
 
     if not isinstance(prompt, str) or not prompt.strip():
         return "research_required"
     if _SMALL_TALK(prompt):
         return "no_session"
-    # Pure clock question wins on the original prompt even with a selected ticker:
-    # a [TICKER] prefix or generated trading plan never diverts it to research.
     norm, toks = _signals(prompt)
-    if toks and toks <= _TIME_TOKS and not (toks & _RESEARCH_TOKS):
+    # Pure clock question wins on the original prompt even with a selected ticker.
+    if _clock_ask(toks):
         return "get_current_time"
     if _ACCESSION_TOKEN_RE.search(prompt) is not None:
         return "research_required"
-    if (
-        (("should" in toks and toks & _ADVICE_VERBS) or "good investment" in norm)
-        and (_objective_ticker(prompt) is not None or _objective_company(prompt) is not None or ticker is not None)
-        and not (toks & _RESEARCH_TOKS)
-    ):
-        return "reasoning_required"
-    if _objective_ticker(prompt) is not None or _objective_company(prompt) is not None or ticker is not None:
-        return "research_required"
-    if toks & _RESEARCH_TOKS or "reg sho" in norm or "betting against" in norm:
-        return "research_required"
+    return _subject_route(prompt, norm, toks, ticker)
+
+
+def _objective_text(session: Mapping[str, JSONValue]) -> str:
+    """Session objective (else query) text; blank when the value is not a string."""
+    raw = session.get("objective") or session.get("query") or ""
+    return raw if isinstance(raw, str) else ""
+
+
+def _clock_round(
+    kernel: _Kernel, sid: str, nid: str, question: object, objective: str, names: set[str]
+) -> tuple[str, ToolDecision] | None:
+    """Answer a clock ask on the original question text before generated words divert it; None otherwise."""
+    if "get_current_time" not in names:
+        return None
+    for text in (question, objective):
+        if not isinstance(text, str) or not text.strip():
+            continue
+        _, toks = _signals(text)
+        if _clock_ask(toks):
+            return _record_pick(kernel, sid, nid, "get_current_time", "time:original-question")
     return None
+
+
+def _record_pick(kernel: _Kernel, sid: str, nid: str, tool: str, reason: str) -> tuple[str, ToolDecision]:
+    """Validate, persist, and log one deterministic tool selection."""
+    from app.research import scheduler as sched
+
+    decision = ToolDecision(
+        action="invoke",
+        tool_name=tool,
+        tool_names=(tool,),
+        probabilities={tool: 1.0},
+        confidence=None,
+    )
+    decision.validate("<programmatic_router>")
+    sched._record(
+        kernel,
+        sid,
+        "tool_selection",
+        candidates={tool: 1.0},
+        probabilities={tool: 1.0},
+        selected=tool,
+        node_id=nid or None,
+        job_id=None,
+        confidence=None,
+    )
+    logger.info("toolflow programmatic sid=%s nid=%s tool=%s reason=%s", sid, nid, tool, reason)
+    return "invoke", decision
 
 
 async def programmatic_select_round(
@@ -325,79 +470,18 @@ async def programmatic_select_round(
 ) -> tuple[str, ToolDecision]:
     from app.research import scheduler as sched
 
-    raw_objective = session.get("objective") or session.get("query") or ""
-    objective = raw_objective if isinstance(raw_objective, str) else ""
+    objective = _objective_text(session)
     question = sched._f(sched._node_dict(node), "question", default="") or ""
-    # Clock routes on the original question first: node text may carry generated
-    # trading words that must never divert a clock ask to the insider tool.
-    for clock_text in (question, objective):
-        if isinstance(clock_text, str) and clock_text.strip():
-            clock_norm, clock_toks = _signals(clock_text)
-            if clock_toks and clock_toks <= _TIME_TOKS and not (clock_toks & _RESEARCH_TOKS):
-                names = _registry_names(registry)
-                if "get_current_time" in names:
-                    tool = _pick_variant("get_current_time", clock_norm, clock_toks, names)
-                    decision = ToolDecision(
-                        action="invoke",
-                        tool_name=tool,
-                        tool_names=(tool,),
-                        probabilities={tool: 1.0},
-                        confidence=None,
-                    )
-                    decision.validate("<programmatic_router>")
-                    sched._record(
-                        kernel,
-                        sid,
-                        "tool_selection",
-                        candidates={tool: 1.0},
-                        probabilities={tool: 1.0},
-                        selected=tool,
-                        node_id=nid or None,
-                        job_id=None,
-                        confidence=None,
-                    )
-                    logger.info(
-                        "toolflow programmatic sid=%s nid=%s tool=%s reason=%s",
-                        sid,
-                        nid,
-                        tool,
-                        "time:original-question",
-                    )
-                    return "invoke", decision
+    names = _registry_names(registry)
+    clock = _clock_round(kernel, sid, nid, question, objective, names)
+    if clock is not None:
+        return clock
     text = f"{objective} {question}".strip() if isinstance(question, str) else objective
     norm, toks = _signals(text)
-    names = _registry_names(registry)
     ranked = _ranked(norm, toks, names)
     pick = _router_pick(text, norm, toks, names, ranked, attempts or [], ctx_evidence or [])
     if pick is not None:
         tool, reason = pick
-        tool = _pick_variant(tool, norm, toks, names)
-        decision = ToolDecision(
-            action="invoke",
-            tool_name=tool,
-            tool_names=(tool,),
-            probabilities={tool: 1.0},
-            confidence=None,
-        )
-        decision.validate("<programmatic_router>")
-        sched._record(
-            kernel,
-            sid,
-            "tool_selection",
-            candidates={tool: 1.0},
-            probabilities={tool: 1.0},
-            selected=tool,
-            node_id=nid or None,
-            job_id=None,
-            confidence=None,
-        )
-        logger.info(
-            "toolflow programmatic sid=%s nid=%s tool=%s reason=%s",
-            sid,
-            nid,
-            tool,
-            reason,
-        )
-        return "invoke", decision
+        return _record_pick(kernel, sid, nid, _pick_variant(tool, norm, toks, names), reason)
     action, decision = await sched._select_round(jev, kernel, sid, nid, session, node, registry, ctx_evidence, attempts)
     return action, _variant_decision(decision, norm, toks, names)

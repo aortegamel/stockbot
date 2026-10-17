@@ -62,24 +62,26 @@ def _attempt_assumption_id(attempt: Mapping[str, object], index: int) -> str:
     return f"attempt-{index}-assumption"
 
 
+def _attempt_assumptions(attempt: Mapping[str, object], index: int) -> list[dict[str, str]]:
+    """Declared assumptions of one attempt: the explicit list wins over single-form keys."""
+    declared = attempt.get("assumptions")
+    if isinstance(declared, list):
+        normalized = (_normalize_assumption(item, f"attempt-{index}-{pos}") for pos, item in enumerate(declared))
+        return [item for item in normalized if item is not None]
+    single = attempt.get("assumption")
+    if isinstance(single, str) and single.strip():
+        return [{"assumptionId": _attempt_assumption_id(attempt, index), "text": single.strip()}]
+    return []
+
+
 def split_grounded_context(evidence: object, attempts: object) -> dict[str, list[object]]:
     """Admitted exact rows (grounded) versus prior declared assumptions from attempts."""
     grounded: list[object] = list(evidence) if isinstance(evidence, (list, tuple)) else []
     assumptions: list[object] = []
     items: list[object] = list(attempts) if isinstance(attempts, (list, tuple)) else []
     for index, attempt in enumerate(items):
-        if not isinstance(attempt, Mapping):
-            continue  # only mapping attempts can declare assumptions
-        declared = attempt.get("assumptions")
-        if isinstance(declared, list):
-            for pos, item in enumerate(declared):
-                normalized = _normalize_assumption(item, f"attempt-{index}-{pos}")
-                if normalized is not None:
-                    assumptions.append(normalized)
-            continue  # explicit list wins over single-form keys on the same attempt
-        single = attempt.get("assumption")
-        if isinstance(single, str) and single.strip():
-            assumptions.append({"assumptionId": _attempt_assumption_id(attempt, index), "text": single.strip()})
+        if isinstance(attempt, Mapping):  # only mapping attempts can declare assumptions
+            assumptions.extend(_attempt_assumptions(attempt, index))
     return {"grounded": grounded, "assumptions": assumptions}
 
 
@@ -109,6 +111,15 @@ def format_grounded_block(record: object) -> str:
     )
 
 
+def _check_quote_verbatim(evidence_id: object, quote: str, texts: dict[str, str] | None) -> None:
+    """Verbatim: the quote must reproduce stored bytes, never a paraphrase."""
+    if texts is None or not isinstance(evidence_id, str):
+        return
+    source = texts.get(evidence_id)
+    if source is not None and quote.strip() not in source:
+        raise ValueError(f"analysis numbers[] quote for {evidence_id!r} not found in evidence content")
+
+
 def _check_number_entry(entry: object, refs: set[str], texts: dict[str, str] | None = None) -> None:
     """One numbers[] entry: non-empty value, evidenceId inside refs, verbatim quote from stored bytes."""
     if not isinstance(entry, Mapping):
@@ -123,11 +134,7 @@ def _check_number_entry(entry: object, refs: set[str], texts: dict[str, str] | N
     quote: object = entry.get("quote")
     if not isinstance(quote, str) or not quote.strip():
         raise ValueError("analysis numbers[] quote must be a non-empty string")
-    # Verbatim: the quote must reproduce stored bytes, never a paraphrase.
-    if texts is not None and isinstance(evidence_id, str):
-        source = texts.get(evidence_id)
-        if source is not None and quote.strip() not in source:
-            raise ValueError(f"analysis numbers[] quote for {evidence_id!r} not found in evidence content")
+    _check_quote_verbatim(evidence_id, quote, texts)
 
 
 def _check_assumption_entries(entries: list[object]) -> None:
@@ -148,12 +155,8 @@ def _check_assumption_entries(entries: list[object]) -> None:
             raise ValueError("analysis assumptions[] text must be a non-empty string")
 
 
-def check_grounded_analysis(
-    analysis: dict[str, object], evidence_ids: set[str], evidence: object = None
-) -> dict[str, object]:
-    """Validate one v2 analysis against admitted ids; return it unchanged or raise ValueError."""
-    if not isinstance(analysis, Mapping):
-        raise ValueError("analysis must be a mapping")  # noqa: TRY004 - public error contract pins ValueError, tests are oracle
+def _admitted_ids(evidence_ids: object) -> set[str]:
+    """String ids from a list/set/tuple; anything else admits nothing."""
     allowed: set[str] = set()
     try:
         candidates: object = evidence_ids or []
@@ -162,42 +165,44 @@ def check_grounded_analysis(
                 allowed.add(eid)
     except TypeError:
         pass  # non-iterable ids mean nothing is admitted; every ref below then fails
-    raw_refs: object = analysis.get("evidenceRefs", [])
-    refs: list[object] = []
-    if raw_refs is None:
-        pass  # absent means "cites nothing", still valid
-    elif isinstance(raw_refs, list):
-        refs = raw_refs
-    else:
-        raise ValueError("analysis evidenceRefs must be a list of evidence ids")
+    return allowed
+
+
+def _optional_list(analysis: Mapping[str, object], key: str, error: str) -> list[object]:
+    """Absent or None means empty (still valid); any other non-list value raises."""
+    raw: object = analysis.get(key, [])
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(error)  # noqa: TRY004 - public error contract pins ValueError, tests are oracle
+    return raw
+
+
+def _cited_refs(refs: list[object], allowed: set[str]) -> set[str]:
+    """Every ref is a non-empty admitted id; any outside ref rejects the whole analysis."""
     ref_set: set[str] = set()
     for ref in refs:
         if not isinstance(ref, str) or not ref:
             raise ValueError(f"analysis evidenceRefs must be non-empty strings, got {ref!r}")
-        # Fail closed: any ref outside the admitted set rejects the whole analysis.
         if ref not in allowed:
             raise ValueError(f"analysis cites unknown evidence id {ref!r}")
         ref_set.add(ref)
+    return ref_set
+
+
+def check_grounded_analysis(
+    analysis: dict[str, object], evidence_ids: set[str], evidence: object = None
+) -> dict[str, object]:
+    """Validate one v2 analysis against admitted ids; return it unchanged or raise ValueError."""
+    if not isinstance(analysis, Mapping):
+        raise ValueError("analysis must be a mapping")  # noqa: TRY004 - public error contract pins ValueError, tests are oracle
+    allowed = _admitted_ids(evidence_ids)
+    refs = _optional_list(analysis, "evidenceRefs", "analysis evidenceRefs must be a list of evidence ids")
+    ref_set = _cited_refs(refs, allowed)
     texts = _evidence_texts(evidence) if evidence is not None else None
-    raw_numbers: object = analysis.get("numbers", [])
-    numbers: list[object] = []
-    if raw_numbers is None:
-        pass
-    elif isinstance(raw_numbers, list):
-        numbers = raw_numbers
-    else:
-        raise ValueError("analysis numbers must be a list")
-    for entry in numbers:
+    for entry in _optional_list(analysis, "numbers", "analysis numbers must be a list"):
         _check_number_entry(entry, ref_set, texts)
-    raw_assumptions: object = analysis.get("assumptions", [])
-    assumptions: list[object] = []
-    if raw_assumptions is None:
-        pass
-    elif isinstance(raw_assumptions, list):
-        assumptions = raw_assumptions
-    else:
-        raise ValueError("analysis assumptions must be a list")
-    _check_assumption_entries(assumptions)
+    _check_assumption_entries(_optional_list(analysis, "assumptions", "analysis assumptions must be a list"))
     return analysis
 
 
@@ -217,22 +222,31 @@ def parse_percent(text: object) -> float | None:
         return None
 
 
+def _first_number_and_assumption(analysis: object) -> tuple[Mapping[str, object], Mapping[str, object]] | None:
+    """First numbers[] and assumptions[] entries when both exist as mappings."""
+    if not isinstance(analysis, Mapping):
+        return None
+    numbers = analysis.get("numbers")
+    assumptions = analysis.get("assumptions")
+    if not isinstance(numbers, list) or not numbers or not isinstance(assumptions, list) or not assumptions:
+        return None
+    first_num = numbers[0]
+    first_asm = assumptions[0]
+    if not isinstance(first_num, Mapping) or not isinstance(first_asm, Mapping):
+        return None
+    return first_num, first_asm
+
+
 def attach_scenario_impact(analysis: dict[str, object]) -> dict[str, object]:
     """Attach computed_impact when the first number + first assumption both parse as percents.
 
     Fail-open by design: unparseable or missing pairs return the analysis
     unchanged (the drop gate already ran; math must never reject reasoning).
     """
-    if not isinstance(analysis, Mapping):
+    pair = _first_number_and_assumption(analysis)
+    if pair is None:
         return analysis
-    numbers = analysis.get("numbers")
-    assumptions = analysis.get("assumptions")
-    if not isinstance(numbers, list) or not numbers or not isinstance(assumptions, list) or not assumptions:
-        return analysis
-    first_num = numbers[0]
-    first_asm = assumptions[0]
-    if not isinstance(first_num, Mapping) or not isinstance(first_asm, Mapping):
-        return analysis
+    first_num, first_asm = pair
     exposure = parse_percent(first_num.get("value"))
     haircut = parse_percent(first_asm.get("text"))
     if exposure is None or haircut is None:
