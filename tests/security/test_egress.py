@@ -112,6 +112,16 @@ def test_malformed_payload_blocked():
     assert authorize_egress("exa", "AMD news", _run_security()).allowed is False
 
 
+def test_egress_verdict_ignores_payload_key_order():
+    # Equal payloads get one verdict: the scan serializes with sorted keys,
+    # so key insertion order cannot move a portfolio noun away from an amount.
+    pad = " ".join(["w"] * 20)
+    near = {"query": "portfolio", "z": "12345", "pad": pad}
+    far = {"query": "portfolio", "pad": pad, "z": "12345"}
+    assert near == far
+    assert authorize_egress("exa", near, _run_security()) == authorize_egress("exa", far, _run_security())
+
+
 def test_thesis_lifecycle_tools_exempt_from_private_scan() -> None:
     from app.tool_runtime import _THESIS_LOCAL_TOOLS
 

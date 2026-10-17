@@ -152,14 +152,14 @@ def _source_denied_hit(name: str, raw_denied: object) -> str | None:
 
 
 def _allowlist_set(raw_allowed: object) -> set[str] | None:
-    """Allowlist entries as lowercase strings; None when not a list."""
+    """Return the string entries, or None for a non-list. _allowlist_match normalizes each entry."""
     if not isinstance(raw_allowed, list):
         return None
-    return {s.strip().lower() for s in raw_allowed if isinstance(s, str)}
+    return {s for s in raw_allowed if isinstance(s, str)}
 
 
 def _allowlist_match(name: str, allowed: set[str]) -> bool:
-    """True when the allowlist covers this tool (per-domain allowlists, never substrings)."""
+    """Match research domains exactly and custom entries by normalized substring."""
     # ponytail: exact per-domain membership for the research domains; any other
     # entry keeps the legacy substring behavior (custom allowlists stay working).
     try:
@@ -169,12 +169,9 @@ def _allowlist_match(name: str, allowed: set[str]) -> bool:
         FINRA_TOOLS = frozenset()
         WEB_TOOLS = frozenset()
     lowered = {a.strip().lower() for a in allowed if isinstance(a, str)}
-    if "sec" in lowered and name in SEC_TOOLS:
-        return True
-    if "finra" in lowered and name in FINRA_TOOLS:
-        return True
-    if "web" in lowered and name in WEB_TOOLS:
-        return True
+    for domain, tools in (("sec", SEC_TOOLS), ("finra", FINRA_TOOLS), ("web", WEB_TOOLS)):
+        if domain in lowered and name in tools:
+            return True
     custom = lowered - {"sec", "finra", "web"}
     return any(a and a in name.strip().lower() for a in custom)
 

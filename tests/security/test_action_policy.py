@@ -1,6 +1,10 @@
 """Tests for intent classification and the action firewall."""
 
+import sys
+
 import pytest
+from hypothesis import given, seed, settings
+from hypothesis import strategies as st
 
 from app.security.action_policy import TOOL_DOMAINS, authorize_tool_call
 from app.security.context import (
@@ -239,6 +243,224 @@ def test_authorize_tool_call_gates_call_tool_inner() -> None:
     # browse_tools itself stays listed; the inner target is what gets gated.
     allowed_browse, _ = authorize_tool_call("browse_tools", {}, run_security)
     assert allowed_browse is True
+
+
+@pytest.mark.parametrize(
+    ("domain", "name", "expected"),
+    [
+        ("SEC", "get_financial_statements", True),
+        ("SEC", "browse_tools", True),
+        ("SEC", "query_finra", False),
+        ("SEC", "get_short_pressure_profile", False),
+        ("SEC", "sec_custom", False),
+        ("FINRA", "query_finra", True),
+        ("FINRA", "get_short_interest", True),
+        ("FINRA", "get_short_pressure_profile", True),
+        ("FINRA", "get_sec_filing", False),
+        ("FINRA", "finra_custom", False),
+        ("WEB", "search_web", True),
+        ("WEB", "get_trend_evidence", False),
+        ("WEB", "web_custom", False),
+    ],
+)
+def test_authorize_source_domains_require_exact_membership(domain: str, name: str, expected: bool) -> None:
+    # Case and surrounding whitespace normalize on the entry, never on the tool name.
+    run_security = _run_security(["Research AMD."])
+    run_security.source_policy = {"mode": "allowlist", "allowed": [f" \t{domain.swapcase()}\n"]}
+    reason = "" if expected else f"POLICY_DENIED: tool {name!r} outside session source allowlist"
+    assert authorize_tool_call(name, {}, run_security) == (expected, reason)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [" GET_SEC_FILING ", "GET_SEC_FILING", " SEARCH_WEB ", "QUERY_FINRA"],
+)
+def test_authorize_domain_membership_does_not_normalize_tool_names(name: str) -> None:
+    run_security = _run_security(["Research AMD."])
+    run_security.source_policy = {"mode": "allowlist", "allowed": ["SEC", "FINRA", "WEB"]}
+    assert authorize_tool_call(name, {}, run_security) == (
+        False,
+        f"POLICY_DENIED: tool {name!r} outside session source allowlist",
+    )
+
+
+@pytest.mark.parametrize(
+    ("entries", "expected"),
+    [
+        ([], False),
+        (["", " \t\n", None, False, 12, {}, []], False),
+        (["", None, {}, [], " \tSNAP\n"], True),
+        (["snapshot"], True),
+        (["get_market_snapshot_suffix"], False),
+    ],
+)
+def test_authorize_custom_allowlist_normalizes_and_ignores_nonstrings(entries: list[object], expected: bool) -> None:
+    run_security = _run_security(["Research AMD."])
+    run_security.source_policy = {"mode": "allowlist", "allowed": entries}
+    reason = "" if expected else "POLICY_DENIED: tool 'get_market_snapshot' outside session source allowlist"
+    assert authorize_tool_call("get_market_snapshot", {}, run_security) == (expected, reason)
+
+
+def test_authorize_custom_allowlist_normalizes_unregistered_tool_name() -> None:
+    run_security = _run_security(["Research AMD."])
+    run_security.source_policy = {"mode": "allowlist", "allowed": [" \tSNAP\n"]}
+    assert authorize_tool_call(" GET_MARKET_SNAPSHOT ", {}, run_security) == (
+        False,
+        "tool call exceeds original user intent",
+    )
+
+
+@pytest.mark.parametrize(
+    ("domain", "name", "custom"),
+    [
+        ("SEC", "get_financial_statements", " FINANCIAL "),
+        ("FINRA", "query_finra", " QUERY_ "),
+        ("WEB", "search_web", " SEARCH_ "),
+    ],
+)
+def test_authorize_import_failure_preserves_custom_matches(
+    monkeypatch: pytest.MonkeyPatch, domain: str, name: str, custom: str
+) -> None:
+    monkeypatch.setitem(sys.modules, "app.research.agents.source_agent", None)
+    run_security = _run_security(["Research AMD."])
+    policy: dict[str, object] = {"mode": "allowlist", "allowed": [domain]}
+    run_security.source_policy = policy
+    assert authorize_tool_call(name, {}, run_security) == (
+        False,
+        f"POLICY_DENIED: tool {name!r} outside session source allowlist",
+    )
+    policy["allowed"] = [domain, custom]
+    assert authorize_tool_call(name, {}, run_security) == (True, "")
+
+
+@pytest.mark.parametrize("entries", [None, "SEC", ("SEC",), {"SEC": True}, 7, False])
+def test_authorize_malformed_allowlists_fail_closed(entries: object) -> None:
+    run_security = _run_security(["Research AMD."])
+    run_security.source_policy = {"mode": "allowlist", "allowed": entries}
+    assert authorize_tool_call("get_sec_filing", {}, run_security) == (
+        False,
+        "POLICY_DENIED: tool 'get_sec_filing' outside session source allowlist",
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("invalid", "unknown source_policy mode 'invalid'"),
+        ("allowlist", "POLICY_DENIED: tool 'get_portfolio_snapshot' denied by session source_policy"),
+        ("all", "POLICY_DENIED: tool 'get_portfolio_snapshot' denied by session source_policy"),
+    ],
+)
+def test_authorize_source_denial_precedence(mode: str, expected: str) -> None:
+    run_security = _run_security(["Research AMD."])
+    run_security.source_policy = {
+        "mode": mode,
+        "allowed": None,
+        "denied": ["", None, " \tPORTFOLIO\n"],
+    }
+    assert authorize_tool_call("get_portfolio_snapshot", {}, run_security) == (False, expected)
+    run_security.authorization = SessionAuthorization(portfolio_read=True)
+    assert authorize_tool_call("get_portfolio_snapshot", {}, run_security) == (False, expected)
+
+
+def test_authorize_allowlist_denial_precedes_portfolio_authorization() -> None:
+    run_security = _run_security(["Research AMD."])
+    policy: dict[str, object] = {"mode": "allowlist", "allowed": ["SEC"]}
+    run_security.source_policy = policy
+    assert authorize_tool_call("get_portfolio_snapshot", {}, run_security) == (
+        False,
+        "POLICY_DENIED: tool 'get_portfolio_snapshot' outside session source allowlist",
+    )
+    policy["allowed"] = ["snapshot"]
+    assert authorize_tool_call("get_portfolio_snapshot", {}, run_security) == (
+        False,
+        "portfolio access is not authorized for this session",
+    )
+    run_security.authorization = SessionAuthorization(portfolio_read=True)
+    assert authorize_tool_call("get_portfolio_snapshot", {}, run_security) == (True, "")
+
+
+def test_authorize_wrapper_denial_precedes_inner_denial() -> None:
+    run_security = _run_security(["Research AMD."])
+    policy: dict[str, object] = {"mode": "allowlist", "allowed": ["SEC"], "denied": ["call_tool", "query"]}
+    run_security.source_policy = policy
+    assert authorize_tool_call("call_tool", {"name": "query_finra"}, run_security) == (
+        False,
+        "POLICY_DENIED: tool 'call_tool' denied by session source_policy",
+    )
+    policy["denied"] = ["query"]
+    assert authorize_tool_call("call_tool", {"name": " \tquery_finra\n"}, run_security) == (
+        False,
+        "POLICY_DENIED: tool 'query_finra' denied by session source_policy",
+    )
+
+
+@pytest.mark.parametrize("arguments", [{}, {"name": 7}, {"name": " \t\n"}])
+def test_authorize_call_tool_without_inner_name_gates_wrapper_only(arguments: dict[str, object]) -> None:
+    run_security = _run_security(["Research AMD."])
+    run_security.source_policy = {"mode": "allowlist", "allowed": ["call_tool"]}
+    assert authorize_tool_call("call_tool", arguments, run_security) == (True, "")
+
+
+@pytest.mark.parametrize("mode_entry", [{}, {"mode": None}, {"mode": 7}])
+def test_authorize_missing_or_nonstring_mode_acts_as_all(mode_entry: dict[str, object]) -> None:
+    run_security = _run_security(["Research AMD."])
+    run_security.source_policy = {**mode_entry, "allowed": ["SEC"]}
+    assert authorize_tool_call("get_market_snapshot", {}, run_security) == (True, "")
+
+
+@seed(20261014)
+@settings(max_examples=100, derandomize=True, deadline=None)
+@given(
+    entries=st.lists(
+        st.one_of(
+            st.text(max_size=30),
+            st.sampled_from(["SEC", " finra ", "WEB", " SNAP ", "market", "", " \t"]),
+            st.none(),
+            st.integers(),
+            st.booleans(),
+            st.lists(st.integers(), max_size=3),
+        ),
+        max_size=12,
+    )
+)
+def test_authorize_custom_allowlist_property(entries: list[object]) -> None:
+    """Custom entries match by normalized substring; malformed entries never grant or raise.
+
+    Oracle: the granted verdict equals "some entry strips and lowercases to a non-domain
+    token contained in the tool name". `get_market_snapshot` belongs to no research
+    domain, so the domain branch cannot contribute here.
+    """
+    run_security = _run_security(["Research AMD."])
+    run_security.source_policy = {"mode": "allowlist", "allowed": entries}
+    expected = False
+    for entry in entries:
+        if not isinstance(entry, str):
+            continue
+        token = entry.strip().lower()
+        if token and token not in {"sec", "finra", "web"} and token in "get_market_snapshot":
+            expected = True
+    reason = "" if expected else "POLICY_DENIED: tool 'get_market_snapshot' outside session source allowlist"
+    assert authorize_tool_call("get_market_snapshot", {}, run_security) == (expected, reason)
+
+
+@seed(20261015)
+@settings(max_examples=100, derandomize=True, deadline=None)
+@given(
+    entries=st.lists(
+        st.one_of(st.text(max_size=20), st.sampled_from(["SEC", " FINRA ", "web", "SNAP", ""]), st.none()),
+        max_size=8,
+    ),
+    extra=st.text(max_size=20),
+)
+def test_authorize_allowlist_entries_are_monotone(entries: list[object], extra: str) -> None:
+    """A granted tool call stays granted when the allowlist grows by one entry."""
+    run_security = _run_security(["Research AMD."])
+    policy: dict[str, object] = {"mode": "allowlist", "allowed": entries}
+    run_security.source_policy = policy
+    if authorize_tool_call("get_market_snapshot", {}, run_security)[0]:
+        policy["allowed"] = [*entries, extra]
+        assert authorize_tool_call("get_market_snapshot", {}, run_security) == (True, "")
 
 
 def test_context_gates_allowlist_combos() -> None:
