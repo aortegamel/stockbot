@@ -64,13 +64,12 @@ coverage-python.lcov
 coverage-ts/
 coverage-rust.lcov
 coverage-harness/
-reports/
 
 # Generated verification reports (Stryker mutation output; never commit)
 reports/
 
 mutants/
-.needle/
+.stryker-tmp/
 needle-harness/benchmarks/
 benchmarks/
 web/dist/
