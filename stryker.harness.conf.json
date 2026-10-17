@@ -1,0 +1,51 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "README: needle-harness mutation config. Run with: bunx stryker run stryker.harness.conf.json. mutate lists every production TS file explicitly (no test files). Add new production files here. The [[]...path[]] pattern matches the literal [...path] directory: Stryker converts backslash escapes to path separators, so a bracket class is the only working escape. Scope a run to changed files with --mutate <changed production files>. Command runner reuses the harness bun test command (needle-harness/package.json). STRYKER_TEST_SCOPE narrows the test files for one campaign; an unset value runs the whole suite. Confirm survivors of a scoped run with the full suite. inPlace matches stryker.conf.json. The typescript checker uses the harness tsconfig. ignorePatterns removes generated root directories (venv, mutmut sandbox, data, reports, coverage, caches) and generated web/public/pdfjs from the input crawl; a leading / anchors a pattern to the repo root. See docs/runtime.md.",
+  "commandRunner": {
+    "command": "cd needle-harness && bun test ${STRYKER_TEST_SCOPE:-}"
+  },
+  "mutate": [
+    "needle-harness/lib/env.ts",
+    "needle-harness/lib/port.ts",
+    "needle-harness/lib/agent/evidence.ts",
+    "needle-harness/lib/agent/kernel.ts",
+    "needle-harness/lib/agent/types.ts",
+    "needle-harness/lib/muse/client.ts",
+    "needle-harness/lib/needle/client.ts",
+    "needle-harness/lib/tools/current-time.ts",
+    "needle-harness/lib/tools/index.ts",
+    "needle-harness/lib/tools/stockbot.ts",
+    "needle-harness/app/api/agent/route.ts",
+    "needle-harness/app/api/health/route.ts",
+    "needle-harness/app/api/research/[[]...path[]]/route.ts",
+    "needle-harness/app/api/watchlist/route.ts",
+    "needle-harness/scripts/api.ts",
+    "needle-harness/scripts/copy-pdfjs-assets.ts",
+    "needle-harness/scripts/needle.ts"
+  ],
+  "ignorePatterns": [
+    "/venv",
+    "/mutants",
+    "/data",
+    "/reports",
+    "/coverage-harness",
+    "/coverage-ts",
+    "/coverage-python.lcov",
+    "/.coverage",
+    "/.hypothesis",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "__pycache__",
+    "/web/public/pdfjs"
+  ],
+  "checkers": ["typescript"],
+  "tsconfigFile": "needle-harness/tsconfig.json",
+  "coverageAnalysis": "off",
+  "inPlace": true,
+  "htmlReporter": {
+    "fileName": "reports/mutation/harness.html"
+  },
+  "jsonReporter": {
+    "fileName": "reports/mutation/harness.json"
+  }
+}

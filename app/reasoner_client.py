@@ -79,6 +79,18 @@ def _str_list(stage: str, v: object, what: str) -> list[str]:
     return list(v)
 
 
+def _decompose_tickers(stage: str, raw: object) -> list[str]:
+    if not isinstance(raw, list) or any(not isinstance(t, str) or not t.strip() for t in raw):
+        raise ValueError(f"{stage}: tickers must be string[]")
+    return [t.strip().upper() for t in raw if isinstance(t, str) and t.strip()]
+
+
+def _decompose_query(stage: str, raw: object) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{stage}: corrected_query must be a nonempty string")
+    return raw.strip()
+
+
 def check_decompose_hints(stage: str, value: object) -> dict[str, object]:
     """Optional intake hints: tickers + corrected_query. Unknown fields still reject."""
     if not isinstance(value, dict):
@@ -90,15 +102,37 @@ def check_decompose_hints(stage: str, value: object) -> dict[str, object]:
     out: dict[str, object] = {"proposals": value["proposals"]}
     raw_tickers = value.get("tickers")
     if raw_tickers is not None:
-        if not isinstance(raw_tickers, list) or any(not isinstance(t, str) or not t.strip() for t in raw_tickers):
-            raise ValueError(f"{stage}: tickers must be string[]")
-        out["tickers"] = [t.strip().upper() for t in raw_tickers if isinstance(t, str) and t.strip()]
+        out["tickers"] = _decompose_tickers(stage, raw_tickers)
     raw_query = value.get("corrected_query")
     if raw_query is not None:
-        if not isinstance(raw_query, str) or not raw_query.strip():
-            raise ValueError(f"{stage}: corrected_query must be a nonempty string")
-        out["corrected_query"] = raw_query.strip()
+        out["corrected_query"] = _decompose_query(stage, raw_query)
     return out
+
+
+def _checked_proposal(stage: str, item: object, objective_id: str) -> tuple[str, Mapping[str, object]]:
+    """Shape phase for one proposal: object, exact keys, id prefix, objective, text fields."""
+    if not _is_obj(item) or not isinstance(item, Mapping):
+        raise ValueError(f"{stage}: proposal must be an object")
+    _exact_keys(stage, item, ["dependsOn", "id", "objectiveId", "question", "whyItMatters"])
+    pid = _nonempty(stage, item.get("id"), "proposal.id")
+    if not pid.startswith(f"{objective_id}-"):
+        raise ValueError(f"{stage}: proposal id {pid} must start with {objective_id}-")
+    if item.get("objectiveId") != objective_id:
+        raise ValueError(f"{stage}: proposal {pid} references wrong objective")
+    _nonempty(stage, item.get("question"), "proposal.question")
+    _nonempty(stage, item.get("whyItMatters"), "proposal.whyItMatters")
+    return pid, item
+
+
+def _check_proposal_deps(stage: str, items: list[Mapping[str, object]], refs: set[str]) -> None:
+    """Dependency phase: runs after every proposal id is known, so forward references resolve."""
+    for item in items:
+        pid = str(item.get("id"))
+        for dep in _str_list(stage, item.get("dependsOn"), f"proposal {pid} dependsOn"):
+            if dep == pid:
+                raise ValueError(f"{stage}: proposal {pid} depends on itself")
+            if dep not in refs:
+                raise ValueError(f"{stage}: proposal {pid} references unknown id {dep}")
 
 
 def check_proposals(stage: str, value: object, objective_id: str, prior_ids: set[str]) -> list[Proposal]:
@@ -107,31 +141,15 @@ def check_proposals(stage: str, value: object, objective_id: str, prior_ids: set
         raise TypeError(f"{stage}: proposals must be an array")
     ids: set[str] = set()
     items: list[Mapping[str, object]] = []
-    for item in value:
-        if not _is_obj(item) or not isinstance(item, Mapping):
-            raise ValueError(f"{stage}: proposal must be an object")
-        _exact_keys(stage, item, ["dependsOn", "id", "objectiveId", "question", "whyItMatters"])
-        pid = _nonempty(stage, item.get("id"), "proposal.id")
-        if not pid.startswith(f"{objective_id}-"):
-            raise ValueError(f"{stage}: proposal id {pid} must start with {objective_id}-")
-        if item.get("objectiveId") != objective_id:
-            raise ValueError(f"{stage}: proposal {pid} references wrong objective")
-        _nonempty(stage, item.get("question"), "proposal.question")
-        _nonempty(stage, item.get("whyItMatters"), "proposal.whyItMatters")
+    for raw in value:
+        pid, item = _checked_proposal(stage, raw, objective_id)
         if pid in ids:
             raise ValueError(f"{stage}: duplicate proposal id {pid}")
         if pid in prior_ids:
             raise ValueError(f"{stage}: reused proposal id {pid}")
         ids.add(pid)
         items.append(item)
-    refs = prior_ids | ids
-    for item in items:
-        pid = str(item.get("id"))
-        for dep in _str_list(stage, item.get("dependsOn"), f"proposal {pid} dependsOn"):
-            if dep == pid:
-                raise ValueError(f"{stage}: proposal {pid} depends on itself")
-            if dep not in refs:
-                raise ValueError(f"{stage}: proposal {pid} references unknown id {dep}")
+    _check_proposal_deps(stage, items, prior_ids | ids)
     out: list[Proposal] = []
     for item in items:
         raw_depends = item.get("dependsOn")
@@ -148,6 +166,96 @@ def check_proposals(stage: str, value: object, objective_id: str, prior_ids: set
     return out
 
 
+def _analysis_fields(
+    stage: str, item: object, objective_id: str, proposal_ids: set[str], evidence_ids: set[str]
+) -> tuple[str, list[str], Mapping[str, object]]:
+    """Validate the analysis fields before its optional annotations."""
+    if not _is_obj(item) or not isinstance(item, Mapping):
+        raise ValueError(f"{stage}: analysis must be an object")
+    actual = set(item.keys())
+    if not {"evidenceRefs", "interpretation", "nodeId", "objectiveId"} <= actual or not actual <= {
+        "assumptions",
+        "evidenceRefs",
+        "interpretation",
+        "nodeId",
+        "numbers",
+        "objectiveId",
+    }:
+        raise ValueError(f"{stage}: unexpected fields [{','.join(sorted(item))}]")
+    node_id = _nonempty(stage, item.get("nodeId"), "analysis.nodeId")
+    if node_id not in proposal_ids:
+        raise ValueError(f"{stage}: analysis references unknown proposal {node_id}")
+    if item.get("objectiveId") != objective_id:
+        raise ValueError(f"{stage}: analysis {node_id} references wrong objective")
+    _nonempty(stage, item.get("interpretation"), "analysis.interpretation")
+    refs = _str_list(stage, item.get("evidenceRefs"), f"analysis {node_id} evidenceRefs")
+    for ref in refs:
+        if ref not in evidence_ids:
+            raise ValueError(f"{stage}: analysis {node_id} references unknown evidence {ref}")
+    return node_id, refs, item
+
+
+def _check_analysis_numbers(stage: str, node_id: str, item: Mapping[str, object], ref_set: set[str]) -> None:
+    """Validate numeric annotations against this analysis's evidence references."""
+    raw_numbers = item.get("numbers")
+    if not isinstance(raw_numbers, list):
+        # Validation contract is ValueError, pinned by tests/test_grounding.py.
+        raise ValueError(f"{stage}: analysis {node_id} numbers must be an array")  # noqa: TRY004
+    for n in raw_numbers:
+        if not _is_obj(n) or not isinstance(n, Mapping):
+            raise ValueError(f"{stage}: analysis {node_id} number must be an object")
+        _exact_keys(stage, n, ["evidenceId", "quote", "value"])
+        _nonempty(stage, n.get("value"), "analysis.number.value")
+        eid = _nonempty(stage, n.get("evidenceId"), "analysis.number.evidenceId")
+        _nonempty(stage, n.get("quote"), "analysis.number.quote")
+        if eid not in ref_set:
+            raise ValueError(f"{stage}: analysis {node_id} number references unknown evidence {eid}")
+
+
+def _check_analysis_assumptions(stage: str, node_id: str, item: Mapping[str, object]) -> None:
+    """Validate assumption fields and reject duplicate assumption ids."""
+    raw_assumptions = item.get("assumptions")
+    if not isinstance(raw_assumptions, list):
+        # Validation contract is ValueError, pinned by tests/test_grounding.py.
+        raise ValueError(f"{stage}: analysis {node_id} assumptions must be an array")  # noqa: TRY004
+    seen_assumption: set[str] = set()
+    for a in raw_assumptions:
+        if not _is_obj(a) or not isinstance(a, Mapping):
+            raise ValueError(f"{stage}: analysis {node_id} assumption must be an object")
+        _exact_keys(stage, a, ["assumptionId", "text"])
+        aid = _nonempty(stage, a.get("assumptionId"), "analysis.assumption.assumptionId")
+        _nonempty(stage, a.get("text"), "analysis.assumption.text")
+        if aid in seen_assumption:
+            raise ValueError(f"{stage}: analysis {node_id} duplicate assumptionId {aid}")
+        seen_assumption.add(aid)
+
+
+def _analysis_entry(item: Mapping[str, object]) -> Analysis:
+    raw_refs = item.get("evidenceRefs")
+    refs = [str(r) for r in raw_refs] if isinstance(raw_refs, list) else []
+    entry = Analysis(
+        nodeId=str(item.get("nodeId")),
+        objectiveId=str(item.get("objectiveId")),
+        interpretation=str(item.get("interpretation")),
+        evidenceRefs=refs,
+    )
+    raw_numbers = item.get("numbers")
+    if isinstance(raw_numbers, list):
+        entry["numbers"] = [
+            AnalysisNumber(value=str(n.get("value")), evidenceId=str(n.get("evidenceId")), quote=str(n.get("quote")))
+            for n in raw_numbers
+            if isinstance(n, Mapping)
+        ]
+    raw_assumptions = item.get("assumptions")
+    if isinstance(raw_assumptions, list):
+        entry["assumptions"] = [
+            AnalysisAssumption(assumptionId=str(a.get("assumptionId")), text=str(a.get("text")))
+            for a in raw_assumptions
+            if isinstance(a, Mapping)
+        ]
+    return entry
+
+
 def check_analyses(
     stage: str,
     value: object,
@@ -159,57 +267,13 @@ def check_analyses(
     if not isinstance(value, list):
         raise TypeError(f"{stage}: analyses must be an array")
     seen: set[str] = set()
-    for item in value:
-        if not _is_obj(item) or not isinstance(item, Mapping):
-            raise ValueError(f"{stage}: analysis must be an object")
-        actual = set(item.keys())
-        if not {"evidenceRefs", "interpretation", "nodeId", "objectiveId"} <= actual or not actual <= {
-            "assumptions",
-            "evidenceRefs",
-            "interpretation",
-            "nodeId",
-            "numbers",
-            "objectiveId",
-        }:
-            raise ValueError(f"{stage}: unexpected fields [{','.join(sorted(item))}]")
-        node_id = _nonempty(stage, item.get("nodeId"), "analysis.nodeId")
-        if node_id not in proposal_ids:
-            raise ValueError(f"{stage}: analysis references unknown proposal {node_id}")
-        if item.get("objectiveId") != objective_id:
-            raise ValueError(f"{stage}: analysis {node_id} references wrong objective")
-        _nonempty(stage, item.get("interpretation"), "analysis.interpretation")
-        refs = _str_list(stage, item.get("evidenceRefs"), f"analysis {node_id} evidenceRefs")
-        for ref in refs:
-            if ref not in evidence_ids:
-                raise ValueError(f"{stage}: analysis {node_id} references unknown evidence {ref}")
+    for raw in value:
+        node_id, refs, item = _analysis_fields(stage, raw, objective_id, proposal_ids, evidence_ids)
         ref_set = set(refs)
         if "numbers" in item:
-            raw_numbers = item.get("numbers")
-            if not isinstance(raw_numbers, list):
-                raise ValueError(f"{stage}: analysis {node_id} numbers must be an array")
-            for n in raw_numbers:
-                if not _is_obj(n) or not isinstance(n, Mapping):
-                    raise ValueError(f"{stage}: analysis {node_id} number must be an object")
-                _exact_keys(stage, n, ["evidenceId", "quote", "value"])
-                _nonempty(stage, n.get("value"), "analysis.number.value")
-                eid = _nonempty(stage, n.get("evidenceId"), "analysis.number.evidenceId")
-                _nonempty(stage, n.get("quote"), "analysis.number.quote")
-                if eid not in ref_set:
-                    raise ValueError(f"{stage}: analysis {node_id} number references unknown evidence {eid}")
+            _check_analysis_numbers(stage, node_id, item, ref_set)
         if "assumptions" in item:
-            raw_assumptions = item.get("assumptions")
-            if not isinstance(raw_assumptions, list):
-                raise ValueError(f"{stage}: analysis {node_id} assumptions must be an array")
-            seen_assumption: set[str] = set()
-            for a in raw_assumptions:
-                if not _is_obj(a) or not isinstance(a, Mapping):
-                    raise ValueError(f"{stage}: analysis {node_id} assumption must be an object")
-                _exact_keys(stage, a, ["assumptionId", "text"])
-                aid = _nonempty(stage, a.get("assumptionId"), "analysis.assumption.assumptionId")
-                _nonempty(stage, a.get("text"), "analysis.assumption.text")
-                if aid in seen_assumption:
-                    raise ValueError(f"{stage}: analysis {node_id} duplicate assumptionId {aid}")
-                seen_assumption.add(aid)
+            _check_analysis_assumptions(stage, node_id, item)
         if node_id in seen:
             raise ValueError(f"{stage}: duplicate analysis for {node_id}")
         seen.add(node_id)
@@ -217,29 +281,7 @@ def check_analyses(
     for item in value:
         if not isinstance(item, Mapping):
             continue
-        raw_refs = item.get("evidenceRefs")
-        refs = [str(r) for r in raw_refs] if isinstance(raw_refs, list) else []
-        entry = Analysis(
-            nodeId=str(item.get("nodeId")),
-            objectiveId=str(item.get("objectiveId")),
-            interpretation=str(item.get("interpretation")),
-            evidenceRefs=refs,
-        )
-        if isinstance(item.get("numbers"), list):
-            entry["numbers"] = [
-                AnalysisNumber(
-                    value=str(n.get("value")), evidenceId=str(n.get("evidenceId")), quote=str(n.get("quote"))
-                )
-                for n in item["numbers"]
-                if isinstance(n, Mapping)
-            ]
-        if isinstance(item.get("assumptions"), list):
-            entry["assumptions"] = [
-                AnalysisAssumption(assumptionId=str(a.get("assumptionId")), text=str(a.get("text")))
-                for a in item["assumptions"]
-                if isinstance(a, Mapping)
-            ]
-        out.append(entry)
+        out.append(_analysis_entry(item))
     return out
 
 
@@ -271,13 +313,8 @@ def check_evidence_requests(stage: str, value: object, objective_id: str, node_i
     return out
 
 
-def _parse_opencode_output(
-    stage: str, raw: object, keys: list[str], optional: list[str] | None = None
-) -> dict[str, object]:
-    """Extract concatenated output_text, parse JSON with required + optional keys (mirrors run.ts)."""
-    output = raw.get("output") if isinstance(raw, dict) else None
-    if not isinstance(output, list):
-        raise TypeError(f"{stage}: malformed_opencode_response")
+def _opencode_text(output: list[object]) -> str:
+    """Concatenate text parts from message output items in their original order."""
     text = ""
     for item in output:
         if not isinstance(item, dict) or item.get("type") != "message":
@@ -291,6 +328,17 @@ def _parse_opencode_output(
             chunk = part.get("text")
             if isinstance(chunk, str):
                 text += chunk
+    return text
+
+
+def _parse_opencode_output(
+    stage: str, raw: object, keys: list[str], optional: list[str] | None = None
+) -> dict[str, object]:
+    """Extract concatenated output_text, parse JSON with required + optional keys (mirrors run.ts)."""
+    output = raw.get("output") if isinstance(raw, dict) else None
+    if not isinstance(output, list):
+        raise TypeError(f"{stage}: malformed_opencode_response")
+    text = _opencode_text(output)
     if not text:
         raise ValueError(f"{stage}: malformed_opencode_response")
     try:

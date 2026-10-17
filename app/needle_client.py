@@ -24,6 +24,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import IO
 
+from app.child_spawn import registering_child
 from app.research.models import JSONValue, validate_json_mapping, validate_json_value
 
 logger = logging.getLogger(__name__)
@@ -133,19 +134,20 @@ def _filter_context(context: object, schema: object) -> JSONValue | None:
     for key in _CONTEXT_KEYS:
         if key not in context:
             continue
-        if key == "temporal_scope":
-            scope = _filter_scope(context[key])
-            if scope is not None:
-                out[key] = scope
-        elif key == "grounded_arguments":
-            grounded = _filter_grounded_arguments(context[key], schema)
-            if grounded is not None:
-                out[key] = grounded
-        else:
-            value = context[key]
-            if isinstance(value, str):
-                out[key] = value
+        value = _context_value(key, context, schema)
+        if value is not None:
+            out[key] = value
     return out
+
+
+def _context_value(key: str, context: dict[str, object], schema: object) -> JSONValue | None:
+    """One filtered context key; None drops a key that is absent or filtered out."""
+    if key == "temporal_scope":
+        return _filter_scope(context[key])
+    if key == "grounded_arguments":
+        return _filter_grounded_arguments(context[key], schema)
+    value = context[key]
+    return value if isinstance(value, str) else None
 
 
 def _server() -> Path:
@@ -246,8 +248,9 @@ def _arm_atexit() -> None:
 def _spawn_locked() -> subprocess.Popen[str]:
     """Spawn the worker; caller holds _LOCK. Raises RuntimeError when spawning fails."""
     global _PROC
-    if sys.platform != "win32":
+    with registering_child():
         try:
+            # start_new_session is POSIX-only: Windows accepts and ignores it.
             proc: subprocess.Popen[str] = subprocess.Popen(
                 [_python(), str(_server())],
                 stdin=subprocess.PIPE,
@@ -260,24 +263,11 @@ def _spawn_locked() -> subprocess.Popen[str]:
             )
         except OSError as exc:
             raise RuntimeError(f"needle spawn failed: {exc}") from exc
-    else:
-        try:
-            proc = subprocess.Popen(
-                [_python(), str(_server())],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                env={**os.environ, "NEEDLE_TELEMETRY": "0", "DO_NOT_TRACK": "1"},
-            )
-        except OSError as exc:
-            raise RuntimeError(f"needle spawn failed: {exc}") from exc
-    if proc.stdin is None or proc.stdout is None or proc.stderr is None:
-        _destroy_proc(proc)
-        raise RuntimeError("needle spawn failed: missing pipes")
-    _PROC = proc
-    _arm_atexit()
+        if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+            _destroy_proc(proc)
+            raise RuntimeError("needle spawn failed: missing pipes")
+        _PROC = proc
+        _arm_atexit()
     threading.Thread(target=_drain_stderr, args=(proc,), daemon=True).start()
     return proc
 
@@ -354,23 +344,31 @@ def _ensure_locked() -> subprocess.Popen[str]:
     return proc
 
 
-def _exchange_locked(proc: subprocess.Popen[str], tool: str, payload: dict[str, JSONValue]) -> dict[str, JSONValue]:
-    """One arguments.generate round trip with id correlation; malformed/error raises."""
+def _exchange_response_locked(
+    proc: subprocess.Popen[str], payload: dict[str, JSONValue], failure: str
+) -> dict[str, JSONValue]:
+    """Write one request and validate its correlated response envelope."""
     inp = proc.stdin
     if inp is None:
-        raise RuntimeError(f"needle arguments.generate failed for {tool!r}: server stdin missing")
+        raise RuntimeError(f"{failure}: server stdin missing")
     inp.write(json.dumps(payload) + "\n")
     inp.flush()
     raw_line = _readline(proc, _TIMEOUT_S)
     try:
         decoded: object = json.loads(raw_line)
     except ValueError as exc:
-        raise RuntimeError(f"needle arguments.generate failed for {tool!r}: malformed server response") from exc
+        raise RuntimeError(f"{failure}: malformed server response") from exc
     if not isinstance(decoded, dict) or decoded.get("id") != payload["id"]:
-        raise RuntimeError(f"needle arguments.generate failed for {tool!r}: malformed server response")
+        raise RuntimeError(f"{failure}: malformed server response")
     resp = validate_json_mapping(decoded, "<needle_client>: 'server'")
     if resp.get("error"):
-        raise RuntimeError(f"needle arguments.generate failed for {tool!r}: {resp['error']}")
+        raise RuntimeError(f"{failure}: {resp['error']}")
+    return resp
+
+
+def _exchange_locked(proc: subprocess.Popen[str], tool: str, payload: dict[str, JSONValue]) -> dict[str, JSONValue]:
+    """One arguments.generate round trip with id correlation; malformed/error raises."""
+    resp = _exchange_response_locked(proc, payload, f"needle arguments.generate failed for {tool!r}")
     validate_needle_tool(tool, resp.get("tool"))
     arguments = resp.get("arguments", {})
     if not isinstance(arguments, dict):
@@ -388,21 +386,7 @@ def _exchange_extract_locked(
     proc: subprocess.Popen[str], record_name: str, payload: dict[str, JSONValue]
 ) -> dict[str, JSONValue]:
     """One extract round trip; record mismatch or ungrounded values raise."""
-    inp = proc.stdin
-    if inp is None:
-        raise RuntimeError(f"needle extract failed for {record_name!r}: server stdin missing")
-    inp.write(json.dumps(payload) + "\n")
-    inp.flush()
-    raw_line = _readline(proc, _TIMEOUT_S)
-    try:
-        decoded: object = json.loads(raw_line)
-    except ValueError as exc:
-        raise RuntimeError(f"needle extract failed for {record_name!r}: malformed server response") from exc
-    if not isinstance(decoded, dict) or decoded.get("id") != payload["id"]:
-        raise RuntimeError(f"needle extract failed for {record_name!r}: malformed server response")
-    resp = validate_json_mapping(decoded, "<needle_client>: 'server'")
-    if resp.get("error"):
-        raise RuntimeError(f"needle extract failed for {record_name!r}: {resp['error']}")
+    resp = _exchange_response_locked(proc, payload, f"needle extract failed for {record_name!r}")
     if resp.get("record") is not None and resp.get("record") != record_name:
         raise RuntimeError(f"needle extract failed for {record_name!r}: malformed server response")
     fields = resp.get("fields", {})
@@ -418,21 +402,7 @@ def _exchange_extract_locked(
 
 def _exchange_embed_locked(proc: subprocess.Popen[str], payload: dict[str, JSONValue]) -> list[float]:
     """One embed round trip; malformed vectors raise."""
-    inp = proc.stdin
-    if inp is None:
-        raise RuntimeError("needle embed failed: server stdin missing")
-    inp.write(json.dumps(payload) + "\n")
-    inp.flush()
-    raw_line = _readline(proc, _TIMEOUT_S)
-    try:
-        decoded: object = json.loads(raw_line)
-    except ValueError as exc:
-        raise RuntimeError("needle embed failed: malformed server response") from exc
-    if not isinstance(decoded, dict) or decoded.get("id") != payload["id"]:
-        raise RuntimeError("needle embed failed: malformed server response")
-    resp = validate_json_mapping(decoded, "<needle_client>: 'server'")
-    if resp.get("error"):
-        raise RuntimeError(f"needle embed failed: {resp['error']}")
+    resp = _exchange_response_locked(proc, payload, "needle embed failed")
     vec = resp.get("embedding", [])
     if not isinstance(vec, list) or not vec:
         raise RuntimeError("needle embed failed: malformed server response")
@@ -472,15 +442,18 @@ def close() -> None:
         _kill_locked()
 
 
+def _arguments_request(args: tuple[object, ...], kwargs: dict[str, object]) -> dict[str, object]:
+    """Normalize the two supported argument-generation calling forms."""
+    if not args:
+        return dict(kwargs)
+    if len(args) != 1 or not isinstance(args[0], dict) or kwargs:
+        raise TypeError("generate_arguments: pass kwargs(tool, schema, ...) or a single request dict")
+    return {str(k): v for k, v in args[0].items()}
+
+
 def generate_arguments(*args: object, **kwargs: object) -> dict[str, JSONValue]:
     """Fill arguments for one JEV-selected tool. Accepts kwargs or one request dict."""
-    req_dict: dict[str, object]
-    if args:
-        if len(args) != 1 or not isinstance(args[0], dict) or kwargs:
-            raise TypeError("generate_arguments: pass kwargs(tool, schema, ...) or a single request dict")
-        req_dict = {str(k): v for k, v in args[0].items()}
-    else:
-        req_dict = dict(kwargs)
+    req_dict = _arguments_request(args, kwargs)
     tool = req_dict.get("tool")
     if not isinstance(tool, str) or not tool:
         raise ValueError("generate_arguments: tool must be a nonempty tool name")
@@ -513,53 +486,57 @@ def generate_arguments(*args: object, **kwargs: object) -> dict[str, JSONValue]:
         "context": _filter_context(req_dict.get("context"), schema),
     }
     with _LOCK:
-        attempt = 0
-        while True:
-            try:
-                proc = _ensure_locked()
-                out = _exchange_locked(proc, tool, payload)
-            except _StartupTimeout as exc:
-                logger.warning("toolflow needle_gen_error sid=%s tool=%s err_type=StartupTimeout", sid_hint, tool)
-                raise RuntimeError(
-                    f"needle arguments.generate startup timed out after {_TIMEOUT_S:g}s for {tool!r}; "
-                    f"stderr tail: {_tail_text() or '(empty)'}"
-                ) from exc
-            except TimeoutError as exc:
-                _kill_locked()
-                logger.warning("toolflow needle_gen_error sid=%s tool=%s err_type=TimeoutError", sid_hint, tool)
-                raise RuntimeError(
-                    f"needle arguments.generate timed out after {_TIMEOUT_S:g}s for {tool!r}; "
-                    f"stderr tail: {_tail_text() or '(empty)'}"
-                ) from exc
-            except OSError as exc:
-                # One bounded restart on BrokenPipe/EOF (ConnectionError rides via OSError).
-                _kill_locked()
-                if attempt >= 1:
-                    logger.warning(
-                        "toolflow needle_gen_error sid=%s tool=%s err_type=%s", sid_hint, tool, type(exc).__name__
-                    )
-                    raise RuntimeError(
-                        f"needle arguments.generate failed for {tool!r}: server unavailable ({exc})"
-                    ) from exc
-                attempt += 1
-            except Exception as exc:
+        out = _generate_locked(tool, payload, sid_hint)
+        conf = out.get("confidence")
+        logger.info(
+            "toolflow needle_gen_ok sid=%s tool=%s conf=%s",
+            sid_hint,
+            tool,
+            "yes" if isinstance(conf, (int, float)) and not isinstance(conf, bool) else "no",
+        )
+        return out
+
+
+def _generate_locked(tool: str, payload: dict[str, JSONValue], sid_hint: str) -> dict[str, JSONValue]:
+    """Generate arguments with one restart and the existing operation-specific error logs."""
+    attempt = 0
+    while True:
+        try:
+            proc = _ensure_locked()
+            return _exchange_locked(proc, tool, payload)
+        except _StartupTimeout as exc:
+            logger.warning("toolflow needle_gen_error sid=%s tool=%s err_type=StartupTimeout", sid_hint, tool)
+            raise RuntimeError(
+                f"needle arguments.generate startup timed out after {_TIMEOUT_S:g}s for {tool!r}; "
+                f"stderr tail: {_tail_text() or '(empty)'}"
+            ) from exc
+        except TimeoutError as exc:
+            _kill_locked()
+            logger.warning("toolflow needle_gen_error sid=%s tool=%s err_type=TimeoutError", sid_hint, tool)
+            raise RuntimeError(
+                f"needle arguments.generate timed out after {_TIMEOUT_S:g}s for {tool!r}; "
+                f"stderr tail: {_tail_text() or '(empty)'}"
+            ) from exc
+        except OSError as exc:
+            # One bounded restart on BrokenPipe/EOF (ConnectionError rides via OSError).
+            _kill_locked()
+            if attempt >= 1:
                 logger.warning(
-                    "toolflow needle_gen_error sid=%s tool=%s err_type=%s err=%.200s",
-                    sid_hint,
-                    tool,
-                    type(exc).__name__,
-                    exc,
+                    "toolflow needle_gen_error sid=%s tool=%s err_type=%s", sid_hint, tool, type(exc).__name__
                 )
-                raise
-            else:
-                conf = out.get("confidence")
-                logger.info(
-                    "toolflow needle_gen_ok sid=%s tool=%s conf=%s",
-                    sid_hint,
-                    tool,
-                    "yes" if isinstance(conf, (int, float)) and not isinstance(conf, bool) else "no",
-                )
-                return out
+                raise RuntimeError(
+                    f"needle arguments.generate failed for {tool!r}: server unavailable ({exc})"
+                ) from exc
+            attempt += 1
+        except Exception as exc:
+            logger.warning(
+                "toolflow needle_gen_error sid=%s tool=%s err_type=%s err=%.200s",
+                sid_hint,
+                tool,
+                type(exc).__name__,
+                exc,
+            )
+            raise
 
 
 def _restartable_dict(
@@ -604,6 +581,16 @@ def _restartable_vec(label: str, exchange: Callable[[subprocess.Popen[str]], lis
             attempt += 1
 
 
+def _check_extract_options(max_new_tokens: object, system: object, strict: object) -> None:
+    """Validate decoding options after the record and passage checks."""
+    if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or not 1 <= max_new_tokens <= 4096:
+        raise TypeError("extract_fields: max_new_tokens must be an int in 1..4096")
+    if system is not None and not isinstance(system, str):
+        raise TypeError("extract_fields: system must be a string or None")
+    if not isinstance(strict, bool):
+        raise TypeError("extract_fields: strict must be a bool")
+
+
 def extract_fields(
     record: dict[str, object],
     passage: str,
@@ -622,12 +609,7 @@ def extract_fields(
         raise ValueError("extract_fields: record must carry a nonempty name")
     if not isinstance(passage, str) or not passage.strip():
         raise ValueError("extract_fields: passage must be a nonempty string")
-    if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or not 1 <= max_new_tokens <= 4096:
-        raise TypeError("extract_fields: max_new_tokens must be an int in 1..4096")
-    if system is not None and not isinstance(system, str):
-        raise TypeError("extract_fields: system must be a string or None")
-    if not isinstance(strict, bool):
-        raise TypeError("extract_fields: strict must be a bool")
+    _check_extract_options(max_new_tokens, system, strict)
     if not _server().exists():
         raise RuntimeError(f"needle extract unavailable (gap: server missing: {_server()})")
     _ensure_weights()
@@ -697,20 +679,27 @@ def similarity_order(
     texts sink; ties keep input order under a stable sort.
     """
     items = list(texts or [])
-    if not isinstance(reference, str) or not reference.strip() or len(items) < 2 or len(items) > max_texts:
+    if not _nonblank_reference(reference) or len(items) < 2 or len(items) > max_texts:
         return None
     try:
         ref_vec = embed(reference.strip()[:max_chars])
-        scored: list[tuple[float, int]] = []
-        for pos, text in enumerate(items):
-            if not isinstance(text, str) or not text.strip():
-                scored.append((float("-inf"), pos))
-                continue
-            scored.append((_cosine(ref_vec, embed(text.strip()[:max_chars])), pos))
+        scored = [(_text_similarity(ref_vec, text, max_chars), pos) for pos, text in enumerate(items)]
         scored.sort(key=_score_key, reverse=True)
         return [pos for _, pos in scored]
     except Exception:  # noqa: BLE001 - embedding is a tiebreak; failure keeps deterministic order
         return None
+
+
+def _nonblank_reference(reference: object) -> bool:
+    """True only for a string reference with non-whitespace text."""
+    return isinstance(reference, str) and bool(reference.strip())
+
+
+def _text_similarity(reference: Sequence[float], text: str, max_chars: int) -> float:
+    """Score one bounded text. Blank texts sort after every embedded text."""
+    if not isinstance(text, str) or not text.strip():
+        return float("-inf")
+    return _cosine(reference, embed(text.strip()[:max_chars]))
 
 
 def _score_key(pair: tuple[float, int]) -> float:

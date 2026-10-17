@@ -90,6 +90,47 @@ def catalog_options(catalogs: list[dict[str, JSONValue]]) -> dict[str, str]:
     return options
 
 
+def _objective_text(session: Mapping[str, JSONValue]) -> str:
+    """Session objective (else query) text; blank when the value is not a string."""
+    raw = session.get("objective") or session.get("query") or ""
+    return raw if isinstance(raw, str) else ""
+
+
+def _question_text(node: object) -> str:
+    """Node question from a dict or attribute node; blank when absent or not a string."""
+    raw = node.get("question") if isinstance(node, dict) else getattr(node, "question", None)
+    return raw if isinstance(raw, str) else ""
+
+
+def _catalog_instructions(target: str) -> str:
+    """Catalog-choice instructions naming the target question, or the generic form."""
+    if target:
+        return f"Select the one tool catalog (domain) most likely to advance this research question: {target[:500]}"
+    return "Select the one tool catalog (domain) most likely to advance the current research question."
+
+
+def _catalog_tools(catalogs: list[dict[str, JSONValue]], winner: str) -> set[str]:
+    """Tool names the winning catalog lists."""
+    wanted: set[str] = set()
+    for catalog in catalogs:
+        if catalog.get("name") != winner:
+            continue
+        raw_tools = catalog.get("tools")
+        if isinstance(raw_tools, list):
+            wanted.update(tool for tool in raw_tools if isinstance(tool, str))
+    return wanted
+
+
+def _catalog_subset(registry: list[dict[str, JSONValue]], wanted: set[str]) -> list[dict[str, JSONValue]]:
+    """Registry entries the winning catalog lists, in registry order."""
+    filtered: list[dict[str, JSONValue]] = []
+    for entry in registry:
+        name = entry.get("name")
+        if isinstance(name, str) and name in wanted:
+            filtered.append(entry)
+    return filtered
+
+
 async def catalog_select_round(
     jev: JevClient,
     kernel: _Kernel,
@@ -106,24 +147,9 @@ async def catalog_select_round(
 
     catalogs = build_tool_catalogs(registry)
     options = catalog_options(catalogs)
-    raw_objective = session.get("objective") or session.get("query")
-    objective = raw_objective if isinstance(raw_objective, str) else ""
-    question = ""
-    if isinstance(node, dict):
-        raw_question = node.get("question")
-        if isinstance(raw_question, str):
-            question = raw_question
-    else:
-        attr_question = getattr(node, "question", None)
-        if isinstance(attr_question, str):
-            question = attr_question
-    target = question or objective
-    if target:
-        instructions = (
-            f"Select the one tool catalog (domain) most likely to advance this research question: {target[:500]}"
-        )
-    else:
-        instructions = "Select the one tool catalog (domain) most likely to advance the current research question."
+    objective = _objective_text(session)
+    question = _question_text(node)
+    instructions = _catalog_instructions(question or objective)
     criteria: dict[str, JSONValue] = {key: value for key, value in options.items()}
     inner: dict[str, JSONValue] = {"type": "choice", "instructions": instructions, "criteria": criteria}
     questions: dict[str, JSONValue] = {"catalog_selection": inner}
@@ -164,17 +190,7 @@ async def catalog_select_round(
             action,
         )
         return action, ToolDecision(action=action)
-    wanted: set[str] = set()
-    for catalog in catalogs:
-        if catalog.get("name") == winner:
-            raw_tools = catalog.get("tools")
-            if isinstance(raw_tools, list):
-                wanted.update(tool for tool in raw_tools if isinstance(tool, str))
-    filtered: list[dict[str, JSONValue]] = []
-    for entry in registry:
-        entry_name = entry.get("name")
-        if isinstance(entry_name, str) and entry_name in wanted:
-            filtered.append(entry)
+    filtered = _catalog_subset(registry, _catalog_tools(catalogs, winner))
     logger.info(
         "toolflow catalog_pick sid=%s nid=%s catalogs=%d winner=%s subset=%d",
         sid,

@@ -176,14 +176,7 @@ def replay_sec_facts_from_archive(*, data_root: Path | None = None) -> dict[str,
             for record in raw_archive.iter_archive("sec", cik_dir.name, "companyfacts", root=raw_root):
                 archived_payloads += 1
                 try:
-                    cik = int(cik_dir.name.removeprefix("cik"))
-                    datasets = _normalize_company_facts(
-                        cik,
-                        record.payload_path.read_bytes(),
-                        retrieved_at=record.retrieved_at,
-                        url=record.url,
-                    )
-                    normalized_rows += sum(len(rows) for rows in datasets.values())
+                    normalized_rows += _replayed_payload_rows(cik_dir.name, record)
                 except Exception as exc:  # noqa: BLE001 - intentional best-effort boundary, never aborts
                     failed.append(
                         {
@@ -200,6 +193,17 @@ def replay_sec_facts_from_archive(*, data_root: Path | None = None) -> dict[str,
         "normalized_rows": normalized_rows,
         "failed": failed,
     }
+
+
+def _replayed_payload_rows(cik_name: str, record: raw_archive.ArchiveRecord) -> int:
+    """Normalized row count for one archived companyfacts payload."""
+    datasets = _normalize_company_facts(
+        int(cik_name.removeprefix("cik")),
+        record.payload_path.read_bytes(),
+        retrieved_at=record.retrieved_at,
+        url=record.url,
+    )
+    return sum(len(rows) for rows in datasets.values())
 
 
 def iter_archive_company_facts(cik: int, *, data_root: Path | None = None) -> Sequence[Mapping[str, object]]:

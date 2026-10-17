@@ -151,7 +151,8 @@ def _neg_hit(key: str) -> dict[str, object] | None:
     return hit if isinstance(hit, dict) else None
 
 
-def _parse_candles(ticker: str, payload: Mapping[str, object], range_: str, interval: str) -> dict[str, object]:
+def _chart_result(payload: Mapping[str, object]) -> dict[str, object]:
+    """Read the first chart result. For empty results, use Yahoo's error description when available."""
     empty: dict[str, object] = {}
     chart_obj = payload.get("chart")
     chart: dict[str, object] = chart_obj if isinstance(chart_obj, dict) else empty
@@ -163,26 +164,28 @@ def _parse_candles(ticker: str, payload: Mapping[str, object], range_: str, inte
         detail = err.get("description")
         raise ValueError(detail if isinstance(detail, str) else "no data")
     first = results[0]
-    result: dict[str, object] = first if isinstance(first, dict) else empty
-    stamps_obj = result.get("timestamp")
-    stamps: list[object] = stamps_obj if isinstance(stamps_obj, list) else []
+    return first if isinstance(first, dict) else empty
+
+
+def _quote_series(result: Mapping[str, object]) -> dict[str, list[object]]:
+    """Read the OHLCV arrays. Replace absent or malformed arrays with empty lists."""
+    empty: dict[str, object] = {}
     ind_obj = result.get("indicators")
     indicators: dict[str, object] = ind_obj if isinstance(ind_obj, dict) else empty
     quotes_obj = indicators.get("quote")
     quotes: list[object] = quotes_obj if isinstance(quotes_obj, list) else []
     head = quotes[0] if quotes and isinstance(quotes[0], dict) else empty
-    opens_obj = head.get("open")
-    opens: list[object] = opens_obj if isinstance(opens_obj, list) else []
-    highs_obj = head.get("high")
-    highs: list[object] = highs_obj if isinstance(highs_obj, list) else []
-    lows_obj = head.get("low")
-    lows: list[object] = lows_obj if isinstance(lows_obj, list) else []
-    closes_obj = head.get("close")
-    closes: list[object] = closes_obj if isinstance(closes_obj, list) else []
-    vols_obj = head.get("volume")
-    vols: list[object] = vols_obj if isinstance(vols_obj, list) else []
-    meta_obj = result.get("meta")
-    meta: dict[str, object] = meta_obj if isinstance(meta_obj, dict) else empty
+    series: dict[str, list[object]] = {}
+    for field in ("open", "high", "low", "close", "volume"):
+        values = head.get(field)
+        series[field] = values if isinstance(values, list) else []
+    return series
+
+
+def _candle_rows(stamps: list[object], series: Mapping[str, list[object]]) -> list[dict[str, object]]:
+    """Keep bars with closes. Use the close for absent prices and zero for absent volume."""
+    opens, highs, lows = series["open"], series["high"], series["low"]
+    closes, vols = series["close"], series["volume"]
     candles: list[dict[str, object]] = []
     for i, ts in enumerate(stamps):
         close = closes[i] if i < len(closes) else None
@@ -198,6 +201,17 @@ def _parse_candles(ticker: str, payload: Mapping[str, object], range_: str, inte
                 "vol": vols[i] if i < len(vols) and vols[i] is not None else 0,
             }
         )
+    return candles
+
+
+def _parse_candles(ticker: str, payload: Mapping[str, object], range_: str, interval: str) -> dict[str, object]:
+    result = _chart_result(payload)
+    stamps_obj = result.get("timestamp")
+    stamps: list[object] = stamps_obj if isinstance(stamps_obj, list) else []
+    series = _quote_series(result)
+    meta_obj = result.get("meta")
+    meta: dict[str, object] = meta_obj if isinstance(meta_obj, dict) else {}
+    candles = _candle_rows(stamps, series)
     if not candles:
         raise ValueError("all bars empty")
     return {
@@ -421,6 +435,39 @@ def _newsquant_items(ticker: str) -> list[dict[str, object]]:
     return holder[0] if holder else []
 
 
+def _merge_feeds(ticker: str) -> list[dict[str, object]]:
+    """Fetch RSS feeds concurrently. Preserve feed order and filter topic feeds for ticker mentions."""
+    q = urllib.parse.quote(f"{ticker} stock")
+    feeds = [
+        (_GNEWS_URL.format(q=q), "Google News", False),
+        (_YAHOO_HEADLINES_URL.format(ticker=ticker), "Yahoo Finance", True),
+        (_SEEKING_ALPHA_TICKER_URL.format(ticker=ticker), "Seeking Alpha", False),
+        (_CNBC_TOP_NEWS_URL, "CNBC", True),
+        (_MARKETWATCH_TOP_URL, "MarketWatch", True),
+    ]
+    merged: list[dict[str, object]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(feeds)) as pool:
+        results = pool.map(_fetch_feed, [u for u, _s, _t in feeds], [s for _u, s, _t in feeds])
+        for (_url, _source, topic_level), items in zip(feeds, results):
+            if topic_level:
+                items = [i for i in items if _mentions_ticker(str(i.get("title", "")), ticker)]
+            merged.extend(items)
+    return merged
+
+
+def _dedup_by_link(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Preserve the first item for each link. Use the title when the link is empty."""
+    seen: set[str] = set()
+    unique: list[dict[str, object]] = []
+    for item in items:
+        link = str(item.get("link") or item.get("title"))
+        if link in seen:
+            continue
+        seen.add(link)
+        unique.append(item)
+    return unique
+
+
 def get_news(sym: str, limit: int = 12) -> dict[str, object]:
     """Per-ticker headlines merged newest-first: Google + Yahoo + SA + CNBC/MW + newsquant.
 
@@ -441,35 +488,36 @@ def get_news(sym: str, limit: int = 12) -> dict[str, object]:
         if isinstance(items, list):
             return dict(hit, items=items[:limit])
         return hit
-    q = urllib.parse.quote(f"{ticker} stock")
-    feeds = [
-        (_GNEWS_URL.format(q=q), "Google News", False),
-        (_YAHOO_HEADLINES_URL.format(ticker=ticker), "Yahoo Finance", True),
-        (_SEEKING_ALPHA_TICKER_URL.format(ticker=ticker), "Seeking Alpha", False),
-        (_CNBC_TOP_NEWS_URL, "CNBC", True),
-        (_MARKETWATCH_TOP_URL, "MarketWatch", True),
-    ]
-    merged: list[dict[str, object]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(feeds)) as pool:
-        results = pool.map(_fetch_feed, [u for u, _s, _t in feeds], [s for _u, s, _t in feeds])
-        for (_url, _source, topic_level), items in zip(feeds, results):
-            if topic_level:
-                items = [i for i in items if _mentions_ticker(str(i.get("title", "")), ticker)]
-            merged.extend(items)
+    merged = _merge_feeds(ticker)
     merged.extend(_newsquant_items(ticker))
-    seen: set[str] = set()
-    unique: list[dict[str, object]] = []
-    for item in merged:
-        link = str(item.get("link") or item.get("title"))
-        if link in seen:
-            continue
-        seen.add(link)
-        unique.append(item)
+    unique = _dedup_by_link(merged)
     # Feed order is relevance/pub-ranked, not chronological — newest first.
     unique.sort(key=_news_sort_key, reverse=True)
     out: dict[str, object] = {"sym": ticker, "items": unique[:limit]}
     cache.set(key, out)
     return out
+
+
+def _atom_filings(raw: bytes) -> list[dict[str, object]]:
+    """Parse filing entries. Reject entries without an official filing date in YYYY-MM-DD form."""
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    root = ET.fromstring(raw)
+    items: list[dict[str, object]] = []
+    for entry in root.findall("a:entry", ns):
+        link = entry.find("a:link", ns)
+        filed = (entry.findtext("a:content/a:filing-date", default="", namespaces=ns) or "").strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", filed):
+            raise ValueError(f"Atom entry without a YYYY-MM-DD filing-date: {filed!r}")
+        items.append(
+            {
+                "title": (entry.findtext("a:title", default="", namespaces=ns) or "").strip(),
+                "link": link.get("href", "") if link is not None else "",
+                "filed": filed,
+                "updated": (entry.findtext("a:updated", default="", namespaces=ns) or "").strip(),
+                "summary": (entry.findtext("a:summary", default="", namespaces=ns) or "").strip()[:300],
+            }
+        )
+    return items
 
 
 def get_filings(sym: str, limit: int = 10) -> dict[str, object]:
@@ -499,23 +547,7 @@ def get_filings(sym: str, limit: int = 10) -> dict[str, object]:
     try:
         url = _SEC_ATOM_URL.format(cik=f"{cik:010d}", n=_FILINGS_PAGE)
         raw = _http_bytes(url, headers={"Accept": "application/atom+xml"})
-        ns = {"a": "http://www.w3.org/2005/Atom"}
-        root = ET.fromstring(raw)
-        items: list[dict[str, object]] = []
-        for entry in root.findall("a:entry", ns):
-            link = entry.find("a:link", ns)
-            filed = (entry.findtext("a:content/a:filing-date", default="", namespaces=ns) or "").strip()
-            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", filed):
-                raise ValueError(f"Atom entry without a YYYY-MM-DD filing-date: {filed!r}")
-            items.append(
-                {
-                    "title": (entry.findtext("a:title", default="", namespaces=ns) or "").strip(),
-                    "link": link.get("href", "") if link is not None else "",
-                    "filed": filed,
-                    "updated": (entry.findtext("a:updated", default="", namespaces=ns) or "").strip(),
-                    "summary": (entry.findtext("a:summary", default="", namespaces=ns) or "").strip()[:300],
-                }
-            )
+        items: list[dict[str, object]] = _atom_filings(raw)
         out: dict[str, object] = {"sym": ticker, "cik": cik, "items": items}
         cache.set(key, out)
         return dict(out, items=items[:limit])
@@ -537,6 +569,27 @@ def get_quote(sym: str) -> dict[str, object]:
         return {"sym": ticker, "price": None, "retrieved_at": None, "error": f"quote unavailable: {e}"}
 
 
+def _candle_window(candles: Mapping[str, object]) -> dict[str, object]:
+    """Summarize numeric closes in their original order."""
+    rows_obj = candles.get("candles")
+    rows: list[object] = rows_obj if isinstance(rows_obj, list) else []
+    closes: list[float] = [
+        float(r["close"]) for r in rows if isinstance(r, dict) and isinstance(r.get("close"), (int, float))
+    ]
+    if not closes:
+        return {"bars": 0, "last": None, "first": None, "high": None, "low": None}
+    summary: dict[str, object] = {
+        "bars": len(closes),
+        "last": closes[-1],
+        "first": closes[0],
+        "high": max(closes),
+        "low": min(closes),
+    }
+    if len(closes) > 1 and closes[0]:
+        summary["change_pct"] = (closes[-1] - closes[0]) / closes[0] * 100
+    return summary
+
+
 def get_viewer_context(sym: str) -> dict[str, object]:
     """Read-only agent context for whatever ticker the UI is showing.
 
@@ -551,20 +604,7 @@ def get_viewer_context(sym: str) -> dict[str, object]:
     candles = get_candles(ticker)
     news = get_news(ticker)
     filings = get_filings(ticker)
-    rows_obj = candles.get("candles")
-    rows: list[object] = rows_obj if isinstance(rows_obj, list) else []
-    closes: list[float] = [
-        float(r["close"]) for r in rows if isinstance(r, dict) and isinstance(r.get("close"), (int, float))
-    ]
-    summary: dict[str, object] = {
-        "bars": len(closes),
-        "last": closes[-1] if closes else None,
-        "first": closes[0] if closes else None,
-        "high": max(closes) if closes else None,
-        "low": min(closes) if closes else None,
-    }
-    if len(closes) > 1 and closes[0]:
-        summary["change_pct"] = (closes[-1] - closes[0]) / closes[0] * 100
+    summary = _candle_window(candles)
     news_obj = news.get("items")
     news_items: list[object] = news_obj if isinstance(news_obj, list) else []
     filings_obj = filings.get("items")

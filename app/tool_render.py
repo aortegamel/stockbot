@@ -197,6 +197,18 @@ def _final_effect_block(items: object) -> list[str]:
 _COVERAGE_VERDICT_KEYS = frozenset({"source_domain", "source_sufficiency", "useful_for_question", "complete"})
 
 
+def _final_coverage_parts(section: dict[str, object]) -> list[str]:
+    """Render the non-verdict scope fields in stable alphabetical order."""
+    parts: list[str] = []
+    for field in sorted(section):
+        if field in _COVERAGE_VERDICT_KEYS or field in ("detail", "summary"):
+            continue
+        items = [str(v).strip() for v in _as_list(section.get(field)) if str(v).strip()]
+        if items:
+            parts.append(f"{field}: {', '.join(items)}")
+    return parts
+
+
 def _final_coverage_block(coverage: object) -> list[str]:
     """Per-source coverage lines: every surviving scope key under its own name."""
     cov = _as_dict(coverage)
@@ -205,13 +217,7 @@ def _final_coverage_block(coverage: object) -> list[str]:
         section = _as_dict(cov.get(key))
         if not section:
             continue
-        parts: list[str] = []
-        for field in sorted(section):
-            if field in _COVERAGE_VERDICT_KEYS or field in ("detail", "summary"):
-                continue
-            items = [str(v).strip() for v in _as_list(section.get(field)) if str(v).strip()]
-            if items:
-                parts.append(f"{field}: {', '.join(items)}")
+        parts = _final_coverage_parts(section)
         detail = _cell(section.get("detail") or section.get("summary")).strip()
         head = key.upper()
         if parts or detail:
@@ -221,19 +227,21 @@ def _final_coverage_block(coverage: object) -> list[str]:
     return lines
 
 
+def _final_source_line(item: object) -> str:
+    """Format one source identity with its integrity and evidence suffix."""
+    row = _as_dict(item)
+    evidence_id = _cell(row.get("evidence_id")).strip()
+    domain = _cell(row.get("domain")).strip().upper() or "SOURCE"
+    integrity = _cell(row.get("integrity_class") or row.get("integrity")).strip().upper()
+    document = _cell(row.get("document") or row.get("source_name")).strip()
+    label = f"{domain} [{integrity}]" if integrity else domain
+    head = " ".join(part for part in (label, document) if part)
+    return f"- {head} [{evidence_id}]" if evidence_id and head != evidence_id else f"- {head}"
+
+
 def _final_source_block(sources: object) -> list[str]:
     """One line per source row: domain + integrity class + document + evidence id."""
-    lines: list[str] = []
-    for item in _as_list(sources):
-        row = _as_dict(item)
-        evidence_id = _cell(row.get("evidence_id")).strip()
-        domain = _cell(row.get("domain")).strip().upper() or "SOURCE"
-        integrity = _cell(row.get("integrity_class") or row.get("integrity")).strip().upper()
-        document = _cell(row.get("document") or row.get("source_name")).strip()
-        label = f"{domain} [{integrity}]" if integrity else domain
-        head = " ".join(part for part in (label, document) if part) or evidence_id or "source"
-        lines.append(f"- {head} [{evidence_id}]" if evidence_id and head != evidence_id else f"- {head}")
-    return lines
+    return [_final_source_line(item) for item in _as_list(sources)]
 
 
 def _final_scope_line(scope: object) -> str:
@@ -2411,19 +2419,52 @@ def _is_text_result(result: dict[str, object]) -> bool:
     return False
 
 
+def _text_result_identity_lines(result: dict[str, object]) -> list[str]:
+    """Render the truthy identity fields before pagination and source references."""
+    return [
+        f"{label}: {result[key]}"
+        for key, label in (
+            ("ticker", "Ticker"),
+            ("form_type", "form_type"),
+            ("item", "item"),
+            ("statement_type", "statement_type"),
+            ("concept_searched", "concept_searched"),
+            ("filed", "Filed"),
+            ("source", "Source"),
+        )
+        if result.get(key)
+    ]
+
+
+def _text_result_reference_lines(result: dict[str, object]) -> list[str]:
+    """Render a source handle followed by each mapping-shaped source reference."""
+    lines: list[str] = []
+    handle = _as_dict(result.get("source_handle"))
+    if handle:
+        lines.append("source_handle: " + ", ".join(f"{k}: {_cell(v)}" for k, v in handle.items()))
+    for ref in _as_list(result.get("source_refs")):
+        if isinstance(ref, dict):
+            lines.append("source_ref: " + ", ".join(f"{k}: {_cell(v)}" for k, v in ref.items()))
+    return lines
+
+
+def _text_result_continuation_lines(result: dict[str, object]) -> list[str]:
+    """Render explicit cursor instructions and any supplied continuation text."""
+    lines: list[str] = []
+    next_cursor = result.get("next_cursor")
+    if next_cursor is not None:
+        args = [f"{key}={result[key]}" for key in ("accession_no", "document_name") if result.get(key)]
+        args.append(f"cursor={next_cursor}")
+        lines.append("Continue: call get_sec_document with " + ", ".join(args) + ".")
+        lines.append("Preserve section, query, and raw settings.")
+    if result.get("continuation"):
+        lines.append(f"continuation: {_cell(result['continuation'])}")
+    return lines
+
+
 def _text_result_header(result: dict[str, object]) -> str:
     """Provenance header for long-text envelopes (ticker/form/filed/source)."""
-    header_lines = []
-    ticker = result.get("ticker")
-    if ticker:
-        header_lines.append(f"Ticker: {ticker}")
-    for key in ("form_type", "item", "statement_type", "concept_searched"):
-        if result.get(key):
-            header_lines.append(f"{key}: {result[key]}")
-    if result.get("filed"):
-        header_lines.append(f"Filed: {result['filed']}")
-    if result.get("source"):
-        header_lines.append(f"Source: {result['source']}")
+    header_lines = _text_result_identity_lines(result)
     for key in (
         "accession_no",
         "document_name",
@@ -2447,20 +2488,8 @@ def _text_result_header(result: dict[str, object]) -> str:
         if key in result:
             value = result[key]
             header_lines.append(f"{key}: {_cell(value) if value is not None else 'none'}")
-    handle = _as_dict(result.get("source_handle"))
-    if handle:
-        header_lines.append("source_handle: " + ", ".join(f"{k}: {_cell(v)}" for k, v in handle.items()))
-    for ref in _as_list(result.get("source_refs")):
-        if isinstance(ref, dict):
-            header_lines.append("source_ref: " + ", ".join(f"{k}: {_cell(v)}" for k, v in ref.items()))
-    next_cursor = result.get("next_cursor")
-    if next_cursor is not None:
-        args = [f"{key}={result[key]}" for key in ("accession_no", "document_name") if result.get(key)]
-        args.append(f"cursor={next_cursor}")
-        header_lines.append("Continue: call get_sec_document with " + ", ".join(args) + ".")
-        header_lines.append("Preserve section, query, and raw settings.")
-    if result.get("continuation"):
-        header_lines.append(f"continuation: {_cell(result['continuation'])}")
+    header_lines.extend(_text_result_reference_lines(result))
+    header_lines.extend(_text_result_continuation_lines(result))
     return "\n".join(header_lines)
 
 
@@ -2548,13 +2577,7 @@ def _render_insider_activity(result: dict[str, object], max_bytes: int) -> str:
     """Narrow insider renderer: head lines + one line per transaction row within budget."""
     acc = _GenericAccumulator(max_bytes)
     _generic_head_lines(result, acc)
-    for key, value in result.items():
-        if value is None or key in ("ticker", "source", "concept_searched", "transactions"):
-            continue
-        if isinstance(value, list):
-            _generic_list_value(key, value, acc)
-        else:
-            _generic_scalar_or_mapping(key, value, acc)
+    _generic_body_lines(result, acc, ("ticker", "source", "concept_searched", "transactions"))
     rows = result.get("transactions")
     rows = rows if isinstance(rows, list) else []
     for item in rows:
@@ -2570,38 +2593,46 @@ def _render_insider_activity(result: dict[str, object], max_bytes: int) -> str:
     return "\n".join(acc.lines)
 
 
+def _generic_series_observations(item: dict[str, object], acc: _GenericAccumulator) -> None:
+    """Render valid observations until one exceeds the remaining byte budget."""
+    for observation in _as_list(item.get("observations")):
+        if not isinstance(observation, dict):
+            continue
+        line = f"  - date: {_cell(observation.get('date'))}, value: {_cell(observation.get('value'))}"
+        if item.get("unit") is not None:
+            line += f", unit: {_cell(item['unit'])}"
+        if not acc.add(line):
+            acc.omitted.append("series")
+            break
+
+
+def _generic_series_value(value: list[object], acc: _GenericAccumulator) -> None:
+    """Render series context before observations, stopping only on context overflow."""
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        context = ", ".join(
+            f"{field}: {_cell(raw)}" for field, raw in item.items() if field != "observations" and raw is not None
+        )
+        if not acc.add("series: " + context):
+            acc.omitted.append("series")
+            break
+        _generic_series_observations(item, acc)
+    if not value:
+        acc.add("series: none")
+
+
 def _generic_list_value(key: str, value: list[object], acc: _GenericAccumulator) -> None:
     """List value as bulleted summary lines (empty list renders none)."""
-    kept = 0
     if key == "series":
-        for item in value:
-            if not isinstance(item, dict):
-                continue
-            context = ", ".join(
-                f"{field}: {_cell(raw)}" for field, raw in item.items() if field != "observations" and raw is not None
-            )
-            if not acc.add("series: " + context):
-                acc.omitted.append(key)
-                break
-            for observation in _as_list(item.get("observations")):
-                if not isinstance(observation, dict):
-                    continue
-                line = f"  - date: {_cell(observation.get('date'))}, value: {_cell(observation.get('value'))}"
-                if item.get("unit") is not None:
-                    line += f", unit: {_cell(item['unit'])}"
-                if not acc.add(line):
-                    acc.omitted.append(key)
-                    break
-        if not value:
-            acc.add("series: none")
+        _generic_series_value(value, acc)
         return
     for item in value:
         line = "  - " + _cell(item if not isinstance(item, dict) else _summarize_dict(item))
         if not acc.add(line):
             acc.omitted.append(key)
             break
-        kept += 1
-    if kept == 0 and not value:
+    if not value:
         acc.add(f"{key}: none")
 
 
@@ -2615,16 +2646,21 @@ def _generic_scalar_or_mapping(key: str, value: object, acc: _GenericAccumulator
         acc.add(f"{key}: {TRUNCATED_MARKER}")
 
 
-def _render_generic(result: dict[str, object], max_bytes: int) -> str:
-    acc = _GenericAccumulator(max_bytes)
-    _generic_head_lines(result, acc)
+def _generic_body_lines(result: dict[str, object], acc: _GenericAccumulator, skip_keys: tuple[str, ...]) -> None:
+    """Render remaining fields with the list or scalar/mapping renderer."""
     for key, value in result.items():
-        if value is None or key in ("ticker", "source", "concept_searched"):
+        if value is None or key in skip_keys:
             continue
         if isinstance(value, list):
             _generic_list_value(key, value, acc)
         else:
             _generic_scalar_or_mapping(key, value, acc)
+
+
+def _render_generic(result: dict[str, object], max_bytes: int) -> str:
+    acc = _GenericAccumulator(max_bytes)
+    _generic_head_lines(result, acc)
+    _generic_body_lines(result, acc, ("ticker", "source", "concept_searched"))
     if acc.omitted:
         acc.add(f"{TRUNCATED_MARKER} (Omitted rows: {len(acc.omitted)} in {', '.join(acc.omitted)})")
     if not acc.lines:

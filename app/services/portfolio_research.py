@@ -8,6 +8,7 @@ None), never estimated or zeroed.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -182,15 +183,30 @@ def _finra_metrics(gateway: SourceGateway, ticker: str, as_of: str) -> dict[str,
         return {}
     if not isinstance(rows, list):
         return {}
+    row = _latest_finra_row(rows, as_of)
+    return {} if row is None else _finra_row_metrics(row)
+
+
+def _eligible_finra_rows(rows: Sequence[object], as_of: str) -> list[dict[str, object]]:
+    """Retain provider rows with settlement dates on or before the cutoff."""
     dated = [row for row in rows if isinstance(row, dict) and str(row.get("settlement_date") or "")]
-    eligible = [row for row in dated if str(row.get("settlement_date") or "")[:10] <= as_of]
+    return [row for row in dated if str(row.get("settlement_date") or "")[:10] <= as_of]
+
+
+def _latest_finra_row(rows: Sequence[object], as_of: str) -> dict[str, object] | None:
+    """Select the newest revision unless its settlement cycle has conflicting values."""
+    eligible = _eligible_finra_rows(rows, as_of)
     if not eligible:
-        return {}
+        return None
     latest_day = max(str(row.get("settlement_date") or "")[:10] for row in eligible)
     same_day = [row for row in eligible if str(row.get("settlement_date") or "")[:10] == latest_day]
     if len(_finra_variants(same_day)) > 1:
-        return {}
-    row = max(same_day, key=_finra_day_key)
+        return None
+    return max(same_day, key=_finra_day_key)
+
+
+def _finra_row_metrics(row: dict[str, object]) -> dict[str, object]:
+    """Calculate changes and normalize provenance for one selected revision."""
     short_position = _decimal(row.get("short_position"))
     prev_position = _decimal(row.get("prev_position"))
     change: Decimal | None = None

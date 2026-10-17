@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from . import finra_client as _finra
 from . import normalization as _norm
@@ -19,6 +20,9 @@ from .domain.market.securities import TickerAlias
 from .sec import client as _sec
 from .sec import filings as _filings
 from .sec.models import Filing, SECSearchResult, pit_of
+
+if TYPE_CHECKING:
+    from .storage.raw_archive import ArchiveRecord
 
 _SHORT_FIELDS = (
     "symbolCode",
@@ -67,8 +71,8 @@ def _ticker_aliases_of(alias_rows: object) -> list[TickerAlias]:
     return built
 
 
-def _archived_ticker_aliases(want: str, as_of: datetime) -> list[TickerAlias] | None:
-    """Aliases for one ticker from the latest company_tickers snapshot at or before ``as_of``."""
+def _latest_ticker_snapshot(as_of: datetime) -> ArchiveRecord | None:
+    """Select the last archived snapshot at the requested knowledge horizon."""
     from .config import get_data_root
     from .storage import raw_archive
 
@@ -81,6 +85,12 @@ def _archived_ticker_aliases(want: str, as_of: datetime) -> list[TickerAlias] | 
         # Strict PIT would bracket coverage and return unresolved (future work, not this change).
         if retrieved and retrieved <= horizon and (latest is None or retrieved >= latest_retrieved):
             latest, latest_retrieved = record, retrieved
+    return latest
+
+
+def _archived_ticker_aliases(want: str, as_of: datetime) -> list[TickerAlias] | None:
+    """Read ticker aliases from the latest eligible archived snapshot."""
+    latest = _latest_ticker_snapshot(as_of)
     if latest is None:
         return None
     try:
@@ -170,6 +180,11 @@ class SourceGateway:
     def short_interest(self, symbol: str, *, as_of: str | None = None) -> list[dict[str, object]]:
         """Normalized short-interest rows, newest first; ``as_of`` gates knowledge time (``known_at``)."""
         sym = str(symbol).strip().upper()
+        cached = self._short_interest_rows(sym)
+        return self._narrow_short_rows(cached, as_of)
+
+    def _short_interest_rows(self, sym: str) -> list[dict[str, object]]:
+        """Provider rows for one symbol, fetched once per run."""
         key = ("short_interest", sym)
         cached: object = self._cache.get(key)
         if cached is None:
@@ -181,13 +196,16 @@ class SourceGateway:
                 limit=25,
             )
             records = result.get("records") if isinstance(result, dict) else None
-            if not isinstance(records, list):
-                cached_list: list[dict[str, object]] = []
-                cached = cached_list
-            else:
+            if isinstance(records, list):
                 cached = self._normalized_short_rows([r for r in records if isinstance(r, dict)])
+            else:
+                cached = list[dict[str, object]]()
             self._cache[key] = cached
         assert isinstance(cached, list)
+        return cached
+
+    def _narrow_short_rows(self, cached: list[dict[str, object]], as_of: str | None) -> list[dict[str, object]]:
+        """``as_of`` gates knowledge time; without one every cached row is served."""
         if as_of is None:
             return list(cached)
         return [row for row in cached if isinstance(row, dict) and _known_as_of(row, as_of)]

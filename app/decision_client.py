@@ -18,6 +18,7 @@ import functools
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -31,8 +32,9 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from itertools import combinations
 from pathlib import Path
-from typing import Protocol, TypeGuard, runtime_checkable
+from typing import TYPE_CHECKING, NoReturn, Protocol, TypeGuard, runtime_checkable
 
+from app.child_spawn import registering_child
 from app.config import get_data_root
 from app.research.models import (
     DecisionRecord,
@@ -47,6 +49,9 @@ from app.research.models import (
 from app.research.repository import ResearchRepository
 from app.storage.runs import get_current_recorder
 
+if TYPE_CHECKING:
+    from app.tools import ToolDiscovery
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["JevClient"]
@@ -59,6 +64,10 @@ class _HasToDict(Protocol):
 
 # DECISION_API_FORMAT values; the protocol is configured, never inferred from URL, key, or model.
 _DECISION_FORMATS = ("chat_completions", "decisions")
+
+# Provider usage keys normalized into the envelope's own wire names, per protocol.
+_CHAT_USAGE_KEYS = (("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens"))
+_DECISIONS_USAGE_KEYS = (("input_tokens", "input_tokens"), ("output_tokens", "output_tokens"))
 
 # Exact text shared with decision/ (TypeScript); one model answers every JEV operation.
 _SYSTEM_PROMPT = (
@@ -151,64 +160,130 @@ def _classify_probability(value: object) -> str | None:
     return "no"
 
 
+def _noul_probability(probs: dict[str, JSONValue], qid: str, decision: Mapping[str, JSONValue]) -> None:
+    """Add one noul answer's probability to the merged map, when the answer carries one."""
+    value = decision.get("probability")
+    if isinstance(value, (int, float)):
+        probs[qid] = value
+
+
+def _distribution(probs: dict[str, JSONValue], decision: Mapping[str, JSONValue]) -> None:
+    """Merge one choice answer's label distribution into the merged map."""
+    values = decision.get("probabilities")
+    if isinstance(values, dict):
+        probs.update(values)
+
+
+def _decision_choice(decision: Mapping[str, JSONValue], default: str | None = None) -> str | None:
+    """Choice label of one parsed decision, or the default when it carries none."""
+    choice = decision.get("choice")
+    return choice if isinstance(choice, str) else default
+
+
+def _carried_confidence(confidence: object) -> float | None:
+    """A caller-supplied confidence when it is a probability; None otherwise."""
+    return float(confidence) if _is_prob(confidence) else None
+
+
+def _support_verdict(decisions: Mapping[str, dict[str, JSONValue]], carried: float | None) -> dict[str, JSONValue]:
+    """Shared support/evidence-state verdict of the two final gates."""
+    support = decisions.get("support") or {}
+    ev_state = decisions.get("evidence_state") or {}
+    prob = support.get("probability")
+    probs: dict[str, JSONValue] = {}
+    _noul_probability(probs, "support", support)
+    _distribution(probs, ev_state)
+    ev_choice = _decision_choice(ev_state)
+    return {
+        "probabilities": probs,
+        "confidence": carried,
+        "support": prob,
+        "support_answer": _classify_probability(prob),
+        "evidence_state": ev_choice,
+        "decision": ev_choice,
+    }
+
+
+def _malformed(name: str, qid: str) -> ValueError:
+    """The one error shape for every rejected answer of a question."""
+    return ValueError(f"{name}: malformed_decision_answer for {qid}")
+
+
+def _answer_of(name: str, qid: str, ans: object, kind: str) -> dict[str, JSONValue]:
+    """The answer object of the declared question kind; any other shape is malformed."""
+    if not isinstance(ans, dict) or ans.get("type") != kind:
+        raise _malformed(name, qid)
+    return ans
+
+
+def _probability_map(name: str, qid: str, probs: object) -> dict[str, JSONValue]:
+    """Label to probability map of an answer; every value must be a probability."""
+    if not isinstance(probs, dict):
+        raise _malformed(name, qid)
+    keep: dict[str, JSONValue] = {}
+    for key, value in probs.items():
+        if not _is_prob(value):
+            raise _malformed(name, qid)
+        keep[str(key)] = float(value)
+    return keep
+
+
+def _choice_probabilities(name: str, qid: str, probs: object, options: Mapping[str, str]) -> dict[str, JSONValue]:
+    """Choice probabilities: exactly the declared labels, each a probability, in label order."""
+    if not isinstance(probs, dict) or sorted(probs) != sorted(options) or not all(_is_prob(probs[k]) for k in options):
+        raise _malformed(name, qid)
+    out: dict[str, JSONValue] = {}
+    for label in sorted(options):
+        out[label] = float(probs[label])
+    return out
+
+
+def _score_number(name: str, qid: str, ans: Mapping[str, JSONValue], max_score: float | None) -> int | float:
+    """The ordinal score of a score answer: a finite number inside the rubric range."""
+    score = ans.get("score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+        raise _malformed(name, qid)
+    if max_score is not None and not 0 <= float(score) <= max_score:
+        raise _malformed(name, qid)
+    return score
+
+
 def _parse_noul(name: str, qid: str, ans: object) -> dict[str, JSONValue]:
-    bad = ValueError(f"{name}: malformed_decision_answer for {qid}")
-    if not isinstance(ans, dict) or ans.get("type") != "noul":
-        raise bad
-    if not _is_prob(ans.get("noul")):
-        raise bad
-    return {"kind": "noul", "probability": float(ans["noul"])}
+    value = _answer_of(name, qid, ans, "noul").get("noul")
+    if not _is_prob(value):
+        raise _malformed(name, qid)
+    return {"kind": "noul", "probability": float(value)}
 
 
 def _parse_choice(name: str, qid: str, ans: object, options: Mapping[str, str]) -> dict[str, JSONValue]:
-    bad = ValueError(f"{name}: malformed_decision_answer for {qid}")
-    if not isinstance(ans, dict) or ans.get("type") != "choice":
-        raise bad
-    choice = ans.get("choice")
-    probs = ans.get("probabilities")
-    conf = ans.get("confidence")
+    data = _answer_of(name, qid, ans, "choice")
+    choice = data.get("choice")
     if not isinstance(choice, str) or choice not in options:
-        raise bad
-    if not isinstance(probs, dict) or not isinstance(conf, (int, float)) or isinstance(conf, bool):
-        raise bad
-    want = sorted(options)
-    got = sorted(probs)
-    if got != want or not _is_prob(conf):
-        raise bad
-    out: dict[str, JSONValue] = {}
-    for k in want:
-        if not _is_prob(probs[k]):
-            raise bad
-        out[k] = float(probs[k])
-    return {"kind": "choice", "choice": choice, "probabilities": out, "confidence": float(conf)}
+        raise _malformed(name, qid)
+    confidence = data.get("confidence")
+    if not _is_prob(confidence):
+        raise _malformed(name, qid)
+    return {
+        "kind": "choice",
+        "choice": choice,
+        "probabilities": _choice_probabilities(name, qid, data.get("probabilities"), options),
+        "confidence": float(confidence),
+    }
 
 
 def _parse_score(name: str, qid: str, ans: object, max_score: float | None) -> dict[str, JSONValue]:
-    bad = ValueError(f"{name}: malformed_decision_answer for {qid}")
-    if not isinstance(ans, dict) or ans.get("type") != "score":
-        raise bad
-    score = ans.get("score")
-    if isinstance(score, bool) or not isinstance(score, (int, float)) or not __import__("math").isfinite(score):
-        raise bad
-    if max_score is not None and not 0 <= float(score) <= max_score:
-        raise bad
-    out: dict[str, JSONValue] = {"kind": "score", "score": score}
-    if ans.get("confidence") is not None:
-        if not _is_prob(ans.get("confidence")):
-            raise bad
-        out["confidence"] = float(ans["confidence"])
-    if ans.get("probabilities") is not None:
-        probs = ans.get("probabilities")
-        if not isinstance(probs, dict):
-            raise bad
-        keep: dict[str, JSONValue] = {}
-        for k, v in probs.items():
-            if not _is_prob(v):
-                raise bad
-            keep[str(k)] = float(v)
-        out["probabilities"] = keep
-    if "legend" in ans:
-        out["raw"] = ans["legend"]
+    data = _answer_of(name, qid, ans, "score")
+    out: dict[str, JSONValue] = {"kind": "score", "score": _score_number(name, qid, data, max_score)}
+    confidence = data.get("confidence")
+    if confidence is not None:
+        if not _is_prob(confidence):
+            raise _malformed(name, qid)
+        out["confidence"] = float(confidence)
+    probabilities = data.get("probabilities")
+    if probabilities is not None:
+        out["probabilities"] = _probability_map(name, qid, probabilities)
+    if "legend" in data:
+        out["raw"] = data["legend"]
     return out
 
 
@@ -228,6 +303,40 @@ def _options_from_question(q: object) -> dict[str, str]:
     return {}
 
 
+def _answers_envelope(raw: object, name: str) -> dict[str, JSONValue]:
+    """The answers object of a decision envelope; any other shape is a malformed response."""
+    if not isinstance(raw, dict):
+        raise TypeError(f"{name}: malformed_decision_response")
+    answers = raw.get("answers")
+    if not isinstance(answers, dict):
+        raise TypeError(f"{name}: malformed_decision_response")
+    return answers
+
+
+def _answer_kind(question: object, answer: object) -> object:
+    """Answer kind of one round: the question type when declared, else the answer's own type."""
+    qtype = question.get("type") if isinstance(question, dict) else None
+    atype = answer.get("type") if isinstance(answer, dict) else None
+    return qtype if qtype in ("choice", "score") else atype
+
+
+def _parse_answer(
+    name: str,
+    qid: str,
+    question: JSONValue,
+    answer: JSONValue,
+    choice_options: Mapping[str, Mapping[str, str]] | None,
+) -> dict[str, JSONValue]:
+    """Validate one answer against its question kind."""
+    kind = _answer_kind(question, answer)
+    if kind == "choice":
+        opts = (choice_options or {}).get(qid) or _options_from_question(question)
+        return _parse_choice(name, qid, answer, opts)
+    if kind == "score":
+        return _parse_score(name, qid, answer, _score_max_from_question(question))
+    return _parse_noul(name, qid, answer)
+
+
 def parse_decisions(
     questions: Mapping[str, JSONValue],
     raw: object,
@@ -235,26 +344,10 @@ def parse_decisions(
     name: str = "decide",
 ) -> dict[str, dict[str, JSONValue]]:
     """Validate a raw decision answer envelope into per-question decisions (mirrors askDecisions)."""
-    if not isinstance(raw, dict) or not isinstance(raw.get("answers"), dict):
-        raise TypeError(f"{name}: malformed_decision_response")
-    answers: dict[str, JSONValue] = raw["answers"]
+    answers = _answers_envelope(raw, name)
     if sorted(answers) != sorted(questions):
         raise ValueError(f"{name}: decision answers do not match questions")
-    out: dict[str, dict[str, JSONValue]] = {}
-    for qid in sorted(questions):
-        q = questions[qid]
-        ans = answers[qid]
-        qtype = q.get("type") if isinstance(q, dict) else None
-        atype = ans.get("type") if isinstance(ans, dict) else None
-        kind = qtype if qtype in ("choice", "score") else atype
-        if kind == "choice":
-            opts = (choice_options or {}).get(qid) or _options_from_question(q)
-            out[qid] = _parse_choice(name, qid, ans, opts)
-        elif kind == "score":
-            out[qid] = _parse_score(name, qid, ans, _score_max_from_question(q))
-        else:
-            out[qid] = _parse_noul(name, qid, ans)
-    return out
+    return {qid: _parse_answer(name, qid, questions[qid], answers[qid], choice_options) for qid in sorted(questions)}
 
 
 def _field(obj: object, *names: str, default: JSONValue | None = None) -> JSONValue | None:
@@ -271,54 +364,60 @@ def _field(obj: object, *names: str, default: JSONValue | None = None) -> JSONVa
     return default
 
 
-def _node_dict(node: object) -> dict[str, JSONValue]:
-    raw: dict[str, JSONValue]
-    if isinstance(node, dict):
-        raw = validate_json_mapping(node, "<node_dict>")
-    elif isinstance(node, _HasToDict):
-        got = node.to_dict()
-        raw = validate_json_mapping(got, "<node_dict>") if isinstance(got, dict) else {}
-    else:
-        raw = {}
-        from dataclasses import asdict, is_dataclass
+_NODE_FIELDS = (
+    "node_id",
+    "id",
+    "session_id",
+    "question",
+    "why_it_matters",
+    "depends_on",
+    "status",
+    "evidence_ids",
+    "missing_evidence",
+)
 
-        if is_dataclass(node) and not isinstance(node, type):
-            candidate = asdict(node)
-            raw = validate_json_mapping(candidate, "<node_dict>") if isinstance(candidate, dict) else {}
-        if not raw:
-            for key in (
-                "node_id",
-                "id",
-                "session_id",
-                "question",
-                "why_it_matters",
-                "depends_on",
-                "status",
-                "evidence_ids",
-                "missing_evidence",
-            ):
-                attr: object = getattr(node, key, None)
-                if attr is not None:
-                    raw[key] = validate_json_value(attr, "<node_dict>")
+
+def _dataclass_mapping(node: object) -> dict[str, JSONValue]:
+    """Dataclass fields of a node as a JSON mapping; empty for anything else."""
+    from dataclasses import asdict, is_dataclass
+
+    if is_dataclass(node) and not isinstance(node, type):
+        candidate = asdict(node)
+        return validate_json_mapping(candidate, "<node_dict>") if isinstance(candidate, dict) else {}
+    return {}
+
+
+def _node_attrs(node: object) -> dict[str, JSONValue]:
+    """Attribute fallback for a node that is neither a mapping nor a dataclass."""
+    raw: dict[str, JSONValue] = {}
+    for key in _NODE_FIELDS:
+        attr: object = getattr(node, key, None)
+        if attr is not None:
+            raw[key] = validate_json_value(attr, "<node_dict>")
+    return raw
+
+
+def _node_raw(node: object) -> dict[str, JSONValue]:
+    """Raw node mapping: the node itself, its to_dict, its dataclass fields, or its attributes."""
+    if isinstance(node, dict):
+        return validate_json_mapping(node, "<node_dict>")
+    if isinstance(node, _HasToDict):
+        got = node.to_dict()
+        return validate_json_mapping(got, "<node_dict>") if isinstance(got, dict) else {}
+    raw = _dataclass_mapping(node)
+    return raw if raw else _node_attrs(node)
+
+
+def _node_dict(node: object) -> dict[str, JSONValue]:
+    raw = _node_raw(node)
     out: dict[str, JSONValue] = {}
-    for key in (
-        "node_id",
-        "id",
-        "session_id",
-        "question",
-        "why_it_matters",
-        "depends_on",
-        "status",
-        "evidence_ids",
-        "missing_evidence",
-    ):
+    for key in _NODE_FIELDS:
         value: object = raw.get(key)
         if value is None:
             continue
-        if isinstance(value, tuple):
-            out[key] = validate_json_value(list(value), "<decision_client>: '_node_dict'")
-        else:
-            out[key] = validate_json_value(value, "<decision_client>: '_node_dict'")
+        out[key] = validate_json_value(
+            list(value) if isinstance(value, tuple) else value, "<decision_client>: '_node_dict'"
+        )
     return out
 
 
@@ -358,29 +457,70 @@ def _evidence_ids(
     return ids
 
 
-def _observation_lines(evidence: Sequence[JSONValue] | None) -> list[str]:
+def _evidence_citation(evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None) -> str:
+    """Cited-evidence sentence for a final gate: item count plus the evidence ids on hand."""
+    count = len(evidence) if isinstance(evidence, list) else 0
+    ids = _evidence_ids(evidence)
+    suffix = f" [{','.join(ids)}]" if ids else ""
+    return f"Cited evidence: {count} item(s){suffix}."
+
+
+def _checked_excerpt(text: object, name: str) -> str:
+    """Whitespace-collapsed 2000-char excerpt; raises on blank or non-text input."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError(f"{name}: text required")
+    return " ".join(text.split())[:2000]
+
+
+def _claims_scope(declared: Sequence[JSONValue]) -> str:
+    """Declared-claim count and types sentence for the whole-response question."""
+    types = sorted(
+        {
+            str(c.get("claim_type"))
+            for c in declared
+            if isinstance(c, dict) and isinstance(c.get("claim_type"), str) and c.get("claim_type")
+        }
+    )
+    return f" Declared claims: {len(declared)}" + (f" (types: {','.join(types)})" if types else "") + "."
+
+
+_MAX_OBSERVATION_LINES = 5
+
+
+def _observed_summary(item: Mapping[str, JSONValue]) -> str | None:
+    """Summary text of a ctx observation record; None when the record is admitted or empty."""
+    if item.get("evidence_id") or item.get("id"):
+        return None
+    summary = item.get("outcome_summary")
+    return summary if isinstance(summary, str) and summary.strip() else None
+
+
+def _observation_line(item: Mapping[str, JSONValue], summary: str) -> str:
+    """One observation line: tool label, optional result ref, then the failure or the clipped summary."""
+    tool = item.get("tool")
+    head = str(tool) if isinstance(tool, str) and tool else "tool"
+    ref = item.get("tool_result_ref")
+    if isinstance(ref, str) and ref.strip():
+        head += f" ref={ref.strip()[:60]}"
+    error = item.get("error")
+    if isinstance(error, str) and error.strip():
+        return f"{head} FAILED: {error.strip()[:200]}"
+    return f"{head}: {' '.join(summary.split())[:200]}"
+
+
+def _observation_lines(evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None) -> list[str]:
     """Recent unadmitted tool observations (ctx evidence without an evidence id)."""
-    lines: list[str] = []
     if not isinstance(evidence, list):
-        return lines
-    for item in evidence[-10:]:
-        if not isinstance(item, dict) or item.get("evidence_id") or item.get("id"):
+        return []
+    lines: list[str] = []
+    for item in evidence[-_OBSERVATION_TAIL:]:
+        if not isinstance(item, dict):
             continue
-        summary = item.get("outcome_summary")
-        if not isinstance(summary, str) or not summary.strip():
+        summary = _observed_summary(item)
+        if summary is None:
             continue
-        tool = item.get("tool")
-        ref = item.get("tool_result_ref")
-        head = str(tool) if isinstance(tool, str) and tool else "tool"
-        if isinstance(ref, str) and ref.strip():
-            head += f" ref={ref.strip()[:60]}"
-        error = item.get("error")
-        if isinstance(error, str) and error.strip():
-            head += f" FAILED: {error.strip()[:200]}"
-        else:
-            head += f": {' '.join(summary.split())[:200]}"
-        lines.append(head)
-        if len(lines) >= 5:
+        lines.append(_observation_line(item, summary))
+        if len(lines) >= _MAX_OBSERVATION_LINES:
             break
     return lines
 
@@ -395,7 +535,7 @@ def _clip(value: JSONValue | None) -> str | None:
     return value[:_COMPACT_TEXT] if isinstance(value, str) else None
 
 
-def _records(items: Sequence[JSONValue] | None, label: str) -> Sequence[JSONValue]:
+def _records(items: Sequence[JSONValue] | Mapping[str, JSONValue] | None, label: str) -> Sequence[JSONValue]:
     """None as empty. A mapping is a caller defect, never silently dropped."""
     if isinstance(items, Mapping):
         raise TypeError(f"jev {label} must be a sequence of records, not a mapping")
@@ -480,6 +620,119 @@ def _manifest_line(entry: Mapping[str, JSONValue]) -> str:
     return line
 
 
+def _registry_options(registry: Sequence[object], options: dict[str, str], name: str) -> None:
+    """Add every registry entry to options; a nameless or duplicate entry is a defect."""
+    for entry in registry:
+        if not isinstance(entry, dict) or not isinstance(tool_name := entry.get("name"), str) or not tool_name:
+            raise ValueError(f"{name}: registry entry needs a name")
+        if tool_name in options:
+            raise ValueError(f"{name}: duplicate tool {tool_name}")
+        options[tool_name] = _manifest_line(entry)
+
+
+def _tool_options(registry: Sequence[Mapping[str, JSONValue]]) -> dict[str, str]:
+    """Selection options: the whole registry plus the two sentinels; raises on a defective registry."""
+    options: dict[str, str] = {}
+    _registry_options(registry, options, "tool_selection")
+    for key, desc in _SENTINEL_DESCRIPTIONS.items():
+        if key in options:
+            raise ValueError(f"tool_selection: registry collides with sentinel {key}")
+        options[key] = desc
+    return options
+
+
+def _evidence_line(evidence: Sequence[JSONValue] | None) -> str:
+    """Evidence-count sentence for the selection question, naming the evidence ids on hand."""
+    count = len(evidence) if isinstance(evidence, list) else 0
+    ids = _evidence_ids(evidence)
+    suffix = f" [{','.join(ids)}]" if ids else ""
+    return f" Evidence on hand: {count} item(s){suffix}."
+
+
+def _failed_attempt(attempt: object) -> tuple[str, str] | None:
+    """Tool name plus error of one failed attempt record; None for anything else."""
+    if not isinstance(attempt, dict):
+        return None
+    tool = attempt.get("tool")
+    error = attempt.get("error")
+    if not isinstance(tool, str) or not isinstance(error, str):
+        return None
+    return (tool, error) if tool and error else None
+
+
+def _prior_failures(attempts: Sequence[JSONValue] | None) -> str:
+    """Failure lines of the last attempts, so JEV never repeats a failed call."""
+    if not isinstance(attempts, list):
+        return ""
+    pairs: list[tuple[str, str]] = []
+    for attempt in attempts:
+        pair = _failed_attempt(attempt)
+        if pair is not None:
+            pairs.append(pair)
+    recent = pairs[-_MAX_PRIOR_FAILURES:]
+    return "".join(f" Prior attempt {tool} failed: {error[:200]}." for tool, error in recent)
+
+
+def _today_guidance() -> str:
+    """Relative-date decoding guidance shared by the selection and post-tool questions."""
+    return (
+        f"Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: "
+        "'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, "
+        "'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); "
+        "'today'/'now' = Today UTC date; "
+        "never pass phrases like 'this week'/'today'/'last quarter' as arg values."
+    )
+
+
+def _hint_text(stamped: object, question: object) -> str:
+    """Question text used for the revenue hints (the same string the question shows)."""
+    if isinstance(stamped, str):
+        return stamped
+    return question if isinstance(question, str) else ""
+
+
+def _revenue_hint(text: str) -> str:
+    """Question-shaped steering for SEC paging (revenue questions only)."""
+    low = text.lower()
+    if "revenue" not in low:
+        return ""
+    latest = re.search(r"\b(?:latest|most recent)\b", low)
+    if re.search(r"\b10-?\s?q\b", low) and latest:
+        return " Latest-10-Q revenue answers come from the 10-Q, not the 8-K: after the filing list, open the 10-Q accession via get_sec_document section reads (Item 1, Item 2, Item 1A) before re-reading any 8-K."
+    if "quarter" in low:
+        return " Revenue-quarter answers come from the 10-Q (MD&A/segment revenue), not the 8-K: after the filing list, open the 10-Q accession via get_sec_document with a revenue query before re-reading any 8-K."
+    if latest:
+        return " Latest revenue means the latest reported financial period. List 10-Q/10-K filings without invented start/end dates. Open the selected accession with a revenue query. State whether the figure covers a quarter or a year."
+    return ""
+
+
+def _selection_prompt(
+    node: Mapping[str, JSONValue],
+    node_id: JSONValue,
+    question: JSONValue,
+    evidence: Sequence[JSONValue] | None,
+    attempts: Sequence[JSONValue] | None,
+) -> str:
+    """Selection instructions: the node question, evidence on hand, prior failures, and date guidance."""
+    stamped = query_with_today_utc(question) if isinstance(question, str) else question
+    prompt = (
+        f"Which single tool runs next for research node {node_id}? Question: {stamped} "
+        "JEV owns this selection and every transition over the whole canonical registry; "
+        "Needle runs args only and never selects, chains, or judges. Choose exactly one winner."
+    )
+    why = node.get("why_it_matters")
+    if isinstance(why, str) and why:
+        prompt += f" Why it matters: {why}"
+    prompt += _evidence_line(evidence)
+    for line in _observation_lines(evidence):
+        prompt += f" Observed {line}."
+    prompt += _prior_failures(attempts)
+    prompt += " " + _today_guidance()
+    prompt += " Search packets list candidates only — page with research_read_search beyond display_limit and open each accession via get_sec_filing/get_sec_document until answered or guard trips."
+    prompt += _revenue_hint(_hint_text(stamped, question))
+    return prompt
+
+
 def _tool_options_prompt(
     registry: Sequence[Mapping[str, JSONValue]],
     node: Mapping[str, JSONValue],
@@ -492,109 +745,118 @@ def _tool_options_prompt(
     question = node.get("question")
     if not node_id or not question:
         raise ValueError("tool_selection: node needs nodeId and question")
-    options: dict[str, str] = {}
-    for entry in registry:
-        name = entry.get("name") if isinstance(entry, dict) else None
-        if not isinstance(name, str) or not name:
-            raise ValueError("tool_selection: registry entry needs a name")
-        if name in options:
-            raise ValueError(f"tool_selection: duplicate tool {name}")
-        options[name] = _manifest_line(entry) if isinstance(entry, dict) else name
-    for key, desc in _SENTINEL_DESCRIPTIONS.items():
-        if key in options:
-            raise ValueError(f"tool_selection: registry collides with sentinel {key}")
-        options[key] = desc
-    stamped = query_with_today_utc(question) if isinstance(question, str) else question
-    prompt = f"Which single tool runs next for research node {node_id}? Question: {stamped} JEV owns this selection and every transition over the whole canonical registry; Needle runs args only and never selects, chains, or judges. Choose exactly one winner."
-    why = node.get("why_it_matters")
-    if isinstance(why, str) and why:
-        prompt += f" Why it matters: {why}"
-    ids = _evidence_ids(evidence)
-    count = len(evidence) if isinstance(evidence, list) else 0
-    prompt += f" Evidence on hand: {count} item(s){f' [{chr(44).join(ids)}]' if ids else ''}."
-    for line in _observation_lines(evidence):
-        prompt += f" Observed {line}."
-    if isinstance(attempts, list):
-        recent: list[tuple[str, str]] = []
-        for attempt in attempts:
-            if not isinstance(attempt, dict):
-                continue
-            tool = attempt.get("tool")
-            error = attempt.get("error")
-            if isinstance(tool, str) and isinstance(error, str) and tool and error:
-                recent.append((tool, error))
-        for tool, error in recent[-_MAX_PRIOR_FAILURES:]:
-            prompt += f" Prior attempt {tool} failed: {error[:200]}."
-    prompt += f" Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values."
-    prompt += " Search packets list candidates only — page with research_read_search beyond display_limit and open each accession via get_sec_filing/get_sec_document until answered or guard trips."
-    _qtext = stamped if isinstance(stamped, str) else (question if isinstance(question, str) else "")
-    _qlow = _qtext.lower()
-    if "revenue" in _qlow and re.search(r"\b10-?\s?q\b", _qlow) and re.search(r"\b(?:latest|most recent)\b", _qlow):
-        prompt += " Latest-10-Q revenue answers come from the 10-Q, not the 8-K: after the filing list, open the 10-Q accession via get_sec_document section reads (Item 1, Item 2, Item 1A) before re-reading any 8-K."
-    elif "revenue" in _qlow and "quarter" in _qlow:
-        prompt += " Revenue-quarter answers come from the 10-Q (MD&A/segment revenue), not the 8-K: after the filing list, open the 10-Q accession via get_sec_document with a revenue query before re-reading any 8-K."
-    elif "revenue" in _qlow and re.search(r"\b(?:latest|most recent)\b", _qlow):
-        prompt += " Latest revenue means the latest reported financial period. List 10-Q/10-K filings without invented start/end dates. Open the selected accession with a revenue query. State whether the figure covers a quarter or a year."
-    return options, prompt
+    return _tool_options(registry), _selection_prompt(node, node_id, question, evidence, attempts)
 
 
-def _auto_registry() -> list[dict[str, JSONValue]]:
-    try:
-        from app.research.scheduler import build_registry
-
-        reg = build_registry()
-        if reg:
-            return reg
-    except ImportError, AttributeError:
-        pass
-    from app.policy import Capability
-    from app.security.action_policy import TOOL_DOMAINS
-    from app.tools import TOOL_DISCOVERY_REGISTRY, tools_for_capabilities
-
+def _scheduler_metadata() -> tuple[frozenset[str], frozenset[str]]:
+    """Scheduler handle/blind sets; empty sets when the scheduler cannot supply them."""
     try:  # scheduler import failed above; reuse its handle/blind lists when available
-        from app.research.scheduler import _HANDLE_PARAMS as _HANDLES
-        from app.research.scheduler import _PIT_BLIND_TOOLS as _BLIND
+        from app.research.scheduler import _HANDLE_PARAMS as handles
+        from app.research.scheduler import _PIT_BLIND_TOOLS as blind
     except ImportError, AttributeError:
-        _HANDLES = frozenset()
-        _BLIND = frozenset()
+        return frozenset(), frozenset()
+    return handles, blind
 
+
+def _discovery_fields(meta: ToolDiscovery | None) -> dict[str, str]:
+    """Discovery metadata in manifest order; empty fields when the tool declares none."""
+    if meta is None:
+        names = ("purpose", "outputKind", "evidence", "intent", "useWhen", "avoidWhen", "conflicts", "nextTools")
+        return dict.fromkeys(names, "")
+    return {
+        "purpose": meta.summary,
+        "outputKind": meta.output_kind,
+        "evidence": meta.output_kind,
+        "intent": meta.intent,
+        "useWhen": "; ".join(meta.choose_when),
+        "avoidWhen": "; ".join(meta.reject_when),
+        "conflicts": ", ".join(meta.conflicts_with),
+        "nextTools": ", ".join(meta.related_tools),
+    }
+
+
+def _tool_params(fn: Mapping[str, object]) -> dict[str, JSONValue]:
+    """Parameter schema of a canonical tool; an absent or malformed schema becomes empty."""
+    params = fn.get("parameters")
+    return dict(params) if isinstance(params, dict) else {}
+
+
+def _required_params(params: Mapping[str, JSONValue]) -> list[str]:
+    """Required parameter names as strings; a non-list schema value means none."""
+    required = params.get("required")
+    return [str(k) for k in required if isinstance(k, str)] if isinstance(required, list) else []
+
+
+def _needs_line(required: Sequence[str], handles: frozenset[str]) -> str:
+    """Prerequisite line naming the required params that are upstream handles."""
+    needs = [k for k in required if k in handles]
+    return f"needs {', '.join(needs)}" if needs else ""
+
+
+def _fallback_entry(
+    fn: Mapping[str, object],
+    *,
+    handles: frozenset[str],
+    blind: frozenset[str],
+) -> dict[str, JSONValue] | None:
+    """One degraded-path manifest; None when the tool entry has no usable name."""
+    from app.security.action_policy import TOOL_DOMAINS
+    from app.tools import TOOL_DISCOVERY_REGISTRY
+
+    name = fn.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    params = _tool_params(fn)
+    required = _required_params(params)
+    description = fn.get("description")
+    discovery = _discovery_fields(TOOL_DISCOVERY_REGISTRY.get(name))
+    return {
+        "name": name,
+        "domain": TOOL_DOMAINS.get(name, "unknown"),
+        "description": description if isinstance(description, str) else "",
+        "purpose": discovery["purpose"],
+        "keyInputs": f"req({', '.join(required)})" if required else "req()",
+        "outputKind": discovery["outputKind"],
+        "evidence": discovery["evidence"],
+        "prerequisites": _needs_line(required, handles),
+        # ponytail: degraded path (scheduler unimportable); blind list best-effort.
+        "pitSupport": "PIT-blind: current state only" if name in blind else "PIT-scoped",
+        "intent": discovery["intent"],
+        "useWhen": discovery["useWhen"],
+        "avoidWhen": discovery["avoidWhen"],
+        "conflicts": discovery["conflicts"],
+        "nextTools": discovery["nextTools"],
+        "parameters": params,
+    }
+
+
+def _fallback_registry() -> list[dict[str, JSONValue]]:
+    """Degraded registry: the canonical RESEARCH tools rebuilt when the scheduler is unimportable."""
+    from app.policy import Capability
+    from app.tools import tools_for_capabilities
+
+    handles, blind = _scheduler_metadata()
     out: list[dict[str, JSONValue]] = []
     for tool in tools_for_capabilities(frozenset({Capability.RESEARCH})):
         fn = tool.get("function") if isinstance(tool, dict) else None
         if not isinstance(fn, dict):
             continue
-        name = fn.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        params = fn.get("parameters")
-        params = dict(params) if isinstance(params, dict) else {}
-        required = params.get("required")
-        req_list: list[str] = [str(k) for k in required if isinstance(k, str)] if isinstance(required, list) else []
-        required = req_list
-        meta = TOOL_DISCOVERY_REGISTRY.get(name)
-        out.append(
-            {
-                "name": name,
-                "domain": TOOL_DOMAINS.get(name, "unknown"),
-                "description": fn.get("description") if isinstance(fn.get("description"), str) else "",
-                "purpose": meta.summary if meta is not None else "",
-                "keyInputs": f"req({', '.join(required)})" if required else "req()",
-                "outputKind": meta.output_kind if meta is not None else "",
-                "evidence": meta.output_kind if meta is not None else "",
-                "prerequisites": f"needs {', '.join(needs)}"
-                if (needs := [k for k in required if k in _HANDLES])
-                else "",
-                # ponytail: degraded path (scheduler unimportable); blind list best-effort.
-                "pitSupport": "PIT-blind: current state only" if name in _BLIND else "PIT-scoped",
-                "intent": meta.intent if meta is not None else "",
-                "useWhen": "; ".join(meta.choose_when) if meta is not None else "",
-                "avoidWhen": "; ".join(meta.reject_when) if meta is not None else "",
-                "conflicts": ", ".join(meta.conflicts_with) if meta is not None else "",
-                "nextTools": ", ".join(meta.related_tools) if meta is not None else "",
-                "parameters": params,
-            }
-        )
+        entry = _fallback_entry(fn, handles=handles, blind=blind)
+        if entry is not None:
+            out.append(entry)
     return out
+
+
+def _auto_registry() -> list[dict[str, JSONValue]]:
+    """Canonical registry: the scheduler's manifests, or a degraded rebuild when it is unimportable."""
+    reg: list[dict[str, JSONValue]] | None = None
+    try:
+        from app.research.scheduler import build_registry
+
+        reg = build_registry()
+    except ImportError, AttributeError:
+        reg = None
+    return reg or _fallback_registry()
 
 
 def _entry_route_options(registry: Sequence[Mapping[str, JSONValue]] | None) -> dict[str, str]:
@@ -604,13 +866,7 @@ def _entry_route_options(registry: Sequence[Mapping[str, JSONValue]] | None) -> 
         if not reg:
             raise ValueError("route_entry: empty registry")
         options: dict[str, str] = dict(_ENTRY_OPTIONS)
-        for entry in reg:
-            name = entry.get("name") if isinstance(entry, dict) else None
-            if not isinstance(name, str) or not name:
-                raise ValueError("route_entry: registry entry needs a name")
-            if name in options:
-                raise ValueError(f"route_entry: duplicate tool {name}")
-            options[name] = _manifest_line(entry)
+        _registry_options(reg, options, "route_entry")
     except Exception as exc:
         logger.warning(
             "toolflow route_defect sid=- nid=- registry=%d err=%s: %s",
@@ -656,27 +912,81 @@ def _rank_prob(item: tuple[str, float]) -> float:
     return item[1]
 
 
+def _ranked_probabilities(probs: object) -> list[tuple[str, float]]:
+    """Probability entries of one decision, highest first; a non-mapping means none."""
+    if not isinstance(probs, dict):
+        return []
+    floats = {str(k): float(v) for k, v in probs.items() if _is_prob(v)}
+    return sorted(floats.items(), key=_rank_prob, reverse=True)
+
+
+def _choice_line(decision: Mapping[str, JSONValue]) -> str:
+    """Winner + confidence + top-3 + margin one-liner."""
+    winner = decision.get("choice")
+    name = winner if isinstance(winner, str) and winner else "-"
+    conf = decision.get("confidence")
+    shown = f"{float(conf):.2f}" if isinstance(conf, (int, float)) and not isinstance(conf, bool) else "-"
+    ranked = _ranked_probabilities(decision.get("probabilities"))
+    top = ",".join(f"{k}:{v:.2f}" for k, v in ranked[:3])
+    margin = ranked[0][1] - ranked[1][1] if len(ranked) >= 2 else 0.0
+    return f"winner={name} conf={shown} top3=[{top}] margin={margin:.2f}"
+
+
 def _choice_summary(decision: object) -> str:
     """Winner + confidence + top-3 + margin one-liner; never raises (logging only)."""
     try:
         if not isinstance(decision, dict):
             return "winner=- conf=- top3=[] margin=0.00"
-        winner = decision.get("choice")
-        w = winner if isinstance(winner, str) and winner else "-"
-        conf = decision.get("confidence")
-        c = f"{float(conf):.2f}" if isinstance(conf, (int, float)) and not isinstance(conf, bool) else "-"
-        probs = decision.get("probabilities")
-        floats: dict[str, float] = {}
-        if isinstance(probs, dict):
-            for k, v in probs.items():
-                if _is_prob(v):
-                    floats[str(k)] = float(v)
-        ranked = sorted(floats.items(), key=_rank_prob, reverse=True)
-        top = ",".join(f"{k}:{v:.2f}" for k, v in ranked[:3])
-        margin = ranked[0][1] - ranked[1][1] if len(ranked) >= 2 else 0.0
-        return f"winner={w} conf={c} top3=[{top}] margin={margin:.2f}"
+        return _choice_line(decision)
     except IndexError, TypeError, ValueError, AttributeError:
         return "winner=? conf=? top3=[] margin=?"
+
+
+def _defect(event: str, sid_s: str, nid_s: str, detail: str) -> None:
+    """One warning shape for every rejected tool-selection decision."""
+    logger.warning("toolflow %s_defect sid=%s nid=%s %s", event, sid_s, nid_s, detail)
+
+
+def _tool_decision_fields(
+    decision: Mapping[str, object],
+    sid_s: str,
+    nid_s: str,
+    event: str,
+) -> tuple[str, dict[str, float], dict[str, JSONValue], float | None]:
+    """Winner, float probabilities, validated probabilities and confidence of one selection decision."""
+    winner = decision.get("choice")
+    probs = decision.get("probabilities")
+    if not isinstance(winner, str) or not isinstance(probs, dict):
+        _defect(event, sid_s, nid_s, "err=malformed_decision")
+        raise TypeError("decide: malformed tool_selection decision")
+    try:
+        floats: dict[str, float] = {str(k): float(v) for k, v in probs.items()}
+    except (TypeError, ValueError) as exc:
+        _defect(event, sid_s, nid_s, f"winner={winner!r} err=malformed_probabilities")
+        raise TypeError(f"decide: malformed tool_selection probabilities: {exc}") from exc
+    probabilities = validate_json_mapping(floats, "<decision_client>: 'probabilities'")
+    conf = decision.get("confidence")
+    confidence = float(conf) if isinstance(conf, (int, float)) and not isinstance(conf, bool) else None
+    return winner, floats, probabilities, confidence
+
+
+def _tool_fanout(winner: str, floats: Mapping[str, float], registry: set[str]) -> tuple[str, ...]:
+    """Winner plus the close runner-ups that run in parallel (floor, window, and cap)."""
+    winner_prob = floats.get(winner, 0.0)
+
+    def _rank_key(tool: str) -> float:
+        return floats.get(tool, 0.0)
+
+    ranked = sorted(
+        (
+            tool
+            for tool in registry
+            if floats.get(tool, 0.0) >= _PARALLEL_MIN_PROB and floats.get(tool, 0.0) >= winner_prob - _PARALLEL_WINDOW
+        ),
+        key=_rank_key,
+        reverse=True,
+    )[:_PARALLEL_CAP]
+    return (winner, *(tool for tool in ranked if tool != winner))[:_PARALLEL_CAP]
 
 
 def _args_summary(args: Mapping[str, JSONValue]) -> str:
@@ -686,6 +996,11 @@ def _args_summary(args: Mapping[str, JSONValue]) -> str:
         return f"argkeys=[{','.join(sorted(str(k) for k in args))}] argbytes={size}"
     except TypeError, ValueError:
         return "argkeys=[] argbytes=?"
+
+
+def _nonbool_int(value: object) -> int | None:
+    """A provider token count, or None for anything else (bools are not counts)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _jev_usage(raw: object) -> tuple[int | None, int | None, str | None]:
@@ -698,13 +1013,47 @@ def _jev_usage(raw: object) -> tuple[int | None, int | None, str | None]:
         usage = raw.get("usage")
         if not isinstance(usage, dict):
             return None, None, model
-        in_raw = usage.get("input_tokens")
-        out_raw = usage.get("output_tokens")
-        jev_in = in_raw if isinstance(in_raw, int) and not isinstance(in_raw, bool) else None
-        jev_out = out_raw if isinstance(out_raw, int) and not isinstance(out_raw, bool) else None
-        return jev_in, jev_out, model
+        return _nonbool_int(usage.get("input_tokens")), _nonbool_int(usage.get("output_tokens")), model
     except TypeError, ValueError, AttributeError:
         return None, None, None
+
+
+def _log_id(value: object) -> str:
+    """Log-safe id: the string when present, "-" otherwise."""
+    return value if isinstance(value, str) and value else "-"
+
+
+def _optional_str(value: object) -> str | None:
+    """The string value, or None (for params typed str | None)."""
+    return value if isinstance(value, str) else None
+
+
+def _context_size(context: object) -> int:
+    """Record count for logs; a mapping (caller defect) still reports its size."""
+    return len(context) if isinstance(context, (list, dict)) else 0
+
+
+def _node_view(node: object) -> tuple[dict[str, JSONValue], JSONValue]:
+    """Projected node plus its id (node_id first, then id)."""
+    node_d = _node_dict(node)
+    return node_d, node_d.get("node_id") or node_d.get("id")
+
+
+def _option_sizes(choice_options: object) -> object:
+    """Log-safe option sizes: question id to criterion count, "-" when no options were passed."""
+    if not isinstance(choice_options, Mapping):
+        return "-"
+    return {str(k): (len(v) if isinstance(v, Mapping) else -1) for k, v in choice_options.items()}
+
+
+def _require_decision_request(decision_type: object, session_id: object, questions: object) -> None:
+    """Reject a request that cannot be a decision before any transport starts."""
+    if not decision_type or not isinstance(decision_type, str):
+        raise ValueError("decide: decision_type required")
+    if not session_id or not isinstance(session_id, str):
+        raise ValueError("decide: session_id required")
+    if not isinstance(questions, Mapping) or not questions:
+        raise ValueError("decide: missing_questions")
 
 
 def _decision_setting(name: str) -> str:
@@ -731,44 +1080,68 @@ def _http_error_text(exc: urllib.error.HTTPError, key: str) -> str:
     return text.replace(key, "[redacted]")[:300]
 
 
-def _decision_envelope(body: bytes, model: str, api_format: str) -> dict[str, JSONValue]:
-    """Normalize one Chat Completions or native Decisions body to {answers, model, usage?}; raise on any defect."""
+def _envelope_error(reason: str) -> TypeError:
+    """One error shape for every rejected provider body."""
+    return TypeError(f"decide: malformed_decision_response: {reason}")
 
-    def bad(reason: str) -> TypeError:
-        return TypeError(f"decide: malformed_decision_response: {reason}")
 
-    def reject_constant(value: str) -> None:
-        raise bad("non-JSON number")
+def _reject_constant(value: str) -> None:
+    """NaN and Infinity are not JSON; reject them while parsing."""
+    raise _envelope_error("non-JSON number")
 
+
+def _json_object(text: str, reason: str) -> object:
+    """Parse one JSON document; a parse failure is the named envelope defect."""
     try:
-        resp = json.loads(body.decode(), parse_constant=reject_constant)
+        parsed: object = json.loads(text, parse_constant=_reject_constant)
     except ValueError:
-        raise bad("body is not JSON") from None
-    usage_keys = (("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens"))
-    if api_format == "decisions":
-        if not isinstance(resp, dict):
-            raise bad("body is not a JSON object")
-        parsed = resp
-        usage_keys = (("input_tokens", "input_tokens"), ("output_tokens", "output_tokens"))
-    else:
-        choices = resp.get("choices") if isinstance(resp, dict) else None
-        first = choices[0] if isinstance(choices, list) and choices else None
-        message = first.get("message") if isinstance(first, dict) else None
-        if not isinstance(first, dict) or not isinstance(message, dict):
-            raise bad("no choices")
-        if message.get("refusal"):
-            raise bad("refusal")
-        if first.get("finish_reason") == "length":
-            raise bad("truncated")
-        content = message.get("content")
-        if not isinstance(content, str) or not content.strip():
-            raise bad("empty content")
-        try:
-            parsed = json.loads(content, parse_constant=reject_constant)
-        except ValueError:
-            raise bad("content is not JSON") from None
-        if not isinstance(parsed, dict):
-            raise bad("content is not an object")
+        raise _envelope_error(reason) from None
+    return parsed
+
+
+def _first_choice(resp: object) -> tuple[Mapping[str, JSONValue], Mapping[str, JSONValue]]:
+    """First chat completion choice and its message; raises when the body has no usable choice."""
+    choices = resp.get("choices") if isinstance(resp, dict) else None
+    first = choices[0] if isinstance(choices, list) and choices else None
+    message = first.get("message") if isinstance(first, dict) else None
+    if not isinstance(first, dict) or not isinstance(message, dict):
+        raise _envelope_error("no choices")
+    return first, message
+
+
+def _chat_content(resp: object) -> Mapping[str, JSONValue]:
+    """Parsed content object of the first chat completion choice; raises on refusal, truncation, or empty content."""
+    choice, message = _first_choice(resp)
+    if message.get("refusal"):
+        raise _envelope_error("refusal")
+    if choice.get("finish_reason") == "length":
+        raise _envelope_error("truncated")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise _envelope_error("empty content")
+    parsed = _json_object(content, "content is not JSON")
+    if not isinstance(parsed, dict):
+        raise _envelope_error("content is not an object")
+    return parsed
+
+
+def _usage_counts(usage: Mapping[str, object], usage_keys: tuple[tuple[str, str], ...]) -> dict[str, JSONValue]:
+    """Token counts of a provider body, keyed by the envelope's wire names."""
+    out: dict[str, JSONValue] = {}
+    for src, dst in usage_keys:
+        value = usage.get(src)
+        if isinstance(value, int) and not isinstance(value, bool):
+            out[dst] = value
+    return out
+
+
+def _envelope_out(
+    resp: Mapping[str, JSONValue],
+    parsed: Mapping[str, JSONValue],
+    usage_keys: tuple[tuple[str, str], ...],
+    model: str,
+) -> dict[str, JSONValue]:
+    """Normalized envelope: answers, the reported or configured model, and any usage counts."""
     reported = resp.get("model")
     out: dict[str, JSONValue] = {
         "answers": parsed.get("answers"),
@@ -776,12 +1149,273 @@ def _decision_envelope(body: bytes, model: str, api_format: str) -> dict[str, JS
     }
     usage = resp.get("usage")
     if isinstance(usage, dict):
-        out["usage"] = {
-            dst: usage[src]
-            for src, dst in usage_keys
-            if isinstance(usage.get(src), int) and not isinstance(usage.get(src), bool)
-        }
+        out["usage"] = _usage_counts(usage, usage_keys)
     return out
+
+
+def _decision_envelope(body: bytes, model: str, api_format: str) -> dict[str, JSONValue]:
+    """Normalize one Chat Completions or native Decisions body to {answers, model, usage?}; raise on any defect."""
+    try:
+        text = body.decode()
+    except UnicodeDecodeError:
+        raise _envelope_error("body is not JSON") from None
+    raw = _json_object(text, "body is not JSON")
+    if api_format == "decisions":
+        if not isinstance(raw, dict):
+            raise _envelope_error("body is not a JSON object")
+        return _envelope_out(raw, raw, _DECISIONS_USAGE_KEYS, model)
+    if not isinstance(raw, dict):
+        raise _envelope_error("no choices")
+    return _envelope_out(raw, _chat_content(raw), _CHAT_USAGE_KEYS, model)
+
+
+def _typed_decisions(decisions: Mapping[str, JSONValue]) -> dict[str, dict[str, JSONValue]]:
+    """Per-question decisions of a sidecar reply; any other shape is a malformed response."""
+    typed: dict[str, dict[str, JSONValue]] = {}
+    for qid, value in validate_json_mapping(decisions, "<decision_client>: 'decisions'").items():
+        if not isinstance(value, dict):
+            raise TypeError("decide: malformed sidecar response")
+        typed[qid] = validate_json_mapping(value, "<decision_client>: 'decision'")
+    return typed
+
+
+def _sidecar_decisions(
+    payload: Mapping[str, JSONValue],
+    response: object,
+) -> tuple[dict[str, dict[str, JSONValue]], JSONValue]:
+    """Typed decisions plus the provider raw envelope from one sidecar reply."""
+    if not isinstance(response, dict) or response.get("id") != payload["id"]:
+        raise TypeError("decide: malformed sidecar response")
+    if "error" in response:
+        raise RuntimeError(f"decide: {response['error']}")
+    decisions = response.get("decisions")
+    if not isinstance(decisions, dict) or not decisions:
+        raise TypeError("decide: malformed sidecar response")
+    return _typed_decisions(decisions), validate_json_value(response.get("raw"), "<raw>")
+
+
+def _route_text(prompt: object) -> str:
+    """Today-stamped entry prompt text; a blank or non-text prompt is a defect."""
+    text = query_with_today_utc(prompt.strip()) if isinstance(prompt, str) else ""
+    if not text:
+        logger.warning("toolflow route_defect sid=- nid=- err=blank_prompt")
+        raise ValueError("route_entry: blank prompt")
+    return text
+
+
+def _check_route_hint(route_hint: str | None) -> None:
+    """A blank route hint is a defect; None keeps the programmatic route."""
+    if route_hint is not None and not route_hint.strip():
+        logger.warning("toolflow route_defect sid=- nid=- err=blank_route_hint")
+        raise ValueError("route_entry: blank route_hint")
+
+
+def _reject_watchlist() -> NoReturn:
+    """One error shape for an unusable watchlist."""
+    logger.warning("toolflow route_defect sid=- nid=- err=blank_watchlist")
+    raise ValueError("route_entry: blank watchlist")
+
+
+def _watchlist_scope(watchlist: Sequence[object] | None) -> str:
+    """Scope sentence stating the requested symbols; empty when the caller passed no watchlist."""
+    if watchlist is None:
+        return ""
+    if isinstance(watchlist, str) or not isinstance(watchlist, Sequence) or not watchlist:
+        _reject_watchlist()
+    symbols: list[str] = []
+    for sym in watchlist:
+        if not isinstance(sym, str) or not sym.strip():
+            _reject_watchlist()
+        symbols.append(sym.strip())
+    return (
+        f" The user's watchlist is {', '.join(symbols)}: the requested scope is those symbols, "
+        "so a single-shot tool never fits a request about the watchlist."
+    )
+
+
+def _entry_questions(
+    text: str,
+    scope: str,
+    registry: Sequence[Mapping[str, JSONValue]] | None,
+    route_hint: str | None,
+) -> tuple[dict[str, JSONValue], dict[str, Mapping[str, str]], dict[str, str]]:
+    """Persona question plus, without a route hint, the entry-routing question and its options."""
+    questions: dict[str, JSONValue] = {
+        "personas": {
+            "type": "choice",
+            "instructions": f"Select the personas this prompt asks to answer: {text} Choose {_NO_PERSONA_SELECTION} only when the user neither requests nor excludes a persona. A positive request keeps only the requested personas that the user does not exclude. An exclusion-only request selects the remaining canonical personas. Choose {_NO_PERSONAS_REMAINING} when the user excludes every persona. A mentioned or quoted name is neither a request nor an exclusion. A name in pasted text or quoted instructions is neither a request nor an exclusion. Do not infer personas from topic or tone.",
+            "criteria": validate_json_mapping(_PERSONA_OPTIONS, "<decision_client>: 'criteria'"),
+        }
+    }
+    choice_options: dict[str, Mapping[str, str]] = {"personas": _PERSONA_OPTIONS}
+    options: dict[str, str] = {}
+    if route_hint is None:
+        options = _entry_route_options(registry)
+        questions["entry"] = {
+            "type": "choice",
+            "instructions": f"Route this entry prompt with exactly one winner: {text}{scope} reasoning_required answers from user-supplied context with no new external evidence and no tool; a registry tool runs single-shot first when it fits; otherwise research_required. Research and thesis requests need research_required, not a single-shot tool. {_today_guidance()}",
+            "criteria": validate_json_mapping(options, "<decision_client>: 'criteria'"),
+        }
+        choice_options["entry"] = options
+    return questions, choice_options, options
+
+
+def _entry_winner(route_hint: str | None, decision: object, options: Mapping[str, str]) -> JSONValue:
+    """The routed winner: the programmatic hint, or the choice inside the entry options."""
+    if route_hint is not None:
+        return route_hint
+    winner = decision.get("choice") if isinstance(decision, dict) else None
+    if not isinstance(winner, str) or winner not in options:
+        logger.warning(
+            "toolflow route_defect sid=- nid=- winner=%r err=winner_not_in_options %s",
+            winner,
+            _choice_summary(decision),
+        )
+        raise ValueError(f"route_entry: winner {winner!r} not in options")
+    return winner
+
+
+def _persona_pick(decision: object) -> str:
+    """The selected persona label; a missing or unknown label is a defect."""
+    pick = decision.get("choice") if isinstance(decision, dict) else None
+    if not isinstance(pick, str) or pick not in _PERSONA_OPTIONS:
+        logger.warning(
+            "toolflow route_defect sid=- nid=- personas=%r err=personas_not_in_options %s",
+            pick,
+            _choice_summary(decision),
+        )
+        raise ValueError(f"route_entry: persona choice {pick!r} not in options")
+    if pick == _NO_PERSONAS_REMAINING:
+        logger.warning(
+            "toolflow route_defect sid=- nid=- err=no_personas_remaining %s",
+            _choice_summary(decision),
+        )
+        raise ValueError("route_entry: no personas remain")
+    return pick
+
+
+def _assess_text(prompt: object, tool: object) -> str:
+    """Today-stamped prompt for the post-tool assessment; a blank prompt or tool is a defect."""
+    text = query_with_today_utc(prompt.strip()) if isinstance(prompt, str) else ""
+    if not text:
+        logger.warning(
+            "toolflow assess_defect sid=- nid=- tool=%s err=blank_prompt",
+            tool if isinstance(tool, str) and tool else "-",
+        )
+        raise ValueError("assess_entry_tool: blank prompt")
+    if not isinstance(tool, str) or not tool:
+        logger.warning("toolflow assess_defect sid=- nid=- err=tool_required")
+        raise ValueError("assess_entry_tool: tool required")
+    return text
+
+
+def _assess_options() -> tuple[list[dict[str, JSONValue]], dict[str, str]]:
+    """Post-tool options: the entry sentinels plus node_resolved and the whole canonical registry."""
+    reg = _auto_registry()
+    if not reg:
+        raise ValueError("assess_entry_tool: empty registry")
+    options: dict[str, str] = dict(_ENTRY_OPTIONS)
+    if RESOLVED_SENTINEL not in options:
+        options[RESOLVED_SENTINEL] = _SENTINEL_DESCRIPTIONS[RESOLVED_SENTINEL]
+    _registry_options(reg, options, "assess_entry_tool")
+    return reg, options
+
+
+def _result_text(res: Mapping[str, JSONValue], key: str) -> str:
+    """One string field of a tool result; anything else counts as absent."""
+    value = res.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def _tool_outcome(tool: str, res: Mapping[str, JSONValue]) -> str:
+    """One-line outcome for the assessment question: ok flag, category, clipped content and error."""
+    return (
+        f"tool {tool} ok={res.get('ok')!r} category={_result_text(res, 'category')!r} "
+        f"content={_result_text(res, 'content')[:1500]!r} error={_result_text(res, 'error')[:500]!r}"
+    )
+
+
+def _score_entry(decision: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+    """Score answer as a stored decision entry: score, any distribution, then confidence."""
+    entry: dict[str, JSONValue] = {"score": decision.get("score")}
+    probabilities = decision.get("probabilities")
+    if isinstance(probabilities, dict):
+        entry.update(probabilities)
+    confidence = decision.get("confidence")
+    if confidence is not None:
+        entry["confidence"] = confidence
+    return entry
+
+
+def _decision_entry(decision: Mapping[str, JSONValue]) -> JSONValue:
+    """One stored decision entry, shaped by its answer kind."""
+    kind = decision.get("kind")
+    if kind == "noul" and isinstance(decision.get("probability"), (int, float)):
+        return {"probability": decision["probability"]}
+    probabilities = decision.get("probabilities")
+    if kind == "choice" and isinstance(probabilities, dict):
+        return dict(probabilities)
+    if kind == "score":
+        return _score_entry(decision)
+    return dict(decision)
+
+
+def _decision_probabilities(decisions: Mapping[str, object]) -> dict[str, JSONValue]:
+    """Per-question probability projection stored with the decision record."""
+    out: dict[str, JSONValue] = {}
+    for qid, decision in decisions.items():
+        if not isinstance(decision, dict):
+            continue
+        out[qid] = _decision_entry(decision)
+    return out
+
+
+def _sole_confidence(decisions: Mapping[str, object]) -> float | None:
+    """Confidence of a single-decision round when it is a probability; None otherwise."""
+    if len(decisions) != 1:
+        return None
+    sole = next(iter(decisions.values()))
+    if not isinstance(sole, dict):
+        return None
+    return _carried_confidence(sole.get("confidence"))
+
+
+def _model_usage(jev_in: int | None, jev_out: int | None) -> dict[str, object] | None:
+    """Provider token counts in the recorder's wire keys; None when no count arrived."""
+    usage: dict[str, object] = {}
+    if jev_in is not None:
+        usage["prompt_tokens"] = jev_in
+    if jev_out is not None:
+        usage["completion_tokens"] = jev_out
+    if jev_in is not None and jev_out is not None:
+        usage["total_tokens"] = jev_in + jev_out
+    return usage or None
+
+
+def _decision_record(
+    *,
+    decision_type: str,
+    session_id: str,
+    node_id: str | None,
+    job_id: str | None,
+    questions: Mapping[str, JSONValue],
+    decisions: Mapping[str, object],
+) -> DecisionRecord:
+    """Domain record of one decision round; raises on any contract violation."""
+    record = DecisionRecord(
+        decision_id=new_decision_id(),
+        session_id=session_id,
+        node_id=node_id,
+        job_id=job_id,
+        decision_type=decision_type,
+        candidates=validate_json_mapping(dict(questions), "<decision_client>: 'candidates'"),
+        probabilities=validate_json_mapping(_decision_probabilities(decisions), "<decision_client>: 'probabilities'"),
+        selected=validate_json_value(decisions, "<decision_client>: 'selected'"),
+        confidence=_sole_confidence(decisions),
+        created_at=utcnow(),
+    )
+    record.validate("<decision_client>")
+    return record
 
 
 class JevClient:
@@ -872,77 +1506,104 @@ class JevClient:
             self._proc = None
         if not self._runtime_ts.exists():
             raise _SidecarUnavailable(f"sidecar missing: {self._runtime_ts}")
-        try:
-            proc = subprocess.Popen(
-                ["bun", str(self._runtime_ts)],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
-                cwd=str(self._repo_root),
-            )
-        except FileNotFoundError as exc:
-            raise _SidecarUnavailable("bun unavailable for sidecar") from exc
-        _arm_atexit()
-        _LIVE_PROCS.add(proc)
-        self._proc = proc
+        with registering_child():
+            try:
+                proc = subprocess.Popen(
+                    ["bun", str(self._runtime_ts)],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                    cwd=str(self._repo_root),
+                )
+            except FileNotFoundError as exc:
+                raise _SidecarUnavailable("bun unavailable for sidecar") from exc
+            _arm_atexit()
+            _LIVE_PROCS.add(proc)
+            self._proc = proc
         return proc
+
+    def _check_pending_cancel(self, token: object | None) -> None:
+        """A call cancelled while queued never starts a sidecar roundtrip."""
+        if token is None:
+            return
+        with self._cancel_guard:
+            if token in self._cancelled:
+                self._cancelled.discard(token)
+                raise asyncio.CancelledError
+
+    def _own_proc(self, token: object | None, proc: subprocess.Popen[str]) -> None:
+        """Publish the live sidecar handle so a cancel can terminate it."""
+        if token is not None:
+            with self._cancel_guard:
+                self._sidecar_owner = (token, proc)
+
+    def _release_owner(self, token: object | None) -> None:
+        """Drop this call's sidecar ownership and pending-cancel mark."""
+        if token is None:
+            return
+        with self._cancel_guard:
+            owner = self._sidecar_owner
+            if owner is not None and owner[0] is token:
+                self._sidecar_owner = None
+            self._cancelled.discard(token)
+
+    def _discard_proc(self, proc: subprocess.Popen[str]) -> None:
+        """Drop a dead sidecar handle so the next call restarts it."""
+        _LIVE_PROCS.discard(proc)
+        try:
+            proc.kill()
+        except OSError, RuntimeError:
+            pass
+        self._proc = None
+
+    @staticmethod
+    def _send_line(proc: subprocess.Popen[str], line: str) -> str:
+        """Write one request line and read one reply line."""
+        assert proc.stdin is not None and proc.stdout is not None
+        proc.stdin.write(line)
+        proc.stdin.flush()
+        raw_line: str = proc.stdout.readline()
+        return raw_line
+
+    def _exchange(
+        self, proc: subprocess.Popen[str], line: str, token: object | None
+    ) -> tuple[subprocess.Popen[str], str]:
+        """One request/reply over a live handle, restarting once when its pipe is broken."""
+        try:
+            return proc, self._send_line(proc, line)
+        except BrokenPipeError, OSError:
+            self._discard_proc(proc)
+            fresh = self._ensure_proc()
+            self._own_proc(token, fresh)
+            return fresh, self._send_line(fresh, line)
+
+    def _sidecar_response(self, proc: subprocess.Popen[str], raw_line: str) -> dict[str, JSONValue]:
+        """One sidecar reply line as a JSON object; EOF kills the dead handle."""
+        if not raw_line:
+            self._discard_proc(proc)
+            raise _SidecarUnavailable("sidecar closed (EOF)")
+        try:
+            response = json.loads(raw_line)
+        except ValueError as exc:
+            raise RuntimeError(f"decide: malformed sidecar response: {exc}") from exc
+        if not isinstance(response, dict):
+            raise TypeError("decide: malformed sidecar response")
+        return validate_json_mapping(response, "<decision_client>: 'sidecar'")
 
     def _sidecar_roundtrip(self, payload: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         token = _INVOKE_TOKEN.get()
         with self._lock:
-            if token is not None:
-                with self._cancel_guard:
-                    if token in self._cancelled:
-                        self._cancelled.discard(token)
-                        raise asyncio.CancelledError
+            self._check_pending_cancel(token)
             proc = self._ensure_proc()
-            if token is not None:
-                with self._cancel_guard:
-                    self._sidecar_owner = (token, proc)
+            self._own_proc(token, proc)
             line = json.dumps(payload) + "\n"
             try:
-                assert proc.stdin is not None and proc.stdout is not None
-                proc.stdin.write(line)
-                proc.stdin.flush()
-                raw_line = proc.stdout.readline()
-            except BrokenPipeError, OSError:
-                _LIVE_PROCS.discard(proc)
-                try:
-                    proc.kill()
-                except OSError, RuntimeError:
-                    pass
-                self._proc = None
-                proc = self._ensure_proc()
-                if token is not None:
-                    with self._cancel_guard:
-                        self._sidecar_owner = (token, proc)
-                assert proc.stdin is not None and proc.stdout is not None
-                proc.stdin.write(line)
-                proc.stdin.flush()
-                raw_line = proc.stdout.readline()
+                proc, raw_line = self._exchange(proc, line, token)
             finally:
-                if token is not None:
-                    with self._cancel_guard:
-                        if self._sidecar_owner is not None and self._sidecar_owner[0] is token:
-                            self._sidecar_owner = None
-                        self._cancelled.discard(token)
-            if not raw_line:
-                _LIVE_PROCS.discard(proc)
-                try:
-                    proc.kill()
-                except OSError, RuntimeError:
-                    pass
-                self._proc = None
-                raise _SidecarUnavailable("sidecar closed (EOF)")
-            try:
-                response = json.loads(raw_line)
-            except ValueError as exc:
-                raise RuntimeError(f"decide: malformed sidecar response: {exc}") from exc
-            if not isinstance(response, dict):
-                raise TypeError("decide: malformed sidecar response")
-            return validate_json_mapping(response, "<decision_client>: 'sidecar'")
+                self._release_owner(token)
+            return self._sidecar_response(proc, raw_line)
 
     def _http_decide(self, state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         api_format = _decision_setting("DECISION_API_FORMAT")
@@ -991,6 +1652,49 @@ class JevClient:
                     self._cancelled.discard(token)
         return validate_json_mapping(_decision_envelope(raw, model, api_format), "<decision_client>: 'http'")
 
+    async def _http_roundtrip(
+        self,
+        state: object,
+        questions: Mapping[str, JSONValue],
+        choice_options: Mapping[str, Mapping[str, str]] | None,
+    ) -> tuple[dict[str, dict[str, JSONValue]], JSONValue, str]:
+        """Direct HTTPS decision over the configured endpoint (sidecar absent)."""
+        loop = asyncio.get_running_loop()
+        # ponytail: run_in_executor drops context (unlike to_thread),
+        # so copy it in; the worker needs the token to register.
+        ctx = contextvars.copy_context()
+        raw = await asyncio.wait_for(
+            loop.run_in_executor(self._http_pool, functools.partial(ctx.run, self._http_decide, state, questions)),
+            timeout=self._timeout_s,
+        )
+        logger.debug(
+            "toolflow invoke_detail sid=- nid=- via=http qids=[%s]", ",".join(sorted(str(k) for k in questions))
+        )
+        return parse_decisions(questions, raw, choice_options), raw, "http"
+
+    async def _await_roundtrip(
+        self,
+        payload: Mapping[str, JSONValue],
+        state: object,
+        questions: Mapping[str, JSONValue],
+        choice_options: Mapping[str, Mapping[str, str]] | None,
+    ) -> tuple[dict[str, dict[str, JSONValue]], JSONValue, str]:
+        """Sidecar decision, falling back to direct HTTPS when the sidecar is missing or dead."""
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(self._sidecar_roundtrip, payload), timeout=self._timeout_s
+            )
+        except _SidecarUnavailable:
+            return await self._http_roundtrip(state, questions, choice_options)
+        except TimeoutError as exc:
+            self.close()
+            raise RuntimeError(f"decide: decision timeout after {self._timeout_s}s") from exc
+        typed, raw = _sidecar_decisions(payload, response)
+        logger.debug(
+            "toolflow invoke_detail sid=- nid=- via=sidecar qids=[%s]", ",".join(sorted(str(k) for k in questions))
+        )
+        return typed, raw, "sidecar"
+
     async def _invoke(
         self,
         state: object,
@@ -1017,28 +1721,7 @@ class JevClient:
         reset = _INVOKE_TOKEN.set(token)
         cancelled_call = False
         try:
-            try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(self._sidecar_roundtrip, payload), timeout=self._timeout_s
-                )
-            except _SidecarUnavailable:
-                loop = asyncio.get_running_loop()
-                # ponytail: run_in_executor drops context (unlike to_thread),
-                # so copy it in; the worker needs the token to register.
-                ctx = contextvars.copy_context()
-                raw = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        self._http_pool, functools.partial(ctx.run, self._http_decide, state, questions)
-                    ),
-                    timeout=self._timeout_s,
-                )
-                logger.debug(
-                    "toolflow invoke_detail sid=- nid=- via=http qids=[%s]", ",".join(sorted(str(k) for k in questions))
-                )
-                return parse_decisions(questions, raw, choice_options), raw, "http"
-            except TimeoutError as exc:
-                self.close()
-                raise RuntimeError(f"decide: decision timeout after {self._timeout_s}s") from exc
+            result = await self._await_roundtrip(payload, state, questions, choice_options)
         except asyncio.CancelledError:
             cancelled_call = True
             self._cancel_owned(token)
@@ -1048,23 +1731,7 @@ class JevClient:
             if not cancelled_call:
                 with self._cancel_guard:
                     self._cancelled.discard(token)
-        if not isinstance(response, dict) or response.get("id") != payload["id"]:
-            raise TypeError("decide: malformed sidecar response")
-        if "error" in response:
-            raise RuntimeError(f"decide: {response['error']}")
-        decisions = response.get("decisions")
-        if not isinstance(decisions, dict) or not decisions:
-            raise TypeError("decide: malformed sidecar response")
-        typed: dict[str, dict[str, JSONValue]] = {}
-        for qid, val in validate_json_mapping(decisions, "<decision_client>: 'decisions'").items():
-            if not isinstance(val, dict):
-                raise TypeError("decide: malformed sidecar response")
-            typed[qid] = validate_json_mapping(val, "<decision_client>: 'decision'")
-        raw_out: object = response.get("raw")
-        logger.debug(
-            "toolflow invoke_detail sid=- nid=- via=sidecar qids=[%s]", ",".join(sorted(str(k) for k in questions))
-        )
-        return typed, validate_json_value(raw_out, "<raw>"), "sidecar"
+        return result
 
     async def decide(
         self,
@@ -1078,12 +1745,7 @@ class JevClient:
         choice_options: Mapping[str, Mapping[str, str]] | None = None,
     ) -> dict[str, dict[str, JSONValue]]:
         """Typed JEV decide; persists the round best-effort, raises on any defect."""
-        if not decision_type or not isinstance(decision_type, str):
-            raise ValueError("decide: decision_type required")
-        if not session_id or not isinstance(session_id, str):
-            raise ValueError("decide: session_id required")
-        if not isinstance(questions, Mapping) or not questions:
-            raise ValueError("decide: missing_questions")
+        _require_decision_request(decision_type, session_id, questions)
         try:
             json.dumps({"state": state, "questions": dict(questions), "options": choice_options})
         except TypeError as exc:
@@ -1110,10 +1772,11 @@ class JevClient:
             jev_out=jev_out,
             jev_model=jev_model,
         )
+        node = _log_id(node_id)
         logger.info(
             "toolflow decide_exit sid=%s nid=%s type=%s qids=[%s] via=%s latency_ms=%.1f in=%s out=%s",
             session_id,
-            node_id if isinstance(node_id, str) and node_id else "-",
+            node,
             decision_type,
             ",".join(sorted(str(k) for k in decisions)),
             via,
@@ -1124,11 +1787,9 @@ class JevClient:
         logger.debug(
             "toolflow decide_detail sid=%s nid=%s type=%s options=%s",
             session_id,
-            node_id if isinstance(node_id, str) and node_id else "-",
+            node,
             decision_type,
-            {str(k): (len(v) if isinstance(v, Mapping) else -1) for k, v in choice_options.items()}
-            if isinstance(choice_options, Mapping)
-            else "-",
+            _option_sizes(choice_options),
         )
         return decisions
 
@@ -1146,9 +1807,8 @@ class JevClient:
         """JEV owns ALL tool selection/transitions over the whole canonical registry every round; Needle is args-only (never selects/chains/judges). Caller assembles the whole registry; single-winner choice + 2 sentinels."""
         objective = query_with_today_utc(objective) if isinstance(objective, str) else objective
         reg = list(registry) if registry else _auto_registry()
-        node_d = _node_dict(node)
-        nid = node_d.get("node_id") or node_d.get("id")
-        nid_s = nid if isinstance(nid, str) and nid else "-"
+        node_d, nid = _node_view(node)
+        nid_s = _log_id(nid)
         options, prompt = _tool_options_prompt(reg, node_d, evidence, attempts)
         logger.info(
             "toolflow select_entry sid=%s nid=%s registry=%d options=%d objective=%r",
@@ -1163,8 +1823,8 @@ class JevClient:
             session_id,
             nid_s,
             _trunc200(node_d.get("question")),
-            len(evidence) if isinstance(evidence, (list, dict)) else 0,
-            len(attempts) if isinstance(attempts, (list, dict)) else 0,
+            _context_size(evidence),
+            _context_size(attempts),
         )
         questions: dict[str, JSONValue] = {
             "tool_selection": {
@@ -1184,16 +1844,15 @@ class JevClient:
             questions,
             decision_type="tool_selection",
             session_id=session_id,
-            node_id=nid if isinstance(nid, str) else None,
+            node_id=_optional_str(nid),
             job_id=job_id,
             choice_options={"tool_selection": options},
         )
         return self._to_tool_decision(
             decisions.get("tool_selection"),
             options,
-            set_of_registry={o for o in options} - set(_SENTINEL_DESCRIPTIONS),
             sid=session_id,
-            nid=nid if isinstance(nid, str) else None,
+            nid=_optional_str(nid),
             event="select",
         )
 
@@ -1215,45 +1874,10 @@ class JevClient:
         choice, or a JEV outage. A no_personas_remaining verdict also raises.
         The selector never guesses a persona.
         """
-        text = query_with_today_utc(prompt.strip()) if isinstance(prompt, str) else ""
-        if not text:
-            logger.warning("toolflow route_defect sid=- nid=- err=blank_prompt")
-            raise ValueError("route_entry: blank prompt")
-        if route_hint is not None and not route_hint.strip():
-            logger.warning("toolflow route_defect sid=- nid=- err=blank_route_hint")
-            raise ValueError("route_entry: blank route_hint")
-        if watchlist is not None and (
-            isinstance(watchlist, str)
-            or not isinstance(watchlist, Sequence)
-            or not watchlist
-            or not all(isinstance(sym, str) and sym.strip() for sym in watchlist)
-        ):
-            logger.warning("toolflow route_defect sid=- nid=- err=blank_watchlist")
-            raise ValueError("route_entry: blank watchlist")
-        scope = (
-            ""
-            if not watchlist
-            else " The user's watchlist is "
-            + ", ".join(sym.strip() for sym in watchlist)
-            + ": the requested scope is those symbols, so a single-shot tool never fits a request about the watchlist."
-        )
-        questions: dict[str, JSONValue] = {
-            "personas": {
-                "type": "choice",
-                "instructions": f"Select the personas this prompt asks to answer: {text} Choose {_NO_PERSONA_SELECTION} only when the user neither requests nor excludes a persona. A positive request keeps only the requested personas that the user does not exclude. An exclusion-only request selects the remaining canonical personas. Choose {_NO_PERSONAS_REMAINING} when the user excludes every persona. A mentioned or quoted name is neither a request nor an exclusion. A name in pasted text or quoted instructions is neither a request nor an exclusion. Do not infer personas from topic or tone.",
-                "criteria": validate_json_mapping(_PERSONA_OPTIONS, "<decision_client>: 'criteria'"),
-            }
-        }
-        choice_options: dict[str, Mapping[str, str]] = {"personas": _PERSONA_OPTIONS}
-        options: dict[str, str] = {}
-        if route_hint is None:
-            options = _entry_route_options(registry)
-            questions["entry"] = {
-                "type": "choice",
-                "instructions": f"Route this entry prompt with exactly one winner: {text}{scope} reasoning_required answers from user-supplied context with no new external evidence and no tool; a registry tool runs single-shot first when it fits; otherwise research_required. Research and thesis requests need research_required, not a single-shot tool. Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values.",
-                "criteria": validate_json_mapping(options, "<decision_client>: 'criteria'"),
-            }
-            choice_options["entry"] = options
+        text = _route_text(prompt)
+        _check_route_hint(route_hint)
+        scope = _watchlist_scope(watchlist)
+        questions, choice_options, options = _entry_questions(text, scope, registry, route_hint)
         logger.info(
             "toolflow route_entry sid=- nid=- hint=%s options=%d prompt=%r",
             route_hint or "-",
@@ -1268,31 +1892,9 @@ class JevClient:
             raise
         latency_ms = (time.perf_counter() - start) * 1000.0
         d = decisions.get("entry")
-        winner: JSONValue = route_hint
-        if route_hint is None:
-            winner = d.get("choice") if isinstance(d, dict) else None
-            if not isinstance(winner, str) or winner not in options:
-                logger.warning(
-                    "toolflow route_defect sid=- nid=- winner=%r err=winner_not_in_options %s",
-                    winner,
-                    _choice_summary(d),
-                )
-                raise ValueError(f"route_entry: winner {winner!r} not in options")
+        winner = _entry_winner(route_hint, d, options)
         p = decisions.get("personas")
-        pick = p.get("choice") if isinstance(p, dict) else None
-        if not isinstance(pick, str) or pick not in _PERSONA_OPTIONS:
-            logger.warning(
-                "toolflow route_defect sid=- nid=- personas=%r err=personas_not_in_options %s",
-                pick,
-                _choice_summary(p),
-            )
-            raise ValueError(f"route_entry: persona choice {pick!r} not in options")
-        if pick == _NO_PERSONAS_REMAINING:
-            logger.warning(
-                "toolflow route_defect sid=- nid=- err=no_personas_remaining %s",
-                _choice_summary(p),
-            )
-            raise ValueError("route_entry: no personas remain")
+        pick = _persona_pick(p)
         jev_in, jev_out, _ = _jev_usage(raw)
         logger.info(
             "toolflow route_exit sid=- nid=- route=%s entry=[%s] personas=[%s] via=%s latency_ms=%.1f in=%s out=%s",
@@ -1322,38 +1924,13 @@ class JevClient:
         directly (never decide: nothing persists); raises on bad input or a
         winner outside the options — the worker fail-opens to research_required.
         """
-        text = query_with_today_utc(prompt.strip()) if isinstance(prompt, str) else ""
-        if not text:
-            logger.warning(
-                "toolflow assess_defect sid=- nid=- tool=%s err=blank_prompt",
-                tool if isinstance(tool, str) and tool else "-",
-            )
-            raise ValueError("assess_entry_tool: blank prompt")
-        if not isinstance(tool, str) or not tool:
-            logger.warning("toolflow assess_defect sid=- nid=- err=tool_required")
-            raise ValueError("assess_entry_tool: tool required")
-        reg = _auto_registry()
-        if not reg:
-            raise ValueError("assess_entry_tool: empty registry")
-        options: dict[str, str] = dict(_ENTRY_OPTIONS)
-        if RESOLVED_SENTINEL not in options:
-            options[RESOLVED_SENTINEL] = _SENTINEL_DESCRIPTIONS[RESOLVED_SENTINEL]
-        for entry in reg:
-            name = entry.get("name") if isinstance(entry, dict) else None
-            if not isinstance(name, str) or not name:
-                raise ValueError("assess_entry_tool: registry entry needs a name")
-            if name in options:
-                raise ValueError(f"assess_entry_tool: duplicate tool {name}")
-            options[name] = _manifest_line(entry)
+        text = _assess_text(prompt, tool)
+        reg, options = _assess_options()
         args = validate_json_mapping(
             dict(arguments) if isinstance(arguments, dict) else {}, "<decision_client>: 'arguments'"
         )
         res = validate_json_mapping(dict(result) if isinstance(result, dict) else {}, "<decision_client>: 'result'")
-        ok = res.get("ok")
-        content = res.get("content") if isinstance(res.get("content"), str) else ""
-        error = res.get("error") if isinstance(res.get("error"), str) else ""
-        category = res.get("category") if isinstance(res.get("category"), str) else ""
-        outcome = f"tool {tool} ok={ok!r} category={category!r} content={content[:1500]!r} error={error[:500]!r}"
+        outcome = _tool_outcome(tool, res)
         logger.info(
             "toolflow assess_entry sid=- nid=- tool=%s registry=%d options=%d prompt=%r %s ok=%r category=%r",
             tool,
@@ -1361,8 +1938,8 @@ class JevClient:
             len(options),
             _trunc200(text),
             _args_summary(args),
-            ok,
-            category,
+            res.get("ok"),
+            _result_text(res, "category"),
         )
         questions: dict[str, JSONValue] = {
             "assess": {
@@ -1372,7 +1949,7 @@ class JevClient:
                     + f"Arguments: {json.dumps(args, default=str)[:2000]} Outcome: {outcome} "
                     + "node_resolved when the result answers the prompt; reasoning_required when no "
                     + "further tool helps; research_required when a full session is needed; otherwise "
-                    + f"the one registry tool to run next. Today UTC is {utcnow().date().isoformat()}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week'/'today'/'last quarter' as arg values."
+                    + f"the one registry tool to run next. {_today_guidance()}"
                 ),
                 "criteria": validate_json_mapping(options, "<decision_client>: 'criteria'"),
             }
@@ -1417,9 +1994,8 @@ class JevClient:
     ) -> ToolDecision:
         """JEV adjudicates a reasoner proposal over the same whole-registry options as select_tool; proposal lives in state only, never filters the registry. Needle never selects/chains/judges."""
         reg = list(registry) if registry else _auto_registry()
-        node_d = _node_dict(node)
-        nid = node_d.get("node_id") or node_d.get("id")
-        nid_s = nid if isinstance(nid, str) and nid else "-"
+        node_d, nid = _node_view(node)
+        nid_s = _log_id(nid)
         options, prompt = _tool_options_prompt(reg, node_d, None, None)
         logger.info(
             "toolflow adjudicate_entry sid=%s nid=%s registry=%d options=%d question=%r",
@@ -1448,16 +2024,15 @@ class JevClient:
             questions,
             decision_type="reason_adjudication",
             session_id=session_id,
-            node_id=nid if isinstance(nid, str) else None,
+            node_id=_optional_str(nid),
             job_id=job_id,
             choice_options={"tool_selection": options},
         )
         return self._to_tool_decision(
             decisions.get("tool_selection"),
             options,
-            set_of_registry={o for o in options} - set(_SENTINEL_DESCRIPTIONS),
             sid=session_id,
-            nid=nid if isinstance(nid, str) else None,
+            nid=_optional_str(nid),
             event="adjudicate",
         )
 
@@ -1471,8 +2046,7 @@ class JevClient:
         job_id: str | None = None,
     ) -> dict[str, JSONValue]:
         """Post-tool assessment: topical relevance + resolution support + state + continue."""
-        node_d = _node_dict(node)
-        nid = node_d.get("node_id") or node_d.get("id")
+        node_d, nid = _node_view(node)
         question = node_d.get("question") or ""
         questions: dict[str, JSONValue] = {
             "topical_relevance": {
@@ -1507,25 +2081,25 @@ class JevClient:
             questions,
             decision_type="result_assessment",
             session_id=session_id,
-            node_id=nid if isinstance(nid, str) else None,
+            node_id=_optional_str(nid),
             job_id=job_id,
             choice_options={"evidence_state": dict(EVIDENCE_STATE_OPTIONS), "continue": dict(CONTINUE_OPTIONS)},
         )
-        topical = decisions.get("topical_relevance") or {}
-        support = decisions.get("resolution_support") or {}
-        ev_state = decisions.get("evidence_state") or {}
-        cont = decisions.get("continue") or {}
+        views: dict[str, dict[str, JSONValue]] = {
+            qid: decisions.get(qid) or {}
+            for qid in ("topical_relevance", "resolution_support", "evidence_state", "continue")
+        }
+        topical = views["topical_relevance"]
+        support = views["resolution_support"]
+        ev_state = views["evidence_state"]
+        cont = views["continue"]
         probs: dict[str, JSONValue] = {}
-        if isinstance(topical.get("probability"), (int, float)):
-            probs["topical_relevance"] = topical["probability"]
-        if isinstance(support.get("probability"), (int, float)):
-            probs["resolution_support"] = support["probability"]
-        if isinstance(ev_state.get("probabilities"), dict):
-            probs.update(ev_state["probabilities"])
-        if isinstance(cont.get("probabilities"), dict):
-            probs.update(cont["probabilities"])
-        continuation = cont.get("choice") if isinstance(cont.get("choice"), str) else "continue_research"
-        ev_choice = ev_state.get("choice") if isinstance(ev_state.get("choice"), str) else None
+        _noul_probability(probs, "topical_relevance", topical)
+        _noul_probability(probs, "resolution_support", support)
+        _distribution(probs, ev_state)
+        _distribution(probs, cont)
+        continuation = _decision_choice(cont, "continue_research")
+        ev_choice = _decision_choice(ev_state)
         return {
             "probabilities": probs,
             "confidence": cont.get("confidence"),
@@ -1554,34 +2128,17 @@ class JevClient:
         claims: Sequence[JSONValue] | None = None,
     ) -> dict[str, JSONValue]:
         """Whole-response gate: does cited evidence support the qualified wording as written."""
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("assess_final_response: text required")
-        excerpt = " ".join(text.split())[:2000]
-        count = len(evidence) if isinstance(evidence, list) else 0
-        ids = _evidence_ids(evidence)
-        suffix = f" [{','.join(ids)}]" if ids else ""
+        excerpt = _checked_excerpt(text, "assess_final_response")
         declared: list[JSONValue] = list(claims) if isinstance(claims, list) else []
-        types = sorted(
-            {
-                str(c.get("claim_type"))
-                for c in declared
-                if isinstance(c, dict) and isinstance(c.get("claim_type"), str) and c.get("claim_type")
-            }
-        )
-        scope = f" Declared claims: {len(declared)}" + (f" (types: {','.join(types)})" if types else "") + "."
-        carried = (
-            float(confidence)
-            if isinstance(confidence, (int, float))
-            and not isinstance(confidence, bool)
-            and 0.0 <= float(confidence) <= 1.0
-            else None
-        )
+        scope = _claims_scope(declared)
+        carried = _carried_confidence(confidence)
         questions: dict[str, JSONValue] = {
             "support": {
                 "type": "noul",
                 "instructions": (
                     f"Does the cited evidence support the qualified wording as written, including any attribution or qualification, not the underlying event itself: {excerpt} "
-                    + f"Cited evidence: {count} item(s){suffix}.{scope} "
+                    + _evidence_citation(evidence)
+                    + f"{scope} "
                     + "The whole response rejects when any prose claim lacks inventory or cited support. "
                     + "An attributed report is supported when the evidence shows the report was made as attributed, even when the event is unproven. "
                     + "A conditional risk is supported when the evidence shows the condition and consequence as qualified, not that the consequence will occur. "
@@ -1603,23 +2160,7 @@ class JevClient:
             job_id=job_id,
             choice_options={"evidence_state": dict(EVIDENCE_STATE_OPTIONS)},
         )
-        support_d = decisions.get("support") or {}
-        ev_state = decisions.get("evidence_state") or {}
-        prob = support_d.get("probability")
-        probs: dict[str, JSONValue] = {}
-        if isinstance(prob, (int, float)):
-            probs["support"] = prob
-        if isinstance(ev_state.get("probabilities"), dict):
-            probs.update(ev_state["probabilities"])
-        ev_choice = ev_state.get("choice") if isinstance(ev_state.get("choice"), str) else None
-        return {
-            "probabilities": probs,
-            "confidence": carried,
-            "support": prob,
-            "support_answer": _classify_probability(prob),
-            "evidence_state": ev_choice,
-            "decision": ev_choice,
-        }
+        return _support_verdict(decisions, carried)
 
     async def assess_final_claim(
         self,
@@ -1632,29 +2173,18 @@ class JevClient:
         confidence: float | None = None,
     ) -> dict[str, JSONValue]:
         """Per-claim gate: does cited evidence support one qualified claim as written."""
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("assess_final_claim: text required")
+        excerpt = _checked_excerpt(text, "assess_final_claim")
         if not isinstance(claim_type, str) or not claim_type.strip():
             raise ValueError("assess_final_claim: claim_type required")
         ctype = claim_type.strip()
-        excerpt = " ".join(text.split())[:2000]
-        count = len(evidence) if isinstance(evidence, list) else 0
-        ids = _evidence_ids(evidence)
-        suffix = f" [{','.join(ids)}]" if ids else ""
-        carried = (
-            float(confidence)
-            if isinstance(confidence, (int, float))
-            and not isinstance(confidence, bool)
-            and 0.0 <= float(confidence) <= 1.0
-            else None
-        )
+        carried = _carried_confidence(confidence)
         questions: dict[str, JSONValue] = {
             "support": {
                 "type": "noul",
                 "instructions": (
                     f"Claim type {ctype}: does the cited evidence support the qualified wording as written, including any attribution or qualification, not the underlying event itself: {excerpt} "
-                    + f"Cited evidence: {count} item(s){suffix}. "
-                    + "An attributed report is supported when the evidence shows the report was made as attributed, even when the event is unproven. "
+                    + _evidence_citation(evidence)
+                    + " An attributed report is supported when the evidence shows the report was made as attributed, even when the event is unproven. "
                     + "A conditional risk is supported when the evidence shows the condition and consequence as qualified, not that the consequence will occur. "
                     + "Contradicted or missing evidence never supports."
                 ),
@@ -1674,88 +2204,38 @@ class JevClient:
             job_id=job_id,
             choice_options={"evidence_state": dict(EVIDENCE_STATE_OPTIONS)},
         )
-        support_d = decisions.get("support") or {}
-        ev_state = decisions.get("evidence_state") or {}
-        prob = support_d.get("probability")
-        probs: dict[str, JSONValue] = {}
-        if isinstance(prob, (int, float)):
-            probs["support"] = prob
-        if isinstance(ev_state.get("probabilities"), dict):
-            probs.update(ev_state["probabilities"])
-        ev_choice = ev_state.get("choice") if isinstance(ev_state.get("choice"), str) else None
-        return {
-            "probabilities": probs,
-            "confidence": carried,
-            "support": prob,
-            "support_answer": _classify_probability(prob),
-            "evidence_state": ev_choice,
-            "decision": ev_choice,
-        }
+        return _support_verdict(decisions, carried)
 
     @staticmethod
     def _to_tool_decision(
         decision: object,
         options: Mapping[str, str],
-        set_of_registry: set[str],
         *,
         sid: str | None = None,
         nid: str | None = None,
         event: str = "choice",
     ) -> ToolDecision:
-        sid_s = sid if isinstance(sid, str) and sid else "-"
-        nid_s = nid if isinstance(nid, str) and nid else "-"
+        sid_s = _log_id(sid)
+        nid_s = _log_id(nid)
         if not isinstance(decision, dict) or decision.get("kind") != "choice":
-            logger.warning("toolflow %s_defect sid=%s nid=%s err=malformed_decision", event, sid_s, nid_s)
+            _defect(event, sid_s, nid_s, "err=malformed_decision")
             raise TypeError("decide: malformed tool_selection decision")
-        winner = decision.get("choice")
-        probs = decision.get("probabilities")
-        conf = decision.get("confidence")
-        if not isinstance(winner, str) or not isinstance(probs, dict):
-            logger.warning("toolflow %s_defect sid=%s nid=%s err=malformed_decision", event, sid_s, nid_s)
-            raise TypeError("decide: malformed tool_selection decision")
-        try:
-            floats: dict[str, float] = {str(k): float(v) for k, v in probs.items()}
-        except (TypeError, ValueError) as exc:
-            logger.warning(
-                "toolflow %s_defect sid=%s nid=%s winner=%r err=malformed_probabilities", event, sid_s, nid_s, winner
-            )
-            raise TypeError(f"decide: malformed tool_selection probabilities: {exc}") from exc
-        probabilities = validate_json_mapping(floats, "<decision_client>: 'probabilities'")
-        confidence = float(conf) if isinstance(conf, (int, float)) and not isinstance(conf, bool) else None
+        winner, floats, probabilities, confidence = _tool_decision_fields(decision, sid_s, nid_s, event)
         if winner == REASON_SENTINEL:
             out = ToolDecision(action="reason", probabilities=probabilities, confidence=confidence)
         elif winner == RESOLVED_SENTINEL:
             out = ToolDecision(action="resolved", probabilities=probabilities, confidence=confidence)
         else:
-            if winner not in set_of_registry:
-                logger.warning(
-                    "toolflow %s_defect sid=%s nid=%s winner=%r err=winner_not_in_registry %s",
-                    event,
-                    sid_s,
-                    nid_s,
-                    winner,
-                    _choice_summary(decision),
+            registry = set(options) - set(_SENTINEL_DESCRIPTIONS)
+            if winner not in registry:
+                _defect(
+                    event, sid_s, nid_s, f"winner={winner!r} err=winner_not_in_registry {_choice_summary(decision)}"
                 )
                 raise ValueError(f"decide: tool_selection winner {winner!r} not in registry")
-            winner_prob = floats.get(winner, 0.0)
-
-            def _rank_key(t: str) -> float:
-                return floats.get(t, 0.0)
-
-            ranked = sorted(
-                (
-                    t
-                    for t in set_of_registry
-                    if floats.get(t, 0.0) >= _PARALLEL_MIN_PROB and floats.get(t, 0.0) >= winner_prob - _PARALLEL_WINDOW
-                ),
-                key=_rank_key,
-                reverse=True,
-            )[:_PARALLEL_CAP]
-            names = (winner, *(t for t in ranked if t != winner))[:_PARALLEL_CAP]
             out = ToolDecision(
                 action="invoke",
                 tool_name=winner,
-                tool_names=names,
+                tool_names=_tool_fanout(winner, floats, registry),
                 probabilities=probabilities,
                 confidence=confidence,
             )
@@ -1799,47 +2279,14 @@ class JevClient:
         jev_model: str | None = None,
     ) -> None:
         try:
-            probabilities: dict[str, JSONValue] = {}
-            for qid, decision in decisions.items():
-                if not isinstance(decision, dict):
-                    continue
-                kind = decision.get("kind")
-                if kind == "noul" and isinstance(decision.get("probability"), (int, float)):
-                    probabilities[qid] = {"probability": decision["probability"]}
-                elif kind == "choice" and isinstance(decision.get("probabilities"), dict):
-                    probabilities[qid] = dict(decision["probabilities"])
-                elif kind == "score":
-                    entry: dict[str, JSONValue] = {"score": decision.get("score")}
-                    if isinstance(decision.get("probabilities"), dict):
-                        entry.update(decision["probabilities"])
-                    if decision.get("confidence") is not None:
-                        entry["confidence"] = decision["confidence"]
-                    probabilities[qid] = entry
-                else:
-                    probabilities[qid] = dict(decision) if isinstance(decision, dict) else {"result": decision}
-            confidence: float | None = None
-            if len(decisions) == 1:
-                sole = next(iter(decisions.values()))
-                raw_conf = sole.get("confidence") if isinstance(sole, dict) else None
-                if (
-                    isinstance(raw_conf, (int, float))
-                    and not isinstance(raw_conf, bool)
-                    and 0.0 <= float(raw_conf) <= 1.0
-                ):
-                    confidence = float(raw_conf)
-            record = DecisionRecord(
-                decision_id=new_decision_id(),
+            record = _decision_record(
+                decision_type=decision_type,
                 session_id=session_id,
                 node_id=node_id,
                 job_id=job_id,
-                decision_type=decision_type,
-                candidates=validate_json_mapping(dict(questions), "<decision_client>: 'candidates'"),
-                probabilities=validate_json_mapping(probabilities, "<decision_client>: 'probabilities'"),
-                selected=validate_json_value(decisions, "<decision_client>: 'selected'"),
-                confidence=confidence,
-                created_at=utcnow(),
+                questions=questions,
+                decisions=decisions,
             )
-            record.validate("<decision_client>")
         except (TypeError, ValueError, AttributeError) as exc:
             logger.debug("jev persist: skipping record build (%s: %s)", type(exc).__name__, exc)
             return
@@ -1933,20 +2380,13 @@ class JevClient:
         if provider is None or jev_model is None:
             return
         try:
-            usage: dict[str, object] = {}
-            if jev_in is not None:
-                usage["prompt_tokens"] = jev_in
-            if jev_out is not None:
-                usage["completion_tokens"] = jev_out
-            if jev_in is not None and jev_out is not None:
-                usage["total_tokens"] = jev_in + jev_out
             recorder.record_model_call(
                 round=0,
                 provider=provider,
                 model=jev_model,
                 started_at=started_at,
                 completed_at=completed_at,
-                usage=usage or None,
+                usage=_model_usage(jev_in, jev_out),
                 tool_call_count=0,
             )
         except (OSError, ValueError, RuntimeError, AttributeError) as exc:

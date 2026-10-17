@@ -579,6 +579,11 @@ def _store_dividend_events(entity_id: str, as_of: _dt.date, data_root: Path | No
     rows = facts.get("dividend_events")
     if not isinstance(rows, list):
         return []
+    return _latest_dividend_events(rows)
+
+
+def _latest_dividend_events(rows: list[object]) -> list[DividendEventRow]:
+    """Validate disclosures and retain the newest revision for each event id."""
     by_id: dict[str, DividendEventRow] = {}
     for row in rows:
         if not isinstance(row, Mapping):
