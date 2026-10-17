@@ -10,10 +10,13 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
 
 from app.research.evals.scenarios import get_scenario
 from app.research.models import JSONValue
+
+if TYPE_CHECKING:
+    from app.research.models import Job, ResearchSession
 
 FIXTURE_FORMAT = "agent-scenario-fixture/v1"
 
@@ -223,22 +226,33 @@ def _ledger_eids(rows: list[dict[str, object]], kind: str) -> list[str]:
     return ids
 
 
+def _sec_provenance_identity(row: dict[str, object]) -> tuple[str, str | None] | None:
+    """Read the accession and optional document from one SEC source record."""
+    provenance = row.get("provenance")
+    if not isinstance(provenance, dict) or provenance.get("kind") != "sec_source":
+        return None
+    accession = provenance.get("accession_no")
+    if not isinstance(accession, str) or not accession:
+        return None
+    document = provenance.get("document_name")
+    if not isinstance(document, str):
+        return accession, None
+    return accession, f"{accession}|{document}"
+
+
 def _sec_provenance_ids(rows: list[dict[str, object]]) -> tuple[list[str], list[str]]:
-    """(accessions, accession|document entries) of sec_source rows, in first-seen order."""
+    """Return SEC accessions and documents in first-seen order."""
     accessions: list[str] = []
     documents: list[str] = []
     for row in rows:
-        provenance = row.get("provenance")
-        if not isinstance(provenance, dict) or provenance.get("kind") != "sec_source":
+        identity = _sec_provenance_identity(row)
+        if identity is None:
             continue
-        accession = provenance.get("accession_no")
-        if isinstance(accession, str) and accession and accession not in accessions:
+        accession, document = identity
+        if accession not in accessions:
             accessions.append(accession)
-        document = provenance.get("document_name")
-        if isinstance(document, str) and isinstance(accession, str) and accession:
-            entry = f"{accession}|{document}"
-            if entry not in documents:
-                documents.append(entry)
+        if document is not None and document not in documents:
+            documents.append(document)
     return accessions, documents
 
 
@@ -354,6 +368,81 @@ def save_fixture(fixture: AgentFixture, fixtures_dir: Path | None = None) -> Pat
     return path
 
 
+def _promotion_records(
+    session_id: str, repo: object | None
+) -> tuple[ResearchSession, list[dict[str, JSONValue]], list[Job]]:
+    """Load the durable session, evidence, and jobs with the public promotion error."""
+    from app.research.repository import ResearchRepository
+
+    store = repo if isinstance(repo, ResearchRepository) else ResearchRepository()
+    try:
+        found = store.get_session(session_id)
+    except KeyError:
+        raise ValueError(f"promote: unknown session_id: {session_id!r}") from None
+    return found, store.list_evidence(session_id), store.list_jobs(session_id)
+
+
+def _promotion_final(final_result: object) -> tuple[dict[str, JSONValue], str]:
+    """Read the persisted final mapping and its string answer without coercion."""
+    final: dict[str, JSONValue] = final_result if isinstance(final_result, dict) else {}
+    answer = final.get("answer")
+    if isinstance(answer, str):
+        return final, answer
+    return final, ""
+
+
+def _committee_job_freezes(runs: list[JSONValue]) -> tuple[str, ...]:
+    """Retain one committee freeze identifier for each string job identifier."""
+    committee: list[str] = []
+    for entry in runs:
+        if isinstance(entry, dict):
+            fid = entry.get("freeze_id")
+            jobs = entry.get("jobs")
+            if isinstance(fid, str) and isinstance(jobs, list):
+                committee.extend([fid] * sum(1 for jid in jobs if isinstance(jid, str)))
+    return tuple(committee)
+
+
+def _promotion_tools(jobs: list[Job]) -> tuple[str, ...]:
+    """List unique diagnostic tool names, falling back to job types in recorded order."""
+    seen: list[str] = []
+    for job in jobs:
+        tool = (job.diagnostics or {}).get("tool_name") if isinstance(job.diagnostics, dict) else None
+        name = tool if isinstance(tool, str) and tool else job.job_type
+        if name not in seen:
+            seen.append(name)
+    return tuple(seen)
+
+
+def _promotion_known_ats(rows: list[dict[str, JSONValue]]) -> tuple[str, ...]:
+    """Retain every string known-at value in ledger order, including duplicates."""
+    known: list[str] = []
+    for row in rows:
+        value = row.get("known_at")
+        if isinstance(value, str):
+            known.append(value)
+    return tuple(known)
+
+
+def _promotion_trace(
+    found: ResearchSession, final: dict[str, JSONValue], rows: list[dict[str, JSONValue]], jobs: list[Job]
+) -> FixtureTrace:
+    """Derive the trace from the durable ledger, freeze history, and completed committee roles."""
+    freeze_id = final.get("freeze_id")
+    freeze_ids = tuple(found.freeze_ids)
+    committee = _committee_job_freezes(found.committee_runs)
+    completed = [job.job_type for job in jobs if job.status == "completed"]
+    roles = tuple(role for role in ("stockbot", "bullbot", "bearbot") if role in completed)
+    return _session_trace(
+        final,
+        rows,
+        freeze_ids=freeze_ids,
+        freeze_id=freeze_id if isinstance(freeze_id, str) else None,
+        committee_ids=committee or freeze_ids,
+        roles=roles,
+    )
+
+
 def promote_to_fixture(
     *,
     session_id: str,
@@ -368,56 +457,22 @@ def promote_to_fixture(
     repo: object | None = None,
 ) -> Path:
     """Promote one durable session: carry its ledger trace into the fixture."""
-    from app.research.repository import ResearchRepository
-
-    store = repo if isinstance(repo, ResearchRepository) else ResearchRepository()
-    try:
-        found = store.get_session(session_id)
-    except KeyError:
-        raise ValueError(f"promote: unknown session_id: {session_id!r}") from None
-    final: dict[str, JSONValue] = found.final_result if isinstance(found.final_result, dict) else {}
-    rows = store.list_evidence(session_id)
-    jobs = store.list_jobs(session_id)
-    freeze_id = final.get("freeze_id") if isinstance(final, dict) else None
+    found, rows, jobs = _promotion_records(session_id, repo)
+    final, final_answer = _promotion_final(found.final_result)
     freeze_ids = tuple(found.freeze_ids)
-    committee: list[str] = []
-    for entry in found.committee_runs:
-        if isinstance(entry, dict):
-            fid = entry.get("freeze_id")
-            got = entry.get("jobs")
-            if isinstance(fid, str) and isinstance(got, list):
-                committee.extend([fid] * sum(1 for jid in got if isinstance(jid, str)))
-    known = [str(row.get("known_at")) for row in rows if isinstance(row, dict) and isinstance(row.get("known_at"), str)]
-    completed = [job.job_type for job in jobs if job.status == "completed"]
-    roles = tuple(role for role in ("stockbot", "bullbot", "bearbot") if role in completed)
-    seen_tools: list[str] = []
-    for job in jobs:
-        tool = (job.diagnostics or {}).get("tool_name") if isinstance(job.diagnostics, dict) else None
-        name = tool if isinstance(tool, str) and tool else job.job_type
-        if name not in seen_tools:
-            seen_tools.append(name)
-    final_answer = final.get("answer") if isinstance(final, dict) else None
-    derived = _session_trace(
-        final,
-        rows,
-        freeze_ids=freeze_ids,
-        freeze_id=freeze_id if isinstance(freeze_id, str) else None,
-        committee_ids=tuple(committee) or freeze_ids,
-        roles=roles,
-    )
+    derived = _promotion_trace(found, final, rows, jobs)
+    last_freeze = freeze_ids[-1] if freeze_ids else None
     fixture = build_fixture(
         session_id=session_id,
         scenario_name=scenario_name,
         question=question if question is not None else (found.query or None),
-        as_of=as_of if as_of is not None else None,
-        tool_calls=tuple(tool_calls) if tool_calls is not None else tuple(seen_tools),
+        as_of=as_of,
+        tool_calls=tuple(tool_calls) if tool_calls is not None else _promotion_tools(jobs),
         evidence_ids=tuple(evidence_ids) if evidence_ids is not None else tuple(derived["raw_evidence_ids"]),
-        known_ats=tuple(known_ats) if known_ats is not None else tuple(known),
-        answer_excerpt=answer_excerpt
-        if answer_excerpt is not None
-        else (final_answer if isinstance(final_answer, str) else ""),
-        freeze_before=freeze_ids[-1] if freeze_ids else None,
-        freeze_after=freeze_ids[-1] if freeze_ids else None,
+        known_ats=tuple(known_ats) if known_ats is not None else _promotion_known_ats(rows),
+        answer_excerpt=answer_excerpt if answer_excerpt is not None else final_answer,
+        freeze_before=last_freeze,
+        freeze_after=last_freeze,
         trace=derived,
     )
     return save_fixture(fixture, fixtures_dir)

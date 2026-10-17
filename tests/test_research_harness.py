@@ -7244,3 +7244,1677 @@ def test_needle_execution_context_excludes_raw_evidence() -> None:
     assert context["ticker"] == "ORCL"
     assert context["temporal_scope"] == {"mode": "latest-available"}
     assert context["grounded_arguments"] == {"identifier": "ORCL"}
+
+
+# --- changed-code CRAP repair: lifecycle argument resolution + coverage folds ---
+
+
+def test_start_job_budget_resolves_request_wave_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A budget-embedded request_id/wave/model/owner shapes the job; a repeat request returns the winner."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _svc_sid(repo)
+    first = _svc.start_job(
+        sid,
+        "source_agent",
+        budget={"request_id": "attempt-budget", "wave_id": 2, "model": "m-budget", "owner": "thesis"},
+        repo=repo,
+    )
+    assert first["wave_id"] == 2 and first["model"] == "m-budget" and first["owner"] == "thesis"
+    repeat = _svc.start_job(sid, "source_agent", budget={"request_id": "attempt-budget"}, repo=repo)
+    assert repeat["job_id"] == first["job_id"] and len(repo.list_jobs(sid)) == 2  # seed job + one winner
+    assert _svc.start_job(sid, "source_agent", budget={"model": 7}, model="m-kwarg", repo=repo)["model"] == "m-kwarg"
+    assert _svc.start_job(sid, "source_agent", budget={"model": 7}, repo=repo)["model"] is None
+
+
+def test_sufficient_required_rejects_empty_domain_work() -> None:
+    """Each domain's sufficient envelope fails closed on an empty work artifact, not only on a missing key."""
+    from app.research import service as _svc
+
+    sec_no_runs = dict(_reg_cov())
+    no_runs: list[object] = []
+    sec_no_runs["search_runs"] = no_runs
+    with pytest.raises(ValueError, match="non-empty search_runs"):
+        _svc._sufficient_required(sec_no_runs, "SEC")
+    sec_blank_branch = dict(_reg_cov())
+    sec_blank_branch["covered_branches"] = ["   "]
+    with pytest.raises(ValueError, match="non-empty covered_branches"):
+        _svc._sufficient_required(sec_blank_branch, "SEC")
+    with pytest.raises(ValueError, match="non-empty covered_branches"):
+        _svc._sufficient_required(_hf_finra_sufficient(covered_branches=[]), "FINRA")
+    with pytest.raises(ValueError, match="non-empty covered_branches"):
+        _svc._sufficient_required(_hf_web_sufficient(covered_branches=["  "]), "WEB")
+    _svc._sufficient_required(_reg_cov(), "SEC")  # the complete envelope passes
+
+
+def test_submit_sufficient_without_search_runs_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sufficient SEC claim with no search runs is ERR_COVERAGE_REQUIRED; the job stays running."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _inv_sid(repo)
+    eid = f"{sid}:ev:1"
+    _svc.record_evidence(sid, src, _svc_item(eid), repo=repo)
+    coverage: dict[str, object] = dict(_reg_cov())
+    no_runs: list[object] = []
+    coverage["search_runs"] = no_runs
+    with pytest.raises(ValueError, match="ERR_COVERAGE_REQUIRED"):
+        _svc.submit_source_result(src, coverage=coverage, evidence_ids=[eid], repo=repo)
+    assert repo.get_job(src).status == "running"
+
+
+def test_wave1_coverage_merges_dossiers_by_domain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wave coverage unions each dossier's lists with a domain tag; an insufficient verdict never upgrades."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _svc_sid(repo)
+    repo.save_dossier(
+        {
+            "dossier_id": f"{sid}:1:sec",
+            "session_id": sid,
+            "wave_id": 1,
+            "created_at": "2025-01-01T00:00:00+00:00",
+            "coverage": {"source_domain": "sec", "resolved": ["a"], "empty": [], "complete": True, "docs": 7},
+            "relationships": [{"kind": "supplier"}, "junk"],
+            "open_questions": ["q1", 7, ""],
+        }
+    )
+    repo.save_dossier(
+        {
+            "dossier_id": f"{sid}:1:finra",
+            "session_id": sid,
+            "wave_id": 1,
+            "created_at": "2025-01-02T00:00:00+00:00",
+            "coverage": {"source_domain": "finra", "resolved": [1, "b"], "useful_for_question": "insufficient"},
+            "open_questions": "not-a-list",
+        }
+    )
+    repo.save_dossier(
+        {
+            "dossier_id": f"{sid}:1:web",
+            "session_id": sid,
+            "wave_id": 1,
+            "created_at": "2025-01-03T00:00:00+00:00",
+            "coverage": {"source_domain": "web", "useful_for_question": "sufficient"},
+        }
+    )
+    repo.save_dossier({"dossier_id": f"{sid}:1:junk", "session_id": sid, "wave_id": 1, "coverage": "nope"})
+    merged, rels, open_q = _svc._wave1_coverage(repo, sid)
+    assert merged == {"resolved": ["[SEC] a", 1, "[FINRA] b"], "useful_for_question": "insufficient"}
+    assert rels == [{"kind": "supplier"}]
+    assert open_q == ["q1"]
+
+
+def test_finalize_coverage_folds_known_domains_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Per-domain coverage keeps stripped, sorted, unique strings; unknown domains and junk rows are dropped."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _svc_sid(repo)
+    repo.save_dossier(
+        {
+            "dossier_id": f"{sid}:1:sec",
+            "session_id": sid,
+            "wave_id": 1,
+            "coverage": {"source_domain": "sec", "docs": [" b ", "a", "a", 5], "notes": []},
+        }
+    )
+    repo.save_dossier(
+        {
+            "dossier_id": f"{sid}:2:sec",
+            "session_id": sid,
+            "wave_id": 2,
+            "coverage": {"source_domain": "SEC", "docs": ["c", "a"]},
+        }
+    )
+    repo.save_dossier(
+        {
+            "dossier_id": f"{sid}:1:other",
+            "session_id": sid,
+            "wave_id": 1,
+            "coverage": {"source_domain": "OTHER", "docs": ["x"]},
+        }
+    )
+    repo.save_dossier({"dossier_id": f"{sid}:1:junk", "session_id": sid, "wave_id": 1, "coverage": "nope"})
+    assert _svc._finalize_coverage(repo, sid) == {"sec": {"docs": ["a", "b", "c"]}}
+
+    def _boom(_session_id: str) -> list[dict[str, object]]:
+        raise RuntimeError("coverage read failed")
+
+    monkeypatch.setattr(repo, "list_dossiers", _boom)
+    assert _svc._finalize_coverage(repo, sid) == {}
+
+
+def test_dossier_limitations_folds_lists_and_incomplete_flag() -> None:
+    """Limitations/gaps fold in stripped and unique; an incomplete dossier names its own source."""
+    from app.research import service as _svc
+
+    lims: list[str] = ["existing"]
+    _svc._dossier_limitations(lims, {"dossier_id": "d1"})
+    _svc._dossier_limitations(lims, {"coverage": "nope"})
+    assert lims == ["existing"]
+    _svc._dossier_limitations(lims, {"coverage": {"source_limitations": ["  a  ", "a", 5], "gaps": ["b"]}})
+    assert lims == ["existing", "a", "b"]
+    _svc._dossier_limitations(lims, {"coverage": {"complete": False, "source_domain": "finra"}})
+    assert lims == ["existing", "a", "b", "FINRA coverage incomplete for this session"]
+    _svc._dossier_limitations(lims, {"coverage": {"complete": False}})
+    assert lims[-1] == "Source coverage incomplete for this session"
+
+
+def test_create_node_validates_arguments_and_dependency_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Node text must be non-blank; every dependency must be a non-empty id inside the same session."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _svc_sid(repo, "first question?")
+    other, _ = _svc_sid(repo, "second question?")
+    with pytest.raises(ValueError, match="'question' must be a non-empty string"):
+        _svc.create_node(sid, "   ", "why it matters", repo=repo)
+    with pytest.raises(ValueError, match="'why_it_matters' must be a non-empty string"):
+        _svc.create_node(sid, "what?", "", repo=repo)
+    with pytest.raises(ValueError, match="'depends_on' must be a list of non-empty strings"):
+        _svc.create_node(sid, "what?", "why", depends_on=["ok", ""], repo=repo)
+    parent = _svc.create_node(sid, "  parent?  ", "  because it matters  ", repo=repo)
+    assert parent.question == "parent?" and parent.why_it_matters == "because it matters"
+    child = _svc.create_node(sid, "child?", "why", depends_on=[parent.node_id], repo=repo)
+    assert child.depends_on == (parent.node_id,) and repo.get_node(child.node_id).session_id == sid
+    foreign = _svc.create_node(other, "foreign?", "why", repo=repo)
+    with pytest.raises(ValueError, match="belongs to another session"):
+        _svc.create_node(sid, "cross?", "why", depends_on=[foreign.node_id], repo=repo)
+    with pytest.raises(_svc.ResearchNotFound, match="unknown node_id"):
+        _svc.create_node(sid, "missing dep?", "why", depends_on=[f"{sid}:node:absent"], repo=repo)
+
+    def _boom_save(_node: object) -> None:
+        raise KeyError("session row vanished")
+
+    monkeypatch.setattr(repo, "save_node", _boom_save)
+    with pytest.raises(_svc.ResearchNotFound, match="unknown session_id"):
+        _svc.create_node(sid, "late?", "why", repo=repo)
+
+
+def test_record_decision_validates_type_and_linked_ownership(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A decision type must be non-blank; a linked node/job must belong to the same session."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, own_job = _svc_sid(repo, "decision owner?")
+    other, foreign_job = _svc_sid(repo, "decision stranger?")
+    with pytest.raises(ValueError, match="'decision_type' must be a non-empty string"):
+        _svc.record_decision(sid, "  ", {}, {}, None, repo=repo)
+    node = _svc.create_node(sid, "q?", "why", repo=repo)
+    foreign_node = _svc.create_node(other, "q?", "why", repo=repo)
+    with pytest.raises(_svc.ResearchNotFound, match="unknown node_id"):
+        _svc.record_decision(sid, "route", {}, {}, None, node_id=foreign_node.node_id, repo=repo)
+    with pytest.raises(_svc.ResearchNotFound, match="unknown job_id"):
+        _svc.record_decision(sid, "route", {}, {}, None, job_id=foreign_job, repo=repo)
+    recorded = _svc.record_decision(
+        sid, " route ", {"a": 1}, {"a": 0.5}, "a", node_id=node.node_id, job_id=own_job, repo=repo
+    )
+    assert recorded.decision_type == "route" and recorded.session_id == sid
+    assert recorded.node_id == node.node_id and recorded.job_id == own_job
+    plain = _svc.record_decision(sid, "route", {}, {}, None, repo=repo)
+    assert plain.node_id is None and plain.job_id is None
+
+    def _boom_save(*args: object, **kwargs: object) -> None:
+        raise KeyError("decision row rejected")
+
+    monkeypatch.setattr(repo, "save_decision", _boom_save)
+    with pytest.raises(_svc.ResearchNotFound, match="decision row rejected"):
+        _svc.record_decision(sid, "route", {}, {}, None, repo=repo)
+
+
+@settings(max_examples=100, derandomize=True)
+@given(st.lists(st.text(), max_size=8))
+def test_prop_finalize_coverage_merge_is_normalized_and_idempotent(docs: list[str]) -> None:
+    """Folding one source's string list stays sorted, blank-free, deduped, and stable on a repeat fold."""
+    from app.research import service as _svc
+
+    out: dict[str, dict[str, list[str]]] = {"sec": {}, "finra": {}, "web": {}}
+    coverage: dict[str, object] = {"source_domain": "SEC", "docs": docs}
+    _svc._merge_final_coverage(out, coverage)
+    merged = out["sec"].get("docs", [])
+    assert merged == sorted({d.strip() for d in docs if d.strip()})
+    _svc._merge_final_coverage(out, coverage)
+    assert out["sec"].get("docs", []) == merged
+
+
+# --- expand_queries rerank: embedding is a tiebreak, never a failure --------
+def test_rerank_queries_orders_only_with_a_usable_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.needle_client as needle
+    from app.research.agents import source_agent as sa
+
+    def _boom(_texts: object, _reference: object, **_kwargs: object) -> None:
+        raise AssertionError("no embedding work for a non-ranking input")
+
+    def _reversed(_texts: object, _reference: object, **_kwargs: object) -> list[int]:
+        return [1, 0]
+
+    monkeypatch.setattr(needle, "similarity_order", _boom)
+    queries = ["nvda demand", "nvda margin"]
+    assert sa._rerank_queries(queries, None) is queries  # absent reference
+    assert sa._rerank_queries(queries, "   ") is queries  # blank reference
+    assert sa._rerank_queries(["nvda demand"], "NVDA exposure") == ["nvda demand"]  # single candidate
+    assert sa._rerank_queries([], "NVDA exposure") == []
+
+    monkeypatch.setattr(needle, "similarity_order", _reversed)
+    assert sa._rerank_queries(queries, "NVDA exposure") == ["nvda margin", "nvda demand"]
+
+
+def test_rerank_queries_keeps_planned_order_when_embedding_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    import app.needle_client as needle
+    from app.research.agents import source_agent as sa
+
+    def _raises(_texts: object, _reference: object, **_kwargs: object) -> None:
+        raise RuntimeError("embed down")
+
+    def _declines(_texts: object, _reference: object, **_kwargs: object) -> None:
+        return None
+
+    queries = ["nvda demand", "nvda margin"]
+    # A missing worker module, a raising embedder, and a refusal to rank all keep the planned order.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(sys.modules, "app.needle_client", None)
+        assert sa._rerank_queries(queries, "NVDA exposure") == queries
+    monkeypatch.setattr(needle, "similarity_order", _raises)
+    assert sa._rerank_queries(queries, "NVDA exposure") == queries
+    monkeypatch.setattr(needle, "similarity_order", _declines)
+    assert sa._rerank_queries(queries, "NVDA exposure") == queries
+
+
+# --- evidence/synthesis: caller integrity rows + coverage lines (public results) ---
+
+
+def test_hf_caller_closed_integrity_wins_over_observation() -> None:
+    """A caller closed-vocabulary integrity survives even when the observation maps elsewhere."""
+    from app.research.agents import GroundedClaim
+    from app.research.agents.bearbot import BearAnalysis
+    from app.research.agents.bullbot import BullAnalysis
+    from app.research.agents.stockbot import StockbotAnalysis
+    from app.research.synthesis.committee import compute_disagreement
+    from app.research.synthesis.final import synthesize_final
+
+    claim = GroundedClaim(text="exposure", evidence_ids=["EV-1"])
+    stock = StockbotAnalysis(
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        evidence_ids=["EV-1"],
+        as_of="2025-06-30",
+        question="q",
+        answer="a",
+        base_case="b",
+        claims=[claim],
+    )
+    bull = BullAnalysis(
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        evidence_ids=["EV-1"],
+        as_of="2025-06-30",
+        question="q",
+        stance="bull",
+        bull_case="up",
+        claims=[claim],
+    )
+    bear = BearAnalysis(
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        evidence_ids=["EV-1"],
+        as_of="2025-06-30",
+        question="q",
+        stance="bear",
+        bear_case="down",
+        claims=[claim],
+    )
+    obs = {
+        "evidence_id": "EV-1",
+        "provenance": {
+            "kind": "finra_record",
+            "tool_name": "query_finra",
+            "record_identity": "row-1",
+        },
+    }
+    synth = synthesize_final(
+        "q",
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        as_of="2025-06-30",
+        stock=stock,
+        bull=bull,
+        bear=bear,
+        disagreement=compute_disagreement(stock, bull, bear),
+        observations=[obs],
+        sources=[
+            {
+                "evidence_id": "EV-1",
+                "domain": "FINRA",
+                "document": "FINRA",
+                "integrity_class": "PRIMARY_DOCUMENT",
+            }
+        ],
+    )
+    assert synth.sources[0]["integrity_class"] == "PRIMARY_DOCUMENT"
+    assert "FINRA [PRIMARY_DOCUMENT]" in synth.answer
+
+
+def test_hf_caller_integrity_alias_accepted() -> None:
+    """Both integrity keys survive: integrity_class alone and the legacy integrity alias alone."""
+    from app.research.agents import GroundedClaim
+    from app.research.agents.bearbot import BearAnalysis
+    from app.research.agents.bullbot import BullAnalysis
+    from app.research.agents.stockbot import StockbotAnalysis
+    from app.research.synthesis.committee import compute_disagreement
+    from app.research.synthesis.final import FinalSynthesis, synthesize_final
+
+    def _synth(source: dict[str, object]) -> FinalSynthesis:
+        claim = GroundedClaim(text="exposure", evidence_ids=["EV-1"])
+        stock = StockbotAnalysis(
+            session_id="rs:t",
+            wave_id=1,
+            freeze_id="F1",
+            evidence_ids=["EV-1"],
+            as_of="2025-06-30",
+            question="q",
+            answer="a",
+            base_case="b",
+            claims=[claim],
+        )
+        bull = BullAnalysis(
+            session_id="rs:t",
+            wave_id=1,
+            freeze_id="F1",
+            evidence_ids=["EV-1"],
+            as_of="2025-06-30",
+            question="q",
+            stance="bull",
+            bull_case="up",
+            claims=[claim],
+        )
+        bear = BearAnalysis(
+            session_id="rs:t",
+            wave_id=1,
+            freeze_id="F1",
+            evidence_ids=["EV-1"],
+            as_of="2025-06-30",
+            question="q",
+            stance="bear",
+            bear_case="down",
+            claims=[claim],
+        )
+        return synthesize_final(
+            "q",
+            session_id="rs:t",
+            wave_id=1,
+            freeze_id="F1",
+            as_of="2025-06-30",
+            stock=stock,
+            bull=bull,
+            bear=bear,
+            disagreement=compute_disagreement(stock, bull, bear),
+            sources=[source],
+        )
+
+    by_class = _synth({"evidence_id": "EV-1", "integrity_class": "canonical_structured"})
+    assert by_class.sources[0]["integrity_class"] == "CANONICAL_STRUCTURED"
+    by_alias = _synth({"evidence_id": "EV-1", "integrity": "canonical_structured"})
+    assert by_alias.sources[0]["integrity_class"] == "CANONICAL_STRUCTURED"
+
+
+def test_hf_caller_closed_vocab_pinned() -> None:
+    """Every closed-vocabulary member survives verbatim, including lowercase external_source."""
+    from app.research.agents import GroundedClaim
+    from app.research.agents.bearbot import BearAnalysis
+    from app.research.agents.bullbot import BullAnalysis
+    from app.research.agents.stockbot import StockbotAnalysis
+    from app.research.synthesis.committee import compute_disagreement
+    from app.research.synthesis.final import synthesize_final
+
+    claims = [GroundedClaim(text="exposure", evidence_ids=["E1", "E2", "E3"])]
+    stock = StockbotAnalysis(
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        evidence_ids=["E1", "E2", "E3"],
+        as_of="2025-06-30",
+        question="q",
+        answer="a",
+        base_case="b",
+        claims=claims,
+    )
+    bull = BullAnalysis(
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        evidence_ids=["E1", "E2", "E3"],
+        as_of="2025-06-30",
+        question="q",
+        stance="bull",
+        bull_case="up",
+        claims=claims,
+    )
+    bear = BearAnalysis(
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        evidence_ids=["E1", "E2", "E3"],
+        as_of="2025-06-30",
+        question="q",
+        stance="bear",
+        bear_case="down",
+        claims=claims,
+    )
+    synth = synthesize_final(
+        "q",
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        as_of="2025-06-30",
+        stock=stock,
+        bull=bull,
+        bear=bear,
+        disagreement=compute_disagreement(stock, bull, bear),
+        observations=[{"evidence_id": "E3", "domain": "SEC", "integrity_class": "PRIMARY_DOCUMENT"}],
+        sources=[
+            {"evidence_id": "E1", "integrity_class": "primary_document"},
+            {"evidence_id": "E2", "integrity_class": "canonical_structured"},
+            {"evidence_id": "E3", "integrity_class": "external_source"},
+        ],
+    )
+    assert [row["integrity_class"] for row in synth.sources] == [
+        "PRIMARY_DOCUMENT",
+        "CANONICAL_STRUCTURED",
+        "EXTERNAL_SOURCE",
+    ]
+
+
+def test_hf_caller_document_label_survives() -> None:
+    """The caller document label (not source_name) renders in sources rows and the answer."""
+    from app.research.agents import GroundedClaim
+    from app.research.agents.bearbot import BearAnalysis
+    from app.research.agents.bullbot import BullAnalysis
+    from app.research.agents.stockbot import StockbotAnalysis
+    from app.research.synthesis.committee import compute_disagreement
+    from app.research.synthesis.final import synthesize_final
+
+    claim = GroundedClaim(text="exposure", evidence_ids=["EV-1"])
+    stock = StockbotAnalysis(
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        evidence_ids=["EV-1"],
+        as_of="2025-06-30",
+        question="q",
+        answer="a",
+        base_case="b",
+        claims=[claim],
+    )
+    bull = BullAnalysis(
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        evidence_ids=["EV-1"],
+        as_of="2025-06-30",
+        question="q",
+        stance="bull",
+        bull_case="up",
+        claims=[claim],
+    )
+    bear = BearAnalysis(
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        evidence_ids=["EV-1"],
+        as_of="2025-06-30",
+        question="q",
+        stance="bear",
+        bear_case="down",
+        claims=[claim],
+    )
+    synth = synthesize_final(
+        "q",
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        as_of="2025-06-30",
+        stock=stock,
+        bull=bull,
+        bear=bear,
+        disagreement=compute_disagreement(stock, bull, bear),
+        sources=[
+            {
+                "evidence_id": "EV-1",
+                "domain": "SEC",
+                "document": "msft-10k.htm",
+                "source_name": "other",
+                "integrity_class": "PRIMARY_DOCUMENT",
+            }
+        ],
+    )
+    assert synth.sources[0]["document"] == "msft-10k.htm"
+    assert "msft-10k.htm" in synth.answer
+
+
+def test_hf_coverage_line_separators_and_summary() -> None:
+    """Coverage answer lines keep ', '/' separation and the summary fallback detail."""
+    from app.research.agents import GroundedClaim
+    from app.research.agents.bearbot import BearAnalysis
+    from app.research.agents.bullbot import BullAnalysis
+    from app.research.agents.stockbot import StockbotAnalysis
+    from app.research.synthesis.committee import compute_disagreement
+    from app.research.synthesis.final import synthesize_final
+
+    claim = GroundedClaim(text="exposure", evidence_ids=["EV-1"])
+    stock = StockbotAnalysis(
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        evidence_ids=["EV-1"],
+        as_of="2025-06-30",
+        question="q",
+        answer="a",
+        base_case="b",
+        claims=[claim],
+    )
+    bull = BullAnalysis(
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        evidence_ids=["EV-1"],
+        as_of="2025-06-30",
+        question="q",
+        stance="bull",
+        bull_case="up",
+        claims=[claim],
+    )
+    bear = BearAnalysis(
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        evidence_ids=["EV-1"],
+        as_of="2025-06-30",
+        question="q",
+        stance="bear",
+        bear_case="down",
+        claims=[claim],
+    )
+    synth = synthesize_final(
+        "q",
+        session_id="rs:t",
+        wave_id=1,
+        freeze_id="F1",
+        as_of="2025-06-30",
+        stock=stock,
+        bull=bull,
+        bear=bear,
+        disagreement=compute_disagreement(stock, bull, bear),
+        coverage={
+            "sec": {"forms": ["10-K", "10-Q"], "docs": ["d1"], "summary": "two filings"},
+        },
+    )
+    assert "forms: 10-K, 10-Q" in synth.answer
+    assert "SEC — docs: d1; forms: 10-K, 10-Q" in synth.answer
+    assert "two filings" in synth.answer
+
+
+# --- service evidence slice: materialized timing, ledger, replay, ownership ---
+
+
+def test_service_materialized_timing_overwrites_caller(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stored row keeps the archive timing, never caller dates, and survives empty archive timing."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _svc_sid(repo)
+    passage = "Archive timing overwrite passage"
+    out = _svc.record_evidence(
+        sid,
+        src,
+        {
+            **_svc_item(f"{sid}:ev:time", passage=passage),
+            "known_at": "1999-01-01",
+            "published_at": "1999-01-02",
+            "retrieved_at": "1999-01-03",
+            "source_uri": "https://caller.example/stale",
+        },
+        repo=repo,
+    )
+    assert out["known_at"] == "2025-05-01T00:00:00+00:00"
+    assert out["published_at"] == "2025-04-30T00:00:00+00:00"
+    assert out["retrieved_at"] == "2025-05-01T00:00:00+00:00"
+    assert out["source_uri"] != "https://caller.example/stale"
+    assert "XXpublished_atXX" not in out and "PUBLISHED_AT" not in out
+    assert "XXretrieved_atXX" not in out and "RETRIEVED_AT" not in out
+    stored = repo.get_evidence(f"{sid}:ev:time")
+    assert stored["published_at"] == "2025-04-30T00:00:00+00:00"
+    assert stored["retrieved_at"] == "2025-05-01T00:00:00+00:00"
+
+
+def test_service_ledger_skips_legacy_and_keeps_duplicates_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy row that cannot decode never blocks admission; a duplicate id still fails closed."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _svc_sid(repo)
+    first = _svc.record_evidence(sid, src, _svc_item(f"{sid}:ev:1"), repo=repo)
+    assert first["evidence_id"] == f"{sid}:ev:1"
+    repo.save_evidence(
+        {
+            "evidence_id": f"{sid}:ev:legacy",
+            "session_id": sid,
+            "wave_id": 1,
+            "source_type": "pi",
+            "source_name": "SEC",
+            "subject": "NVDA",
+            "claim_text": "legacy",
+            "content": "legacy",
+            "content_hash": "0" * 64,
+            "retrieved_at": "2025-05-01T00:00:00+00:00",
+            "provenance": {"kind": "none"},
+        }
+    )
+    second = _svc.record_evidence(sid, src, _svc_item(f"{sid}:ev:2"), repo=repo)
+    assert second["evidence_id"] == f"{sid}:ev:2"
+    assert repo.get_evidence(f"{sid}:ev:2")["session_id"] == sid
+    passage = "A passage the ledger has never seen"
+    fresh = _svc.record_evidence(sid, src, _svc_item(f"{sid}:ev:3", passage=passage), repo=repo)
+    assert fresh["evidence_id"] == f"{sid}:ev:3"
+    assert len(repo.list_evidence(sid)) == 4
+    with pytest.raises(ValueError, match="duplicate evidence_id"):
+        repo.save_evidence_and_session(repo.get_session(sid), repo.get_evidence(f"{sid}:ev:2"))
+    assert len(repo.list_evidence(sid)) == 4
+    corrected = _svc.record_evidence(
+        sid,
+        src,
+        _svc_item(
+            f"{sid}:ev:corrected",
+            passage="The later filing corrects the earlier finding.",
+            superseded_by=f"{sid}:ev:2",
+        ),
+        repo=repo,
+    )
+    assert corrected["superseded_by"] == f"{sid}:ev:2"
+    assert repo.get_evidence(f"{sid}:ev:corrected")["superseded_by"] == f"{sid}:ev:2"
+    assert len(repo.list_evidence(sid)) == 5
+
+
+def test_service_finra_citation_keys_and_tool_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """FINRA replay reads record_identity cites and rejects non-record staged tools."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC", "FINRA", "WEB")
+    fin, _ = _hf_desks(repo, sid)
+    rid = _hf_persist_finra(repo, sid, fin, f"{sid}:tr:fin-keys")
+    marker = rid.rsplit(":tr:", 1)[-1]
+    passage = f"NVDA short interest 12345 shares {marker}"
+    out = _svc.record_evidence(
+        sid,
+        fin,
+        {
+            "evidence_id": f"{sid}:ev:fin-keys",
+            "content": "unrelated content",
+            "claim_text": "unrelated claim",
+            "subject": "NVDA",
+            "source_name": "FINRA",
+            "tool_result_id": rid,
+            "record_identity": passage,
+        },
+        repo=repo,
+    )
+    assert _hf_prov(out, "record_identity") == passage
+    wrong = _hf_persist_finra(repo, sid, fin, f"{sid}:tr:fin-wrong")
+    repo.save_tool_result(
+        {**repo.get_tool_result(wrong), "tool_result_id": f"{sid}:tr:fin-bad-tool", "tool_name": "search_web"}
+    )
+    with pytest.raises(ValueError, match="ERR_PROVENANCE_MISMATCH"):
+        _svc.record_evidence(
+            sid,
+            fin,
+            {
+                "evidence_id": f"{sid}:ev:fin-bad-tool",
+                "content": passage,
+                "claim_text": passage,
+                "subject": "NVDA",
+                "source_name": "FINRA",
+                "tool_result_id": f"{sid}:tr:fin-bad-tool",
+                "matching_passage": passage,
+            },
+            repo=repo,
+        )
+    assert repo.list_evidence(sid) == [repo.get_evidence(f"{sid}:ev:fin-keys")]
+
+
+def test_service_record_ownership_pins_session_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stored rows keep the caller session/job, claim, and default id prefix; events name the job."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _svc_sid(repo)
+    passage = "Ownership pins the submitting session and job"
+    out = _svc.record_evidence(
+        sid, src, _svc_item(f"{sid}:ev:own", passage=passage, claim_text="A caller claim"), repo=repo
+    )
+    stored = repo.get_evidence(f"{sid}:ev:own")
+    assert (stored["session_id"], stored["job_id"]) == (sid, src)
+    assert stored["claim_text"] == "A caller claim"
+    assert out["claim_text"] == "A caller claim"
+    defaulted = _svc.record_evidence(
+        sid,
+        src,
+        {k: v for k, v in _svc_item("unused", passage="An unclaimed passage").items() if k != "evidence_id"},
+        repo=repo,
+    )
+    assert str(defaulted["evidence_id"]).startswith(f"{sid}:ev:")
+    accepted = [e for e in repo.list_events(sid) if e.event_type == "evidence.accepted"]
+    assert accepted and all(e.payload.get("job_id") == src for e in accepted)
+    cov = _absence_cov()
+    artifact = _svc.record_evidence(
+        sid,
+        src,
+        {
+            "wave_id": 1,
+            "content": "no NVDA capacity constraint disclosed",
+            "claim_text": "not disclosed in the searched scope",
+            "claim_kind": "absence_observation",
+            "subject": "NVDA",
+            "source_name": "SEC",
+            "search_id": "s-own",
+            "query": "NVDA capacity",
+            "coverage": cov,
+        },
+        repo=repo,
+    )
+    assert repo.list_coverage_artifacts(sid)[-1]["job_id"] == src
+    assert str(artifact["artifact_id"]).startswith(f"{sid}:cov:")
+
+
+def test_service_evidence_identity_dedupes_repeats(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A same-subject repeat returns the winner without a new row; subjects stay isolated."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _svc_sid(repo)
+    passage = "Repeated observed passage for dedupe"
+    first = _svc.record_evidence(sid, src, _svc_item(f"{sid}:ev:first", passage=passage), repo=repo)
+    repeat = _svc.record_evidence(
+        sid,
+        src,
+        dict(_svc_item(f"{sid}:ev:second", passage=passage), content=first["content"], claim_text=first["claim_text"]),
+        repo=repo,
+    )
+    assert repeat == {"evidence_id": first["evidence_id"], "accepted": False, "duplicate_of": first["evidence_id"]}
+    assert [r["evidence_id"] for r in repo.list_evidence(sid)] == [first["evidence_id"]]
+    other = _svc.record_evidence(
+        sid,
+        src,
+        dict(_svc_item(f"{sid}:ev:other", subject="AAPL"), content=first["content"], claim_text=first["claim_text"]),
+        repo=repo,
+    )
+    assert other["evidence_id"] == f"{sid}:ev:other"
+    assert len(repo.list_evidence(sid)) == 2
+
+
+def test_service_absence_and_wave_guards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wrong-wave item and a stale job fail closed; a live wave-2 absence admits."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _svc_sid(repo)
+    _svc.record_evidence(sid, src, _svc_item(f"{sid}:ev:1"), repo=repo)
+    with pytest.raises(ValueError, match="item wave"):
+        _svc.record_evidence(sid, src, _svc_item(f"{sid}:ev:bad-wave", wave=2), repo=repo)
+    assert len(repo.list_evidence(sid)) == 1
+    _svc.complete_job(src, {}, repo=repo)
+    _svc.freeze_session(sid, 1, repo=repo)
+    wave2 = str(_svc.start_job(sid, "source_agent", repo=repo, wave_id=2)["job_id"])
+    stale = str(_svc.start_job(sid, "source_agent", repo=repo, wave_id=1)["job_id"])
+    with pytest.raises(ValueError, match="current wave"):
+        _svc.record_evidence(sid, stale, _svc_item(f"{sid}:ev:stale"), repo=repo)
+    cov = _absence_cov()
+    out = _svc.record_evidence(
+        sid,
+        wave2,
+        {
+            "wave_id": 2,
+            "content": "no NVDA capacity constraint disclosed",
+            "claim_text": "not disclosed in the searched scope",
+            "claim_kind": "absence_observation",
+            "subject": "NVDA",
+            "source_name": "SEC",
+            "search_id": "s-wave2",
+            "query": "NVDA capacity wave 2",
+            "coverage": cov,
+        },
+        repo=repo,
+    )
+    assert str(out["artifact_id"]).startswith(f"{sid}:cov:")
+    assert repo.list_coverage_artifacts(sid)[-1]["wave_id"] == 2
+    assert len(repo.list_evidence(sid)) == 1
+
+
+def test_service_missing_archive_dates_replace_caller_dates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An archive without optional dates clears publication and uses the current retrieval time."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _svc_sid(repo)
+    captured_at = datetime(2025, 5, 2, tzinfo=UTC)
+    monkeypatch.setattr(_svc, "utcnow", lambda: captured_at)
+
+    def document_without_dates(
+        accession_no: str,
+        document_name: str | None = None,
+        *,
+        offset: int = 0,
+        max_chars: int | None = None,
+        **_unused: object,
+    ) -> dict[str, object]:
+        document = seam.fake_sec_document(accession_no, document_name, offset=offset, max_chars=max_chars)
+        return {**document, "filed_at": None, "retrieved_at": None}
+
+    monkeypatch.setattr("app.sec.documents.get_sec_document", document_without_dates)
+    out = _svc.record_evidence(
+        sid,
+        src,
+        _svc_item(
+            f"{sid}:ev:no-dates",
+            published_at="1999-01-01",
+            retrieved_at="1999-01-02",
+        ),
+        repo=repo,
+    )
+    assert out["published_at"] is None
+    assert out["retrieved_at"] == captured_at.isoformat()
+    stored = repo.get_evidence(f"{sid}:ev:no-dates")
+    assert stored["published_at"] is None
+    assert stored["retrieved_at"] == captured_at.isoformat()
+    assert stored["known_at"] == "2025-05-01T00:00:00+00:00"
+
+
+def test_service_same_evidence_replay_returns_original(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An identical citation returns its original identity without another accepted event."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _svc_sid(repo)
+    item = _svc_item(f"{sid}:ev:repeat")
+    first = _svc.record_evidence(sid, src, item, repo=repo)
+    events = repo.list_events(sid)
+    repeated = _svc.record_evidence(sid, src, item, repo=repo)
+    assert repeated == {"evidence_id": first["evidence_id"], "accepted": False, "duplicate_of": first["evidence_id"]}
+    assert repo.list_evidence(sid) == [first]
+    assert repo.list_events(sid) == events
+
+
+@pytest.mark.parametrize("domain", ["FINRA", "WEB"])
+def test_service_replay_acceptance_event_names_submitting_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, domain: str
+) -> None:
+    """The journal retains the submitting job for each non-document citation."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, domain)
+    job = str(_svc.start_job(sid, "source_agent", source=domain, repo=repo)["job_id"])
+    rid = f"{sid}:tr:owner"
+    if domain == "FINRA":
+        _hf_persist_finra(repo, sid, job, rid)
+        passage = "NVDA short interest 12345 shares owner"
+    else:
+        _hf_persist_web(repo, sid, job, rid)
+        passage = "NVDA rallies on demand"
+    out = _svc.record_evidence(
+        sid,
+        job,
+        _hf_replay_item(f"{sid}:ev:owner", rid, passage, source_name=domain),
+        repo=repo,
+    )
+    assert out["job_id"] == job
+    assert repo.get_evidence(f"{sid}:ev:owner")["job_id"] == job
+    accepted = [event for event in repo.list_events(sid) if event.event_type == "evidence.accepted"]
+    assert len(accepted) == 1
+    assert accepted[0].payload["job_id"] == job
+    assert accepted[0].payload["evidence_id"] == out["evidence_id"]
+    assert accepted[0].payload["tool_result_id"] == rid
+
+
+def test_hf_replay_finra_dataset_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bare persisted dataset still grounds the FINRA citation when dataset_id is absent."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC", "FINRA", "WEB")
+    fin, _ = _hf_desks(repo, sid)
+    rid = f"{sid}:tr:fin-dataset"
+    marker = rid.rsplit(":tr:", 1)[-1]
+    passage = f"NVDA short interest 12345 shares {marker}"
+    _svc.persist_tool_result(
+        sid,
+        fin,
+        "query_finra",
+        rid,
+        {
+            "records": [{"symbol": "NVDA", "shortInterest": 12345, "marker": marker}],
+            "briefing": passage,
+            "dataset": "short-interest",
+            "as_of_date": "2025-06-15",
+            "published_at": "2025-06-20",
+        },
+        repo=repo,
+    )
+    out = _svc.record_evidence(
+        sid,
+        fin,
+        {
+            "evidence_id": f"{sid}:ev:fin-dataset",
+            "content": passage,
+            "claim_text": passage,
+            "subject": "NVDA",
+            "source_name": "FINRA",
+            "tool_result_id": rid,
+            "matching_passage": passage,
+        },
+        repo=repo,
+    )
+    assert _hf_prov(out, "kind") == "finra_record"
+    assert _hf_prov(out, "dataset") == "short-interest"
+
+
+def test_hf_replay_finra_declared_source_uri(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The caller-declared source_uri survives the FINRA replay onto the stored provenance."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC", "FINRA", "WEB")
+    fin, _ = _hf_desks(repo, sid)
+    rid = _hf_persist_finra(repo, sid, fin, f"{sid}:tr:fin-uri")
+    marker = rid.rsplit(":tr:", 1)[-1]
+    passage = f"NVDA short interest 12345 shares {marker}"
+    out = _svc.record_evidence(
+        sid,
+        fin,
+        {
+            "evidence_id": f"{sid}:ev:fin-uri",
+            "content": passage,
+            "claim_text": passage,
+            "subject": "NVDA",
+            "source_name": "FINRA",
+            "tool_result_id": rid,
+            "matching_passage": passage,
+            "source_uri": "https://example.com/finra/short-interest",
+        },
+        repo=repo,
+    )
+    assert _hf_prov(out, "kind") == "finra_record"
+    assert _hf_prov(out, "source_uri") == "https://example.com/finra/short-interest"
+
+
+def test_hf_replay_truncates_long_identities_to_2000(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Over-long FINRA/SEC/WEB citations store a 2000-char identity, never 2001."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC", "FINRA", "WEB")
+    fin, web = _hf_desks(repo, sid)
+    sec = str(_svc.start_job(sid, "source_agent", source="SEC", repo=repo, wave_id=1)["job_id"])
+    fin_passage = "Short interest increased. " * 120
+    fin_rid = f"{sid}:tr:fin-long"
+    _svc.persist_tool_result(
+        sid,
+        fin,
+        "query_finra",
+        fin_rid,
+        {
+            "records": [{"note": fin_passage}],
+            "briefing": fin_passage,
+            "as_of_date": "2025-06-15",
+            "published_at": "2025-06-20",
+        },
+        repo=repo,
+    )
+    fin_out = _svc.record_evidence(
+        sid,
+        fin,
+        {
+            "evidence_id": f"{sid}:ev:fin-long",
+            "content": fin_passage,
+            "claim_text": fin_passage,
+            "subject": "NVDA",
+            "source_name": "FINRA",
+            "tool_result_id": fin_rid,
+            "matching_passage": fin_passage,
+        },
+        repo=repo,
+    )
+    fin_prov = fin_out["provenance"]
+    assert isinstance(fin_prov, dict)
+    assert len(str(fin_prov["record_identity"])) == 2000
+    sec_passage = "Revenue increased. " * 120
+    sec_rid = str(
+        _svc.persist_tool_result(
+            sid,
+            sec,
+            "list_sec_filings",
+            f"{sid}:tr:sec-long",
+            {"filings": [{"form": "10-Q", "description": sec_passage}], "filed_at": "2025-06-01"},
+            repo=repo,
+        )["tool_result_id"]
+    )
+    sec_out = _svc.record_evidence(
+        sid,
+        sec,
+        {
+            "evidence_id": f"{sid}:ev:sec-long",
+            "content": sec_passage,
+            "source_name": "SEC",
+            "tool_result_id": sec_rid,
+            "matching_passage": sec_passage,
+        },
+        repo=repo,
+    )
+    sec_prov = sec_out["provenance"]
+    assert isinstance(sec_prov, dict)
+    assert len(str(sec_prov["record_identity"])) == 2000
+    web_passage = "Company demand increased. " * 120
+    web_rid = str(
+        _svc.persist_tool_result(
+            sid,
+            web,
+            "search_web",
+            f"{sid}:tr:web-long",
+            {
+                "evidence": [
+                    {
+                        "url": "https://example.com/long",
+                        "source_domain": "example.com",
+                        "title": "long read",
+                        "published_at": "2025-06-20",
+                        "retrieved_at": "2025-06-21",
+                        "highlight": web_passage,
+                    }
+                ]
+            },
+            repo=repo,
+        )["tool_result_id"]
+    )
+    web_out = _svc.record_evidence(
+        sid,
+        web,
+        {
+            "evidence_id": f"{sid}:ev:web-long",
+            "content": web_passage,
+            "claim_text": web_passage,
+            "subject": "NVDA",
+            "source_name": "web",
+            "tool_result_id": web_rid,
+            "matching_passage": web_passage,
+            "known_at": "2025-06-29T00:00:00+00:00",
+        },
+        repo=repo,
+    )
+    web_prov = web_out["provenance"]
+    assert isinstance(web_prov, dict)
+    assert len(str(web_prov["excerpt"])) == 2000
+
+
+def test_hf_replay_sec_ticker_dataset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SEC dataset reads the persisted ticker; a result with no subject/ticker stores no dataset."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC", "FINRA", "WEB")
+    sec = str(_svc.start_job(sid, "source_agent", source="SEC", repo=repo, wave_id=1)["job_id"])
+    tick_passage = "NVDA Form 4 accession 0001045810-25-000011"
+    tick_rid = str(
+        _svc.persist_tool_result(
+            sid,
+            sec,
+            "list_sec_filings",
+            f"{sid}:tr:sec-tick",
+            {"filings": [{"form": "4", "description": tick_passage}], "ticker": "NVDA", "filed_at": "2025-06-01"},
+            repo=repo,
+        )["tool_result_id"]
+    )
+    tick_out = _svc.record_evidence(
+        sid,
+        sec,
+        {
+            "evidence_id": f"{sid}:ev:sec-tick",
+            "content": tick_passage,
+            "source_name": "SEC",
+            "tool_result_id": tick_rid,
+            "matching_passage": tick_passage,
+        },
+        repo=repo,
+    )
+    assert _hf_prov(tick_out, "kind") == "sec_record"
+    assert _hf_prov(tick_out, "dataset") == "NVDA"
+    bare_passage = "NVDA 10-Q accession 0001045810-25-000012"
+    bare_rid = str(
+        _svc.persist_tool_result(
+            sid,
+            sec,
+            "list_sec_filings",
+            f"{sid}:tr:sec-bare",
+            {"filings": [{"form": "10-Q", "description": bare_passage}], "filed_at": "2025-06-01"},
+            repo=repo,
+        )["tool_result_id"]
+    )
+    bare_out = _svc.record_evidence(
+        sid,
+        sec,
+        {
+            "evidence_id": f"{sid}:ev:sec-bare",
+            "content": bare_passage,
+            "source_name": "SEC",
+            "tool_result_id": bare_rid,
+            "matching_passage": bare_passage,
+        },
+        repo=repo,
+    )
+    bare_prov = bare_out["provenance"]
+    assert isinstance(bare_prov, dict)
+    assert "dataset" not in bare_prov
+
+
+def test_hf_replay_sec_source_uri_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No declared URI: the SEC citation keeps the persisted result source."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC", "FINRA", "WEB")
+    sec = str(_svc.start_job(sid, "source_agent", source="SEC", repo=repo, wave_id=1)["job_id"])
+    uri = "https://www.sec.gov/Archives/edgar/data/1045810/000104581025000011/"
+    passage = "NVDA Form 4 accession 0001045810-25-000011"
+    rid = str(
+        _svc.persist_tool_result(
+            sid,
+            sec,
+            "list_sec_filings",
+            f"{sid}:tr:sec-uri",
+            {"filings": [{"form": "4", "description": passage}], "source": uri, "filed_at": "2025-06-01"},
+            repo=repo,
+        )["tool_result_id"]
+    )
+    out = _svc.record_evidence(
+        sid,
+        sec,
+        {
+            "evidence_id": f"{sid}:ev:sec-uri",
+            "content": passage,
+            "source_name": "SEC",
+            "tool_result_id": rid,
+            "matching_passage": passage,
+        },
+        repo=repo,
+    )
+    assert _hf_prov(out, "kind") == "sec_record"
+    assert _hf_prov(out, "source_uri") == uri
+
+
+def test_hf_replay_web_skips_highlightless_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A persisted row without highlight is not citable; the next matching row still grounds."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC", "FINRA", "WEB")
+    _, web = _hf_desks(repo, sid)
+    good = "NVDA rallies on demand"
+    rid = str(
+        _svc.persist_tool_result(
+            sid,
+            web,
+            "search_web",
+            f"{sid}:tr:web-skip",
+            {
+                "evidence": [
+                    {
+                        "url": "https://example.com/skip",
+                        "source_domain": "example.com",
+                        "title": "skip",
+                        "published_at": "2025-06-20",
+                        "retrieved_at": "2025-06-21",
+                    },
+                    {
+                        "url": "https://example.com/a",
+                        "source_domain": "example.com",
+                        "title": "NVDA news",
+                        "published_at": "2025-06-20",
+                        "retrieved_at": "2025-06-21",
+                        "highlight": good,
+                    },
+                ]
+            },
+            repo=repo,
+        )["tool_result_id"]
+    )
+    out = _svc.record_evidence(
+        sid,
+        web,
+        {
+            "evidence_id": f"{sid}:ev:web-skip",
+            "content": good,
+            "claim_text": good,
+            "subject": "NVDA",
+            "source_name": "web",
+            "tool_result_id": rid,
+            "matching_passage": good,
+            "known_at": "2025-06-29T00:00:00+00:00",
+        },
+        repo=repo,
+    )
+    assert _hf_prov(out, "url") == "https://example.com/a"
+    assert _hf_prov(out, "excerpt") == good
+
+
+def test_hf_replay_web_rejects_blank_highlight_fabrication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A highlightless persisted row never mints excerpt text: citing it fails ERR_PASSAGE_NOT_IN_SOURCE."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC", "FINRA", "WEB")
+    _, web = _hf_desks(repo, sid)
+    rid = str(
+        _svc.persist_tool_result(
+            sid,
+            web,
+            "search_web",
+            f"{sid}:tr:web-blank",
+            {
+                "evidence": [
+                    {
+                        "url": "https://example.com/a",
+                        "source_domain": "example.com",
+                        "title": "NVDA news",
+                        "published_at": "2025-06-20",
+                        "retrieved_at": "2025-06-21",
+                    }
+                ]
+            },
+            repo=repo,
+        )["tool_result_id"]
+    )
+    with pytest.raises(ValueError, match="ERR_PASSAGE_NOT_IN_SOURCE"):
+        _svc.record_evidence(
+            sid,
+            web,
+            {
+                "evidence_id": f"{sid}:ev:web-blank",
+                "content": "XXXX",
+                "claim_text": "XXXX",
+                "subject": "NVDA",
+                "source_name": "web",
+                "tool_result_id": rid,
+                "matching_passage": "XXXX",
+                "known_at": "2025-06-29T00:00:00+00:00",
+            },
+            repo=repo,
+        )
+    assert repo.list_evidence(sid) == []
+
+
+def test_hf_replay_web_representation_defaults_to_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provider extraction without a representation stores as text."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC", "FINRA", "WEB")
+    _, web = _hf_desks(repo, sid)
+    highlight = "NVDA rallies on demand"
+    rid = str(
+        _svc.persist_tool_result(
+            sid,
+            web,
+            "search_web",
+            f"{sid}:tr:web-repr",
+            {
+                "evidence": [
+                    {
+                        "url": "https://example.com/a",
+                        "source_domain": "example.com",
+                        "title": "NVDA news",
+                        "published_at": "2025-06-20",
+                        "retrieved_at": "2025-06-21",
+                        "highlight": highlight,
+                        "source_content": f"{highlight}. Revenue increased.",
+                    }
+                ]
+            },
+            repo=repo,
+        )["tool_result_id"]
+    )
+    out = _svc.record_evidence(
+        sid,
+        web,
+        {
+            "evidence_id": f"{sid}:ev:web-repr",
+            "content": highlight,
+            "claim_text": highlight,
+            "subject": "NVDA",
+            "source_name": "web",
+            "tool_result_id": rid,
+            "matching_passage": highlight,
+            "known_at": "2025-06-29T00:00:00+00:00",
+        },
+        repo=repo,
+    )
+    prov = out["provenance"]
+    assert isinstance(prov, dict)
+    assert prov["source_content"] == f"{highlight}. Revenue increased."
+    assert prov["source_representation"] == "text"
+
+
+def test_hf_replay_web_omits_absent_optional_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A persisted web row without title/domain stores no fabricated placeholder for them."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC", "FINRA", "WEB")
+    _, web = _hf_desks(repo, sid)
+    highlight = "NVDA rallies on demand"
+    rid = str(
+        _svc.persist_tool_result(
+            sid,
+            web,
+            "search_web",
+            f"{sid}:tr:web-bare",
+            {
+                "evidence": [
+                    {
+                        "url": "https://example.com/a",
+                        "published_at": "2025-06-20",
+                        "retrieved_at": "2025-06-21",
+                        "highlight": highlight,
+                    }
+                ]
+            },
+            repo=repo,
+        )["tool_result_id"]
+    )
+    out = _svc.record_evidence(
+        sid,
+        web,
+        {
+            "evidence_id": f"{sid}:ev:web-bare",
+            "content": highlight,
+            "claim_text": highlight,
+            "subject": "NVDA",
+            "source_name": "web",
+            "tool_result_id": rid,
+            "matching_passage": highlight,
+            "known_at": "2025-06-29T00:00:00+00:00",
+        },
+        repo=repo,
+    )
+    prov = out["provenance"]
+    assert isinstance(prov, dict)
+    assert prov["excerpt"] == highlight
+    assert "title" not in prov and "domain" not in prov
+
+
+def test_submit_success_returns_refs_and_persists_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Submit returns job/dossier/evidence/telemetry refs and persists the job result."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _reg_svc_sid(repo)
+    eid = f"{sid}:ev:1"
+    _svc.record_evidence(sid, src, _reg_item(eid), repo=repo)
+    out = _svc.submit_source_result(src, coverage=_reg_cov(), evidence_ids=[eid], repo=repo)
+    assert out["job_status"] == "completed"
+    assert out["job_id"] == src
+    assert out["dossier_id"] == f"{sid}:1:sec"
+    assert out["evidence_ids"] == [eid]
+    assert isinstance(out["telemetry"], dict) and isinstance(out["warnings"], list)
+    stored = repo.get_job(src).result or {}
+    coverage = stored.get("coverage")
+    assert isinstance(coverage, dict)
+    assert coverage["useful_for_question"] == "sufficient"
+    assert stored.get("evidence_ids") == [eid]
+    assert isinstance(stored.get("telemetry"), dict)
+    assert repo.get_session(sid).current_wave == 1
+
+
+def test_submit_wave2_advances_current_wave(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wave-2 submit advances the session current_wave to 2."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _reg_svc_sid(repo)
+    eid1 = f"{sid}:ev:1"
+    _svc.record_evidence(sid, src, _reg_item(eid1), repo=repo)
+    _svc.submit_source_result(src, coverage=_reg_cov(), evidence_ids=[eid1], repo=repo)
+    _svc.freeze_session(sid, 1, repo=repo)
+    src2 = str(_svc.start_job(sid, "source_agent", repo=repo, wave_id=2)["job_id"])
+    eid2 = f"{sid}:ev:2"
+    admitted = _svc.record_evidence(
+        sid,
+        src2,
+        _reg_item(
+            eid2,
+            wave=2,
+            claim_text="The later filing reports revised GS exposure terms.",
+            matching_passage="The firm reports revised OpenAI-linked exposure terms.",
+        ),
+        repo=repo,
+    )
+    assert admitted["evidence_id"] == eid2
+    assert admitted["job_id"] == src2
+    assert admitted["wave_id"] == 2
+    assert repo.get_evidence(eid2)["job_id"] == src2
+    out2 = _svc.submit_source_result(
+        src2, coverage={"useful_for_question": "insufficient"}, evidence_ids=[eid2], repo=repo
+    )
+    assert out2["job_id"] == src2
+    assert repo.get_session(sid).current_wave == 2
+    result = repo.get_job(src2).result
+    assert isinstance(result, dict)
+    assert result["evidence_ids"] == [eid2]
+
+
+def test_submit_insufficient_preserves_unresolved_in_dossier_and_telemetry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An insufficient submit persists unresolved questions in the dossier and telemetry."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _reg_svc_sid(repo)
+    eid = f"{sid}:ev:1"
+    _svc.record_evidence(sid, src, _reg_item(eid), repo=repo)
+    cov_question = "Coverage residual terms"
+    arg_question = "Is the exposure hedged?"
+    out = _svc.submit_source_result(
+        src,
+        coverage={"useful_for_question": "insufficient", "material_open_questions": [cov_question]},
+        evidence_ids=[eid],
+        unresolved_questions=[arg_question],
+        repo=repo,
+    )
+    dossier = repo.get_dossier(str(out["dossier_id"]))
+    open_questions = dossier.get("open_questions")
+    assert isinstance(open_questions, list)
+    assert arg_question in open_questions
+    telemetry = out["telemetry"]
+    assert isinstance(telemetry, dict)
+    remaining = telemetry.get("branches_remaining")
+    assert isinstance(remaining, list)
+    assert arg_question in remaining and cov_question in remaining
+
+
+def test_submit_uses_explicit_repo_not_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Submit honors the explicit repo object when the env DB points elsewhere."""
+    from app.research import service as _svc
+    from app.research.repository import ResearchRepository as _RR
+
+    env_db = tmp_path / "env.sqlite"
+    real_db = tmp_path / "real.sqlite"
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(env_db))
+    repo = _RR(path=real_db)
+    sid, src = _reg_svc_sid(repo)
+    eid = f"{sid}:ev:1"
+    _svc.record_evidence(sid, src, _reg_item(eid), repo=repo)
+    out = _svc.submit_source_result(src, coverage=_reg_cov(), evidence_ids=[eid], repo=repo)
+    assert out["job_id"] == src
+    assert repo.get_job(src).status == "completed"
+    assert _RR(path=env_db).list_sessions() == []
+
+
+def test_decision_service_budget_ignores_non_string_request_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-string budget request_id is ignored: the job still creates with no dedup claim."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _svc_sid(repo)
+    before = len(repo.list_jobs(sid))
+    first = _svc.start_job(sid, "source_agent", budget={"request_id": 123}, repo=repo)
+    assert first["job_id"]
+    assert repo.submission_job_id(sid, "123") is None
+    second = _svc.start_job(sid, "source_agent", budget={"request_id": ""}, repo=repo)
+    assert second["job_id"] != first["job_id"]
+    assert len(repo.list_jobs(sid)) == before + 2
+
+
+def test_decision_service_node_created_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """create_node persists the node and journals one node.created event with its id."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _svc_sid(repo)
+    node = _svc.create_node(sid, "what?", "why", repo=repo)
+    assert repo.get_node(node.node_id).question == "what?"
+    matches = [e for e in repo.list_events(sid) if e.event_type == "node.created"]
+    assert len(matches) == 1
+    assert matches[0].payload.get("node_id") == node.node_id
+
+
+def test_decision_service_decision_confidence_persists(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """record_decision persists the caller confidence on the returned row and the stored row."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _svc_sid(repo)
+    recorded = _svc.record_decision(sid, "route", {"a": 1}, {"a": 0.5}, "a", confidence=0.75, repo=repo)
+    assert recorded.confidence == 0.75
+    stored = repo.list_decisions(sid)
+    assert len(stored) == 1
+    assert stored[0].confidence == 0.75
+    assert stored[0].to_dict()["confidence"] == 0.75
+
+
+def test_decision_service_decision_recorded_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """record_decision persists the row and journals one decision.recorded event with id and type."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _svc_sid(repo)
+    recorded = _svc.record_decision(sid, "route", {"a": 1}, {"a": 0.5}, "a", repo=repo)
+    assert repo.list_decisions(sid)[0].decision_id == recorded.decision_id
+    matches = [e for e in repo.list_events(sid) if e.event_type == "decision.recorded"]
+    assert len(matches) == 1
+    assert matches[0].payload.get("decision_id") == recorded.decision_id
+    assert matches[0].payload.get("type") == "route"
+
+
+def test_submit_existing_dossier_keeps_current_telemetry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A later source job reports its current coverage despite the immutable earlier dossier."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, first = _svc_sid(repo)
+    second = str(_svc.start_job(sid, "source_agent", repo=repo)["job_id"])
+    before: dict[str, object] = {
+        "useful_for_question": "insufficient",
+        "material_open_questions": ["Prior filing terms"],
+    }
+    after: dict[str, object] = {
+        "useful_for_question": "insufficient",
+        "material_open_questions": ["Current filing terms"],
+    }
+    prior = _svc.submit_source_result(first, coverage=before, repo=repo)
+    current = _svc.submit_source_result(second, coverage=after, repo=repo)
+    assert current["dossier_id"] == prior["dossier_id"]
+    telemetry = current["telemetry"]
+    assert isinstance(telemetry, dict)
+    assert telemetry["branches_remaining"] == ["Current filing terms"]
+    stored = repo.get_job(second).result
+    assert isinstance(stored, dict)
+    assert stored["telemetry"] == telemetry
+
+
+def test_submit_sufficient_missing_keys_reports_all(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sufficient envelope missing two work keys reports both; the job stays running with no dossier."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, src = _inv_sid(repo)
+    eid = f"{sid}:ev:1"
+    _svc.record_evidence(sid, src, _svc_item(eid), repo=repo)
+    coverage: dict[str, object] = dict(_reg_cov())
+    del coverage["forms_examined"]
+    del coverage["search_runs"]
+    with pytest.raises(ValueError, match="ERR_COVERAGE_REQUIRED") as excinfo:
+        _svc.submit_source_result(src, coverage=coverage, evidence_ids=[eid], repo=repo)
+    message = str(excinfo.value)
+    assert "forms_examined" in message and "search_runs" in message
+    assert repo.get_job(src).status == "running"
+    assert repo.get_job(src).result is None
+    assert repo.list_dossiers(sid) == []
+    assert repo.get_session(sid).status not in ("completed", "synthesizing", "failed")
+
+
+def test_create_node_rejects_null_nonstring_question(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A null/non-string question fails through create_node with the documented ValueError."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _svc_sid(repo, "first question?")
+    bad_questions: list[object] = [None, 123]
+    for bad_question in bad_questions:
+        with pytest.raises(ValueError, match="'question' must be a non-empty string"):
+            _svc.create_node(sid, bad_question, "why it matters", repo=repo)  # type: ignore[arg-type]
+    assert repo.list_nodes(sid) == []

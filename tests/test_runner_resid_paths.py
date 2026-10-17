@@ -16,11 +16,13 @@ from __future__ import annotations
 import json
 import re as _re
 from collections.abc import Callable
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 import tests.research_source_seam as seam
 from app.research.repository import ResearchRepository
@@ -30,6 +32,8 @@ if TYPE_CHECKING:
     from app.research.agents.bullbot import BullAnalysis
     from app.research.agents.stockbot import StockbotAnalysis
     from app.research.director import Wave1Result
+    from app.research.evidence import Evidence
+    from app.research.models import JSONValue
     from app.research.runner import _LiveRun
 
 
@@ -1636,3 +1640,365 @@ def test_runner_retention_no_archive_on_reject_or_admit(
     assert repo.list_evidence(sid2) == []
     assert [e for e in repo.list_events(sid2) if e.event_type == "evidence.accepted"] == []
     assert repo.get_session(sid2).evidence_ids == []
+
+
+def _bundle_record(
+    evidence_id: str = "EV-bundle",
+    session_id: str = "bundle-session",
+    content: str = "Revenue grew.\nExact source text.",
+) -> Evidence:
+    from app.research.evidence import Evidence, evidence_content_hash
+
+    return Evidence(
+        evidence_id=evidence_id,
+        session_id=session_id,
+        wave_id=1,
+        source_type="sec",
+        source_name="get_sec_document",
+        subject="NVDA",
+        claim_text="Revenue grew.",
+        content=content,
+        content_hash=evidence_content_hash(content),
+        retrieved_at=datetime(2025, 5, 1, tzinfo=UTC),
+    )
+
+
+@pytest.mark.parametrize(
+    ("url", "excerpt"),
+    [("", "quote"), ("https://example.com", " "), (12, "quote"), ("https://example.com", None)],
+)
+def test_web_source_ref_rejects_missing_required_text(url: object, excerpt: object) -> None:
+    from app.research.evidence import web_source_ref
+
+    with pytest.raises(ValueError, match="web_source_ref: url and excerpt must be non-empty strings"):
+        web_source_ref(url=url, excerpt=excerpt)
+
+
+@pytest.mark.parametrize("representation", [None, " ", 17, " html "])
+def test_web_source_ref_trims_and_bounds_provider_content(representation: object) -> None:
+    from app.research.evidence import web_source_ref
+
+    ref = web_source_ref(
+        url=" https://example.com/page ",
+        excerpt=" quoted text ",
+        title=" Headline ",
+        domain=" example.com ",
+        published_at=" 2025-04-30 ",
+        retrieved_at=" 2025-05-01 ",
+        tool_result_id=" result-1 ",
+        source_content=" " + "a" * 12001 + " ",
+        source_representation=representation,
+    )
+    assert ref == {
+        "kind": "web_source",
+        "url": "https://example.com/page",
+        "excerpt": "quoted text",
+        "title": "Headline",
+        "domain": "example.com",
+        "published_at": "2025-04-30",
+        "retrieved_at": "2025-05-01",
+        "tool_result_id": "result-1",
+        "source_content": "a" * 12000,
+        "source_representation": "html" if representation == " html " else "text",
+    }
+    excerpt_only = web_source_ref(
+        url="https://example.com/page",
+        excerpt="quoted text",
+        title=" ",
+        domain=17,
+        source_content=" ",
+        source_representation="html",
+    )
+    assert excerpt_only == {"kind": "web_source", "url": "https://example.com/page", "excerpt": "quoted text"}
+
+
+@pytest.mark.parametrize(
+    ("source_uri", "record_id", "provenance", "expected_url", "expected_accession"),
+    [
+        (
+            " https://explicit.test/doc ",
+            "record",
+            {"source_uri": "https://provenance.test/doc"},
+            "https://explicit.test/doc",
+            "record",
+        ),
+        (None, "record", {"source_uri": " https://provenance.test/doc "}, "https://provenance.test/doc", "record"),
+        (
+            " ",
+            "0000320193-25-000079",
+            {},
+            "https://www.sec.gov/Archives/edgar/data/000032019325000079",
+            "0000320193-25-000079",
+        ),
+        (
+            None,
+            "record",
+            {"accession_no": "0000320193-25-000080"},
+            "https://www.sec.gov/Archives/edgar/data/000032019325000080",
+            "0000320193-25-000080",
+        ),
+        (None, None, {"source_uri": " ", "accession_no": ""}, "", ""),
+        (
+            None,
+            "record-id",
+            {"source_uri": 17, "accession_no": 42},
+            "https://www.sec.gov/Archives/edgar/data/recordid",
+            "record-id",
+        ),
+        (None, "---", {}, "", "---"),
+    ],
+)
+def test_bundle_entry_source_url_precedence(
+    source_uri: str | None,
+    record_id: str | None,
+    provenance: dict[str, JSONValue],
+    expected_url: str,
+    expected_accession: str,
+) -> None:
+    from dataclasses import replace
+
+    from app.research.evidence import evidence_bundle_entry
+
+    rec = replace(_bundle_record(), source_uri=source_uri, source_record_id=record_id)
+    # Legacy mutable provenance can hold fields beyond the canonical constructor shape.
+    rec.provenance.update(provenance)
+    entry = evidence_bundle_entry(rec)
+    assert entry["source_url"] == expected_url
+    assert entry["accession"] == expected_accession
+    assert entry["evidence_id"] == rec.evidence_id
+    assert entry["session_id"] == rec.session_id
+
+
+@pytest.mark.parametrize(
+    ("provenance", "metadata", "locator", "artifact", "form"),
+    [
+        (
+            {
+                "accession_no": "0000320193-25-000079",
+                "document_name": "source.htm",
+                "section": "Risk",
+                "offset": 0,
+                "end": 20,
+            },
+            {"document_name": "fallback.htm", "source_bytes": "archived", "form": "10-Q"},
+            {"document": "source.htm", "section": "Risk", "start": 0, "end": 20},
+            "source://sec/0000320193-25-000079/source.htm",
+            "10-Q",
+        ),
+        (
+            {"document_name": "", "section": 1, "offset": True, "end": False},
+            {"document_name": "fallback.htm", "filing_form": "10-K", "source_bytes": "archived"},
+            {"document": "fallback.htm", "section": None, "start": None, "end": None},
+            None,
+            "10-K",
+        ),
+        (
+            {"document_name": 42, "offset": "0", "end": None},
+            {"document_name": 12, "form": 7},
+            {"document": "12", "section": None, "start": None, "end": None},
+            None,
+            None,
+        ),
+        ({}, {"document_name": None}, {"document": "", "section": None, "start": None, "end": None}, None, None),
+    ],
+)
+def test_bundle_entry_preserves_locator_and_archived_identity(
+    provenance: dict[str, JSONValue],
+    metadata: dict[str, JSONValue],
+    locator: dict[str, JSONValue],
+    artifact: str | None,
+    form: str | None,
+) -> None:
+    from app.research.evidence import evidence_bundle_entry
+
+    rec = _bundle_record()
+    rec.provenance.update(provenance)
+    rec.metadata.update(metadata)
+    entry = evidence_bundle_entry(rec, accepted_at="2025-06-01T00:00:00+00:00")
+    assert entry["source_locator"] == locator
+    assert entry["source_artifact"] == artifact
+    assert entry["form"] == form
+    assert entry["accepted_at"] == "2025-06-01T00:00:00+00:00"
+    assert entry["retrieved_at"] == "2025-05-01T00:00:00+00:00"
+    assert entry["rendered_to_model"] == rec.content
+    assert entry["source_hash"] == f"sha256:{rec.content_hash}"
+
+
+@settings(derandomize=True, max_examples=40)
+@given(
+    evidence_id=st.text(alphabet=st.characters(blacklist_categories=("Cs",)), min_size=1, max_size=40),
+    source_uri=st.one_of(st.none(), st.text(alphabet=" abcdef:/._-", max_size=40)),
+    accession=st.one_of(st.none(), st.text(alphabet="0123456789-", max_size=20)),
+)
+def test_bundle_entry_preserves_id_and_string_url(
+    evidence_id: str,
+    source_uri: str | None,
+    accession: str | None,
+) -> None:
+    from dataclasses import replace
+
+    from app.research.evidence import evidence_bundle_entry
+
+    rec = replace(_bundle_record(evidence_id), source_uri=source_uri, source_record_id=accession)
+    entry = evidence_bundle_entry(rec)
+    assert entry["evidence_id"] == evidence_id
+    assert isinstance(entry["source_url"], str)
+    assert entry["rendered_to_model"] == rec.content
+    assert entry["accepted_at"] == entry["retrieved_at"]
+    if source_uri is not None and source_uri.strip():
+        assert entry["source_url"] == source_uri.strip()
+
+
+def test_write_bundle_selects_substantive_unique_rows_and_uses_ledger_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from app.research.evidence import evidence_to_dict
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    repo = ResearchRepository()
+    run = _make_run(repo)
+    sid = run._create_session("Exact question?", "", None)
+    ledger_record = _bundle_record("EV-ledger", sid)
+    run.ledger.append(ledger_record)
+    persisted_record = _bundle_record("EV-persisted", sid, "Second source text.")
+    navigation = replace(ledger_record, evidence_id="EV-navigation", record_kind="discovery")
+    rows: list[object] = [
+        None,
+        {},
+        {"evidence_id": 7},
+        {"evidence_id": ""},
+        {"evidence_id": "EV-ledger", "content": "corrupt persisted copy"},
+        evidence_to_dict(persisted_record),
+        evidence_to_dict(navigation),
+        {"evidence_id": "EV-ledger"},
+        evidence_to_dict(persisted_record),
+    ]
+
+    def _rows(session_id: str) -> list[object]:
+        return rows
+
+    monkeypatch.setattr(repo, "list_evidence", _rows)
+    bundle = run.write_bundle(sid)
+    assert {path.name for path in (bundle / "evidence").iterdir()} == {"EV-ledger.json", "EV-persisted.json"}
+    exported = json.loads((bundle / "evidence" / "EV-ledger.json").read_text())
+    assert exported["rendered_to_model"] == ledger_record.content
+    assert exported["evidence_id"] == "EV-ledger"
+    assert json.loads((bundle / "eval.json").read_text()) == {
+        "session_id": sid,
+        "artifacts": [f"sha256_{ledger_record.content_hash}", f"sha256_{persisted_record.content_hash}"],
+    }
+    request = json.loads((bundle / "request.json").read_text())
+    session = repo.get_session(sid)
+    assert session.as_of is not None
+    assert request == {"question": "Exact question?", "as_of": session.as_of.isoformat()}
+
+
+def test_write_bundle_skips_invalid_export_entries_and_sanitizes_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from app.research.journal import append_event
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    repo = ResearchRepository()
+    run = _make_run(repo)
+    sid = run._create_session("Bundle question?", "2025-06-30T00:00:00+00:00", None)
+    repo.save_session(replace(repo.get_session(sid), final_result={"answer": "Exact answer."}))
+    repo.save_event(append_event(sid, "tool.completed", "runner", "runner", {"tool": "get_sec_document"}))
+    rows: list[object] = [
+        None,
+        {},
+        {"evidence_id": 1},
+        {"evidence_id": ""},
+        {"evidence_id": "EV/a:bé.-", "text": "exact"},
+    ]
+
+    def _entries(session_id: str) -> tuple[list[object], list[str]]:
+        return rows, ["artifact-name"]
+
+    def _agents(session_id: str) -> dict[str, object]:
+        return {"bull/role": {"result": "exact"}}
+
+    monkeypatch.setattr(run, "_bundle_evidence_entries", _entries)
+    monkeypatch.setattr(run, "_bundle_agents", _agents)
+    bundle = run.write_bundle(sid)
+    assert {path.name for path in (bundle / "evidence").iterdir()} == {"EV_a_bé.-.json"}
+    assert json.loads((bundle / "evidence" / "EV_a_bé.-.json").read_text()) == rows[-1]
+    assert json.loads((bundle / "agents" / "bull_role.json").read_text()) == {"result": "exact"}
+    assert json.loads((bundle / "answer.json").read_text()) == {
+        "answer": "Exact answer.",
+        "final_result": {"answer": "Exact answer."},
+    }
+    assert json.loads((bundle / "eval.json").read_text()) == {"session_id": sid, "artifacts": ["artifact-name"]}
+    calls = [json.loads(line) for line in (bundle / "tool_calls.jsonl").read_text().splitlines()]
+    # job./tool. events go to the export; session.created does not.
+    assert [call["event_type"] for call in calls] == ["job.created", "tool.completed"]
+    assert calls[0]["payload"] == {"job_id": run.source_jobs[-1], "job_type": "source_agent"}
+    assert calls[1]["payload"] == {"tool": "get_sec_document"}
+    assert (bundle / "artifacts").is_dir()
+
+
+def test_evidence_record_preserves_archive_dates_and_navigation_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    run = _make_run(repo)
+    sid = run._create_session("NVDA demand?", "", None)
+    now = datetime(2025, 6, 1, tzinfo=UTC)
+    monkeypatch.setattr("app.research.runner.utcnow", lambda: now)
+    args: dict[str, object] = {
+        "arguments": {"ticker": " NVDA ", "query": " revenue "},
+    }
+    raw = _with_handle(
+        {
+            "accession_no": seam.DEFAULT_ACCESSION,
+            "document_name": seam.DEFAULT_DOCUMENT,
+            "text": "Revenue grew.",
+            "source_uri": "https://tool.test/doc",
+            "known_at": "2025-05-02",
+        }
+    )
+    doc = run._build_evidence_record(sid, 1, "NVDA demand?", "job-1", "get_sec_document", args, raw, "EV-document")
+    assert doc.retrieved_at == datetime(2025, 5, 1, tzinfo=UTC)
+    assert doc.published_at == datetime(2025, 4, 30, tzinfo=UTC)
+    assert doc.known_at == datetime(2025, 5, 1, tzinfo=UTC)
+    assert (
+        doc.source_uri
+        == f"https://www.sec.gov/Archives/edgar/data/{seam.DEFAULT_ACCESSION.replace('-', '')}/{seam.DEFAULT_DOCUMENT}"
+    )
+    assert doc.job_id == "job-1"
+    assert doc.metadata["search_scope"] == "NVDA"
+    assert doc.metadata["query"] == "revenue"
+    nav = run._build_evidence_record(
+        sid,
+        1,
+        "NVDA demand?",
+        "",
+        "search_sec_filings",
+        args,
+        {"search_id": " search-1 ", "known_at": "2025-05-02", "source_uri": "https://tool.test/search"},
+        "EV-navigation",
+    )
+    assert nav.retrieved_at == now
+    assert nav.published_at is None
+    assert nav.known_at == datetime(2025, 5, 2, tzinfo=UTC)
+    assert nav.source_uri == "https://tool.test/search"
+    assert nav.job_id is None
+    assert nav.metadata == {
+        "tool": "search_sec_filings",
+        "tickers": "NVDA",
+        "record_kind": "discovery",
+        "query": "revenue",
+        "search_id": "search-1",
+        "search_scope": "NVDA",
+    }
+    assert nav.provenance == {"kind": "search_run", "search_id": "search-1", "query": "revenue"}

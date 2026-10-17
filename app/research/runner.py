@@ -377,6 +377,63 @@ def _record_ref(is_evidence: bool, ref: str | None, search_id: str, accession: s
     return ref or search_id or accession or None
 
 
+def _record_metadata(
+    inner: str,
+    scoped: Sequence[str],
+    kind: str,
+    *,
+    accession: str,
+    document_name: str,
+    query: str,
+    search_id: str,
+    scope: str,
+) -> dict[str, JSONValue]:
+    """Record the tool identity and the nonempty document or search fields."""
+    metadata: dict[str, JSONValue] = {
+        "tool": inner,
+        "tickers": ", ".join(scoped),
+        "record_kind": kind,
+    }
+    for key, value in (
+        ("accession_no", accession),
+        ("document_name", document_name),
+        ("query", query),
+        ("search_id", search_id),
+        ("search_scope", scope),
+    ):
+        if value:
+            metadata[key] = value
+    return metadata
+
+
+def _record_source_fields(
+    materialized: MaterializedEvidenceSource | None, uri: str | None, known_at: datetime | None
+) -> tuple[datetime, str | None, datetime | None, datetime | None]:
+    """Use archive source fields when present, retaining the tool URL and known-time fallbacks."""
+    retrieved_at = materialized.retrieved_at if materialized is not None and materialized.retrieved_at else utcnow()
+    source_uri = (materialized.source_url if materialized is not None else None) or uri
+    published_at = materialized.filed_at if materialized is not None else None
+    source_known_at = materialized.known_at if materialized is not None else known_at
+    return retrieved_at, source_uri, published_at, source_known_at
+
+
+def _select_bundle_evidence(row: object, by_id: Mapping[str, Evidence], seen: set[str]) -> Evidence | None:
+    """Select a substantive unseen row, preferring the validated ledger record."""
+    from app.research.evidence import evidence_from_dict as _from_dict
+
+    if not isinstance(row, dict):
+        return None
+    eid = row.get("evidence_id")
+    if not isinstance(eid, str) or not eid or eid in seen:
+        return None
+    rec = by_id.get(eid)
+    if rec is None:
+        rec = _from_dict(row)
+    if rec.record_kind != "evidence":
+        return None
+    return rec
+
+
 def _record_provenance(
     is_evidence: bool,
     *,
@@ -1114,21 +1171,18 @@ class _LiveRun:
                 ),
             )
         subject, claim_text = _record_labels(q, is_evidence, inner, accession, document_name, self.scoped)
-        metadata: dict[str, JSONValue] = {
-            "tool": inner,
-            "tickers": ", ".join(self.scoped),
-            "record_kind": kind,
-        }
-        scope = _first_str(inner_args, ("ticker", "cik"))
-        for key, value in (
-            ("accession_no", accession),
-            ("document_name", document_name),
-            ("query", query),
-            ("search_id", search_id),
-            ("search_scope", scope),
-        ):
-            if value:
-                metadata[key] = value
+        metadata = _record_metadata(
+            inner,
+            self.scoped,
+            kind,
+            accession=accession,
+            document_name=document_name,
+            query=query,
+            search_id=search_id,
+            scope=_first_str(inner_args, ("ticker", "cik")),
+        )
+        content_hash = evidence_content_hash(content)
+        retrieved_at, source_uri, published_at, source_known_at = _record_source_fields(materialized, uri, known_at)
         return Evidence(
             evidence_id=eid,
             session_id=sid,
@@ -1138,14 +1192,12 @@ class _LiveRun:
             subject=subject,
             claim_text=claim_text,
             content=content,
-            content_hash=evidence_content_hash(content),
-            retrieved_at=materialized.retrieved_at
-            if materialized is not None and materialized.retrieved_at
-            else utcnow(),
-            source_uri=(materialized.source_url if materialized is not None else None) or uri,
+            content_hash=content_hash,
+            retrieved_at=retrieved_at,
+            source_uri=source_uri,
             source_record_id=_record_ref(is_evidence, ref, search_id, accession),
-            published_at=materialized.filed_at if materialized is not None else None,
-            known_at=materialized.known_at if materialized is not None else known_at,
+            published_at=published_at,
+            known_at=source_known_at,
             job_id=src_job_id or None,
             agent_id="sec_scout",
             supports=(),
@@ -2359,7 +2411,6 @@ class _LiveRun:
     def _bundle_evidence_entries(self, session_id: str) -> tuple[list[object], list[str]]:
         """Bundle evidence entries + selective artifact names for substantive rows only."""
         from app.research.evidence import evidence_bundle_entry as _entry
-        from app.research.evidence import evidence_from_dict as _from_dict
         from app.storage import raw_archive as _artifacts
 
         entries: list[object] = []
@@ -2369,16 +2420,10 @@ class _LiveRun:
         ledger_rows = _ledger_evidence(self.ledger, session_id)
         by_id = {rec.evidence_id: rec for rec in ledger_rows}
         for row in rows:
-            if not isinstance(row, dict):
-                continue
-            eid = row.get("evidence_id")
-            if not isinstance(eid, str) or not eid or eid in seen:
-                continue
-            rec = by_id.get(eid)
+            rec = _select_bundle_evidence(row, by_id, seen)
             if rec is None:
-                rec = _from_dict(row)
-            if rec.record_kind != "evidence":
                 continue
+            eid = rec.evidence_id
             entries.append(_entry(rec))
             seen.add(eid)
             artifacts.append(f"sha256_{rec.content_hash}")
@@ -2414,6 +2459,18 @@ class _LiveRun:
             agents[job.job_type] = dict(job.result)
         return agents
 
+    def _write_bundle_evidence(self, evidence_dir: Path, entries: Sequence[object]) -> None:
+        """Write valid evidence entries with filesystem-safe identifiers."""
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            eid = entry.get("evidence_id")
+            if not isinstance(eid, str) or not eid:
+                continue
+            safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in eid)
+            (evidence_dir / f"{safe}.json").write_text(json.dumps(entry, sort_keys=True, indent=2, default=str) + "\n")
+
     def write_bundle(self, session_id: str) -> Path:
         """Per-session JSON evidence bundle: disposable export view, never a source of truth.
 
@@ -2447,16 +2504,7 @@ class _LiveRun:
         with calls_path.open("w", encoding="utf-8") as handle:
             for row in tool_calls:
                 handle.write(_json.dumps(row, sort_keys=True, default=str) + "\n")
-        evidence_dir = run_dir / "evidence"
-        evidence_dir.mkdir(parents=True, exist_ok=True)
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            eid = entry.get("evidence_id")
-            if not isinstance(eid, str) or not eid:
-                continue
-            safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in eid)
-            (evidence_dir / f"{safe}.json").write_text(_json.dumps(entry, sort_keys=True, indent=2, default=str) + "\n")
+        self._write_bundle_evidence(run_dir / "evidence", entries)
         (run_dir / "artifacts").mkdir(parents=True, exist_ok=True)
         agents_dir = run_dir / "agents"
         agents_dir.mkdir(parents=True, exist_ok=True)

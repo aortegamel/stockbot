@@ -1170,16 +1170,21 @@ class ResearchRepository:
             ).fetchall()
         return [validate_json_mapping(json.loads(str(r["record"])), "<research.sqlite>: tool result") for r in rows]
 
-    def resource_stores(self, session_id: str) -> dict[str, dict[str, object]]:
-        """id->record mappings for read_resource: evidence/freeze/dossier/coverage/job/research/tool_result."""
-        session = self.get_session(session_id)
-        evidence: dict[str, object] = {str(r.get("evidence_id", "")): r for r in self.list_evidence(session_id)}
+    def _freeze_store(self, freeze_ids: list[str]) -> dict[str, object]:
+        """Load referenced freezes; absent rows do not become readable resources."""
         freezes: dict[str, object] = {}
-        for fid in session.freeze_ids:
+        for fid in freeze_ids:
             try:
                 freezes[fid] = self.get_freeze(fid)
             except KeyError:
                 continue
+        return freezes
+
+    def resource_stores(self, session_id: str) -> dict[str, dict[str, object]]:
+        """id->record mappings for read_resource: evidence/freeze/dossier/coverage/job/research/tool_result."""
+        session = self.get_session(session_id)
+        evidence: dict[str, object] = {str(r.get("evidence_id", "")): r for r in self.list_evidence(session_id)}
+        freezes = self._freeze_store(session.freeze_ids)
         dossiers: dict[str, object] = {}
         for dossier in self.list_dossiers(session_id):
             key = dossier.get("dossier_id")

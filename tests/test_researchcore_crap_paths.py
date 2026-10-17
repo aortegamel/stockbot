@@ -68,7 +68,7 @@ from app.research.director import (
     Wave1Result,
     decide_next_wave,
 )
-from app.research.models import Job, ResearchSession, default_policy, utcnow
+from app.research.models import DecisionRecord, Job, ResearchSession, default_policy, utcnow
 from app.research.repository import (
     ResearchRepository,
     _iso_or_none,
@@ -6587,3 +6587,522 @@ def test_kernel_node_lifecycle_ready_gating_and_decision_roundtrip(
         .fetchone()[0]
     )
     assert mirror == 1
+
+
+# Preserve this entry point before the autouse SEC seam replaces it.
+_LIVE_EXACT_SOURCE_BYTES = svc._exact_source_bytes
+
+
+@pytest.mark.parametrize("representation", ["html", ""])
+def test_exact_source_bytes_replays_attachment(monkeypatch: pytest.MonkeyPatch, representation: str) -> None:
+    from app.sec import documents
+
+    calls: list[object] = []
+
+    def filing(accession: str) -> str:
+        calls.append(accession)
+        return "filing"
+
+    def resolve_in(filing: object, accession: str, document: object) -> str:
+        calls.append((filing, accession, document))
+        return "attachment"
+
+    def source_bytes_of(attachment: object) -> tuple[bytes, str]:
+        del attachment
+        return (b"exact source", representation)
+
+    monkeypatch.setattr(documents, "_filing", filing)
+    monkeypatch.setattr(documents, "_resolve_in", resolve_in)
+    monkeypatch.setattr(documents, "_source_bytes_of", source_bytes_of)
+    assert _LIVE_EXACT_SOURCE_BYTES("accession", "") == (b"exact source", representation or "source_bytes")
+    assert calls == ["accession", ("filing", "accession", None)]
+
+
+def test_exact_source_bytes_rejects_missing_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec import documents
+
+    def filing(accession: str) -> str:
+        del accession
+        return "filing"
+
+    def resolve_in(filing: object, accession: str, document: object) -> str:
+        del filing, accession, document
+        return "attachment"
+
+    def source_bytes_of(attachment: object) -> tuple[None, str]:
+        del attachment
+        return (None, "html")
+
+    monkeypatch.setattr(documents, "_filing", filing)
+    monkeypatch.setattr(documents, "_resolve_in", resolve_in)
+    monkeypatch.setattr(documents, "_source_bytes_of", source_bytes_of)
+    with pytest.raises(
+        ValueError,
+        match=r"^record_evidence: ERR_NO_SOURCE_BYTES \(EdgarTools exposed no exact bytes for accession/document\)$",
+    ):
+        _LIVE_EXACT_SOURCE_BYTES("accession", "document")
+
+
+@pytest.mark.parametrize("domain", ["FINRA", "SEC", "WEB"])
+@pytest.mark.parametrize("defect", ["locator", "unknown", "session", "tool", "lane", "passage"])
+def test_replayed_provenance_rejection_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, domain: str, defect: str
+) -> None:
+    repo = _repo(tmp_path, monkeypatch)
+    sid, jid = _sid(repo)
+    tool = {"FINRA": "get_short_interest", "SEC": "list_sec_filings", "WEB": "search_web"}[domain]
+    provenance = {"FINRA": svc._finra_provenance, "SEC": svc._sec_record_provenance, "WEB": svc._web_provenance}[domain]
+    record: dict[str, object] = {
+        "tool_result_id": "replay",
+        "session_id": "other-session" if defect == "session" else sid,
+        "job_id": "other-job" if defect in {"tool", "lane"} else jid,
+        "tool_name": "wrong-tool" if defect in {"session", "tool"} else tool,
+        "result": {},
+    }
+    if defect not in {"locator", "unknown"}:
+        repo.save_tool_result(record)
+    data = {"tool_result_id": "replay", "matching_passage": "" if defect == "locator" else "missing passage"}
+    expected = {
+        "locator": "ERR_RAW_SOURCE_REQUIRED",
+        "unknown": f"unknown persisted {'web' if domain == 'WEB' else domain} tool result",
+        "session": "belongs to session",
+        "tool": "not a search_web result" if domain == "WEB" else f"not {domain} records",
+        "lane": "not in wave",
+        "passage": "ERR_PASSAGE_NOT_IN_SOURCE",
+    }[defect]
+    with pytest.raises(ValueError, match=expected):
+        provenance(data, repo.get_job(jid), store=repo, session_id=sid)
+    assert repo.list_evidence(sid) == []
+
+
+@pytest.mark.parametrize("domain", ["FINRA", "SEC"])
+@pytest.mark.parametrize("wrapped", [True, False])
+def test_structured_provenance_replays_dataset_uri_and_timing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, domain: str, wrapped: bool
+) -> None:
+    repo = _repo(tmp_path, monkeypatch)
+    sid, jid = _sid(repo)
+    payload = {
+        "records": [{"metric": "revenue grew"}],
+        "dataset_id": "finra-data",
+        "subject": "NVDA",
+        "source_url": " https://sec.gov/persisted ",
+        "published_at": KNOWN,
+    }
+    record: dict[str, object] = {
+        "tool_result_id": "structured",
+        "session_id": sid,
+        "job_id": jid,
+        "tool_name": "get_short_interest" if domain == "FINRA" else "list_sec_filings",
+    }
+    if wrapped:
+        record["result"] = payload
+    else:
+        record.update(payload)
+    repo.save_tool_result(record)
+    provenance = svc._finra_provenance if domain == "FINRA" else svc._sec_record_provenance
+    out = provenance({"tool_result_id": "structured", "matching_passage": "revenue   grew"}, repo.get_job(jid))
+    assert out["record_identity"] == "revenue grew"
+    assert out["tool_result_id"] == "structured"
+    assert out["dataset"] == ("finra-data" if domain == "FINRA" else "NVDA")
+    assert out["known_at"] == KNOWN
+    if domain == "SEC":
+        assert out["source_uri"] == "https://sec.gov/persisted"
+        declared = provenance(
+            {
+                "tool_result_id": "structured",
+                "matching_passage": "revenue grew",
+                "source_uri": "https://sec.gov/declared",
+            },
+            store=repo,
+            session_id=sid,
+        )
+        assert declared["source_uri"] == "https://sec.gov/declared"
+
+
+def test_web_provenance_skips_uncitable_rows_and_selects_matching_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path, monkeypatch)
+    sid, jid = _sid(repo)
+    repo.save_tool_result(
+        {
+            "tool_result_id": "web",
+            "session_id": sid,
+            "job_id": jid,
+            "tool_name": "search_web",
+            "result": {
+                "evidence": [
+                    None,
+                    {"url": 3, "highlight": "citation"},
+                    {"url": " ", "highlight": "citation"},
+                    {"url": "https://example.com/blank", "highlight": " "},
+                    {"url": "https://example.com/first", "highlight": "citation"},
+                    {"url": "https://example.com/chosen", "highlight": " citation ", "source_content": 3},
+                ]
+            },
+        }
+    )
+    out = svc._web_provenance(
+        {"tool_result_id": "web", "matching_passage": "citation", "url": "https://example.com/chosen"},
+        repo.get_job(jid),
+        store=repo,
+        session_id=sid,
+    )
+    assert out["url"] == "https://example.com/chosen"
+    assert out["excerpt"] == "citation"
+    assert "source_content" not in out
+    assert "source_representation" not in out
+    first = svc._web_provenance({"tool_result_id": "web", "matching_passage": "citation"}, store=repo)
+    assert first["url"] == "https://example.com/first"
+
+
+def test_web_provenance_preserves_normalized_highlight_and_stored_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hypothesis import given, settings
+    from hypothesis import strategies as st
+
+    repo = _repo(tmp_path, monkeypatch)
+    sid, jid = _sid(repo)
+    counter = 0
+
+    @settings(derandomize=True, max_examples=20, deadline=None)
+    @given(st.lists(st.text(alphabet="abcdefghijklmnopqrstuvwxyz", min_size=1, max_size=8), min_size=1, max_size=5))
+    def check(words: list[str]) -> None:
+        nonlocal counter
+        counter += 1
+        rid = f"web-property-{counter}"
+        highlight = " \t ".join(words)
+        repo.save_tool_result(
+            {
+                "tool_result_id": rid,
+                "session_id": sid,
+                "job_id": jid,
+                "tool_name": "search_web",
+                "result": {
+                    "evidence": [
+                        {
+                            "url": " https://example.com/source ",
+                            "source_domain": " example.com ",
+                            "title": " Stored title ",
+                            "published_at": KNOWN,
+                            "retrieved_at": KNOWN,
+                            "highlight": highlight,
+                            "source_content": " Exact stored source ",
+                            "source_representation": " html ",
+                        }
+                    ]
+                },
+            }
+        )
+        out = svc._web_provenance({"tool_result_id": rid, "matching_passage": " ".join(words)}, store=repo)
+        assert out["excerpt"] == highlight
+        assert out["url"] == "https://example.com/source"
+        assert out["title"] == "Stored title"
+        assert out["domain"] == "example.com"
+        assert out["source_content"] == "Exact stored source"
+        assert out["source_representation"] == "html"
+        assert out["published_at"] == KNOWN
+        assert out["retrieved_at"] == KNOWN
+
+    check()
+
+
+def test_materialize_sec_passage_rejects_archive_without_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.sec import documents
+
+    handle = seam.handle_for("archive passage")
+
+    def get_sec_document(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        return {"text": None}
+
+    monkeypatch.setattr(documents, "get_sec_document", get_sec_document)
+    with pytest.raises(
+        ValueError, match=r"^record_evidence: ERR_SEC_HANDLE_UNREADABLE \(the archive returned no document text\)$"
+    ):
+        svc.materialize_sec_passage(handle, "archive passage")
+
+
+@pytest.mark.parametrize(
+    "domain,tool", [("FINRA", "get_short_interest"), ("WEB", "search_web"), ("SEC", "list_sec_filings")]
+)
+def test_persist_tool_result_preserves_first_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, domain: str, tool: str
+) -> None:
+    repo = _repo(tmp_path, monkeypatch)
+    sid, jid = _svc_sid(repo)
+    repo.save_job(dataclasses.replace(repo.get_job(jid), source_domain=domain, status="running"))
+    first = svc.persist_tool_result(sid, jid, tool, " result-id ", {"rows": [1]}, repo=repo)
+    again = svc.persist_tool_result(sid, jid, tool, "result-id", {"rows": [2]}, repo=repo)
+    assert again == first
+    assert repo.get_tool_result("result-id")["result"] == {"rows": [1]}
+
+
+@pytest.mark.parametrize(
+    "domain,tool,message",
+    [
+        ("FINRA", "search_web", "cannot ground FINRA evidence"),
+        ("FINRA", "list_finra_datasets", "cannot ground FINRA evidence"),
+        ("WEB", "list_sec_filings", "cannot ground WEB evidence"),
+        ("SEC", "search_web", "cannot ground SEC replay"),
+        ("SEC", "get_sec_document", "cannot ground SEC replay"),
+        ("OTHER", "search_web", "persists no tool results"),
+    ],
+)
+def test_persist_tool_result_rejects_wrong_domain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, domain: str, tool: str, message: str
+) -> None:
+    repo = _repo(tmp_path, monkeypatch)
+    sid, jid = _sid(repo)
+    repo.save_job(dataclasses.replace(repo.get_job(jid), source_domain=domain, status="running"))
+    with pytest.raises(ValueError, match=message):
+        svc.persist_tool_result(sid, jid, tool, None, {}, repo=repo)
+    assert repo.list_tool_results(sid) == []
+
+
+def test_persist_tool_result_propagates_nonduplicate_storage_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path, monkeypatch)
+    sid, jid = _sid(repo)
+    repo.save_job(dataclasses.replace(repo.get_job(jid), source_domain="SEC", status="running"))
+
+    def fail(record: Mapping[str, object]) -> str:
+        raise ValueError("storage unavailable")
+
+    monkeypatch.setattr(repo, "save_tool_result", fail)
+    with pytest.raises(ValueError, match="^storage unavailable$"):
+        svc.persist_tool_result(sid, jid, "list_sec_filings", None, {}, repo=repo)
+    assert not any(event.event_type == "tool_result.persisted" for event in repo.list_events(sid))
+
+
+@pytest.mark.parametrize("identity_conflict", [False, True])
+def test_record_evidence_handles_atomic_storage_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, identity_conflict: bool
+) -> None:
+    repo = _repo(tmp_path, monkeypatch)
+    sid, jid = _sid(repo)
+    save = repo.save_evidence_and_session
+
+    def conflict(found: ResearchSession, record: Mapping[str, object]) -> None:
+        if identity_conflict:
+            save(found, record)
+            raise ValueError("duplicate identity_key")
+        raise ValueError("storage unavailable")
+
+    monkeypatch.setattr(repo, "save_evidence_and_session", conflict)
+    eid = f"{sid}:ev:storage"
+    if identity_conflict:
+        assert svc.record_evidence(sid, jid, _item(eid), repo=repo) == {
+            "evidence_id": eid,
+            "accepted": False,
+            "duplicate_of": eid,
+        }
+    else:
+        with pytest.raises(ValueError, match="^storage unavailable$"):
+            svc.record_evidence(sid, jid, _item(eid), repo=repo)
+        assert repo.list_evidence(sid) == []
+    assert not any(event.event_type == "evidence.accepted" for event in repo.list_events(sid))
+
+
+def test_record_evidence_accepts_when_optional_artifact_mirror_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.storage import raw_archive
+
+    repo = _repo(tmp_path, monkeypatch)
+    sid, jid = _sid(repo)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError("mirror unavailable")
+
+    def list_evidence(session_id: str) -> list[dict[str, object]]:
+        del session_id
+        legacy: dict[str, object] = {}
+        return [legacy]
+
+    monkeypatch.setattr(raw_archive, "store_evidence_artifact", fail)
+    monkeypatch.setattr(repo, "list_evidence", list_evidence)
+    eid = f"{sid}:ev:mirror"
+    out = svc.record_evidence(sid, jid, _item(eid), repo=repo)
+    assert out["evidence_id"] == eid
+    assert repo.get_evidence(eid)["evidence_id"] == eid
+    assert eid in repo.get_session(sid).evidence_ids
+    assert [
+        event.payload.get("evidence_id") for event in repo.list_events(sid) if event.event_type == "evidence.accepted"
+    ] == [eid]
+
+
+def test_research_start_policy_precedence_and_shorthand() -> None:
+    policy = {1: "kept", "research_sources": {"mode": "allowlist", "sources": ["WEB"]}}
+    assert tools_mod._start_policy({"policy": policy, "research_sources": {"mode": "other"}, "sources": ["SEC"]}) == {
+        "1": "kept",
+        "research_sources": {"mode": "allowlist", "sources": ["WEB"]},
+    }
+    assert tools_mod._start_policy(
+        {"research_sources": {"mode": "allowlist", "sources": ["FINRA"]}, "sources": ["WEB"]}
+    ) == {"research_sources": {"mode": "allowlist", "sources": ["FINRA"]}}
+    assert tools_mod._start_policy({"sources": [" SEC ", " WEB "]}) == {
+        "research_sources": {"mode": "allowlist", "sources": ["SEC", "WEB"]}
+    }
+    assert tools_mod._start_policy({"sources": []}) == {"research_sources": {"mode": "allowlist", "sources": []}}
+    for sources in (["SEC", " "], ["SEC", 3], "SEC", None):
+        assert tools_mod._start_policy({"sources": sources}) is None
+
+
+# --- models: today stamp, session targeting, decision confidence ------------
+def test_query_with_today_utc_stamps_every_supported_day_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.research import models as _models
+    from app.research.models import query_with_today_utc
+
+    monkeypatch.setattr(_models, "utcnow", lambda: datetime(2026, 1, 2, 3, 4, 5, tzinfo=_dt.UTC))
+    assert query_with_today_utc("NVDA demand?") == "[Today UTC 2026-01-02] NVDA demand?"
+    assert query_with_today_utc("NVDA demand?", datetime(2025, 6, 30, 23, 59, tzinfo=_dt.UTC)) == (
+        "[Today UTC 2025-06-30] NVDA demand?"
+    )
+    assert query_with_today_utc("NVDA demand?", date(2025, 6, 30)) == "[Today UTC 2025-06-30] NVDA demand?"
+    assert query_with_today_utc("NVDA demand?", "  2025-06-30  ") == "[Today UTC 2025-06-30] NVDA demand?"
+    assert query_with_today_utc("NVDA demand?", "   ") == "[Today UTC 2026-01-02] NVDA demand?"
+    assert query_with_today_utc("   ") == "   " and query_with_today_utc("") == ""
+    already = "[Today UTC 2025-06-30] NVDA demand?"
+    assert query_with_today_utc(already) == already
+
+
+def test_research_session_targeting_rejects_unvalidated_channels() -> None:
+    # Malformed replacement values sit outside the frozen dataclass signature on purpose.
+    replace: Callable[..., ResearchSession] = dataclasses.replace
+    session = _session.create_session("NVDA demand?", "NVDA demand?")
+    assert session.targeted_question is None and session.ticker is None
+    session.validate()
+    with pytest.raises(ValueError, match="'targeted_question' must be a string or null"):
+        replace(session, targeted_question=5).validate()
+    with pytest.raises(ValueError, match="'targeted_domain' must be a string or null"):
+        replace(session, targeted_domain=5).validate()
+    with pytest.raises(ValueError, match="'ticker' must be a validated uppercase token"):
+        replace(session, ticker="nvda").validate()
+    with pytest.raises(ValueError, match="must be a string or null"):
+        replace(session, ticker=5).validate()
+    targeted = replace(session, targeted_question="What drove Q2?", targeted_domain="SEC", ticker="NVDA")
+    targeted.validate()
+    assert targeted.ticker == "NVDA"
+    from app.research.models import Failure
+
+    # The category is a plain str field; "nope" is outside the closed vocabulary.
+    with pytest.raises(ValueError, match="failure: 'category' must be one of"):
+        replace(session, failure=Failure(category="nope", message="m")).validate()
+
+
+def _decision(**changes: object) -> DecisionRecord:
+    from app.research.models import DecisionRecord
+
+    # Deliberately malformed field values sit outside the dataclass signature.
+    build: Callable[..., DecisionRecord] = DecisionRecord
+    base: dict[str, object] = {
+        "decision_id": "dec-1",
+        "session_id": "rs:1",
+        "node_id": None,
+        "job_id": None,
+        "decision_type": "route",
+        "candidates": {},
+        "probabilities": {},
+        "selected": {},
+    }
+    return build(**{**base, **changes})
+
+
+def test_decision_record_confidence_bounds_and_required_ids() -> None:
+    for field_name in ("decision_id", "session_id", "decision_type"):
+        with pytest.raises(ValueError, match=f"'{field_name}' must be a non-empty string"):
+            _decision(**{field_name: ""}).validate()
+    _decision(confidence=None).validate()
+    for good in (0.0, 1.0, 0.25, 0.5):
+        _decision(confidence=good).validate()
+    for bad in (-0.1, 1.1, float("nan"), float("inf"), True, "0.5"):
+        with pytest.raises(ValueError, match="'confidence' must be in \\[0, 1\\] or null"):
+            _decision(confidence=bad).validate()
+
+
+# --- persisted-result citable text: FINRA and structured SEC rows -----------
+def test_finra_record_texts_cover_rows_lists_query_briefing_and_metrics() -> None:
+    result: dict[str, object] = {
+        "result": {
+            "records": [{"symbolCode": "AAPL", "currentShortPositionQuantity": 100}, "not-a-row"],
+            "query": {"symbol": "AAPL"},
+            "briefing": "  short   interest rose  ",
+            "briefing_source": None,
+            "metrics": {"days_to_cover": 2.5},
+        }
+    }
+    texts = svc._finra_record_texts(result)
+    assert '"symbolCode": "AAPL"' in texts[0]
+    assert "not-a-row" not in texts
+    assert '"symbol": "AAPL"' in texts[1]
+    assert texts[2] == "short interest rose"
+    assert '"days_to_cover": 2.5' in texts[3]
+    assert len(texts) == 4  # the blank briefing_source is dropped, never cited
+    # A wrapperless payload is read as the payload itself.
+    bare = svc._finra_record_texts({"records": [{"symbolCode": "MSFT"}]})
+    assert len(bare) == 1 and '"symbolCode": "MSFT"' in bare[0]
+    assert svc._finra_record_texts({"result": ["not", "a", "mapping"]}) == []
+    assert svc._finra_record_texts({}) == []
+
+
+def test_sec_record_texts_cover_every_structured_row_shape() -> None:
+    result: dict[str, object] = {
+        "result": {
+            "filings": [{"accession_no": "0000320193-25-000080"}],
+            "transactions": ["raw line"],
+            "quarterly_eps": [1.5],
+            "facts": [{"val": 10}],
+            "rows": [None],
+            "records": [],
+            "documents": [{"document": "d.htm"}],
+            "events": [],
+            "subject": "AAPL",
+        }
+    }
+    texts = svc._sec_record_texts(result)
+    assert any('"accession_no": "0000320193-25-000080"' in text for text in texts)
+    assert "raw line" in texts and "1.5" in texts
+    assert any('"val": 10' in text for text in texts)
+    assert any('"document": "d.htm"' in text for text in texts)
+    # Non-row members (None) contribute nothing; the envelope JSON is always citable.
+    assert not any(text == "None" for text in texts)
+    assert '"subject": "AAPL"' in texts[-1]
+    assert svc._sec_record_texts({"filings": [{"a": 1}]}) == ['{"a": 1}', '{"filings": [{"a": 1}]}']
+
+
+def test_resource_stores_drops_freezes_that_no_longer_exist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _repo(tmp_path, monkeypatch)
+    sid, _src = _sid(repo)
+    stores = repo.resource_stores(sid)
+    assert set(stores) == {"evidence", "freeze", "dossier", "coverage", "job", "research", "tool_result"}
+    assert stores["research"] == {sid: repo.get_session(sid).to_dict()}
+    # A referenced freeze row that no longer exists is not advertised as a readable resource.
+    replace: Callable[..., ResearchSession] = dataclasses.replace
+    repo.save_session(replace(repo.get_session(sid), freeze_ids=[f"{sid}:1:freeze", "missing"]))
+    repo.save_freeze({"freeze_id": f"{sid}:1:freeze", "session_id": sid, "created_at": "2025-06-30T00:00:00+00:00"})
+    assert sorted(repo.resource_stores(sid)["freeze"]) == [f"{sid}:1:freeze"]
+
+
+def test_prop_today_stamp_is_idempotent_and_well_formed() -> None:
+    """Any query text gets at most one date stamp, and the stamp survives a repeat call."""
+    from hypothesis import given, settings
+    from hypothesis import strategies as st
+
+    from app.research.models import query_with_today_utc
+
+    @settings(max_examples=100, derandomize=True)
+    @given(st.text(max_size=40))
+    def check(text: str) -> None:
+        stamped = query_with_today_utc(text)
+        if not text.strip():
+            assert stamped == text
+            return
+        assert re.match(r"^\[Today UTC \d{4}-\d{2}-\d{2}\] .", stamped), stamped
+        assert query_with_today_utc(stamped) == stamped
+
+    check()
