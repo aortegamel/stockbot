@@ -118,42 +118,107 @@ class StockbotBridge {
 }
 
 const bridge = new StockbotBridge();
-// ponytail: keyword ladder over verbatim kernel/gateway text; bridge error_type wins when known. Add branches for new distinct refusals, never collapse to one string.
-// Precedence: explicit error_type, then explicit deadline/timeout signals, then substring traps
-// (duplicate/provider/budget/policy). Deadline/timeout stay first because a timed-out call is
-// often re-reported with "duplicate"/"budget"/"provider" wording attached — the timeout is the cause.
-export function categorizeFailure(message: string, errorType?: unknown): { category: FailureCategory; retryable: boolean } {
-  if (errorType === "deadline_exceeded") return { category: "deadline_exceeded", retryable: false };
-  if (errorType === "run_budget_exceeded") return { category: "tool_budget_exhausted", retryable: false };
-  if (errorType === "evidence_budget_exceeded") return { category: "token_budget_exhausted", retryable: false };
-  if (errorType === "invalid_research_context") return { category: "policy_denied", retryable: false };
+
+type BridgeResult = NonNullable<BridgeReply["result"]>;
+type Failure = { category: FailureCategory; retryable: boolean };
+// Bridge error_type wins when known; otherwise the ordered message rules decide.
+const ERROR_TYPE_CATEGORIES: Record<string, FailureCategory> = {
+  deadline_exceeded: "deadline_exceeded",
+  run_budget_exceeded: "tool_budget_exhausted",
+  evidence_budget_exceeded: "token_budget_exhausted",
+  invalid_research_context: "policy_denied",
+};
+
+// Ordered keyword rules over verbatim kernel/gateway text: the first match wins.
+// Deadline and timeout stay ahead of the duplicate/provider/budget wording a
+// timed-out call often carries, because the timeout is the cause. `scope` admits
+// a rule only for messages that also name a budget or quota. Add a rule for a new
+// distinct refusal; never collapse two refusals into one.
+const MESSAGE_RULES: readonly {
+  traps: readonly string[];
+  scope?: readonly string[];
+  category: FailureCategory;
+  retryable: boolean;
+}[] = [
+    { traps: ["deadline"], category: "deadline_exceeded", retryable: false },
+    { traps: ["timeout", "timed out", "timed_out", "expired"], category: "timeout", retryable: true },
+    { traps: ["research_loop_detected", "repeats an action", "already ran"], category: "research_loop_detected", retryable: false },
+    { traps: ["duplicate"], category: "duplicate_research_action", retryable: false },
+    { traps: ["token"], scope: ["budget", "quota"], category: "token_budget_exhausted", retryable: false },
+    { traps: ["job"], scope: ["budget", "quota"], category: "job_budget_exhausted", retryable: false },
+    { traps: ["wave"], scope: ["budget", "quota"], category: "wave_budget_exhausted", retryable: false },
+    { traps: ["budget", "quota"], category: "tool_budget_exhausted", retryable: false },
+    {
+      traps: ["policy", "denied", "not permitted", "not authorized", "blocked", "intent", "private", "egress", "withheld"],
+      category: "policy_denied",
+      retryable: false,
+    },
+    { traps: ["provider"], category: "provider_error", retryable: true },
+  ];
+
+function ruleMatches(rule: (typeof MESSAGE_RULES)[number], low: string): boolean {
+  if (!rule.traps.some((trap) => low.includes(trap))) return false;
+  return rule.scope === undefined || rule.scope.some((trap) => low.includes(trap));
+}
+
+export function categorizeFailure(message: string, errorType?: unknown): Failure {
+  const typed = typeof errorType === "string" && Object.hasOwn(ERROR_TYPE_CATEGORIES, errorType)
+    ? ERROR_TYPE_CATEGORIES[errorType]
+    : undefined;
+  if (typed !== undefined) return { category: typed, retryable: false };
   const low = message.toLowerCase();
-  if (low.includes("deadline")) return { category: "deadline_exceeded", retryable: false };
-  if (low.includes("timeout") || low.includes("timed out") || low.includes("timed_out") || low.includes("expired"))
-    return { category: "timeout", retryable: true };
-  if (low.includes("research_loop_detected") || low.includes("repeats an action") || low.includes("already ran"))
-    return { category: "research_loop_detected", retryable: false };
-  if (low.includes("duplicate")) return { category: "duplicate_research_action", retryable: false };
-  if (low.includes("budget") || low.includes("quota")) {
-    if (low.includes("token")) return { category: "token_budget_exhausted", retryable: false };
-    if (low.includes("job")) return { category: "job_budget_exhausted", retryable: false };
-    if (low.includes("wave")) return { category: "wave_budget_exhausted", retryable: false };
-    return { category: "tool_budget_exhausted", retryable: false };
-  }
-  if (
-    low.includes("policy") ||
-    low.includes("denied") ||
-    low.includes("not permitted") ||
-    low.includes("not authorized") ||
-    low.includes("blocked") ||
-    low.includes("intent") ||
-    low.includes("private") ||
-    low.includes("egress") ||
-    low.includes("withheld")
-  )
-    return { category: "policy_denied", retryable: false };
-  if (low.includes("provider")) return { category: "provider_error", retryable: true };
-  return { category: "tool_error", retryable: false };
+  const rule = MESSAGE_RULES.find((candidate) => ruleMatches(candidate, low));
+  return rule === undefined
+    ? { category: "tool_error", retryable: false }
+    : { category: rule.category, retryable: rule.retryable };
+}
+
+// A failed reply: the tool's own error wins over the bridge envelope error.
+function resultFailure(result: BridgeReply["result"]): { error: string; errorType: unknown } | undefined {
+  if (!result || typeof result !== "object") return undefined;
+  if (typeof result.error !== "string" || !result.error) return undefined;
+  return { error: result.error, errorType: result.error_type };
+}
+
+function envelopeFailure(error: unknown): { error: string } | undefined {
+  if (error === undefined || error === null || error === "") return undefined;
+  return { error: typeof error === "string" ? error : JSON.stringify(error) };
+}
+
+function failed(failure: { error: string; errorType?: unknown }): ToolResult {
+  return { ok: false, error: failure.error, ...categorizeFailure(failure.error, failure.errorType) };
+}
+
+function replyContent(result: BridgeResult): string {
+  if ("content" in result && typeof result.content === "string") return result.content;
+  return JSON.stringify("content" in result ? result.content ?? result : result).slice(0, 32768);
+}
+
+// Only a captured handle or refs map survives; anything else is dropped, never repaired.
+function replyMeta(meta: BridgeResult["meta"]): {
+  sourceHandle?: Record<string, unknown>;
+  sourceRefs?: Record<string, unknown>;
+  sources: unknown;
+} {
+  const handle = meta?.source_handle;
+  const refs = meta?.source_refs;
+  return {
+    sourceHandle: handle !== null && typeof handle === "object" && !Array.isArray(handle) ? handle as Record<string, unknown> : undefined,
+    sourceRefs: refs !== null && typeof refs === "object" && !Array.isArray(refs) ? refs as Record<string, unknown> : undefined,
+    sources: meta?.sources,
+  };
+}
+
+function succeeded(name: string, result: BridgeResult): ToolResult {
+  const { sourceHandle, sourceRefs, sources } = replyMeta(result.meta);
+  const evidence = makeEvidence(name, replyContent(result), {
+    title: name,
+    ...(sourceHandle !== undefined ? { sourceHandle } : {}),
+    ...(sourceRefs !== undefined ? { sourceRefs } : {}),
+  });
+  const refs = sourceReferences(sources);
+  if (refs.length) evidence.sources = refs;
+  return { ok: true, evidence };
 }
 
 export async function invoke(name: string, args: Record<string, unknown>, sessionId: string): Promise<ToolResult> {
@@ -161,37 +226,10 @@ export async function invoke(name: string, args: Record<string, unknown>, sessio
   try {
     msg = await bridge.call({ op: "tool.invoke", name, arguments: args, session_id: sessionId });
   } catch (err) {
-    const error = err instanceof Error ? err.message : String(err);
-    return { ok: false, error, ...categorizeFailure(error) };
+    return failed({ error: err instanceof Error ? err.message : String(err) });
   }
-  const errType = msg.result != null && typeof msg.result === "object" ? msg.result.error_type : undefined;
-  if (msg.result && typeof msg.result === "object" && typeof msg.result.error === "string" && msg.result.error) {
-    const error = msg.result.error;
-    return { ok: false, error, ...categorizeFailure(error, errType) };
-  }
-  if (msg.error !== undefined && msg.error !== null && msg.error !== "") {
-    const error = typeof msg.error === "string" ? msg.error : JSON.stringify(msg.error);
-    return { ok: false, error, ...categorizeFailure(error) };
-  }
-  const result = msg.result ?? {};
-  const content =
-    "content" in result && typeof result.content === "string"
-      ? result.content
-      : JSON.stringify("content" in result ? result.content ?? result : result).slice(0, 32768);
-  const meta = result.meta;
-  const rawHandle = meta != null && typeof meta === "object" && "source_handle" in meta ? (meta as BridgeResultMeta).source_handle : undefined;
-  const rawRefs = meta != null && typeof meta === "object" && "source_refs" in meta ? (meta as BridgeResultMeta).source_refs : undefined;
-  const rawSources = meta != null && typeof meta === "object" ? (meta as BridgeResultMeta).sources : undefined;
-  const sourceHandle = rawHandle !== null && typeof rawHandle === "object" && !Array.isArray(rawHandle) ? (rawHandle as Record<string, unknown>) : undefined;
-  const sourceRefs = rawRefs !== null && typeof rawRefs === "object" && !Array.isArray(rawRefs) ? (rawRefs as Record<string, unknown>) : undefined;
-  const sources = sourceReferences(rawSources);
-  const evidence = makeEvidence(name, content, {
-    title: name,
-    ...(sourceHandle !== undefined ? { sourceHandle } : {}),
-    ...(sourceRefs !== undefined ? { sourceRefs } : {}),
-  });
-  if (sources.length) evidence.sources = sources;
-  return { ok: true, evidence };
+  const failure = resultFailure(msg.result) ?? envelopeFailure(msg.error);
+  return failure === undefined ? succeeded(name, msg.result ?? {}) : failed(failure);
 }
 
 export async function endSession(sessionId: string): Promise<void> {

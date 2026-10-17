@@ -138,6 +138,55 @@ describe("bun api host", () => {
     }
   });
 
+  test("watchlist worker outage is a 502 carrying the failure message", async () => {
+    for (const [thrown, message] of [[new Error("worker down"), "worker down"], ["raw boom", "raw boom"]] as const) {
+      const spy = spyOn(kernelRouter, "call").mockImplementation(async () => {
+        throw thrown;
+      });
+      try {
+        const res = await dispatch(new Request("http://localhost/api/watchlist?symbols=NVDA,AAPL"));
+        expect(res.status).toBe(502);
+        expect(await res.json()).toEqual({ error: message });
+      } finally {
+        spy.mockRestore();
+      }
+    }
+  });
+
+  test("every owned path reaches its handler with or without a trailing slash", async () => {
+    const spy = spyOn(kernelRouter, "call").mockImplementation(async () => ({ watchlist: [] }) as unknown as KernelResponse);
+    try {
+      const results: unknown[] = [];
+      for (const path of ["/api/health", "/api/health/"]) {
+        const res = await dispatch(new Request(`http://localhost${path}`));
+        results.push([res.status, (await res.json()).ok]);
+      }
+      for (const path of ["/api/watchlist?symbols=NVDA", "/api/watchlist/?symbols=NVDA"]) {
+        const res = await dispatch(new Request(`http://localhost${path}`));
+        results.push([res.status, res.headers.get("Cache-Control")]);
+      }
+      const agent = await dispatch(new Request("http://localhost/api/agent/", { method: "GET" }));
+      results.push(agent.status);
+      expect(results).toEqual([
+        [200, true], [200, true],
+        [200, "no-store"], [200, "no-store"],
+        405,
+      ]);
+      expect(spy).toHaveBeenCalledTimes(2);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("research root and prefixed paths fail loudly without a bridge read", async () => {
+    const research = await dispatch(new Request("http://localhost/api/research", { method: "GET" }));
+    expect(research.status).toBe(400);
+    expect(await research.json()).toEqual({ error: "bad session_id" });
+    const agent = await dispatch(new Request("http://localhost/api/agent", { method: "POST", body: "{" }));
+    expect(agent.status).toBe(400);
+    expect(await agent.json()).toEqual({ error: "invalid JSON" });
+  });
+
   test("malformed watchlist symbols are rejected before any worker call", async () => {
     const spy = spyOn(kernelRouter, "call");
     try {
@@ -162,7 +211,7 @@ describe("bun api host", () => {
       if (prev === undefined) delete process.env.KERNEL_PREWARMED;
       else process.env.KERNEL_PREWARMED = prev;
     }
-  }, 30000);
+  }, 130_000);
 
   test("listener answers health on a non-primary loopback address, so it binds every IPv4 interface", async () => {
     // A 127.0.0.1-only bind refuses 127.0.0.2 on Linux; 0.0.0.0 accepts it. No LAN interface needed.
@@ -184,5 +233,5 @@ describe("bun api host", () => {
       if (saved.prewarmed === undefined) delete process.env.KERNEL_PREWARMED;
       else process.env.KERNEL_PREWARMED = saved.prewarmed;
     }
-  }, 30000);
+  }, 130_000);
 });

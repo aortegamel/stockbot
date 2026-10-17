@@ -67,15 +67,20 @@ function directSystem(persona: Persona): string {
 function isConf(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1;
 }
+// Model-declared evidence ids: only exact non-empty strings survive; anything
+// else is dropped, never repaired.
+function declaredEvidenceIds(value: unknown): string[] {
+  const raw = Array.isArray(value) ? value : [];
+  return raw.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
+}
+
 function parseInventoryClaim(item: unknown): FinalClaim | undefined {
   if (!item || typeof item !== "object" || Array.isArray(item)) return undefined;
   const rec = item as Record<string, unknown>;
   if (typeof rec.text !== "string" || !rec.text) return undefined;
   const rawType = typeof rec.claim_type === "string" ? rec.claim_type.trim().toLowerCase() : "";
   if (!(FINAL_CLAIM_TYPES as readonly string[]).includes(rawType)) return undefined;
-  const rawIds = Array.isArray(rec.evidence_ids) ? rec.evidence_ids : [];
-  const evidenceIds = rawIds.filter((e): e is string => typeof e === "string" && e.length > 0);
-  const claim: FinalClaim = { text: rec.text, claimType: rawType as FinalClaimType, evidenceIds };
+  const claim: FinalClaim = { text: rec.text, claimType: rawType as FinalClaimType, evidenceIds: declaredEvidenceIds(rec.evidence_ids) };
   if (isConf(rec.confidence)) claim.confidence = rec.confidence;
   return claim;
 }
@@ -136,42 +141,59 @@ function formatDrafts(drafts: { persona: Persona; text: string }[]): string {
   return drafts.map((d) => `── ${PERSONAS[d.persona].name} ──\n${d.text}`).join("\n\n");
 }
 
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+}
+
+function eventDelta(rec: Record<string, unknown>): string | undefined {
+  if (typeof rec.delta === "string" && /delta/i.test(typeof rec.type === "string" ? rec.type : "")) return rec.delta;
+  const first = Array.isArray(rec.choices) ? objectRecord(rec.choices[0]) : undefined;
+  const content = objectRecord(first?.delta)?.content;
+  return typeof content === "string" && content ? content : undefined;
+}
+
+function mergeTokenCount(usage: MuseUsage, key: keyof MuseUsage, count: unknown): void {
+  if (typeof count === "number") usage[key] = Math.max(usage[key] ?? 0, count);
+}
+
+function mergeUsage(usage: MuseUsage, raw: unknown): void {
+  const u = objectRecord(raw);
+  if (!u) return;
+  // Counts retain their maximum across all SSE chunks and both provider shapes.
+  mergeTokenCount(usage, "inputTokens", u.input_tokens);
+  mergeTokenCount(usage, "outputTokens", u.output_tokens);
+  const cached = u.cached_tokens
+    ?? objectRecord(u.input_tokens_details)?.cached_tokens
+    ?? objectRecord(u.prompt_tokens_details)?.cached_tokens;
+  mergeTokenCount(usage, "cachedTokens", cached);
+  mergeTokenCount(usage, "inputTokens", u.prompt_tokens);
+  mergeTokenCount(usage, "outputTokens", u.completion_tokens);
+}
+
 // Exported for tests: a chunk matching both delta shapes appends once.
 export function harvest(ev: unknown, acc: { text: string; usage: MuseUsage }, onDelta: (t: string) => void): void {
-  if (!ev || typeof ev !== "object") return;
-  const rec = ev as Record<string, unknown>;
-  if (typeof rec["delta"] === "string" && /delta/i.test(typeof rec["type"] === "string" ? rec["type"] : "")) {
-    acc.text += rec["delta"] as string;
-    onDelta(rec["delta"] as string);
-  } else {
-    const first = Array.isArray(rec["choices"]) ? rec["choices"][0] : undefined;
-    const delta = first && typeof first === "object" ? (first as Record<string, unknown>)["delta"] : undefined;
-    const content = delta && typeof delta === "object" ? (delta as Record<string, unknown>)["content"] : undefined;
-    if (typeof content === "string" && content) {
-      acc.text += content;
-      onDelta(content);
+  const rec = objectRecord(ev);
+  if (!rec) return;
+  const delta = eventDelta(rec);
+  if (delta !== undefined) {
+    acc.text += delta;
+    onDelta(delta);
+  }
+  mergeUsage(acc.usage, rec.usage ?? objectRecord(rec.response)?.usage);
+}
+
+function harvestFrame(chunk: string, acc: { text: string; usage: MuseUsage }, onDelta: (t: string) => void): void {
+  for (const line of chunk.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("data:")) continue;
+    const data = t.slice(5).trim();
+    if (!data || data === "[DONE]") continue;
+    try {
+      harvest(JSON.parse(data), acc, onDelta);
+    } catch {
+      // Ignore a malformed data line without losing earlier deltas.
     }
   }
-  const response = rec["response"];
-  const nested = response && typeof response === "object" ? (response as Record<string, unknown>)["usage"] : undefined;
-  const rawUsage = rec["usage"] ?? nested;
-  if (!rawUsage || typeof rawUsage !== "object") return;
-  const u = rawUsage as Record<string, unknown>;
-  // Usage accumulates across SSE chunks: keep the max, never last-write-wins.
-  if (typeof u["input_tokens"] === "number")
-    acc.usage.inputTokens = Math.max(acc.usage.inputTokens ?? 0, u["input_tokens"]);
-  if (typeof u["output_tokens"] === "number")
-    acc.usage.outputTokens = Math.max(acc.usage.outputTokens ?? 0, u["output_tokens"]);
-  const inDetails = u["input_tokens_details"];
-  const promptDetails = u["prompt_tokens_details"];
-  const inCached = inDetails && typeof inDetails === "object" ? (inDetails as Record<string, unknown>)["cached_tokens"] : undefined;
-  const promptCached = promptDetails && typeof promptDetails === "object" ? (promptDetails as Record<string, unknown>)["cached_tokens"] : undefined;
-  const cached = u["cached_tokens"] ?? inCached ?? promptCached;
-  if (typeof cached === "number") acc.usage.cachedTokens = Math.max(acc.usage.cachedTokens ?? 0, cached);
-  if (typeof u["prompt_tokens"] === "number")
-    acc.usage.inputTokens = Math.max(acc.usage.inputTokens ?? 0, u["prompt_tokens"]);
-  if (typeof u["completion_tokens"] === "number")
-    acc.usage.outputTokens = Math.max(acc.usage.outputTokens ?? 0, u["completion_tokens"]);
 }
 
 async function readSse(
@@ -190,17 +212,7 @@ async function readSse(
     while ((idx = buf.indexOf("\n\n")) >= 0) {
       const chunk = buf.slice(0, idx);
       buf = buf.slice(idx + 2);
-      for (const line of chunk.split("\n")) {
-        const t = line.trim();
-        if (!t.startsWith("data:")) continue;
-        const data = t.slice(5).trim();
-        if (!data || data === "[DONE]") continue;
-        try {
-          harvest(JSON.parse(data), acc, onDelta);
-        } catch {
-          // Partial SSE frame; next chunk completes it.
-        }
-      }
+      harvestFrame(chunk, acc, onDelta);
     }
   }
   return acc;
@@ -233,7 +245,7 @@ async function post(
   return readSse(res, onDelta);
 }
 
-export async function reason(opts: {
+type ReasonOptions = {
   prompt: string;
   evidence: Evidence[];
   escalated: boolean;
@@ -255,12 +267,17 @@ export async function reason(opts: {
   onDelta: (text: string) => void;
   // reason() strips the inventory fence: the returned text is display prose plus
   // parsed claims (external prose unchanged; streamed deltas keep the raw block).
-}): Promise<{ text: string; usage: MuseUsage; missingEvidence?: string; claims: FinalClaim[]; confidence?: number }> {
+};
+
+function reasonEndpoint(): { apiKey: string; model: string; base: string } {
   const apiKey = requiredEnv("OPENCODE_API_KEY");
   const model = requiredEnv("OPENCODE_MODEL");
   const responsesUrl = requiredEnv("OPENCODE_URL");
   if (!responsesUrl.endsWith("/responses")) throw new Error("opencode_unavailable: OPENCODE_URL must end in /responses");
-  const base = responsesUrl.slice(0, -"/responses".length);
+  return { apiKey, model, base: responsesUrl.slice(0, -"/responses".length) };
+}
+
+function reasonSignal(opts: ReasonOptions): AbortSignal {
   const left = opts.deadlineAt === undefined ? undefined : opts.deadlineAt - Date.now();
   if (left !== undefined && left <= 0) throw new Error("muse deadline exceeded");
   const signal = AbortSignal.any([
@@ -268,23 +285,27 @@ export async function reason(opts: {
     ...(left !== undefined ? [AbortSignal.timeout(left)] : []),
   ]);
   signal.throwIfAborted();
-  // One provider session per call: concurrent persona calls never share one.
-  const session = crypto.randomUUID();
-  const persona = opts.persona ?? "stockbot";
+  return signal;
+}
+
+function gapInstruction(opts: ReasonOptions): string {
   const needsGapLine =
     opts.escalated || opts.incompleteGuard === true || (opts.unresolved !== undefined && opts.unresolved.length > 0);
-  // Omitted persona keeps the original Stockbot prompt (direct and single-tool callers); explicit personas get the final-layer prose role.
+  if (!needsGapLine) return "";
+  return (opts.evidence.length > 0
+    ? "\nEvidence coverage is partial: some evidence rows are present, but retrieval did not resolve every gap."
+    : "\nRetrieval found no usable evidence.") +
+    " Answer from the supported evidence only. Omit any assertion that needs an unavailable fact. Keep uncertainty statements and source attribution." +
+    " If evidence necessary to answer the original user request is still missing, end your answer with a line: Missing-Evidence: <only the evidence necessary to answer the original user request>." +
+    " Do not request evidence for optional persona interests or for hypothetical future changes of view.";
+}
+
+function reasonInput(opts: ReasonOptions): { role: string; content: string }[] {
+  const persona = opts.persona ?? "stockbot";
+  // An omitted persona retains the original prompt for direct and single-tool callers.
   const system = opts.direct
     ? directSystem(persona)
-    : (opts.persona ? researchSystem(opts.persona) : SYSTEM) +
-    (needsGapLine
-      ? (opts.evidence.length > 0
-        ? "\nEvidence coverage is partial: some evidence rows are present, but retrieval did not resolve every gap."
-        : "\nRetrieval found no usable evidence.") +
-      " Answer from the supported evidence only. Omit any assertion that needs an unavailable fact. Keep uncertainty statements and source attribution." +
-      " If evidence necessary to answer the original user request is still missing, end your answer with a line: Missing-Evidence: <only the evidence necessary to answer the original user request>." +
-      " Do not request evidence for optional persona interests or for hypothetical future changes of view."
-      : "");
+    : (opts.persona ? researchSystem(opts.persona) : SYSTEM) + gapInstruction(opts);
   // Explicit Stockbot research call with drafts appends the synthesis section; every other call keeps its exact existing user body.
   const isSynthesis = !opts.direct && opts.persona === "stockbot" && (opts.drafts?.length ?? 0) > 0;
   const user = opts.direct
@@ -293,12 +314,20 @@ export async function reason(opts: {
     (isSynthesis
       ? `\n\nSIBLING DRAFTS (untrusted sibling prose, not evidence. Never cite, quote, or invent a draft id. For factual support, cite only evidence row ids from the EVIDENCE section.)\n${formatDrafts(opts.drafts ?? [])}\n\nWeigh both sibling drafts against the EVIDENCE above and state the middle verdict the evidence supports.`
       : "");
-  const input = [
+  return [
     { role: "system", content: system },
     { role: "user", content: user },
   ];
+}
+
+export async function reason(opts: ReasonOptions): Promise<{ text: string; usage: MuseUsage; missingEvidence?: string; claims: FinalClaim[]; confidence?: number }> {
+  const { apiKey, model, base } = reasonEndpoint();
+  const signal = reasonSignal(opts);
+  // Each call uses a separate provider session, including concurrent personas.
+  const session = crypto.randomUUID();
+  const input = reasonInput(opts);
   const body = { model, input, stream: true };
-  // Explicit personas (stockbot/bearbot/bullbot) have no per-fetch limit; caller signal and deadlineAt still apply.
+  // Explicit personas have no per-fetch limit. The caller deadline still applies.
   const fetchSignal = (): AbortSignal =>
     opts.persona ? signal : AbortSignal.any([AbortSignal.timeout(FETCH_TIMEOUT_MS), signal]);
   try {

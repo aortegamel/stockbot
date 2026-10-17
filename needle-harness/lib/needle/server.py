@@ -33,17 +33,8 @@ def _catalog_path():
     return os.path.normpath(os.path.join(here, "..", "..", ".needle-catalog.json"))
 
 
-def load_catalog():
-    path = _catalog_path()
-    try:
-        with open(path) as f:
-            tools = json.load(f)
-    except Exception:
-        logger.exception("needle server: cannot load tool catalog at %s", path)
-        sys.exit(1)
-    if not isinstance(tools, list) or not tools:
-        sys.stderr.write(f"needle server: tool catalog at {path} is empty or invalid\n")
-        sys.exit(1)
+def _slim_catalog(tools):
+    """Slim catalog entries for the shared init budget; unusable entries drop out."""
     # ponytail: full describe text (~58KB catalog) exceeds the Needle init
     # budget (needle_init code -1); truncated top-level descriptions ground
     # routing (name-only misroutes, e.g. clock->insider), stripped params fit.
@@ -56,6 +47,18 @@ def load_catalog():
         raw_desc = tool.get("description")
         desc = raw_desc if isinstance(raw_desc, str) and raw_desc.strip() else tool["name"]
         slim.append({"name": tool["name"], "description": desc[:150], "parameters": {"type": "object"}})
+    return slim
+
+
+def load_catalog():
+    path = _catalog_path()
+    try:
+        with open(path) as f:
+            tools = json.load(f)
+    except Exception:
+        logger.exception("needle server: cannot load tool catalog at %s", path)
+        sys.exit(1)
+    slim = _slim_catalog(tools) if isinstance(tools, list) else []
     if not slim:
         sys.stderr.write(f"needle server: tool catalog at {path} is empty or invalid\n")
         sys.exit(1)
@@ -117,16 +120,19 @@ _agent_lock = threading.Lock()
 MAX_LINE_CHARS = 1_000_000
 
 
+def _catalog_entry(tool):
+    """Find the original catalog metadata for one bound tool."""
+    with open(_catalog_path()) as f:
+        for entry in json.load(f):
+            if isinstance(entry, dict) and entry.get("name") == tool:
+                return entry
+    return {}
+
+
 def _tool_entry(tool, schema):
     """Single-tool binding for one arguments.generate call: original full metadata, no triggers."""
     params = schema if isinstance(schema, dict) else {}
-    full = None
-    with open(_catalog_path()) as f:
-        for t in json.load(f):
-            if isinstance(t, dict) and t.get("name") == tool:
-                full = t
-                break
-    full = full if isinstance(full, dict) else {}
+    full = _catalog_entry(tool)
     raw_desc = full.get("description")
     desc = raw_desc if isinstance(raw_desc, str) and raw_desc.strip() else tool
     full_params = full.get("parameters")
@@ -295,15 +301,21 @@ def _requested_limit(objective, node, context, schema):
     # get_sec_document's limit counts characters, not records. Its max_chars alias identifies that schema.
     if not isinstance(properties, dict) or "limit" not in properties or "max_chars" in properties:
         return None
+    counts = _limit_counts(objective, node, context)
+    if len(counts) > 1:
+        raise ValueError(f"conflicting explicit counts {sorted(counts)} in the request; ask for one count")
+    return next(iter(counts), None)
+
+
+def _limit_counts(objective, node, context):
+    """Collect request counts and the explicit structured limit before conflict checks."""
     text = objective if isinstance(objective, str) and objective.strip() else _request_text(node, objective)
     counts = _explicit_counts(text)
     grounded = context.get("grounded_arguments") if isinstance(context, dict) else None
     structured = grounded.get("limit") if isinstance(grounded, dict) else None
     if isinstance(structured, int) and not isinstance(structured, bool):
         counts.add(structured)
-    if len(counts) > 1:
-        raise ValueError(f"conflicting explicit counts {sorted(counts)} in the request; ask for one count")
-    return next(iter(counts), None)
+    return counts
 
 
 def _check_limit(tool, arguments, limit):
@@ -313,26 +325,40 @@ def _check_limit(tool, arguments, limit):
         raise ValueError(f"needle arguments for {tool!r} set limit {value!r}; the request asks for {limit}")
 
 
-def _arguments_facts(objective, node, context, schema=None, limit=None):
-    """Bind request facts, explicit arguments, and declared schema defaults. Never bind research records or feedback."""
-    facts = [f"date: {datetime.now(UTC).strftime('%Y-%m-%d %a %H:%M')} UTC", "locale: en-US"]
-    if isinstance(objective, str) and objective.strip():
-        facts.append(f"objective: {objective}")
+def _metadata_facts(node):
+    """Keep node metadata before execution context and its temporal scope."""
+    facts = []
     if isinstance(node, dict):
         for key in _NODE_KEYS:
             value = node.get(key)
             if isinstance(value, str):
                 facts.append(f"node {key}: {value}")
-    grounded = context.get("grounded_arguments") if isinstance(context, dict) else None
-    explicit = dict(grounded) if isinstance(grounded, dict) else {}
-    if limit is not None:
-        explicit["limit"] = limit
+    return facts
+
+
+def _context_facts(context):
+    """Keep explicit context strings and the persisted temporal window."""
+    facts = []
     if isinstance(context, dict):
         for key in ("as_of", "today_utc", "ticker"):
             value = context.get(key)
             if isinstance(value, str):
                 facts.append(f"{key}: {value}")
         facts.extend(_scope_facts(context.get("temporal_scope")))
+    return facts
+
+
+def _arguments_facts(objective, node, context, schema=None, limit=None):
+    """Bind request facts, explicit arguments, and declared schema defaults. Never bind research records or feedback."""
+    facts = [f"date: {datetime.now(UTC).strftime('%Y-%m-%d %a %H:%M')} UTC", "locale: en-US"]
+    if isinstance(objective, str) and objective.strip():
+        facts.append(f"objective: {objective}")
+    facts.extend(_metadata_facts(node))
+    grounded = context.get("grounded_arguments") if isinstance(context, dict) else None
+    explicit = dict(grounded) if isinstance(grounded, dict) else {}
+    if limit is not None:
+        explicit["limit"] = limit
+    facts.extend(_context_facts(context))
     facts.extend(_grounded_argument_facts(explicit, schema))
     facts.extend(_default_facts(schema, explicit))
     return "; ".join(facts)
@@ -379,13 +405,23 @@ def _grounding_flags(r):
     return sorted(flagged)
 
 
+def _response_calls(r):
+    """Prefer actual calls. Use suppressed calls only when actual calls are absent."""
+    calls = r.get("function_calls") or []
+    if calls:
+        return calls, False
+    calls = r.get("suppressed_calls") or []
+    return calls, bool(calls)
+
+
+def _first_call(calls):
+    """First call as a mapping; a malformed entry becomes an empty mapping."""
+    return calls[0] if calls and isinstance(calls[0], dict) else {}
+
+
 def _extract_decision(record_name, r, strict=True):
     """First call (or withheld call) as extracted fields; null record when nothing matched."""
-    calls = r.get("function_calls") or []
-    withheld = False
-    if not calls:
-        calls = r.get("suppressed_calls") or []
-        withheld = bool(calls)
+    calls, withheld = _response_calls(r)
     if not calls:
         return {
             "record": None,
@@ -394,7 +430,7 @@ def _extract_decision(record_name, r, strict=True):
             "confidence": r.get("confidence"),
             "reasoning": r.get("reasoning") or "",
         }
-    call = calls[0] if isinstance(calls[0], dict) else {}
+    call = _first_call(calls)
     name = call.get("name")
     if name != record_name:
         raise ValueError(f"extract record mismatch: declared {record_name!r}, engine emitted {name!r}")
@@ -424,17 +460,12 @@ def _noncall_detail(r):
 
 
 def _decision(r, want=None):
-    calls = r.get("function_calls") or []
-    withheld = False
-    if not calls:
-        calls = r.get("suppressed_calls") or []
-        withheld = bool(calls)
-    if (r.get("type") == "call" and calls) or (
-        withheld and (calls[0].get("name") if isinstance(calls[0], dict) else None) == want
-    ):
-        call = calls[0] if isinstance(calls[0], dict) else {}
+    calls, withheld = _response_calls(r)
+    call = _first_call(calls)
+    name = call.get("name")
+    if (r.get("type") == "call" and calls) or (withheld and name == want):
         return {
-            "tool": call.get("name"),
+            "tool": name,
             "arguments": call.get("arguments") or {},
             "withheld": withheld,
             "confidence": r.get("confidence"),
@@ -464,6 +495,125 @@ def validate_needle_tool(jev_tool, needle_tool):
     return needle_tool
 
 
+def _handle_start(req):
+    """Run the legacy initial prompt on the serialized shared agent."""
+    prompt = req["prompt"]
+    if not isinstance(prompt, str):
+        raise TypeError("bad prompt")
+    with _agent_lock:
+        agent.reset()
+        r = agent.complete(prompt, max_new_tokens=256)
+    return _decision(r)
+
+
+def _handle_step(req):
+    """Run a legacy result on the serialized shared agent."""
+    with _agent_lock:
+        r = agent.complete(json.dumps(req.get("result")), max_new_tokens=256)
+    return _decision(r)
+
+
+def _generated_decision(tool, r, limit):
+    """Validate the engine result before arguments cross the execution boundary."""
+    if r.get("type") == "error" or r.get("success") is False or r.get("error"):
+        raise ValueError(f"needle engine failed for {tool!r}: {r.get('error') or r.get('type')}")
+    decision = _decision(r, tool)
+    try:
+        validate_needle_tool(tool, decision["tool"])
+    except ValueError:
+        if decision["tool"] is None:
+            raise ValueError(
+                f"needle tool mismatch: jev selected {tool!r}, needle emitted None ({_noncall_detail(r)})"
+            ) from None
+        raise
+    flagged = _grounding_flags(r)
+    if flagged:
+        raise ValueError(f"needle arguments for {tool!r} not grounded in the request: {', '.join(flagged)}")
+    _check_limit(tool, decision["arguments"], limit)
+    return decision
+
+
+def _handle_generate(req):
+    """Generate arguments for exactly one JEV-selected tool.
+
+    Narrow execution worker: no registry inspection, no tool choice, no
+    chaining, no sufficiency judgment. Legacy start/step (the old Needle-owned
+    loop) stay until the loop.ts cutover.
+    """
+    tool = req.get("tool")
+    if not isinstance(tool, str) or not tool:
+        raise TypeError("bad tool")
+    import time as _t
+
+    _gen_t0 = _t.perf_counter()
+    _init_ms = 0.0
+    node = req.get("node")
+    objective = req.get("objective")
+    text = _request_text(node, objective)
+    entry = _tool_entry(tool, req.get("schema"))
+    schema = entry["parameters"]
+    context = req.get("context")
+    # Conflicting counts fail here, before the engine runs.
+    limit = _requested_limit(objective, node, context, schema)
+    bound = _bound_agent(tool, schema, _arguments_facts(objective, node, context, schema, limit))
+    _init_ms = (_t.perf_counter() - _gen_t0) * 1000.0
+    try:
+        r = bound.complete(text, max_new_tokens=512)
+    finally:
+        bound.close()
+    _gen_ms = (_t.perf_counter() - _gen_t0) * 1000.0
+    sys.stderr.write(f"needle timing tool={tool} init_ms={_init_ms:.1f} generate_ms={_gen_ms:.1f}\n")
+    sys.stderr.flush()
+    return _generated_decision(tool, r, limit)
+
+
+def _handle_extract(req):
+    """Decode one record shape, never the full registry."""
+    record = req.get("record")
+    passage = req.get("passage")
+    if not isinstance(record, dict) or not record.get("name"):
+        raise TypeError("bad record")
+    if not isinstance(passage, str) or not passage.strip():
+        raise TypeError("bad passage")
+    max_tokens = req.get("max_new_tokens", 512)
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or not 1 <= max_tokens <= 4096:
+        raise TypeError("bad max_new_tokens")
+    strict = req.get("strict", True)
+    strict = strict if isinstance(strict, bool) else True
+    bound = _extract_agent(record, req.get("system"))
+    try:
+        r = bound.complete(passage, max_new_tokens=max_tokens)
+    finally:
+        bound.close()
+    return _extract_decision(str(record["name"]), r, strict)
+
+
+def _handle_embed(req):
+    """Retrieve one vector from the serialized shared agent."""
+    text = req.get("text", "")
+    if not isinstance(text, str) or not text.strip():
+        raise TypeError("bad text")
+    with _agent_lock:
+        vec = agent.embed(text)
+    if not isinstance(vec, list):
+        raise TypeError("bad embedding")
+    if not vec or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vec):
+        raise ValueError("bad embedding")
+    return {"embedding": vec}
+
+
+# One handler per request action. Handlers return the response body without
+# the id, which handle() adds. start/step are the legacy non-kernel path: the
+# kernel path uses arguments.generate only and JEV owns transitions.
+_HANDLERS = {
+    "start": _handle_start,
+    "step": _handle_step,
+    "arguments.generate": _handle_generate,
+    "extract": _handle_extract,
+    "embed": _handle_embed,
+}
+
+
 def handle(line):
     # Bound stdin memory: a huge prompt never reaches json/model work.
     if len(line) > MAX_LINE_CHARS:
@@ -478,103 +628,14 @@ def handle(line):
         logger.exception("needle server: bad request")
         return {"id": "?", "error": "bad_request"}
     try:
-        # Ping-only gate: answers after imports load weights; never touches the model.
+        # Ping answers after imports load weights. It never touches the model.
         if action == "ping":
             return {"id": rid, "ready": True}
-        # Legacy non-kernel path: kernel path uses arguments.generate only; JEV owns transitions (start/step stay until loop.ts cutover).
-        if action == "start":
-            prompt = req["prompt"]
-            if not isinstance(prompt, str):
-                raise TypeError("bad prompt")
-            with _agent_lock:
-                agent.reset()
-                r = agent.complete(prompt, max_new_tokens=256)
-        elif action == "step":
-            with _agent_lock:
-                r = agent.complete(json.dumps(req.get("result")), max_new_tokens=256)
-        elif action == "arguments.generate":
-            # Narrow execution worker: exactly one JEV-selected tool. No
-            # registry inspection, no tool choice, no chaining, no
-            # sufficiency judgment. start/step (old Needle-owned loop) intact.
-            tool = req.get("tool")
-            if not isinstance(tool, str) or not tool:
-                raise TypeError("bad tool")
-            import time as _t
-
-            _gen_t0 = _t.perf_counter()
-            _init_ms = 0.0
-            node = req.get("node")
-            objective = req.get("objective")
-            text = _request_text(node, objective)
-            entry = _tool_entry(tool, req.get("schema"))
-            schema = entry["parameters"]
-            context = req.get("context")
-            # Conflicting counts fail here, before the engine runs.
-            limit = _requested_limit(objective, node, context, schema)
-            bound = _bound_agent(tool, schema, _arguments_facts(objective, node, context, schema, limit))
-            _init_ms = (_t.perf_counter() - _gen_t0) * 1000.0
-            try:
-                r = bound.complete(text, max_new_tokens=512)
-            finally:
-                bound.close()
-            _gen_ms = (_t.perf_counter() - _gen_t0) * 1000.0
-            sys.stderr.write(f"needle timing tool={tool} init_ms={_init_ms:.1f} generate_ms={_gen_ms:.1f}\n")
-            sys.stderr.flush()
-            if r.get("type") == "error" or r.get("success") is False or r.get("error"):
-                raise ValueError(f"needle engine failed for {tool!r}: {r.get('error') or r.get('type')}")
-            decision = _decision(r, tool)
-            try:
-                validate_needle_tool(tool, decision["tool"])
-            except TypeError:
-                raise
-            except ValueError:
-                if decision["tool"] is None:
-                    raise ValueError(
-                        f"needle tool mismatch: jev selected {tool!r}, needle emitted None ({_noncall_detail(r)})"
-                    ) from None
-                raise
-            flagged = _grounding_flags(r)
-            if flagged:
-                raise ValueError(f"needle arguments for {tool!r} not grounded in the request: {', '.join(flagged)}")
-            _check_limit(tool, decision["arguments"], limit)
-        elif action == "extract":
-            # Structured extraction: one record shape in, typed fields out.
-            # Never hands the full registry — the grammar admits exactly this record.
-            record = req.get("record")
-            passage = req.get("passage")
-            if not isinstance(record, dict) or not record.get("name"):
-                raise TypeError("bad record")
-            if not isinstance(passage, str) or not passage.strip():
-                raise TypeError("bad passage")
-            max_tokens = req.get("max_new_tokens", 512)
-            if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or not 1 <= max_tokens <= 4096:
-                raise TypeError("bad max_new_tokens")
-            strict = req.get("strict", True)
-            strict = strict if isinstance(strict, bool) else True
-            bound = _extract_agent(record, req.get("system"))
-            try:
-                r = bound.complete(passage, max_new_tokens=max_tokens)
-            finally:
-                bound.close()
-            out = {"id": rid}
-            out.update(_extract_decision(str(record["name"]), r, strict))
-            return out
-        elif action == "embed":
-            # Retrieval embedding off the shared agent; serial like start/step.
-            text = req.get("text", "")
-            if not isinstance(text, str) or not text.strip():
-                raise TypeError("bad text")
-            with _agent_lock:
-                vec = agent.embed(text)
-            if not isinstance(vec, list):
-                raise TypeError("bad embedding")
-            if not vec or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vec):
-                raise ValueError("bad embedding")
-            return {"id": rid, "embedding": vec}
-        else:
+        handler = _HANDLERS.get(action) if isinstance(action, str) else None
+        if handler is None:
             return {"id": rid, "error": "bad_action"}
         out = {"id": rid}
-        out.update(decision if action == "arguments.generate" else _decision(r))
+        out.update(handler(req))
         return out
     except Exception as e:
         logger.exception("needle server: request failed id=%s", rid)

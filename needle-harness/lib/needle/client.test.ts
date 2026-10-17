@@ -62,6 +62,7 @@ describe("needle lifecycle (replaces keep-alive timeout test)", () => {
   // the production timeout clock. No wall-clock sleep anywhere in this block.
   type FakeChild = {
     exitCode: number | null;
+    pid?: number;
     killCalls: number;
     written: string[];
     kill: (signal?: string) => void;
@@ -78,22 +79,24 @@ describe("needle lifecycle (replaces keep-alive timeout test)", () => {
     if (body && typeof body === "object" && "action" in body) return body.action;
     return undefined;
   };
-  const idOf = (data: string): unknown => {
-    const body: unknown = JSON.parse(data);
-    if (body && typeof body === "object" && "id" in body && typeof body.id === "string") return body.id;
-    return undefined;
-  };
-  const toolOf = (data: string): string | null => {
-    const body: unknown = JSON.parse(data);
-    if (body && typeof body === "object" && "tool" in body && typeof body.tool === "string") return body.tool;
-    return null;
-  };
   const routeReply = (id: unknown): string =>
     JSON.stringify({ id, tool: null, arguments: {}, withheld: false, confidence: null, reasoning: "" });
   const expectedRoute = { tool: null, arguments: {}, withheld: false, confidence: null, reasoning: "" };
 
+  type FakeReply = (body: Record<string, unknown>) => unknown;
+  type FakeOpts = { hangGeneration?: boolean; echoTool?: boolean; reply?: FakeReply; ping?: FakeReply };
+
+  // Protocol reply for one request body; undefined keeps the worker silent.
+  function protocolReply(body: Record<string, unknown>, opts?: FakeOpts): unknown {
+    if (body.action === "ping") return opts?.ping ? opts.ping(body) : { id: body.id, ready: true };
+    if (opts?.hangGeneration) return undefined;
+    if (opts?.reply) return opts.reply(body);
+    const tool = typeof body.tool === "string" ? body.tool : null;
+    return { id: body.id, tool: opts?.echoTool ? tool : null, arguments: {}, withheld: false, confidence: null, reasoning: "" };
+  }
+
   type FakeEntry = { fake: FakeChild; onLine: (line: string) => void };
-  function makeFake(opts?: { hangGeneration?: boolean; echoTool?: boolean }): FakeEntry {
+  function makeFake(opts?: FakeOpts): FakeEntry {
     const stdoutListeners: ((chunk: Buffer) => void)[] = [];
     let onLine: (line: string) => void = () => { };
     const fake: FakeChild = {
@@ -106,13 +109,8 @@ describe("needle lifecycle (replaces keep-alive timeout test)", () => {
       stdin: {
         write: (data: string, cb?: (err?: Error | null) => void): void => {
           fake.written.push(data);
-          const id = idOf(data);
-          if (actionOf(data) === "ping") {
-            queueMicrotask(() => onLine(JSON.stringify({ id, ready: true })));
-          } else if (!opts?.hangGeneration) {
-            const tool = opts?.echoTool ? toolOf(data) : null;
-            queueMicrotask(() => onLine(JSON.stringify({ id, tool, arguments: {}, withheld: false, confidence: null, reasoning: "" })));
-          }
+          const reply = protocolReply(JSON.parse(data) as Record<string, unknown>, opts);
+          if (reply !== undefined) queueMicrotask(() => onLine(JSON.stringify(reply)));
           cb?.(null);
         },
       },
@@ -437,6 +435,180 @@ describe("needle lifecycle (replaces keep-alive timeout test)", () => {
       first.exitCode = 0;
     } finally {
       await router.close();
+    }
+  });
+
+  test("extractFields sends only the record boundary and returns the typed reply", async () => {
+    const { router, children } = setup(() =>
+      makeFake({
+        reply: (body) => ({ id: body.id, record: "filing", fields: { ticker: "T" }, withheld: true, confidence: 0.5, reasoning: "cited [E1]" }),
+      }).fake,
+    );
+    try {
+      const r = await router.extractFields({ record: { name: "filing", private: "x" }, passage: "  text  " });
+      expect(r).toEqual({ record: "filing", fields: { ticker: "T" }, withheld: true, confidence: 0.5, reasoning: "cited [E1]" });
+      const first = children[0];
+      if (!first) throw new Error("expected one spawned child");
+      const bodies = first.written.map((w) => JSON.parse(w) as Record<string, unknown>);
+      const extract = bodies.find((b) => b.action === "extract");
+      if (!extract) throw new Error("expected extract write");
+      expect(Object.keys(extract).sort()).toEqual(["action", "id", "max_new_tokens", "passage", "record", "strict"]);
+      expect(extract.record).toEqual({ name: "filing", private: "x" });
+      expect(extract.passage).toBe("  text  ");
+      expect(extract.max_new_tokens).toBe(512);
+      expect(extract.strict).toBe(true);
+      first.exitCode = 0;
+    } finally {
+      await router.close();
+    }
+  });
+
+  test("extractFields rejects a foreign record name and malformed fields", async () => {
+    const foreign = setup(() => makeFake({ reply: (body) => ({ id: body.id, record: "other", fields: {} }) }).fake);
+    const unusable = setup(() => makeFake({ reply: (body) => ({ id: body.id, record: "filing", fields: "filing" }) }).fake);
+    const absent = setup(() => makeFake({ reply: (body) => ({ id: body.id, record: "filing" }) }).fake);
+    const passing = setup(() => makeFake({ reply: (body) => ({ id: body.id, record: null, fields: { a: 1 } }) }).fake);
+    try {
+      await expect(foreign.router.extractFields({ record: { name: "filing" }, passage: "p" })).rejects.toThrow("malformed server response");
+      await expect(unusable.router.extractFields({ record: { name: "filing" }, passage: "p" })).rejects.toThrow("needle extract failed");
+      await expect(absent.router.extractFields({ record: { name: "filing" }, passage: "p" })).rejects.toThrow("needle extract failed");
+      // A null record means the server found no record; the caller decides on the fields.
+      expect(await passing.router.extractFields({ record: { name: "filing" }, passage: "p" })).toEqual({
+        record: null, fields: { a: 1 }, withheld: false, confidence: null, reasoning: "",
+      });
+    } finally {
+      for (const s of [foreign, unusable, absent, passing]) {
+        const first = s.children[0];
+        if (first) first.exitCode = 0;
+        await s.router.close();
+      }
+    }
+  });
+
+  test("extractFields validates the record and passage before any call", async () => {
+    const { router, children } = setup(() => makeFake().fake);
+    try {
+      await expect(router.extractFields({ record: { name: "" }, passage: "p" })).rejects.toThrow("nonempty name");
+      await expect(router.extractFields({ record: { name: "filing" }, passage: "   " })).rejects.toThrow("passage must be nonempty");
+      await expect(router.embed("   ")).rejects.toThrow("text must be nonempty");
+      expect(children.length).toBe(0);
+    } finally {
+      await router.close();
+    }
+  });
+
+  test("embed returns the vector and rejects a malformed embedding", async () => {
+    const good = setup(() => makeFake({ reply: (body) => ({ id: body.id, embedding: [1, 2.5, -3] }) }).fake);
+    const mixed = setup(() => makeFake({ reply: (body) => ({ id: body.id, embedding: [1, "x"] }) }).fake);
+    const absent = setup(() => makeFake({ reply: (body) => ({ id: body.id }) }).fake);
+    try {
+      expect(await good.router.embed("query")).toEqual([1, 2.5, -3]);
+      await expect(mixed.router.embed("query")).rejects.toThrow("needle embed failed");
+      await expect(absent.router.embed("query")).rejects.toThrow("needle embed failed");
+    } finally {
+      for (const s of [good, mixed, absent]) {
+        const first = s.children[0];
+        if (first) first.exitCode = 0;
+        await s.router.close();
+      }
+    }
+  });
+
+  test("a server error reply rejects the pending call before its payload", async () => {
+    const { router, children } = setup(() =>
+      makeFake({ reply: (body) => ({ id: body.id, error: "needle server exploded", tool: "search_sec_filings", arguments: {} }) }).fake,
+    );
+    try {
+      await expect(router.generateArguments({ tool: "search_sec_filings" })).rejects.toThrow("needle server exploded");
+      const first = children[0];
+      if (!first) throw new Error("expected one spawned child");
+      first.exitCode = 0;
+    } finally {
+      await router.close();
+    }
+  });
+
+  test("a malformed ready reply fails startup without touching Pending work", async () => {
+    const { router, children } = setup(() => makeFake({ ping: (body) => ({ id: body.id }) }).fake);
+    try {
+      await expect(router.generateArguments({ tool: "search_sec_filings" })).rejects.toThrow("malformed server response");
+      expect(pendingKeys(router)).toEqual([]);
+      const first = children[0];
+      if (!first) throw new Error("expected one spawned child");
+      first.exitCode = 0;
+    } finally {
+      await router.close();
+    }
+  });
+
+  test("a worker without stdio fails the call instead of waiting", async () => {
+    const { router, children } = setup(() => {
+      const { fake } = makeFake();
+      fake.stdin = null;
+      fake.stdout = null;
+      return fake;
+    });
+    try {
+      await expect(router.generateArguments({ tool: "search_sec_filings" })).rejects.toThrow("needle spawn failed");
+      expect(children.length).toBe(1);
+      expect(pendingKeys(router)).toEqual([]);
+    } finally {
+      await router.close();
+    }
+  });
+
+  test("a warm ready worker that lost stdin fails the call without respawning", async () => {
+    const { router, children } = setup(() => makeFake().fake);
+    type RouterSeam = { rawCall: (b: Record<string, unknown>, k: string, t: number) => Promise<unknown> };
+    // Unchecked cast: rawCall has no public seam; route behavior under test.
+    const seam = router as unknown as RouterSeam;
+    try {
+      const first = await seam.rawCall({ action: "arguments.generate", tool: "search_sec_filings" }, "route", 500);
+      expect(first).toEqual(expectedRoute);
+      const worker = children[0];
+      if (!worker) throw new Error("expected one spawned child");
+      worker.stdin = null;
+      await expect(seam.rawCall({ action: "arguments.generate", tool: "search_sec_filings" }, "route", 500)).rejects.toThrow("needle spawn failed");
+      expect(children.length).toBe(1);
+      worker.exitCode = 0;
+    } finally {
+      await router.close();
+    }
+  });
+
+  test("a timeout reaps a worker whose process group is already gone", async () => {
+    // Timeout firing is the behavior under test; advanceTimersByTime drives the
+    // production clock deterministically with no wall-clock sleep.
+    vi.useFakeTimers();
+    try {
+      const { router, children } = setup(() => {
+        const { fake } = makeFake({ hangGeneration: true });
+        // Above any reachable pid, so the process-group signal cannot reach a real
+        // group and the direct kill fallback must run.
+        fake.pid = 2_147_483_647;
+        return fake;
+      });
+      type RouterSeam = { rawCall: (b: Record<string, unknown>, k: string, t: number) => Promise<unknown> };
+      // Unchecked cast: rawCall has no public seam; route behavior under test.
+      const seam = router as unknown as RouterSeam;
+      const slow = seam.rawCall({ action: "slow" }, "route", 30);
+      const slowSettled = slow.then(
+        (): null => null,
+        (e: unknown): unknown => e,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      vi.advanceTimersByTime(30);
+      const err = await slowSettled;
+      if (!(err instanceof Error)) throw new Error("expected timeout rejection");
+      expect(err.message).toMatch(/timeout/i);
+      const first = children[0];
+      if (!first) throw new Error("expected one spawned child");
+      expect(first.killCalls).toBe(1);
+      await router.close();
+    } finally {
+      vi.useRealTimers();
     }
   });
 });

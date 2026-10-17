@@ -5,6 +5,16 @@ import { existsSync, readFileSync } from "node:fs";
 // exports, so a stale parent env (daemon broker, shell export) silently won. Parse
 // here and assign directly so the file always wins; callers log the overrides.
 
+function parseDotenvValue(raw: string): string {
+  if (!/^["']/.test(raw)) {
+    const hash = raw.search(/\s#/);
+    return hash === -1 ? raw : raw.slice(0, hash).trim();
+  }
+  const quote = raw[0];
+  const end = raw.indexOf(quote, 1);
+  return end === -1 ? raw.slice(1) : raw.slice(1, end);
+}
+
 // Minimal dotenv parser: KEY="value", KEY='value', KEY=value, export prefix,
 // full-line comments. Quoted values keep inner #; unquoted values cut at " #".
 export function parseDotenv(text: string): Record<string, string> {
@@ -14,19 +24,7 @@ export function parseDotenv(text: string): Record<string, string> {
     if (!t || t.startsWith("#")) continue;
     const m = t.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
     if (!m) continue;
-    const raw = m[2].trim();
-    if (!raw) {
-      out[m[1]] = "";
-      continue;
-    }
-    const q = raw[0];
-    if (q === '"' || q === "'") {
-      const end = raw.indexOf(q, 1);
-      out[m[1]] = end === -1 ? raw.slice(1) : raw.slice(1, end);
-      continue;
-    }
-    const hash = raw.search(/\s#/);
-    out[m[1]] = (hash === -1 ? raw : raw.slice(0, hash).trim());
+    out[m[1]] = parseDotenvValue(m[2].trim());
   }
   return out;
 }

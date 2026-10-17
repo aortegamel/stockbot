@@ -21,6 +21,11 @@ let routeReply: Record<string, unknown> | null = null;
 let argsReply: Record<string, unknown> | null = null;
 // runKernelAgent throws this value when non-null.
 let runThrows: unknown = null;
+let assessDown = false;
+let assessReply: Record<string, unknown> | null = null;
+let toolFailure: { category: string; error: string } | null = null;
+let toolThrows: unknown = null;
+let endThrows = false;
 const runCalls: unknown[][] = [];
 type ReasonCall = { prompt: string; evidence: Evidence[]; onDelta?: (t: string) => void };
 const reasonCalls: ReasonCall[] = [];
@@ -52,6 +57,8 @@ mock.module("@/lib/agent/kernel", () => ({
         return argsReply ?? { tool: body.tool, arguments: { q: "x" }, confidence: 1, reasoning: "t" };
       }
       if (body.op === "assess_entry") {
+        if (assessDown) throw new Error("assessment down");
+        if (assessReply !== null) return assessReply;
         const verdict = verdicts.length > 1 ? verdicts.shift()! : verdicts[0];
         return { verdict };
       }
@@ -85,11 +92,14 @@ mock.module("@/lib/muse/client", () => ({
 mock.module("@/lib/tools/stockbot", () => ({
   invoke: async (name: string, args: unknown, sessionId: string) => {
     invoked.push([name, args, sessionId]);
+    if (toolThrows !== null) throw toolThrows;
+    if (toolFailure !== null) return { ok: false, ...toolFailure };
     return { ok: true, evidence: { ...bridgeEvidence, source: name } };
   },
   newSessionId: () => "sess-test",
   endSession: async (id: string) => {
     ended.push(id);
+    if (endThrows) throw new Error("session cleanup failed");
   },
 }));
 
@@ -105,6 +115,11 @@ function reset(): void {
   routeReply = null;
   argsReply = null;
   runThrows = null;
+  assessDown = false;
+  assessReply = null;
+  toolFailure = null;
+  toolThrows = null;
+  endThrows = false;
   runCalls.length = 0;
   reasonCalls.length = 0;
   kernelCalls.length = 0;
@@ -612,5 +627,126 @@ describe("agent entry route", () => {
       expect(kernelCalls.length).toBe(0);
       expect(runCalls.length).toBe(0);
     }
+  });
+
+  test("invalid JSON and missing prompts stop before routing", async () => {
+    const { POST } = await import("./route");
+    for (const [body, error] of [
+      ["{", "invalid JSON"],
+      ["null", "invalid JSON"],
+      ["{}", "prompt required"],
+      ['{"prompt":"   "}', "prompt required"],
+      ['{"prompt":7}', "prompt required"],
+    ]) {
+      reset();
+      const response = await POST(new Request("http://localhost/api/agent", { method: "POST", body }));
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error });
+      expect(kernelCalls).toEqual([]);
+    }
+  });
+
+  test("bridge failure rows reach assessment and preserve failure metrics", async () => {
+    reset();
+    winner = "query_finra";
+    const message = "provider unavailable ".repeat(50);
+    toolFailure = { category: "provider_error", error: message };
+    const events = await eventsFor("short interest?");
+    expect(events.map((event) => event.type)).toEqual([
+      "agent_start", "needle_decision", "tool_start", "tool_result", "tool_failed", "reasoning_start", "answer_delta", "done",
+    ]);
+    expect(events.find((event) => event.type === "tool_result")?.preview).toBe(message.slice(0, 160));
+    expect(events.find((event) => event.type === "tool_failed")).toMatchObject({ category: "provider_error", preview: message.slice(0, 160) });
+    expect(kernelCalls.find((call) => call.op === "assess_entry")).toMatchObject({
+      result: { ok: false, category: "provider_error", error: message.slice(0, 500) },
+    });
+    expect(events.at(-1)).toMatchObject({ metrics: { failures: { provider_error: 1 }, evidence: { count: 0, characters: 0 } } });
+    expect(metricCalls(events, "tools")).toBe(1);
+    expect(ended).toEqual(["sess-test"]);
+    expect(reasonCalls[0].evidence).toEqual([]);
+  });
+
+  test("thrown tool failures close their sessions and report zero completed calls", async () => {
+    for (const thrown of [new Error("tool exploded"), "tool exploded"]) {
+      reset();
+      winner = "query_finra";
+      toolThrows = thrown;
+      const events = await eventsFor("short interest?");
+      expect(events.map((event) => event.type)).toEqual([
+        "agent_start", "needle_decision", "tool_start", "tool_failed", "reasoning_start", "answer_delta", "done",
+      ]);
+      expect(events.find((event) => event.type === "tool_failed")).toEqual({
+        type: "tool_failed", tool: "query_finra", category: "tool_error", preview: "tool exploded",
+      });
+      expect(events.at(-1)).toMatchObject({ metrics: { failures: { tool_error: 1 } } });
+      expect(metricCalls(events, "tools")).toBe(0);
+      expect(ended).toEqual(["sess-test"]);
+    }
+  });
+
+  test("unavailable assessment retains evidence for research", async () => {
+    reset();
+    winner = "query_finra";
+    assessDown = true;
+    const events = await eventsFor("short interest?");
+    expect(events.map((event) => event.type)).toEqual(["agent_start", "needle_decision", "tool_start", "tool_result", "evidence"]);
+    expect(runCalls[0]?.[2]).toMatchObject({ seedEvidence: [expect.objectContaining({ id: "ev:bridge" })] });
+    expect(reasonCalls).toEqual([]);
+    expect(ended).toEqual(["sess-test"]);
+  });
+
+  test("invalid assessment verdicts and a three-tool cap defer to research", async () => {
+    for (const verdict of [undefined, "", 42, "invalid tool", "query_finra"]) {
+      reset();
+      winner = "query_finra";
+      assessReply = { verdict };
+      await eventsFor("short interest?");
+      const expectedCalls = verdict === "query_finra" ? 3 : 1;
+      expect(invoked).toHaveLength(expectedCalls);
+      expect(ended).toHaveLength(expectedCalls);
+      expect(runCalls).toHaveLength(1);
+      expect(runCalls[0]?.[2]).toMatchObject({ seedEvidence: expect.arrayContaining([expect.objectContaining({ id: "ev:bridge" })]) });
+      expect(reasonCalls).toEqual([]);
+    }
+  });
+
+  test("cleanup failure retains completed evidence without assessing the tool", async () => {
+    reset();
+    winner = "query_finra";
+    endThrows = true;
+    await eventsFor("short interest?");
+    expect(kernelCalls.map((call) => call.op)).toEqual(["route", "arguments"]);
+    expect(ended).toEqual(["sess-test"]);
+    expect(runCalls[0]?.[2]).toMatchObject({ seedEvidence: [expect.objectContaining({ id: "ev:bridge" })] });
+  });
+
+  test("single-shot reasoning failure emits the original error without research", async () => {
+    reset();
+    winner = "query_finra";
+    reasonDown = true;
+    const events = await eventsFor("short interest?");
+    expect(events.at(-1)).toEqual({ type: "error", message: "muse down" });
+    expect(events.some((event) => event.type === "done")).toBe(false);
+    expect(runCalls).toEqual([]);
+  });
+
+  test("missing reasoning configuration defers the direct answer to research", async () => {
+    reset();
+    delete process.env.OPENCODE_MODEL;
+    const events = await eventsFor("hello");
+    expect(events.map((event) => event.type)).toEqual(["agent_start"]);
+    expect(reasonCalls).toEqual([]);
+    expect(runCalls).toHaveLength(1);
+  });
+
+  test("an already aborted request produces no stream events", async () => {
+    reset();
+    const { POST } = await import("./route");
+    const controller = new AbortController();
+    controller.abort();
+    const response = await POST(new Request("http://localhost/api/agent", {
+      method: "POST", body: JSON.stringify({ prompt: "hello" }), signal: controller.signal,
+    }));
+    expect(await response.text()).toBe("");
   });
 });

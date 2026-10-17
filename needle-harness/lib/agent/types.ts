@@ -54,21 +54,28 @@ export type Evidence = {
 // Match the source endpoint. References never contain paths or live URLs.
 const SOURCE_ID_RE = /^(?:capture:[a-f0-9]{64}|evidence:[A-Za-z0-9:_-]{1,256})$/;
 
-// Trust boundary: keep only well-formed server references; anything else is dropped, never repaired.
+// One candidate reference: only a well-formed id plus public title/url fields
+// survive; every other shape drops the row instead of repairing it.
+function readSourceReference(raw: unknown): SourceReference | undefined {
+  if (raw === null || typeof raw !== "object") return undefined;
+  const { id, title, url } = raw as Record<string, unknown>;
+  if (typeof id !== "string" || !SOURCE_ID_RE.test(id)) return undefined;
+  const ref: SourceReference = { id };
+  if (typeof title === "string" && title) ref.title = title.slice(0, 300);
+  if (typeof url === "string" && /^https?:\/\//i.test(url)) ref.url = url.slice(0, 2000);
+  return ref;
+}
+// Trust boundary: keep only well-formed server references, in source order and
+// deduplicated by id; anything else is dropped, never repaired.
 export function sourceReferences(raw: unknown): SourceReference[] {
   if (!Array.isArray(raw)) return [];
   const out: SourceReference[] = [];
   const seen = new Set<string>();
   for (const r of raw) {
-    if (r === null || typeof r !== "object") continue;
-    const { id, title, url } = r as Record<string, unknown>;
-    if (typeof id !== "string" || !SOURCE_ID_RE.test(id) || seen.has(id)) continue;
-    seen.add(id);
-    out.push({
-      id,
-      ...(typeof title === "string" && title ? { title: title.slice(0, 300) } : {}),
-      ...(typeof url === "string" && /^https?:\/\//i.test(url) ? { url: url.slice(0, 2000) } : {}),
-    });
+    const ref = readSourceReference(r);
+    if (ref === undefined || seen.has(ref.id)) continue;
+    seen.add(ref.id);
+    out.push(ref);
   }
   return out;
 }

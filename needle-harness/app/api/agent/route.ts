@@ -16,8 +16,7 @@ function parsePersonas(v: unknown): Persona[] | null | undefined {
   const canonical = FINAL_PERSONAS.filter((p) => v.includes(p));
   return v.length > 0 && v.length === canonical.length && canonical.every((p, i) => v[i] === p) ? canonical : undefined;
 }
-export async function POST(req: Request): Promise<Response> {
-  const deadlineAt = Date.now() + REQUEST_WALL_MS;
+async function readAgentRequest(req: Request): Promise<Response | { prompt: string; ticker: unknown; parsedWatchlist: string[] | undefined }> {
   let prompt: unknown;
   let ticker: unknown;
   let watchlistRaw: unknown;
@@ -37,7 +36,82 @@ export async function POST(req: Request): Promise<Response> {
     console.error("[web] [agent-api] invalid watchlist");
     return Response.json({ error: "watchlist must list 1-25 valid tickers" }, { status: 400 });
   }
-  // Only a prompt that names the watchlist takes watchlist scope; its symbols are the scope and replace the selected ticker.
+  return { prompt, ticker, parsedWatchlist };
+}
+
+function publicEvent(e: AgentEvent): AgentEvent | null {
+  if (["needle_decision", "tool_start", "tool_result", "tool_failed"].includes(e.type)) return null;
+  switch (e.type) {
+    case "evidence":
+      return {
+        type: "evidence",
+        ...(e.sessionId ? { sessionId: e.sessionId } : {}),
+        evidence: e.evidence.map((ev) => ({
+          id: ev.id,
+          source: ev.source,
+          retrievedAt: ev.retrievedAt,
+          content: "",
+          ...(ev.title !== undefined ? { title: ev.title } : {}),
+          ...(ev.url !== undefined ? { url: ev.url } : {}),
+          sources: sourceReferences(ev.sources),
+        })),
+      };
+    case "progress":
+      return { type: "progress", stage: "working" };
+    case "reasoning_start":
+      return { type: "reasoning_start", model: "stockbot" };
+    default:
+      return e;
+  }
+}
+
+function streamSender(req: Request, controller: ReadableStreamDefaultController<Uint8Array>): (e: AgentEvent) => void {
+  const enc = new TextEncoder();
+  const debug = ["1", "true", "yes"].includes((process.env.STOCKBOT_DEBUG ?? "").trim().toLowerCase());
+  let terminalSent = false;
+  return (e) => {
+    if (req.signal.aborted) return;
+    let out = debug ? e : publicEvent(e);
+    if (!out) return;
+    if (!debug && (e.type === "failed" || e.type === "error")) {
+      if (terminalSent) return;
+      terminalSent = true;
+      out = { type: "error", message: "Stockbot couldn't complete that request. Try again." };
+    }
+    try {
+      controller.enqueue(enc.encode(`data: ${JSON.stringify(out)}\n\n`));
+    } catch {
+      // The client disconnected. Later sends do not affect the closed stream.
+    }
+  };
+}
+
+type EntrySelection = { route: string; personas: Persona[] | null } | { error: string };
+function parseEntrySelection(routed: KernelResponse | undefined): Exclude<EntrySelection, { error: string }> | null {
+  const personas = parsePersonas(routed?.personas);
+  if (!routed || (typeof routed.error === "string" && routed.error) || typeof routed.route !== "string" || personas === undefined) {
+    return null;
+  }
+  return { route: routed.route, personas };
+}
+async function selectEntry(body: Record<string, unknown>, signal: AbortSignal): Promise<EntrySelection> {
+  let routed: KernelResponse | undefined;
+  let routeError = "route_invalid: malformed route selection";
+  try {
+    routed = await kernelRouter.call(body, { signal });
+    if (typeof routed.error === "string" && routed.error) routeError = routed.error;
+  } catch (err) {
+    routeError = err instanceof Error ? err.message : String(err);
+  }
+  return parseEntrySelection(routed) ?? { error: routeError };
+}
+
+export async function POST(req: Request): Promise<Response> {
+  const deadlineAt = Date.now() + REQUEST_WALL_MS;
+  const input = await readAgentRequest(req);
+  if (input instanceof Response) return input;
+  const { prompt, ticker, parsedWatchlist } = input;
+  // Only a prompt that names the watchlist uses its symbols instead of the selected ticker.
   const watchlist = parsedWatchlist !== undefined && asksWatchlist(prompt) ? parsedWatchlist : undefined;
   const watchlistField = watchlist ? { watchlist } : {};
   // Validated ticker channel beside the verbatim prompt; invalid values drop (prompt never changes).
@@ -46,56 +120,7 @@ export async function POST(req: Request): Promise<Response> {
   console.log(`[web] [agent-api] POST prompt_chars=${prompt.length}${watchlist ? ` watchlist=${watchlist.length}` : ""}`);
   const stream = new ReadableStream({
     async start(controller) {
-      const enc = new TextEncoder();
-      // STOCKBOT_DEBUG=1 streams unfiltered working logs (routing, tools, model).
-      // Prod summarizes: generic working indicator, generic errors, Stockbot labels.
-      const debug = ["1", "true", "yes"].includes((process.env.STOCKBOT_DEBUG ?? "").trim().toLowerCase());
-      let terminalSent = false;
-      const send = (e: AgentEvent) => {
-        if (req.signal.aborted) return;
-        let out: AgentEvent | null = e;
-        if (!debug) {
-          switch (e.type) {
-            case "needle_decision":
-            case "tool_start":
-            case "tool_result":
-            case "tool_failed":
-              return;
-            case "evidence":
-              out = {
-                type: "evidence",
-                ...(e.sessionId ? { sessionId: e.sessionId } : {}),
-                evidence: e.evidence.map((ev) => ({
-                  id: ev.id,
-                  source: ev.source,
-                  retrievedAt: ev.retrievedAt,
-                  content: "",
-                  ...(ev.title !== undefined ? { title: ev.title } : {}),
-                  ...(ev.url !== undefined ? { url: ev.url } : {}),
-                  sources: sourceReferences(ev.sources),
-                })),
-              };
-              break;
-            case "progress":
-              out = { type: "progress", stage: "working" };
-              break;
-            case "reasoning_start":
-              out = { type: "reasoning_start", model: "stockbot" };
-              break;
-            case "failed":
-            case "error":
-              if (terminalSent) return;
-              terminalSent = true;
-              out = { type: "error", message: "Stockbot couldn't complete that request. Try again." };
-              break;
-          }
-        }
-        try {
-          controller.enqueue(enc.encode(`data: ${JSON.stringify(out)}\n\n`));
-        } catch {
-          // Client disconnected mid-stream; remaining sends no-op, close below ends it.
-        }
-      };
+      const send = streamSender(req, controller);
       // ponytail: JEV owns routing; this answers direct with zero session/DB.
       const answerDirect = async (): Promise<boolean> => {
         const t0 = performance.now();
@@ -114,6 +139,32 @@ export async function POST(req: Request): Promise<Response> {
       };
       // ponytail: single-shot evidence must survive research fallback (risk SSE dropped ev:58f5).
       const singleShotEvidence: Evidence[] = [];
+      const generateArguments = async (tool: string): Promise<{ args: Record<string, unknown>; confidence: number | null } | null> => {
+        try {
+          const gen = await kernelRouter.call({ op: "arguments", tool, objective: prompt, ...tickerField }, { signal: req.signal });
+          if (typeof gen.error === "string" && gen.error) return null;
+          if (gen.tool !== tool || typeof gen.arguments !== "object" || gen.arguments === null) return null;
+          return {
+            args: gen.arguments as Record<string, unknown>,
+            confidence: typeof gen.confidence === "number" ? gen.confidence : null,
+          };
+        } catch {
+          // Shared Needle failed. Research supplies the next arguments.
+          return null;
+        }
+      };
+      type ToolOutcome = { ok: boolean; content?: string; error?: string; category?: string };
+      const assessTool = async (tool: string, args: Record<string, unknown>, outcome: ToolOutcome): Promise<string | null> => {
+        try {
+          const assessed = await kernelRouter.call(
+            { op: "assess_entry", prompt, tool, arguments: args, result: outcome, ...tickerField },
+            { signal: req.signal },
+          );
+          return typeof assessed.verdict === "string" && assessed.verdict ? assessed.verdict : "research_required";
+        } catch {
+          return null;
+        }
+      };
       // ponytail: JEV selects; shared kernel Needle fills args; every post-tool verdict returns to JEV (max 3 rounds).
       const answerSingleShot = async (toolName: string): Promise<boolean> => {
         const t0 = performance.now();
@@ -123,27 +174,9 @@ export async function POST(req: Request): Promise<Response> {
         const failures: Partial<Record<FailureCategory, number>> = {};
         let needleCalls = 0;
         let toolCalls = 0;
-        let current: string | null = toolName;
-        for (let step = 0; step < 3 && current; step++) {
-          const tool = current;
-          current = null;
-          let args: Record<string, unknown>;
-          let confidence: number | null = null;
-          try {
-            const gen = await kernelRouter.call({ op: "arguments", tool, objective: prompt, ...tickerField }, { signal: req.signal });
-            if (typeof gen.error === "string" && gen.error) return false;
-            if (gen.tool !== tool || typeof gen.arguments !== "object" || gen.arguments === null) return false;
-            args = gen.arguments as Record<string, unknown>;
-            confidence = typeof gen.confidence === "number" ? gen.confidence : null;
-          } catch {
-            // Shared-Needle failure — never fabricate args; fall through to research.
-            return false;
-          }
-          needleCalls += 1;
-          send({ type: "needle_decision", step, tool, arguments: redactArgs(args), confidence });
-          send({ type: "tool_start", tool });
+        const executeTool = async (tool: string, args: Record<string, unknown>): Promise<ToolOutcome> => {
           const sessionId = newSessionId();
-          let outcome: { ok: boolean; content?: string; error?: string; category?: string };
+          let outcome: ToolOutcome;
           try {
             const entry = tools[tool];
             const res = entry?.execute ? await entry.execute(args, { sessionId }) : await invoke(tool, args, sessionId);
@@ -168,73 +201,70 @@ export async function POST(req: Request): Promise<Response> {
           } finally {
             await endSession(sessionId);
           }
-          let verdict: string;
+          return outcome;
+        };
+        const answerFromEvidence = async (): Promise<void> => {
+          send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
           try {
-            const assessed = await kernelRouter.call(
-              { op: "assess_entry", prompt, tool, arguments: args, result: outcome, ...tickerField },
-              { signal: req.signal },
-            );
-            verdict = typeof assessed.verdict === "string" && assessed.verdict ? assessed.verdict : "research_required";
-          } catch {
-            return false;
+            const m0 = performance.now();
+            const r = await reason({ prompt, evidence, escalated: false, direct: evidence.length === 0, onDelta: (text) => send({ type: "answer_delta", text }) });
+            send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures } });
+          } catch (err) {
+            send({ type: "error", message: err instanceof Error ? err.message : String(err) });
           }
+        };
+        let current: string | null = toolName;
+        for (let step = 0; step < 3 && current; step++) {
+          const tool = current;
+          current = null;
+          const generated = await generateArguments(tool);
+          if (!generated) return false;
+          const { args, confidence } = generated;
+          needleCalls += 1;
+          send({ type: "needle_decision", step, tool, arguments: redactArgs(args), confidence });
+          send({ type: "tool_start", tool });
+          const outcome = await executeTool(tool, args);
+          const verdict = await assessTool(tool, args, outcome);
+          if (verdict === null) return false;
           if (verdict === "node_resolved" || verdict === "reasoning_required") {
-            send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
-            try {
-              const m0 = performance.now();
-              const r = await reason({ prompt, evidence, escalated: false, direct: evidence.length === 0, onDelta: (text) => send({ type: "answer_delta", text }) });
-              send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures } });
-            } catch (err) {
-              send({ type: "error", message: err instanceof Error ? err.message : String(err) });
-            }
+            await answerFromEvidence();
             return true;
           }
           if (verdict === "research_required") return false;
           // ponytail: worker output is untrusted — only identifier-shaped tool names chain; anything else researches.
-          current = /^[A-Za-z_][A-Za-z0-9_]*$/.test(verdict) ? verdict : null;
-          if (!current) return false;
+          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(verdict)) return false;
+          current = verdict;
         }
         // Cap reached with another tool pending — research owns the longer chain.
         return false;
       };
+      const tryEntryAnswer = async (winner: string): Promise<boolean> => {
+        try {
+          if (winner === "no_session" || winner === "reasoning_required") return await answerDirect();
+          // Only identifier-shaped tool names can enter the single-tool path.
+          if (winner !== "research_required" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(winner)) return await answerSingleShot(winner);
+        } catch {
+          // The direct answer failed to start. Research owns the next attempt.
+        }
+        return false;
+      };
       // ponytail: JEV-first entry — one route round selects the route and any explicit personas.
       // The watchlist rides as separate context; JEV's returned route governs dispatch here.
-      let routed: KernelResponse | undefined;
-      let routeError = "route_invalid: malformed route selection";
-      try {
-        routed = await kernelRouter.call({ op: "route", prompt, ...tickerField, ...watchlistField }, { signal: req.signal });
-        if (typeof routed.error === "string" && routed.error) routeError = routed.error;
-      } catch (err) {
-        routeError = err instanceof Error ? err.message : String(err);
-      }
-      const personas = parsePersonas(routed?.personas);
-      if (!routed || (typeof routed.error === "string" && routed.error) || typeof routed.route !== "string" || personas === undefined) {
-        // Selection is unknown: fail rather than guess personas or a route.
+      const selected = await selectEntry({ op: "route", prompt, ...tickerField, ...watchlistField }, req.signal);
+      if ("error" in selected) {
+        const routeError = selected.error;
+        // Selection is unknown. The route must not guess personas or a route.
         send({ type: "agent_start", prompt });
         send({ type: "failed", category: "provider_error", message: routeError.slice(0, 160) });
         send({ type: "error", message: routeError });
         controller.close();
         return;
       }
+      const { personas } = selected;
       // Explicit personas skip direct and single-tool answers: research owns their evidence lifecycle.
-      if (personas === null) {
-        const winner = routed.route;
-        try {
-          if (winner === "no_session" || winner === "reasoning_required") {
-            await answerDirect();
-            controller.close();
-            return;
-          }
-          // ponytail: worker output is untrusted — only identifier-shaped names single-shot; anything else researches.
-          if (winner !== "research_required" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(winner)) {
-            if (await answerSingleShot(winner)) {
-              controller.close();
-              return;
-            }
-          }
-        } catch {
-          // Direct or single-tool answer failed to start — fail open to research below.
-        }
+      if (personas === null && await tryEntryAnswer(selected.route)) {
+        controller.close();
+        return;
       }
       try {
         await runKernelAgent(prompt, send, { signal: req.signal, seedEvidence: singleShotEvidence, deadlineAt, ...(personas ? { personas } : {}), ...tickerField, ...(watchlist ? { watchlist } : {}) });

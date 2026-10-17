@@ -60,6 +60,114 @@ export async function acquireNeedle(): Promise<() => void> {
   return () => release();
 }
 
+type GenerateRequest = {
+  tool: string;
+  schema?: unknown;
+  objective?: unknown;
+  node?: unknown;
+  context?: unknown;
+};
+
+function isArgumentMap(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function pickOwn(record: Record<string, unknown>, keys: string[]): Record<string, unknown> {
+  const picked: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(record, key)) picked[key] = record[key];
+  }
+  return picked;
+}
+
+function isScalar(value: unknown): boolean {
+  return value === null || typeof value === "string" || typeof value === "boolean"
+    || (typeof value === "number" && Number.isFinite(value));
+}
+
+function admitGroundedArguments(grounded: Record<string, unknown>, properties: Record<string, unknown>): Record<string, unknown> {
+  const admitted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(grounded)) {
+    if (!Object.prototype.hasOwnProperty.call(properties, key)) continue;
+    if (isScalar(value) || (Array.isArray(value) && value.every(isScalar))) admitted[key] = value;
+  }
+  return admitted;
+}
+
+function generationContext(context: Record<string, unknown>, schema: unknown): Record<string, unknown> {
+  const filtered = pickOwn(context, ["as_of", "temporal_scope", "today_utc", "ticker"]);
+  const properties = isArgumentMap(schema) ? schema.properties : undefined;
+  if (isArgumentMap(context.grounded_arguments) && isArgumentMap(properties)) {
+    filtered.grounded_arguments = admitGroundedArguments(context.grounded_arguments, properties);
+  }
+  return filtered;
+}
+
+function generationBody(req: GenerateRequest): Record<string, unknown> {
+  // Raw evidence, attempts, feedback, and arbitrary caller fields never enter the server input.
+  const body: Record<string, unknown> = {
+    action: "arguments.generate",
+    tool: req.tool,
+    schema: req.schema,
+    objective: req.objective,
+  };
+  if (isArgumentMap(req.node)) body.node = pickOwn(req.node, ["question", "node_id", "id", "type"]);
+  if (isArgumentMap(req.context)) body.context = generationContext(req.context, req.schema);
+  return body;
+}
+
+function replyAnnotations(msg: Record<string, unknown>): Pick<NeedleRouteResult, "withheld" | "confidence" | "reasoning"> {
+  return {
+    withheld: typeof msg.withheld === "boolean" ? msg.withheld : false,
+    confidence: typeof msg.confidence === "number" ? msg.confidence : null,
+    reasoning: typeof msg.reasoning === "string" ? msg.reasoning : "",
+  };
+}
+
+function extractReply(msg: Record<string, unknown>): NeedleExtractResult | null {
+  if (typeof msg.fields !== "object" || msg.fields === null) return null;
+  return {
+    record: typeof msg.record === "string" || msg.record === null ? msg.record : null,
+    fields: msg.fields as Record<string, unknown>,
+    ...replyAnnotations(msg),
+  };
+}
+
+function routeReply(msg: Record<string, unknown>): NeedleRouteResult {
+  return {
+    tool: typeof msg.tool === "string" || msg.tool === null ? msg.tool : null,
+    arguments: typeof msg.arguments === "object" && msg.arguments !== null ? msg.arguments as Record<string, unknown> : {},
+    ...replyAnnotations(msg),
+  };
+}
+
+function dispatchReply(p: Pending, msg: Record<string, unknown>): void {
+  if (typeof msg.error === "string") {
+    p.reject(new Error(msg.error));
+    return;
+  }
+  switch (p.kind) {
+    case "ping":
+      if (msg.ready === true) p.resolve();
+      else p.reject(new Error("needle startup failed: malformed server response"));
+      return;
+    case "embed": {
+      const vec = msg.embedding;
+      if (Array.isArray(vec) && vec.every((v) => typeof v === "number")) p.resolve(vec);
+      else p.reject(new Error("needle embed failed: malformed server response"));
+      return;
+    }
+    case "extract": {
+      const result = extractReply(msg);
+      if (result === null) p.reject(new Error("needle extract failed: malformed server response"));
+      else p.resolve(result);
+      return;
+    }
+    case "route":
+      p.resolve(routeReply(msg));
+  }
+}
+
 
 export class NeedleRouter {
   private child: ChildProcess | null = null;
@@ -215,57 +323,15 @@ export class NeedleRouter {
     } catch {
       return;
     }
-    if (typeof msg !== "object" || msg === null || !("id" in msg)) return;
-    const id: unknown = msg.id;
+    if (typeof msg !== "object" || msg === null) return;
+    const reply = msg as Record<string, unknown>;
+    const id = reply.id;
     if (typeof id !== "string") return;
     const p = this.pending[id];
     if (!p) return;
     delete this.pending[id];
     p.cancel();
-    if ("error" in msg && typeof msg.error === "string") {
-      p.reject(new Error(msg.error));
-      return;
-    }
-    if (p.kind === "ping") {
-      if ("ready" in msg && msg.ready === true) {
-        p.resolve();
-        return;
-      }
-      p.reject(new Error("needle startup failed: malformed server response"));
-      return;
-    }
-    const confidence = "confidence" in msg && typeof msg.confidence === "number" ? msg.confidence : null;
-    const reasoning = "reasoning" in msg && typeof msg.reasoning === "string" ? msg.reasoning : "";
-    if (p.kind === "embed") {
-      const vec = "embedding" in msg && Array.isArray(msg.embedding) ? msg.embedding : null;
-      if (!vec || !vec.every((v) => typeof v === "number")) {
-        p.reject(new Error("needle embed failed: malformed server response"));
-        return;
-      }
-      p.resolve(vec as number[]);
-      return;
-    }
-    if (p.kind === "extract") {
-      const record = "record" in msg && (typeof msg.record === "string" || msg.record === null) ? msg.record : null;
-      const fields =
-        "fields" in msg && typeof msg.fields === "object" && msg.fields !== null
-          ? (msg.fields as Record<string, unknown>)
-          : null;
-      const withheld = "withheld" in msg && typeof msg.withheld === "boolean" ? msg.withheld : false;
-      if (fields === null) {
-        p.reject(new Error("needle extract failed: malformed server response"));
-        return;
-      }
-      p.resolve({ record, fields, withheld, confidence, reasoning });
-      return;
-    }
-    const tool = "tool" in msg && (typeof msg.tool === "string" || msg.tool === null) ? msg.tool : null;
-    const args =
-      "arguments" in msg && typeof msg.arguments === "object" && msg.arguments !== null
-        ? (msg.arguments as Record<string, unknown>)
-        : {};
-    const withheld = "withheld" in msg && typeof msg.withheld === "boolean" ? msg.withheld : false;
-    p.resolve({ tool, arguments: args, withheld, confidence, reasoning });
+    dispatchReply(p, reply);
   }
 
   private onData(chunk: string): void {
@@ -320,16 +386,11 @@ export class NeedleRouter {
         if (worker === child) {
           this.child = null;
           if (this.readyChild === worker) this.readyChild = null;
-          this.killOwned(worker);
-          this.failAll(timeoutError());
-        } else if (worker == null) {
-          this.killOwned(child);
-          this.failAll(timeoutError());
-        } else {
-          // Worker already replaced by a fresh spawn: reap the old child only;
-          // the fresh worker and its pending calls stay untouched.
-          this.killOwned(child);
         }
+        // A replaced worker is reaped only; the fresh worker and its pending
+        // calls stay untouched. A missing worker leaves no successor to protect.
+        this.killOwned(child);
+        if (worker === child || worker == null) this.failAll(timeoutError());
         reject(timeoutError());
       }, timeoutMs);
       const fail = (err: Error): void => {
@@ -355,56 +416,11 @@ export class NeedleRouter {
   // tool only. Single request->response (no Needle-owned conversation).
   // Enforces emitted tool == requested tool; caller treats rejection as
   // retryable and returns to JEV with the full registry again.
-  async generateArguments(req: {
-    tool: string;
-    schema?: unknown;
-    objective?: unknown;
-    node?: unknown;
-    context?: unknown;
-  }): Promise<NeedleRouteResult> {
+  async generateArguments(req: GenerateRequest): Promise<NeedleRouteResult> {
     if (!req.tool) throw new Error("generateArguments: tool must be a nonempty tool name");
     const release = await acquireNeedle();
     try {
-      // Tool-only boundary: raw evidence, attempts, feedback, and arbitrary
-      // caller fields never reach this server input.
-      const body: Record<string, unknown> = {
-        action: "arguments.generate",
-        tool: req.tool,
-        schema: req.schema,
-        objective: req.objective,
-      };
-      if (req.node && typeof req.node === "object" && !Array.isArray(req.node)) {
-        const node = req.node as Record<string, unknown>;
-        const picked: Record<string, unknown> = {};
-        for (const key of ["question", "node_id", "id", "type"]) {
-          if (Object.prototype.hasOwnProperty.call(node, key)) picked[key] = node[key];
-        }
-        body.node = picked;
-      }
-      if (req.context && typeof req.context === "object" && !Array.isArray(req.context)) {
-        const context = req.context as Record<string, unknown>;
-        const filtered: Record<string, unknown> = {};
-        for (const key of ["as_of", "temporal_scope", "today_utc", "ticker"]) {
-          if (Object.prototype.hasOwnProperty.call(context, key)) filtered[key] = context[key];
-        }
-        const grounded = context.grounded_arguments;
-        const properties = req.schema && typeof req.schema === "object" && !Array.isArray(req.schema)
-          ? (req.schema as Record<string, unknown>).properties : undefined;
-        if (grounded && typeof grounded === "object" && !Array.isArray(grounded)
-          && properties && typeof properties === "object" && !Array.isArray(properties)) {
-          const isScalar = (value: unknown): boolean =>
-            value === null || typeof value === "string" || typeof value === "boolean"
-            || (typeof value === "number" && Number.isFinite(value));
-          const admitted: Record<string, unknown> = {};
-          for (const [key, value] of Object.entries(grounded)) {
-            if (!Object.prototype.hasOwnProperty.call(properties, key)) continue;
-            if (isScalar(value) || (Array.isArray(value) && value.every(isScalar))) admitted[key] = value;
-          }
-          filtered.grounded_arguments = admitted;
-        }
-        body.context = filtered;
-      }
-      const r = (await this.rawCall(body, "route")) as NeedleRouteResult;
+      const r = (await this.rawCall(generationBody(req), "route")) as NeedleRouteResult;
       validateNeedleTool(req.tool, r.tool);
       return r;
     } finally {

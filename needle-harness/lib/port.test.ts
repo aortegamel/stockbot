@@ -38,5 +38,11 @@ describe("pickFreePort", () => {
   test("treats invalid input as 3000", async () => {
     expect(await pickFreePort(Number("junk"))).toBeGreaterThanOrEqual(3000);
     expect(await pickFreePort(-1)).toBeGreaterThanOrEqual(3000);
+    expect(await pickFreePort(0)).toBeGreaterThanOrEqual(3000);
+    expect(await pickFreePort(3000.5)).toBeGreaterThanOrEqual(3000);
+  });
+
+  test("rejects a starting port beyond the TCP range without probing", async () => {
+    await expect(pickFreePort(65536)).rejects.toThrow("no free port at or above 65536");
   });
 });

@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { categorizeFailure, closeBridge, endSession, invoke, newSessionId } from "./stockbot";
-import { harvest, reason } from "../muse/client";
+import { harvest, reason, splitInventory } from "../muse/client";
 import fc from "fast-check";
 import { FINAL_PERSONAS, sourceReferences, type Evidence, type Persona } from "../agent/types";
 
@@ -24,10 +24,101 @@ describe.skipIf(!HAS_BRIDGE)("stockbot bridge", () => {
     async () => {
       const result = await invoke("get_sec_document", { accession_no: "bad" }, sid);
       expect(result.ok).toBe(false);
-      if (!result.ok) expect(result.error).toMatch(/accession/i);
+      if (!result.ok) {
+        expect(result.error).toMatch(/accession/i);
+        expect(result.category).toBe("tool_error");
+        expect(result.retryable).toBe(false);
+      }
     },
     60_000,
   );
+
+  test(
+    "a local tool reply becomes evidence with a stable id",
+    async () => {
+      const result = await invoke("list_tool_domains", {}, sid);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.evidence.source).toBe("list_tool_domains");
+        expect(result.evidence.id).toMatch(/^ev:[0-9a-f]{16}$/);
+        expect(result.evidence.title).toBe("list_tool_domains");
+        expect(result.evidence.content).toContain("sec");
+      }
+    },
+    60_000,
+  );
+
+  test(
+    "a malformed request surfaces the bridge envelope error",
+    async () => {
+      // The bridge rejects a request without a session id; the envelope error path
+      // must categorize it without inventing a tool result.
+      expect(await invoke("list_tool_domains", {}, "")).toEqual({
+        ok: false,
+        error: "missing_arg",
+        category: "tool_error",
+        retryable: false,
+      });
+    },
+    60_000,
+  );
+
+  // Last in this block: it closes the shared bridge child.
+  test(
+    "an in-flight call fails when the bridge closes instead of hanging",
+    async () => {
+      const inFlight = invoke("list_tool_domains", {}, sid);
+      closeBridge();
+      expect(await inFlight).toEqual({
+        ok: false,
+        error: "stockbot bridge closed",
+        category: "tool_error",
+        retryable: false,
+      });
+    },
+    60_000,
+  );
+});
+
+describe("categorizeFailure ordered rules", () => {
+  test("a known bridge error_type wins over the message", () => {
+    expect(categorizeFailure("deadline exceeded", "run_budget_exceeded")).toEqual({ category: "tool_budget_exhausted", retryable: false });
+    expect(categorizeFailure("run budget exceeded", "evidence_budget_exceeded")).toEqual({ category: "token_budget_exhausted", retryable: false });
+    expect(categorizeFailure("anything", "invalid_research_context")).toEqual({ category: "policy_denied", retryable: false });
+    expect(categorizeFailure("anything", "deadline_exceeded")).toEqual({ category: "deadline_exceeded", retryable: false });
+  });
+
+  test("an unknown or non-string error_type falls through to the message", () => {
+    expect(categorizeFailure("provider unavailable", "tool_error")).toEqual({ category: "provider_error", retryable: true });
+    expect(categorizeFailure("provider unavailable", 7)).toEqual({ category: "provider_error", retryable: true });
+  });
+
+  test("budget rules place token, job and wave before the generic rule", () => {
+    expect(categorizeFailure("token budget exhausted")).toEqual({ category: "token_budget_exhausted", retryable: false });
+    expect(categorizeFailure("job budget exhausted")).toEqual({ category: "job_budget_exhausted", retryable: false });
+    expect(categorizeFailure("wave quota spent")).toEqual({ category: "wave_budget_exhausted", retryable: false });
+    expect(categorizeFailure("quota spent")).toEqual({ category: "tool_budget_exhausted", retryable: false });
+  });
+
+  test("a bare token, job or wave mention is not a budget refusal", () => {
+    expect(categorizeFailure("token refreshed")).toEqual({ category: "tool_error", retryable: false });
+    expect(categorizeFailure("job started")).toEqual({ category: "tool_error", retryable: false });
+    expect(categorizeFailure("wave 2 started")).toEqual({ category: "tool_error", retryable: false });
+  });
+
+  test("policy, loop, timeout and provider traps keep category and retryability", () => {
+    for (const message of ["policy denied", "not permitted", "not authorized", "blocked by intent", "private data withheld", "egress blocked"]) {
+      expect(categorizeFailure(message)).toEqual({ category: "policy_denied", retryable: false });
+    }
+    for (const message of ["research_loop_detected", "repeats an action", "already ran this step"]) {
+      expect(categorizeFailure(message)).toEqual({ category: "research_loop_detected", retryable: false });
+    }
+    for (const message of ["request timed out", "timed_out waiting", "token expired"]) {
+      expect(categorizeFailure(message)).toEqual({ category: "timeout", retryable: true });
+    }
+    expect(categorizeFailure("provider unavailable")).toEqual({ category: "provider_error", retryable: true });
+    expect(categorizeFailure("unexpected failure")).toEqual({ category: "tool_error", retryable: false });
+  });
 });
 
 describe("categorizeFailure precedence", () => {
@@ -64,6 +155,110 @@ describe("harvest single-append", () => {
     harvest({ usage: { input_tokens: 100, output_tokens: 10 } }, acc, noop);
     harvest({ usage: { input_tokens: 50, output_tokens: 40 } }, acc, noop);
     expect(acc.usage).toMatchObject({ inputTokens: 100, outputTokens: 40 });
+  });
+});
+
+describe("harvest protocol shapes", () => {
+  const noop = () => { };
+
+  test("events without a recognized delta shape append nothing", () => {
+    const acc = { text: "", usage: {} };
+    const seen: string[] = [];
+    const shapes: unknown[] = [
+      null, 7, "delta", [], { delta: "raw" }, { type: "response.created", delta: 5 },
+      { choices: [] }, { choices: "x" }, { choices: [{}] }, { choices: [null] },
+      { choices: [{ delta: { content: "" } }] }, { choices: [{ delta: "x" }] },
+    ];
+    for (const ev of shapes) harvest(ev, acc, (t) => seen.push(t));
+    expect(acc.text).toBe("");
+    expect(seen).toEqual([]);
+    expect(acc.usage).toEqual({});
+  });
+
+  test("a chat-completions chunk appends its content once", () => {
+    const acc = { text: "", usage: {} };
+    const seen: string[] = [];
+    harvest({ choices: [{ delta: { content: "chat" } }] }, acc, (t) => seen.push(t));
+    expect(acc.text).toBe("chat");
+    expect(seen).toEqual(["chat"]);
+  });
+
+  test("the response envelope usage is read when the chunk carries none", () => {
+    const acc = { text: "", usage: {} };
+    harvest({ response: { usage: { input_tokens: 3, output_tokens: 4 } } }, acc, noop);
+    expect(acc.usage).toEqual({ inputTokens: 3, outputTokens: 4 });
+    // A chunk-level usage wins over the nested envelope for the same chunk.
+    harvest({ usage: { input_tokens: 12 }, response: { usage: { input_tokens: 40 } } }, acc, noop);
+    expect(acc.usage).toEqual({ inputTokens: 12, outputTokens: 4 });
+  });
+
+  test("usage accepts both provider count names and both cached detail keys", () => {
+    const acc = { text: "", usage: {} };
+    harvest({ usage: { prompt_tokens: 5, completion_tokens: 6, cached_tokens: 2 } }, acc, noop);
+    expect(acc.usage).toEqual({ inputTokens: 5, outputTokens: 6, cachedTokens: 2 });
+    harvest({ usage: { input_tokens_details: { cached_tokens: 9 } } }, acc, noop);
+    expect(acc.usage).toEqual({ inputTokens: 5, outputTokens: 6, cachedTokens: 9 });
+    harvest({ usage: { prompt_tokens_details: { cached_tokens: 4 } } }, acc, noop);
+    expect(acc.usage).toEqual({ inputTokens: 5, outputTokens: 6, cachedTokens: 9 });
+  });
+
+  test("malformed usage values are ignored, never coerced", () => {
+    const acc = { text: "", usage: {} };
+    for (const usage of [null, 5, "usage", {}, { input_tokens: "3" }, { output_tokens: null }]) {
+      harvest({ usage }, acc, noop);
+    }
+    harvest({ usage: { input_tokens_details: 7, prompt_tokens_details: null } }, acc, noop);
+    expect(acc.usage).toEqual({});
+  });
+});
+
+describe("muse inventory fence", () => {
+  test("prose without a fence passes through unchanged", () => {
+    expect(splitInventory("A fact [E1].")).toEqual({ prose: "A fact [E1].", claims: [] });
+  });
+
+  test("a trailing fence is stripped and its claims are coerced", () => {
+    const payload = {
+      claims: [
+        { text: "A fact [E1].", claim_type: " Observed_Fact ", evidence_ids: ["E1", "", 3], confidence: 0.9 },
+        { text: "An inference.", claim_type: "inference", evidence_ids: "E1" },
+        { text: "", claim_type: "inference" },
+        { text: "Bad type.", claim_type: "not_a_type" },
+        { text: "No type." },
+        "skip",
+        null,
+        [],
+      ],
+      confidence: 0.75,
+    };
+    const inv = splitInventory(`A fact [E1].\nAn inference.\n\`\`\`json ${JSON.stringify(payload)} \`\`\``);
+    expect(inv.prose).toBe("A fact [E1].\nAn inference.\n");
+    expect(inv.claims).toEqual([
+      { text: "A fact [E1].", claimType: "observed_fact", evidenceIds: ["E1"], confidence: 0.9 },
+      { text: "An inference.", claimType: "inference", evidenceIds: [] },
+    ]);
+    expect(inv.confidence).toBe(0.75);
+  });
+
+  test("an unusable fence is stripped without inventing claims", () => {
+    for (const body of ["{not json}", "[1,2]", "5", "null", '{"claims": 5}', '{"claims": [null]}']) {
+      const inv = splitInventory(`Prose.\n\`\`\`json ${body}\`\`\``);
+      expect(inv.prose).toBe("Prose.\n");
+      expect(inv.claims).toEqual([]);
+      expect(inv.confidence).toBeUndefined();
+    }
+  });
+
+  test("out-of-range confidence is dropped, never clamped", () => {
+    const raw = (confidence: number): string =>
+      `Prose.\n\`\`\`json ${JSON.stringify({ claims: [{ text: "T", claim_type: "inference", confidence }], confidence })}\`\`\``;
+    expect(splitInventory(raw(0)).claims[0].confidence).toBe(0);
+    expect(splitInventory(raw(1)).confidence).toBe(1);
+    for (const out of [-0.1, 1.1]) {
+      const inv = splitInventory(raw(out));
+      expect(inv.claims[0].confidence).toBeUndefined();
+      expect(inv.confidence).toBeUndefined();
+    }
   });
 });
 
@@ -249,6 +444,77 @@ describe("muse reason personas (fake provider)", () => {
     await expect(reason({ ...input, persona: "bearbot", deadlineAt: Date.now() - 1 })).rejects.toThrow("muse deadline exceeded");
     await expect(reason({ ...input, persona: "bullbot", signal: AbortSignal.abort() })).rejects.toThrow();
     expect(seen.length).toBe(0);
+  });
+
+  test("partial and malformed frames keep every complete delta", async () => {
+    const encoder = new TextEncoder();
+    respond = () =>
+      new Response(
+        new ReadableStream({
+          start(c) {
+            // One frame split across chunks, then a malformed data line, an SSE
+            // comment, a non-delta event, a chat-shaped delta, and a usage-only chunk.
+            c.enqueue(encoder.encode(`data: {"type":"response.output_text.delta","delta":"par`));
+            c.enqueue(
+              encoder.encode(
+                `tial"}\n\ndata: {not json}\n\n: keep-alive\n\ndata: {"type":"response.created"}\n\n` +
+                `data: ${JSON.stringify({ choices: [{ delta: { content: " chat" } }] })}\n\n` +
+                `data: ${JSON.stringify({ usage: { input_tokens: 9 } })}\n\n`,
+              ),
+            );
+            c.enqueue(encoder.encode("data: [DONE]\n\n"));
+            c.close();
+          },
+        }),
+        { headers: { "Content-Type": "text/event-stream" } },
+      );
+    const deltas: string[] = [];
+    const r = await reason({ ...input, persona: "bullbot", onDelta: (t) => deltas.push(t) });
+    expect(r.text).toBe("partial chat");
+    expect(deltas).toEqual(["partial", " chat"]);
+    expect(r.usage).toEqual({ inputTokens: 9 });
+    expect(r.claims).toEqual([]);
+  });
+
+  test("a direct call sends the direct system prompt without evidence", async () => {
+    const r = await reason({ prompt: "What is ACME?", evidence: [], escalated: false, direct: true, onDelta: () => { } });
+    expect(r.text).toBe("Stockbot read [E1].");
+    expect(seen.length).toBe(1);
+    const [call] = seen;
+    if (!call) throw new Error("expected one provider call");
+    expect(call.path).toBe("/v1/responses");
+    expect(systemOf(call.body)).toContain("Answer the user directly and briefly");
+    expect(systemOf(call.body)).not.toContain("Missing-Evidence:");
+    expect(userOf(call.body)).toBe("USER REQUEST\nWhat is ACME?");
+    expect(userOf(call.body)).not.toContain("EVIDENCE");
+  });
+
+  test("a single-tool call without a persona keeps the evidence prompt", async () => {
+    const r = await reason({ ...input, persona: undefined, escalated: false, onDelta: () => { } });
+    expect(r.text).toBe("Stockbot read [E1].");
+    const [call] = seen;
+    if (!call) throw new Error("expected one provider call");
+    expect(systemOf(call.body)).toContain("Answer only from the EVIDENCE below");
+    expect(systemOf(call.body)).not.toContain("Bearbot");
+    expect(userOf(call.body)).toContain("EVIDENCE\n[E1]\nsource: sec");
+    expect(userOf(call.body)).not.toContain("SIBLING DRAFTS");
+  });
+
+  test("reason strips the inventory fence and returns parsed claims", async () => {
+    const fence = JSON.stringify({
+      claims: [{ text: "Bearbot read [E1].", claim_type: "observed_fact", evidence_ids: ["E1"], confidence: 0.8 }],
+      confidence: 0.6,
+    });
+    respond = () => sse(`Bearbot read [E1].\n\`\`\`json ${fence}\`\`\``);
+    const deltas: string[] = [];
+    const r = await reason({ ...input, persona: "bearbot", onDelta: (t) => deltas.push(t) });
+    expect(r.text).toBe("Bearbot read [E1].\n");
+    expect(r.claims).toEqual([{ text: "Bearbot read [E1].", claimType: "observed_fact", evidenceIds: ["E1"], confidence: 0.8 }]);
+    expect(r.confidence).toBe(0.6);
+    expect(r.missingEvidence).toBeUndefined();
+    // Streamed deltas keep the raw block; only the returned prose is display text.
+    expect(deltas.join("")).toContain("```json");
+    expect(r.text).not.toContain("```json");
   });
 
   test("unsupported /responses falls back to chat on the same session and persona prompt", async () => {

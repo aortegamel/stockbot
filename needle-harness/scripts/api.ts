@@ -26,26 +26,27 @@ if (process.env.OPENCODE_API_KEY) {
   process.stdout.write(`api [env]: opencode identity fp=${fingerprintKey(process.env.OPENCODE_API_KEY)}\n`);
 }
 
-// Former cactus API paths owned by Bun. Wrong methods are 405; unknown paths are 404.
+// Former cactus API paths owned by Bun. Wrong methods are 405. Unknown paths are 404.
+function dispatchMethod(req: Request, method: string, handler: (req: Request) => Promise<Response>): Promise<Response> | Response {
+  if (req.method !== method) return Response.json({ error: "method not allowed" }, { status: 405 });
+  return handler(req);
+}
+
 export async function dispatch(req: Request): Promise<Response> {
   const path = new URL(req.url).pathname;
-  if (path === "/api/agent" || path === "/api/agent/") {
-    if (req.method !== "POST") return Response.json({ error: "method not allowed" }, { status: 405 });
-    return agentPOST(req);
-  }
-  if (path === "/api/watchlist" || path === "/api/watchlist/") {
-    if (req.method !== "GET") return Response.json({ error: "method not allowed" }, { status: 405 });
-    return watchlistGET(req);
-  }
-  if (path === "/api/health" || path === "/api/health/") {
-    if (req.method !== "GET") return Response.json({ error: "method not allowed" }, { status: 405 });
-    return healthGET();
+  switch (path) {
+    case "/api/agent":
+    case "/api/agent/":
+      return dispatchMethod(req, "POST", agentPOST);
+    case "/api/watchlist":
+    case "/api/watchlist/":
+      return dispatchMethod(req, "GET", watchlistGET);
+    case "/api/health":
+    case "/api/health/":
+      return dispatchMethod(req, "GET", healthGET);
   }
   if (path === "/api/research") return researchGET(req);
-  if (path.startsWith("/api/research/")) {
-    if (req.method !== "GET") return Response.json({ error: "method not allowed" }, { status: 405 });
-    return researchGET(req);
-  }
+  if (path.startsWith("/api/research/")) return dispatchMethod(req, "GET", researchGET);
   return Response.json({ error: "not found" }, { status: 404 });
 }
 

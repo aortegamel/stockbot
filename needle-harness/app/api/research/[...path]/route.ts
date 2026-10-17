@@ -17,6 +17,51 @@ const SOURCE_ERRORS: Record<number, string> = {
   502: "source read failed",
 };
 
+type FailureEnvelope = { error: string; status?: unknown };
+
+function readFailureEnvelope(output: string): FailureEnvelope | null {
+  try {
+    const raw: unknown = JSON.parse(output);
+    if (raw && typeof raw === "object" && "ok" in raw && raw.ok === false && "error" in raw && typeof raw.error === "string") {
+      return { error: raw.error, status: "status" in raw ? raw.status : undefined };
+    }
+  } catch {
+    // Execution failures can omit the bridge envelope.
+  }
+  return null;
+}
+
+function sourceBridgeFailure(envelope: FailureEnvelope | null, code: unknown): BridgeOut {
+  // Only the bridge's own status envelope maps; tracebacks and paths never reach the client.
+  const status = envelope && code === 1 && typeof envelope.status === "number" && envelope.status in SOURCE_ERRORS ? envelope.status : 502;
+  return { status, body: { error: SOURCE_ERRORS[status] } };
+}
+
+function sessionBridgeFailure(error: unknown, envelope: FailureEnvelope | null): BridgeOut {
+  if (envelope) return { status: error instanceof Error && "code" in error && error.code === 1 ? 404 : 502, body: { error: envelope.error } };
+  const message = error instanceof Error ? error.message : "research read failed";
+  return { status: 502, body: { error: `bridge execution failed: ${message.slice(0, 200)}` } };
+}
+
+function bridgeFailure(error: unknown, isSource: boolean): BridgeOut {
+  const output = error instanceof Error && "stdout" in error && typeof error.stdout === "string" ? error.stdout : "";
+  const envelope = readFailureEnvelope(output);
+  if (!isSource) return sessionBridgeFailure(error, envelope);
+  return sourceBridgeFailure(envelope, error instanceof Error && "code" in error ? error.code : undefined);
+}
+
+function bridgeSuccess(stdout: string, isSource: boolean): BridgeOut {
+  try {
+    const raw: unknown = JSON.parse(stdout || "{}");
+    if (!raw || typeof raw !== "object" || !("data" in raw)) {
+      return { status: 502, body: { error: isSource ? SOURCE_ERRORS[502] : "research bridge bad shape" } };
+    }
+    return { status: 200, body: raw.data };
+  } catch {
+    return { status: 502, body: { error: isSource ? SOURCE_ERRORS[502] : "research bridge bad json" } };
+  }
+}
+
 async function runBridge(payload: Record<string, unknown>): Promise<BridgeOut> {
   const py = join(ROOT, "venv/bin/python");
   const isSource = payload.kind === "source" || payload.kind === "source_pdf";
@@ -79,40 +124,12 @@ except Exception as e:
       maxBuffer: Infinity,
     }));
   } catch (error: unknown) {
-    const output = error instanceof Error && "stdout" in error && typeof error.stdout === "string" ? error.stdout : "";
-    const code = error instanceof Error && "code" in error ? error.code : undefined;
-    try {
-      const raw: unknown = JSON.parse(output);
-      if (raw && typeof raw === "object" && "ok" in raw && raw.ok === false && "error" in raw && typeof raw.error === "string") {
-        if (isSource) {
-          // Only the bridge's own status envelope maps; tracebacks and paths never reach the client.
-          const status = code === 1 && "status" in raw && typeof raw.status === "number" && raw.status in SOURCE_ERRORS ? raw.status : 502;
-          return { status, body: { error: SOURCE_ERRORS[status] } };
-        }
-        return { status: code === 1 ? 404 : 502, body: { error: raw.error } };
-      }
-    } catch {
-      // Execution failures can omit the bridge envelope.
-    }
-    if (isSource) return { status: 502, body: { error: SOURCE_ERRORS[502] } };
-    const message = error instanceof Error ? error.message : "research read failed";
-    return { status: 502, body: { error: `bridge execution failed: ${message.slice(0, 200)}` } };
+    return bridgeFailure(error, isSource);
   }
-  try {
-    const raw: unknown = JSON.parse(stdout || "{}");
-    if (!raw || typeof raw !== "object" || !("data" in raw)) {
-      return { status: 502, body: { error: isSource ? SOURCE_ERRORS[502] : "research bridge bad shape" } };
-    }
-    return { status: 200, body: raw.data };
-  } catch {
-    return { status: 502, body: { error: isSource ? SOURCE_ERRORS[502] : "research bridge bad json" } };
-  }
+  return bridgeSuccess(stdout, isSource);
 }
 
-async function readSource(pathname: string): Promise<Response> {
-  const headers = { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" };
-  // /api/research/sources/:id | /api/research/sources/:id/pdf (raw split keeps empty segments visible)
-  const parts = pathname.split("/");
+function sourceIdFromPath(parts: string[], headers: Record<string, string>): string | Response {
   if ((parts.length !== 5 && parts.length !== 6) || (parts.length === 6 && parts[5] !== "pdf")) {
     return Response.json({ error: "unknown source path" }, { status: 404, headers });
   }
@@ -125,10 +142,22 @@ async function readSource(pathname: string): Promise<Response> {
   if (/^(?:capture:[a-f0-9]{64}|evidence:[A-Za-z0-9:_-]{1,256})$/.exec(sourceId)?.[0] !== sourceId) {
     return Response.json({ error: "bad source_id" }, { status: 400, headers });
   }
+  return sourceId;
+}
+
+async function readSource(pathname: string): Promise<Response> {
+  const headers = { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" };
+  // /api/research/sources/:id | /api/research/sources/:id/pdf (raw split keeps empty segments visible)
+  const parts = pathname.split("/");
+  const sourceId = sourceIdFromPath(parts, headers);
+  if (sourceId instanceof Response) return sourceId;
   const isPdf = parts.length === 6;
   const r = await runBridge({ kind: isPdf ? "source_pdf" : "source", source_id: sourceId });
   if (!isPdf || r.status !== 200) return Response.json(r.body, { status: r.status, headers });
-  const body = r.body;
+  return sourcePdfResponse(r.body, headers);
+}
+
+function sourcePdfResponse(body: unknown, headers: Record<string, string>): Response {
   if (
     !body ||
     typeof body !== "object" ||
@@ -142,18 +171,29 @@ async function readSource(pathname: string): Promise<Response> {
   return new Response(Buffer.from(body.pdf_base64, "base64"), { headers: { ...headers, "Content-Type": "application/pdf" } });
 }
 
-export async function GET(req: Request): Promise<Response> {
-  const u = new URL(req.url);
-  const parts = u.pathname.split("/").filter(Boolean);
-  if (parts[2] === "sources") return readSource(u.pathname);
-  // /api/research/sessions | /api/research/:id | /api/research/:id/journal
-  if (parts.length === 3 && parts[2] === "sessions") {
-    const limitRaw = u.searchParams.get("limit") ?? "20";
-    const parsed = Number.parseInt(limitRaw, 10);
-    const limit = Number.isFinite(parsed) ? Math.min(100, Math.max(1, parsed)) : 20;
-    const r = await runBridge({ kind: "sessions", limit });
-    return Response.json(r.body, { status: r.status, headers: { "Cache-Control": "no-store" } });
+async function readResearch(payload: Record<string, unknown>): Promise<Response> {
+  const r = await runBridge(payload);
+  return Response.json(r.body, { status: r.status, headers: { "Cache-Control": "no-store" } });
+}
+
+function readSessions(params: URLSearchParams): Promise<Response> {
+  const limitRaw = params.get("limit") ?? "20";
+  const parsed = Number.parseInt(limitRaw, 10);
+  const limit = Number.isFinite(parsed) ? Math.min(100, Math.max(1, parsed)) : 20;
+  return readResearch({ kind: "sessions", limit });
+}
+
+function sessionPayload(sessionId: string, u: URL, parts: string[]): Record<string, unknown> | undefined {
+  if (parts.length === 4 && parts[3] === "journal") {
+    const afterRaw = u.searchParams.get("after_seq") ?? u.searchParams.get("after") ?? "0";
+    const parsed = Number.parseInt(afterRaw, 10);
+    const afterSeq = Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+    return { kind: "journal", session_id: sessionId, after_seq: afterSeq };
   }
+  if (parts.length === 3) return { kind: "snapshot", session_id: sessionId };
+}
+
+async function readSession(u: URL, parts: string[]): Promise<Response> {
   let sessionId: string;
   try {
     sessionId = decodeURIComponent(parts[2] ?? "");
@@ -163,16 +203,16 @@ export async function GET(req: Request): Promise<Response> {
   if (!/^[A-Za-z0-9:_-]{1,128}$/.test(sessionId)) {
     return Response.json({ error: "bad session_id" }, { status: 400 });
   }
-  if (parts.length === 4 && parts[3] === "journal") {
-    const afterRaw = u.searchParams.get("after_seq") ?? u.searchParams.get("after") ?? "0";
-    const parsed = Number.parseInt(afterRaw, 10);
-    const afterSeq = Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
-    const r = await runBridge({ kind: "journal", session_id: sessionId, after_seq: afterSeq });
-    return Response.json(r.body, { status: r.status, headers: { "Cache-Control": "no-store" } });
-  }
-  if (parts.length === 3) {
-    const r = await runBridge({ kind: "snapshot", session_id: sessionId });
-    return Response.json(r.body, { status: r.status, headers: { "Cache-Control": "no-store" } });
-  }
+  const payload = sessionPayload(sessionId, u, parts);
+  if (payload) return readResearch(payload);
   return Response.json({ error: "unknown research path" }, { status: 404 });
+}
+
+export async function GET(req: Request): Promise<Response> {
+  const u = new URL(req.url);
+  const parts = u.pathname.split("/").filter(Boolean);
+  if (parts[2] === "sources") return readSource(u.pathname);
+  // /api/research/sessions | /api/research/:id | /api/research/:id/journal
+  if (parts.length === 3 && parts[2] === "sessions") return readSessions(u.searchParams);
+  return readSession(u, parts);
 }
