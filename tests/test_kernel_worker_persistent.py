@@ -955,15 +955,39 @@ def test_signal_inside_spawn_window_reaps_new_child(tmp_path: Path, gate: str, s
         _assert_tree_gone(child)
 
 
-def test_caller_pipe_eof_during_startup_exits_and_reaps(tmp_path: Path) -> None:
-    """An empty caller hangup during startup ends startup, even while it waits under the Needle lock."""
-    with _kernel_child(tmp_path, KW_TEST_HOLD="needle") as child:
-        _await_event(child, "needle-ping")
+@pytest.mark.parametrize("provider", ["bun", "needle"])
+def test_caller_pipe_eof_during_startup_exits_and_reaps(tmp_path: Path, provider: str) -> None:
+    """Caller EOF cancels a pending provider handshake and reaps every owned process."""
+    with _kernel_child(tmp_path, KW_TEST_HOLD=provider) as child:
+        _await_event(child, f"{provider}-ping")
         assert child.proc.stdin is not None
         child.proc.stdin.close()
         rows, err = _finish(child)
         assert child.proc.returncode == 128 + signal.SIGTERM, err
         assert rows == []
+        _assert_tree_gone(child)
+
+
+def test_connected_caller_reaches_ready_and_closes_cleanly(tmp_path: Path) -> None:
+    """A connected caller completes startup, receives an answer, and closes without cancellation."""
+    with _kernel_child(tmp_path, KW_TEST_HOLD="needle") as child:
+        _await_event(child, "needle-ping")
+        assert child.proc.stdin is not None
+        assert child.proc.stdout is not None
+        assert child.proc.poll() is None
+        os.write(child.release, b"go\n")
+        assert select.select([child.proc.stdout], [], [], _WAIT_S)[0], "worker did not become ready"
+        assert json.loads(child.proc.stdout.readline()) == {"type": "ready"}
+        assert child.proc.poll() is None
+        child.proc.stdin.write(json.dumps({"id": "connected", "op": "nope"}).encode() + b"\n")
+        child.proc.stdin.close()
+        rows, err = _finish(child)
+        assert child.proc.returncode == 0, err
+        assert len(rows) == 1
+        assert rows[0]["id"] == "connected"
+        terminal = rows[0]["terminal"]
+        assert isinstance(terminal, dict)
+        assert terminal["category"] == "invalid_params"
         _assert_tree_gone(child)
 
 
