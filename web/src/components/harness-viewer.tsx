@@ -218,6 +218,42 @@ function NamedList({ title, items }: { title: string; items: string[] }) {
   );
 }
 
+function FinalNarrative({ final }: { final: NonNullable<Run["finalResult"]> }) {
+  return (<>
+    <p>{final.answer || "No answer persisted."}</p>
+    {final.executiveSummary !== "" && final.executiveSummary !== final.answer ? (
+      <p>Bottom line: {final.executiveSummary}</p>
+    ) : null}
+    {final.consensus !== "" ? <p>Consensus: {final.consensus}</p> : null}
+    {final.baseCase !== "" ? <p>Base case: {final.baseCase}</p> : null}
+    {final.bullCase !== "" ? <p>Bull case: {final.bullCase}</p> : null}
+    {final.bearCase !== "" ? <p>Bear case: {final.bearCase}</p> : null}
+  </>);
+}
+
+function FinalClaims({ claims, frozen }: { claims: NonNullable<Run["finalResult"]>["claims"]; frozen: string[] }) {
+  return claims.length === 0 ? <p>No validated claims.</p> : (
+    <>
+      <h3>Claims</h3>
+      <ul>
+        {claims.map((claim, index) => (
+          <li key={index}>
+            {claim.text} [
+            {claim.evidenceIds.map((eid, inner) => (
+              <span key={eid}>
+                {inner > 0 ? ", " : ""}
+                <a href={`freeze://${eid}`}>{eid}</a>
+                {frozen.includes(eid) ? "" : " (outside freeze)"}
+              </span>
+            ))}
+            ]
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
+
 function FinalSection({ run }: { run: Run }) {
   const final = run.finalResult ?? null;
   if (final === null) {
@@ -232,41 +268,13 @@ function FinalSection({ run }: { run: Run }) {
   return (
     <>
       <h2>Final</h2>
-      <p>{final.answer || "No answer persisted."}</p>
-      {final.executiveSummary !== "" && final.executiveSummary !== final.answer ? (
-        <p>Bottom line: {final.executiveSummary}</p>
-      ) : null}
-      {final.consensus !== "" ? <p>Consensus: {final.consensus}</p> : null}
-      {final.baseCase !== "" ? <p>Base case: {final.baseCase}</p> : null}
-      {final.bullCase !== "" ? <p>Bull case: {final.bullCase}</p> : null}
-      {final.bearCase !== "" ? <p>Bear case: {final.bearCase}</p> : null}
+      <FinalNarrative final={final} />
       <NamedList title="Positioning" items={final.positioning} />
       <NamedList title="Catalysts" items={final.catalysts} />
       <NamedList title="Uncertainties" items={final.uncertainties} />
       <NamedList title="What changes the view" items={final.whatChangesTheView} />
       <NamedList title="Limitations" items={final.limitations} />
-      {final.claims.length === 0 ? (
-        <p>No validated claims.</p>
-      ) : (
-        <>
-          <h3>Claims</h3>
-          <ul>
-            {final.claims.map((claim, index) => (
-              <li key={index}>
-                {claim.text} [
-                {claim.evidenceIds.map((eid, inner) => (
-                  <span key={eid}>
-                    {inner > 0 ? ", " : ""}
-                    <a href={`freeze://${eid}`}>{eid}</a>
-                    {frozen.includes(eid) ? "" : " (outside freeze)"}
-                  </span>
-                ))}
-                ]
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
+      <FinalClaims claims={final.claims} frozen={frozen} />
       {final.sources.length === 0 ? null : (
         <>
           <h3>Sources</h3>

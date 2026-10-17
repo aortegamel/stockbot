@@ -57,35 +57,42 @@ function renderedQuote(quote: string): string {
 
 type PaintedQuote = { resolution: QuoteResolution; quote: string };
 
+function resolveRenderedQuote(text: string, current: SourceDocument, location: SourceDocument["location"]): PaintedQuote {
+  let chosen: PaintedQuote = { resolution: resolveQuote(text, current.quote, location), quote: current.quote };
+  // A literal match, even an ambiguous one, wins. Literal angle brackets never select a projected passage.
+  if (chosen.resolution.status === "unresolved" && current.representation === "html" && (current.captureKind === "provider_extraction" || current.captureKind === "search_excerpt")) {
+    const projected = renderedQuote(current.quote);
+    const resolution = resolveQuote(text, projected, location);
+    if (resolution.status !== "unresolved") chosen = { resolution, quote: projected };
+  }
+  return chosen;
+}
+
+function paintSource(root: HTMLDivElement, current: SourceDocument): PaintedQuote & { marks: HTMLElement[] } {
+  root.replaceChildren();
+  if (current.representation === "html" && current.matchingText !== undefined) {
+    const map = mapSourceHtml(root, window as unknown as WindowLike, current.content ?? "");
+    const highlighted = highlightMappedQuote(root, map, current);
+    return { ...highlighted, quote: current.quote };
+  }
+  renderSourceText(root, current);
+  const location = current.representation === "html" && current.location?.basis === "raw"
+    ? { prefix: current.location.prefix, suffix: current.location.suffix }
+    : current.location;
+  const chosen = resolveRenderedQuote(root.textContent ?? "", current, location);
+  const found = chosen.resolution;
+  return { ...chosen, marks: found.status === "resolved" ? markQuote(root, found.start, found.end) : [] };
+}
+
 function useSourceHighlight(content: React.RefObject<HTMLDivElement | null>, source: SourceDocument | null): { painted: PaintedQuote | null; marks: React.RefObject<HTMLElement[]> } {
   const marks = useRef<HTMLElement[]>([]);
   const [painted, setPainted] = useState<PaintedQuote | null>(null);
 
   const paint = (root: HTMLDivElement, current: SourceDocument): PaintedQuote => {
-    root.replaceChildren();
-    if (current.representation === "html" && current.matchingText !== undefined) {
-      const map = mapSourceHtml(root, window as unknown as WindowLike, current.content ?? "");
-      const highlighted = highlightMappedQuote(root, map, current);
-      marks.current = highlighted.marks;
-      if (marks.current.length) activateQuote(root, marks.current);
-      return { resolution: highlighted.resolution, quote: current.quote };
-    }
-    renderSourceText(root, current);
-    const location = current.representation === "html" && current.location?.basis === "raw"
-      ? { prefix: current.location.prefix, suffix: current.location.suffix }
-      : current.location;
-    const text = root.textContent ?? "";
-    let chosen: PaintedQuote = { resolution: resolveQuote(text, current.quote, location), quote: current.quote };
-    // A literal match, even an ambiguous one, wins. Literal angle brackets then never select a projected passage.
-    if (chosen.resolution.status === "unresolved" && current.representation === "html" && (current.captureKind === "provider_extraction" || current.captureKind === "search_excerpt")) {
-      const projected = renderedQuote(current.quote);
-      const resolution = resolveQuote(text, projected, location);
-      if (resolution.status !== "unresolved") chosen = { resolution, quote: projected };
-    }
-    const found = chosen.resolution;
-    marks.current = found.status === "resolved" ? markQuote(root, found.start, found.end) : [];
-    if (marks.current.length) activateQuote(root, marks.current);
-    return chosen;
+    const { marks: found, resolution, quote } = paintSource(root, current);
+    marks.current = found;
+    if (found.length) activateQuote(root, found);
+    return { resolution, quote };
   };
 
   useEffect(() => {
@@ -122,6 +129,30 @@ function SourceQuote({ quote, resolution }: { quote: string; resolution: QuoteRe
 }
 
 
+function CapturedSource({ source, painted, pdfResolution, content, marks, onPdfResolve }: {
+  source: SourceDocument;
+  painted: PaintedQuote | null;
+  pdfResolution: QuoteResolution | null;
+  content: React.RefObject<HTMLDivElement | null>;
+  marks: React.RefObject<HTMLElement[]>;
+  onPdfResolve: React.Dispatch<React.SetStateAction<QuoteResolution | null>>;
+}) {
+  const status = source.representation === "pdf" ? pdfResolution : painted?.resolution ?? null;
+  // Display and Open original use the quote that the passage resolved against. PDF never paints here.
+  const quote = painted?.quote ?? source.quote ?? "";
+  const original = originalSourceUrl({ ...source, quote }, status?.status === "resolved");
+  return (<>
+    <SourceHeader source={source} />
+    {original && <a className="mt-2 inline-block text-blue-300 underline" href={original} target="_blank" rel="noopener noreferrer">Open original</a>}
+    <SourceQuote quote={quote} resolution={status} />
+    {status?.status === "resolved" && source.representation !== "pdf" && <button type="button" className="source-control mb-2" onClick={() => {
+      if (content.current) activateQuote(content.current, marks.current);
+    }}>Go to quote</button>}
+    {source.representation === "pdf" ? <Suspense fallback={<p role="status">Loading the PDF renderer…</p>}><SourcePdf source={source} onResolve={onPdfResolve} /></Suspense> : <div ref={content} aria-label="Captured source content" className={`max-h-[65vh] overflow-auto rounded bg-white p-4 text-sm text-zinc-900 ${source.representation === "html" ? "source-html" : "whitespace-pre-wrap font-mono"}`} />}
+    <p className="mt-2 text-xs text-zinc-400">This pane shows the immutable capture. The original link can show a newer document.</p>
+  </>);
+}
+
 export function SourcePanel({ reference, position, count, onNavigate, onClose }: {
   reference: SourceReference;
   position: number;
@@ -135,15 +166,11 @@ export function SourcePanel({ reference, position, count, onNavigate, onClose }:
   const { source, error } = useSourceDocument(reference, retry);
   const { painted, marks } = useSourceHighlight(content, source);
   const [pdfResolution, setPdfResolution] = useState<QuoteResolution | null>(null);
-  const status = source?.representation === "pdf" ? pdfResolution : painted?.resolution ?? null;
-  // Display and Open original use the quote that the passage resolved against. PDF never paints here.
-  const quote = painted?.quote ?? source?.quote ?? "";
 
   useEffect(() => {
     panel.current?.focus();
   }, [reference.id, retry]);
 
-  const original = source ? originalSourceUrl({ ...source, quote }, status?.status === "resolved") : undefined;
   return (
     <aside ref={panel} tabIndex={-1} aria-label="Captured source" className="source-panel mt-4 rounded border border-zinc-600 bg-zinc-950 p-3 outline-none focus-visible:ring-2 focus-visible:ring-blue-400" onKeyDown={(event) => {
       if (event.key === "Escape") { event.preventDefault(); onClose(); }
@@ -157,16 +184,7 @@ export function SourcePanel({ reference, position, count, onNavigate, onClose }:
       </div>
       {!source && !error && <p role="status" className="py-3">Loading captured source…</p>}
       {error && <div role="alert" className="py-3 text-red-300"><p>{error}</p><button type="button" className="source-control mt-2" onClick={() => setRetry((value) => value + 1)}>Retry source</button></div>}
-      {source && <>
-        <SourceHeader source={source} />
-        {original && <a className="mt-2 inline-block text-blue-300 underline" href={original} target="_blank" rel="noopener noreferrer">Open original</a>}
-        <SourceQuote quote={quote} resolution={status} />
-        {status?.status === "resolved" && source.representation !== "pdf" && <button type="button" className="source-control mb-2" onClick={() => {
-          if (content.current) activateQuote(content.current, marks.current);
-        }}>Go to quote</button>}
-        {source.representation === "pdf" ? <Suspense fallback={<p role="status">Loading the PDF renderer…</p>}><SourcePdf source={source} onResolve={setPdfResolution} /></Suspense> : <div ref={content} aria-label="Captured source content" className={`max-h-[65vh] overflow-auto rounded bg-white p-4 text-sm text-zinc-900 ${source.representation === "html" ? "source-html" : "whitespace-pre-wrap font-mono"}`} />}
-        <p className="mt-2 text-xs text-zinc-400">This pane shows the immutable capture. The original link can show a newer document.</p>
-      </>}
+      {source && <CapturedSource source={source} painted={painted} pdfResolution={pdfResolution} content={content} marks={marks} onPdfResolve={setPdfResolution} />}
     </aside>
   );
 }

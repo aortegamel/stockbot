@@ -58,10 +58,6 @@ export default function TradingChart({ sym }: { sym: string }) {
     setFailed(false);
   }, [src]);
 
-  useEffect(() => {
-    setFailed(false);
-  }, [src]);
-
   const bdr = "rgba(255,255,255,0.12)";
 
   if (!symbol) {

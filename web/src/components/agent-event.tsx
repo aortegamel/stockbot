@@ -4,25 +4,27 @@ function conf(c: number | null): string {
   return c === null ? "n/a" : `${Math.round(c * 100)}%`;
 }
 
-export function AgentEventView({ event }: { event: AgentEvent }) {
-  switch (event.type) {
-    case "agent_start":
-      return <div className="text-zinc-100">&gt; {event.prompt}</div>;
-    case "needle_decision":
-      return (
-        <div>
-          <span className="rounded border border-green-900 px-1 text-[10px] text-green-500">NEEDLE/LOCAL</span>{" "}
-          <span style={{ color: "#4ade80" }}>
-            ● needle / {event.tool ?? "(escalate)"}
-            {event.tool ? ` / confidence ${conf(event.confidence)}` : ""}
-          </span>
-          {event.tool && (
-            <div className="pl-4 text-zinc-500">
-              ├─ {event.tool}({JSON.stringify(redactArgs(event.arguments))})
-            </div>
-          )}
+function NeedleDecisionView({ event }: { event: Extract<AgentEvent, { type: "needle_decision" }> }) {
+  return (
+    <div>
+      <span className="rounded border border-green-900 px-1 text-[10px] text-green-500">NEEDLE/LOCAL</span>{" "}
+      <span style={{ color: "#4ade80" }}>
+        ● needle / {event.tool ?? "(escalate)"}
+        {event.tool ? ` / confidence ${conf(event.confidence)}` : ""}
+      </span>
+      {event.tool && (
+        <div className="pl-4 text-zinc-500">
+          ├─ {event.tool}({JSON.stringify(redactArgs(event.arguments))})
         </div>
-      );
+      )}
+    </div>
+  );
+}
+
+function WorkEventView({ event }: { event: AgentEvent }) {
+  switch (event.type) {
+    case "needle_decision":
+      return <NeedleDecisionView event={event} />;
     case "tool_start":
       return <div className="pl-4 text-zinc-500">├─ {event.tool}…</div>;
     case "tool_result":
@@ -35,6 +37,15 @@ export function AgentEventView({ event }: { event: AgentEvent }) {
       const detail = event.detail !== undefined ? ` ${JSON.stringify(event.detail).slice(0, 160)}` : "";
       return <div className="pl-4 text-zinc-500">├─ {event.stage}{detail}</div>;
     }
+    case "tool_failed":
+      return <div className="pl-4 text-zinc-500">├─ {event.tool} / ✗ {event.category} — {event.preview}</div>;
+  }
+}
+
+export function AgentEventView({ event }: { event: AgentEvent }) {
+  switch (event.type) {
+    case "agent_start":
+      return <div className="text-zinc-100">&gt; {event.prompt}</div>;
     case "reasoning_start":
       return (
         <div>
@@ -63,9 +74,9 @@ export function AgentEventView({ event }: { event: AgentEvent }) {
     }
     case "error":
       return <div className="text-red-400">✗ {event.message}</div>;
-    case "tool_failed":
-      return <div className="pl-4 text-zinc-500">├─ {event.tool} / ✗ {event.category} — {event.preview}</div>;
     case "failed":
       return <div className="text-red-400">✗ {event.category}: {event.message}</div>;
+    default:
+      return <WorkEventView event={event} />;
   }
 }

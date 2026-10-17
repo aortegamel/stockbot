@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { fetchSourceDocument } from "./research-client";
+import { fetchJournal, fetchSnapshot, fetchSourceDocument, listSessions } from "./research-client";
 import type { SourceDocument } from "./research-client";
 
 const originalFetch = globalThis.fetch;
@@ -138,5 +138,64 @@ describe("fetchSourceDocument", () => {
   test("reports the HTTP status when a server error has no message", async () => {
     respond({ error: 42 }, 503);
     await expect(fetchSourceDocument(id)).rejects.toThrow("503");
+  });
+
+  test("reports validation failures in a fixed order with their own messages", async () => {
+    const cases: [unknown, string][] = [
+      [{ ...document(), id: "other", url: 42, location: null }, "The source response is invalid."],
+      [{ ...document(), url: 42, location: null }, "The source metadata is invalid."],
+      [{ ...document(), content: undefined, location: null }, "The captured source content is missing."],
+      [{ ...document(), location: null }, "The source location is invalid."],
+      [{ ...document(), representation: "pdf", captureKind: "provider_extraction", content: undefined, location: null }, "The PDF does not identify an original capture."],
+    ];
+    for (const [body, message] of cases) {
+      respond(body);
+      await expect(fetchSourceDocument(id)).rejects.toThrow(message);
+    }
+    respond({ error: 42 }, 503);
+    await expect(fetchSourceDocument(id)).rejects.toThrow("Source request failed (503).");
+  });
+});
+
+describe("research reads", () => {
+  const urls: string[] = [];
+  function capture(body: unknown, status = 200): void {
+    const fetchState = globalThis as { fetch?: typeof fetch };
+    fetchState.fetch = ((input: string | URL | Request) => {
+      urls.push(String(input));
+      return Promise.resolve(new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } }));
+    }) as unknown as typeof fetch;
+  }
+
+  afterEach(() => {
+    urls.length = 0;
+  });
+
+  test("reads a snapshot, a journal tail, and a bounded session list from their own endpoints", async () => {
+    capture({ session: { session_id: "rs:1" }, jobs: [] });
+    expect(await fetchSnapshot("rs:1")).toEqual({ session: { session_id: "rs:1" }, jobs: [] });
+    capture({ session_id: "rs:1", after_seq: 7, events: [{ sequence: 8, event_type: "source_agent" }] });
+    expect(await fetchJournal("rs:1", 7)).toEqual({ session_id: "rs:1", after_seq: 7, events: [{ sequence: 8, event_type: "source_agent" }] });
+    capture({ sessions: [{ session_id: "rs:1" }] });
+    expect(await listSessions(5)).toEqual({ sessions: [{ session_id: "rs:1" }] });
+    capture({ sessions: [] });
+    expect(await listSessions()).toEqual({ sessions: [] });
+    expect(urls).toEqual([
+      "/api/research/rs%3A1",
+      "/api/research/rs%3A1/journal?after_seq=7",
+      "/api/research/sessions?limit=5",
+      "/api/research/sessions?limit=20",
+    ]);
+  });
+
+  test("surfaces the server message for a failed read before the generic status text", async () => {
+    capture({ error: "unknown session: 'rs:9'" }, 404);
+    await expect(fetchSnapshot("rs:9")).rejects.toThrow("unknown session: 'rs:9'");
+    capture({ after_seq: 0, error: 42 }, 500);
+    await expect(fetchJournal("rs:9", 0)).rejects.toThrow("journal 500");
+    capture({}, 503);
+    await expect(listSessions(3)).rejects.toThrow("sessions 503");
+    capture({}, 502);
+    await expect(fetchSnapshot("rs:9")).rejects.toThrow("snapshot 502");
   });
 });

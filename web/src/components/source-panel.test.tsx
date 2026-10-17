@@ -216,6 +216,47 @@ describe("SourcePanel", () => {
     expect(root.querySelector('[aria-label="Captured source content"]')?.textContent).toBe("RevenueRevenue");
   });
 
+  test("names missing capture metadata and renders a capture with no quote", async () => {
+    const sparse: SourceDocument = {
+      id: "evidence:panel:sparse",
+      title: "Notice",
+      representation: "text",
+      captureKind: "structured_record",
+      content: "No citation text captured.",
+      quote: "",
+    };
+    const root = await open(sparse);
+    expect([...root.querySelectorAll("dl dd")].map((cell) => cell.textContent)).toEqual(["Not recorded", "Not recorded", "Not recorded", "Not recorded", "text"]);
+    expect(root.textContent).toContain("Structured record");
+    expect(root.querySelector("blockquote")).toBeNull();
+    expect(root.querySelector("mark")).toBeNull();
+    expect(root.querySelector('a[href^="https://"]')).toBeNull();
+    expect(root.textContent).toContain("The quote does not resolve in the rendered source. No passage is selected.");
+  });
+
+  test("a raw-basis location never selects through rendered coordinates", async () => {
+    const content = "<p>Revenue grew in Q1.</p><p>Revenue grew in Q2.</p>";
+    const byContext: SourceDocument = {
+      ...TEXT,
+      id: "evidence:panel:raw-basis",
+      representation: "html",
+      content,
+      quote: "Revenue grew in Q1.",
+      location: { offset: 0, end: 19, basis: "raw", prefix: "Q9." },
+    };
+    const rejected = await open(byContext);
+    expect(rejected.textContent).toContain("The quote does not resolve in the rendered source. No passage is selected.");
+    expect(rejected.querySelector("mark")).toBeNull();
+    expect(rejected.querySelector('[aria-label="Captured source content"]')?.textContent).toBe("Revenue grew in Q1.Revenue grew in Q2.");
+    await close();
+
+    const rendered: SourceDocument = { ...byContext, id: "evidence:panel:rendered-basis", location: { offset: 0, end: 19, basis: "rendered" } };
+    const selected = await open(rendered);
+    expect(selected.textContent).toContain("The quote matches the captured source.");
+    expect([...selected.querySelectorAll("mark")].map((mark) => mark.textContent)).toEqual(["Revenue grew in Q1."]);
+    expect(originalHref(selected)).toBe("https://www.sec.gov/filing#:~:text=Revenue%20grew%20in%20Q1.");
+  });
+
   test("projects an Exa HTML quote to rendered text for the marks, the display, and the original link", async () => {
     const requests = serve({ body: EXA });
     const root = await mount(panel(EXA.id));

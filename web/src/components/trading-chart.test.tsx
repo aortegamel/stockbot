@@ -143,4 +143,87 @@ describe("TradingChart", () => {
     await click(control(empty, "Retry chart"));
     await until(() => frame(empty) !== null);
   });
+
+  test("a detached frame cannot fail the current chart after a symbol or interval replacement", async () => {
+    const root = await mount(<TradingChart sym="NVDA" />);
+    await until(() => frame(root) !== null);
+    const bySymbol = frame(root);
+    if (!bySymbol) throw new Error("missing symbol frame");
+    await rerender(<TradingChart sym="AAPL" />);
+    await until(() => (frame(root)?.src ?? "").includes("symbol=AAPL"));
+    expect(bySymbol.isConnected).toBe(false);
+    expect(frame(root)).not.toBe(bySymbol);
+    await act(async () => {
+      bySymbol.dispatchEvent(new dom.window.Event("error"));
+    });
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+    expect((frame(root)?.src ?? "").includes("symbol=AAPL")).toBe(true);
+
+    const byInterval = frame(root);
+    if (!byInterval) throw new Error("missing interval frame");
+    await click(control(root, "1H"));
+    await until(() => (frame(root)?.src ?? "").includes("interval=60"));
+    expect(byInterval.isConnected).toBe(false);
+    await act(async () => {
+      byInterval.dispatchEvent(new dom.window.Event("error"));
+    });
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+    expect((frame(root)?.src ?? "").includes("interval=60")).toBe(true);
+  });
+
+  test("a widget failure clears when the symbol changes", async () => {
+    const root = await mount(<TradingChart sym="NVDA" />);
+    await until(() => frame(root) !== null);
+    await act(async () => {
+      frame(root)?.dispatchEvent(new dom.window.Event("error"));
+    });
+    await until(() => root.querySelector('[role="alert"]')?.textContent?.includes("unavailable for NVDA") ?? false);
+    await rerender(<TradingChart sym="AAPL" />);
+    await until(() => (frame(root)?.src ?? "").includes("symbol=AAPL"));
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  test("a frame error after remount fails the remounted chart, not the old frame", async () => {
+    const root = await mount(<TradingChart sym="NVDA" />);
+    await until(() => frame(root) !== null);
+    const beforeUnmount = frame(root);
+    if (!beforeUnmount) throw new Error("missing pre-unmount frame");
+    await act(async () => mounted?.unmount());
+    mounted = null;
+    expect(beforeUnmount.isConnected).toBe(false);
+    await act(async () => {
+      beforeUnmount.dispatchEvent(new dom.window.Event("error"));
+    });
+    const remounted = await mount(<TradingChart sym="NVDA" />);
+    await until(() => frame(remounted) !== null);
+    expect(remounted.querySelector('[role="alert"]')).toBeNull();
+    await act(async () => {
+      frame(remounted)?.dispatchEvent(new dom.window.Event("error"));
+    });
+    await until(() => remounted.querySelector('[role="alert"]')?.textContent?.includes("unavailable for NVDA") ?? false);
+    expect(frame(remounted)).toBeNull();
+  });
+
+  test("the offline alert takes precedence over a widget failure and the online chart recovers", async () => {
+    const root = await mount(<TradingChart sym="NVDA" />);
+    await until(() => frame(root) !== null);
+    await act(async () => {
+      frame(root)?.dispatchEvent(new dom.window.Event("error"));
+    });
+    await until(() => root.querySelector('[role="alert"]')?.textContent?.includes("unavailable for NVDA") ?? false);
+    onlineValue = false;
+    await act(async () => {
+      dom.window.dispatchEvent(new dom.window.Event("offline"));
+    });
+    expect(root.querySelector('[role="alert"]')?.textContent).toContain("you are offline");
+    expect(frame(root)).toBeNull();
+    onlineValue = true;
+    await act(async () => {
+      dom.window.dispatchEvent(new dom.window.Event("online"));
+    });
+    await until(() => root.querySelector('[role="alert"]')?.textContent?.includes("unavailable for NVDA") ?? false);
+    await click(control(root, "Retry chart"));
+    await until(() => frame(root) !== null);
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+  });
 });

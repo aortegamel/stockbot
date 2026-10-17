@@ -26,12 +26,29 @@ function evidenceById(events: AgentEvent[]): Map<string, Evidence> {
   return new Map(evidence.map((entry) => [entry.id, entry]));
 }
 
+type SourceSelection = { evidenceId: string; position: number } | null;
+
+function SelectedSource({
+  selected,
+  known,
+  setSelected,
+}: {
+  selected: SourceSelection;
+  known: Map<string, Evidence>;
+  setSelected: React.Dispatch<React.SetStateAction<SourceSelection>>;
+}) {
+  if (!selected) return null;
+  const sources = known.get(selected.evidenceId)?.sources || [];
+  if (sources.length === 0) return null;
+  const position = selected.position % sources.length;
+  return <SourcePanel key={sources[position].id} reference={sources[position]} position={position} count={sources.length} onNavigate={(direction) => setSelected((current) => current && { evidenceId: current.evidenceId, position: (current.position + direction + sources.length) % sources.length })} onClose={() => setSelected(null)} />;
+}
+
 // ponytail: selection keeps evidence id + index so follow-up merges refresh the panel instead of a stale snapshot.
 export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[]; reasoning: boolean; debug: boolean }) {
-  const [selected, setSelected] = useState<{ evidenceId: string; position: number } | null>(null);
+  const [selected, setSelected] = useState<SourceSelection>(null);
   const known = evidenceById(events);
   const sourceControls = [...known.values()].filter((entry) => entry.sources?.length);
-  const sources = (selected && known.get(selected.evidenceId)?.sources) || [];
   if (events.length === 0) {
     return (
       <div className="flex-1 space-y-3 overflow-y-auto px-4 py-4 text-sm">
@@ -63,7 +80,6 @@ export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[
   );
   const tail = visible.filter((e) => e.type === "done" || e.type === "error" || e.type === "failed");
   const streaming = reasoning && tail.length === 0;
-  const position = selected && sources.length ? selected.position % sources.length : 0;
   return (
     <div className="flex-1 space-y-2 overflow-y-auto px-4 py-4 text-sm">
       {head.map((e, i) => (
@@ -83,7 +99,7 @@ export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[
           </button>
         ))}
       </div>}
-      {selected && sources.length > 0 && <SourcePanel key={sources[position].id} reference={sources[position]} position={position} count={sources.length} onNavigate={(direction) => setSelected((current) => current && { evidenceId: current.evidenceId, position: (current.position + direction + sources.length) % sources.length })} onClose={() => setSelected(null)} />}
+      <SelectedSource selected={selected} known={known} setSelected={setSelected} />
       {tail.map((e, i) => (
         <AgentEventView key={`tail-${i}`} event={e} />
       ))}

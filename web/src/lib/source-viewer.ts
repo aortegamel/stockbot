@@ -106,11 +106,17 @@ export function sanitizeSourceHtml(sourceWindow: WindowLike, html: string): Docu
   });
 }
 
+// A link is safe only when the viewer could fetch it directly: web scheme, host present, no credentials.
+function fetchableHttpUrl(parsed: URL): boolean {
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+  return parsed.hostname !== "" && !parsed.username && !parsed.password;
+}
+
 export function safeSourceUrl(value: string | undefined): string | undefined {
   if (!value) return undefined;
   try {
     const parsed = new URL(value);
-    if ((parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.hostname && !parsed.username && !parsed.password) return parsed.href;
+    if (fetchableHttpUrl(parsed)) return parsed.href;
   } catch {
     return undefined;
   }
@@ -229,21 +235,21 @@ function pushSecSynthetic(state: SecWalkState, value: string): void {
   for (const character of value) state.chunks.push({ value: character });
 }
 
+function consumeSecNoiseMarker(state: SecWalkState, value: string): boolean {
+  if (state.hasReserved) return false;
+  if (value !== NOISE_START && value !== NOISE_END) return false;
+  const opening = value === NOISE_START;
+  if (state.noise === opening) state.invalid = true;
+  state.noise = opening;
+  return true;
+}
+
 function visitSecText(state: SecWalkState, node: Text, visible: boolean): void {
   const data = node.data;
   let kept = "";
   for (let offset = 0; offset < data.length; offset++) {
     const value = data[offset];
-    if (!state.hasReserved && value === NOISE_START) {
-      if (state.noise) state.invalid = true;
-      state.noise = true;
-      continue;
-    }
-    if (!state.hasReserved && value === NOISE_END) {
-      if (!state.noise) state.invalid = true;
-      state.noise = false;
-      continue;
-    }
+    if (consumeSecNoiseMarker(state, value)) continue;
     if (!state.noise) (state.cell ?? state.chunks).push(visible ? { value, node, offset: kept.length } : { value, hidden: true });
     kept += value;
   }
@@ -257,6 +263,18 @@ function enterSecElement(state: SecWalkState, name: string): void {
   else if (Object.hasOwn(SEC_CELL_TAGS, name)) state.cell = [];
 }
 
+function finishSecRow(state: SecWalkState): void {
+  let first = true;
+  for (const characters of state.row ?? []) {
+    if (!characters.length) continue;
+    if (!first) pushSecSynthetic(state, " | ");
+    for (const character of characters) state.chunks.push(character);
+    first = false;
+  }
+  if (!first) pushSecSynthetic(state, "\n");
+  state.row = undefined;
+}
+
 function leaveSecElement(state: SecWalkState, name: string): void {
   if (state.noise) return;
   if (Object.hasOwn(SEC_CELL_TAGS, name)) {
@@ -267,15 +285,7 @@ function leaveSecElement(state: SecWalkState, name: string): void {
     return;
   }
   if (name === "tr") {
-    let first = true;
-    for (const characters of state.row ?? []) {
-      if (!characters.length) continue;
-      if (!first) pushSecSynthetic(state, " | ");
-      for (const character of characters) state.chunks.push(character);
-      first = false;
-    }
-    if (!first) pushSecSynthetic(state, "\n");
-    state.row = undefined;
+    finishSecRow(state);
     return;
   }
   if (Object.hasOwn(SEC_END_BLOCK_TAGS, name)) pushSecSynthetic(state, "\n");

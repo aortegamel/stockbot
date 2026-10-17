@@ -250,4 +250,32 @@ describe("source DOM rendering", () => {
     expect(root.textContent).toBe("\uE000x\uE001");
     expect(root.querySelector("mark")).toBeNull();
   });
+
+  test("a quote that is only a synthetic table separator never paints", () => {
+    const { window, document } = dom();
+    const root = document.createElement("div");
+    const source = capture("<table><tr><td>R</td><td>10</td></tr></table>", "R | 10", "|");
+    const result = highlightMappedQuote(root, mapSourceHtml(root, window, source.content ?? ""), source);
+    expect(result.resolution).toEqual({ status: "unresolved" });
+    expect(result.marks).toEqual([]);
+    expect(root.querySelector("mark")).toBeNull();
+    expect(root.textContent).toBe("R10");
+  });
+
+  test("a raw-basis location uses only its context, never mapped coordinates", () => {
+    const { window, document } = dom();
+    const html = "<h2>Item 1</h2><table><tr><td>Revenue</td><td>10</td></tr></table><h2>Item 7</h2><table><tr><td>Revenue</td><td>10</td></tr></table>";
+    const basis = "Item 1\nRevenue | 10\nItem 7\nRevenue | 10";
+    const selected = document.createElement("div");
+    const byContext = capture(html, basis, "Revenue | 10", { offset: 0, end: 12, basis: "raw", prefix: "Item 7\n" });
+    expect(highlightMappedQuote(selected, mapSourceHtml(selected, window, html), byContext).resolution.status).toBe("resolved");
+    expect(selected.querySelectorAll("table")[0].querySelector("mark")).toBeNull();
+    expect(selected.querySelectorAll("table")[1].querySelectorAll("mark").length).toBe(2);
+
+    const rejected = document.createElement("div");
+    const staleCoordinates = capture(html, basis, "Revenue | 10", { offset: 0, end: 12, basis: "raw", prefix: "Item 9\n" });
+    const result = highlightMappedQuote(rejected, mapSourceHtml(rejected, window, html), staleCoordinates);
+    expect(result.resolution).toEqual({ status: "unresolved" });
+    expect(result.marks).toEqual([]);
+  });
 });

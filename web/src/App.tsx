@@ -63,6 +63,42 @@ function Strip() {
   );
 }
 
+// Frames can span network chunks. Ignore malformed data without changing event order.
+function pushAgentFrame(frame: string, push: (event: AgentEvent) => void) {
+  for (const line of frame.split("\n")) {
+    const data = line.trim();
+    if (!data.startsWith("data:")) continue;
+    try {
+      const event = JSON.parse(data.slice(5)) as AgentEvent;
+      if (event.type !== "agent_start") push(event);
+    } catch {
+      // Preserve the existing parser behavior for malformed frames.
+    }
+  }
+}
+
+async function receiveAgentResponse(response: Response, push: (event: AgentEvent) => void, arm: () => void) {
+  if (!response.ok || !response.body) {
+    push({ type: "error", message: `request failed: ${response.status}` });
+    return;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (; ;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    arm();
+    buffer += decoder.decode(value, { stream: true });
+    let index: number;
+    while ((index = buffer.indexOf("\n\n")) >= 0) {
+      const frame = buffer.slice(0, index);
+      buffer = buffer.slice(index + 2);
+      pushAgentFrame(frame, push);
+    }
+  }
+}
+
 export default function App() {
   const [selected, setSelected] = useState("NVDA");
   const [query, setQuery] = useState("");
@@ -133,18 +169,7 @@ export default function App() {
     let alive = true;
     const ctrl = new AbortController();
     let cursor = 0;
-    async function poll() {
-      try {
-        const snap = await fetchSnapshot(current, ctrl.signal);
-        if (!alive) {
-          return;
-        }
-        setSnapshot(snap);
-      } catch {
-        if (alive) {
-          setSnapshot({ error: "snapshot unavailable" });
-        }
-      }
+    async function pollJournal() {
       try {
         const page = await fetchJournal(current, cursor, ctrl.signal);
         if (!alive) {
@@ -169,6 +194,20 @@ export default function App() {
           setJournal((prev) => prev ?? { error: "journal unavailable" });
         }
       }
+    }
+    async function poll() {
+      try {
+        const snap = await fetchSnapshot(current, ctrl.signal);
+        if (!alive) {
+          return;
+        }
+        setSnapshot(snap);
+      } catch {
+        if (alive) {
+          setSnapshot({ error: "snapshot unavailable" });
+        }
+      }
+      await pollJournal();
     }
     void poll();
     const id = setInterval(() => void poll(), 5_000);
@@ -249,34 +288,7 @@ export default function App() {
         body: JSON.stringify({ prompt, ticker: selected, watchlist: watchlistFor(selected) }),
         signal: ctrl.signal,
       });
-      if (!response.ok || !response.body) {
-        push({ type: "error", message: `request failed: ${response.status}` });
-        return;
-      }
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      for (; ;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        arm();
-        buffer += decoder.decode(value, { stream: true });
-        let index: number;
-        while ((index = buffer.indexOf("\n\n")) >= 0) {
-          const frame = buffer.slice(0, index);
-          buffer = buffer.slice(index + 2);
-          for (const line of frame.split("\n")) {
-            const data = line.trim();
-            if (!data.startsWith("data:")) continue;
-            try {
-              const event = JSON.parse(data.slice(5)) as AgentEvent;
-              if (event.type !== "agent_start") push(event);
-            } catch {
-              // Preserve the existing parser behavior for malformed frames.
-            }
-          }
-        }
-      }
+      await receiveAgentResponse(response, push, arm);
       if (!terminal) push({ type: "error", message: "stream ended without a terminal event" });
     } catch (error) {
       if (!terminal) {

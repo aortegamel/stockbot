@@ -150,4 +150,14 @@ describe("source URLs", () => {
     expect(originalSourceUrl(blank, true)).toBe(blank.url);
     expect(originalSourceUrl(document({ url: "javascript:alert(1)" }), true)).toBeUndefined();
   });
+
+  test("unparseable, hostless, and non-web URLs are dropped", () => {
+    for (const value of ["https://", "not a url at all", "//www.sec.gov/filing", "file:///etc/passwd"]) {
+      expect(safeSourceUrl(value)).toBeUndefined();
+    }
+    expect(safeSourceUrl("")).toBeUndefined();
+    expect(safeSourceUrl("https://www.sec.gov:8443/filing")).toBe("https://www.sec.gov:8443/filing");
+    // A third slash parses "filing" as the host, so the URL survives and normalizes.
+    expect(safeSourceUrl("https:///filing")).toBe("https://filing/");
+  });
 });
