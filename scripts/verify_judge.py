@@ -50,10 +50,19 @@ from decimal import Decimal, InvalidOperation
 from signal import SIG_DFL, SIGPIPE
 from signal import signal as _handle_signal
 
-try:  # allow `verify_judge.py --list | head` without BrokenPipeError
-    _handle_signal(SIGPIPE, SIG_DFL)
-except Exception:  # noqa: BLE001, S110 - intentional best-effort boundary, never aborts; intentional silent skip
-    pass
+
+def restore_default_sigpipe() -> None:
+    """CLI entry only: `verify_judge.py --list | head` exits quietly instead of raising BrokenPipeError.
+
+    Never call this at import time: pytest imports every test module during collection, and a
+    process-wide SIG_DFL turns any later write to a closed pipe into a fatal signal.
+    """
+    try:
+        _handle_signal(SIGPIPE, SIG_DFL)
+    except Exception:  # noqa: BLE001, S110 - intentional best-effort boundary, never aborts; intentional silent skip
+        pass
+
+
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -3450,4 +3459,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    restore_default_sigpipe()
     sys.exit(main())

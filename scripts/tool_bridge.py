@@ -41,7 +41,8 @@ _sessions_lock = threading.Lock()
 logger = logging.getLogger(__name__)
 
 
-def _required_string(request: Mapping[str, object], key: str) -> str | None:
+def _nonempty_string(request: Mapping[str, object], key: str) -> str | None:
+    """The request value when it is a non-empty string, else None."""
     value = request.get(key)
     if not isinstance(value, str) or not value:
         return None
@@ -65,18 +66,15 @@ def _describe(protocol_id: str) -> dict[str, object]:
 
 
 def _invoke(request: Mapping[str, object], protocol_id: str) -> dict[str, object]:
-    name = _required_string(request, "name")
-    session_id = _required_string(request, "session_id")
+    name = _nonempty_string(request, "name")
+    session_id = _nonempty_string(request, "session_id")
     arguments = request.get("arguments", {})
     if name is None or session_id is None or not isinstance(arguments, dict):
         return {"id": protocol_id, "error": "missing_arg"}
 
-    raw_tool_call_id = request.get("tool_call_id")
-    tool_call_id = raw_tool_call_id if isinstance(raw_tool_call_id, str) and raw_tool_call_id else None
-    raw_data_root = request.get("data_root")
-    data_root = raw_data_root if isinstance(raw_data_root, str) and raw_data_root else None
-    raw_as_of = request.get("as_of")
-    as_of = raw_as_of if isinstance(raw_as_of, str) and raw_as_of else None
+    tool_call_id = _nonempty_string(request, "tool_call_id")
+    data_root = _nonempty_string(request, "data_root")
+    as_of = _nonempty_string(request, "as_of")
 
     try:
         with capture_scope(data_root) as sources:
@@ -101,7 +99,7 @@ def _invoke(request: Mapping[str, object], protocol_id: str) -> dict[str, object
 
 
 def _end_session(request: Mapping[str, object], protocol_id: str) -> dict[str, object]:
-    session_id = _required_string(request, "session_id")
+    session_id = _nonempty_string(request, "session_id")
     if session_id is None:
         return {"id": protocol_id, "error": "missing_arg"}
     with _sessions_lock:
@@ -110,7 +108,7 @@ def _end_session(request: Mapping[str, object], protocol_id: str) -> dict[str, o
 
 
 def handle(request: Mapping[str, object]) -> dict[str, object]:
-    protocol_id = _required_string(request, "id")
+    protocol_id = _nonempty_string(request, "id")
     if protocol_id is None:
         return {"error": "missing_arg"}
     op = request.get("op")

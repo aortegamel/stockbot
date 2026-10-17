@@ -234,6 +234,49 @@ def _collect_coverage(repo: ResearchRepository, sid: str) -> list[dict[str, obje
     return artifacts
 
 
+def _case_summary(raw: object) -> str:
+    """Read a case summary from either the structured or text representation."""
+    return str((raw or {}).get("summary") if isinstance(raw, dict) else raw or "")
+
+
+def _final_narrative(final: dict[str, object]) -> dict[str, object]:
+    """Project the answer and the committee's case narratives."""
+    return {
+        "answer": str(final.get("content") or final.get("answer") or final.get("executive_summary") or ""),
+        "executiveSummary": str(final.get("executive_summary") or final.get("answer") or ""),
+        "consensus": str(final.get("consensus") or ""),
+        "baseCase": str(final.get("base_case") or ""),
+        "bullCase": _case_summary(final.get("bull_case")),
+        "bearCase": _case_summary(final.get("bear_case")),
+    }
+
+
+def _final_outlook(final: dict[str, object]) -> dict[str, object]:
+    """Project the disagreements, outlook, and limitations as clean text lists."""
+    return {
+        "disagreements": _clean_str_list(final.get("critical_disagreements") or final.get("disagreements")),
+        "positioning": _clean_str_list(final.get("positioning")),
+        "catalysts": _clean_str_list(final.get("catalysts")),
+        "uncertainties": _clean_str_list(final.get("uncertainties")),
+        "whatChangesTheView": _clean_str_list(final.get("what_would_change") or final.get("what_changes_the_view")),
+        "limitations": _clean_str_list(final.get("evidence_limitations") or final.get("limitations")),
+    }
+
+
+def _final_evidence(final: dict[str, object]) -> dict[str, object]:
+    """Project claims, source scope, and the evidence snapshot."""
+    scope = final.get("research_scope")
+    coverage = final.get("coverage")
+    return {
+        "claims": _clean_text_items(final.get("claims") or final.get("grounded_claims")),
+        "sources": [dict(s) for s in final["sources"]] if isinstance(final.get("sources"), list) else [],
+        "coverage": dict(coverage) if isinstance(coverage, dict) else {},
+        "allowedSources": _clean_str_list(scope.get("allowed_sources")) if isinstance(scope, dict) else [],
+        "freezeId": str(final.get("freeze_id") or ""),
+        "asOf": str(final.get("as_of") or ""),
+    }
+
+
 def _collect_final(sess: object) -> dict[str, object] | None:
     """Persisted final_result in viewer shape (None when absent/mistyped)."""
     try:
@@ -242,39 +285,7 @@ def _collect_final(sess: object) -> dict[str, object] | None:
         return None
     if not isinstance(final, dict):
         return None
-    claims = _clean_text_items(final.get("claims") or final.get("grounded_claims"))
-    scope = final.get("research_scope")
-    allowed: list[str] = _clean_str_list(scope.get("allowed_sources")) if isinstance(scope, dict) else []
-    coverage = final.get("coverage")
-    coverage_out: dict[str, object] = dict(coverage) if isinstance(coverage, dict) else {}
-    return {
-        "answer": str(final.get("content") or final.get("answer") or final.get("executive_summary") or ""),
-        "executiveSummary": str(final.get("executive_summary") or final.get("answer") or ""),
-        "consensus": str(final.get("consensus") or ""),
-        "baseCase": str(final.get("base_case") or ""),
-        "bullCase": str(
-            (final.get("bull_case") or {}).get("summary")
-            if isinstance(final.get("bull_case"), dict)
-            else final.get("bull_case") or ""
-        ),
-        "bearCase": str(
-            (final.get("bear_case") or {}).get("summary")
-            if isinstance(final.get("bear_case"), dict)
-            else final.get("bear_case") or ""
-        ),
-        "disagreements": _clean_str_list(final.get("critical_disagreements") or final.get("disagreements")),
-        "positioning": _clean_str_list(final.get("positioning")),
-        "catalysts": _clean_str_list(final.get("catalysts")),
-        "uncertainties": _clean_str_list(final.get("uncertainties")),
-        "whatChangesTheView": _clean_str_list(final.get("what_would_change") or final.get("what_changes_the_view")),
-        "limitations": _clean_str_list(final.get("evidence_limitations") or final.get("limitations")),
-        "claims": claims,
-        "sources": [dict(s) for s in final["sources"]] if isinstance(final.get("sources"), list) else [],
-        "coverage": coverage_out,
-        "allowedSources": allowed,
-        "freezeId": str(final.get("freeze_id") or ""),
-        "asOf": str(final.get("as_of") or ""),
-    }
+    return {**_final_narrative(final), **_final_outlook(final), **_final_evidence(final)}
 
 
 def _job_row(job: Job) -> dict[str, object]:

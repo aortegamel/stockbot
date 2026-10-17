@@ -2,7 +2,7 @@
 
 Launch: `bun run stockbot` runs `bun needle-harness/scripts/needle.ts`,
 which refreshes the tool catalog via `scripts/tool_bridge.py describe` and
-starts three loopback services: the Bun API host (`needle-harness/scripts/api.ts`),
+starts three services: the Bun API host (`needle-harness/scripts/api.ts`),
 FastAPI (`api.main:app`), and Vite. The Bun host dispatches `POST /api/agent`,
 `GET /api/watchlist`, `GET /api/health`, and `GET /api/research/*` to the existing handlers. Vite
 proxies those paths to Bun and the existing market `/api/*` paths to FastAPI.
@@ -146,6 +146,19 @@ One gap adds one follow-up research pass and one more persona generation round.
 Persona generation, the draft retry, and Stockbot synthesis have no application time limit.
 The kernel waits for them without a deadline, even after the wall passes.
 The caller cancellation signal still reaches every persona call and aborts it.
+
+Startup prewarm: the Bun host waits up to 120 seconds for the kernel worker `ready` message.
+At 120 seconds, prewarm kills the silent worker and logs the failure. The API host keeps serving.
+
+Before readiness, the worker handles `SIGINT` and `SIGTERM` without acquiring the Needle lock.
+The worker unwinds startup before its exit handlers remove owned child processes.
+During child creation, the worker defers termination until the child enters its owner's registry.
+This deferral does not change the child's signal mask.
+
+A POSIX watcher detects caller disconnection without reading stdin.
+The watcher preserves queued requests and stops signaling once startup completes.
+Normal request handling and post-ready shutdown remain unchanged.
+An explicit `SIGKILL` cannot run this cleanup.
 
 The kernel scheduler owns the agent loop.
 JEV selects from the whole registry when deterministic routing does not select a tool.
@@ -384,11 +397,18 @@ The Reasoner keeps its separate `OPENCODE_*` settings.
 
 `knip.json` treats `decision/runtime.ts` as a root entry. The Python process
 starts this file. The harness uses its own workspace and manifest.
-Its project pattern includes CSS imports.
+The web project pattern includes CSS files, so Knip resolves CSS imports.
 
 Knip treats `python3.14`, `poly-crap`, `gitleaks`, `osv-scanner`, and
 `llama-server` as external executables. Package dependencies do not provide
 these executables.
+
+The launcher starts the Bun API host by its absolute path
+(`needle-harness/scripts/api.ts`). The working directory stays `needle-harness`.
+Kernel types without outside users stay local to `kernel.ts`.
+
+`needle-harness/scripts/setup-needle.sh` creates the Needle venv with
+`python3.14`, not the moving `python3` alias.
 
 The guided SEC accession errors carry the tool name in a `tool` key. The error
 text and self-correcting hint stay unchanged. The tool-health gate reads this
@@ -398,6 +418,11 @@ The clock tool reads time through a `_utc_now` helper. The tool-health gate
 doubles this helper with a fixed UTC instant. Production output keeps its
 `utc_now` and `source` fields.
 
+FINRA freshness tests freeze the local date that the FINRA client reads.
+They check records at 90 and 91 days, including a year boundary.
+SEC facts tests freeze the UTC clock.
+They check that an omitted `as_of` uses the UTC date when the local date differs.
+
 The live judge runs each scenario through `create_research`, `create_node`,
 and `run_node` in an isolated per-attempt store. JEV, tool invocation, and the
 evaluator all use that store. The evaluator reads session status, final
@@ -406,6 +431,229 @@ in the result record.
 
 Root TypeScript uses the classic 5.x compiler. The Stryker checker requires
 its classic API. The `mutation:ts` script runs the mutation gate.
+
+## Python type integrity
+
+Public functions keep strict parameter and return types. Private guards
+accept `object` and narrow it with `isinstance` checks or `TypeGuard`.
+Malformed runtime values reach the existing error path. The rules forbid
+casts, type-ignore comments, and weaker Pyrefly rules.
+Tests that need malformed repository rows use a repository double that
+returns those rows. The tests do not cast them.
+
+Source resolution in `app/research/sources.py` types the injected store
+with a private structural `Protocol` and a `TypeGuard`. A store qualifies
+when it has callable `get_evidence` and `get_tool_result` methods.
+`ResearchRepository` and test doubles both qualify. Other values fall back to
+a `ResearchRepository` for the data root.
+
+`pyrefly.toml` sets `python-interpreter-path = "venv/bin/python"`. Pyrefly
+resolves this relative path from the directory of `pyrefly.toml`. The CLI
+therefore resolves imports from the repository venv, not from the
+`python3` on `PATH`. The language server reads the same configuration.
+
+pandas ships no `py.typed` marker. `requirements.txt` therefore pins
+`pandas-stubs`. Pyrefly reads the pandas types from these stubs in the
+repository venv. The stubs do not change runtime pandas behavior.
+
+## Mutation sandbox
+
+The `source_paths` list in `setup.cfg` names the mutated sources:
+
+- `app/`
+- `api/market_providers.py`
+- `calculations/`
+- `scripts/tool_bridge.py`
+- `needle-harness/lib/needle/server.py`
+
+mutmut accepts directories and individual files in this list. It copies each
+source into `mutants/`. It then copies `tests/`, `setup.cfg`, and the
+`also_copy` list. Last, it writes the mutants over the copied sources.
+A source that also sits inside an `also_copy` directory therefore receives
+mutants. The other files in that directory stay unmodified support copies.
+For example, `api/market_providers.py` receives mutants, but `api/main.py`
+stays a support copy.
+
+mutmut associates tests through a function's module name. The server test
+loader uses `needle-harness.lib.needle.server`. This name matches the
+server's path-derived key. The production subprocess still uses `__main__`,
+which does not select named mutants.
+
+mutmut 3.8.0 caches the mapping from functions to tests.
+Its configuration fingerprint excludes `source_paths`.
+Its incremental collection runs only new test IDs.
+Existing tests can therefore leave new modules without recorded calls.
+
+Refresh this mapping after changes to `source_paths`, loader module names,
+or the functions that existing tests call:
+
+1. Wait until every mutation process stops.
+2. Rename `mutants/mutmut-stats.json` to a unique backup name.
+3. Keep the `.meta` files to preserve completed verdicts.
+4. Run the affected mutants by their exact keys.
+5. Check the new module's function keys before trusting a `NoTests` result.
+
+The next run collects fresh statistics when the statistics file is absent.
+New statistics alone do not rerun cached `NoTests` verdicts.
+
+The `also_copy` list adds the other files that the collected suite reads:
+
+- `scripts/`: tests import `scripts.*` modules. `tests/security/test_sandbox.py`
+  runs `scripts/host/pi-opencode-go-secret`.
+- `api/`: `tests/test_market_providers.py` imports `api.main` and
+  `api.market_providers`.
+- `calculations/`: `tests/test_calculations.py` imports the package.
+- `cli.py`: several tests import `cli`.
+- `conftest.py`: the root fixture isolates `RUNS_DB_PATH` and
+  `STOCKBOT_DATA_DIR` in temporary directories.
+- `pytest.ini`: it sets `pythonpath`, `testpaths`, the default marker
+  filter for live tests, and the marker names.
+- `pyrefly.toml`: `tests/test_verify_type_escape_hatches.py` reads its
+  `project-includes`.
+- `docker-compose.yml`, `sandbox/stockbot/`, `package.json`, `.omp/`:
+  `tests/security/test_sandbox.py` reads them. `tests/test_coverage_scripts.py`
+  runs the `package.json` scripts.
+- `evals/`: `app.research.evals.regression` and
+  `scripts/strict_routing_harness.py` read its fixtures.
+- `needle-harness/lib/`: `tests/test_exa_agent.py` reads `muse/client.ts`.
+  `tests/test_needle_client.py` loads `needle/server.py`. The web sources
+  import `agent/types.ts`.
+- `decision/`: `tests/test_jev_start.py` runs `decision/runtime.ts` with Bun.
+  The runtime imports only its sibling files and Node built-in modules.
+- `web/src/`, `web/index.html`, `web/package.json`, `web/bun.lock`,
+  `web/tsconfig.json`, `web/vite.config.ts`: the browser test runs Vite in
+  `mutants/web`. `web/src/` comes first because mutmut needs the parent
+  directory before it copies individual files.
+
+The list copies support files only. It filters no tests and excludes no
+mutants.
+
+Install the sandbox web dependencies from the copied lockfile before mutation:
+
+```bash
+venv/bin/python -c 'from mutmut.utils.file_utils import copy_also_copy_files; copy_also_copy_files()'
+bun install --frozen-lockfile --cwd mutants/web
+SEC_EDGAR_IDENTITY='Stockbot tests tests@example.invalid' venv/bin/mutmut run
+```
+
+The baseline resolves a ticker through EDGAR's bundled index.
+The test identity permits that offline lookup. Do not copy the root `.env`
+into the sandbox.
+
+Do not copy `web/node_modules` through `also_copy`. The copy operation
+dereferences its executable links, which breaks the Vite entrypoint.
+The separate installation preserves those links and isolates Vite's cache.
+
+### Survivor repair scope
+
+The repair uses saved `Survived` verdicts outside `calculations/`.
+Pending, missing, and `NoTests` cases remain unverified.
+The calculations checks cover the named portfolio risk, valuation, execution,
+performance, and fundamentals functions. The application imports no functions
+from `calculations.factors` or `calculations.technicals`.
+
+`tests/test_calculations.py` checks known answers, defined input boundaries,
+and fixed-seed properties. These tests preserve the existing formulas and units.
+The repair adds no tests to `*_crap_paths.py`.
+
+Before a focused mutation run, preserve the existing metadata and test map.
+Collect a fresh test map for the affected normal test modules.
+Run exact mutant keys from one source module.
+Keep equivalent and excluded mutants in the report.
+Report retained verdicts separately from new verdicts.
+Keep mutation and CRAP thresholds unchanged.
+
+### TypeScript mutation
+
+Use the existing decision configuration for decision sources:
+
+```bash
+bunx stryker run --mutate decision/jev.ts
+```
+
+Use the harness configuration for harness sources:
+
+```bash
+bunx stryker run stryker.harness.conf.json --mutate needle-harness/lib/agent/kernel.ts
+```
+
+Both configurations retain the TypeScript checker. The harness configuration
+uses `needle-harness/tsconfig.json` and runs the existing Bun suite from that
+directory. It lists production files explicitly, without negative globs.
+Add new production files to its `mutate` list.
+
+Stryker reads every file below the repository root as campaign input. The
+harness `ignorePatterns` list removes generated content from that input:
+
+- `/venv`, `/mutants` (the mutmut sandbox), `/data`, and `/reports`
+- `/coverage-harness`, `/coverage-ts`, `/coverage-python.lcov`, and
+  `/.coverage`
+- `/.hypothesis`, `/.pytest_cache`, `/.ruff_cache`, and `__pycache__` at any
+  depth
+- `/web/public/pdfjs`, the output of `scripts/copy-pdfjs-assets.ts`
+
+A leading `/` anchors a pattern to the repository root. An unanchored pattern
+matches that name in any directory. The list excludes no application source,
+no test, and no `mutate` target. Stryker skips the tracked runtime file
+`data/mandate.json` during the scan. The `inPlace` run keeps excluded files
+on disk. Tests and the checker still read them.
+
+Anchor each new pattern. Do not exclude source or tests.
+The decision configuration has no input exclusions.
+
+The harness command reads the test scope from `STRYKER_TEST_SCOPE`. An unset
+value runs the whole harness suite. Two harness test files dominate the run
+time: `scripts/api.test.ts` (50s) and
+`app/api/research/[...path]/route.test.ts` (29s). The other eight files run in
+about 3s together.
+
+A scoped run trades time for certainty. A mutant can survive a scoped run and
+die in the full suite, because the excluded tests can kill it. Confirm every
+survivor of a scoped run with an unset `STRYKER_TEST_SCOPE`:
+
+```bash
+bunx stryker run stryker.harness.conf.json --concurrency 6 --timeoutMS 300000 \
+  --reporters clear-text,html,json --mutate '<survivor ranges>'
+```
+
+Stryker accepts `file:startLine-endLine` ranges in `--mutate`. Merge the
+survivor ranges per file before the confirm run. The `timeoutMS` value covers
+the two slow files. Without it, Stryker derives a short timeout and reports
+slow mutants as `Timeout`.
+
+The harness writes `reports/mutation/harness.html` and `harness.json`. It does
+not replace the decision report at `reports/mutation/mutation.html`.
+
+#### Restore after an interrupted run
+
+Both configurations use `inPlace`. Stryker writes instrumented code and
+`// @ts-nocheck` comments into the working files. Stryker keeps the originals
+in `.stryker-tmp/backup-<id>`.
+
+If the process stops before cleanup finishes, backup files can remain.
+A reset log line alone does not prove that Stryker restored every file.
+
+Before any new Stryker run, restore the files. A new run saves contaminated
+files as its originals. Before the normal checks, restore the files.
+A `// @ts-nocheck` comment hides type errors, and instrumented code changes
+what the tests run.
+
+If you edited files after Stryker started, save those edits before you restore the backup.
+
+1. Check that no Stryker process runs.
+2. Find the backup directory in the `Find your backup at` log line.
+3. Copy the backup files into the repository root.
+4. Compare every restored file with its backup.
+
+```bash
+backup='.stryker-tmp/backup-<id>'
+cp -a "$backup"/. .
+(cd "$backup" && find . -type f) | while read -r f; do cmp "$backup/$f" "$f"; done
+```
+
+An empty `cmp` output means that every file matches its backup. Do not use
+`git restore`, `git checkout`, or `git reset`. They discard uncommitted source
+changes. Run the normal checks only after the restoration.
 
 ## Failure cleanup and terminal reads
 
@@ -420,5 +668,7 @@ The research API uses an asynchronous Python subprocess with a 15-second
 timeout. Unknown sessions return HTTP 404. Import, database, execution, and
 bridge response errors return HTTP 502.
 
-The harness binds development and production servers to `127.0.0.1`.
-It does not advertise LAN access or provide authentication for remote use.
+The harness binds all three listeners to `0.0.0.0`
+(`needle-harness/scripts/api.ts`, `needle-harness/scripts/needle.ts`).
+It provides no authentication for remote use. Run it only on a trusted
+network. See the README "LAN access" section.

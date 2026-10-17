@@ -36,7 +36,7 @@ None
 ## Required arguments
 
 - `search_id` (string): Search id returned by search_sec_filings.
-- `session_id` (string): Research session ID returned by search_sec_filings (direct calls create one).
+- `session_id` (string): Research session ID.
 
 ## Optional arguments
 

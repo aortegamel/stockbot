@@ -9,6 +9,8 @@ project-excludes = ["venv", "data"]
 search-path = ["."]
 python-platform = "linux"
 python-version = "3.14"
+python-interpreter-path = "venv/bin/python"
+site-package-path = ["venv/lib/python3.14/site-packages"]
 preset = "strict"
 [errors]
 explicit-any = true
