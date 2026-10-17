@@ -1,5 +1,6 @@
-import { describe, expect, setSystemTime, test } from "bun:test";
-import { existsSync } from "node:fs";
+import { describe, expect, jest, setSystemTime, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
 import { applyFinalGates, asksWatchlist, inventoryDefect, KernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
@@ -122,6 +123,35 @@ describe("parseWatchlist / asksWatchlist", () => {
     for (const p of ["latest filings for my watchlist", "Watch list short interest?", "watch-lists summary", "WATCHLIST"]) expect(asksWatchlist(p)).toBe(true);
     for (const p of ["NVDA risk factors?", "what should I watch?", "watchlistsX", "list watches"]) expect(asksWatchlist(p)).toBe(false);
   });
+});
+
+describe("kernel startup", () => {
+  test("startup health stays unready when the external worker exits before ready", () => {
+    const dir = mkdtempSync(join(tmpdir(), "stockbot-kernel-startup-"));
+    try {
+      mkdirSync(join(dir, "venv", "bin"), { recursive: true });
+      // The local worker exits before its ready message without loading Python or a provider.
+      writeFileSync(join(dir, "venv", "bin", "python"), "#!/bin/sh\nexit 7\n", { mode: 0o755 });
+      writeFileSync(
+        join(dir, "probe.ts"),
+        `import { dispatch, registerPrewarm } from ${JSON.stringify(join(import.meta.dir, "..", "..", "scripts", "api.ts"))};
+delete process.env.KERNEL_PREWARMED;
+await registerPrewarm();
+const health = await dispatch(new Request("http://localhost/api/health"));
+console.log(JSON.stringify({ status: health.status, ...await health.json() }));
+`,
+      );
+      const child = Bun.spawnSync([process.execPath, join(dir, "probe.ts")], {
+        cwd: join(import.meta.dir, "..", ".."),
+        env: { ...process.env, STOCKBOT_REPO_ROOT: dir },
+      });
+      if (child.exitCode !== 0) throw new Error(child.stderr.toString());
+      const result = JSON.parse(child.stdout.toString().trim().split("\n").at(-1) ?? "");
+      expect(result).toMatchObject({ status: 200, ok: true, kernelPrewarmed: false });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 130_000);
 });
 
 describe("KernelRouter", () => {
@@ -255,6 +285,72 @@ describe("KernelRouter", () => {
       router.close();
     }
   });
+  // Fake clock drives the 120s prewarm deadline: no real wait, no ready auto-reply.
+  async function fakeClockPrewarm(drive: (child: FakeChild, state: () => unknown) => Promise<void>): Promise<void> {
+    const children: FakeChild[] = [];
+    const router = new KernelRouter({
+      python: "py",
+      workerPath: "w",
+      spawnFn: (): KernelChild => {
+        const c = new FakeChild();
+        children.push(c);
+        return c;
+      },
+    });
+    const prev = process.env.KERNEL_PREWARMED;
+    delete process.env.KERNEL_PREWARMED;
+    jest.useFakeTimers();
+    try {
+      let state: unknown = "pending";
+      void router.prewarm().then(() => { state = "ready"; }, (e: unknown) => { state = e; });
+      const first = children[0];
+      if (!first) throw new Error("expected one spawned child");
+      await drive(first, () => state);
+    } finally {
+      jest.useRealTimers();
+      router.close();
+      if (prev === undefined) delete process.env.KERNEL_PREWARMED;
+      else process.env.KERNEL_PREWARMED = prev;
+    }
+  }
+  const flush = async (): Promise<void> => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  };
+
+  test("prewarm stays pending past 30s and resolves on ready before 120s", async () => {
+    await fakeClockPrewarm(async (child, state) => {
+      jest.advanceTimersByTime(30_001);
+      await flush();
+      expect(state()).toBe("pending");
+      expect(child.killCalls).toBe(0);
+      jest.advanceTimersByTime(119_999 - 30_001);
+      await flush();
+      expect(state()).toBe("pending");
+      child.emitStdout('{"type":"ready"}\n');
+      await flush();
+      expect(state()).toBe("ready");
+      expect(process.env.KERNEL_PREWARMED as string | undefined).toBe("1");
+      // Ready cleared the deadline: crossing 120s afterwards never kills the worker.
+      jest.advanceTimersByTime(1);
+      await flush();
+      expect(child.killCalls).toBe(0);
+    });
+  });
+
+  test("prewarm kills the silent worker and rejects at 120s", async () => {
+    await fakeClockPrewarm(async (child, state) => {
+      jest.advanceTimersByTime(119_999);
+      await flush();
+      expect(state()).toBe("pending");
+      jest.advanceTimersByTime(1);
+      await flush();
+      const err = state();
+      if (!(err instanceof Error)) throw new Error("expected prewarm timeout rejection");
+      expect(err.message).toMatch("kernel worker prewarm timeout after 120000ms");
+      expect(child.killCalls).toBe(1);
+      expect(process.env.KERNEL_PREWARMED).toBeUndefined();
+    });
+  });
   test("progress lines reach onProgress without resolving the pending call", async () => {
     const { router, children } = setup();
     try {
@@ -270,6 +366,43 @@ describe("KernelRouter", () => {
       first.emitStdout('{"id":"1","marker":"res-1"}\n');
       const res = await pending;
       expect(markerOf(res)).toBe("res-1");
+    } finally {
+      router.close();
+    }
+  });
+
+  test("a throwing progress listener never fails the pending call", async () => {
+    const { router, children } = setup();
+    try {
+      const pending = router.call({ op: "run", hold: true }, {
+        timeoutMs: 1000,
+        onProgress: () => {
+          throw new Error("listener down");
+        },
+      });
+      const first = children[0];
+      if (!first) throw new Error("expected one spawned child");
+      await Promise.resolve();
+      first.emitStdout('{"type":"progress","id":"1","stage":"intake"}\n');
+      await Promise.resolve();
+      first.emitStdout('{"id":"1","marker":"res-1"}\n');
+      expect(markerOf(await pending)).toBe("res-1");
+    } finally {
+      router.close();
+    }
+  });
+
+  test("bridge noise, non-object lines, and unknown ids never settle a call", async () => {
+    const { router, children } = setup();
+    try {
+      const pending = router.call({ op: "run", hold: true }, { timeoutMs: 1000 });
+      const first = children[0];
+      if (!first) throw new Error("expected one spawned child");
+      await Promise.resolve();
+      first.emitStdout('not json\n{"broken":\n7\nnull\n[]\n{"type":"progress","id":"99","stage":"other"}\n{"id":"99","marker":"stale"}\n');
+      await Promise.resolve();
+      first.emitStdout('{"id":"1","marker":"res-1"}\n');
+      expect(markerOf(await pending)).toBe("res-1");
     } finally {
       router.close();
     }
@@ -1389,5 +1522,202 @@ describe("runKernelAgent final personas", () => {
     if (!("text" in gated)) throw new Error("expected gated text");
     expect(gated.text).toContain("KEEP");
     expect(gated.text).not.toContain("CUT");
+  });
+});
+
+describe("runKernelAgent worker replies", () => {
+  // Deterministic reasoner: no test in this block may reach a provider.
+  async function runAgent(
+    events: AgentEvent[],
+    spawnFn: KernelSpawn,
+    personas?: readonly Persona[],
+  ): Promise<void> {
+    process.env.OPENCODE_MODEL = "test-model";
+    await runKernelAgent("q", (e) => { events.push(e); }, {
+      ...(personas ? { personas } : {}),
+      deps: {
+        python: "py",
+        workerPath: "w",
+        spawnFn,
+        reason: async (o: KernelReasonInput) => ({ text: `${o.persona} answer`, usage: {} }),
+      },
+    });
+  }
+  function scriptedWorker(reply: (id: string) => string): KernelSpawn {
+    return (): KernelChild => {
+      const child = new FakeChild();
+      child.reply = reply;
+      queueMicrotask(() => child.emitStdout('{"type":"ready"}\n'));
+      return child;
+    };
+  }
+  function doneOf(events: AgentEvent[]): Metrics {
+    const last = events.at(-1);
+    if (last?.type !== "done") throw new Error("expected done last");
+    return last.metrics;
+  }
+  function toolFailedOf(events: AgentEvent[]): [string, string] {
+    const e = events.find((x) => x.type === "tool_failed");
+    return e?.type === "tool_failed" ? [e.tool, e.category] : ["(none)", "(none)"];
+  }
+
+  test("a worker that dies before ready ends at done with the needle failure shape", async () => {
+    const events: AgentEvent[] = [];
+    const spawnFn = (): KernelChild => {
+      const child = new FakeChild();
+      queueMicrotask(() => child.emitExit());
+      return child;
+    };
+    await runAgent(events, spawnFn);
+    expect(events.map((e) => e.type)).toEqual(["agent_start", "tool_failed", "failed", "done"]);
+    expect(toolFailedOf(events)).toEqual(["needle", "provider_error"]);
+    const failed = events.find((e) => e.type === "failed");
+    expect(failed?.type === "failed" ? failed.category : "").toBe("provider_error");
+    expect(failed?.type === "failed" ? failed.message : "").toContain("kernel worker exited");
+    const metrics = doneOf(events);
+    expect(metrics.failures).toEqual({ provider_error: 1 });
+    expect(metrics.needle).toEqual({ calls: 0, totalMs: 0, escalations: 1 });
+    expect(metrics.tools).toEqual({ calls: 0, totalMs: 0 });
+    expect(metrics.muse).toEqual({ calls: 0, totalMs: 0 });
+    expect(metrics.evidence).toEqual({ count: 0, characters: 0 });
+  });
+
+  test("a worker-level error ends the report with merged evidence and worker tallies", async () => {
+    const events: AgentEvent[] = [];
+    const reply = (id: string): string => `${JSON.stringify({
+      id,
+      sessionId: "rs:err",
+      objective: "q",
+      error: "unknown session",
+      evidence: [{ id: "ev:1", content: "fact" }, { id: "ev:1", content: "fact again" }],
+      nodes: [],
+      decisions: [],
+      unresolved: [],
+      toolExecutions: [{ step: 1, tool: "list_sec_filings", arguments: {}, confidence: null }],
+      toolCalls: [{ tool: "list_sec_filings", ok: true, evidenceId: "ev:1" }],
+      failures: { tool_error: 2 },
+      escalations: 3,
+      escalated: false,
+    })}\n`;
+    await runAgent(events, scriptedWorker(reply));
+    // The error ends the report before any tool replay, and the duplicate evidence
+    // row contributes one row and one character budget.
+    expect(events.map((e) => e.type)).toEqual(["agent_start", "evidence", "tool_failed", "failed", "done"]);
+    const evidence = events[1];
+    expect(evidence?.type === "evidence" ? evidence.evidence.map((e) => e.content) : []).toEqual(["fact"]);
+    expect(evidence?.type === "evidence" ? evidence.sessionId : undefined).toBe("rs:err");
+    const metrics = doneOf(events);
+    expect(metrics.evidence).toEqual({ count: 1, characters: 4 });
+    expect(metrics.needle).toEqual({ calls: 1, totalMs: 0, escalations: 4 });
+    expect(metrics.tools.calls).toBe(1);
+    expect(metrics.muse.calls).toBe(0);
+    expect(metrics.failures).toEqual({ tool_error: 2, provider_error: 1 });
+  });
+
+  test("a terminal result ends the report once and never repeats a disclosed tool failure", async () => {
+    const cases = [
+      {
+        calls: [{ tool: "list_sec_filings", ok: false, category: "tool_error", error: "boom" }],
+        terminal: { category: "timeout", message: "research deadline passed" },
+        flow: ["agent_start", "evidence", "tool_start", "tool_result", "tool_failed", "failed", "done"],
+        disclosed: ["list_sec_filings", "tool_error"],
+      },
+      {
+        calls: [],
+        terminal: { category: "policy_denied", message: "denied by policy" },
+        flow: ["agent_start", "evidence", "tool_failed", "failed", "done"],
+        disclosed: ["worker", "policy_denied"],
+      },
+    ] as const;
+    for (const c of cases) {
+      const events: AgentEvent[] = [];
+      const reply = (id: string): string => `${JSON.stringify({
+        id,
+        sessionId: "rs:terminal",
+        objective: "q",
+        evidence: [{ id: "ev:1", content: "fact" }],
+        nodes: [],
+        decisions: [],
+        unresolved: [],
+        toolExecutions: [],
+        toolCalls: c.calls,
+        failures: {},
+        escalations: 0,
+        escalated: false,
+        terminal: c.terminal,
+      })}\n`;
+      await runAgent(events, scriptedWorker(reply));
+      expect(events.map((e) => e.type)).toEqual([...c.flow]);
+      expect(toolFailedOf(events)).toEqual([...c.disclosed]);
+      const failed = events.find((e) => e.type === "failed");
+      expect(failed?.type === "failed" ? [failed.category, failed.message] : []).toEqual([c.terminal.category, c.terminal.message]);
+      const metrics = doneOf(events);
+      expect(metrics.failures[c.terminal.category]).toBe(1);
+      expect(metrics.tools.calls).toBe(c.calls.length);
+      expect(metrics.evidence.count).toBe(1);
+    }
+  });
+
+  test("call replay shows evidence previews, re-selections, disclosed failures, and redacted arguments", async () => {
+    const events: AgentEvent[] = [];
+    const long = "x".repeat(2500);
+    const reply = (id: string): string => `${JSON.stringify({
+      id,
+      sessionId: "rs:calls",
+      objective: "q",
+      evidence: [{ id: "ev:1", content: "filing text" }],
+      nodes: [],
+      decisions: [],
+      unresolved: [],
+      incomplete_guard: false,
+      toolExecutions: [
+        { step: 7, tool: "list_sec_filings", arguments: { api_key: "sk-secret", symbol: "NVDA", nested: { token: "t" }, list: ["a"], long, scalar: 3, nothing: null, flag: true }, confidence: 0.5 },
+        { tool: "get_quote", arguments: {} },
+        { tool: "get_news", arguments: {} },
+      ],
+      toolCalls: [
+        { tool: "list_sec_filings", ok: true, evidenceId: "ev:1" },
+        { tool: "get_quote", ok: false, category: "reselect", error: "unknown symbol" },
+        { tool: "get_news", ok: false, category: "timeout", error: "slow" },
+      ],
+      failures: {},
+      escalations: 0,
+      escalated: false,
+    })}\n`;
+    await runAgent(events, scriptedWorker(reply), ["stockbot"]);
+    const flow = events
+      .filter((e) => e.type === "needle_decision" || e.type === "tool_start" || e.type === "tool_result" || e.type === "tool_failed")
+      .map((e) => e.type);
+    expect(flow).toEqual([
+      "needle_decision", "tool_start", "tool_result",
+      "needle_decision", "tool_start", "tool_result",
+      "needle_decision", "tool_start", "tool_result", "tool_failed",
+    ]);
+    const decisions = events.filter((e) => e.type === "needle_decision");
+    const first = decisions[0];
+    if (first?.type !== "needle_decision") throw new Error("expected a decision event");
+    expect(first.step).toBe(7);
+    expect(first.confidence).toBe(0.5);
+    // Secrets redact by key norm, nested and array values survive, and a long
+    // string argument truncates at the argument budget.
+    expect(first.arguments).toEqual({
+      api_key: "[REDACTED]",
+      symbol: "NVDA",
+      nested: { token: "[REDACTED]" },
+      list: ["a"],
+      long: "x".repeat(2000),
+      scalar: 3,
+      nothing: null,
+      flag: true,
+    });
+    expect(decisions[1]?.type === "needle_decision" ? decisions[1].step : -1).toBe(1);
+    expect(decisions[2]?.type === "needle_decision" ? decisions[2].confidence : "unset").toBeNull();
+    const results = events.filter((e) => e.type === "tool_result");
+    expect(results[0]?.type === "tool_result" ? [results[0].evidenceId, results[0].preview] : []).toEqual(["ev:1", "filing text"]);
+    expect(results[1]?.type === "tool_result" ? results[1].preview : "").toBe("unknown symbol");
+    expect(results[1]?.type === "tool_result" ? "evidenceId" in results[1] : true).toBe(false);
+    expect(results[2]?.type === "tool_result" ? results[2].preview : "").toBe("slow");
+    expect(toolFailedOf(events)).toEqual(["get_news", "timeout"]);
+    expect(events.some((e) => e.type === "failed")).toBe(false);
   });
 });

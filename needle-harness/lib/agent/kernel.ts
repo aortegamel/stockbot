@@ -17,7 +17,7 @@ const WORKER_TIMEOUT_MS = 10 * 60 * 1000;
 // 120s from their own start. Persona generation, retries, and synthesis run
 // with no time limit, so the follow-up never depends on persona elapsed time.
 export const REQUEST_WALL_MS = 120_000;
-const PREWARM_TIMEOUT_MS = 30_000;
+const PREWARM_TIMEOUT_MS = 120_000;
 
 // Bun host runs with cwd=needle-harness; the repo root is its parent.
 const ROOT = process.env.STOCKBOT_REPO_ROOT ?? join(process.cwd(), "..");
@@ -57,7 +57,7 @@ export function asksWatchlist(prompt: string): boolean {
   return WATCHLIST_WORD.test(prompt);
 }
 // One (symbol, source) outcome the worker persisted; never client-provided.
-export type WatchlistRow = {
+type WatchlistRow = {
   symbol: string;
   source: string;
   tool: string;
@@ -161,8 +161,8 @@ export type KernelChild = {
 export type KernelSpawn = (cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => KernelChild;
 
 export type KernelReasonResult = { text: string; usage: MuseUsage; missingEvidence?: string; claims?: FinalClaim[]; confidence?: number };
-export type KernelReasonFn = (opts: KernelReasonInput) => Promise<KernelReasonResult>;
-export type FinalGateVerdict = { verdict?: string; support_answer?: string; error?: string };
+type KernelReasonFn = (opts: KernelReasonInput) => Promise<KernelReasonResult>;
+type FinalGateVerdict = { verdict?: string; support_answer?: string; error?: string };
 export type FinalGateCaller = (
   body: Record<string, unknown>,
   opts?: { signal?: AbortSignal; timeoutMs?: number },
@@ -210,6 +210,68 @@ function inventoryCorrection(validIds: readonly string[], prose: string, claims:
     `Rejected inventory:\n${JSON.stringify(claims.map(toWireClaim))}`,
   ].join("\n");
 }
+// Gate context: every op carries the evidence rows verbatim, and the session
+// travels with them so the worker judges against this run's persisted rows.
+type FinalGateContext = {
+  gate: FinalGateCaller;
+  evidence: { id: string; content: string }[];
+  sessionId?: string;
+  opts?: { signal?: AbortSignal; timeoutMs?: number };
+};
+// A gate call failure never fails the run: the affected claim is rejected instead.
+async function callGate(ctx: FinalGateContext, body: Record<string, unknown>): Promise<{ verdict: FinalGateVerdict } | { failure: string }> {
+  try {
+    return { verdict: await ctx.gate(body, ctx.opts) };
+  } catch (err) {
+    return { failure: `final gate unavailable: ${errorText(err)}` };
+  }
+}
+// One persona through both gate stages: a passing whole-response keeps the prose,
+// a reject runs the per-claim ops and deletes only the rejected substrings.
+async function gateResult(r: FinalPersonaResult, ctx: FinalGateContext): Promise<{ text: string } | { failure: string }> {
+  const whole = await callGate(ctx, {
+    op: "assess_final_response",
+    ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
+    persona: r.persona,
+    text: r.text,
+    claims: r.claims.map(toWireClaim),
+    evidence: ctx.evidence,
+    ...(r.confidence !== undefined ? { confidence: r.confidence } : {}),
+  });
+  if ("failure" in whole) return { failure: `${r.persona}: ${whole.failure}` };
+  if (gatePasses(whole.verdict)) return { text: r.text };
+  return deleteRejectedClaims(r, ctx);
+}
+// Per-claim ops run only after a whole-response reject: each rejected claim loses
+// its substring, and prose left empty by the deletions fails the run.
+async function deleteRejectedClaims(r: FinalPersonaResult, ctx: FinalGateContext): Promise<{ text: string } | { failure: string }> {
+  let kept = r.text;
+  for (const c of r.claims) {
+    const one = await callGate(ctx, {
+      op: "assess_final_claim",
+      ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
+      persona: r.persona,
+      claim: toWireClaim(c),
+      evidence: ctx.evidence,
+      ...(c.confidence !== undefined ? { confidence: c.confidence } : {}),
+    });
+    if ("failure" in one) return { failure: `${r.persona}: ${one.failure}` };
+    if (!gatePasses(one.verdict)) kept = kept.split(c.text).join("");
+  }
+  kept = kept.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!kept) return { failure: `${r.persona}: all claims rejected` };
+  return { text: kept };
+}
+// Every selected persona appears exactly once, in the requested order; the
+// answer labels each block with its persona.
+function assembleGated(gated: readonly { persona: Persona; text: string }[], personaOrder: readonly Persona[]): { text: string } | { failure: string } {
+  if (gated.length !== personaOrder.length) return { failure: `final gate persona mismatch: ${gated.length} gated, ${personaOrder.length} ordered` };
+  const byPersona = new Map(gated.map((g) => [g.persona, g.text] as const));
+  if (byPersona.size !== gated.length) return { failure: "final gate duplicate persona result" };
+  for (const p of personaOrder) if (!byPersona.has(p)) return { failure: `final gate missing persona: ${p}` };
+  const blocks = personaOrder.map((p) => `── ${p.charAt(0).toUpperCase()}${p.slice(1)} ──\n${byPersona.get(p) ?? ""}`);
+  return { text: blocks.join("\n\n") };
+}
 // Final accuracy gates: inventory -> whole-response JEV via Python worker ops ->
 // on reject per-claim gates -> surgical deletion of rejected substrings ->
 // single answer_delta. Fail closed; never deletes evidence rows.
@@ -225,64 +287,23 @@ export async function applyFinalGates(opts: {
   gateOpts?: { signal?: AbortSignal; timeoutMs?: number };
 }): Promise<{ text: string } | { failure: string }> {
   const known = new Set(opts.evidence.map((e) => e.id));
+  const ctx: FinalGateContext = {
+    gate: opts.gate,
+    evidence: opts.evidence.map((e) => ({ id: e.id, content: e.content })),
+    ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+    opts: opts.gateOpts,
+  };
   const gated: { persona: Persona; text: string }[] = [];
   for (const r of opts.results) {
     const defect = inventoryDefect(r.text, r.claims, known);
     if (defect !== undefined) return { failure: `${r.persona}: ${defect}` };
-    const evidenceWire = opts.evidence.map((e) => ({ id: e.id, content: e.content }));
-    let whole: FinalGateVerdict;
-    try {
-      whole = await opts.gate(
-        {
-          op: "assess_final_response",
-          ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
-          persona: r.persona,
-          text: r.text,
-          claims: r.claims.map(toWireClaim),
-          evidence: evidenceWire,
-          ...(r.confidence !== undefined ? { confidence: r.confidence } : {}),
-        },
-        opts.gateOpts,
-      );
-    } catch (err) {
-      return { failure: `${r.persona}: final gate unavailable: ${err instanceof Error ? err.message : String(err)}` };
-    }
-    if (gatePasses(whole)) {
-      gated.push({ persona: r.persona, text: r.text });
-      continue;
-    }
-    let kept = r.text;
-    for (const c of r.claims) {
-      let one: FinalGateVerdict;
-      try {
-        one = await opts.gate(
-          {
-            op: "assess_final_claim",
-            ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
-            persona: r.persona,
-            claim: toWireClaim(c),
-            evidence: evidenceWire,
-            ...(c.confidence !== undefined ? { confidence: c.confidence } : {}),
-          },
-          opts.gateOpts,
-        );
-      } catch (err) {
-        return { failure: `${r.persona}: final gate unavailable: ${err instanceof Error ? err.message : String(err)}` };
-      }
-      if (!gatePasses(one)) kept = kept.split(c.text).join("");
-    }
-    kept = kept.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-    if (!kept) return { failure: `${r.persona}: all claims rejected` };
-    gated.push({ persona: r.persona, text: kept });
+    const outcome = await gateResult(r, ctx);
+    if ("failure" in outcome) return outcome;
+    gated.push({ persona: r.persona, text: outcome.text });
   }
-  if (gated.length !== opts.personaOrder.length) return { failure: `final gate persona mismatch: ${gated.length} gated, ${opts.personaOrder.length} ordered` };
-  const byPersona = new Map(gated.map((g) => [g.persona, g.text] as const));
-  if (byPersona.size !== gated.length) return { failure: "final gate duplicate persona result" };
-  for (const p of opts.personaOrder) if (!byPersona.has(p)) return { failure: `final gate missing persona: ${p}` };
-  const text = opts.personaOrder.map((p) => `── ${p.charAt(0).toUpperCase()}${p.slice(1)} ──\n${byPersona.get(p) ?? ""}`).join("\n\n");
-  return { text };
+  return assembleGated(gated, opts.personaOrder);
 }
-export type RunKernelDeps = {
+type RunKernelDeps = {
   spawnFn?: KernelSpawn;
   reason?: KernelReasonFn;
   python?: string;
@@ -291,6 +312,18 @@ export type RunKernelDeps = {
 
 function defaultSpawn(cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv }): KernelChild {
   return spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"], env: opts.env }) as unknown as KernelChild;
+}
+
+// Untrusted JSONL from the worker: non-JSON noise and non-object lines drop.
+function parseLine(line: string): Record<string, unknown> | undefined {
+  let msg: unknown;
+  try {
+    msg = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  if (typeof msg !== "object" || msg === null) return undefined;
+  return msg as Record<string, unknown>;
 }
 
 type KernelPending = {
@@ -379,20 +412,16 @@ export class KernelRouter {
   }
 
   private onLine(line: string): void {
-    let msg: unknown;
-    try {
-      msg = JSON.parse(line);
-    } catch {
-      // Non-JSON bridge noise; keep scanning.
-    }
-    if (typeof msg !== "object" || msg === null) return;
-    const rec = msg as Record<string, unknown>;
+    const rec = parseLine(line);
+    if (rec === undefined) return;
     if (typeof rec.id !== "string") {
       // Ready gate: worker hello, never a response.
       if (rec.type === "ready") this.resolveReady();
       return;
     }
     if (rec.type === "progress") {
+      // Progress is advisory: a dead listener never fails the run, and the
+      // pending call stays open for the terminal reply.
       const p = this.pending[rec.id];
       const stage = typeof rec.stage === "string" ? rec.stage : "working";
       const detail = rec.detail && typeof rec.detail === "object" ? (rec.detail as Record<string, unknown>) : undefined;
@@ -408,7 +437,7 @@ export class KernelRouter {
     delete this.pending[rec.id];
     p.cancel();
     // boundary: JSONL line from our own worker; every field is defaulted where read below.
-    p.resolve(msg as KernelResponse);
+    p.resolve(rec as KernelResponse);
   }
 
   private onData(chunk: string): void {
@@ -593,74 +622,195 @@ function graphProjection(input: {
   ].join("\n\n");
 }
 
-export async function runKernelAgent(
-  prompt: string,
-  emit: (e: AgentEvent) => void,
-  opts?: { signal?: AbortSignal; deadlineAt?: number; deps?: RunKernelDeps; seedEvidence?: Evidence[]; personas?: readonly Persona[]; ticker?: string; watchlist?: readonly string[] },
-): Promise<void> {
-  const t0 = performance.now();
-  const deps = opts?.deps ?? {};
-  const reasonFn = deps.reason ?? reason;
-  const deadlineAt = opts?.deadlineAt ?? Date.now() + REQUEST_WALL_MS;
-  // A watchlist request carries the list as context and never the selected-ticker scope.
-  const runWatchlist = opts?.watchlist?.length ? [...opts.watchlist] : undefined;
-  const runTicker = runWatchlist ? undefined : parseTicker(opts?.ticker);
-  const runBody = (extra: Record<string, unknown>): Record<string, unknown> => ({
-    ...extra,
-    ...(runTicker !== undefined ? { ticker: runTicker } : {}),
-    ...(runWatchlist ? { watchlist: runWatchlist } : {}),
-  });
-  const hasWorkerDeps = deps.spawnFn !== undefined || deps.python !== undefined || deps.workerPath !== undefined;
-  const router = hasWorkerDeps
-    ? new KernelRouter({
-      ...(deps.python ? { python: deps.python } : {}),
-      ...(deps.workerPath ? { workerPath: deps.workerPath } : {}),
-      ...(deps.spawnFn ? { spawnFn: deps.spawnFn } : {}),
-    })
-    : kernelRouter;
+type KernelRunOptions = {
+  signal?: AbortSignal;
+  deadlineAt?: number;
+  deps?: RunKernelDeps;
+  seedEvidence?: Evidence[];
+  personas?: readonly Persona[];
+  ticker?: string;
+  watchlist?: readonly string[];
+};
 
-  const buildMetrics = (
-    decisions: number,
-    calls: number,
-    ev: Evidence[],
-    workerMs: number,
-    escalations: number,
-    fl: Partial<Record<FailureCategory, number>>,
-    muse: Metrics["muse"],
-  ): Metrics => ({
-    totalMs: performance.now() - t0,
+// One research run's mutable state: the request scope, the merged worker graph,
+// and the totals every terminal event reports.
+type KernelRun = {
+  t0: number;
+  prompt: string;
+  emit: (e: AgentEvent) => void;
+  signal?: AbortSignal;
+  reasonFn: KernelReasonFn;
+  router: KernelRouter;
+  deadlineAt: number;
+  scope: Record<string, unknown>;
+  personas: readonly Persona[];
+  isTrio: boolean;
+  seed: Evidence[];
+  objective: string;
+  sessionId: string | undefined;
+  direct: boolean;
+  terminal: { category: FailureCategory; message: string } | undefined;
+  toolFailed: boolean;
+  evidence: Evidence[];
+  byId: Record<string, Evidence>;
+  nodes: KernelGraphNode[];
+  records: Record<string, unknown>[];
+  unresolved: string[];
+  guard: boolean;
+  escalated: boolean;
+  watchlist: WatchlistRow[];
+  toolDecisions: KernelNeedleDecision[];
+  toolCalls: KernelToolCall[];
+  decisionsCount: number;
+  callsCount: number;
+  workerMs: number;
+  escalations: number;
+  failures: Partial<Record<FailureCategory, number>>;
+  museCalls: number;
+  museMs: number;
+  usage: MuseUsage;
+};
+
+// One answer pass: the reasoner stages plus the drafts and gaps that the gate and
+// follow-up stages read.
+type Pass = {
+  run: KernelRun;
+  failure: string | undefined;
+  results: FinalPersonaResult[] | undefined;
+  drafts: Partial<Record<Persona, string>>;
+  synthDrafts: { persona: Persona; text: string }[] | undefined;
+  gaps: string[];
+};
+// A finished pass either emitted its answer or handed back the gap to research.
+type PassOutcome = { gap: string } | { ended: true };
+// One settled reasoner call: a rejection settles as a value so siblings finish.
+type Settled = { r: KernelReasonResult } | { err: unknown };
+type SettledPersona = { persona: Persona; outcome: Settled };
+// Everything a persona call needs except the persona and the trio drafts.
+type ReasonInput = Omit<KernelReasonInput, "persona" | "drafts">;
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+// Reporter failures name the persona, so every message keeps that prefix.
+function errorMsg(persona: Persona, err: unknown): string {
+  return `${persona}: ${errorText(err)}`;
+}
+
+// Worker arrays are untrusted: anything that is not an array reads as empty.
+function rowsOf<T>(v: T[] | undefined): T[] {
+  return Array.isArray(v) ? v : [];
+}
+
+// Every terminal event reports the same totals.
+function metricsOf(run: KernelRun, escalations: number): Metrics {
+  return {
+    totalMs: performance.now() - run.t0,
     // ponytail: kernel reports no routing/execution split yet; worker wall time sits on tools, TS routing is 0.
-    needle: { calls: decisions, totalMs: 0, escalations },
-    tools: { calls, totalMs: workerMs },
-    muse,
-    evidence: { count: ev.length, characters: ev.reduce((n, e) => n + e.content.length, 0) },
-    failures: fl,
-  });
+    needle: { calls: run.decisionsCount, totalMs: 0, escalations },
+    tools: { calls: run.callsCount, totalMs: run.workerMs },
+    muse: { calls: run.museCalls, totalMs: run.museMs, ...run.usage },
+    evidence: { count: run.evidence.length, characters: run.evidence.reduce((n, e) => n + e.content.length, 0) },
+    failures: run.failures,
+  };
+}
 
-  emit({ type: "agent_start", prompt });
-  const seed = Array.isArray(opts?.seedEvidence) ? opts.seedEvidence : [];
-  if (seed.length) emit({ type: "evidence", evidence: seed.map((e) => ({ ...e, sources: sourceReferences(e.sources) })) });
+// One shared terminal path: count the failure, disclose it, then report totals.
+function endFailed(run: KernelRun, tool: string | null, category: FailureCategory, message: string): void {
+  run.failures[category] = (run.failures[category] ?? 0) + 1;
+  if (tool !== null) run.emit({ type: "tool_failed", tool, category, preview: message.slice(0, 160) });
+  run.emit({ type: "failed", category, message: message.slice(0, 160) });
+  run.emit({ type: "done", metrics: metricsOf(run, run.escalations + 1) });
+}
 
-  // ponytail: entry routing lives in route.ts (op:route fast-path there);
-  // runKernelAgent stays research-only so agent_start emits exactly once.
-  let res: KernelResponse;
-  const workerStart = performance.now();
-  try {
-    res = await router.call(runBody({ op: "run", prompt, deadlineAt }), { signal: opts?.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1), onProgress: (stage, detail) => emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage }) });
-  } catch (err) {
-    // ponytail: needle-down shape — worker failure still ends at done, never throws to the route.
-    const msg = err instanceof Error ? err.message : String(err);
-    emit({ type: "tool_failed", tool: "needle", category: "provider_error", preview: msg.slice(0, 160) });
-    emit({ type: "failed", category: "provider_error", message: msg.slice(0, 160) });
-    emit({ type: "done", metrics: buildMetrics(0, 0, [], 0, 1, { provider_error: 1 }, { calls: 0, totalMs: 0 }) });
-    return;
+// A finished answer: the exact text the gates cleared, then the totals.
+function endReport(run: KernelRun, text: string): void {
+  run.emit({ type: "answer_delta", text });
+  run.emit({ type: "done", metrics: metricsOf(run, run.escalations) });
+}
+
+// Worker failure tallies arrive as untrusted JSON: only numbers count.
+function addFailures(target: Partial<Record<FailureCategory, number>>, raw: unknown): void {
+  if (!raw || typeof raw !== "object") return;
+  for (const [k, v] of Object.entries(raw)) if (typeof v === "number") target[k as FailureCategory] = (target[k as FailureCategory] ?? 0) + v;
+}
+
+function addUsage(run: KernelRun, u: MuseUsage): void {
+  for (const k of ["inputTokens", "outputTokens", "cachedTokens"] as const) {
+    const n = u[k];
+    if (typeof n === "number") run.usage[k] = (run.usage[k] ?? 0) + n;
   }
-  const workerMs = performance.now() - workerStart;
-  // Canonical toolExecutions; legacy needleDecisions alias kept one release for compat.
-  const rawExec = Array.isArray(res.toolExecutions) ? res.toolExecutions : res.needleDecisions;
-  const decisions = Array.isArray(rawExec) ? rawExec : [];
-  const calls = Array.isArray(res.toolCalls) ? res.toolCalls : [];
-  const nodes: KernelGraphNode[] = (Array.isArray(res.nodes) ? res.nodes : [])
+}
+
+// Evidence rows merge by id: a repeat keeps the first row and unions its server
+// references, and the returned index answers tool-result previews.
+function mergeEvidence(target: Evidence[], incoming: readonly Evidence[]): Record<string, Evidence> {
+  const byId: Record<string, Evidence> = {};
+  for (const e of target) byId[e.id] = e;
+  for (const e of incoming) {
+    const existing = byId[e.id];
+    if (existing) existing.sources = sourceReferences([...(existing.sources ?? []), ...(e.sources ?? [])]);
+    else {
+      byId[e.id] = e;
+      target.push(e);
+    }
+  }
+  return byId;
+}
+
+// Evidence is visible to the model from the first pass on; the event copies rows
+// so a later merge never rewrites an already delivered event.
+function emitEvidence(run: KernelRun, sessionId: string | undefined): void {
+  if (run.evidence.length === 0) return;
+  run.emit({ type: "evidence", evidence: run.evidence.map((e) => ({ ...e })), ...(sessionId ? { sessionId } : {}) });
+}
+
+// ponytail: empty graph never closes silent — first pass answers direct.
+function answersDirect(run: KernelRun): boolean {
+  return run.evidence.length === 0 && run.decisionsCount === 0 && run.callsCount === 0 && run.unresolved.length === 0 && !run.guard && run.watchlist.length === 0;
+}
+
+// A terminal worker result is typed or absent; any other shape is ignored.
+function terminalOf(res: KernelResponse): { category: FailureCategory; message: string } | undefined {
+  if (res.terminal === undefined || res.terminal === null || typeof res.terminal !== "object") return undefined;
+  return res.terminal;
+}
+
+// A worker terminal result ends the report: the failure counts once, and a
+// tool_failed line appears unless a call already disclosed that category.
+function endTerminal(run: KernelRun): void {
+  const terminal = run.terminal;
+  if (terminal === undefined) return;
+  const last = run.toolCalls.at(-1);
+  endFailed(run, run.toolFailed ? null : last ? last.tool : "worker", terminal.category, terminal.message);
+}
+
+// Every in-flight worker call carries the request signal when the route sent one,
+// and relays worker progress with a detail only when the worker sent one.
+function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSignal; timeoutMs: number; onProgress: (stage: string, detail?: Record<string, unknown>) => void } {
+  const onProgress = (stage: string, detail?: Record<string, unknown>): void => {
+    run.emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage });
+  };
+  return { ...(run.signal ? { signal: run.signal } : {}), timeoutMs, onProgress };
+}
+
+// One worker reply, normalized once: pass 1 adopts it and pass 2 merges onto it.
+type WorkerReply = {
+  decisions: KernelNeedleDecision[];
+  calls: KernelToolCall[];
+  records: Record<string, unknown>[];
+  nodes: KernelGraphNode[];
+  evidence: Evidence[];
+  unresolved: string[];
+  guard: boolean;
+  watchlist: WatchlistRow[];
+};
+
+// Graph nodes are untrusted JSON: keep only rows with a node id, default the rest.
+function graphNodes(raw: unknown): KernelGraphNode[] {
+  const rows = Array.isArray(raw) ? (raw as KernelGraphNode[]) : [];
+  return rows
     .filter((n) => n && typeof n.node_id === "string")
     .map((n) => ({
       node_id: String(n.node_id),
@@ -668,11 +818,13 @@ export async function runKernelAgent(
       status: String(n.status ?? ""),
       depends_on: Array.isArray(n.depends_on) ? n.depends_on.map(String) : [],
     }));
-  const persisted: Record<string, unknown>[] = Array.isArray(res.decisions) ? res.decisions : [];
-  const unresolved: string[] = Array.isArray(res.unresolved) ? res.unresolved.map(String) : [];
-  const incompleteGuard = res.incompleteGuard ?? res.incomplete_guard ?? false;
-  const objective = typeof res.objective === "string" && res.objective ? res.objective : prompt;
-  const evidence: Evidence[] = [...seed, ...(Array.isArray(res.evidence) ? res.evidence : []).map((e) => ({
+}
+
+// Kernel evidence rows are untrusted JSON: every field is defaulted, and the
+// server reference list is re-sanitized at the trust boundary.
+function kernelEvidence(raw: unknown): Evidence[] {
+  const rows = Array.isArray(raw) ? (raw as KernelEvidence[]) : [];
+  return rows.map((e) => ({
     id: String(e.id),
     source: e.source ?? "kernel",
     ...(e.title !== undefined ? { title: e.title } : {}),
@@ -680,405 +832,466 @@ export async function runKernelAgent(
     retrievedAt: e.retrievedAt ?? new Date().toISOString(),
     content: String(e.content ?? ""),
     sources: sourceReferences(e.sources),
-  }))];
-  const byId: Record<string, Evidence> = {};
-  const ordered: Evidence[] = [];
-  for (const e of evidence) {
-    const previous = byId[e.id];
-    if (previous) previous.sources = sourceReferences([...(previous.sources ?? []), ...(e.sources ?? [])]);
-    else {
-      byId[e.id] = e;
-      ordered.push(e);
-    }
-  }
-  evidence.length = 0;
-  evidence.push(...ordered);
-  if (evidence.length) emit({ type: "evidence", evidence: evidence.map((e) => ({ ...e })), ...(res.sessionId ? { sessionId: res.sessionId } : {}) });
-  const failures: Partial<Record<FailureCategory, number>> = {};
-  if (res.failures && typeof res.failures === "object") {
-    for (const [k, v] of Object.entries(res.failures)) if (typeof v === "number") failures[k as FailureCategory] = v;
-  }
-  const countFailure = (c: FailureCategory): void => {
-    failures[c] = (failures[c] ?? 0) + 1;
-  };
+  }));
+}
 
-  if (typeof res.error === "string" && res.error) {
-    countFailure("provider_error");
-    emit({ type: "tool_failed", tool: "needle", category: "provider_error", preview: res.error.slice(0, 160) });
-    emit({ type: "failed", category: "provider_error", message: res.error.slice(0, 160) });
-    emit({ type: "done", metrics: buildMetrics(decisions.length, calls.length, evidence, workerMs, (res.escalations ?? 0) + 1, failures, { calls: 0, totalMs: 0 }) });
+// Watchlist coverage rows are untrusted JSON: keep only rows the projection reads.
+function watchRows(raw: unknown): WatchlistRow[] {
+  const rows = Array.isArray(raw) ? (raw as WatchlistRow[]) : [];
+  return rows.filter((w) => w && typeof w.symbol === "string" && typeof w.source === "string" && typeof w.status === "string");
+}
+
+function readReply(res: KernelResponse): WorkerReply {
+  // Canonical toolExecutions; the legacy needleDecisions alias covers old workers.
+  const exec = Array.isArray(res.toolExecutions) ? res.toolExecutions : rowsOf(res.needleDecisions);
+  return {
+    decisions: exec,
+    calls: rowsOf(res.toolCalls),
+    records: rowsOf(res.decisions),
+    nodes: graphNodes(res.nodes),
+    evidence: kernelEvidence(res.evidence),
+    unresolved: rowsOf(res.unresolved).map(String),
+    guard: res.incompleteGuard ?? res.incomplete_guard ?? false,
+    watchlist: watchRows(res.watchlist),
+  };
+}
+
+// Pass-1 adoption: the worker graph, the merged evidence, and the counters every
+// later stage reads. A malformed session id stays as sent; the gates reject it.
+function adoptFirst(run: KernelRun, res: KernelResponse): void {
+  const reply = readReply(res);
+  run.sessionId = res.sessionId;
+  run.objective = typeof res.objective === "string" && res.objective ? res.objective : run.prompt;
+  run.terminal = terminalOf(res);
+  run.toolDecisions = reply.decisions;
+  run.toolCalls = reply.calls;
+  run.decisionsCount = reply.decisions.length;
+  run.callsCount = reply.calls.length;
+  run.nodes = reply.nodes;
+  run.records = reply.records;
+  run.unresolved = reply.unresolved;
+  run.guard = reply.guard;
+  run.escalated = res.escalated ?? false;
+  run.escalations = res.escalations ?? 0;
+  run.watchlist = reply.watchlist;
+  run.evidence = [];
+  run.byId = mergeEvidence(run.evidence, [...run.seed, ...reply.evidence]);
+  addFailures(run.failures, res.failures);
+  run.direct = answersDirect(run);
+  emitEvidence(run, res.sessionId);
+}
+
+// Pass-2 adoption: the follow-up merges onto the pass-1 graph.
+function adoptFollow(run: KernelRun, res: KernelResponse, sameSession: boolean): void {
+  const reply = readReply(res);
+  run.byId = mergeEvidence(run.evidence, reply.evidence);
+  emitEvidence(run, res.sessionId);
+  // ponytail: same-session pass 2 returns the full session lists — replace,
+  // never append (appending would duplicate pass-1 nodes/decisions).
+  run.nodes = sameSession ? reply.nodes : [...run.nodes, ...reply.nodes];
+  run.records = sameSession ? reply.records : [...run.records, ...reply.records];
+  run.unresolved = reply.unresolved;
+  run.guard = reply.guard;
+  run.escalated = res.escalated ?? false;
+  if (sameSession) run.watchlist = reply.watchlist;
+  run.decisionsCount += reply.decisions.length;
+  run.callsCount += reply.calls.length;
+  run.escalations += res.escalations ?? 0;
+  addFailures(run.failures, res.failures);
+  replayFollowCalls(run, reply.calls);
+}
+
+// Tool-result previews come from the merged evidence index, never from the model.
+function emitToolResult(run: KernelRun, c: KernelToolCall): void {
+  const ev = c.evidenceId ? run.byId[c.evidenceId] : undefined;
+  run.emit({ type: "tool_result", tool: c.tool, evidenceId: c.evidenceId, preview: (ev?.content ?? "").slice(0, 160) });
+}
+
+// A call with evidence shows its preview; a re-selection is a result only;
+// anything else is disclosed as a failure of the run's terminal category.
+function emitToolCall(run: KernelRun, c: KernelToolCall): void {
+  run.emit({ type: "tool_start", tool: c.tool });
+  if (c.ok) {
+    emitToolResult(run, c);
     return;
   }
+  if (c.category === "reselect") {
+    run.emit({ type: "tool_result", tool: c.tool, preview: (c.error ?? "re-selecting").slice(0, 160) });
+    return;
+  }
+  const preview = (c.error ?? "tool failed").slice(0, 160);
+  run.emit({ type: "tool_result", tool: c.tool, preview });
+  run.emit({ type: "tool_failed", tool: c.tool, category: c.category ?? run.terminal?.category ?? "tool_error", preview });
+  run.toolFailed = true;
+}
 
-  // ponytail: index-aligned replay — worker lists decisions and calls in execution order, so calls[i] belongs to decisions[i]; a trailing escalate decision has no call.
-  const termCategory = res.terminal && typeof res.terminal === "object" ? res.terminal.category : undefined;
-  let toolFailedEmitted = false;
-  const emitCall = (c: KernelToolCall): void => {
-    emit({ type: "tool_start", tool: c.tool });
-    if (c.ok) {
-      const ev = c.evidenceId ? byId[c.evidenceId] : undefined;
-      emit({ type: "tool_result", tool: c.tool, evidenceId: c.evidenceId, preview: (ev?.content ?? "").slice(0, 160) });
-    } else if (c.category === "reselect") {
-      emit({ type: "tool_result", tool: c.tool, preview: (c.error ?? "re-selecting").slice(0, 160) });
-    } else {
-      const preview = (c.error ?? "tool failed").slice(0, 160);
-      emit({ type: "tool_result", tool: c.tool, preview });
-      emit({ type: "tool_failed", tool: c.tool, category: (c.category as FailureCategory | undefined) ?? termCategory ?? "tool_error", preview });
-      toolFailedEmitted = true;
-    }
-  };
+// Pass-1 replay is index-aligned: calls[i] belongs to decisions[i], and a
+// trailing escalate decision has no call. A decision's args are redacted here.
+function replayTools(run: KernelRun, decisions: readonly KernelNeedleDecision[], calls: readonly KernelToolCall[]): void {
   for (let i = 0; i < decisions.length; i++) {
     const d = decisions[i];
-    emit({ type: "needle_decision", step: d.step ?? i, tool: d.tool ?? null, arguments: redactArgs(d.arguments ?? {}), confidence: d.confidence ?? null });
-    if (i < calls.length) emitCall(calls[i]);
+    run.emit({ type: "needle_decision", step: d.step ?? i, tool: d.tool ?? null, arguments: redactArgs(d.arguments ?? {}), confidence: d.confidence ?? null });
+    if (i < calls.length) emitToolCall(run, calls[i]);
   }
-  for (let i = decisions.length; i < calls.length; i++) emitCall(calls[i]);
+  for (let i = decisions.length; i < calls.length; i++) emitToolCall(run, calls[i]);
+}
 
-  if (res.terminal && typeof res.terminal === "object") {
-    const { category, message } = res.terminal;
-    countFailure(category);
-    if (!toolFailedEmitted) {
-      emit({ type: "tool_failed", tool: calls.length > 0 ? calls[calls.length - 1].tool : "worker", category, preview: message.slice(0, 160) });
-    }
-    emit({ type: "failed", category, message: message.slice(0, 160) });
-    emit({ type: "done", metrics: buildMetrics(decisions.length, calls.length, evidence, workerMs, (res.escalations ?? 0) + 1, failures, { calls: 0, totalMs: 0 }) });
+// Pass-2 replay: the follow-up's own calls, in order; pass 2 reports its
+// failures through the gates rather than as another tool_failed line.
+function replayFollowCalls(run: KernelRun, calls: readonly KernelToolCall[]): void {
+  for (const c of calls) {
+    run.emit({ type: "tool_start", tool: c.tool });
+    if (c.ok) emitToolResult(run, c);
+  }
+}
+
+// Pass 1: one worker research run. False means the run already ended.
+async function researchPass(run: KernelRun): Promise<boolean> {
+  const workerStart = performance.now();
+  let res: KernelResponse;
+  try {
+    res = await run.router.call({ op: "run", prompt: run.prompt, deadlineAt: run.deadlineAt, ...run.scope }, workerCallOpts(run, Math.max(run.deadlineAt - Date.now(), 1)));
+  } catch (err) {
+    // ponytail: needle-down shape — worker failure still ends at done, never throws to the route.
+    endFailed(run, "needle", "provider_error", errorText(err));
+    return false;
+  }
+  run.workerMs += performance.now() - workerStart;
+  adoptFirst(run, res);
+  if (typeof res.error === "string" && res.error) {
+    endFailed(run, "needle", "provider_error", res.error);
+    return false;
+  }
+  // The replay settles whether a tool failure is already disclosed before the
+  // terminal result reports its own.
+  replayTools(run, run.toolDecisions, run.toolCalls);
+  if (run.terminal !== undefined) {
+    endTerminal(run);
+    return false;
+  }
+  return true;
+}
+
+// Pass 2: exactly one shared same-session follow-up for the pass-1 gap, with a
+// fresh research wall. False means the run already ended.
+async function followPass(run: KernelRun, gap: string): Promise<boolean> {
+  // ponytail: pass 2 reuses the pass-1 session — one gap node, no intake, full
+  // session evidence visible. A worker without a session id keeps the legacy
+  // full-prompt call.
+  const sessionId = typeof run.sessionId === "string" && run.sessionId ? run.sessionId : undefined;
+  const deadlineAt = Date.now() + REQUEST_WALL_MS;
+  run.direct = false;
+  run.emit({ type: "progress", stage: "evidence_gap", detail: { missing: gap.slice(0, 300) } });
+  const body: Record<string, unknown> = sessionId === undefined
+    ? { op: "run", prompt: `${run.prompt}\nStill missing: ${gap}`, deadlineAt, ...run.scope }
+    : { op: "run", prompt: run.prompt, sessionId, gap, deadlineAt, ...run.scope };
+  const started = performance.now();
+  let res: KernelResponse;
+  try {
+    res = await run.router.call(body, workerCallOpts(run, REQUEST_WALL_MS));
+  } catch (err) {
+    endFailed(run, "needle", "provider_error", errorText(err));
+    return false;
+  }
+  run.workerMs += performance.now() - started;
+  adoptFollow(run, res, typeof res.sessionId === "string" && res.sessionId === run.sessionId);
+  return true;
+}
+
+// Reasoner input for this pass: the verbatim prompt plus the graph projection on
+// the research path; a direct answer carries the prompt alone.
+function reasonInput(run: KernelRun): ReasonInput {
+  const prompt = run.direct
+    ? run.prompt
+    : `${run.prompt}\n\n${graphProjection({ objective: run.objective, nodes: run.nodes, decisions: run.records, unresolved: run.unresolved, incompleteGuard: run.guard, escalated: run.escalated, watchlist: run.watchlist })}`;
+  return {
+    prompt,
+    evidence: run.evidence,
+    escalated: run.direct ? false : run.escalated,
+    direct: run.direct || (run.escalated && run.evidence.length === 0),
+    objective: run.objective,
+    nodes: run.nodes,
+    decisions: run.records,
+    unresolved: run.unresolved,
+    incompleteGuard: run.guard,
+    ...(run.signal ? { signal: run.signal } : {}),
+    onDelta: () => { },
+  };
+}
+
+// One reasoner call: a rejection settles as a value, so siblings always finish.
+function settle(run: KernelRun, input: ReasonInput, persona: Persona, drafts?: { persona: Persona; text: string }[]): Promise<Settled> {
+  const call: KernelReasonInput = { ...input, persona, ...(drafts !== undefined ? { drafts } : {}) };
+  return run.reasonFn(call).then(
+    (r) => ({ r }) as const,
+    (err: unknown) => ({ err }) as const,
+  );
+}
+
+// Missing-Evidence lines drive the one shared follow-up; repeats collapse.
+function noteGap(pass: Pass, missing: string | undefined): void {
+  const gap = missing?.trim();
+  if (gap && !pass.gaps.includes(gap)) pass.gaps.push(gap);
+}
+
+// Usage counts every completed call, blank answers included; a blank answer still
+// fails the report. Results keep the model's declared inventory.
+function collectResult(pass: Pass, persona: Persona, r: KernelReasonResult): string | undefined {
+  addUsage(pass.run, r.usage);
+  const text = r.text.trim();
+  if (!text) return `${persona}: empty response`;
+  pass.results ??= [];
+  pass.results.push({
+    persona,
+    text,
+    claims: Array.isArray(r.claims) ? r.claims : [],
+    ...(r.confidence !== undefined ? { confidence: r.confidence } : {}),
+    ...(r.missingEvidence !== undefined ? { missingEvidence: r.missingEvidence } : {}),
+  });
+  return undefined;
+}
+
+// A settled answer becomes a persona result: an error or a blank answer fails the
+// report, and a surviving answer also reports its Missing-Evidence line.
+function acceptAnswer(pass: Pass, persona: Persona, outcome: Settled): string | undefined {
+  if ("err" in outcome) return errorMsg(persona, outcome.err);
+  const failure = collectResult(pass, persona, outcome.r);
+  if (failure === undefined) noteGap(pass, outcome.r.missingEvidence);
+  return failure;
+}
+
+// The first stage failure wins; a later success or failure never overwrites it,
+// and every settled call still reports its usage and result.
+function noteFailure(pass: Pass, failure: string | undefined): void {
+  if (pass.failure === undefined) pass.failure = failure;
+}
+
+// Partial cohort: every selected persona answers over the shared snapshot before
+// the verdict, so one failure waits out its siblings.
+// ponytail: siblings finish before the verdict; abort them early if final-stage latency matters.
+async function personaStage(pass: Pass, input: ReasonInput): Promise<void> {
+  const personas = pass.run.personas;
+  pass.run.museCalls += personas.length;
+  const settled = await Promise.all(personas.map(async (persona) => ({ persona, outcome: await settle(pass.run, input, persona) })));
+  for (const s of settled) noteFailure(pass, acceptAnswer(pass, s.persona, s.outcome));
+}
+
+// A trio draft is kept only when it is non-blank: a blank or failed draft fails
+// the report before its tokens are counted, so it never reports a result.
+function acceptDraft(pass: Pass, s: SettledPersona): string | undefined {
+  if ("err" in s.outcome) return errorMsg(s.persona, s.outcome.err);
+  const text = s.outcome.r.text.trim();
+  if (!text) return `${s.persona}: empty response`;
+  pass.drafts[s.persona] = text;
+  return acceptAnswer(pass, s.persona, s.outcome);
+}
+
+// Exactly one failed draft retries once; two failures fail with the first message.
+async function draftFailures(pass: Pass, input: ReasonInput, failed: readonly { persona: Persona; message: string }[]): Promise<void> {
+  if (failed.length === 1) {
+    const only = failed[0];
+    if (only !== undefined) pass.failure = await retryDraft(pass, input, only.persona);
     return;
   }
+  if (failed.length > 1) pass.failure = failed[0]?.message;
+}
 
-  // Fail-closed evidence loop: partial selections reason concurrently over one
-  // shared snapshot; the full trio synthesizes (bear+bull draft concurrently,
-  // then stockbot judges both drafts against the same snapshot). Drafts stay
-  // buffered. Any Missing-Evidence line on pass 1 runs exactly one shared
-  // same-session follow-up with a fresh research wall, merges, and regenerates.
-  // Pass 2 is final even with gaps: the final gates check the prose and drop
-  // unsupported claims. Any failure after the trio's one draft retry fails.
-  const personas = opts?.personas ?? FINAL_PERSONAS;
-  // ponytail: synthesis trigger is the exact full trio, nothing else.
-  const isTrio =
-    personas.length === FINAL_PERSONAS.length && FINAL_PERSONAS.every((p) => (personas as readonly string[]).includes(p));
-  // ponytail: empty graph never closes silent — first pass answers direct.
-  // Worker rows are untrusted JSON: keep only rows with the fields the writer reads.
-  const watchRows = (r: KernelResponse): WatchlistRow[] =>
-    (Array.isArray(r.watchlist) ? r.watchlist : []).filter((w) => w && typeof w.symbol === "string" && typeof w.source === "string" && typeof w.status === "string");
-  let mergedWatchlist = watchRows(res);
-  // A watchlist request with every source failed still projects its coverage rows, never a silent direct answer.
-  let direct = evidence.length === 0 && decisions.length === 0 && calls.length === 0 && unresolved.length === 0 && !incompleteGuard && mergedWatchlist.length === 0;
-  let pass = 1;
-  const mergedEvidence = evidence;
-  let mergedNodes = nodes;
-  let mergedDecisions = persisted;
-  let mergedUnresolved = unresolved;
-  let mergedGuard = incompleteGuard;
-  let mergedEscalated = res.escalated ?? false;
-  let totalWorkerMs = workerMs;
-  let totalDecisions = decisions.length;
-  let totalCalls = calls.length;
-  let totalEscalations = res.escalations ?? 0;
-  let museCalls = 0;
-  let museMs = 0;
-  const usage: MuseUsage = {};
-  for (; ;) {
-    emit({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
-    const tm = performance.now();
-    const input = {
-      prompt: direct ? prompt : `${prompt}\n\n${graphProjection({ objective, nodes: mergedNodes, decisions: mergedDecisions, unresolved: mergedUnresolved, incompleteGuard: mergedGuard, escalated: mergedEscalated, watchlist: mergedWatchlist })}`,
-      evidence: mergedEvidence,
-      escalated: direct ? false : mergedEscalated,
-      direct: direct || (mergedEscalated && mergedEvidence.length === 0),
-      objective,
-      nodes: mergedNodes,
-      decisions: mergedDecisions,
-      unresolved: mergedUnresolved,
-      incompleteGuard: mergedGuard,
-      ...(opts?.signal ? { signal: opts.signal } : {}),
-      onDelta: () => { },
-    };
-    const gaps: string[] = [];
-    const noteGap = (g: string | undefined): void => {
-      const t = g?.trim();
-      if (t && !gaps.includes(t)) gaps.push(t);
-    };
-    const addUsage = (u: MuseUsage): void => {
-      for (const k of ["inputTokens", "outputTokens", "cachedTokens"] as const) {
-        const n = u[k];
-        if (typeof n === "number") usage[k] = (usage[k] ?? 0) + n;
-      }
-    };
-    let failure: string | undefined;
-    let gap: string | undefined;
-    let answerText: string | undefined;
-    let personaResults: FinalPersonaResult[] | undefined;
-    const collectResult = (persona: Persona, r: KernelReasonResult): string | undefined => {
-      addUsage(r.usage);
-      const text = r.text.trim();
-      if (!text) return `${persona}: empty response`;
-      personaResults ??= [];
-      personaResults.push({
-        persona,
-        text,
-        claims: Array.isArray(r.claims) ? r.claims : [],
-        ...(r.confidence !== undefined ? { confidence: r.confidence } : {}),
-        ...(r.missingEvidence !== undefined ? { missingEvidence: r.missingEvidence } : {}),
-      });
-      noteGap(r.missingEvidence);
-      return undefined;
-    };
-    let synthDrafts: { persona: Persona; text: string }[] | undefined;
-    if (!isTrio) {
-      museCalls += personas.length;
-      // ponytail: every persona settles before the verdict, so one failure waits out its siblings; abort them early if final-stage latency matters.
-      const results = await Promise.all(
-        personas.map((persona) => reasonFn({ ...input, persona }).then((r) => ({ persona, r }), (err: unknown) => ({ persona, err }))),
-      );
-      museMs += performance.now() - tm;
-      for (const x of results) {
-        if ("err" in x) {
-          failure ??= `${x.persona}: ${x.err instanceof Error ? x.err.message : String(x.err)}`;
-          continue;
-        }
-        const empty = collectResult(x.persona, x.r);
-        if (empty !== undefined) failure ??= empty;
-      }
-      if (failure === undefined) {
-        gap = gaps.length > 0 ? gaps.join("; ") : undefined;
-      }
-    } else {
-      // Trio synthesis: bear+bull draft concurrently over the shared snapshot,
-      // then stockbot judges both drafts against the same snapshot. Exactly one
-      // failed or empty draft retries once with the request signal and no time limit;
-      // a second failure, a failed or empty synthesis, or any gap follows the
-      // shared fail-closed and gap-retry rules below.
-      const draftOrder = personas.filter((p) => p !== "stockbot");
-      museCalls += draftOrder.length;
-      const settled = await Promise.all(
-        draftOrder.map((persona) => reasonFn({ ...input, persona }).then((r) => ({ persona, r }), (err: unknown) => ({ persona, err }))),
-      );
-      const draftText: Partial<Record<Persona, string>> = {};
-      const failed: { persona: Persona; message: string }[] = [];
-      const settledOk: { persona: Persona; r: KernelReasonResult }[] = [];
-      for (const x of settled) {
-        if ("err" in x) {
-          failed.push({ persona: x.persona, message: `${x.persona}: ${x.err instanceof Error ? x.err.message : String(x.err)}` });
-          continue;
-        }
-        if (!x.r.text.trim()) {
-          failed.push({ persona: x.persona, message: `${x.persona}: empty response` });
-          continue;
-        }
-        settledOk.push({ persona: x.persona, r: x.r });
-      }
-      for (const ok of settledOk) {
-        const empty = collectResult(ok.persona, ok.r);
-        if (empty !== undefined) failed.push({ persona: ok.persona, message: empty });
-        else draftText[ok.persona] = ok.r.text.trim();
-      }
-      if (failed.length === 1) {
-        const only = failed[0];
-        if (only) {
-          museCalls += 1;
-          const retry = await reasonFn({ ...input, persona: only.persona }).then(
-            (r) => ({ r }) as const,
-            (err: unknown) => ({ err }) as const,
-          );
-          if ("err" in retry) {
-            failure = `${only.persona}: ${retry.err instanceof Error ? retry.err.message : String(retry.err)}`;
-          } else if (!retry.r.text.trim()) {
-            failure = `${only.persona}: empty response`;
-          } else {
-            personaResults = (personaResults ?? []).filter((r) => r.persona !== only.persona);
-            const empty = collectResult(only.persona, retry.r);
-            if (empty !== undefined) failure = empty;
-            else draftText[only.persona] = retry.r.text.trim();
-          }
-        }
-      }
-      if (failure === undefined && failed.length > 1) failure = failed[0]?.message;
-      if (failure === undefined) {
-        museCalls += 1;
-        synthDrafts = draftOrder.map((persona) => ({ persona, text: draftText[persona] ?? "" }));
-        const synth = await reasonFn({
-          ...input,
-          persona: "stockbot",
-          drafts: synthDrafts,
-        }).then(
-          (r) => ({ r }) as const,
-          (err: unknown) => ({ err }) as const,
-        );
-        if ("err" in synth) {
-          failure = `stockbot: ${synth.err instanceof Error ? synth.err.message : String(synth.err)}`;
-        } else {
-          const empty = collectResult("stockbot", synth.r);
-          if (empty !== undefined) failure = empty;
-        }
-      }
-      museMs += performance.now() - tm;
-      if (failure === undefined) gap = gaps.length > 0 ? gaps.join("; ") : undefined;
-    }
-    if (failure !== undefined) {
-      countFailure("provider_error");
-      emit({ type: "tool_failed", tool: "muse", category: "provider_error", preview: failure.slice(0, 160) });
-      emit({ type: "failed", category: "provider_error", message: failure.slice(0, 160) });
-      emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations + 1, failures, { calls: museCalls, totalMs: museMs, ...usage }) });
-      return;
-    }
-    // Final accuracy gates on the research path only: direct answers carry no
-    // inventory. Whole-response first, per-claim only after reject. Pass 2 is
-    // final even when gaps remain. Fail closed as provider_error.
-    // ponytail: unknown evidence ids and non-verbatim claims[].text (never other
-    // defects) retry once per persona on the same snapshot; the correction
-    // reruns these same gates.
-    if ((gap === undefined || pass >= 2) && failure === undefined && !direct && personaResults !== undefined) {
-      const validIds = mergedEvidence.map((e) => e.id);
-      const knownIds = new Set(validIds);
-      const rejected = personaResults.filter((r) => {
-        const defect = inventoryDefect(r.text, r.claims, knownIds);
-        return defect?.startsWith("inventory cites unknown evidence id") === true || defect?.startsWith("inventory text not a prose substring") === true;
-      });
-      if (rejected.length > 0) {
-        const retryStart = performance.now();
-        museCalls += rejected.length;
-        const retried = await Promise.all(
-          rejected.map((r) =>
-            reasonFn({
-              ...input,
-              prompt: `${input.prompt}\n\n${inventoryCorrection(validIds, r.text, r.claims)}`,
-              persona: r.persona,
-              ...(r.persona === "stockbot" && synthDrafts !== undefined ? { drafts: synthDrafts } : {}),
-            }).then((out) => ({ persona: r.persona, out }) as const, (err: unknown) => ({ persona: r.persona, err }) as const),
-          ),
-        );
-        museMs += performance.now() - retryStart;
-        const rejectedPersona: Record<string, true> = {};
-        for (const r of rejected) rejectedPersona[r.persona] = true;
-        personaResults = personaResults.filter((r) => !rejectedPersona[r.persona]);
-        for (const x of retried) {
-          if ("err" in x) {
-            failure ??= `${x.persona}: ${x.err instanceof Error ? x.err.message : String(x.err)}`;
-            continue;
-          }
-          addUsage(x.out.usage);
-          const corrected = x.out.text.trim();
-          if (!corrected) {
-            failure ??= `${x.persona}: empty response`;
-            continue;
-          }
-          personaResults.push({
-            persona: x.persona,
-            text: corrected,
-            claims: Array.isArray(x.out.claims) ? x.out.claims : [],
-            ...(x.out.confidence !== undefined ? { confidence: x.out.confidence } : {}),
-            ...(x.out.missingEvidence !== undefined ? { missingEvidence: x.out.missingEvidence } : {}),
-          });
-        }
-      }
-    }
-    if (failure !== undefined) {
-      countFailure("provider_error");
-      emit({ type: "tool_failed", tool: "muse", category: "provider_error", preview: failure.slice(0, 160) });
-      emit({ type: "failed", category: "provider_error", message: failure.slice(0, 160) });
-      emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations + 1, failures, { calls: museCalls, totalMs: museMs, ...usage }) });
-      return;
-    }
-    if (gap === undefined || pass >= 2) {
-      if (!direct && personaResults !== undefined) {
-        const order: Persona[] = isTrio ? ["bearbot", "bullbot", "stockbot"] : [...personas];
-        const gated = await applyFinalGates({
-          results: order.flatMap((p) => personaResults?.filter((r) => r.persona === p) ?? []),
-          evidence: mergedEvidence,
-          personaOrder: order,
-          // Gates are judged against this run's session; without it the worker
-          // falls back to the numeric request id and fails every gate closed.
-          ...(typeof res.sessionId === "string" && res.sessionId ? { sessionId: res.sessionId } : {}),
-          gate: (body, gateOpts) => router.call(body, { ...(opts?.signal ? { signal: opts.signal } : {}), ...gateOpts }),
-        });
-        if ("failure" in gated) {
-          countFailure("provider_error");
-          emit({ type: "tool_failed", tool: "muse", category: "provider_error", preview: gated.failure.slice(0, 160) });
-          emit({ type: "failed", category: "provider_error", message: gated.failure.slice(0, 160) });
-          emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations + 1, failures, { calls: museCalls, totalMs: museMs, ...usage }) });
-          return;
-        }
-        answerText = gated.text;
-      } else if (personaResults !== undefined) {
-        answerText = personaResults.map((r) => `── ${r.persona.charAt(0).toUpperCase()}${r.persona.slice(1)} ──\n${r.text}`).join("\n\n");
-      }
-      emit({ type: "answer_delta", text: answerText ?? "" });
-      emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations, failures, { calls: museCalls, totalMs: museMs, ...usage }) });
-      return;
-    }
-    pass += 1;
-    direct = false;
-    emit({ type: "progress", stage: "evidence_gap", detail: { missing: gap.slice(0, 300) } });
-    const followStart = performance.now();
-    let follow: KernelResponse;
-    // ponytail: pass 2 reuses the pass-1 session — one gap node, no intake,
-    // full session evidence visible. Old workers without sessionId keep the
-    // legacy full-prompt call. The follow-up gets a fresh research wall.
-    const followDeadlineAt = Date.now() + REQUEST_WALL_MS;
-    const followBody: Record<string, unknown> = runBody(
-      typeof res.sessionId === "string" && res.sessionId
-        ? { op: "run", prompt, sessionId: res.sessionId, gap, deadlineAt: followDeadlineAt }
-        : { op: "run", prompt: `${prompt}\nStill missing: ${gap}`, deadlineAt: followDeadlineAt });
-    try {
-      follow = await router.call(followBody, { signal: opts?.signal, timeoutMs: REQUEST_WALL_MS, onProgress: (stage, detail) => emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage }) });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      countFailure("provider_error");
-      emit({ type: "tool_failed", tool: "needle", category: "provider_error", preview: msg.slice(0, 160) });
-      emit({ type: "failed", category: "provider_error", message: msg.slice(0, 160) });
-      emit({ type: "done", metrics: buildMetrics(totalDecisions, totalCalls, mergedEvidence, totalWorkerMs, totalEscalations + 1, failures, { calls: museCalls, totalMs: museMs, ...usage }) });
-      return;
-    }
-    totalWorkerMs += performance.now() - followStart;
-    const followEvidence: Evidence[] = (Array.isArray(follow.evidence) ? follow.evidence : []).map((e) => ({
-      id: String(e.id),
-      source: e.source ?? "kernel",
-      ...(e.title !== undefined ? { title: e.title } : {}),
-      ...(e.url !== undefined ? { url: e.url } : {}),
-      retrievedAt: e.retrievedAt ?? new Date().toISOString(),
-      content: String(e.content ?? ""),
-      sources: sourceReferences(e.sources),
-    }));
-    const existingById: Record<string, Evidence> = {};
-    for (const e of mergedEvidence) existingById[e.id] = e;
-    for (const e of followEvidence) {
-      const existing = existingById[e.id];
-      if (existing) existing.sources = sourceReferences([...(existing.sources ?? []), ...(e.sources ?? [])]);
-      else {
-        existingById[e.id] = e;
-        mergedEvidence.push(e);
-      }
-    }
-    if (mergedEvidence.length) emit({ type: "evidence", evidence: mergedEvidence.map((e) => ({ ...e })), ...(follow.sessionId ? { sessionId: follow.sessionId } : {}) });
-    const followNodes: KernelGraphNode[] = (Array.isArray(follow.nodes) ? follow.nodes : [])
-      .filter((n) => n && typeof n.node_id === "string")
-      .map((n) => ({ node_id: String(n.node_id), question: String(n.question ?? ""), status: String(n.status ?? ""), depends_on: Array.isArray(n.depends_on) ? n.depends_on.map(String) : [] }));
-    // ponytail: same-session pass 2 returns the full session lists — replace,
-    // never append (appending would duplicate pass-1 nodes/decisions).
-    const sameSession = typeof follow.sessionId === "string" && follow.sessionId === res.sessionId;
-    mergedNodes = sameSession ? followNodes : [...mergedNodes, ...followNodes];
-    mergedDecisions = sameSession
-      ? (Array.isArray(follow.decisions) ? follow.decisions : [])
-      : [...mergedDecisions, ...(Array.isArray(follow.decisions) ? follow.decisions : [])];
-    mergedUnresolved = Array.isArray(follow.unresolved) ? follow.unresolved.map(String) : [];
-    mergedGuard = follow.incompleteGuard ?? follow.incomplete_guard ?? false;
-    mergedEscalated = follow.escalated ?? false;
-    if (sameSession) mergedWatchlist = watchRows(follow);
-    totalDecisions += (Array.isArray(follow.toolExecutions) ? follow.toolExecutions : follow.needleDecisions ?? []).length;
-    totalCalls += (Array.isArray(follow.toolCalls) ? follow.toolCalls : []).length;
-    totalEscalations += follow.escalations ?? 0;
-    if (follow.failures && typeof follow.failures === "object") {
-      for (const [k, v] of Object.entries(follow.failures)) if (typeof v === "number") failures[k as FailureCategory] = (failures[k as FailureCategory] ?? 0) + v;
-    }
-    const followCalls = Array.isArray(follow.toolCalls) ? follow.toolCalls : [];
-    const byFollowId: Record<string, Evidence> = {};
-    for (const e of mergedEvidence) byFollowId[e.id] = e;
-    for (const c of followCalls) {
-      emit({ type: "tool_start", tool: c.tool });
-      if (c.ok) {
-        const ev = c.evidenceId ? byFollowId[c.evidenceId] : undefined;
-        emit({ type: "tool_result", tool: c.tool, evidenceId: c.evidenceId, preview: (ev?.content ?? "").slice(0, 160) });
-      }
-    }
+// The retry re-asks the same persona on the same snapshot with no draft attached.
+async function retryDraft(pass: Pass, input: ReasonInput, persona: Persona): Promise<string | undefined> {
+  pass.run.museCalls += 1;
+  return acceptDraft(pass, { persona, outcome: await settle(pass.run, input, persona) });
+}
+
+// Trio synthesis: bear+bull draft concurrently over the shared snapshot, then
+// stockbot judges both drafts against the same snapshot. Exactly one failed or
+// empty draft retries once with the request signal and no time limit; a second
+// failure, a failed or empty synthesis, or any gap follows the shared
+// fail-closed and gap-retry rules.
+async function trioStage(pass: Pass, input: ReasonInput): Promise<void> {
+  const draftOrder = pass.run.personas.filter((p) => p !== "stockbot");
+  pass.run.museCalls += draftOrder.length;
+  const settled = await Promise.all(draftOrder.map(async (persona) => ({ persona, outcome: await settle(pass.run, input, persona) })));
+  const failed: { persona: Persona; message: string }[] = [];
+  for (const s of settled) {
+    const message = acceptDraft(pass, s);
+    if (message !== undefined) failed.push({ persona: s.persona, message });
   }
+  await draftFailures(pass, input, failed);
+  if (pass.failure !== undefined) return;
+  pass.run.museCalls += 1;
+  pass.synthDrafts = draftOrder.map((persona) => ({ persona, text: pass.drafts[persona] ?? "" }));
+  pass.failure = acceptAnswer(pass, "stockbot", await settle(pass.run, input, "stockbot", pass.synthDrafts));
+}
+
+// One-shot inventory correction: an unknown evidence id (often a graph node id
+// like rn:...) or a non-verbatim claims[].text retries once against the same
+// snapshot. Other defects never retry. The rejected prose and inventory are
+// untrusted model output.
+async function correctInventory(pass: Pass, input: ReasonInput): Promise<void> {
+  const results = pass.results ?? [];
+  const validIds = pass.run.evidence.map((e) => e.id);
+  const known = new Set(validIds);
+  const rejected = results.filter((r) => {
+    const defect = inventoryDefect(r.text, r.claims, known);
+    return defect?.startsWith("inventory cites unknown evidence id") === true || defect?.startsWith("inventory text not a prose substring") === true;
+  });
+  if (rejected.length === 0) return;
+  const started = performance.now();
+  pass.run.museCalls += rejected.length;
+  const retried = await Promise.all(rejected.map(async (r) => ({
+    persona: r.persona,
+    outcome: await settle(
+      pass.run,
+      { ...input, prompt: `${input.prompt}\n\n${inventoryCorrection(validIds, r.text, r.claims)}` },
+      r.persona,
+      r.persona === "stockbot" ? pass.synthDrafts : undefined,
+    ),
+  })));
+  pass.run.museMs += performance.now() - started;
+  const replaced: Record<string, true> = {};
+  for (const r of rejected) replaced[r.persona] = true;
+  pass.results = results.filter((r) => !replaced[r.persona]);
+  for (const x of retried) noteFailure(pass, acceptAnswer(pass, x.persona, x.outcome));
+}
+
+// A failed stage ends the report as provider_error; the reasoner is the tool.
+function endStageFailure(run: KernelRun, pass: Pass): boolean {
+  if (pass.failure === undefined) return false;
+  endFailed(run, "muse", "provider_error", pass.failure);
+  return true;
+}
+
+// A research answer is gated before display; a direct answer carries no
+// inventory and shows every selected persona as-is.
+async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
+  const results = pass.results;
+  if (run.direct || results === undefined) {
+    const blocks = results === undefined ? [] : results.map((r) => `── ${r.persona.charAt(0).toUpperCase()}${r.persona.slice(1)} ──\n${r.text}`);
+    endReport(run, blocks.join("\n\n"));
+    return;
+  }
+  const order: Persona[] = run.isTrio ? ["bearbot", "bullbot", "stockbot"] : [...run.personas];
+  const gated = await applyFinalGates({
+    results: order.flatMap((p) => results.filter((r) => r.persona === p)),
+    evidence: run.evidence,
+    personaOrder: order,
+    // Gates are judged against this run's session; without it the worker falls
+    // back to the numeric request id and fails every gate closed.
+    ...(typeof run.sessionId === "string" && run.sessionId ? { sessionId: run.sessionId } : {}),
+    gate: (body, gateOpts) => run.router.call(body, { ...(run.signal ? { signal: run.signal } : {}), ...gateOpts }),
+  });
+  if ("failure" in gated) endFailed(run, "muse", "provider_error", gated.failure);
+  else endReport(run, gated.text);
+}
+
+// One answer pass over the current snapshot: reasoning_start, the stage set, the
+// optional inventory correction, then the gated answer or the gap follow-up.
+async function answerPass(run: KernelRun, pass: number): Promise<PassOutcome> {
+  run.emit({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
+  const started = performance.now();
+  const input = reasonInput(run);
+  const stage: Pass = { run, failure: undefined, results: undefined, drafts: {}, synthDrafts: undefined, gaps: [] };
+  if (run.isTrio) await trioStage(stage, input);
+  else await personaStage(stage, input);
+  run.museMs += performance.now() - started;
+  if (endStageFailure(run, stage)) return { ended: true };
+  // Final accuracy gates on the research path only, and pass 2 is final even when
+  // gaps remain: the gates check the prose and drop unsupported claims.
+  const last = stage.gaps.length === 0 || pass >= 2;
+  if (last && !run.direct && stage.results !== undefined) await correctInventory(stage, input);
+  if (endStageFailure(run, stage)) return { ended: true };
+  if (last) {
+    await finishAnswer(run, stage);
+    return { ended: true };
+  }
+  return { gap: stage.gaps.join("; ") };
+}
+
+// Fail-closed evidence loop: partial selections reason concurrently over one
+// shared snapshot; the full trio synthesizes (bear+bull draft concurrently,
+// then stockbot judges both drafts against the same snapshot). Drafts stay
+// buffered. Any Missing-Evidence line on pass 1 runs exactly one shared
+// same-session follow-up with a fresh research wall, merges, and regenerates.
+// Pass 2 is final even with gaps: the final gates check the prose and drop
+// unsupported claims. Any failure after the trio's one draft retry fails.
+export async function runKernelAgent(
+  prompt: string,
+  emit: (e: AgentEvent) => void,
+  opts?: KernelRunOptions,
+): Promise<void> {
+  const run = openRun(prompt, emit, opts);
+  emit({ type: "agent_start", prompt });
+  const seed = run.seed;
+  if (seed.length) emit({ type: "evidence", evidence: seed.map((e) => ({ ...e, sources: sourceReferences(e.sources) })) });
+  // ponytail: entry routing lives in route.ts (op:route fast-path there);
+  // runKernelAgent stays research-only so agent_start emits exactly once.
+  if (!(await researchPass(run))) return;
+  const first = await answerPass(run, 1);
+  if ("ended" in first) return;
+  if (!(await followPass(run, first.gap))) return;
+  await answerPass(run, 2);
+}
+
+function openRun(prompt: string, emit: (e: AgentEvent) => void, opts: KernelRunOptions | undefined): KernelRun {
+  const t0 = performance.now();
+  const deps = opts?.deps ?? {};
+  // A watchlist request carries the list as context and never the selected-ticker scope.
+  const requested = opts?.watchlist?.length ? [...opts.watchlist] : undefined;
+  const ticker = requested ? undefined : parseTicker(opts?.ticker);
+  const personas = opts?.personas ?? FINAL_PERSONAS;
+  return {
+    t0,
+    prompt,
+    emit,
+    signal: opts?.signal,
+    reasonFn: deps.reason ?? reason,
+    router: runRouter(deps),
+    deadlineAt: opts?.deadlineAt ?? Date.now() + REQUEST_WALL_MS,
+    scope: runScope(ticker, requested),
+    personas,
+    isTrio: isTrioPersonas(personas),
+    seed: Array.isArray(opts?.seedEvidence) ? opts.seedEvidence : [],
+    objective: prompt,
+    sessionId: undefined,
+    direct: true,
+    terminal: undefined,
+    toolFailed: false,
+    evidence: [],
+    byId: {},
+    nodes: [],
+    records: [],
+    unresolved: [],
+    guard: false,
+    escalated: false,
+    watchlist: [],
+    toolDecisions: [],
+    toolCalls: [],
+    decisionsCount: 0,
+    callsCount: 0,
+    workerMs: 0,
+    escalations: 0,
+    failures: {},
+    museCalls: 0,
+    museMs: 0,
+    usage: {},
+  };
+}
+
+// Only a deps-injected run gets its own router; a bare run shares the process router.
+function runRouter(deps: RunKernelDeps): KernelRouter {
+  if (deps.spawnFn === undefined && deps.python === undefined && deps.workerPath === undefined) return kernelRouter;
+  return new KernelRouter({ python: deps.python, workerPath: deps.workerPath, spawnFn: deps.spawnFn });
+}
+
+// The selected ticker and the watchlist never ride the same body.
+function runScope(ticker: string | undefined, requested: readonly string[] | undefined): Record<string, unknown> {
+  const scope: Record<string, unknown> = {};
+  if (ticker !== undefined) scope.ticker = ticker;
+  if (requested !== undefined) scope.watchlist = requested;
+  return scope;
+}
+
+// ponytail: synthesis trigger is the exact full trio, nothing else.
+function isTrioPersonas(personas: readonly Persona[]): boolean {
+  return personas.length === FINAL_PERSONAS.length && FINAL_PERSONAS.every((p) => (personas as readonly string[]).includes(p));
 }
