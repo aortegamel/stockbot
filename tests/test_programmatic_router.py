@@ -103,6 +103,7 @@ def _pick(objective: str) -> tuple[str, str | None]:
 def test_route_fast_path_marks_research():
     assert programmatic_route("What drove NVDA revenue last quarter?") == "research_required"
     assert programmatic_route("hello") == "no_session"
+    assert programmatic_route("hello", ticker="NVDA") == "no_session"
 
 
 def test_route_clock_and_advice_fast_paths(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -169,6 +170,31 @@ def test_small_talk_never_creates_session(prompt: str) -> None:
 @pytest.mark.parametrize(
     ("prompt", "expected"),
     [
+        ("$TY", "research_required"),
+        ("TY", "research_required"),
+        ("$HI", "research_required"),
+        ("HI", "research_required"),
+        ("hi", "no_session"),
+        ("ty", "no_session"),
+        ("$hi", None),
+    ],
+)
+def test_ticker_tokens_do_not_route_as_small_talk(
+    prompt: str, expected: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ticker tokens and dollar signs do not become greetings after normalization."""
+    import app.tools as _tools
+
+    def _resolve(name: str) -> str | None:
+        return {"TY": "TY", "HI": "HI"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
+    assert programmatic_route(prompt) == expected
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
         ("hello, what drove NVDA revenue last quarter?", "research_required"),
         ("hi bullbot", None),
     ],
@@ -189,15 +215,15 @@ def test_greeting_with_request_keeps_existing_route(
     phrase=st.sampled_from(["hello", "hi there", "good morning", "whats up", "thanks", "never mind", "got it"]),
     punctuation=st.text(alphabet="!?.,'_-#@", max_size=6),
     whitespace=st.text(alphabet=" \t\n", min_size=1, max_size=6),
-    uppercase=st.booleans(),
+    title_case=st.booleans(),
 )
 def test_prop_small_talk_ignores_case_punctuation_and_whitespace(
-    phrase: str, punctuation: str, whitespace: str, uppercase: bool
+    phrase: str, punctuation: str, whitespace: str, title_case: bool
 ) -> None:
     """Normalization preserves an exact phrase despite case, punctuation, and whitespace changes."""
     text = whitespace.join(punctuation.join(word) for word in phrase.split())
-    if uppercase:
-        text = text.upper()
+    if title_case:
+        text = text.title()
     assert programmatic_route(f"{whitespace}{punctuation}{text}{punctuation}{whitespace}") == "no_session"
 
 

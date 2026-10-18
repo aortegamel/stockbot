@@ -350,6 +350,12 @@ def _router_pick(
 
 def _SMALL_TALK(prompt: str) -> bool:
     """Exact greetings and acknowledgements create no session after punctuation and space normalization."""
+    if "$" in prompt:
+        return False
+    from app.research.scheduler import _objective_ticker
+
+    if _objective_ticker(prompt) is not None:
+        return False
     text = " ".join("".join(c for c in prompt.lower() if c.isalnum() or c.isspace()).split())
     return text in (
         "thanks",

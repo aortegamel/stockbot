@@ -81,6 +81,9 @@ The scheduler never substitutes a fallback concept.
 Entry routing sends one `op:route` call.
 In programmatic mode, exact greetings and acknowledgements return `no_session` with `personas: null` without a JEV call.
 The matcher removes punctuation, ignores case, and collapses whitespace before it compares exact phrases.
+Before normalization, the matcher rejects prompts that contain `$` or a resolved uppercase ticker.
+Resolved ticker tokens such as `$TY`, `TY`, `$HI`, and `HI` continue through research routing.
+A selected caller ticker does not override an exact greeting: `hello` with `ticker="NVDA"` still returns `no_session`.
 `Hello!`, `thanks!!`, and `what's up?` use one short Stockbot reply without research, tools, or a session.
 Mixed requests such as `hello, what drove NVDA revenue last quarter?` still enter research.
 Persona greetings such as `hi bullbot` still reach JEV.
