@@ -79,12 +79,18 @@ An ungrounded concept starts JEV selection before the tool runs.
 The scheduler never substitutes a fallback concept.
 
 Entry routing sends one `op:route` call.
-JEV returns `{route, personas}`.
+In programmatic mode, exact greetings and acknowledgements return `no_session` with `personas: null` without a JEV call.
+The matcher removes punctuation, ignores case, and collapses whitespace before it compares exact phrases.
+`Hello!`, `thanks!!`, and `what's up?` use one short Stockbot reply without research, tools, or a session.
+Mixed requests such as `hello, what drove NVDA revenue last quarter?` still enter research.
+Persona greetings such as `hi bullbot` still reach JEV.
+For other requests, JEV returns `{route, personas}`.
 `personas: null` means the request neither selects nor excludes a persona.
 An explicit list is nonempty, unique, and canonical, in the order Stockbot, Bearbot, Bullbot.
 Positive requests retain only requested personas that the user does not exclude.
 Exclusion-only requests select the remaining personas.
-A programmatic route becomes a `route_hint` while JEV selects personas.
+Other programmatic routes become a `route_hint` while JEV selects personas.
+Without a hint, the JEV prompt assigns small talk without a company, ticker, or market topic to `reasoning_required`.
 A selector failure returns `{id, error}` without an assumed persona set.
 No remaining persona also fails the request.
 

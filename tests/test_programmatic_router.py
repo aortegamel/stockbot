@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import override
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import given, seed, settings
 from hypothesis import strategies as st
 
 from app.decision_client import JevClient
@@ -102,7 +102,7 @@ def _pick(objective: str) -> tuple[str, str | None]:
 
 def test_route_fast_path_marks_research():
     assert programmatic_route("What drove NVDA revenue last quarter?") == "research_required"
-    assert programmatic_route("hello") is None
+    assert programmatic_route("hello") == "no_session"
 
 
 def test_route_clock_and_advice_fast_paths(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -123,13 +123,82 @@ def test_route_clock_and_advice_fast_paths(monkeypatch: pytest.MonkeyPatch) -> N
     assert programmatic_route("did NVDA insiders sell") == "research_required"
 
 
-def test_small_talk_never_creates_session() -> None:
-    """thanks / never mind short-circuit to no_session (plan entry route)."""
-    from app.research.programmatic_router import programmatic_route
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "thanks",
+        "thank you",
+        "never mind",
+        "nevermind",
+        "ok",
+        "okay",
+        "got it",
+        "great thanks",
+        "hello",
+        "hi",
+        "hey",
+        "hiya",
+        "yo",
+        "howdy",
+        "greetings",
+        "hello there",
+        "hi there",
+        "hey there",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "whats up",
+        "sup",
+        "how are you",
+        "thx",
+        "ty",
+        "cool",
+        "bye",
+        "goodbye",
+        "Hello!",
+        "Good morning.",
+        "thanks!!",
+        "what's up?",
+    ],
+)
+def test_small_talk_never_creates_session(prompt: str) -> None:
+    """Exact greetings and acknowledgements route to no_session."""
+    assert programmatic_route(prompt) == "no_session"
 
-    assert programmatic_route("thanks") == "no_session"
-    assert programmatic_route("never mind") == "no_session"
-    assert programmatic_route("What drove NVDA revenue last quarter?") == "research_required"
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        ("hello, what drove NVDA revenue last quarter?", "research_required"),
+        ("hi bullbot", None),
+    ],
+)
+def test_greeting_with_request_keeps_existing_route(
+    prompt: str, expected: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A greeting prefix does not hide a research request or an explicit persona."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_ticker)
+    assert programmatic_route(prompt) == expected
+
+
+@seed(20261018)
+@settings(max_examples=60, deadline=None)
+@given(
+    phrase=st.sampled_from(["hello", "hi there", "good morning", "whats up", "thanks", "never mind", "got it"]),
+    punctuation=st.text(alphabet="!?.,'_-#@", max_size=6),
+    whitespace=st.text(alphabet=" \t\n", min_size=1, max_size=6),
+    uppercase=st.booleans(),
+)
+def test_prop_small_talk_ignores_case_punctuation_and_whitespace(
+    phrase: str, punctuation: str, whitespace: str, uppercase: bool
+) -> None:
+    """Normalization preserves an exact phrase despite case, punctuation, and whitespace changes."""
+    text = whitespace.join(punctuation.join(word) for word in phrase.split())
+    if uppercase:
+        text = text.upper()
+    assert programmatic_route(f"{whitespace}{punctuation}{text}{punctuation}{whitespace}") == "no_session"
 
 
 def test_five_live_questions_first_hop():

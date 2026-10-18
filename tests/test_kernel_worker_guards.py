@@ -163,21 +163,41 @@ class _JevRoute(JevClient):
 
 @pytest.mark.parametrize("rid", [None, 7, False, [], {}])
 def test_route_invalid_request_id_uses_protocol_placeholder(rid: JSONValue) -> None:
-    out = kw._route({"id": rid, "prompt": "hello"}, jev=_JevRoute("reasoning_required"))
+    out = kw._route({"id": rid, "prompt": "explain diversification"}, jev=_JevRoute("reasoning_required"))
     assert out == {"id": "?", "route": "reasoning_required", "personas": None}
 
 
 def test_route_reasoning_choice_returns_fast_path() -> None:
     out = kw._route(
-        {"id": "r1", "op": "route", "prompt": "hello"},
+        {"id": "r1", "op": "route", "prompt": "explain diversification"},
         jev=_JevRoute("reasoning_required"),
     )
     assert out == {"id": "r1", "route": "reasoning_required", "personas": None}
 
 
 def test_route_selector_outage_is_error_not_assumed_personas() -> None:
-    out = kw._route({"id": "r1", "op": "route", "prompt": "hello"}, jev=_JevRoute(fail=True))
+    out = kw._route({"id": "r1", "op": "route", "prompt": "explain diversification"}, jev=_JevRoute(fail=True))
     assert out == {"id": "r1", "error": "jev down"}
+
+
+@pytest.mark.parametrize(
+    ("req", "rid"),
+    [
+        ({"prompt": "hello"}, "?"),
+        ({"id": "r1", "prompt": "hello"}, "r1"),
+        ({"id": None, "prompt": "hello"}, "?"),
+        ({"id": 7, "prompt": "hello"}, "?"),
+        ({"id": False, "prompt": "hello"}, "?"),
+        ({"id": [], "prompt": "hello"}, "?"),
+        ({"id": {}, "prompt": "hello"}, "?"),
+    ],
+)
+def test_route_small_talk_needs_no_jev(monkeypatch: pytest.MonkeyPatch, req: dict[str, JSONValue], rid: str) -> None:
+    monkeypatch.delenv("STOCKBOT_TOOLFLOW", raising=False)
+    jev = _JevRoute(fail=True)
+    out = kw._route(req, jev=jev)
+    assert out == {"id": rid, "route": "no_session", "personas": None}
+    assert jev.seen == []
 
 
 def test_route_blank_prompt_needs_no_jev() -> None:
@@ -3336,7 +3356,7 @@ def test_route_caller_ticker_reaches_programmatic_hint(monkeypatch: pytest.Monke
     """Caller ticker grounds subject routing: hint wins over the JEV fallback."""
     monkeypatch.delenv("STOCKBOT_TOOLFLOW", raising=False)
     jev = _JevRoute("reasoning_required")
-    out = kw._route({"id": "r1", "op": "route", "prompt": "hello", "ticker": "NVDA"}, jev=jev)
+    out = kw._route({"id": "r1", "op": "route", "prompt": "explain diversification", "ticker": "NVDA"}, jev=jev)
     assert out == {"id": "r1", "route": "research_required", "personas": None}
 
 

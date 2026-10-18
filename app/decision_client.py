@@ -99,7 +99,7 @@ _SENTINEL_DESCRIPTIONS = {
 
 # Entry routing (JEV-before-kernel): fast-path + research sentinels framing the whole canonical registry.
 _ENTRY_OPTIONS = {
-    REASON_SENTINEL: "Answerable by reasoning/explanation from user-supplied context without new external evidence.",
+    REASON_SENTINEL: "Answerable by reasoning/explanation from user-supplied context without new external evidence. Also greetings, small talk, thanks, and questions about what the assistant can do.",
     "research_required": "Needs current/external facts, evidence retrieval, source verification, or tool execution.",
 }
 # Persona choice labels mirror needle-harness FINAL_PERSONAS order.
@@ -1289,7 +1289,7 @@ def _entry_questions(
         options = _entry_route_options(registry)
         questions["entry"] = {
             "type": "choice",
-            "instructions": f"Route this entry prompt with exactly one winner: {text}{scope} reasoning_required answers from user-supplied context with no new external evidence and no tool; a registry tool runs single-shot first when it fits; otherwise research_required. Research and thesis requests need research_required, not a single-shot tool. {_today_guidance()}",
+            "instructions": f"Route this entry prompt with exactly one winner: {text}{scope} reasoning_required answers from user-supplied context with no new external evidence and no tool; a registry tool runs single-shot first when it fits; otherwise research_required. Research and thesis requests need research_required, not a single-shot tool. Greetings and small talk with no company, ticker or market topic are reasoning_required, never research_required. {_today_guidance()}",
             "criteria": validate_json_mapping(options, "<decision_client>: 'criteria'"),
         }
         choice_options["entry"] = options

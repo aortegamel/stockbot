@@ -349,8 +349,8 @@ def _router_pick(
 
 
 def _SMALL_TALK(prompt: str) -> bool:
-    """Exact small-talk only: thanks / never mind / ok variants create no session."""
-    text = " ".join(prompt.strip().lower().split())
+    """Exact greetings and acknowledgements create no session after punctuation and space normalization."""
+    text = " ".join("".join(c for c in prompt.lower() if c.isalnum() or c.isspace()).split())
     return text in (
         "thanks",
         "thank you",
@@ -360,6 +360,27 @@ def _SMALL_TALK(prompt: str) -> bool:
         "okay",
         "got it",
         "great thanks",
+        "hello",
+        "hi",
+        "hey",
+        "hiya",
+        "yo",
+        "howdy",
+        "greetings",
+        "hello there",
+        "hi there",
+        "hey there",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "whats up",
+        "sup",
+        "how are you",
+        "thx",
+        "ty",
+        "cool",
+        "bye",
+        "goodbye",
     )
 
 
@@ -393,7 +414,7 @@ def _subject_route(prompt: str, norm: str, toks: set[str], ticker: str | None) -
 
 
 def programmatic_route(prompt: object, ticker: str | None = None) -> str | None:
-    """Entry fast-path: research signals -> research_required, else None (JEV decides)."""
+    """Route exact small talk, clocks, advice, and research signals. JEV decides other prompts."""
     from app.research.scheduler import _ACCESSION_TOKEN_RE
 
     if not isinstance(prompt, str) or not prompt.strip():

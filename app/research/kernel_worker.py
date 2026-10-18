@@ -1697,10 +1697,10 @@ def _log_route(rid: str, routed: Mapping[str, JSONValue], watchlist: list[str] |
 
 
 def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
-    """Entry route + JEV persona selection; zero session/DB.
+    """Select the entry route and personas without a session or database access.
 
-    Programmatic fast routes ride as route_hint (JEV still selects personas). Returns
-    {"id", "route", "personas"}; any selector/JEV failure returns {"id", "error"}, never an assumed persona set.
+    Exact small talk returns no_session without JEV. Other programmatic hints retain JEV persona selection.
+    Return {"id", "route", "personas"} on success or {"id", "error"} when JEV selection fails.
     """
     rid = _request_id(req)
     prompt = req.get("prompt")
@@ -1719,6 +1719,9 @@ def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[s
         from app.research.programmatic_router import programmatic_route
 
         hint = programmatic_route(prompt.strip(), ticker=ticker)
+    if hint == "no_session":
+        logger.info("toolflow route rid=%s route=no_session reason=small-talk", rid)
+        return {"id": rid, "route": "no_session", "personas": None}
     try:
         client = _jev_client(jev)
         routed = asyncio.run(
