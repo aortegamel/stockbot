@@ -106,6 +106,30 @@ def test_route_fast_path_marks_research():
     assert programmatic_route("hello", ticker="NVDA") == "no_session"
 
 
+@pytest.mark.parametrize(
+    ("prompt", "expected", "expected_requests"),
+    [
+        ("What drove NVDA revenue last quarter?", "research_required", ["NVDA"]),
+        ("hello", "no_session", []),
+    ],
+)
+def test_route_resolves_only_required_tickers(
+    prompt: str, expected: str, expected_requests: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Research resolves its ticker once. Ordinary greetings need no external resolution."""
+    import app.tools as _tools
+
+    requests: list[str] = []
+
+    def _resolve(name: str) -> str | None:
+        requests.append(name)
+        return _resolve_ticker(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
+    assert programmatic_route(prompt) == expected
+    assert requests == expected_requests
+
+
 def test_route_clock_and_advice_fast_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     """Clock asks single-shot; pure advice answers direct; mixed/insider asks research."""
     import app.tools as _tools

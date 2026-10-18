@@ -348,46 +348,49 @@ def _router_pick(
     )
 
 
+_SMALL_TALK_PHRASES = (
+    "thanks",
+    "thank you",
+    "never mind",
+    "nevermind",
+    "ok",
+    "okay",
+    "got it",
+    "great thanks",
+    "hello",
+    "hi",
+    "hey",
+    "hiya",
+    "yo",
+    "howdy",
+    "greetings",
+    "hello there",
+    "hi there",
+    "hey there",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "whats up",
+    "sup",
+    "how are you",
+    "thx",
+    "ty",
+    "cool",
+    "bye",
+    "goodbye",
+)
+
+
 def _SMALL_TALK(prompt: str) -> bool:
     """Exact greetings and acknowledgements create no session after punctuation and space normalization."""
+    text = " ".join("".join(c for c in prompt.lower() if c.isalnum() or c.isspace()).split())
+    if text not in _SMALL_TALK_PHRASES:
+        return False
     if "$" in prompt:
         return False
     from app.research.scheduler import _objective_ticker
 
-    if _objective_ticker(prompt) is not None:
-        return False
-    text = " ".join("".join(c for c in prompt.lower() if c.isalnum() or c.isspace()).split())
-    return text in (
-        "thanks",
-        "thank you",
-        "never mind",
-        "nevermind",
-        "ok",
-        "okay",
-        "got it",
-        "great thanks",
-        "hello",
-        "hi",
-        "hey",
-        "hiya",
-        "yo",
-        "howdy",
-        "greetings",
-        "hello there",
-        "hi there",
-        "hey there",
-        "good morning",
-        "good afternoon",
-        "good evening",
-        "whats up",
-        "sup",
-        "how are you",
-        "thx",
-        "ty",
-        "cool",
-        "bye",
-        "goodbye",
-    )
+    return _objective_ticker(prompt) is None
 
 
 def _advice_cue(norm: str, toks: set[str]) -> bool:
