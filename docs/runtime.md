@@ -683,6 +683,8 @@ appear in the worker log and do not replace the original result or error.
 The terminal clears its snapshot, journal, and sequence when the selected
 session changes. It ignores responses from the previous session.
 
+TradingView owns the timeframe and chart-style controls inside the embedded terminal chart.
+
 The research API uses an asynchronous Python subprocess with a 15-second
 timeout. Unknown sessions return HTTP 404. Import, database, execution, and
 bridge response errors return HTTP 502.

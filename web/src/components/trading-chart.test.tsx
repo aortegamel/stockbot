@@ -96,28 +96,6 @@ describe("TradingChart", () => {
     await until(() => frame(root)?.src.includes("symbol=AAPL") ?? false);
   });
 
-  test("every interval control issues a distinct widget source", async () => {
-    const root = await mount(<TradingChart sym="NVDA" />);
-    await until(() => frame(root) !== null);
-    const seen = new Set<string>();
-    for (const [label, param] of [["5M", "interval=5"], ["15M", "interval=15"], ["1H", "interval=60"], ["4H", "interval=240"], ["1D", "interval=D"], ["1W", "interval=W"]] as const) {
-      await click(control(root, label));
-      await until(() => (frame(root)?.src ?? "").includes(param));
-      expect(control(root, label).getAttribute("aria-pressed")).toBe("true");
-      seen.add(frame(root)?.src ?? "");
-    }
-    expect(seen.size).toBe(6);
-  });
-
-  test("the style toggle issues a distinct widget source", async () => {
-    const root = await mount(<TradingChart sym="NVDA" />);
-    await until(() => frame(root) !== null);
-    await click(control(root, "Line"));
-    await until(() => (frame(root)?.src ?? "").includes("style=2"));
-    await click(control(root, "Candles"));
-    await until(() => (frame(root)?.src ?? "").includes("style=1"));
-  });
-
   test("reports offline, empty-symbol, and widget-failure states with recovery", async () => {
     const empty = await mount(<TradingChart sym="  " />);
     expect(empty.querySelector('[role="alert"]')?.textContent).toContain("no symbol");
@@ -144,7 +122,7 @@ describe("TradingChart", () => {
     await until(() => frame(empty) !== null);
   });
 
-  test("a detached frame cannot fail the current chart after a symbol or interval replacement", async () => {
+  test("a detached frame cannot fail the current chart after a symbol replacement", async () => {
     const root = await mount(<TradingChart sym="NVDA" />);
     await until(() => frame(root) !== null);
     const bySymbol = frame(root);
@@ -158,17 +136,6 @@ describe("TradingChart", () => {
     });
     expect(root.querySelector('[role="alert"]')).toBeNull();
     expect((frame(root)?.src ?? "").includes("symbol=AAPL")).toBe(true);
-
-    const byInterval = frame(root);
-    if (!byInterval) throw new Error("missing interval frame");
-    await click(control(root, "1H"));
-    await until(() => (frame(root)?.src ?? "").includes("interval=60"));
-    expect(byInterval.isConnected).toBe(false);
-    await act(async () => {
-      byInterval.dispatchEvent(new dom.window.Event("error"));
-    });
-    expect(root.querySelector('[role="alert"]')).toBeNull();
-    expect((frame(root)?.src ?? "").includes("interval=60")).toBe(true);
   });
 
   test("a widget failure clears when the symbol changes", async () => {
