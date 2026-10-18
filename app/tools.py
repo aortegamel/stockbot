@@ -6093,19 +6093,33 @@ def _sec_search_result(args: dict[str, object], context: RequestContext) -> dict
 
 def _persist_search_envelope(result: SECSearchResult, context: RequestContext) -> None:
     """Persist the visible search packet when the provider path bypassed storage."""
-    request = result.request.to_dict()
-    coverage = result.coverage.to_dict()
+    try:
+        data = result.to_dict()
+    except AttributeError:
+        return
+    if not isinstance(data, dict):
+        return
+    request = _envelope_dict(data.get("request"))
+    coverage = _envelope_dict(data.get("coverage"))
+    search_id = data.get("search_id")
+    if not isinstance(search_id, str) or not search_id:
+        return
+    raw_hits = data.get("text_hits")
+    hits: list[dict[str, object]] = (
+        [hit for hit in raw_hits if isinstance(hit, dict)] if isinstance(raw_hits, (list, tuple)) else []
+    )
+    status = coverage.get("status")
     try:
         _research_repo_for(context).save_search(
             {
-                "search_id": result.search_id,
+                "search_id": search_id,
                 "query": request.get("query") or request.get("company_name"),
                 "request": request,
                 "scope": {key: request[key] for key in ("ticker", "cik", "forms") if request.get(key) is not None},
-                "hits": [hit.to_dict() for hit in result.text_hits],
+                "hits": hits,
                 "coverage": coverage,
-                "pagination_complete": coverage["status"] in ("complete", "complete_within_source_limits"),
-                "source_exhausted": result.request.exhaustive and coverage["status"] == "complete",
+                "pagination_complete": status in ("complete", "complete_within_source_limits"),
+                "source_exhausted": bool(request.get("exhaustive")) and status == "complete",
             }
         )
     except ValueError:
