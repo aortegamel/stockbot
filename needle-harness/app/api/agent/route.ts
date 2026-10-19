@@ -240,6 +240,13 @@ export async function POST(req: Request): Promise<Response> {
       };
       const tryEntryAnswer = async (winner: string): Promise<boolean> => {
         try {
+          if (winner === "clarify_subject") {
+            const t0 = performance.now();
+            send({ type: "agent_start", prompt });
+            send({ type: "answer_delta", text: "Which stock, ETF, sector, or holding do you want buying advice on? Give a ticker (for example NVDA) or a company name, and I will research it." });
+            send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures: {} } });
+            return true;
+          }
           if (winner === "no_session" || winner === "reasoning_required") return await answerDirect();
           // Only identifier-shaped tool names can enter the single-tool path.
           if (winner !== "research_required" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(winner)) return await answerSingleShot(winner);

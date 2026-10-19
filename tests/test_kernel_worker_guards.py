@@ -200,6 +200,45 @@ def test_route_small_talk_needs_no_jev(monkeypatch: pytest.MonkeyPatch, req: dic
     assert jev.seen == []
 
 
+@pytest.mark.parametrize("ticker", [None, "NVDA"])
+def test_route_missing_advice_subject_needs_no_jev(ticker: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("STOCKBOT_TOOLFLOW", raising=False)
+    jev = _JevRoute(fail=True)
+    with mock.patch.object(kw, "_jev_client", side_effect=AssertionError("clarification must not access JEV")):
+        out = kw._route(
+            {"id": "advice", "op": "route", "prompt": "can you give me buying advice", "ticker": ticker}, jev=jev
+        )
+    assert out == {"id": "advice", "route": "clarify_subject", "personas": None}
+    assert jev.seen == []
+
+
+@pytest.mark.parametrize(
+    ("prompt", "ticker", "hint"),
+    [
+        ("can you give me buying advice on NVDA", None, "research_required"),
+        ("can you give me buying advice on NVDA", "NVDA", "research_required"),
+        ("can you give me buying advice for Nvidia", None, "research_required"),
+        ("can you give me buying advice for Nvidia", "NVDA", "research_required"),
+        ("can you give me buying advice on bonds", None, None),
+        ("can you give me buying advice after CPI", None, None),
+    ],
+)
+def test_route_advice_with_content_retains_jev(
+    prompt: str, ticker: str | None, hint: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("STOCKBOT_TOOLFLOW", raising=False)
+
+    def _resolve(name: str) -> str | None:
+        return {"NVDA": "NVDA", "Nvidia": "NVDA"}.get(name)
+
+    monkeypatch.setattr("app.tools._resolve_company_to_ticker", _resolve)
+    jev = _JevRoute("research_required")
+    out = kw._route({"id": "advice", "prompt": prompt, "ticker": ticker}, jev=jev)
+    assert out == {"id": "advice", "route": "research_required", "personas": None}
+    assert len(jev.seen) == 1
+    assert jev.seen[0][1] == hint
+
+
 def test_route_blank_prompt_needs_no_jev() -> None:
     jev = _JevRoute("reasoning_required")
     out = kw._route({"id": "r1", "op": "route", "prompt": "  "}, jev=jev)

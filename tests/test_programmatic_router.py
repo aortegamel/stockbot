@@ -20,6 +20,7 @@ from app.research.programmatic_router import (
     _router_pick,
     _short_tool,
     _signals,
+    needs_subject,
     programmatic_route,
     programmatic_select_round,
 )
@@ -146,6 +147,104 @@ def test_route_clock_and_advice_fast_paths(monkeypatch: pytest.MonkeyPatch) -> N
     assert programmatic_route("should I buy NVDA") == "reasoning_required"
     assert programmatic_route("should I buy NVDA after its Q3 revenue") == "research_required"
     assert programmatic_route("did NVDA insiders sell") == "research_required"
+
+
+@pytest.mark.parametrize(
+    ("prompt", "ticker", "expected"),
+    [
+        ("can you give me buying advice", None, True),
+        ("can you give me buying advice", "NVDA", True),
+        ("What should I buy now?", None, True),
+        ("Please give me some good recommendations today.", None, True),
+        ("advice", None, True),
+        ("buying advice", "NVDA", True),
+        ("can you give me buying advice on NVDA", None, False),
+        ("can you give me buying advice on NVDA", "NVDA", False),
+        ("can you give me buying advice on bonds", None, False),
+        ("can you give me buying advice after CPI", None, False),
+        ("can you give me buying advice for Nvidia", None, False),
+        ("can you give me buying advice for Nvidia", "NVDA", False),
+        ("what should I do", None, False),
+        ("please", None, False),
+        ("", None, False),
+    ],
+)
+def test_needs_subject_requires_advice_without_other_content(
+    prompt: str, ticker: str | None, expected: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_ticker)
+    assert needs_subject(prompt, ticker) is expected
+    assert (programmatic_route(prompt, ticker) == "clarify_subject") is expected
+
+
+@pytest.mark.parametrize("subject_helper", ["_objective_ticker", "_objective_company"])
+def test_needs_subject_respects_scheduler_subject(subject_helper: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A scheduler subject prevents clarification even when only advice tokens remain."""
+
+    def _no_subject(prompt: object) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "_objective_ticker", _no_subject)
+    monkeypatch.setattr(scheduler, "_objective_company", _no_subject)
+    subject = "NVDA" if subject_helper == "_objective_ticker" else ("Nvidia", "NVDA")
+
+    def _resolved_subject(prompt: object) -> str | tuple[str, str]:
+        return subject
+
+    monkeypatch.setattr(scheduler, subject_helper, _resolved_subject)
+    assert not needs_subject("can you give me buying advice", None)
+
+
+@seed(20261018)
+@settings(max_examples=50, deadline=None)
+@given(
+    advice=st.sampled_from(
+        [
+            "buy",
+            "sell",
+            "hold",
+            "advice",
+            "recommend",
+            "recommendation",
+            "buying",
+            "selling",
+            "pick",
+            "picks",
+            "invest",
+            "investing",
+        ]
+    ),
+    filler=st.lists(
+        st.sampled_from(
+            [
+                "can",
+                "you",
+                "give",
+                "me",
+                "some",
+                "any",
+                "what",
+                "should",
+                "i",
+                "a",
+                "the",
+                "to",
+                "now",
+                "today",
+                "please",
+                "good",
+            ]
+        ),
+        max_size=8,
+    ),
+)
+def test_prop_advice_fillers_need_subject_but_content_does_not(advice: str, filler: list[str]) -> None:
+    prompt = " ".join([*filler, advice])
+    assert needs_subject(prompt, None)
+    for subject in ("NVDA", "bonds", "CPI", "energy", "portfolio"):
+        assert not needs_subject(f"{prompt} {subject}", None)
 
 
 @pytest.mark.parametrize(

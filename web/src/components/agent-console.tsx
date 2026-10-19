@@ -1,13 +1,17 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { AgentEvent, Evidence } from "../../../needle-harness/lib/agent/types";
+import { fetchSourceDocument } from "../lib/research-client";
+import { originalSourceUrl, safeSourceUrl } from "../lib/source-viewer";
 import { AgentEventView } from "./agent-event";
 import { SourcePanel } from "./source-panel";
 
+type AnswerPart = { text: string; citation?: Evidence };
+
 // ponytail: citations are exact Evidence.ids in brackets, never a parsed link scheme.
-function splitAnswer(answer: string, known: Map<string, Evidence>): { text: string; citation?: Evidence }[] {
+function splitAnswer(answer: string, known: Map<string, Evidence>): AnswerPart[] {
   const entries = [...known.keys()];
   if (entries.length === 0) return [{ text: answer }];
-  const parts: { text: string; citation?: Evidence }[] = [];
+  const parts: AnswerPart[] = [];
   const pattern = new RegExp(`\\[(${entries.map((id) => id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\]`, "g");
   let last = 0;
   answer.replace(pattern, (match, id, offset) => {
@@ -24,6 +28,30 @@ function evidenceById(events: AgentEvent[]): Map<string, Evidence> {
   // Each evidence event carries the full merged list, so the last one wins.
   const evidence = events.findLast((e) => e.type === "evidence")?.evidence ?? [];
   return new Map(evidence.map((entry) => [entry.id, entry]));
+}
+
+function useCitationUrls(parts: AnswerPart[]): Map<string, string | undefined> {
+  const requests = useRef(new Map<string, Promise<string | undefined>>());
+  const [urls, setUrls] = useState(new Map<string, string | undefined>());
+  useEffect(() => {
+    let active = true;
+    for (const part of parts) {
+      const reference = part.citation?.sources?.[0];
+      if (!reference || urls.has(reference.id)) continue;
+      let request = requests.current.get(reference.id);
+      if (!request) {
+        request = fetchSourceDocument(reference.id)
+          .then((source) => originalSourceUrl(source, true))
+          .catch(() => safeSourceUrl(reference.url));
+        requests.current.set(reference.id, request);
+      }
+      void request.then((url) => {
+        if (active) setUrls((current) => new Map(current).set(reference.id, url));
+      });
+    }
+    return () => { active = false; };
+  }, [parts, urls]);
+  return urls;
 }
 
 type SourceSelection = { evidenceId: string; position: number } | null;
@@ -49,6 +77,9 @@ export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[
   const [selected, setSelected] = useState<SourceSelection>(null);
   const known = evidenceById(events);
   const sourceControls = [...known.values()].filter((entry) => entry.sources?.length);
+  const answer = events.filter((e) => e.type === "answer_delta").map((e) => e.text).join("");
+  const parts = splitAnswer(answer, known);
+  const citationUrls = useCitationUrls(parts);
   if (events.length === 0) {
     return (
       <div className="flex-1 space-y-3 overflow-y-auto px-4 py-4 text-sm">
@@ -71,7 +102,6 @@ export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[
       </div>
     );
   }
-  const answer = events.filter((e) => e.type === "answer_delta").map((e) => e.text).join("");
   // Prod hides internal work rows; debug (.env STOCKBOT_DEBUG=1) shows all.
   // The evidence event stays out of prod rows: citations + source controls read it directly.
   const visible = debug ? events : events.filter((e) => e.type === "agent_start" || e.type === "answer_delta" || e.type === "reasoning_start" || e.type === "done" || e.type === "error" || e.type === "failed");
@@ -86,11 +116,15 @@ export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[
         <AgentEventView key={i} event={e} />
       ))}
       {streaming && <AgentEventView event={{ type: "reasoning_start", model: "stockbot" }} />}
-      {answer && <div className="whitespace-pre-wrap pt-2 text-zinc-100">{splitAnswer(answer, known).map((part, i) => {
+      {answer && <div className="whitespace-pre-wrap pt-2 text-zinc-100">{parts.map((part, i) => {
         const citation = part.citation;
-        return citation?.sources?.length
-          ? <button key={i} type="button" onClick={() => setSelected({ evidenceId: citation.id, position: 0 })} aria-label={`Open source for ${citation.id}`} className="rounded border border-blue-800 px-1 text-blue-300 underline decoration-dotted hover:bg-blue-950">{part.text}</button>
-          : <span key={i}>{part.text}</span>;
+        const reference = citation?.sources?.[0];
+        if (!citation || !reference) return <span key={i}>{part.text}</span>;
+        const url = citationUrls.has(reference.id) ? citationUrls.get(reference.id) : safeSourceUrl(reference.url);
+        const className = "rounded border border-blue-800 px-1 text-blue-300 underline decoration-dotted hover:bg-blue-950";
+        return url
+          ? <a key={i} href={url} target="_blank" rel="noopener noreferrer" aria-label={`Open source for ${citation.id}`} className={className}>{part.text}</a>
+          : <button key={i} type="button" onClick={() => setSelected({ evidenceId: citation.id, position: 0 })} aria-label={`Open source for ${citation.id}`} className={className}>{part.text}</button>;
       })}</div>}
       {sourceControls.length > 0 && <div className="flex flex-wrap gap-2 pt-2" role="group" aria-label="Captured sources">
         {sourceControls.map((entry) => (

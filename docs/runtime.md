@@ -87,6 +87,10 @@ A selected caller ticker does not override an exact greeting: `hello` with `tick
 `Hello!`, `thanks!!`, and `what's up?` use one short Stockbot reply without research, tools, or a session.
 Mixed requests such as `hello, what drove NVDA revenue last quarter?` still enter research.
 Persona greetings such as `hi bullbot` still reach JEV.
+In programmatic mode, advice with no subject in the prompt returns `clarify_subject` without JEV.
+The selected chart ticker does not supply the missing subject for this check.
+The matcher accepts only advice words and filler, so `should I buy bonds` still uses existing routing.
+The harness streams one fixed clarification with no research session, provider call, or tool call.
 For other requests, JEV returns `{route, personas}`.
 `personas: null` means the request neither selects nor excludes a persona.
 An explicit list is nonempty, unique, and canonical, in the order Stockbot, Bearbot, Bullbot.
@@ -263,6 +267,10 @@ Structured extraction keeps its native 512-token default and 1-4096 validation b
 The argument SDK receives no research evidence, raw tool results, or attempt history.
 Its context contains temporal anchors, the selected ticker, and explicitly grounded argument values.
 The server filters context fields before it binds the selected tool.
+Fresh nodes exclude `research_read` and `research_read_search` because they lack saved resource handles.
+If Needle rejects `search_web` through a tool mismatch or grounding error, the scheduler uses the node question.
+It trims that query to 200 characters without another generation.
+One deterministic Needle failure excludes its tool for the next round when another tool remains.
 Durable storage retains complete evidence records.
 JEV retains its evidence context outside the argument SDK.
 Downstream checks retain evidence for identifier validation and quote validation.

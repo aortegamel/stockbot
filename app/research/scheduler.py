@@ -322,14 +322,11 @@ _NO_EVIDENCE_ROUNDS = 2
 # mechanism itself, not research actions.
 _JEV_REGISTRY_EXCLUDED = frozenset({"call_tool", "browse_tools", "search_tools", "list_tool_domains", "describe_tool"})
 
-# research_start creates a NEW session so it can never advance the current
-# node (10x start/None loop in toolflow logs); research_read_search pages a
-# persisted search universe and needs its saved session/search pair (9x
-# read_search/None loop in toolflow logs); research_resume re-enters the node
-# itself so it can never advance it either (resume/None loop: Needle emits
-# None vs JEV pick every round). All stay in build_registry so entry/assess
-# paths are untouched; only the in-node context filters them.
-_NODE_INVALID_CONTROL_TOOLS = frozenset({"research_start", "research_read_search", "research_resume"})
+# research_start creates a new session. research_resume re-enters the current
+# node. Fresh nodes lack the resource handles that research_read and
+# research_read_search require. Keep these tools in build_registry for entry
+# and assessment paths, but exclude them from node selection.
+_NODE_INVALID_CONTROL_TOOLS = frozenset({"research_start", "research_read", "research_read_search", "research_resume"})
 
 
 # Required params that name an upstream handle (a prior tool's output) rather
@@ -1853,6 +1850,14 @@ def _fallback_sec_args(tool_name: str, objective: object) -> dict[str, JSONValue
     return _fallback_entity_accession(tool_name, objective)
 
 
+def _fallback_search_web_args(tool_name: str, node: object) -> dict[str, JSONValue] | None:
+    """Seed a web query from the node question without another generation."""
+    question = _f(node, "question", default=None)
+    if tool_name == "search_web" and isinstance(question, str) and question.strip():
+        return {"query": question.strip()[:200]}
+    return None
+
+
 def _revenue_listing_forms(objective: object) -> list[JSONValue] | None:
     """Keep explicit 10-Q requests separate from latest quarterly or annual revenue."""
     if _latest_revenue_objective(objective):
@@ -2527,7 +2532,7 @@ async def _generate_tool_arguments(
         return grounded
     try:
         generated = await _call_needle(needle_generate, tool_name, schema, objective, node, context)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         return _needle_failure_args(exc, tool_name, objective, session, node, evidence, attempts, sid, nid)
     needle_tool, generated_args, needle_reasoning, withheld = _split_generated(tool_name, generated)
     try:
@@ -2741,13 +2746,19 @@ async def _call_needle(
     return await _awaited(await asyncio.get_running_loop().run_in_executor(_TOOL_POOL, call))
 
 
-def _needle_failure_recoverable(tool_name: str, exc: RuntimeError) -> bool:
-    """Timeouts on carry tools and worker-down failures recover; anything else re-raises."""
+def _needle_failure_recoverable(tool_name: str, exc: RuntimeError | ValueError) -> bool:
+    """Recover known outages, carry timeouts, and web grounding failures."""
     low = str(exc).lower()
+    if isinstance(exc, ValueError):
+        return tool_name == "search_web" and "needle tool mismatch" in low
+    if "not grounded in the request" in low:
+        return tool_name == "search_web"
     if "timed out" in low or "timeout" in low:
         return tool_name in _ACCESSION_CARRY_TOOLS
     if "needle tool mismatch" in low:
         return True
+    if tool_name == "search_web":
+        return False
     return any(
         reason in low
         for reason in (
@@ -2761,7 +2772,7 @@ def _needle_failure_recoverable(tool_name: str, exc: RuntimeError) -> bool:
 
 
 def _needle_failure_args(
-    exc: RuntimeError,
+    exc: RuntimeError | ValueError,
     tool_name: str,
     objective: object,
     session: Mapping[str, JSONValue],
@@ -2791,7 +2802,7 @@ def _needle_failure_args(
                 nid,
                 "carried accession from packet after needle failure",
             )
-    seeded = _fallback_sec_args(tool_name, objective)
+    seeded = _fallback_search_web_args(tool_name, node) or _fallback_sec_args(tool_name, objective)
     if seeded is not None:
         logger.info(
             "toolflow args_seed sid=%s nid=%s tool=%s keys=%s err=%s",
@@ -2801,7 +2812,12 @@ def _needle_failure_args(
             ",".join(sorted(seeded)),
             str(exc)[:80],
         )
-        return seeded, "seeded SEC identifier from objective ticker after needle failure", False
+        reasoning = (
+            "seeded search query from node question after needle failure"
+            if tool_name == "search_web"
+            else "seeded SEC identifier from objective ticker after needle failure"
+        )
+        return seeded, reasoning, False
     if tool_name in ("search_sec_filings", "search_sec_filings_bounded"):
         raise _search_reselect(objective, f"needle failure ({str(exc)[:80]}) and no ticker resolves") from exc
     raise exc
@@ -2822,7 +2838,10 @@ def _withhold_args(
     sid: str,
     nid: str,
 ) -> tuple[dict[str, JSONValue], str, bool]:
-    """Recover args when Needle withheld the tool. A real mismatch re-raises with its log line."""
+    """Recover withheld arguments or a web mismatch. Other tool mismatches raise."""
+    web_args = _fallback_search_web_args(tool_name, node)
+    if web_args is not None:
+        return web_args, "seeded search query from node question after needle mismatch", False
     if needle_tool is None:
         current = generated_args if isinstance(generated_args, dict) else {}
         if _args_need_accession(tool_name, current):
@@ -5188,11 +5207,10 @@ def _four_of_five_tool(attempts: Sequence[Mapping[str, JSONValue]]) -> tuple[str
 def _rejected_tool(
     attempts: Sequence[Mapping[str, JSONValue]], select_registry: Sequence[dict[str, JSONValue]]
 ) -> tuple[str, str] | None:
-    """Tool whose arguments were just rejected, while other registry tools stay to pick.
+    """Drop a rejected tool for one round while alternatives remain.
 
-    The model produced an argument no request or source names, so an immediate
-    same-tool retry re-pays generation for the same rejection. Dropping lasts
-    one round only; a later round may pick it again with new grounding.
+    Deterministic Needle failures also reject the tool after one attempt.
+    Other failures retain the existing retry behavior.
     """
     if not attempts:
         return None
@@ -5200,12 +5218,16 @@ def _rejected_tool(
     rejected = last.get("tool")
     if not (isinstance(rejected, str) and rejected):
         return None
-    if last.get("error_type") != "reselect" or last.get("arguments") != {}:
+    error = str(last.get("error")).lower()
+    deterministic = "not grounded in the request" in error or (
+        "needle tool mismatch" in error and "needle emitted none" in error
+    )
+    if (last.get("error_type") != "reselect" and not deterministic) or last.get("arguments") != {}:
         return None
     names = [entry.get("name") for entry in select_registry]
-    if rejected not in names:
+    if not 0 < names.count(rejected) < len(names):
         return None
-    return (rejected, "reselect-1") if any(name != rejected for name in names) else None
+    return rejected, "reselect-1"
 
 
 def _hook_repo(hooks: Mapping[str, object]) -> ResearchRepository | Path | str | None:

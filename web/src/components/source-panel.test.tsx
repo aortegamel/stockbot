@@ -266,7 +266,7 @@ describe("SourcePanel", () => {
     expect(shownQuote(root)).toBe(projected);
     expect(markTexts(root)).toEqual(["Nvidia's ", "sales ", "soared", " & margins held.", "Getty Images", "Revenue dou"]);
     expect(root.querySelector('[aria-label="Captured source content"] strong em mark')?.textContent).toBe("soared");
-    expect(originalHref(root)).toBe(fragment(EXA.url ?? "", "Nvidia's sales soared & margins held. Getty Images Revenue dou"));
+    expect(originalHref(root)).toBe(`${EXA.url}#:~:text=Nvidia's%20sales%20soared%20%26%20margins,Revenue%20dou`);
     expect(root.textContent).toContain("sha256-of-raw-exa-body");
     expect(root.textContent).toContain("Provider extraction — not the original document");
   });
@@ -397,10 +397,92 @@ describe("SourcePanel", () => {
     expect(events).toEqual(["navigate:-1", "navigate:1", "close", "close"]);
   });
 
+  test("console citations load only the first cited source once and keep the source controls", async () => {
+    const source: SourceDocument = { ...TEXT, representation: "html", content: "<p>Revenue grew.</p><p>Margins held.</p>", quote: "Revenue grew.\nMargins held." };
+    const { promise: loaded, resolve: release } = Promise.withResolvers<void>();
+    const requests = serve({ body: source, gate: loaded }, { body: source });
+    const events: AgentEvent[] = [
+      {
+        type: "evidence", evidence: [
+          { id: "ev:cited", source: "sec", retrievedAt: "", content: "", sources: [{ id: source.id, url: "https://www.sec.gov/before-load" }, { id: "evidence:unused" }] },
+          { id: "ev:uncited", source: "sec", retrievedAt: "", content: "", sources: [{ id: "evidence:uncited" }] },
+        ]
+      },
+      { type: "answer_delta", text: "Revenue rose [ev:cited]. Margins held [ev:cited]." },
+    ];
+    const root = await mount(<AgentConsole events={events} reasoning={false} debug={false} />);
+    const anchors = () => [...root.querySelectorAll('a[aria-label="Open source for ev:cited"]')];
+    expect(anchors()).toHaveLength(2);
+    for (const anchor of anchors()) {
+      expect(anchor.getAttribute("href")).toBe("https://www.sec.gov/before-load");
+      expect(anchor.getAttribute("target")).toBe("_blank");
+      expect(anchor.getAttribute("rel")).toBe("noopener noreferrer");
+    }
+    expect(requests).toEqual([TEXT_URL]);
+    await act(async () => release());
+    await until(() => anchors().every((anchor) => anchor.getAttribute("href") === `${source.url}#:~:text=Revenue%20grew.,Margins%20held.`));
+    await act(async () => mounted?.render(<AgentConsole events={[...events, { type: "answer_delta", text: " More [ev:cited]." }]} reasoning={false} debug={false} />));
+    expect(anchors()).toHaveLength(3);
+    for (const anchor of anchors()) {
+      expect(anchor.getAttribute("href")).toBe(`${source.url}#:~:text=Revenue%20grew.,Margins%20held.`);
+      expect(anchor.getAttribute("target")).toBe("_blank");
+      expect(anchor.getAttribute("rel")).toBe("noopener noreferrer");
+    }
+    expect(requests).toEqual([TEXT_URL]);
+    expect(root.querySelector("aside")).toBeNull();
+    await click(root, "Sources: ev:cited");
+    await until(resolved(root));
+    expect(root.querySelector("aside h3")?.textContent).toBe("10-K");
+    expect(root.textContent).toContain("1 of 2");
+    expect(requests).toEqual([TEXT_URL, TEXT_URL]);
+  });
+
+  test("console citations without an original URL still open the captured source panel", async () => {
+    const source: SourceDocument = { ...TEXT, url: undefined };
+    const requests = serve({ body: source }, { body: source });
+    const events: AgentEvent[] = [
+      { type: "evidence", evidence: [{ id: "ev:no-url", source: "sec", retrievedAt: "", content: "", sources: [{ id: source.id }] }] },
+      { type: "answer_delta", text: "Revenue rose [ev:no-url]." },
+    ];
+    const root = await mount(<AgentConsole events={events} reasoning={false} debug={false} />);
+    expect(requests).toEqual([TEXT_URL]);
+    expect(root.querySelector('a[aria-label="Open source for ev:no-url"]')).toBeNull();
+    expect(root.querySelector('button[aria-label="Open source for ev:no-url"]')).not.toBeNull();
+    await click(root, "[ev:no-url]");
+    await until(resolved(root));
+    expect(root.querySelector("aside h3")?.textContent).toBe("10-K");
+    expect(requests).toEqual([TEXT_URL, TEXT_URL]);
+  });
+
+  test("console citations reject unsafe reference and loaded URLs", async () => {
+    for (const { url, referenceUrl } of [
+      { url: "javascript:alert(1)", referenceUrl: "javascript:alert(1)" },
+      { url: "https://user:secret@example.com/filing", referenceUrl: "https://user:secret@example.com/filing" },
+      { url: "javascript:alert(1)", referenceUrl: "https://www.sec.gov/filing" },
+    ]) {
+      const source: SourceDocument = { ...TEXT, url };
+      const { promise: loaded, resolve: release } = Promise.withResolvers<void>();
+      const requests = serve({ body: source, gate: loaded }, { body: source });
+      const events: AgentEvent[] = [
+        { type: "evidence", evidence: [{ id: "ev:unsafe", source: "sec", retrievedAt: "", content: "", sources: [{ id: source.id, url: referenceUrl }] }] },
+        { type: "answer_delta", text: "Revenue rose [ev:unsafe]." },
+      ];
+      const root = await mount(<AgentConsole events={events} reasoning={false} debug={false} />);
+      expect(root.querySelector('a[aria-label="Open source for ev:unsafe"]')?.getAttribute("href")).toBe(referenceUrl === "https://www.sec.gov/filing" ? referenceUrl : undefined);
+      await act(async () => release());
+      expect(root.querySelector('a[aria-label="Open source for ev:unsafe"]')).toBeNull();
+      await click(root, "[ev:unsafe]");
+      await until(resolved(root));
+      expect(originalHref(root)).toBeUndefined();
+      expect(requests).toEqual([TEXT_URL, TEXT_URL]);
+      await close();
+    }
+  });
+
   test("console navigation shows only the selected capture while loading and after failure", async () => {
     const next: SourceDocument = { ...TEXT, id: "evidence:panel:next", title: "8-K", content: "Margins fell sharply.", quote: "Margins fell" };
     const { promise: nextLoaded, resolve: releaseNext } = Promise.withResolvers<void>();
-    const requests = serve({ body: TEXT }, { body: next, gate: nextLoaded }, { body: { error: "source capture not found" }, status: 404 });
+    const requests = serve({ body: { ...TEXT, url: undefined } }, { body: TEXT }, { body: next, gate: nextLoaded }, { body: { error: "source capture not found" }, status: 404 });
     const events: AgentEvent[] = [
       { type: "agent_start", prompt: "risk?" },
       { type: "evidence", evidence: [{ id: "ev:abc123", source: "sec", retrievedAt: "2026-10-10T00:00:00Z", content: "", sources: [{ id: TEXT.id }, { id: next.id }, { id: "evidence:panel:missing" }] }] },
@@ -430,7 +512,7 @@ describe("SourcePanel", () => {
     expect(failed).not.toContain("8-K");
     expect(root.querySelector("aside h3")).toBeNull();
     expect(root.querySelector("aside mark")).toBeNull();
-    expect(requests).toEqual([TEXT_URL, "/api/research/sources/evidence%3Apanel%3Anext", "/api/research/sources/evidence%3Apanel%3Amissing"]);
+    expect(requests).toEqual([TEXT_URL, TEXT_URL, "/api/research/sources/evidence%3Apanel%3Anext", "/api/research/sources/evidence%3Apanel%3Amissing"]);
   });
 
   test("rejects a provider-extracted PDF before it reaches the PDF renderer", async () => {

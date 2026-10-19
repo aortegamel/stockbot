@@ -32,6 +32,37 @@ _TOP_N = 5
 _SHORT_TOKS = frozenset({"betting", "short", "shorting", "shorted", "bearish"})
 _INSIDER_TOKS = frozenset({"insider", "executive", "traded", "trading", "bought", "sold"})
 _ADVICE_VERBS = frozenset({"buy", "sell", "hold"})
+_SUBJECT_ADVICE_TOKS = _ADVICE_VERBS | {
+    "advice",
+    "recommend",
+    "recommendation",
+    "buying",
+    "selling",
+    "pick",
+    "picks",
+    "invest",
+    "investing",
+}
+_SUBJECT_FILLER_TOKS = frozenset(
+    {
+        "can",
+        "you",
+        "give",
+        "me",
+        "some",
+        "any",
+        "what",
+        "should",
+        "i",
+        "a",
+        "the",
+        "to",
+        "now",
+        "today",
+        "please",
+        "good",
+    }
+)
 _PLANNED_TOKS = frozenset({"planned", "proposed", "144"})
 _EXECUTED_TOKS = frozenset({"executed", "actual", "actually", "trade", "traded", "sell", "sold", "sale"})
 _READ_TOKS = frozenset({"revenue", "read", "text", "says", "mention", "section", "risk", "document"})
@@ -410,6 +441,16 @@ def _has_subject(prompt: str, ticker: str | None) -> bool:
     return _objective_ticker(prompt) is not None or _objective_company(prompt) is not None or ticker is not None
 
 
+def needs_subject(prompt: str, ticker: str | None) -> bool:
+    """Clarify advice without a prompt subject. The selected ticker does not supply a subject."""
+    _, toks = _signals(prompt)
+    return (
+        bool(toks & _SUBJECT_ADVICE_TOKS)
+        and not toks.difference(_SUBJECT_ADVICE_TOKS, _SUBJECT_FILLER_TOKS)
+        and not _has_subject(prompt, None)
+    )
+
+
 def _subject_route(prompt: str, norm: str, toks: set[str], ticker: str | None) -> str | None:
     """Advice needs a resolved subject and no research token; a subject alone routes research."""
     # Advice yields only to research tokens; "reg sho"/"betting against" phrases do not override it.
@@ -434,6 +475,8 @@ def programmatic_route(prompt: object, ticker: str | None = None) -> str | None:
     # Pure clock question wins on the original prompt even with a selected ticker.
     if _clock_ask(toks):
         return "get_current_time"
+    if needs_subject(prompt, ticker):
+        return "clarify_subject"
     if _ACCESSION_TOKEN_RE.search(prompt) is not None:
         return "research_required"
     return _subject_route(prompt, norm, toks, ticker)

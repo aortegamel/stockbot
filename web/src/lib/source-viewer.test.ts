@@ -115,7 +115,7 @@ describe("source URLs", () => {
 
   test("resolved HTML quotes add a text fragment inside Open original", () => {
     const url = originalSourceUrl(document({ quote: "Revenue grew" }), true);
-    expect(url).toContain(":~:text=Revenue%20grew");
+    expect(url).toBe(`${document().url}#:~:text=Revenue%20grew`);
     expect(url?.startsWith("https://www.sec.gov/")).toBe(true);
   });
 
@@ -136,11 +136,47 @@ describe("source URLs", () => {
     expect(safeSourceUrl("https://:secret@example.com/")).toBeUndefined();
   });
 
-  test("text fragments collapse quote whitespace and append to the URL", () => {
-    const source = document({ quote: "  Revenue \n  grew  " });
+  test("text fragments collapse single-line whitespace and preserve an existing anchor", () => {
+    const source = document({ quote: "  Revenue \t  grew  " });
     expect(originalSourceUrl(source, true)).toBe(`${source.url}#:~:text=Revenue%20grew`);
     const anchored = document({ url: "https://www.sec.gov/a.htm#item7", quote: "Revenue grew" });
     expect(originalSourceUrl(anchored, true)).toBe("https://www.sec.gov/a.htm#item7:~:text=Revenue%20grew");
+  });
+
+  test("multiline quotes select the first and last five words from nonempty lines", () => {
+    const source = document({ quote: "\n \r\nYear-over-year revenue, profit & cash rose sharply.\r\n\nCosts decreased.\nThe board expects steady growth, margins & buy-backs.\n " });
+    expect(originalSourceUrl(source, true)).toBe(`${source.url}#:~:text=Year%2Dover%2Dyear%20revenue%2C%20profit%20%26%20cash,steady%20growth%2C%20margins%20%26%20buy%2Dbacks.`);
+  });
+
+  test("short multiline quotes still use a range", () => {
+    const source = document({ quote: "Revenue\n grew" });
+    expect(originalSourceUrl(source, true)).toBe(`${source.url}#:~:text=Revenue,grew`);
+  });
+
+  test("normalized length selects a range only above 80 characters", () => {
+    const quote = `Alpha beta gamma delta ${"x".repeat(28)} epsilon zeta eta theta omega`;
+    expect(quote.length).toBe(80);
+    expect(originalSourceUrl(document({ quote }), true)).toBe(`${document().url}#:~:text=${encodeURIComponent(quote)}`);
+    const long = `${quote}!`;
+    expect(originalSourceUrl(document({ quote: long }), true)).toBe(`${document().url}#:~:text=Alpha%20beta%20gamma%20delta%20${"x".repeat(28)},epsilon%20zeta%20eta%20theta%20omega!`);
+    expect(originalSourceUrl(document({ quote: quote.replaceAll(" ", "   ") }), true)).toBe(`${document().url}#:~:text=${encodeURIComponent(quote)}`);
+  });
+
+  test("fragment components encode directive separators inside a short quote", () => {
+    const source = document({ quote: "Profit-margin, R&D" });
+    expect(originalSourceUrl(source, true)).toBe(`${source.url}#:~:text=Profit%2Dmargin%2C%20R%26D`);
+  });
+
+  test("range components preserve words without creating extra fragment directives", () => {
+    const words = fc.array(fc.constantFrom("net-income", "R&D", "revenue,", "margin", "growth"), { minLength: 1, maxLength: 10 });
+    fc.assert(fc.property(words, words, (first, last) => {
+      const quote = `${first.join(" ")}\n${last.join(" ")}`;
+      const directive = originalSourceUrl(document({ quote }), true)?.split(":~:text=")[1] ?? "";
+      const components = directive.split(",");
+      expect(components).toHaveLength(2);
+      expect(components.every((component) => !/[-&]/u.test(component))).toBe(true);
+      expect(components.map(decodeURIComponent)).toEqual([first.slice(0, 5).join(" "), last.slice(-5).join(" ")]);
+    }), { seed: 20261018, numRuns: 100 });
   });
 
   test("text fragments apply only to safe HTML sources with a quote", () => {

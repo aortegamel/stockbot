@@ -519,10 +519,10 @@ def test_research_cue_single_signals_route_research() -> None:
     assert programmatic_route("funds are betting against it") == "research_required"
 
 
-def test_subject_route_uses_caller_ticker() -> None:
+def test_advice_requires_prompt_subject_but_other_routes_use_caller_ticker() -> None:
     from app.research.programmatic_router import programmatic_route
 
-    assert programmatic_route("should I buy it", ticker="GME") == "reasoning_required"
+    assert programmatic_route("should I buy it", ticker="GME") == "clarify_subject"
     assert programmatic_route("how is it doing", ticker="GME") == "research_required"
     assert programmatic_route("how is it doing") is None
 

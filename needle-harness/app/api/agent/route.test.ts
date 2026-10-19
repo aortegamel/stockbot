@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 import { FINAL_PERSONAS, type Evidence } from "@/lib/agent/types";
 // Real validator captured before mock.module replaces the kernel exports; route.ts must see the production rule.
 import { asksWatchlist, parseTicker, parseWatchlist } from "@/lib/agent/kernel";
@@ -33,6 +33,7 @@ type KernelCall = { op?: unknown; tool?: unknown; prompt?: unknown; objective?: 
 const kernelCalls: KernelCall[] = [];
 const invoked: unknown[][] = [];
 const ended: string[] = [];
+let sessionsCreated = 0;
 
 let emitProgress = false;
 let emitEvidence = false;
@@ -96,7 +97,10 @@ mock.module("@/lib/tools/stockbot", () => ({
     if (toolFailure !== null) return { ok: false, ...toolFailure };
     return { ok: true, evidence: { ...bridgeEvidence, source: name } };
   },
-  newSessionId: () => "sess-test",
+  newSessionId: () => {
+    sessionsCreated += 1;
+    return "sess-test";
+  },
   endSession: async (id: string) => {
     ended.push(id);
     if (endThrows) throw new Error("session cleanup failed");
@@ -125,6 +129,7 @@ function reset(): void {
   kernelCalls.length = 0;
   invoked.length = 0;
   ended.length = 0;
+  sessionsCreated = 0;
   process.env.STOCKBOT_DEBUG = "1";
   process.env.OPENCODE_MODEL = "test-model";
 }
@@ -157,6 +162,61 @@ function metricCalls(events: AgentEventShape[], key: string): unknown {
 }
 
 describe("agent entry route", () => {
+  test("clarify_subject streams a fixed answer without reasoning, tools, research, or sessions", async () => {
+    for (const [debug, ticker] of [["1", undefined], ["", "NVDA"]] as const) {
+      reset();
+      process.env.STOCKBOT_DEBUG = debug;
+      delete process.env.OPENCODE_MODEL;
+      winner = "clarify_subject";
+      const prompt = "can you give me buying advice";
+      const now = spyOn(performance, "now").mockReturnValueOnce(100).mockReturnValue(125);
+      try {
+        const events = await eventsFor(prompt, ticker);
+        expect(events).toEqual([
+          { type: "agent_start", prompt },
+          { type: "answer_delta", text: "Which stock, ETF, sector, or holding do you want buying advice on? Give a ticker (for example NVDA) or a company name, and I will research it." },
+          {
+            type: "done",
+            metrics: {
+              totalMs: 25,
+              needle: { calls: 0, totalMs: 0, escalations: 0 },
+              tools: { calls: 0, totalMs: 0 },
+              muse: { calls: 0, totalMs: 0 },
+              evidence: { count: 0, characters: 0 },
+              failures: {},
+            },
+          },
+        ]);
+        expect(kernelCalls).toEqual([{ op: "route", prompt, ...(ticker ? { ticker } : {}) }]);
+        expect(reasonCalls).toEqual([]);
+        expect(runCalls).toEqual([]);
+        expect(invoked).toEqual([]);
+        expect(sessionsCreated).toBe(0);
+        expect(ended).toEqual([]);
+      } finally {
+        now.mockRestore();
+      }
+    }
+  });
+
+  test("clarify_subject with explicit personas preserves research dispatch", async () => {
+    reset();
+    winner = "clarify_subject";
+    personas = ["stockbot"];
+    emitProgress = true;
+    const prompt = "Stockbot, what should I buy?";
+    const events = await eventsFor(prompt);
+    expect(events).toEqual([{ type: "progress", stage: "intake_done", detail: { calls: 3 } }]);
+    expect(runCalls).toHaveLength(1);
+    expect(runCalls[0]?.[0]).toBe(prompt);
+    expect(runCalls[0]?.[2]).toMatchObject({ personas: ["stockbot"] });
+    expect(kernelCalls).toEqual([{ op: "route", prompt }]);
+    expect(reasonCalls).toEqual([]);
+    expect(invoked).toEqual([]);
+    expect(sessionsCreated).toBe(0);
+    expect(ended).toEqual([]);
+  });
+
   test("reasoning_required answers direct without tools or research", async () => {
     reset();
     const types = (await eventsFor("hello")).map((e) => e.type);

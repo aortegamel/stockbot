@@ -55,7 +55,13 @@ Needle routes, Bun orchestrates, tools retrieve, Muse reasons, Vite displays.
 
 ### Captured evidence
 
-Citation buttons open an immutable source capture beside the answer.
+Answer citations open the original page in a new tab when the source supplies a safe HTTP or HTTPS URL.
+The browser fetches each cited source once per console instance to add its quote fragment.
+Long quotes and multiline quotes use a text range across the first and last five words.
+The browser can highlight that range across paragraph boundaries if the original page still contains it.
+Short, single-line quotes keep a single text fragment.
+Without a safe URL, the citation opens the immutable source capture beside the answer.
+The `Sources: …` controls still open that capture.
 The server creates every source ID. The browser never builds one.
 
 - `capture:<sha256>` names a capture that the bridge archived after the runtime accepted a tool result.

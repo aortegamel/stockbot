@@ -1134,13 +1134,17 @@ def test_node_selection_excludes_recursive_research_controls() -> None:
                 {"name": "research_resume", "parameters": {}},
                 {"name": "research_start", "parameters": {}},
                 {"name": "research_read_search", "parameters": {}},
+                {"name": "research_read", "parameters": {}},
                 {"name": "query_finra", "parameters": {}},
             ],
             tool_session=_tool_session(),
         )
     )
     assert seen and all("query_finra" in names for names in seen)
-    assert all(not names.intersection({"research_resume", "research_start"}) for names in seen)
+    assert all(
+        not names.intersection({"research_resume", "research_start", "research_read", "research_read_search"})
+        for names in seen
+    )
     assert out["status"] == "resolved" and out["admitted"] == 1
 
 
@@ -1231,8 +1235,9 @@ def test_repeated_winner_drop_triggers_on_4_of_5() -> None:
     assert out["status"] == "blocked" and out["incomplete_guard"] is True
 
 
-def test_ungrounded_reselect_drops_tool_for_next_round_only() -> None:
-    """An ungrounded-argument reselect excludes that tool next round; later rounds may retry it."""
+@pytest.mark.parametrize("failure", ["ungrounded_argument", "withheld", "runtime_withheld", "grounding"])
+def test_ungrounded_reselect_drops_tool_for_next_round_only(failure: str) -> None:
+    """One deterministic rejection excludes the tool next round. Later rounds can select it again."""
     seen: list[list[str]] = []
     real_select = sched._select_round
 
@@ -1269,6 +1274,12 @@ def test_ungrounded_reselect_drops_tool_for_next_round_only() -> None:
 
     async def fake_gen(**kw: object) -> dict[str, JSONValue]:
         if kw["tool"] == "get_xbrl_facts":
+            if failure == "withheld":
+                return {"tool": None, "arguments": {}}
+            if failure == "runtime_withheld":
+                raise RuntimeError("needle tool mismatch: jev selected 'get_xbrl_facts', needle emitted None")
+            if failure == "grounding":
+                raise RuntimeError("needle arguments are not grounded in the request")
             return {
                 "tool": "get_xbrl_facts",
                 "arguments": {"ticker": "NVDA", "concept": "instruction"},
@@ -1307,7 +1318,7 @@ def test_ungrounded_reselect_drops_tool_for_next_round_only() -> None:
     assert "get_xbrl_facts" in seen[2]
     attempts = out["attempts"]
     assert isinstance(attempts, list) and isinstance(attempts[0], dict)
-    assert attempts[0]["error_type"] == "reselect"
+    assert attempts[0]["error_type"] == ("reselect" if failure == "ungrounded_argument" else "tool_error")
     assert attempts[0]["arguments"] == {}
 
 
@@ -1835,6 +1846,103 @@ def test_relative_tradedate_scrubbed_to_wtd_omit() -> None:
         )
     )
     assert kept == {"ticker": "AAPL", "tradeDate": "2026-09-22"}
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["withheld", "foreign_tool", "runtime_mismatch", "value_mismatch", "grounding"],
+)
+def test_search_web_fallback_uses_node_question_once(failure: str) -> None:
+    """Web recovery uses the trimmed node question, not the session objective or generated arguments."""
+    calls: list[str] = []
+    question = "  Which segment drove the margin change? " + "x" * 220 + "  "
+    node = dataclasses.replace(_node(), question=question)
+
+    async def generate(**kw: object) -> dict[str, JSONValue]:
+        calls.append(str(kw["tool"]))
+        if failure == "runtime_mismatch":
+            raise RuntimeError("needle tool mismatch: jev selected 'search_web', needle emitted None")
+        if failure == "value_mismatch":
+            raise ValueError("needle tool mismatch: jev selected 'search_web', needle emitted None")
+        if failure == "grounding":
+            raise RuntimeError("needle arguments are not grounded in the request")
+        return {
+            "tool": None if failure == "withheld" else "get_sec_document",
+            "arguments": {"query": "Unrelated company news", "limit": 99},
+        }
+
+    args, reasoning, withheld = asyncio.run(
+        sched._generate_tool_arguments(
+            generate,
+            "search_web",
+            [],
+            {"session_id": "s1", "objective": "Explain the full investment thesis."},
+            node,
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
+    )
+    assert args == {"query": question.strip()[:200]}
+    assert calls == ["search_web"]
+    assert "node question" in reasoning
+    assert withheld is False
+
+
+@pytest.mark.parametrize("question", [None, "", "   ", 12])
+def test_search_web_fallback_requires_nonblank_node_question(question: object) -> None:
+    """Web recovery does not invent a query when the node lacks a question."""
+
+    async def generate(**kw: object) -> dict[str, JSONValue]:
+        return {"tool": None, "arguments": {}}
+
+    with pytest.raises(ValueError, match="needle tool mismatch"):
+        asyncio.run(
+            sched._generate_tool_arguments(
+                generate,
+                "search_web",
+                [],
+                {"session_id": "s1", "objective": "Do not use this objective as the query."},
+                {"node_id": "n1", "question": question},
+                [],
+                [],
+                None,
+                _Kernel(),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "message"),
+    [
+        ("search_web", "provider connection failed"),
+        ("search_web", "needle worker closed"),
+        ("search_web", "needle timed out"),
+        ("get_sec_filing", "needle arguments are not grounded in the request"),
+        ("list_sec_filings", "needle arguments are not grounded in the request"),
+    ],
+)
+def test_search_web_fallback_preserves_other_generation_errors(tool_name: str, message: str) -> None:
+    """Only web grounding failures recover. Other generation errors still raise."""
+
+    async def generate(**kw: object) -> dict[str, JSONValue]:
+        raise RuntimeError(message)
+
+    with pytest.raises(RuntimeError, match=message):
+        asyncio.run(
+            sched._generate_tool_arguments(
+                generate,
+                tool_name,
+                [],
+                {"session_id": "s1", "objective": "Read NVDA filing history."},
+                _node(),
+                [],
+                [],
+                None,
+                _Kernel(),
+            )
+        )
 
 
 def test_sec_withhold_falls_back_to_objective_ticker_latest(
@@ -5632,6 +5740,36 @@ def test_round_registry_drops_the_loop_shape(caplog: pytest.LogCaptureFixture) -
     rejected: list[dict[str, JSONValue]] = [{"tool": "query_finra", "error_type": "reselect", "arguments": {}}]
     assert _round_drops(registry, rejected, caplog) == (["search_web"], ["tool=query_finra fails=reselect-1"])
     assert _round_drops([{"name": "query_finra"}], rejected, caplog) == (["query_finra"], [])
+
+
+@pytest.mark.parametrize(
+    ("error", "drops"),
+    [
+        ("needle tool mismatch: jev selected 'query_finra', needle emitted None", True),
+        ("needle arguments are not grounded in the request", True),
+        ("needle tool mismatch: jev selected 'query_finra', needle emitted 'search_web'", False),
+        ("needle timed out", False),
+        ("provider connection failed", False),
+    ],
+)
+def test_round_registry_drops_one_deterministic_failure_only(
+    error: str, drops: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One deterministic Needle failure excludes its tool. Transient errors preserve the registry."""
+    registry: list[dict[str, JSONValue]] = [{"name": "query_finra"}, {"name": "search_web"}]
+    attempts: list[dict[str, JSONValue]] = [
+        {"tool": "query_finra", "error_type": "tool_error", "error": error, "arguments": {}}
+    ]
+    expected: tuple[list[str], list[str]] = (
+        (["search_web"], ["tool=query_finra fails=reselect-1"])
+        if drops
+        else (
+            ["query_finra", "search_web"],
+            [],
+        )
+    )
+    assert _round_drops(registry, attempts, caplog) == expected
+    assert _round_drops(registry[:1], attempts, caplog) == (["query_finra"], [])
 
 
 def test_round_registry_drops_looping_and_rejected_tools_together(caplog: pytest.LogCaptureFixture) -> None:
