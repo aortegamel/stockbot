@@ -9,6 +9,8 @@ pytest==9.1.1
 # Real-browser offline regressions use the local Chromium and ChromeDriver.
 selenium==4.51.0
 mcp==2.3.0
+# Needle runtime shares the root Python environment.
+cactus-needle==3.0.1
 pyrefly==1.2.0
 PyYAML==6.0.3
 types-PyYAML==6.0.12.20260906

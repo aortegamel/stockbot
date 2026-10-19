@@ -2,7 +2,7 @@
   "name": "stockbot",
   "private": true,
   "scripts": {
-    "setup": "python3.14 -m venv venv && venv/bin/pip install --upgrade pip && venv/bin/pip install -r requirements.txt",
+    "setup": "uv venv --managed-python --seed --allow-existing venv && venv/bin/pip install --upgrade pip && venv/bin/pip install -r requirements.txt",
     "test": "venv/bin/pytest && bun run test:ts && (cd needle-harness && bun test) && (cd web && bun test)",
     "test:ts": "bun test decision/",
     "test:browser": "venv/bin/pytest tests/test_browser_ui.py -q",

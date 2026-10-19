@@ -17,7 +17,6 @@ import os
 import select
 import signal
 import subprocess
-import sys
 import threading
 import uuid
 from collections.abc import Callable, Sequence
@@ -155,11 +154,7 @@ def _server() -> Path:
 
 
 def _python() -> str:
-    # Mirror of VENV_PYTHON in needle-harness/lib/needle/client.ts.
-    venv = Path(os.path.expanduser("~/.cache/needle-harness/.needle/bin/python"))
-    if venv.exists():
-        return str(venv)
-    return sys.executable
+    return str(Path(__file__).resolve().parent.parent / "venv" / "bin" / "python")
 
 
 def _ensure_weights() -> None:

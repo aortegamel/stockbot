@@ -419,7 +419,7 @@ The Reasoner keeps its separate `OPENCODE_*` settings.
 starts this file. The harness uses its own workspace and manifest.
 The web project pattern includes CSS files, so Knip resolves CSS imports.
 
-Knip treats `python3.14`, `poly-crap`, `gitleaks`, `osv-scanner`, and
+Knip treats `uv`, `poly-crap`, `gitleaks`, `osv-scanner`, and
 `llama-server` as external executables. Package dependencies do not provide
 these executables.
 
@@ -427,8 +427,10 @@ The launcher starts the Bun API host by its absolute path
 (`needle-harness/scripts/api.ts`). The working directory stays `needle-harness`.
 Kernel types without outside users stay local to `kernel.ts`.
 
-`needle-harness/scripts/setup-needle.sh` creates the Needle venv with
-`python3.14`, not the moving `python3` alias.
+The project uses one root `venv/` with uv-managed Python 3.14.
+`bun run setup` reads `.python-version` and installs all requirements, including `cactus-needle`.
+Stockbot and Needle use `venv/bin/python` without a system-Python fallback.
+Docker runs the same setup in `/app`.
 
 The guided SEC accession errors carry the tool name in a `tool` key. The error
 text and self-correcting hint stay unchanged. The tool-health gate reads this

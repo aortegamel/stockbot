@@ -34,7 +34,7 @@ NVDA's 12.5% OpenAI exposure is quoted verbatim from `ev-nvda-10k`; code compute
 
 ## Requirements
 
-- Python 3.14
+- uv (installs and manages Python 3.14)
 - An SEC EDGAR identity for SEC requests
 - A working Pi setup for model inference (Stockbot shells to `pi`)
 - Bun (task runner) — `package.json` scripts are zero-dependency wrappers around Python tooling; required for `bun run setup`, `bun run test`, `bun run verify`.
@@ -46,6 +46,10 @@ cp .env.example .env
 # Fill only the credentials for integrations you intend to use.
 bun run setup
 ```
+
+`bun run setup` reads `.python-version` and creates the only Python environment at `venv/`.
+Stockbot, Needle, and all Python tools use this environment.
+The setup installs their shared dependencies from `requirements.txt`.
 
 Offline tests do not need FINRA, Robinhood, or SEC credentials.
 

@@ -4,18 +4,21 @@ Local routing (Cactus Needle 3), remote reasoning (Muse Spark via OpenCode Go AP
 
 ## 1. Requirements
 
-- Bun 1.4.2, Python 3 with `cactus-needle`, repo-root `needle3.cact` weights
+- Bun 1.4.2, uv, and the repo-root `needle3.cact` weights
 - `SEC_EDGAR_IDENTITY="Name email@example.com"` in the repo-root `.env` for SEC tools
 
 ## 2. Setup
 
 ```bash
-bash scripts/setup-needle.sh
+bun run --cwd .. setup
 bun install
 # Set OPENCODE_API_KEY in the repo-root ../.env (value from ../scripts/host/pi-opencode-go-secret).
 # Do not export it: an empty OPENCODE_API_KEY="" in ../.env replaces any shell export.
 # Set SEC_EDGAR_IDENTITY="Name email@example.com" in the repo-root ../.env.
 ```
+
+Stockbot and Needle share the repository-root `venv/`.
+The harness does not create a separate Python environment.
 
 ## 3. Env vars
 

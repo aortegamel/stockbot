@@ -1,9 +1,11 @@
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { fingerprintKey } from "@/lib/env";
 
 export async function GET(): Promise<Response> {
+  const root =
+    process.env.STOCKBOT_REPO_ROOT ??
+    (process.cwd().endsWith("needle-harness") ? process.cwd().replace(/\/needle-harness$/, "") : process.cwd());
   const needleWeights = process.env.NEEDLE_WEIGHTS ?? null;
   const opencodeKey = process.env.OPENCODE_API_KEY ?? "";
   const weightsPresent =
@@ -15,7 +17,7 @@ export async function GET(): Promise<Response> {
       hasOpencodeKey: Boolean(opencodeKey),
       needleWeights,
       weightsPresent,
-      venvPresent: existsSync(`${homedir()}/.cache/needle-harness/.needle/bin/python`),
+      venvPresent: existsSync(join(root, "venv/bin/python")),
       // Best-effort: set by the Bun host after prewarmKernel().
       // Env-only so health never pulls the kernel singleton into its module graph.
       kernelPrewarmed: process.env.KERNEL_PREWARMED === "1",

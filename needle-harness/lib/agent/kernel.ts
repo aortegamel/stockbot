@@ -1,6 +1,4 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { reason, type MuseUsage } from "../muse/client";
 import { FINAL_PERSONAS, redactArgs, sourceReferences } from "./types";
@@ -19,11 +17,10 @@ const WORKER_TIMEOUT_MS = 10 * 60 * 1000;
 export const REQUEST_WALL_MS = 120_000;
 const PREWARM_TIMEOUT_MS = 120_000;
 
-// Bun host runs with cwd=needle-harness; the repo root is its parent.
-const ROOT = process.env.STOCKBOT_REPO_ROOT ?? join(process.cwd(), "..");
+const ROOT =
+  process.env.STOCKBOT_REPO_ROOT ??
+  (process.cwd().endsWith("needle-harness") ? process.cwd().replace(/\/needle-harness$/, "") : process.cwd());
 const WORKER = join(ROOT, "app/research/kernel_worker.py");
-const VENV_PYTHON = `${homedir()}/.cache/needle-harness/.needle/bin/python`;
-// Stockbot kernel needs repo deps (dotenv, app.*); the needle-only venv lacks them.
 const REPO_PYTHON = join(ROOT, "venv/bin/python");
 const TICKER_RE = /^[A-Z][A-Z0-9.\-]{0,9}$/;
 const TICKER_ORG: Record<string, true> = { FINRA: true, SEC: true, NYSE: true, NASDAQ: true, OTC: true, EDGAR: true, SHO: true, REG: true };
@@ -347,7 +344,7 @@ export class KernelRouter {
   private readonly spawnFn: KernelSpawn;
 
   constructor(opts?: { python?: string; workerPath?: string; spawnFn?: KernelSpawn }) {
-    this.python = opts?.python ?? (existsSync(REPO_PYTHON) ? REPO_PYTHON : existsSync(VENV_PYTHON) ? VENV_PYTHON : "python3");
+    this.python = opts?.python ?? REPO_PYTHON;
     this.workerPath = opts?.workerPath ?? WORKER;
     this.spawnFn = opts?.spawnFn ?? defaultSpawn;
   }

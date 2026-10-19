@@ -1,9 +1,10 @@
 FROM docker/sandbox-templates:shell-docker
+COPY --from=ghcr.io/astral-sh/uv:0.12.11 /uv /usr/local/bin/uv
 USER root
 ARG BUN_VERSION=1.4.2
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl unzip nodejs python3-venv python-is-python3 \
+    ca-certificates curl unzip nodejs \
  && rm -rf /var/lib/apt/lists/* \
  && case "${TARGETARCH}" in \
       amd64) BUN_ARCH=x64; BUN_SHA256=36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913;; \
@@ -17,10 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && chmod +x /usr/local/bin/bun \
  && rm -rf /tmp/bun.zip "/tmp/bun-linux-${BUN_ARCH}"
 WORKDIR /app
-COPY requirements.txt package.json bun.lock ./
-RUN python -m venv /app/venv \
- && /app/venv/bin/pip install --upgrade pip \
- && /app/venv/bin/pip install --no-cache-dir -r requirements.txt \
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+COPY .python-version requirements.txt package.json bun.lock ./
+RUN bun run setup \
  && bun install
 COPY . .
 RUN id -u agent >/dev/null 2>&1 || useradd -m -u 1000 -d /home/agent -s /bin/bash agent \

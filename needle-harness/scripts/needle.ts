@@ -1,7 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fingerprintKey, loadDotenvAuthoritative } from "../lib/env";
@@ -12,7 +11,6 @@ const ROOT_DIR = dirname(HARNESS_DIR);
 const WEB_DIR = join(ROOT_DIR, "web");
 const SERVER = join(HARNESS_DIR, "lib/needle/server.py");
 
-const VENV_PYTHON = `${homedir()}/.cache/needle-harness/.needle/bin/python`;
 const REPO_PYTHON = join(ROOT_DIR, "venv/bin/python");
 const WARMUP_TIMEOUT_MS = 120_000;
 const owned = new Set<ChildProcess>();
@@ -250,10 +248,10 @@ if (import.meta.main) {
       if (owned.size === 0) process.exit(1);
     });
   }
-  if (!existsSync(VENV_PYTHON)) {
-    fail("needle venv missing — run: bash scripts/setup-needle.sh");
+  if (!existsSync(REPO_PYTHON)) {
+    fail("Repository venv missing. Run: bun run setup");
   }
-  process.stdout.write(`needle [ai]: venv ok ${VENV_PYTHON}\n`);
+  process.stdout.write(`needle [ai]: venv ok ${REPO_PYTHON}\n`);
 
   const pinned = process.env.NEEDLE_WEIGHTS;
   const repoBlob = join(ROOT_DIR, "needle3.cact");

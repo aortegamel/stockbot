@@ -1,7 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 
 export type NeedleRouteResult = {
   tool: string | null;
@@ -34,7 +32,7 @@ const REPO_ROOT =
   process.env.STOCKBOT_REPO_ROOT ??
   (process.cwd().endsWith("needle-harness") ? process.cwd().replace(/\/needle-harness$/, "") : process.cwd());
 const SERVER = `${REPO_ROOT}/needle-harness/lib/needle/server.py`;
-const VENV_PYTHON = `${homedir()}/.cache/needle-harness/.needle/bin/python`;
+const REPO_PYTHON = `${REPO_ROOT}/venv/bin/python`;
 
 type Pending =
   | { kind: "route"; resolve: (v: NeedleRouteResult) => void; reject: (e: Error) => void; cancel: () => void }
@@ -212,11 +210,10 @@ export class NeedleRouter {
   }
 
   private spawn(): ChildProcess {
-    const python = existsSync(VENV_PYTHON) ? VENV_PYTHON : "python3";
     this.exited = false;
     this.buf = "";
     this.bridgeStderrTail = "";
-    const child = this.spawnFn(python, [SERVER], {
+    const child = this.spawnFn(REPO_PYTHON, [SERVER], {
       env: { ...process.env, NEEDLE_TELEMETRY: "0", DO_NOT_TRACK: "1" },
     });
     this.child = child;
@@ -255,7 +252,7 @@ export class NeedleRouter {
       this.child = null;
       if (this.readyChild === child) this.readyChild = null;
     });
-    console.error(`[ai] needle bridge spawn ${python} (${SERVER})`);
+    console.error(`[ai] needle bridge spawn ${REPO_PYTHON} (${SERVER})`);
     this.startReadyHandshake(child);
     return child;
   }

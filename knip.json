@@ -12,7 +12,7 @@
         "config": ["stryker.conf.json"]
       },
       "ignoreBinaries": [
-        "python3.14",
+        "uv",
         "poly-crap",
         "gitleaks",
         "osv-scanner",

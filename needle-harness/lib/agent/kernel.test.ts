@@ -1486,7 +1486,7 @@ describe("runKernelAgent final personas", () => {
     expect(worker.endsWith(join("app", "research", "kernel_worker.py"))).toBe(true);
     expect(existsSync(worker)).toBe(true);
     const python = spawns[0]?.cmd ?? "";
-    expect(python === "python3" || python.endsWith(join("bin", "python"))).toBe(true);
+    expect(python).toBe(join(worker, "..", "..", "..", "venv", "bin", "python"));
   });
 
   test("worker progress reaches the stream with detail only when the worker sent one", async () => {
