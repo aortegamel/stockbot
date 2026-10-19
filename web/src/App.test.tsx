@@ -12,6 +12,7 @@ import type { Metrics } from "../../needle-harness/lib/agent/types";
 const { createRoot } = await import("react-dom/client");
 
 const realFetch = globalThis.fetch;
+const realSetTimeout = globalThis.setTimeout;
 const encoder = new TextEncoder();
 let mounted: Root | null = null;
 
@@ -22,8 +23,7 @@ const AGENT_PROMPT = '[aria-label="Ask the research agent"]';
 const SEARCH = 'input[placeholder="Search any US ticker…"]';
 
 afterEach(async () => {
-  await act(async () => mounted?.unmount());
-  mounted = null;
+  await unmount();
   globalThis.fetch = realFetch;
   jest.useRealTimers();
 });
@@ -47,7 +47,12 @@ function serve(extra: Handler = () => undefined): { urls: string[]; bodies: stri
     if (handled !== undefined) return Promise.resolve(handled);
     if (url.includes("/api/health")) return Promise.resolve(json({ debug: false }));
     if (url.includes("/api/quote")) return Promise.resolve(json({ sym: "X", price: 100 }));
-    if (url.includes("/api/watchlist")) return Promise.resolve(json({ watchlist: [] }));
+    if (url.includes("/api/watchlist")) {
+      const symbols = new URL(url, dom.window.location.href).searchParams.get("symbols")?.split(",") ?? [];
+      return Promise.resolve(json({
+        watchlist: symbols.map((symbol) => ({ symbol, source: "sec_filings", tool: "sec-filings", status: "no_records" })),
+      }));
+    }
     if (url.includes("/api/filings")) return Promise.resolve(json({ cik: 1, items: [] }));
     if (url.includes("/api/news")) return Promise.resolve(json({ sym: "X", items: [] }));
     if (url.includes("/api/research/sessions")) return Promise.resolve(json({ sessions: [] }));
@@ -106,17 +111,24 @@ function patchWindowTimers(): () => void {
   };
 }
 
-async function mount(element: ReactNode): Promise<HTMLElement> {
+async function mount(element: ReactNode, waitForWatchlist = true): Promise<HTMLElement> {
   const container = dom.window.document.getElementById("root");
   if (!container) throw new Error("missing test root");
   mounted = createRoot(container);
   await act(async () => mounted?.render(element));
+  if (waitForWatchlist) await until(() => text(container).includes("NVDA100DELAYEDSEC none"));
   return container;
+}
+
+async function unmount(): Promise<void> {
+  await act(async () => mounted?.unmount());
+  mounted = null;
 }
 
 async function until(ready: () => boolean): Promise<void> {
   for (let tick = 0; tick < 200 && !ready(); tick++) {
-    await act(() => new Promise<void>((resolve) => setTimeout(resolve, 10)));
+    // Poll real time even when the test controls application timers.
+    await act(() => new Promise<void>((resolve) => realSetTimeout(resolve, 10)));
   }
   if (!ready()) throw new Error("the terminal did not reach the expected state");
 }
@@ -215,8 +227,8 @@ describe("App terminal shell", () => {
       // One Response body can be read once, so every request builds its own.
       return url.includes("sym=NVDA") ? gate.then(() => json({ sym: "NVDA", price: 100 })) : json({ sym: "X", price: 100 });
     });
-    const root = await mount(<App />);
-    await until(() => text(root).includes("NVDA—DELAYED"));
+    const root = await mount(<App />, false);
+    await until(() => text(root).includes("NVDA—DELAYEDSEC none"));
     expect(text(root)).not.toContain("NVDA100DELAYED");
     await act(async () => {
       holder.release?.(json({ sym: "NVDA", price: 100 }));
@@ -246,6 +258,7 @@ describe("App ticker search", () => {
     expect(root.querySelector('[role="listbox"]')).toBeNull();
     // The selected ticker joins the front of the watchlist the agent receives.
     await until(() => urls.some((url) => url.includes("symbols=BRK.B%2CNVDA")));
+    await until(() => text(root).includes("BRK.B100DELAYEDSEC none"));
   });
 
   test("clears the query on Escape and ignores a blank pick", async () => {
@@ -359,7 +372,11 @@ describe("App agent send", () => {
       const { urls } = serve((url, init) =>
         url.includes("/api/agent") ? new Response(silentStream(init?.signal ?? null), { status: 200 }) : undefined,
       );
-      const root = await mount(<App />);
+      const root = await mount(<App />, false);
+      await act(async () => {
+        jest.advanceTimersByTime(0);
+      });
+      await until(() => text(root).includes("NVDA100DELAYEDSEC none"));
       const prompt = find<HTMLInputElement>(root, AGENT_PROMPT);
       await type(prompt, "slow");
       await click(button(root, "Send"));
@@ -384,6 +401,7 @@ describe("App agent send", () => {
       await settle();
       expect(urls.filter((url) => url.includes("/api/quote")).length).toBeGreaterThan(quotesBefore);
     } finally {
+      await unmount();
       restore();
       jest.useRealTimers();
     }
@@ -395,7 +413,11 @@ describe("App agent send", () => {
     try {
       const live = liveStream();
       serve((url) => (url.includes("/api/agent") ? new Response(live.stream, { status: 200 }) : undefined));
-      const root = await mount(<App />);
+      const root = await mount(<App />, false);
+      await act(async () => {
+        jest.advanceTimersByTime(0);
+      });
+      await until(() => text(root).includes("NVDA100DELAYEDSEC none"));
       const prompt = find<HTMLInputElement>(root, AGENT_PROMPT);
       await type(prompt, "reasoned");
       await click(button(root, "Send"));
@@ -417,6 +439,7 @@ describe("App agent send", () => {
       await settle();
       expect(findButton(root, "Send")).not.toBeNull();
     } finally {
+      await unmount();
       restore();
       jest.useRealTimers();
     }
@@ -446,7 +469,11 @@ describe("App research session polling", () => {
         }
         return undefined;
       });
-      const root = await mount(<App />);
+      const root = await mount(<App />, false);
+      await act(async () => {
+        jest.advanceTimersByTime(0);
+      });
+      await until(() => text(root).includes("NVDA100DELAYEDSEC none"));
       await settle();
       await click(button(root, "s-1 runningnvda research"));
       await settle();
@@ -470,6 +497,7 @@ describe("App research session polling", () => {
       expect(text(root)).toContain("#7 job_finished");
       expect(text(root)).toContain("LOGS · seq 7");
     } finally {
+      await unmount();
       restore();
       jest.useRealTimers();
     }
@@ -497,7 +525,11 @@ describe("App research session polling", () => {
         if (url.includes("/api/research/sessions")) return json({ sessions: [{ session_id: "s-9", status: "done" }] });
         return undefined;
       });
-      const root = await mount(<App />);
+      const root = await mount(<App />, false);
+      await act(async () => {
+        jest.advanceTimersByTime(0);
+      });
+      await until(() => text(root).includes("NVDA100DELAYEDSEC none"));
       await settle();
       await click(button(root, "s-9 done"));
       await settle();
@@ -515,6 +547,7 @@ describe("App research session polling", () => {
       expect(text(root)).toContain("#191 tick");
       expect(text(root)).not.toContain("#190 tick");
     } finally {
+      await unmount();
       restore();
       jest.useRealTimers();
     }
@@ -559,5 +592,6 @@ describe("App view switch", () => {
     expect(text(root)).not.toContain("WATCHLIST · DELAYED");
     await click(button(root, "Terminal"));
     await until(() => text(root).includes("WATCHLIST · DELAYED"));
+    await until(() => text(root).includes("NVDA100DELAYEDSEC none"));
   });
 });

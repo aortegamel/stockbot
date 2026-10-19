@@ -80,6 +80,10 @@ Its package metadata supports Python 3.10 or later, including the repository's P
 The test uses headless Chromium without a display server.
 `bun run test` and `bun run verify` include this regression through the default Python suite.
 
+The web component suite runs with `bun test --cwd web`.
+Its App tests await deferred watchlist results inside React `act` boundaries.
+Fake-timer tests unmount components before restoring the real timers.
+
 ## Environment variables
 
 See [`.env.example`](.env.example) for the current list and whether each setting is required, optional, or testing-only. `SEC_EDGAR_IDENTITY` is required only for SEC features. FINRA and Robinhood are optional integrations.
