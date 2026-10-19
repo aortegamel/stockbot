@@ -441,13 +441,13 @@ def _has_subject(prompt: str, ticker: str | None) -> bool:
     return _objective_ticker(prompt) is not None or _objective_company(prompt) is not None or ticker is not None
 
 
-def needs_subject(prompt: str, ticker: str | None) -> bool:
-    """Clarify advice without a prompt subject. The selected ticker does not supply a subject."""
+def needs_subject(prompt: str, ticker: str | None, current_ticker: str | None = None) -> bool:
+    """Clarify subjectless advice only when neither scope nor displayed stock supplies a subject."""
     _, toks = _signals(prompt)
     return (
         bool(toks & _SUBJECT_ADVICE_TOKS)
         and not toks.difference(_SUBJECT_ADVICE_TOKS, _SUBJECT_FILLER_TOKS)
-        and not _has_subject(prompt, None)
+        and not _has_subject(prompt, ticker or current_ticker)
     )
 
 

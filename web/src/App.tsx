@@ -22,6 +22,10 @@ const BG =
 
 const STRIP_DEFAULTS = ["NVDA", "AAPL", "MSFT", "TSLA", "SPY", "QQQ"];
 
+// Match the validated ticker channel in the kernel.
+const TICKER_RE = /^[A-Z][A-Z0-9.\-]{0,9}$/;
+const TICKER_ORG: Record<string, true> = { FINRA: true, SEC: true, NYSE: true, NASDAQ: true, OTC: true, EDGAR: true, SHO: true, REG: true };
+
 function Strip() {
   const [prices, setPrices] = useState<Record<string, number | null>>({});
   useEffect(() => {
@@ -272,6 +276,11 @@ export default function App() {
       }, STALL_TIMEOUT_MS);
     };
     const push = (event: AgentEvent) => {
+      if (event.type === "chart_update") {
+        const ticker = typeof event.ticker === "string" ? event.ticker.trim().toUpperCase() : "";
+        if (!TICKER_RE.test(ticker) || TICKER_ORG[ticker]) return;
+        pick(ticker);
+      }
       if (event.type === "done" || event.type === "error" || event.type === "failed") terminal = true;
       if (event.type === "reasoning_start") {
         reasoningStarted = true;

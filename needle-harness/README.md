@@ -45,21 +45,60 @@ These endpoints have no login protection. Use them only on a trusted network. Ne
 ## 5. Architecture
 
 ```
-prompt → Needle 3 (local routing, JSONL bridge) → Bun loop (max 8 steps)
-  → Tools (search_web, find_sec_entities, search_sec_filings, get_sec_document via the runtime-neutral tool bridge; get_current_time local)
-  → Evidence[] → Muse Spark 1.3 (single reasoning call) → answer + metrics
+prompt + current chart + exclusive ticker/watchlist scope
+  → JEV selects the original answer/research route, personas, and an optional chart focus
+  → EDGAR resolves only the selected stock label
+  → Needle generates set_chart_symbol arguments → canonical tool → chart_update
+  → original answer/research route → evidence → reasoner → answer + metrics
 Bun streams AgentEvents as SSE to the terminal UI.
 ```
 
-Needle routes, Bun orchestrates, tools retrieve, Muse reasons, Vite displays.
+JEV alone selects the route and chart focus. Needle generates tool arguments. Bun orchestrates. Tools retrieve. The reasoner answers.
+
+### Current stock and chart actions
+
+The API sends the displayed stock as `currentChartTicker`, separately from the exclusive research `ticker` or `watchlist` scope.
+The existing frontend `ticker` supplies the displayed stock unless the request supplies a valid `currentChartTicker`.
+The API validates each stock symbol with the existing ticker validator.
+The user prompt remains verbatim.
+
+For a question with several stocks, JEV chooses the focus in the same call that selects the original route.
+The worker resolves only that chosen ticker or company label through EDGAR.
+It returns `chartTicker` only when the resolved focus differs from the current chart.
+It returns `chartError` when chart selection or resolution fails.
+Invalid chart metadata never authorizes a chart change or discards a valid original route.
+
+Before a direct answer, single-tool answer, or persona research run, the API executes any approved chart action.
+Needle generates arguments for the fixed `set_chart_symbol` tool using the selected focus.
+The API checks the generated ticker against that focus.
+The canonical tool must return a matching `chart_selection` receipt before the API emits `{type:"chart_update", ticker}`.
+The bridge carries that structured receipt in `result.meta.chart_selection`.
+The TypeScript adapter preserves it as untrusted `ToolResult.chartSelection` only for `set_chart_symbol`.
+The API checks that object, not the tool's formatted content. Existing metrics remain scoped to the original answer path.
+The pre-action shares the existing request deadline and existing worker/bridge cancellation behavior. It adds no retry or separate timeout policy.
+The chart receipt supplies no factual answer evidence or research seed evidence.
+The API adds no assessment call and never reroutes the question for this action.
+The API rejects `set_chart_symbol` as an original entry route or a post-tool answer transition.
+
+If the chart action fails, the API emits a warning as answer text and continues the original question.
+The reasoner keeps the prior chart context after failure.
+After success, direct, single-tool, persona, follow-up, and synthesis calls use the applied ticker as separate reasoner context.
+Watchlist calls omit that reasoner ticker and keep their exclusive watchlist research scope.
+The reasoner treats current-stock context as context, not evidence.
+
+A successful canonical research invocation emits the same event through validated worker progress.
+Production SSE retains `chart_update` while ordinary progress remains redacted.
+The API does not infer chart actions from tool previews or answer prose.
 
 ### Captured evidence
 
 Answer citations open the original page in a new tab when the source supplies a safe HTTP or HTTPS URL.
 The browser fetches each cited source once per console instance to add its quote fragment.
-Long quotes and multiline quotes use a text range across the first and last five words.
+Text-only updates do not restart source resolution.
+The browser uses a range for multiline quotes or single-line quotes that exceed 80 characters and ten words.
+Each range covers the first and last five words.
 The browser can highlight that range across paragraph boundaries if the original page still contains it.
-Short, single-line quotes keep a single text fragment.
+All other quotes use one complete text fragment.
 Without a safe URL, the citation opens the immutable source capture beside the answer.
 The `Sources: …` controls still open that capture.
 The server creates every source ID. The browser never builds one.

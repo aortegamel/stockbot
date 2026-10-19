@@ -102,6 +102,7 @@ type KernelGraphNode = {
 
 export type KernelReasonInput = {
   prompt: string;
+  ticker?: string;
   evidence: Evidence[];
   escalated: boolean;
   direct?: boolean;
@@ -135,6 +136,8 @@ export type KernelResponse = {
   escalations: number;
   escalated: boolean;
   route?: string;
+  chartTicker?: unknown;
+  chartError?: unknown;
   personas?: Persona[] | null;
   tool?: string;
   arguments?: Record<string, unknown>;
@@ -624,6 +627,7 @@ type KernelRunOptions = {
   seedEvidence?: Evidence[];
   personas?: readonly Persona[];
   ticker?: string;
+  currentChartTicker?: string;
   watchlist?: readonly string[];
 };
 
@@ -638,6 +642,7 @@ type KernelRun = {
   router: KernelRouter;
   deadlineAt: number;
   scope: Record<string, unknown>;
+  currentChartTicker: string | undefined;
   personas: readonly Persona[];
   isTrio: boolean;
   seed: Evidence[];
@@ -785,6 +790,14 @@ function endTerminal(run: KernelRun): void {
 // and relays worker progress with a detail only when the worker sent one.
 function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSignal; timeoutMs: number; onProgress: (stage: string, detail?: Record<string, unknown>) => void } {
   const onProgress = (stage: string, detail?: Record<string, unknown>): void => {
+    if (stage === "chart_update") {
+      const ticker = parseTicker(detail?.ticker);
+      if (ticker !== undefined) {
+        if (run.scope.watchlist === undefined) run.currentChartTicker = ticker;
+        run.emit({ type: "chart_update", ticker });
+      }
+      return;
+    }
     run.emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage });
   };
   return { ...(run.signal ? { signal: run.signal } : {}), timeoutMs, onProgress };
@@ -1001,6 +1014,7 @@ function reasonInput(run: KernelRun): ReasonInput {
     : `${run.prompt}\n\n${graphProjection({ objective: run.objective, nodes: run.nodes, decisions: run.records, unresolved: run.unresolved, incompleteGuard: run.guard, escalated: run.escalated, watchlist: run.watchlist })}`;
   return {
     prompt,
+    ...(run.scope.watchlist === undefined && run.currentChartTicker !== undefined ? { ticker: run.currentChartTicker } : {}),
     evidence: run.evidence,
     escalated: run.direct ? false : run.escalated,
     direct: run.direct || (run.escalated && run.evidence.length === 0),
@@ -1243,6 +1257,7 @@ function openRun(prompt: string, emit: (e: AgentEvent) => void, opts: KernelRunO
     router: runRouter(deps),
     deadlineAt: opts?.deadlineAt ?? Date.now() + REQUEST_WALL_MS,
     scope: runScope(ticker, requested),
+    currentChartTicker: requested ? undefined : parseTicker(opts?.currentChartTicker) ?? ticker,
     personas,
     isTrio: isTrioPersonas(personas),
     seed: Array.isArray(opts?.seedEvidence) ? opts.seedEvidence : [],

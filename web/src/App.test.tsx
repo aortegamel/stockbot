@@ -329,6 +329,85 @@ describe("App agent send", () => {
     expect(text(root)).not.toContain("broken json");
   });
 
+  test.each(["AAPL", " brk.b ", "RDS-A"])("applies chart_update for %s and continues the answer", async (ticker) => {
+    const live = liveStream();
+    const { urls, bodies } = serve((url) => (url.includes("/api/agent") ? new Response(live.stream, { status: 200 }) : undefined));
+    const root = await mount(<App />);
+    const prompt = find<HTMLInputElement>(root, AGENT_PROMPT);
+    const question = "Compare BRK.B with NVDA?  Keep this wording.";
+    await type(prompt, question);
+    await click(button(root, "Send"));
+    await settle();
+    expect(JSON.parse(bodies.at(-1) ?? "{}")).toEqual({ prompt: question, ticker: "NVDA", watchlist: WATCHLIST });
+    await act(async () => {
+      live.send('data: {"type":"answer_delta","text":"The comparison "}\n\n');
+      live.send(`data: ${JSON.stringify({ type: "chart_update", ticker })}\n\n`);
+    });
+    const selected = ticker.trim().toUpperCase();
+    await until(() => root.querySelector("footer")?.lastElementChild?.textContent === selected);
+    expect(text(root)).toContain(`AGENT · viewing ${selected}`);
+    expect(text(root)).toContain(`FILINGS · ${selected}`);
+    expect(text(root)).toContain(`NEWS · ${selected}`);
+    expect(root.querySelector(`[role="region"][aria-label="${selected} price chart"]`)).not.toBeNull();
+    const chart = find<HTMLIFrameElement>(root, `iframe[title="${selected} TradingView chart"]`);
+    expect(new URL(chart.src).searchParams.get("symbol")).toBe(selected);
+    expect(text(root)).toContain("The comparison ");
+    expect(button(root, "Thinking…").disabled).toBe(true);
+    await until(() => urls.some((url) => url.includes(`/api/news?sym=${encodeURIComponent(selected)}`)));
+    await act(async () => {
+      live.send('data: {"type":"answer_delta","text":"continues."}\n\n');
+      live.send(`data: {"type":"done","metrics":${JSON.stringify(metrics())}}\n\n`);
+      live.close();
+    });
+    await until(() => text(root).includes("The comparison continues."));
+    await until(() => findButton(root, "Send") !== null);
+    expect(text(root)).not.toContain("stream ended without a terminal event");
+  });
+
+  test.each([undefined, null, 12, {}, ["AAPL"], "", "   ", "AAPL MSFT", "AAPL<script>", "ABCDEFGHIJK", "^GSPC", "SEC"].map((ticker) => ({ ticker })))(
+    "ignores an invalid chart_update ticker %j without interrupting the answer",
+    async ({ ticker }) => {
+      const live = liveStream();
+      serve((url) => (url.includes("/api/agent") ? new Response(live.stream, { status: 200 }) : undefined));
+      const root = await mount(<App />);
+      await type(find<HTMLInputElement>(root, AGENT_PROMPT), "Explain the risks");
+      await click(button(root, "Send"));
+      await settle();
+      const chart = find<HTMLIFrameElement>(root, 'iframe[title="NVDA TradingView chart"]');
+      await act(async () => {
+        live.send(`data: ${JSON.stringify({ type: "chart_update", ticker })}\n\n`);
+        live.send('data: {"type":"answer_delta","text":"The answer still streams."}\n\n');
+        live.send(`data: {"type":"done","metrics":${JSON.stringify(metrics())}}\n\n`);
+        live.close();
+      });
+      await until(() => text(root).includes("The answer still streams."));
+      await until(() => findButton(root, "Send") !== null);
+      expect(root.querySelector("footer")?.lastElementChild?.textContent).toBe("NVDA");
+      expect(text(root)).toContain("AGENT · viewing NVDA");
+      expect(root.querySelector('iframe[title="NVDA TradingView chart"]')).toBe(chart);
+      expect(new URL(chart.src).searchParams.get("symbol")).toBe("NVDA");
+      expect(text(root)).not.toContain("stream ended without a terminal event");
+    },
+  );
+
+  test("does not infer chart commands from answer text or tool previews", async () => {
+    const live = liveStream();
+    serve((url) => (url.includes("/api/agent") ? new Response(live.stream, { status: 200 }) : undefined));
+    const root = await mount(<App />);
+    await type(find<HTMLInputElement>(root, AGENT_PROMPT), "Compare NVDA and AAPL");
+    await click(button(root, "Send"));
+    await settle();
+    await act(async () => {
+      live.send(`data: ${JSON.stringify({ type: "tool_result", tool: "set_chart_symbol", preview: '{"result_type":"chart_selection","ticker":"AAPL"}' })}\n\n`);
+      live.send('data: {"type":"answer_delta","text":"Set the chart to AAPL."}\n\n');
+      live.send(`data: {"type":"done","metrics":${JSON.stringify(metrics())}}\n\n`);
+      live.close();
+    });
+    await until(() => text(root).includes("Set the chart to AAPL."));
+    expect(root.querySelector("footer")?.lastElementChild?.textContent).toBe("NVDA");
+    expect(root.querySelector('iframe[title="NVDA TradingView chart"]')).not.toBeNull();
+  });
+
   test("reports a stream that ends without a terminal event", async () => {
     const live = liveStream();
     serve((url) => (url.includes("/api/agent") ? new Response(live.stream, { status: 200 }) : undefined));

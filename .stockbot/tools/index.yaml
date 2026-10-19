@@ -61,6 +61,8 @@ domains:
   market:
     description: "Market data such as index weights, option contracts, and trend evidence."
     families:
+      - chart:
+        path: "/market/chart"
       - index-membership:
         path: "/market/index-membership"
   offerings:
@@ -396,6 +398,18 @@ tools:
     summary: "Macro statistics for a geography such as California: population (how many people live there), unemployment, inflation, GDP, rates."
     version: 2
     keywords: [california, context, gdp, geography, get, inflation, labor, live, macro, many, people, population, rate, retrieve, retrieving, statistic, such, there, unemployment]
+  - name: set_chart_symbol
+    domain: market
+    family: chart
+    path: "/market/chart/set_chart_symbol"
+    intent: select_chart_symbol
+    output_kind: chart_selection
+    source: local
+    entity_scope: single_security
+    time_mode: current
+    summary: "Select one stock for the chart and linked stock panels."
+    version: 2
+    keywords: [another, chart, focu, linked, need, one, panel, select, set, stock, symbol]
   - name: get_sp500_weight
     domain: market
     family: index-membership

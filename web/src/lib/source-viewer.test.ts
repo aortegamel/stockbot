@@ -153,13 +153,21 @@ describe("source URLs", () => {
     expect(originalSourceUrl(source, true)).toBe(`${source.url}#:~:text=Revenue,grew`);
   });
 
-  test("normalized length selects a range only above 80 characters", () => {
-    const quote = `Alpha beta gamma delta ${"x".repeat(28)} epsilon zeta eta theta omega`;
+  test("single-line quotes above ten words use a range only above 80 normalized characters", () => {
+    const quote = `Alpha beta gamma delta ${"x".repeat(25)} epsilon zeta eta theta nu omega`;
     expect(quote.length).toBe(80);
     expect(originalSourceUrl(document({ quote }), true)).toBe(`${document().url}#:~:text=${encodeURIComponent(quote)}`);
     const long = `${quote}!`;
-    expect(originalSourceUrl(document({ quote: long }), true)).toBe(`${document().url}#:~:text=Alpha%20beta%20gamma%20delta%20${"x".repeat(28)},epsilon%20zeta%20eta%20theta%20omega!`);
+    expect(originalSourceUrl(document({ quote: long }), true)).toBe(`${document().url}#:~:text=Alpha%20beta%20gamma%20delta%20${"x".repeat(25)},zeta%20eta%20theta%20nu%20omega!`);
     expect(originalSourceUrl(document({ quote: quote.replaceAll(" ", "   ") }), true)).toBe(`${document().url}#:~:text=${encodeURIComponent(quote)}`);
+  });
+
+  test.each([1, 5, 9, 10])("single-line quotes with %i long words use one full encoded fragment", (wordCount) => {
+    const quote = Array(wordCount).fill("long-word,&".repeat(9)).join(" ");
+    expect(quote.length).toBeGreaterThan(80);
+    const expected = `${document().url}#:~:text=${encodeURIComponent(quote).replace(/-/gu, "%2D")}`;
+    expect(originalSourceUrl(document({ quote }), true)).toBe(expected);
+    expect(originalSourceUrl(document({ quote: `  ${quote.replaceAll(" ", " \t ")}  ` }), true)).toBe(expected);
   });
 
   test("fragment components encode directive separators inside a short quote", () => {

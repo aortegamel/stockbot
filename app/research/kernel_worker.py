@@ -4,6 +4,7 @@ Request:  {"id", "op": "run", "prompt", "asOf"?, "deadlineAt"? (epoch ms), "sess
            "ticker"?, "watchlist"? ([tickers]: the user's watchlist request; replaces ticker scope)}
           {"id", "op": "watchlist", "watchlist": [tickers], "deadlineAt"?} -> {"id", "watchlist": [rows]}
           (read-only page-load fan-out: no session, no evidence; same tool handlers and caches as intake)
+          {"id", "op": "route", "prompt", "ticker"?, "watchlist"?, "currentChartTicker"?}
 Response: {"id", "objective", "evidence": [{id, content}],
            "nodes": [{node_id, question, status, depends_on}],
            "decisions": [...persisted JEV records...], "unresolved": [node_ids],
@@ -1206,11 +1207,11 @@ async def _intake_round(
     return admitted, raw, stats
 
 
-def _intake_start_tickers(objective: str) -> list[str]:
-    """Objective subject ticker as the first intake scope; empty when the objective names none."""
+def _intake_start_tickers(objective: str, supplied_ticker: str | None = None) -> list[str]:
+    """Use the explicit objective subject, else the supplied chart ticker."""
     from app.research import scheduler
 
-    resolved = scheduler._objective_subject_ticker(objective)
+    resolved = scheduler._objective_subject_ticker(objective, supplied_ticker)
     if isinstance(resolved, str) and resolved.strip():
         return [resolved.strip().upper()]
     return []
@@ -1280,6 +1281,7 @@ async def _graph_intake(
     progress: ProgressFn | None = None,
     setup_deadline: float | None = None,
     watchlist: list[str] | None = None,
+    supplied_ticker: str | None = None,
 ) -> list[dict[str, object]]:
     """Intake rounds + Reasoner + escape hatch; logs each round as intake_digest. Returns proposals.
 
@@ -1293,7 +1295,7 @@ async def _graph_intake(
     rounds = 0
     fetched_tickers: list[str] = []
     fetched_queries: list[str] = []
-    tickers = _intake_start_tickers(objective)
+    tickers = _intake_start_tickers(objective, None if watchlist else supplied_ticker)
     query_text: str | None = objective
     while True:
         if _intake_round2_spent(setup_deadline, rounds):
@@ -1578,7 +1580,19 @@ def run_graph_prompt(
         session = scheduler._load_session(sid, kernel)
         session.setdefault("session_id", sid)
         proposals: list[dict[str, object]] = asyncio.run(
-            _graph_intake(objective, as_of, sid, session, registry, client, kernel, progress, setup_deadline, watchlist)
+            _graph_intake(
+                objective,
+                as_of,
+                sid,
+                session,
+                registry,
+                client,
+                kernel,
+                progress,
+                setup_deadline,
+                watchlist,
+                supplied_ticker=ticker,
+            )
         )
         # ponytail: 4 concrete questions max; cap BEFORE JEV so disposition never judges
         # proposals that can't become nodes, and dropped deps never silently vanish.
@@ -1667,10 +1681,11 @@ def _needle_request_context(context: JSONValue, tool: str, objective: str, ticke
         "as_of": as_of,
         "temporal_scope": scoped,
         "today_utc": datetime.now(UTC).date().isoformat(),
-        "grounded_arguments": _sched._grounded_execution_values(tool, schema, objective),
+        "grounded_arguments": _sched._grounded_execution_values(tool, schema, objective, ticker),
     }
-    if ticker is not None:
-        out["ticker"] = ticker
+    effective_tickers = _intake_start_tickers(objective, ticker)
+    if effective_tickers:
+        out["ticker"] = effective_tickers[0]
     return out
 
 
@@ -1695,7 +1710,7 @@ def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[s
     """Select the entry route and personas without a session or database access.
 
     Small talk and missing advice subjects bypass JEV. Other hints retain JEV persona selection.
-    Return {"id", "route", "personas"} on success or {"id", "error"} when JEV selection fails.
+    Return route/personas with optional chartTicker/chartError, or an error when route selection fails.
     """
     rid = _request_id(req)
     prompt = req.get("prompt")
@@ -1703,7 +1718,10 @@ def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[s
         logger.info("toolflow route rid=%s route=research_required reason=blank-prompt", rid)
         return {"id": rid, "route": "research_required", "personas": None}
     try:
+        from app.research.models import validate_ticker
+
         ticker = _request_ticker(req)
+        current_ticker = validate_ticker(req.get("currentChartTicker"), "<worker>: 'currentChartTicker'")
         # Watchlist scope rides as context: JEV decides the route with it, never a code override.
         watchlist = _request_watchlist(req)
     except ValueError as exc:
@@ -1713,7 +1731,7 @@ def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[s
     if _toolflow() not in ("catalog", "full", "whole", "direct"):
         from app.research.programmatic_router import programmatic_route
 
-        hint = programmatic_route(prompt.strip(), ticker=ticker)
+        hint = programmatic_route(prompt.strip(), ticker=ticker or current_ticker)
     if hint == "no_session":
         logger.info("toolflow route rid=%s route=no_session reason=small-talk", rid)
         return {"id": rid, "route": "no_session", "personas": None}
@@ -1723,13 +1741,23 @@ def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[s
     try:
         client = _jev_client(jev)
         routed = asyncio.run(
-            client.route_entry(query_with_today_utc(prompt.strip()), route_hint=hint, watchlist=watchlist)
+            client.route_entry(
+                query_with_today_utc(prompt.strip()),
+                route_hint=hint,
+                watchlist=watchlist,
+                current_ticker=current_ticker,
+            )
         )
     except Exception as exc:
         logger.warning("toolflow route_fail rid=%s err_type=%s", rid, type(exc).__name__, exc_info=True)
         return {"id": rid, "error": str(exc)[:500] or "route selection failed"}
     _log_route(rid, routed, watchlist, hint)
-    return {"id": rid, "route": routed.get("route"), "personas": routed.get("personas")}
+    return {
+        "id": rid,
+        "route": routed.get("route"),
+        "personas": routed.get("personas"),
+        **{key: routed[key] for key in ("chartTicker", "chartError") if key in routed},
+    }
 
 
 def _arguments_session_hint(req: Mapping[str, JSONValue]) -> str | None:
@@ -1809,11 +1837,11 @@ def _arguments_request_value(req: Mapping[str, JSONValue], key: str) -> JSONValu
     return validate_json_value(raw, f"<arguments>: '{key}'") if raw is not None else None
 
 
-def _arguments_withhold(rid: str, tool: str, prompt: str) -> dict[str, JSONValue]:
-    """Needle withheld the call: seed from the objective when it grounds, else fail open."""
+def _arguments_withhold(rid: str, tool: str, prompt: str, ticker: str | None = None) -> dict[str, JSONValue]:
+    """Seed a withheld call from the explicit subject, else the supplied chart ticker."""
     from app.research import scheduler as _sched
 
-    seeded = _sched._fallback_sec_args(tool, prompt)
+    seeded = _sched._fallback_sec_args(tool, prompt, ticker)
     if not isinstance(seeded, dict):
         logger.warning("toolflow arguments_fail_open rid=%s tool=%s err_type=NeedleWithhold", rid, tool)
         return {"id": rid, "error": "needle arguments failed"}
@@ -1842,7 +1870,7 @@ def _arguments_generate(rid: str, sid_display: str, tool: str, req: Mapping[str,
         tool=tool, schema=schema, objective=prompt, node=node, context=context
     )
     if generated is None:
-        return _arguments_withhold(rid, tool, prompt)
+        return _arguments_withhold(rid, tool, prompt, arg_ticker)
     return _arguments_result(rid, sid_display, tool, generated, prompt)
 
 

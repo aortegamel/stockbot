@@ -135,13 +135,16 @@ class _JevRoute(JevClient):
         choice: str | None = None,
         personas: list[str] | None = None,
         fail: bool = False,
+        chart_metadata: dict[str, JSONValue] | None = None,
     ) -> None:
         super().__init__()
         self.choice = choice
         self.personas = personas
         self.fail = fail
+        self.chart_metadata = chart_metadata or {}
         self.seen: list[tuple[str, str | None]] = []
         self.watchlists: list[Sequence[str] | None] = []
+        self.current_tickers: list[str | None] = []
 
     @override
     async def route_entry(
@@ -150,14 +153,17 @@ class _JevRoute(JevClient):
         registry: Sequence[Mapping[str, JSONValue]] | None = None,
         route_hint: str | None = None,
         watchlist: Sequence[str] | None = None,
+        current_ticker: str | None = None,
     ) -> dict[str, JSONValue]:
         if self.fail:
             raise RuntimeError("jev down")
         self.seen.append((prompt, route_hint))
         self.watchlists.append(watchlist)
+        self.current_tickers.append(current_ticker)
         return {
             "route": route_hint or self.choice or "research_required",
             "personas": list[JSONValue](self.personas) if self.personas is not None else None,
+            **self.chart_metadata,
         }
 
 
@@ -200,16 +206,89 @@ def test_route_small_talk_needs_no_jev(monkeypatch: pytest.MonkeyPatch, req: dic
     assert jev.seen == []
 
 
-@pytest.mark.parametrize("ticker", [None, "NVDA"])
-def test_route_missing_advice_subject_needs_no_jev(ticker: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_route_missing_advice_subject_needs_no_jev(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("STOCKBOT_TOOLFLOW", raising=False)
     jev = _JevRoute(fail=True)
     with mock.patch.object(kw, "_jev_client", side_effect=AssertionError("clarification must not access JEV")):
-        out = kw._route(
-            {"id": "advice", "op": "route", "prompt": "can you give me buying advice", "ticker": ticker}, jev=jev
-        )
+        out = kw._route({"id": "advice", "op": "route", "prompt": "can you give me buying advice"}, jev=jev)
     assert out == {"id": "advice", "route": "clarify_subject", "personas": None}
     assert jev.seen == []
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        {"ticker": "NVDA"},
+        {"currentChartTicker": "nvda"},
+        {"ticker": "AAPL", "currentChartTicker": "NVDA"},
+    ],
+)
+def test_route_current_context_supplies_advice_subject(
+    context: dict[str, JSONValue], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("STOCKBOT_TOOLFLOW", raising=False)
+    jev = _JevRoute("research_required", personas=["bearbot"])
+    out = kw._route({"id": "advice", "prompt": "can you give me buying advice", **context}, jev=jev)
+    assert out == {"id": "advice", "route": "research_required", "personas": ["bearbot"]}
+    assert jev.seen[0][1] == "research_required"
+    assert jev.current_tickers == (["NVDA"] if "currentChartTicker" in context else [None])
+
+
+@pytest.mark.parametrize("prompt", ["hello", "thanks", "good morning"])
+def test_route_greeting_ignores_current_chart(prompt: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("STOCKBOT_TOOLFLOW", raising=False)
+    jev = _JevRoute(fail=True)
+    assert kw._route({"id": "greeting", "prompt": prompt, "currentChartTicker": "NVDA"}, jev=jev) == {
+        "id": "greeting",
+        "route": "no_session",
+        "personas": None,
+    }
+    assert jev.seen == []
+
+
+def test_route_current_chart_does_not_override_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("STOCKBOT_TOOLFLOW", raising=False)
+    jev = _JevRoute(personas=["bearbot"])
+    out = kw._route({"id": "clock", "prompt": "What time is it?", "currentChartTicker": "nvda"}, jev=jev)
+    assert out == {"id": "clock", "route": "get_current_time", "personas": ["bearbot"]}
+    assert jev.seen[0][1] == "get_current_time"
+    assert jev.current_tickers == ["NVDA"]
+
+
+@pytest.mark.parametrize("bad", [True, 7, [], {}, "FINRA", "NVDA AAPL"])
+def test_route_rejects_invalid_current_chart(bad: JSONValue) -> None:
+    jev = _JevRoute(fail=True)
+    out = kw._route({"id": "bad-chart", "prompt": "advice", "currentChartTicker": bad}, jev=jev)
+    assert out["id"] == "bad-chart"
+    assert "currentChartTicker" in str(out["error"])
+    assert jev.seen == []
+
+
+@pytest.mark.parametrize("metadata", [{"chartTicker": "AAPL"}, {"chartError": "EDGAR unavailable"}])
+def test_route_preserves_chart_metadata(metadata: dict[str, JSONValue]) -> None:
+    jev = _JevRoute("research_required", personas=["bullbot"], chart_metadata=metadata)
+    assert kw._route({"id": "chart", "prompt": "explain diversification"}, jev=jev) == {
+        "id": "chart",
+        "route": "research_required",
+        "personas": ["bullbot"],
+        **metadata,
+    }
+
+
+def test_route_current_chart_stays_separate_from_watchlist() -> None:
+    jev = _JevRoute("research_required")
+    out = kw._route(
+        {
+            "id": "watchlist",
+            "prompt": "Latest filings for my watchlist?",
+            "currentChartTicker": "aapl",
+            "watchlist": ["nvda", "QQQ"],
+        },
+        jev=jev,
+    )
+    assert out == {"id": "watchlist", "route": "research_required", "personas": None}
+    assert jev.watchlists == [["NVDA", "QQQ"]]
+    assert jev.current_tickers == ["AAPL"]
 
 
 @pytest.mark.parametrize(
@@ -360,6 +439,40 @@ def test_arguments_context_carries_ticker_without_raw_evidence(monkeypatch: pyte
     assert "evidence" not in context and "attempts" not in context and "grounding_hint" not in context
     grounded = context.get("grounded_arguments")
     assert isinstance(grounded, dict) and grounded.get("identifier") == "NVDA"
+
+
+@pytest.mark.parametrize(
+    ("objective", "expected"),
+    [
+        ("can you give me buying advice", "NVDA"),
+        ("Should I buy Apple?", "AAPL"),
+        ("Should I buy MissingCo?", None),
+    ],
+)
+def test_arguments_context_and_withhold_preserve_subject_precedence(
+    monkeypatch: pytest.MonkeyPatch, objective: str, expected: str | None
+) -> None:
+    def _resolve(name: str) -> str | None:
+        return {"Apple": "AAPL", "NVDA": "NVDA"}.get(name)
+
+    monkeypatch.setattr("app.tools._resolve_company_to_ticker", _resolve)
+    generated = _FailGenerate(None)
+    monkeypatch.setattr(kw, "_shared_needle_generate", lambda: generated)
+    out = kw._arguments({"id": "context", "tool": "list_sec_filings", "objective": objective, "ticker": "NVDA"})
+    payload = generated.seen[0]
+    assert isinstance(payload, dict)
+    context = payload["context"]
+    assert isinstance(context, dict)
+    assert context.get("ticker") == expected
+    grounded = context["grounded_arguments"]
+    assert isinstance(grounded, dict)
+    if expected is None:
+        assert "identifier" not in grounded
+        assert "arguments" not in out and "error" in out
+    else:
+        assert grounded["identifier"] == expected
+        arguments = out["arguments"]
+        assert isinstance(arguments, dict) and arguments["identifier"] == expected
 
 
 class _FailGenerate:
@@ -657,15 +770,72 @@ def _choice_stub(
 _ROUTE_REG: list[dict[str, JSONValue]] = [{"name": "get_current_time", "description": "Current time."}]
 
 
+def test_chart_tool_stays_in_research_selection_but_not_direct_routes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.research import service
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    session_id = service.create_research("show a chart", "Show a chart.")
+    node = service.create_node(session_id, "Show a chart.", "why chart tooling matters")
+    registry = sched.build_registry()
+    assert any(entry.get("name") == "set_chart_symbol" for entry in registry)
+    seen: dict[str, object] = {}
+    client = JevClient(
+        transport=_choice_stub(
+            {"entry": "research_required", "assess": "node_resolved", "tool_selection": "set_chart_symbol"}, seen
+        ),
+        data_root=tmp_path,
+    )
+    route = asyncio.run(client.route_entry("explain diversification", registry))
+    assert route == {"route": "research_required", "personas": None}
+    route_questions = seen["questions"]
+    assert isinstance(route_questions, dict)
+    entry = route_questions["entry"]
+    assert isinstance(entry, dict)
+    entry_options = entry["criteria"]
+    assert isinstance(entry_options, dict) and "set_chart_symbol" not in entry_options
+
+    assessment = asyncio.run(client.assess_entry_tool("What time is it?", "get_current_time"))
+    assert assessment == "node_resolved"
+    assess_questions = seen["questions"]
+    assert isinstance(assess_questions, dict)
+    assess = assess_questions["assess"]
+    assert isinstance(assess, dict)
+    assess_options = assess["criteria"]
+    assert isinstance(assess_options, dict) and "set_chart_symbol" not in assess_options
+
+    selected = asyncio.run(
+        client.select_tool(
+            "show a chart", {"node_id": node.node_id, "question": "Show a chart."}, registry, session_id=session_id
+        )
+    )
+    assert selected.action == "invoke" and selected.tool_name == "set_chart_symbol"
+    tool_questions = seen["questions"]
+    assert isinstance(tool_questions, dict)
+    tool_selection = tool_questions["tool_selection"]
+    assert isinstance(tool_selection, dict)
+    tool_options = tool_selection["criteria"]
+    assert isinstance(tool_options, dict) and "set_chart_symbol" in tool_options
+
+
 def _route_entry(
     prompt: str,
     picks: dict[str, str],
     route_hint: str | None = None,
     watchlist: Sequence[str] | None = None,
+    current_ticker: str | None = None,
 ) -> tuple[dict[str, JSONValue], dict[str, object]]:
     seen: dict[str, object] = {}
     client = JevClient(transport=_choice_stub(picks, seen), data_root=Path("/tmp"))
-    return asyncio.run(client.route_entry(prompt, _ROUTE_REG, route_hint=route_hint, watchlist=watchlist)), seen
+    return (
+        asyncio.run(
+            client.route_entry(
+                prompt, _ROUTE_REG, route_hint=route_hint, watchlist=watchlist, current_ticker=current_ticker
+            )
+        ),
+        seen,
+    )
 
 
 @pytest.mark.parametrize("prompt", ["", " \t\n"])
@@ -820,7 +990,7 @@ def test_route_entry_rejects_missing_or_invalid_sidecar_route(
         asyncio.run(client.route_entry("NVDA?", _ROUTE_REG))
 
 
-def test_route_entry_hint_keeps_route_and_asks_only_personas() -> None:
+def test_route_entry_hint_keeps_route_and_asks_personas_and_chart() -> None:
     out, seen = _route_entry(
         "what time is it?",
         {"personas": "bearbot_bullbot"},
@@ -828,7 +998,127 @@ def test_route_entry_hint_keeps_route_and_asks_only_personas() -> None:
     )
     assert out == {"route": "get_current_time", "personas": ["bearbot", "bullbot"]}
     questions = seen["questions"]
-    assert isinstance(questions, dict) and list(questions) == ["personas"]
+    assert isinstance(questions, dict) and list(questions) == ["personas", "chart"]
+
+
+def test_route_entry_no_change_never_resolves_candidates() -> None:
+    with mock.patch("app.tools._resolve_company_to_ticker", side_effect=AssertionError("no resolution")):
+        out, seen = _route_entry(
+            "Compare Nvidia and Apple",
+            {"entry": "research_required", "personas": "bearbot", "chart": "no_change"},
+            current_ticker="MSFT",
+        )
+    assert out == {"route": "research_required", "personas": ["bearbot"]}
+    questions = seen["questions"]
+    assert isinstance(questions, dict)
+    chart = questions["chart"]
+    assert isinstance(chart, dict)
+    assert chart["type"] == "choice"
+    criteria = chart["criteria"]
+    assert isinstance(criteria, dict) and set(criteria) == {"no_change", "Nvidia", "Apple"}
+
+
+@pytest.mark.parametrize(("selected", "ticker"), [("Nvidia", "NVDA"), ("Apple", "AAPL")])
+def test_route_entry_resolves_only_selected_candidate(selected: str, ticker: str) -> None:
+    with mock.patch("app.tools._resolve_company_to_ticker", return_value=ticker) as resolve:
+        out, _ = _route_entry(
+            "Compare Nvidia and Apple",
+            {"entry": "research_required", "personas": "stockbot_bullbot", "chart": selected},
+            current_ticker="MSFT",
+        )
+    resolve.assert_called_once_with(selected)
+    assert out == {"route": "research_required", "personas": ["stockbot", "bullbot"], "chartTicker": ticker}
+
+
+def test_route_entry_explicit_stock_excludes_displayed_chart_candidate() -> None:
+    with mock.patch("app.tools._resolve_company_to_ticker", return_value="NVDA") as resolve:
+        out, seen = _route_entry(
+            "Should I buy NVDA?",
+            {"entry": "reasoning_required", "chart": "NVDA"},
+            current_ticker="AAPL",
+        )
+    resolve.assert_called_once_with("NVDA")
+    assert out == {"route": "reasoning_required", "personas": None, "chartTicker": "NVDA"}
+    questions = seen["questions"]
+    assert isinstance(questions, dict)
+    chart = questions["chart"]
+    assert isinstance(chart, dict)
+    criteria = chart["criteria"]
+    assert isinstance(criteria, dict) and set(criteria) == {"no_change", "NVDA"}
+
+
+def test_route_entry_selected_current_chart_has_no_update() -> None:
+    with mock.patch("app.tools._resolve_company_to_ticker", return_value="NVDA") as resolve:
+        out, _ = _route_entry(
+            "Should I buy it?",
+            {"entry": "research_required", "personas": "bearbot", "chart": "NVDA"},
+            current_ticker="NVDA",
+        )
+    resolve.assert_called_once_with("NVDA")
+    assert out == {"route": "research_required", "personas": ["bearbot"]}
+
+
+@pytest.mark.parametrize("resolution", [None, "", "FINRA", 7])
+def test_route_entry_chart_resolution_failure_keeps_route_and_personas(resolution: object) -> None:
+    with mock.patch("app.tools._resolve_company_to_ticker", return_value=resolution) as resolve:
+        out, _ = _route_entry(
+            "Should I buy Nvidia?",
+            {"entry": "reasoning_required", "personas": "bullbot", "chart": "Nvidia"},
+            current_ticker="AAPL",
+        )
+    resolve.assert_called_once_with("Nvidia")
+    assert out["route"] == "reasoning_required"
+    assert out["personas"] == ["bullbot"]
+    assert "Nvidia" in str(out["chartError"])
+    assert "chartTicker" not in out
+
+
+def test_route_entry_chart_resolver_outage_keeps_route_and_personas() -> None:
+    with mock.patch("app.tools._resolve_company_to_ticker", side_effect=RuntimeError("EDGAR unavailable")):
+        out, _ = _route_entry(
+            "Should I buy Nvidia?",
+            {"entry": "research_required", "personas": "bearbot", "chart": "Nvidia"},
+        )
+    assert out["route"] == "research_required"
+    assert out["personas"] == ["bearbot"]
+    assert "EDGAR unavailable" in str(out["chartError"])
+    assert "chartTicker" not in out
+
+
+@settings(max_examples=50, derandomize=True)
+@given(
+    st.one_of(
+        st.none(),
+        st.booleans(),
+        st.integers(),
+        st.text(max_size=40),
+        st.lists(st.text(max_size=10), max_size=3),
+    )
+)
+def test_route_entry_malformed_chart_choice_never_resolves(label: JSONValue) -> None:
+    assume(label not in ("no_change", "NVDA"))
+    client = JevClient(data_root=Path("/tmp"))
+
+    def _sidecar(payload: dict[str, JSONValue]) -> dict[str, JSONValue]:
+        return {
+            "id": payload["id"],
+            "decisions": {
+                "entry": {"choice": "research_required"},
+                "personas": {"choice": "bearbot"},
+                "chart": {"choice": label},
+            },
+            "raw": {},
+        }
+
+    with (
+        mock.patch.object(client, "_sidecar_roundtrip", _sidecar),
+        mock.patch("app.tools._resolve_company_to_ticker", side_effect=AssertionError("invalid chart choice")),
+    ):
+        out = asyncio.run(client.route_entry("NVDA?", _ROUTE_REG))
+    assert out["route"] == "research_required"
+    assert out["personas"] == ["bearbot"]
+    assert isinstance(out.get("chartError"), str) and out["chartError"]
+    assert "chartTicker" not in out
 
 
 def test_route_entry_selector_unavailable_raises() -> None:
@@ -1330,7 +1620,7 @@ def test_failed_intake_closes_bootstrap_without_replacing_setup_error(
 
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
 
-    def _no_ticker(objective: str) -> None:
+    def _no_ticker(objective: str, supplied_ticker: object = None) -> None:
         return None
 
     monkeypatch.setattr(sched, "build_registry", list)
@@ -2621,6 +2911,50 @@ def test_graph_intake_fetches_only_new_scope(
     assert service.ready_nodes(sid)
 
 
+@pytest.mark.parametrize(
+    ("objective", "expected"),
+    [
+        ("can you give me buying advice", ["NVDA"]),
+        ("Should I buy Apple?", ["AAPL"]),
+        ("Should I buy MissingCo?", []),
+    ],
+)
+def test_graph_intake_uses_current_context_only_without_explicit_stock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, objective: str, expected: list[str]
+) -> None:
+    def _resolve(name: str) -> str | None:
+        return {"Apple": "AAPL", "NVDA": "NVDA"}.get(name)
+
+    def _no_cik(symbol: str) -> None:
+        return None
+
+    monkeypatch.setattr("app.tools._resolve_company_to_ticker", _resolve)
+    monkeypatch.setattr("app.sec.client.resolve_cik", _no_cik)
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    monkeypatch.setattr(sched, "build_registry", list)
+    identifiers: list[object] = []
+
+    async def _attempt(tool: str, args: dict[str, object], *rest: object) -> dict[str, object]:
+        if tool == "list_sec_filings":
+            identifiers.append(args["identifier"])
+        return {"tool": tool, "arguments": args, "error": "source unavailable"}
+
+    def _decompose(
+        prompt: str, as_of: object, sid: str, digest: str, *rest: object
+    ) -> tuple[list[dict[str, object]], dict[str, object]]:
+        return (
+            [{"id": "q1", "objectiveId": sid, "question": prompt, "dependsOn": [], "whyItMatters": "w"}],
+            {},
+        )
+
+    monkeypatch.setattr(kw, "_intake_attempt", _attempt)
+    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
+    sid = kw.run_graph_prompt(objective, ticker="NVDA", jev=_JevDown(), setup_deadline=kw.time.perf_counter())
+    assert identifiers == expected
+    assert ResearchRepository().get_session(sid).objective == objective
+    assert [node.question for node in ResearchRepository().list_nodes(sid)] == [objective]
+
+
 def test_run_followup_setup_failure_is_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A raising pass-2 setup reports provider_error with the session-setup text."""
 
@@ -2891,7 +3225,7 @@ def test_run_persists_scope_and_uses_injected_authority(
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     monkeypatch.setattr(sched, "build_registry", list)
 
-    def _no_subject(objective: str) -> None:
+    def _no_subject(objective: str, supplied_ticker: object = None) -> None:
         return None
 
     monkeypatch.setattr(sched, "_objective_subject_ticker", _no_subject)
@@ -2977,7 +3311,7 @@ def test_graph_intake_persists_citable_sources_dedupes_and_settles_jobs(
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     monkeypatch.setattr(sched, "build_registry", list)
 
-    def _no_subject(objective: str) -> None:
+    def _no_subject(objective: str, supplied_ticker: object = None) -> None:
         return None
 
     monkeypatch.setattr(sched, "_objective_subject_ticker", _no_subject)

@@ -243,6 +243,7 @@ async function post(
 
 type ReasonOptions = {
   prompt: string;
+  ticker?: string;
   evidence: Evidence[];
   escalated: boolean;
   direct?: boolean;
@@ -300,6 +301,9 @@ function reasonInput(opts: ReasonOptions): { role: string; content: string }[] {
   const system = opts.direct
     ? directSystem(persona)
     : (opts.persona ? researchSystem(opts.persona) : SYSTEM) + gapInstruction(opts);
+  const stockContext = opts.ticker
+    ? `\n\nCURRENT STOCK CONTEXT\nThe current chart stock is ${opts.ticker}. Use this stock only if the user request does not name a stock. An explicit stock in the user request takes precedence.`
+    : "";
   // Explicit Stockbot research call with drafts appends the synthesis section; every other call keeps its exact existing user body.
   const isSynthesis = !opts.direct && opts.persona === "stockbot" && (opts.drafts?.length ?? 0) > 0;
   const user = opts.direct
@@ -309,7 +313,7 @@ function reasonInput(opts: ReasonOptions): { role: string; content: string }[] {
       ? `\n\nSIBLING DRAFTS (untrusted sibling prose, not evidence. Never cite, quote, or invent a draft id. For factual support, cite only evidence row ids from the EVIDENCE section.)\n${formatDrafts(opts.drafts ?? [])}\n\nWeigh both sibling drafts against the EVIDENCE above.`
       : "");
   return [
-    { role: "system", content: system },
+    { role: "system", content: system + stockContext },
     { role: "user", content: user },
   ];
 }

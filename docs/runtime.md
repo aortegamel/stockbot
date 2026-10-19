@@ -87,19 +87,46 @@ A selected caller ticker does not override an exact greeting: `hello` with `tick
 `Hello!`, `thanks!!`, and `what's up?` use one short Stockbot reply without research, tools, or a session.
 Mixed requests such as `hello, what drove NVDA revenue last quarter?` still enter research.
 Persona greetings such as `hi bullbot` still reach JEV.
-In programmatic mode, advice with no subject in the prompt returns `clarify_subject` without JEV.
-The selected chart ticker does not supply the missing subject for this check.
+In programmatic mode, advice without a prompt subject or supplied stock returns `clarify_subject` without JEV.
+The separate `currentChartTicker` supplies the displayed stock when the prompt names no stock.
 The matcher accepts only advice words and filler, so `should I buy bonds` still uses existing routing.
 The harness streams one fixed clarification with no research session, provider call, or tool call.
-For other requests, JEV returns `{route, personas}`.
+For other requests, JEV returns `{route, personas}` with optional `chartTicker` or `chartError`.
 `personas: null` means the request neither selects nor excludes a persona.
 An explicit list is nonempty, unique, and canonical, in the order Stockbot, Bearbot, Bullbot.
 Positive requests retain only requested personas that the user does not exclude.
 Exclusion-only requests select the remaining personas.
-Other programmatic routes become a `route_hint` while JEV selects personas.
+Other programmatic routes become a `route_hint` while JEV selects personas and an independent chart focus.
 Without a hint, the JEV prompt assigns small talk without a company, ticker, or market topic to `reasoning_required`.
 A selector failure returns `{id, error}` without an assumed persona set.
 No remaining persona also fails the request.
+
+The route request carries `currentChartTicker` separately from the exclusive ticker or watchlist research scope.
+The worker validates this field with the existing ticker validator.
+The chart focus question remains present when a programmatic hint suppresses the normal entry question.
+The entry route and direct-tool assessment exclude `set_chart_symbol` because the independent chart action owns this operation.
+JEV chooses a declared lexical stock label or `no_change` in the same entry call.
+Explicit user stocks take precedence over the displayed stock.
+For several stocks, JEV chooses the chart focus.
+The entry client resolves only this chosen label through EDGAR.
+Existing greeting and advice subject checks retain their separate resolution behavior.
+The entry client validates the resolved ticker before it returns `chartTicker`.
+It omits `chartTicker` when the focus matches the displayed chart.
+Resolution failures return `chartError` without changing the original route or personas.
+
+The harness asks Needle only for arguments to the fixed `set_chart_symbol` tool.
+It checks the generated ticker against the chosen focus before canonical execution.
+The harness emits `{type: "chart_update", ticker}` only after canonical success.
+A chart failure produces a visible warning, while the original question continues.
+The chart receipt does not enter factual evidence.
+During research, canonical chart success emits progress with `stage: "chart_update"` and `detail: {ticker}`.
+The scheduler validates `result.meta.chart_selection` before it emits this progress.
+It does not parse formatted chart text or infer success from the final execution list.
+A chart receipt alone cannot resolve a substantive stock question.
+
+Research intake uses the supplied ticker only when the objective names no stock.
+An explicit objective stock takes precedence over this context.
+Deterministic fallback arguments use the same subject precedence as Needle.
 
 Without an explicit selection, direct and single-tool answers use one Stockbot call.
 Research uses all three personas.
@@ -269,7 +296,10 @@ Its context contains temporal anchors, the selected ticker, and explicitly groun
 The server filters context fields before it binds the selected tool.
 Fresh nodes exclude `research_read` and `research_read_search` because they lack saved resource handles.
 If Needle rejects `search_web` through a tool mismatch or grounding error, the scheduler uses the node question.
-It trims that query to 200 characters without another generation.
+It removes a leading `[Today UTC YYYY-MM-DD]` instruction before it trims whitespace and truncates the query to 200 characters.
+It preserves dates within the question.
+A blank or non-string question remains invalid.
+The scheduler makes no additional generation call.
 One deterministic Needle failure excludes its tool for the next round when another tool remains.
 Durable storage retains complete evidence records.
 JEV retains its evidence context outside the argument SDK.

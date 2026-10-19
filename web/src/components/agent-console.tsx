@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { AgentEvent, Evidence } from "../../../needle-harness/lib/agent/types";
+import type { AgentEvent, Evidence, SourceReference } from "../../../needle-harness/lib/agent/types";
 import { fetchSourceDocument } from "../lib/research-client";
 import { originalSourceUrl, safeSourceUrl } from "../lib/source-viewer";
 import { AgentEventView } from "./agent-event";
@@ -31,26 +31,31 @@ function evidenceById(events: AgentEvent[]): Map<string, Evidence> {
 }
 
 function useCitationUrls(parts: AnswerPart[]): Map<string, string | undefined> {
-  const requests = useRef(new Map<string, Promise<string | undefined>>());
+  const requested = useRef(new Set<string>());
+  const mounted = useRef(false);
   const [urls, setUrls] = useState(new Map<string, string | undefined>());
+  const references = new Map<string, SourceReference>();
+  for (const part of parts) {
+    const reference = part.citation?.sources?.[0];
+    if (reference && !references.has(reference.id)) references.set(reference.id, { id: reference.id, url: reference.url });
+  }
+  const sources = JSON.stringify([...references.values()]);
   useEffect(() => {
-    let active = true;
-    for (const part of parts) {
-      const reference = part.citation?.sources?.[0];
-      if (!reference || urls.has(reference.id)) continue;
-      let request = requests.current.get(reference.id);
-      if (!request) {
-        request = fetchSourceDocument(reference.id)
-          .then((source) => originalSourceUrl(source, true))
-          .catch(() => safeSourceUrl(reference.url));
-        requests.current.set(reference.id, request);
-      }
-      void request.then((url) => {
-        if (active) setUrls((current) => new Map(current).set(reference.id, url));
-      });
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  useEffect(() => {
+    for (const reference of JSON.parse(sources) as SourceReference[]) {
+      if (requested.current.has(reference.id)) continue;
+      requested.current.add(reference.id);
+      void fetchSourceDocument(reference.id)
+        .then((source) => originalSourceUrl(source, true))
+        .catch(() => safeSourceUrl(reference.url))
+        .then((url) => {
+          if (mounted.current) setUrls((current) => new Map(current).set(reference.id, url));
+        });
     }
-    return () => { active = false; };
-  }, [parts, urls]);
+  }, [sources]);
   return urls;
 }
 

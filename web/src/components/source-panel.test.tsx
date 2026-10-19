@@ -397,15 +397,18 @@ describe("SourcePanel", () => {
     expect(events).toEqual(["navigate:-1", "navigate:1", "close", "close"]);
   });
 
-  test("console citations load only the first cited source once and keep the source controls", async () => {
+  test("console citations keep stable links while text streams and resolve new sources once", async () => {
     const source: SourceDocument = { ...TEXT, representation: "html", content: "<p>Revenue grew.</p><p>Margins held.</p>", quote: "Revenue grew.\nMargins held." };
+    const next: SourceDocument = { ...TEXT, id: "evidence:panel:next-citation", url: "https://www.sec.gov/next", representation: "html", content: "<p>Margins held.</p>", quote: "Margins held." };
+    const nextUrl = "/api/research/sources/evidence%3Apanel%3Anext-citation";
     const { promise: loaded, resolve: release } = Promise.withResolvers<void>();
-    const requests = serve({ body: source, gate: loaded }, { body: source });
+    const { promise: nextLoaded, resolve: releaseNext } = Promise.withResolvers<void>();
+    const requests = serve({ body: source, gate: loaded }, { body: next, gate: nextLoaded }, { body: source });
     const events: AgentEvent[] = [
       {
         type: "evidence", evidence: [
           { id: "ev:cited", source: "sec", retrievedAt: "", content: "", sources: [{ id: source.id, url: "https://www.sec.gov/before-load" }, { id: "evidence:unused" }] },
-          { id: "ev:uncited", source: "sec", retrievedAt: "", content: "", sources: [{ id: "evidence:uncited" }] },
+          { id: "ev:uncited", source: "sec", retrievedAt: "", content: "", sources: [{ id: next.id, url: "https://www.sec.gov/next-before-load" }] },
         ]
       },
       { type: "answer_delta", text: "Revenue rose [ev:cited]. Margins held [ev:cited]." },
@@ -419,22 +422,36 @@ describe("SourcePanel", () => {
       expect(anchor.getAttribute("rel")).toBe("noopener noreferrer");
     }
     expect(requests).toEqual([TEXT_URL]);
+    const textOnly: AgentEvent[] = [...events, { type: "answer_delta", text: " More streamed text." }];
+    await act(async () => mounted?.render(<AgentConsole events={textOnly} reasoning={false} debug={false} />));
+    expect(anchors().map((anchor) => anchor.getAttribute("href"))).toEqual(["https://www.sec.gov/before-load", "https://www.sec.gov/before-load"]);
+    expect(requests).toEqual([TEXT_URL]);
+    const withNext: AgentEvent[] = [...textOnly, { type: "answer_delta", text: " More [ev:cited]. Next [ev:uncited] and [ev:uncited]." }];
+    await act(async () => mounted?.render(<AgentConsole events={withNext} reasoning={false} debug={false} />));
+    const nextAnchors = () => [...root.querySelectorAll('a[aria-label="Open source for ev:uncited"]')];
+    expect(anchors()).toHaveLength(3);
+    expect(nextAnchors().map((anchor) => anchor.getAttribute("href"))).toEqual(["https://www.sec.gov/next-before-load", "https://www.sec.gov/next-before-load"]);
+    expect(requests).toEqual([TEXT_URL, nextUrl]);
     await act(async () => release());
     await until(() => anchors().every((anchor) => anchor.getAttribute("href") === `${source.url}#:~:text=Revenue%20grew.,Margins%20held.`));
-    await act(async () => mounted?.render(<AgentConsole events={[...events, { type: "answer_delta", text: " More [ev:cited]." }]} reasoning={false} debug={false} />));
+    await act(async () => mounted?.render(<AgentConsole events={[...withNext, { type: "answer_delta", text: " Text without another citation." }]} reasoning={false} debug={false} />));
     expect(anchors()).toHaveLength(3);
     for (const anchor of anchors()) {
       expect(anchor.getAttribute("href")).toBe(`${source.url}#:~:text=Revenue%20grew.,Margins%20held.`);
       expect(anchor.getAttribute("target")).toBe("_blank");
       expect(anchor.getAttribute("rel")).toBe("noopener noreferrer");
     }
-    expect(requests).toEqual([TEXT_URL]);
+    expect(nextAnchors().map((anchor) => anchor.getAttribute("href"))).toEqual(["https://www.sec.gov/next-before-load", "https://www.sec.gov/next-before-load"]);
+    await act(async () => releaseNext());
+    await until(() => nextAnchors().every((anchor) => anchor.getAttribute("href") === fragment(next.url ?? "", next.quote ?? "")));
+    expect(nextAnchors()).toHaveLength(2);
+    expect(requests).toEqual([TEXT_URL, nextUrl]);
     expect(root.querySelector("aside")).toBeNull();
     await click(root, "Sources: ev:cited");
     await until(resolved(root));
     expect(root.querySelector("aside h3")?.textContent).toBe("10-K");
     expect(root.textContent).toContain("1 of 2");
-    expect(requests).toEqual([TEXT_URL, TEXT_URL]);
+    expect(requests).toEqual([TEXT_URL, nextUrl, TEXT_URL]);
   });
 
   test("console citations without an original URL still open the captured source panel", async () => {

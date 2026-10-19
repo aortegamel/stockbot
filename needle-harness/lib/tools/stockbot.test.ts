@@ -1,5 +1,7 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync } from "node:fs";
+import * as childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
 import { categorizeFailure, closeBridge, endSession, invoke, newSessionId } from "./stockbot";
 import { harvest, reason, splitInventory } from "../muse/client";
 import fc from "fast-check";
@@ -78,6 +80,82 @@ describe.skipIf(!HAS_BRIDGE)("stockbot bridge", () => {
     },
     60_000,
   );
+});
+
+describe("stockbot bridge chart metadata", () => {
+  let reply: Record<string, unknown>;
+  let restoreSpawn = (): void => { };
+  const selection = { result_type: "chart_selection", ticker: "MSFT" };
+  beforeEach(() => {
+    closeBridge();
+    reply = { content: "Chart updated." };
+    const stdout = new EventEmitter();
+    const child = Object.assign(new EventEmitter(), {
+      exitCode: null,
+      stdout,
+      stderr: new EventEmitter(),
+      stdin: {
+        write(data: string, callback?: (error?: Error | null) => void): boolean {
+          const request = JSON.parse(data) as { id: string };
+          stdout.emit("data", Buffer.from(`${JSON.stringify({ id: request.id, result: reply })}\n`));
+          callback?.(null);
+          return true;
+        },
+      },
+      kill: () => true,
+    }) as unknown as childProcess.ChildProcessWithoutNullStreams;
+    const spawn = spyOn(childProcess, "spawn").mockReturnValue(child);
+    restoreSpawn = () => spawn.mockRestore();
+  });
+
+  afterEach(() => {
+    closeBridge();
+    restoreSpawn();
+  });
+
+  test("the chart tool preserves structured metadata independently of content", async () => {
+    const content = JSON.stringify({ ticker: "NVDA" });
+    reply = { content, meta: { chart_selection: selection } };
+    const result = await invoke("set_chart_symbol", {}, "chart-test");
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.error);
+    expect(result.chartSelection).toEqual(selection);
+    expect(result.evidence.content).toBe(content);
+  });
+
+  test("missing metadata does not create a selection (%j)", async () => {
+    reply = { content: JSON.stringify({ chart_selection: selection }) };
+    const result = await invoke("set_chart_symbol", {}, "chart-test");
+    expect(result.ok).toBe(true);
+    expect(result).not.toHaveProperty("chartSelection");
+  });
+
+  test.each([null, false, 7, "not-json", [], { ticker: 7 }, { result_type: "research", ticker: "MSFT" }, { result_type: "chart_selection", ticker: "MSFT", extra: 1 }].map((chartSelection) => ({ chartSelection })))(
+    "malformed chart metadata remains untrusted (%j)",
+    async ({ chartSelection }) => {
+      reply = { content: "Chart updated.", meta: { chart_selection: chartSelection } };
+      const result = await invoke("set_chart_symbol", {}, "chart-test");
+      expect(result.ok).toBe(true);
+      expect(result).not.toHaveProperty("chartSelection");
+    },
+  );
+
+  test.each(["list_tool_domains", "SET_CHART_SYMBOL"])(
+    "another tool cannot carry a chart selection (%s)",
+    async (name) => {
+      reply = { content: "Chart updated.", meta: { chart_selection: selection } };
+      const result = await invoke(name, {}, "chart-test");
+      expect(result.ok).toBe(true);
+      expect(result).not.toHaveProperty("chartSelection");
+    },
+  );
+
+  test("a failed chart tool cannot carry a chart selection", async () => {
+    reply = { error: "tool failed", meta: { chart_selection: selection } };
+    const result = await invoke("set_chart_symbol", {}, "chart-test");
+    expect(result.ok).toBe(false);
+    expect(result).not.toHaveProperty("chartSelection");
+  });
 });
 
 describe("categorizeFailure ordered rules", () => {
@@ -375,7 +453,7 @@ describe("muse reason personas (fake provider)", () => {
   });
 
   test("personas see the same request and evidence on separate sessions; gaps stay per persona", async () => {
-    const results = await Promise.all(FINAL_PERSONAS.map((persona) => reason({ ...input, persona })));
+    const results = await Promise.all(FINAL_PERSONAS.map((persona) => reason({ ...input, ticker: "NVDA", persona })));
     expect(results.map((r) => r.text)).toEqual([
       "Stockbot read [E1].",
       "Bearbot read [E1].\nMissing-Evidence: revolver covenant terms",
@@ -390,10 +468,16 @@ describe("muse reason personas (fake provider)", () => {
     expect(users.size).toBe(1);
     const user = [...users][0];
     for (const fact of ["OBJECTIVE", "[E1]", "[E2]", "Revolver matures 2027", "Top customer is 38%"]) expect(user).toContain(fact);
+    expect(user).toStartWith(`USER REQUEST\n${input.prompt}\n\nEVIDENCE\n`);
     // Roles differ, and each keeps the open-node gap instruction.
     const systems = seen.map((s) => systemOf(s.body));
     expect(new Set(systems).size).toBe(3);
-    for (const s of systems) expect(s).toContain("Missing-Evidence:");
+    for (const s of systems) {
+      expect(s).toContain("Missing-Evidence:");
+      expect(s).toContain("CURRENT STOCK CONTEXT\nThe current chart stock is NVDA.");
+      expect(s).toContain("Use this stock only if the user request does not name a stock.");
+      expect(s).toContain("An explicit stock in the user request takes precedence.");
+    }
   });
 
   test("stockbot synthesis carries both labeled drafts as untrusted; bear/bull carry none", async () => {
@@ -401,9 +485,9 @@ describe("muse reason personas (fake provider)", () => {
       { persona: "bearbot", text: "Bear draft [E1]." },
       { persona: "bullbot", text: "Bull draft [E1]." },
     ];
-    await reason({ ...input, persona: "stockbot", drafts });
-    await reason({ ...input, persona: "bearbot" });
-    await reason({ ...input, persona: "bullbot" });
+    await reason({ ...input, ticker: "NVDA", persona: "stockbot", drafts });
+    await reason({ ...input, ticker: "NVDA", persona: "bearbot" });
+    await reason({ ...input, ticker: "NVDA", persona: "bullbot" });
     expect(seen.map((s) => s.path)).toEqual(["/v1/responses", "/v1/responses", "/v1/responses"]);
     const [synthUser, bearUser, bullUser] = seen.map((s) => userOf(s.body));
     // Identical evidence snapshot: synthesis opens with the exact draft-free base.
@@ -418,6 +502,10 @@ describe("muse reason personas (fake provider)", () => {
     expect(synthUser).toContain("cite only evidence");
     expect(bearUser).not.toContain("SIBLING DRAFTS");
     expect(bullUser).not.toContain("SIBLING DRAFTS");
+    for (const call of seen) {
+      expect(systemOf(call.body)).toContain("CURRENT STOCK CONTEXT\nThe current chart stock is NVDA.");
+      expect(systemOf(call.body)).toContain("An explicit stock in the user request takes precedence.");
+    }
   });
 
   test("deadline during the 429 backoff stops without retry or fallback", async () => {
@@ -475,14 +563,17 @@ describe("muse reason personas (fake provider)", () => {
     expect(r.claims).toEqual([]);
   });
 
-  test("a direct call sends the direct system prompt without evidence", async () => {
-    const r = await reason({ prompt: "What is ACME?", evidence: [], escalated: false, direct: true, onDelta: () => { } });
+  test.each([undefined, "NVDA"])("a direct call sends the direct system prompt without evidence (ticker %s)", async (ticker) => {
+    const r = await reason({ prompt: "What is ACME?", ticker, evidence: [], escalated: false, direct: true, onDelta: () => { } });
     expect(r.text).toBe("Stockbot read [E1].");
     expect(seen.length).toBe(1);
     const [call] = seen;
     if (!call) throw new Error("expected one provider call");
     expect(call.path).toBe("/v1/responses");
     expect(systemOf(call.body)).not.toContain("Missing-Evidence:");
+    expect(systemOf(call.body)).toBe("You are Stockbot." + (ticker
+      ? "\n\nCURRENT STOCK CONTEXT\nThe current chart stock is NVDA. Use this stock only if the user request does not name a stock. An explicit stock in the user request takes precedence."
+      : ""));
     expect(userOf(call.body)).toBe("USER REQUEST\nWhat is ACME?");
     expect(userOf(call.body)).not.toContain("EVIDENCE");
   });
@@ -493,6 +584,7 @@ describe("muse reason personas (fake provider)", () => {
     const [call] = seen;
     if (!call) throw new Error("expected one provider call");
     expect(systemOf(call.body)).not.toContain("Bearbot");
+    expect(systemOf(call.body)).not.toContain("CURRENT STOCK CONTEXT");
     expect(userOf(call.body)).toContain("EVIDENCE\n[E1]\nsource: sec");
     expect(userOf(call.body)).not.toContain("SIBLING DRAFTS");
   });

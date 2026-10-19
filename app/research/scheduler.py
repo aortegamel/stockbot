@@ -54,6 +54,7 @@ from app.research.models import (
     ResearchNode,
     ToolDecision,
     query_with_today_utc,
+    validate_ticker,
 )
 from app.research.repository import ResearchRepository
 from app.tool_runtime import (
@@ -688,11 +689,13 @@ def _scalar_or_scalar_list(value: object) -> bool:
     )
 
 
-def _grounded_execution_values(tool_name: str, schema: Mapping[str, object], objective: object) -> dict[str, JSONValue]:
+def _grounded_execution_values(
+    tool_name: str, schema: Mapping[str, object], objective: object, supplied_ticker: object = None
+) -> dict[str, JSONValue]:
     """Explicitly grounded execution values keyed by selected schema properties."""
     properties = schema.get("properties") if isinstance(schema, dict) else None
     names = set(properties) if isinstance(properties, dict) else set()
-    seeded = _fallback_sec_args(tool_name, objective) or {}
+    seeded = _fallback_sec_args(tool_name, objective, supplied_ticker) or {}
     return {
         str(key): list(value) if isinstance(value, tuple) else value
         for key, value in seeded.items()
@@ -925,10 +928,10 @@ def _context_evidence(
     cap_last: int | None = None,
 ) -> list[dict[str, JSONValue]]:
     """Admitted evidence + recent unadmitted observation summaries (success or failure)."""
-    ctx = list(evidence)
+    ctx = [item for item in evidence if item.get("tool") != "set_chart_symbol"]
     tail = attempts[-_OBSERVATION_TAIL:] if cap_last is None else attempts[-cap_last:]
     for attempt in tail:
-        if attempt.get("evidence_id"):
+        if attempt.get("tool") == "set_chart_symbol" or attempt.get("evidence_id"):
             continue  # admitted evidence already covers it
         summary = attempt.get("outcome_summary")
         if not isinstance(summary, str) or not summary:
@@ -1728,6 +1731,85 @@ _COMPANY_SUFFIX = frozenset(
 )
 
 
+_OBJECTIVE_TICKER_RE = re.compile(r"\b[A-Z]{2,5}\b")
+_OBJECTIVE_COMPANY_RE = re.compile(
+    r"\b(?:for|with)\s+([A-Z][a-zA-Z&.'\- ]{2,40}?)(?:\s+this\s+week|\s+last\s+|\s+daily|\s+now|\s*$)",
+    flags=re.IGNORECASE,
+)
+
+
+def _candidate_sort_key(item: tuple[int, str]) -> int:
+    """Sort one lexical candidate by its objective position."""
+    return item[0]
+
+
+def _objective_chart_candidates(objective: str) -> list[str]:
+    """Return explicit lexical stock labels in objective order without resolving them."""
+    objective = re.sub(r"^\[Today UTC \d{4}-\d{2}-\d{2}\]\s*", "", objective).strip()
+    labels: list[tuple[int, str]] = [
+        (match.start(), match.group()) for match in _OBJECTIVE_TICKER_RE.finditer(objective)
+    ]
+    companies: list[tuple[int, str]] = [
+        (objective.find(label), label) for label in _company_token_candidates(objective)
+    ]
+    matches: list[re.Match[str]] = [
+        *_OBJECTIVE_COMPANY_RE.finditer(objective),
+        *re.finditer(
+            r"\b(?i:buy|sell|hold|compare|invest\s+in|how\s+is|how\s+are|tell\s+me\s+about)\s+"
+            r"([A-Z][a-zA-Z&.'\-]*(?:\s+(?:(?i:and|vs\.?|versus|with|to)\s+)?[A-Z][a-zA-Z&.'\-]*)*)",
+            objective,
+        ),
+    ]
+    for match in matches:
+        for company in re.split(r"\s+(?:and|vs\.?|versus|with|to)\s+", match.group(1), flags=re.IGNORECASE):
+            companies.append((objective.find(company, match.start(1)), company.strip()))
+    for match in re.finditer(
+        r"\b([A-Z][a-zA-Z&.'\-]*(?:\s+[A-Z][a-zA-Z&.'\-]*)*)\s+(?i:versus|vs\.?)\s+"
+        r"([A-Z][a-zA-Z&.'\-]*(?:\s+[A-Z][a-zA-Z&.'\-]*)*)",
+        objective,
+    ):
+        companies.extend((match.start(group), match.group(group)) for group in (1, 2))
+    excluded = {
+        "hi",
+        "hey",
+        "hello",
+        "good",
+        "morning",
+        "afternoon",
+        "evening",
+        "today",
+        "tomorrow",
+        "yesterday",
+        "utc",
+        "est",
+        "edt",
+        "pst",
+        "pdt",
+        "et",
+        "am",
+        "pm",
+    }
+    labels.extend(
+        (position, label)
+        for position, label in companies
+        if not any(word.lower() in excluded for word in label.split())
+    )
+    unique: dict[str, str] = {}
+    for _, label in sorted(labels, key=_candidate_sort_key):
+        normalized = " ".join(label.split())
+        if _company_token_allowed(normalized) and normalized.split()[0].lower() not in {
+            "buy",
+            "sell",
+            "hold",
+            "compare",
+            "invest",
+            "tell",
+            "about",
+        }:
+            unique.setdefault(normalized.casefold(), normalized)
+    return list(unique.values())
+
+
 def _objective_ticker(objective: object) -> str | None:
     """Explicit ticker token from the objective (uppercase 2-5ch EDGAR hit, never first-word fallback)."""
     if not isinstance(objective, str) or not objective.strip():
@@ -1735,7 +1817,7 @@ def _objective_ticker(objective: object) -> str | None:
     from app.tools import _FINRA_ORG_WORDS as _ORG
     from app.tools import _resolve_company_to_ticker as _resolve
 
-    for _tok in re.findall(r"\b[A-Z]{2,5}\b", objective):
+    for _tok in _OBJECTIVE_TICKER_RE.findall(objective):
         if _tok.upper() in _ORG or _tok.upper() in ("SHO", "REG"):
             continue
         _rt = _resolve(_tok)
@@ -1751,11 +1833,7 @@ def _objective_company(objective: object) -> tuple[str, str] | None:
     from app.tools import _FINRA_ORG_WORDS as _ORG
     from app.tools import _resolve_company_to_ticker as _resolve
 
-    _qm = re.search(
-        r"\b(?:for|with)\s+([A-Z][a-zA-Z&.'\- ]{2,40}?)(?:\s+this\s+week|\s+last\s+|\s+daily|\s+now|\s*$)",
-        objective.strip(),
-        flags=re.IGNORECASE,
-    )
+    _qm = _OBJECTIVE_COMPANY_RE.search(objective.strip())
     _cand = _qm.group(1).strip() if _qm else None
     if not _cand or _cand.lower() in _COMPANY_TOKEN_STOP or _cand.upper() in _ORG:
         return None
@@ -1822,8 +1900,10 @@ def _company_token_allowed(candidate: str) -> bool:
     return candidate.upper() not in _FINRA_ORG_WORDS and candidate.upper() not in ("SHO", "REG", "EPS", "SEC", "FINRA")
 
 
-def _objective_subject_ticker(objective: object) -> str | None:
-    """Explicit ticker token, else for-<Company>, else possessive/insider mention."""
+def _objective_subject_ticker(objective: object, supplied_ticker: object = None) -> str | None:
+    """Prefer the explicit objective subject. Use chart context only without an explicit label."""
+    if isinstance(objective, str):
+        objective = re.sub(r"^\[Today UTC \d{4}-\d{2}-\d{2}\]\s*", "", objective).strip()
     _ticker = _objective_ticker(objective)
     if _ticker is not None:
         return _ticker
@@ -1831,30 +1911,53 @@ def _objective_subject_ticker(objective: object) -> str | None:
     if _comp is not None:
         return _comp[1]
     _tok = _objective_company_token(objective)
-    return _tok[1] if _tok is not None else None
+    if _tok is not None:
+        return _tok[1]
+    if isinstance(objective, str):
+        from app.tools import _resolve_company_to_ticker
+
+        candidates = _objective_chart_candidates(objective)
+        for candidate in candidates:
+            resolved = _resolve_company_to_ticker(candidate)
+            if resolved is not None:
+                return resolved
+        if candidates:
+            return None
+    return supplied_ticker.strip().upper() if isinstance(supplied_ticker, str) and supplied_ticker.strip() else None
 
 
-def _fallback_sec_args(tool_name: str, objective: object) -> dict[str, JSONValue] | None:
-    """Seeded args from the objective; latest means no start/end window."""
+def _fallback_sec_args(
+    tool_name: str, objective: object, supplied_ticker: object = None
+) -> dict[str, JSONValue] | None:
+    """Seed arguments from the explicit subject, else the supplied chart ticker."""
+    if (
+        tool_name not in _SEC_IDENTIFIER_TOOLS
+        and tool_name not in _SHO_FALLBACK_TOOLS
+        and tool_name not in _TICKER_FALLBACK_TOOLS
+        and tool_name not in ("set_chart_symbol", "find_sec_entities", "find_sec_entities_bounded")
+    ):
+        return _fallback_entity_accession(tool_name, objective, None)
+    ticker = _objective_subject_ticker(objective, supplied_ticker)
     if tool_name in _SEC_IDENTIFIER_TOOLS:
-        return _fallback_sec_identifier(tool_name, objective)
+        return _fallback_sec_identifier(tool_name, objective, ticker)
     if tool_name in _SHO_FALLBACK_TOOLS:
         company = _objective_company(objective)
         if company is not None:
             return {"ticker": company[1], "company_name": company[0]}
-        ticker = _objective_subject_ticker(objective)
         if ticker is not None:
             return {"ticker": ticker}
-    if tool_name in _TICKER_FALLBACK_TOOLS:
-        return _fallback_ticker_args(tool_name, objective)
-    return _fallback_entity_accession(tool_name, objective)
+    if tool_name in _TICKER_FALLBACK_TOOLS or tool_name == "set_chart_symbol":
+        return _fallback_ticker_args(tool_name, objective, ticker)
+    return _fallback_entity_accession(tool_name, objective, ticker)
 
 
 def _fallback_search_web_args(tool_name: str, node: object) -> dict[str, JSONValue] | None:
     """Seed a web query from the node question without another generation."""
     question = _f(node, "question", default=None)
-    if tool_name == "search_web" and isinstance(question, str) and question.strip():
-        return {"query": question.strip()[:200]}
+    if tool_name == "search_web" and isinstance(question, str):
+        unstamped = re.sub(r"^\[Today UTC \d{4}-\d{2}-\d{2}\]\s*", "", question).strip()
+        if unstamped:
+            return {"query": unstamped[:200]}
     return None
 
 
@@ -1871,9 +1974,8 @@ def _revenue_listing_forms(objective: object) -> list[JSONValue] | None:
     return None
 
 
-def _fallback_sec_identifier(tool_name: str, objective: object) -> dict[str, JSONValue] | None:
-    """Seed SEC listing identifiers or search tickers from the objective subject."""
-    ticker = _objective_subject_ticker(objective)
+def _fallback_sec_identifier(tool_name: str, objective: object, ticker: str | None) -> dict[str, JSONValue] | None:
+    """Seed SEC listing identifiers or search tickers from the selected subject."""
     if ticker is None:
         return None
     if tool_name == "list_sec_filings":
@@ -1884,9 +1986,8 @@ def _fallback_sec_identifier(tool_name: str, objective: object) -> dict[str, JSO
     return {"ticker": ticker}
 
 
-def _fallback_ticker_args(tool_name: str, objective: object) -> dict[str, JSONValue] | None:
+def _fallback_ticker_args(tool_name: str, objective: object, ticker: str | None) -> dict[str, JSONValue] | None:
     """Add the EPS metric only for fundamental requests that explicitly name it."""
-    ticker = _objective_subject_ticker(objective)
     if ticker is None:
         return None
     if tool_name == "get_fundamentals" and isinstance(objective, str) and "eps" in objective.lower():
@@ -1894,14 +1995,13 @@ def _fallback_ticker_args(tool_name: str, objective: object) -> dict[str, JSONVa
     return {"ticker": ticker}
 
 
-def _fallback_entity_accession(tool_name: str, objective: object) -> dict[str, JSONValue] | None:
+def _fallback_entity_accession(tool_name: str, objective: object, ticker: str | None) -> dict[str, JSONValue] | None:
     """Seed entity queries or an explicit filing accession without adding a date window."""
     if (
         tool_name in ("find_sec_entities", "find_sec_entities_bounded")
         and isinstance(objective, str)
         and objective.strip()
     ):
-        ticker = _objective_subject_ticker(objective)
         if ticker is not None:
             return {"query": ticker}
         return {"query": objective.strip()[:200]}
@@ -2594,15 +2694,12 @@ def _needle_context(
     session: Mapping[str, JSONValue],
 ) -> dict[str, object]:
     """Grounded context for one Needle call: types and objective strings, never raw request text."""
-    raw_ticker = session.get("ticker")
-    ticker = raw_ticker.strip().upper() if isinstance(raw_ticker, str) and raw_ticker.strip() else None
-    if ticker is None:
-        ticker = _objective_subject_ticker(objective)
+    ticker = _objective_subject_ticker(objective, session.get("ticker"))
     context: dict[str, object] = {
         "as_of": as_of,
         "temporal_scope": scoped,
         "today_utc": datetime.now(UTC).date().isoformat(),
-        "grounded_arguments": _grounded_execution_values(tool_name, schema, objective),
+        "grounded_arguments": _grounded_execution_values(tool_name, schema, objective, ticker),
     }
     if ticker is not None:
         context["ticker"] = ticker
@@ -2650,7 +2747,7 @@ def _grounded_revenue_arguments(
     if not (_undated_latest_ten_q(session, node, as_of) or _latest_revenue_requested(session, node, as_of)):
         return None
     if tool_name == "list_sec_filings":
-        grounded = _fallback_sec_args(tool_name, objective)
+        grounded = _fallback_sec_args(tool_name, objective, session.get("ticker"))
         reasoning = "scheduler grounded latest revenue arguments from the user request"
     else:
         grounded = _listing_carry_args(tool_name, objective, attempts)
@@ -2802,7 +2899,9 @@ def _needle_failure_args(
                 nid,
                 "carried accession from packet after needle failure",
             )
-    seeded = _fallback_search_web_args(tool_name, node) or _fallback_sec_args(tool_name, objective)
+    seeded = _fallback_search_web_args(tool_name, node) or _fallback_sec_args(
+        tool_name, objective, session.get("ticker")
+    )
     if seeded is not None:
         logger.info(
             "toolflow args_seed sid=%s nid=%s tool=%s keys=%s err=%s",
@@ -2850,7 +2949,7 @@ def _withhold_args(
                 return _repaired_carry(
                     tool_name, carried, objective, session, node, evidence, attempts, sid, nid, needle_reasoning
                 )
-        seeded = _fallback_sec_args(tool_name, objective)
+        seeded = _fallback_sec_args(tool_name, objective, session.get("ticker"))
         if seeded is not None:
             logger.info(
                 "toolflow args_seed sid=%s nid=%s tool=%s keys=%s",
@@ -3372,6 +3471,8 @@ def _grounded_allowed_ids(evidence: Sequence[object], attempts: Sequence[object]
     allowed: set[str] = set()
     items: list[object] = [*evidence, *attempts]
     for item in items:
+        if _f(item, "tool", default=None) == "set_chart_symbol":
+            continue
         for key in ("evidence_id", "tool_result_ref", "tool_result_id"):
             value = _f(item, key, default=None)
             if isinstance(value, str) and value.strip():
@@ -3486,9 +3587,10 @@ async def _reasoner_expand(
 
 def _has_trusted_evidence(evidence: Sequence[object], attempts: Sequence[Mapping[str, JSONValue]]) -> bool:
     """Admitted/trusted evidence present: stored records or an in-run admission."""
-    if evidence:
+    non_chart = [item for item in evidence if _f(item, "tool", default=None) != "set_chart_symbol"]
+    if non_chart:
         return True
-    return any(a.get("evidence_id") for a in attempts)
+    return any(a.get("evidence_id") and a.get("tool") != "set_chart_symbol" for a in attempts)
 
 
 def _normalize_expansion_item(item: object) -> dict[str, str] | None:
@@ -4106,6 +4208,8 @@ def _admittable_candidate(
     kernel: _Kernel,
 ) -> dict[str, object] | None:
     """Admit a candidate only when JEV permits its state and the kernel can cite its bytes."""
+    if tool == "set_chart_symbol":
+        return None
     if not (isinstance(ev_state, str) and ev_state in _ADMITTABLE_EVIDENCE_STATES and _f(outcome, "error") is None):
         return None
     return _evidence_candidate(tool, _attempt_domain(tool, attempt), attempt.get("result"), outcome, kernel)
@@ -4568,6 +4672,26 @@ def _without_control_tools(registry: list[dict[str, JSONValue]], sid: str, nid: 
     return kept
 
 
+def _chart_receipt_ticker(attempt: Mapping[str, object]) -> str | None:
+    """Validate the canonical chart receipt without treating it as factual evidence."""
+    if attempt.get("tool") != "set_chart_symbol":
+        return None
+    result = attempt.get("result")
+    selection = _f(_f(result, "meta"), "chart_selection")
+    if _f(selection, "result_type") != "chart_selection":
+        return None
+    if any(
+        _f(packet, key) is not None
+        for packet in (attempt, result, selection, attempt.get("outcome"))
+        for key in ("error", "error_type")
+    ):
+        return None
+    try:
+        return validate_ticker(_f(selection, "ticker"), "<chart receipt>")
+    except ValueError:
+        return None
+
+
 async def _invoke_and_settle(
     decision: ToolDecision,
     tools: list[str],
@@ -4585,6 +4709,7 @@ async def _invoke_and_settle(
     executors: _Executors,
     tool_session: RuntimeToolSession,
     as_of_str: str | None,
+    progress: _Progress | None = None,
 ) -> _RoundOut:
     """Invoke selected tools and settle results; returns step signals."""
     results = await _invoke_phase(
@@ -4601,6 +4726,7 @@ async def _invoke_and_settle(
         tool_session,
         as_of_str,
     )
+    tickers = [_chart_receipt_ticker(attempt) for attempt in results]
     round_out = await _settle_round(
         results,
         jev,
@@ -4614,6 +4740,9 @@ async def _invoke_and_settle(
         admitted,
         session=session,
     )
+    for ticker in tickers:
+        if ticker is not None:
+            _progress(progress, "chart_update", {"ticker": ticker})
     return {
         "terminal": round_out["terminal"],
         "continue": False,
@@ -4641,6 +4770,7 @@ async def _run_round(
     executors: _Executors,
     tool_session: RuntimeToolSession,
     as_of_str: str | None,
+    progress: _Progress | None = None,
 ) -> _RoundOut:
     """One tool round: resolved/reason dispatch, invoke, settle; returns step signals."""
     if action == "resolved":
@@ -4715,6 +4845,7 @@ async def _run_round(
         executors,
         tool_session,
         as_of_str,
+        progress=progress,
     )
 
 
@@ -4973,6 +5104,7 @@ async def _drive_rounds(
             executors,
             tool_session,
             as_of_str,
+            progress=progress,
         )
         admitted = step["admitted"]
         _progress(progress, "tool_done", {"node_id": nid, "admitted": admitted})

@@ -1852,10 +1852,27 @@ def test_relative_tradedate_scrubbed_to_wtd_omit() -> None:
     "failure",
     ["withheld", "foreign_tool", "runtime_mismatch", "value_mismatch", "grounding"],
 )
-def test_search_web_fallback_uses_node_question_once(failure: str) -> None:
-    """Web recovery uses the trimmed node question, not the session objective or generated arguments."""
+@pytest.mark.parametrize(
+    ("question", "expected_query"),
+    [
+        (
+            "  Which segment drove the margin change? " + "x" * 220 + "  ",
+            ("Which segment drove the margin change? " + "x" * 220)[:200],
+        ),
+        (
+            "[Today UTC 2026-10-19] \n  Which segment drove the margin change? " + "x" * 220 + "  ",
+            ("Which segment drove the margin change? " + "x" * 220)[:200],
+        ),
+        ("What changed on 2026-09-22?", "What changed on 2026-09-22?"),
+        (
+            "What does [Today UTC 2026-10-19] mean?",
+            "What does [Today UTC 2026-10-19] mean?",
+        ),
+    ],
+)
+def test_search_web_fallback_uses_node_question_once(failure: str, question: str, expected_query: str) -> None:
+    """Web recovery removes only the leading date instruction before it trims and truncates the question."""
     calls: list[str] = []
-    question = "  Which segment drove the margin change? " + "x" * 220 + "  "
     node = dataclasses.replace(_node(), question=question)
 
     async def generate(**kw: object) -> dict[str, JSONValue]:
@@ -1884,13 +1901,13 @@ def test_search_web_fallback_uses_node_question_once(failure: str) -> None:
             _Kernel(),
         )
     )
-    assert args == {"query": question.strip()[:200]}
+    assert args == {"query": expected_query}
     assert calls == ["search_web"]
     assert "node question" in reasoning
     assert withheld is False
 
 
-@pytest.mark.parametrize("question", [None, "", "   ", 12])
+@pytest.mark.parametrize("question", [None, "", "   ", 12, "[Today UTC 2026-10-19]", "[Today UTC 2026-10-19] \n "])
 def test_search_web_fallback_requires_nonblank_node_question(question: object) -> None:
     """Web recovery does not invent a query when the node lacks a question."""
 
@@ -7980,3 +7997,560 @@ def test_carried_accession_preserves_runtime_arguments(
     )
     assert out["error"] is None
     assert invoked == [expected]
+
+
+@pytest.mark.parametrize(
+    ("objective", "expected"),
+    [
+        ("Compare NVDA, AAPL, NVDA and MSFT.", ["NVDA", "AAPL", "MSFT"]),
+        ("compare Apple and Microsoft", ["Apple", "Microsoft"]),
+        ("compare Acme Systems versus Apple", ["Acme Systems", "Apple"]),
+        ("Apple versus Microsoft", ["Apple", "Microsoft"]),
+        ("buy Apple; compare Microsoft; with apple", ["Apple", "Microsoft"]),
+        ("buy Apple; compare NVDA and Microsoft; hold AAPL", ["Apple", "NVDA", "Microsoft", "AAPL"]),
+        ("What are Apple's margins? What did Tesla insiders sell?", ["Apple", "Tesla"]),
+        ("What are Acme Systems margins?", ["Acme Systems"]),
+        ("short interest for Apple this week", ["Apple"]),
+        ("volume with Tesla now", ["Tesla"]),
+        ("Should I buy Apple?", ["Apple"]),
+        ("sell Microsoft", ["Microsoft"]),
+        ("hold Apple", ["Apple"]),
+        ("invest in Acme Systems", ["Acme Systems"]),
+        ("how is Apple doing?", ["Apple"]),
+        ("tell me about Apple", ["Apple"]),
+        ("[Today UTC 2026-10-19] compare AAPL and NVDA", ["AAPL", "NVDA"]),
+        ("[Today UTC 2026-10-19] hi", []),
+        ("hello, good morning", []),
+        ("hi ty", []),
+        ("HI TY", ["HI", "TY"]),
+        ("What are SEC FINRA REG SHO EPS figures?", []),
+        ("Growth slowed last quarter", []),
+        ("", []),
+    ],
+)
+def test_objective_chart_candidates_are_ordered_lexical_labels(
+    objective: str, expected: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Candidate extraction preserves explicit labels without calling the resolver."""
+    from app import tools
+
+    resolver = mock.Mock(side_effect=AssertionError("Lexical extraction must not resolve a company."))
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", resolver)
+    assert sched._objective_chart_candidates(objective) == expected
+    resolver.assert_not_called()
+
+
+@settings(max_examples=60, derandomize=True, deadline=None)
+@given(
+    st.lists(st.sampled_from(["NVDA", "AAPL", "MSFT", "ORCL", "HI", "TY"]), min_size=1, max_size=12),
+    st.sampled_from([" ", "  ", "\t", "\n", " \t "]),
+)
+def test_prop_chart_ticker_candidates_preserve_first_order_and_deduplicate(labels: list[str], whitespace: str) -> None:
+    """Repeated ticker labels retain their first position across whitespace changes."""
+    objective = whitespace + ("," + whitespace).join(labels) + whitespace
+    with mock.patch("app.tools._resolve_company_to_ticker", side_effect=AssertionError("No resolver call allowed.")):
+        assert sched._objective_chart_candidates(objective) == list(dict.fromkeys(labels))
+
+
+@settings(max_examples=60, derandomize=True, deadline=None)
+@given(
+    st.lists(st.sampled_from(["Apple", "Microsoft", "Acme Systems", "Coca Cola"]), min_size=1, max_size=10),
+    st.sampled_from([" ", "  ", "\t", "\n", " \t "]),
+)
+def test_prop_chart_company_candidates_normalize_whitespace_and_deduplicate(labels: list[str], whitespace: str) -> None:
+    """Company labels keep their first order despite case changes and internal whitespace."""
+    objective = "; ".join(f"buy {whitespace.join(label.split())}; with {label.lower()} now" for label in labels)
+    with mock.patch("app.tools._resolve_company_to_ticker", side_effect=AssertionError("No resolver call allowed.")):
+        assert sched._objective_chart_candidates(objective) == list(dict.fromkeys(labels))
+
+
+def _resolve_chart_test_subject(label: str) -> str | None:
+    return {"Apple": "AAPL", "MSFT": "MSFT"}.get(label)
+
+
+@pytest.mark.parametrize(
+    ("objective", "supplied", "expected"),
+    [
+        ("How is it doing?", " nvda ", "NVDA"),
+        ("hi", " aapl ", "AAPL"),
+        ("", " msft ", "MSFT"),
+        ("How is it doing?", "", None),
+        ("How is it doing?", " \t ", None),
+        ("How is it doing?", None, None),
+        ("How is it doing?", 42, None),
+        ("buy Apple", "NVDA", "AAPL"),
+        ("how is Apple doing?", "NVDA", "AAPL"),
+        ("tell me about Apple", "NVDA", "AAPL"),
+        ("What are Apple's margins? Compare MSFT", "NVDA", "MSFT"),
+        ("buy Unlisted Company", "NVDA", None),
+        ("compare ZZZZX and Unknown Company", "NVDA", None),
+    ],
+)
+def test_objective_subject_prefers_explicit_labels_over_chart_context(
+    objective: str, supplied: object, expected: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit subjects retain old precedence and unresolved labels refuse the chart ticker."""
+    from app import tools
+
+    resolver = mock.Mock(side_effect=_resolve_chart_test_subject)
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", resolver)
+    assert sched._objective_subject_ticker(objective, supplied) == expected
+    assert all(call.args != ("NVDA",) for call in resolver.call_args_list)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected"),
+    [
+        ("list_sec_filings", {"identifier": "NVDA"}),
+        ("search_sec_filings", {"ticker": "NVDA", "query": "How is it doing?"}),
+        ("search_sec_filings_bounded", {"ticker": "NVDA", "query": "How is it doing?"}),
+        ("find_sec_entities", {"query": "NVDA"}),
+        ("find_sec_entities_bounded", {"query": "NVDA"}),
+        ("get_reg_sho_volume", {"ticker": "NVDA"}),
+        ("get_short_interest", {"ticker": "NVDA"}),
+        ("get_insider_activity", {"ticker": "NVDA"}),
+        ("get_planned_insider_sales", {"ticker": "NVDA"}),
+        ("get_fundamentals", {"ticker": "NVDA"}),
+        ("set_chart_symbol", {"ticker": "NVDA"}),
+        ("get_sec_document", None),
+        ("get_sec_filing", None),
+        ("get_stock_price", None),
+    ],
+)
+def test_fallback_args_use_normalized_chart_context_without_an_explicit_subject(
+    tool_name: str, expected: dict[str, JSONValue] | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chart context supplies only the selectors each tool accepts, never a filing accession."""
+    from app import tools
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", mock.Mock(return_value=None))
+    assert sched._fallback_sec_args(tool_name, "How is it doing?", " nvda ") == expected
+
+
+@pytest.mark.parametrize(
+    "tool_name", ["list_sec_filings", "search_sec_filings", "get_reg_sho_volume", "set_chart_symbol"]
+)
+def test_fallback_args_refuse_chart_context_for_unresolved_explicit_subject(
+    tool_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unresolved explicit company cannot silently become the selected chart company."""
+    from app import tools
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", mock.Mock(return_value=None))
+    assert sched._fallback_sec_args(tool_name, "buy Unlisted Company", "NVDA") is None
+    assert sched._fallback_sec_args("find_sec_entities", "buy Unlisted Company", "NVDA") == {
+        "query": "buy Unlisted Company"
+    }
+
+
+@pytest.mark.parametrize(
+    ("objective", "expected"),
+    [
+        ("How is it doing?", "NVDA"),
+        ("buy Apple", "AAPL"),
+        ("buy Unlisted Company", None),
+    ],
+)
+def test_needle_context_and_grounded_values_share_explicit_subject_precedence(
+    objective: str, expected: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Needle receives the selected subject and only schema-supported grounded values."""
+    from app import tools
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_chart_test_subject)
+    schema: dict[str, JSONValue] = {
+        "type": "object",
+        "properties": {"ticker": {"type": "string"}},
+    }
+    session: dict[str, JSONValue] = {"session_id": "s1", "objective": objective, "ticker": " nvda "}
+    context = sched._needle_context("get_fundamentals", schema, objective, None, {}, session)
+    grounded: dict[str, JSONValue] = {} if expected is None else {"ticker": expected}
+    assert context.get("ticker") == expected
+    assert context["grounded_arguments"] == grounded
+    assert sched._grounded_execution_values("get_fundamentals", schema, objective, " nvda ") == grounded
+    assert sched._grounded_execution_values("get_fundamentals", {"properties": {}}, objective, "NVDA") == {}
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "withhold"])
+@pytest.mark.parametrize(
+    ("tool_name", "selector"),
+    [
+        ("list_sec_filings", "identifier"),
+        ("search_sec_filings", "ticker"),
+        ("find_sec_entities", "query"),
+        ("get_reg_sho_volume", "ticker"),
+        ("get_fundamentals", "ticker"),
+        ("get_short_interest", "ticker"),
+        ("set_chart_symbol", "ticker"),
+    ],
+)
+@pytest.mark.parametrize(("objective", "ticker"), [("How is it doing?", "NVDA"), ("buy Apple", "AAPL")])
+def test_generate_arguments_recovers_with_session_chart_ticker(
+    failure: str, tool_name: str, selector: str, objective: str, ticker: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both real recovery paths preserve explicit subjects before they use chart context."""
+    from app import tools
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_chart_test_subject)
+    calls: list[str] = []
+
+    async def generate(**kwargs: object) -> dict[str, JSONValue]:
+        calls.append(str(kwargs["tool"]))
+        context = kwargs["context"]
+        assert isinstance(context, dict)
+        assert context["ticker"] == ticker
+        if failure == "unavailable":
+            raise RuntimeError("needle worker closed")
+        return {"tool": None, "arguments": {}, "reasoning": "withheld"}
+
+    args, reasoning, withheld = asyncio.run(
+        sched._generate_tool_arguments(
+            generate,
+            tool_name,
+            sched.build_registry(),
+            {"session_id": "s1", "objective": objective, "ticker": " nvda "},
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
+    )
+    expected: dict[str, JSONValue] = {selector: ticker}
+    if tool_name == "search_sec_filings":
+        expected["query"] = objective
+    assert calls == [tool_name]
+    assert args == expected
+    assert reasoning
+    assert withheld is False
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "withhold"])
+def test_generate_arguments_recovery_reselects_unresolved_subject_despite_chart(
+    failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recovery never changes an unresolved explicit company into the chart company."""
+    from app import tools
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", mock.Mock(return_value=None))
+    calls: list[str] = []
+
+    async def generate(**kwargs: object) -> dict[str, JSONValue]:
+        calls.append(str(kwargs["tool"]))
+        context = kwargs["context"]
+        assert isinstance(context, dict) and "ticker" not in context
+        if failure == "unavailable":
+            raise RuntimeError("needle worker closed")
+        return {"tool": None, "arguments": {}, "reasoning": "withheld"}
+
+    with pytest.raises(sched._ReselectRequest, match="re-selecting"):
+        asyncio.run(
+            sched._generate_tool_arguments(
+                generate,
+                "search_sec_filings",
+                sched.build_registry(),
+                {"session_id": "s1", "objective": "buy Unlisted Company", "ticker": "NVDA"},
+                _node(),
+                [],
+                [],
+                None,
+                _Kernel(),
+            )
+        )
+    assert calls == ["search_sec_filings"]
+
+
+@pytest.mark.parametrize(
+    ("objective", "expected"),
+    [
+        ("What is its latest revenue?", "NVDA"),
+        ("What is Apple's latest revenue?", "AAPL"),
+    ],
+)
+def test_latest_revenue_listing_uses_session_ticker_without_needle(
+    objective: str, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deterministic revenue listing uses chart context only when the objective lacks a subject."""
+    from app import tools
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_chart_test_subject)
+    generate = mock.AsyncMock(side_effect=AssertionError("The deterministic listing must not call Needle."))
+    args, reasoning, withheld = asyncio.run(
+        sched._generate_tool_arguments(
+            generate,
+            "list_sec_filings",
+            sched.build_registry(),
+            {"session_id": "s1", "objective": objective, "ticker": " nvda "},
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
+    )
+    assert args == {"identifier": expected, "forms": ["10-Q", "10-K"]}
+    assert "latest revenue" in reasoning
+    assert withheld is False
+    generate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "none",
+        "result-error",
+        "receipt-error",
+        "outcome-error",
+        "invoke-error",
+        "wrong-type",
+        "missing-type",
+        "missing-ticker",
+        "blank-ticker",
+        "invalid-ticker",
+        "organization-ticker",
+        "nonstring-ticker",
+        "formatted-only",
+        "top-level-only",
+        "missing-meta",
+        "invalid-meta",
+        "invalid-receipt",
+    ],
+)
+def test_run_node_emits_only_valid_chart_receipts_without_resolving_evidence(
+    defect: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a successful structured chart receipt emits an update, never factual evidence or resolution."""
+    from app import tools
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_chart_test_subject)
+    receipt: dict[str, JSONValue] = {"result_type": "chart_selection", "ticker": "AAPL"}
+    if defect == "receipt-error":
+        receipt["error"] = "chart selection failed"
+    elif defect == "wrong-type":
+        receipt["result_type"] = "quote"
+    elif defect == "missing-type":
+        receipt.pop("result_type")
+    elif defect == "missing-ticker":
+        receipt.pop("ticker")
+    elif defect == "blank-ticker":
+        receipt["ticker"] = " \t "
+    elif defect == "invalid-ticker":
+        receipt["ticker"] = "AAPL MSFT"
+    elif defect == "organization-ticker":
+        receipt["ticker"] = "SEC"
+    elif defect == "nonstring-ticker":
+        receipt["ticker"] = 123
+    response: dict[str, JSONValue] = {"meta": {"chart_selection": receipt}}
+    if defect == "result-error":
+        response["error"] = "chart selection failed"
+    elif defect == "formatted-only":
+        response = {"content": '{"result_type":"chart_selection","ticker":"AAPL"}'}
+    elif defect == "top-level-only":
+        response = dict(receipt)
+    elif defect == "missing-meta":
+        response = {}
+    elif defect == "invalid-meta":
+        response = {"meta": "not a receipt"}
+    elif defect == "invalid-receipt":
+        response = {"meta": {"chart_selection": "not a receipt"}}
+    updates: list[tuple[str, dict[str, object]]] = []
+    invoked: list[str] = []
+    selected = 0
+    kernel = _Kernel(objective="buy Apple")
+
+    async def select(*args: object, **kwargs: object) -> tuple[str, ToolDecision]:
+        nonlocal selected
+        selected += 1
+        return (
+            ("invoke", _invoke("set_chart_symbol")) if selected == 1 else ("resolved", ToolDecision(action="resolved"))
+        )
+
+    async def generate(**kwargs: object) -> dict[str, JSONValue]:
+        return {"tool": "set_chart_symbol", "arguments": {"ticker": "AAPL"}}
+
+    async def invoke(name: str, args: dict[str, JSONValue], session: object, **kwargs: object) -> dict[str, JSONValue]:
+        invoked.append(name)
+        assert args == {"ticker": "AAPL"}
+        if defect == "invoke-error":
+            raise RuntimeError("chart unavailable")
+        return dict(response)
+
+    def outcome(name: str, result: Mapping[str, object]) -> ToolOutcome:
+        return dataclasses.replace(
+            _outcome(
+                json.dumps({"result_type": "chart_selection", "ticker": "AAPL"}),
+                error="chart rejected" if defect == "outcome-error" else None,
+            ),
+            tool_name=name,
+        )
+
+    def progress(stage: str, detail: dict[str, object]) -> None:
+        updates.append((stage, detail))
+
+    with (
+        mock.patch.object(kernel, "resolve_node", wraps=kernel.resolve_node) as resolve,
+        mock.patch.object(
+            sched, "_evidence_candidate", side_effect=AssertionError("Chart tools cannot admit evidence.")
+        ),
+    ):
+        result = asyncio.run(
+            sched.run_node(
+                _node(),
+                "s1",
+                kernel=kernel,
+                jev=_JevAdmit(),
+                select_round=select,
+                needle_generate=generate,
+                invoke=invoke,
+                to_outcome=outcome,
+                registry=sched.build_registry(),
+                tool_session=_tool_session(),
+                progress=progress,
+                max_rounds=2,
+            )
+        )
+        resolve.assert_not_called()
+    assert invoked == ["set_chart_symbol"]
+    chart_updates = [detail for stage, detail in updates if stage == "chart_update"]
+    assert chart_updates == ([{"ticker": "AAPL"}] if defect == "none" else [])
+    assert result["status"] == "blocked"
+    assert result["admitted"] == 0
+    assert kernel.evidence == []
+    assert not any(call[0] == "admit" for call in kernel.calls)
+
+
+def test_chart_records_never_supply_factual_context_citations_or_trusted_evidence() -> None:
+    """Chart records remain outside factual context, citation identifiers, and resolution evidence."""
+    chart: dict[str, JSONValue] = {
+        "tool": "set_chart_symbol",
+        "evidence_id": "ev-chart",
+        "tool_result_ref": "s1:tr:chart",
+        "content": "Chart changed to AAPL.",
+        "outcome_summary": "Chart changed to AAPL.",
+    }
+    fact: dict[str, JSONValue] = {
+        "tool": "get_sec_document",
+        "evidence_id": "ev-fact",
+        "content": "Revenue was 10 million.",
+    }
+    observation: dict[str, JSONValue] = {
+        "tool": "get_stock_price",
+        "tool_result_ref": "s1:tr:quote",
+        "outcome_summary": "Price was 100.",
+    }
+    assert sched._context_evidence([chart], [chart]) == []
+    assert sched._grounded_allowed_ids([chart], [chart]) == set()
+    assert sched._has_trusted_evidence([chart], [chart]) is False
+    context = sched._context_evidence([chart, fact], [chart, observation])
+    assert context[0] == fact
+    assert len(context) == 2 and context[1]["tool"] == "get_stock_price"
+    assert sched._grounded_allowed_ids([chart, fact], [chart, observation]) == {"ev-fact", "s1:tr:quote"}
+    assert sched._has_trusted_evidence([chart, fact], []) is True
+    assert sched._has_trusted_evidence([], [chart, fact]) is True
+
+
+def test_run_node_does_not_resolve_from_preexisting_chart_evidence() -> None:
+    """A stored chart record cannot satisfy a later resolution decision."""
+    chart: dict[str, JSONValue] = {
+        "tool": "set_chart_symbol",
+        "evidence_id": "ev-chart",
+        "content": "Chart selection is not a financial fact.",
+    }
+
+    class _ChartKernel(_Kernel):
+        @override
+        def list_evidence(self, session_id: str) -> list[dict[str, JSONValue]]:
+            return [chart]
+
+    async def select(*args: object, **kwargs: object) -> tuple[str, ToolDecision]:
+        assert "Chart selection is not a financial fact." not in json.dumps(args[7])
+        return "resolved", ToolDecision(action="resolved")
+
+    kernel = _ChartKernel(objective="How is it doing?")
+    with mock.patch.object(kernel, "resolve_node", wraps=kernel.resolve_node) as resolve:
+        result = asyncio.run(
+            sched.run_node(
+                _node(),
+                "s1",
+                kernel=kernel,
+                jev=_JevAdmit(),
+                select_round=select,
+                registry=[],
+                max_rounds=1,
+                tool_session=_tool_session(),
+            )
+        )
+        resolve.assert_not_called()
+    assert result["status"] == "blocked"
+    assert result["admitted"] == 0
+
+
+@pytest.mark.parametrize("failure", ["timeout", "other-tool"])
+def test_chart_context_does_not_hide_unrecoverable_generation_errors(
+    failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chart context does not recover unrelated timeouts or a different generated tool."""
+    from app import tools
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", mock.Mock(return_value=None))
+
+    async def generate(**kwargs: object) -> dict[str, JSONValue]:
+        if failure == "timeout":
+            raise RuntimeError("needle timed out")
+        return {"tool": "search_web", "arguments": {"query": "unrelated"}}
+
+    with pytest.raises((RuntimeError, ValueError), match="needle timed out|needle tool mismatch"):
+        asyncio.run(
+            sched._generate_tool_arguments(
+                generate,
+                "list_sec_filings",
+                sched.build_registry(),
+                {"session_id": "s1", "objective": "How is it doing?", "ticker": "NVDA"},
+                _node(),
+                [],
+                [],
+                None,
+                _Kernel(),
+            )
+        )
+
+
+def test_run_node_rejects_chart_receipt_from_a_non_chart_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A chart-shaped receipt from another tool cannot change the chart."""
+    from app import tools
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_chart_test_subject)
+    updates: list[dict[str, object]] = []
+
+    async def select(*args: object, **kwargs: object) -> tuple[str, ToolDecision]:
+        return "invoke", _invoke("get_fundamentals")
+
+    async def generate(**kwargs: object) -> dict[str, JSONValue]:
+        return {"tool": "get_fundamentals", "arguments": {"ticker": "AAPL"}}
+
+    async def invoke(name: str, args: dict[str, JSONValue], session: object, **kwargs: object) -> dict[str, JSONValue]:
+        return {"meta": {"chart_selection": {"result_type": "chart_selection", "ticker": "MSFT"}}}
+
+    def progress(stage: str, detail: dict[str, object]) -> None:
+        if stage == "chart_update":
+            updates.append(detail)
+
+    result = asyncio.run(
+        sched.run_node(
+            _node(),
+            "s1",
+            kernel=_Kernel(objective="buy Apple"),
+            jev=_JevAdmit(),
+            select_round=select,
+            needle_generate=generate,
+            invoke=invoke,
+            to_outcome=_to_outcome,
+            registry=sched.build_registry(),
+            tool_session=_tool_session(),
+            progress=progress,
+            max_rounds=1,
+        )
+    )
+    assert updates == []
+    assert result["status"] == "blocked"
+    assert result["admitted"] == 0

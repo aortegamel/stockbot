@@ -627,6 +627,105 @@ def test_search_egress_denial_is_soft_and_recorded(monkeypatch: pytest.MonkeyPat
 # -- success meta shaping ----------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("set_chart_symbol", {"ticker": "  aapl \t"}),
+        ("call_tool", {"name": "set_chart_symbol", "arguments": {"ticker": "  aapl \t"}}),
+    ],
+)
+def test_execute_chart_symbol_returns_normalized_selection_meta(
+    name: str, arguments: dict[str, object], tmp_path: Path
+) -> None:
+    out = execute_agent_tool(name, arguments, RuntimeToolSession(session_id="gw-chart"), data_root=tmp_path)
+
+    assert set(out) == {"content", "meta"}, out
+    assert isinstance(out["content"], str) and out["content"]
+    meta = out["meta"]
+    assert isinstance(meta, dict)
+    assert meta["status"] == "completed"
+    assert meta["chart_selection"] == {"result_type": "chart_selection", "ticker": "AAPL"}
+
+
+def test_success_meta_copies_only_normalized_chart_selection_fields() -> None:
+    from app.security.context_gateway import envelope_for_tool
+
+    result: dict[str, object] = {
+        "result_type": "chart_selection",
+        "ticker": "  brk.b \t",
+        "unknown_field": "dropped",
+        "chart_selection": {"result_type": "chart_selection", "ticker": "MSFT"},
+    }
+    envelope = envelope_for_tool("set_chart_symbol", result)
+    out = rt._success_meta("set_chart_symbol", result, rt._tool_result_meta(result), envelope, "completed")
+
+    assert out["chart_selection"] == {"result_type": "chart_selection", "ticker": "BRK.B"}
+    assert "unknown_field" not in out
+
+
+@pytest.mark.parametrize(
+    ("name", "status", "result"),
+    [
+        pytest.param(
+            "get_current_time", "completed", {"result_type": "chart_selection", "ticker": "AAPL"}, id="other-tool"
+        ),
+        pytest.param("set_chart_symbol", "failed", {"result_type": "chart_selection", "ticker": "AAPL"}, id="failed"),
+        pytest.param("set_chart_symbol", "partial", {"result_type": "chart_selection", "ticker": "AAPL"}, id="partial"),
+        pytest.param(
+            "set_chart_symbol", "completed", {"result_type": "other_result", "ticker": "AAPL"}, id="wrong-result-type"
+        ),
+        pytest.param("set_chart_symbol", "completed", {"ticker": "AAPL"}, id="missing-result-type"),
+        pytest.param(
+            "set_chart_symbol", "completed", {"result_type": "chart_selection", "ticker": ""}, id="empty-ticker"
+        ),
+        pytest.param(
+            "set_chart_symbol", "completed", {"result_type": "chart_selection", "ticker": " \t"}, id="blank-ticker"
+        ),
+        pytest.param(
+            "set_chart_symbol", "completed", {"result_type": "chart_selection", "ticker": None}, id="null-ticker"
+        ),
+        pytest.param("set_chart_symbol", "completed", {"result_type": "chart_selection"}, id="missing-ticker"),
+        pytest.param(
+            "set_chart_symbol", "completed", {"result_type": "chart_selection", "ticker": 7}, id="numeric-ticker"
+        ),
+        pytest.param(
+            "set_chart_symbol", "completed", {"result_type": "chart_selection", "ticker": True}, id="boolean-ticker"
+        ),
+        pytest.param(
+            "set_chart_symbol", "completed", {"result_type": "chart_selection", "ticker": []}, id="list-ticker"
+        ),
+        pytest.param(
+            "set_chart_symbol", "completed", {"result_type": "chart_selection", "ticker": "AAPL!"}, id="invalid-ticker"
+        ),
+        pytest.param(
+            "set_chart_symbol",
+            "completed",
+            {"result_type": "chart_selection", "ticker": " sec "},
+            id="organization-word",
+        ),
+        pytest.param(
+            "set_chart_symbol",
+            "completed",
+            {"result_type": "chart_selection", "ticker": "AAPL", "error": None},
+            id="error-key",
+        ),
+        pytest.param(
+            "set_chart_symbol",
+            "completed",
+            {"result_type": "chart_selection", "ticker": "AAPL", "error_type": ""},
+            id="error-type-key",
+        ),
+    ],
+)
+def test_success_meta_withholds_invalid_chart_selection(name: str, status: str, result: dict[str, object]) -> None:
+    from app.security.context_gateway import envelope_for_tool
+
+    envelope = envelope_for_tool(name, result)
+    out = rt._success_meta(name, result, rt._tool_result_meta(result), envelope, status)
+
+    assert "chart_selection" not in out
+
+
 def test_success_meta_copies_discovery_names_and_paging_fields_only() -> None:
     from app.security.context_gateway import envelope_for_tool
 

@@ -1,4 +1,5 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
+import fc from "fast-check";
 import { FINAL_PERSONAS, type Evidence } from "@/lib/agent/types";
 // Real validator captured before mock.module replaces the kernel exports; route.ts must see the production rule.
 import { asksWatchlist, parseTicker, parseWatchlist } from "@/lib/agent/kernel";
@@ -26,11 +27,16 @@ let assessReply: Record<string, unknown> | null = null;
 let toolFailure: { category: string; error: string } | null = null;
 let toolThrows: unknown = null;
 let endThrows = false;
+let chartReceipt: unknown = { result_type: "chart_selection", ticker: "MSFT" };
+let emitChartUpdate = false;
+const executionOrder: string[] = [];
 const runCalls: unknown[][] = [];
-type ReasonCall = { prompt: string; evidence: Evidence[]; onDelta?: (t: string) => void };
+type ReasonCall = { prompt: string; ticker?: string; evidence: Evidence[]; onDelta?: (t: string) => void };
 const reasonCalls: ReasonCall[] = [];
-type KernelCall = { op?: unknown; tool?: unknown; prompt?: unknown; objective?: unknown; ticker?: unknown; watchlist?: unknown };
+type KernelCall = { op?: unknown; tool?: unknown; prompt?: unknown; objective?: unknown; ticker?: unknown; currentChartTicker?: unknown; watchlist?: unknown };
 const kernelCalls: KernelCall[] = [];
+const kernelOpts: unknown[] = [];
+const invokeTimeouts: unknown[] = [];
 const invoked: unknown[][] = [];
 const ended: string[] = [];
 let sessionsCreated = 0;
@@ -50,11 +56,13 @@ mock.module("@/lib/agent/kernel", () => ({
   parseWatchlist: realParseWatchlist,
   asksWatchlist: realAsksWatchlist,
   kernelRouter: {
-    call: async (body: KernelCall) => {
+    call: async (body: KernelCall, opts?: { signal?: AbortSignal; timeoutMs?: number }) => {
+      kernelOpts.push(opts);
       kernelCalls.push(body);
       if (routeDown) throw new Error("worker down");
       if (body.op === "arguments") {
         if (argsDown) throw new Error("needle down");
+        if (body.tool === "set_chart_symbol" && argsReply === null) return { tool: body.tool, arguments: { ticker: body.ticker } };
         return argsReply ?? { tool: body.tool, arguments: { q: "x" }, confidence: 1, reasoning: "t" };
       }
       if (body.op === "assess_entry") {
@@ -68,6 +76,11 @@ mock.module("@/lib/agent/kernel", () => ({
   },
   runKernelAgent: async (...args: unknown[]) => {
     runCalls.push(args);
+    executionOrder.push("research");
+    if (emitChartUpdate) {
+      const emit = args[1] as (e: Record<string, unknown>) => void;
+      emit({ type: "chart_update", ticker: "MSFT" });
+    }
     if (runThrows !== null) throw runThrows;
     if (emitProgress) {
       const emit = args[1] as (e: Record<string, unknown>) => void;
@@ -84,6 +97,7 @@ mock.module("@/lib/agent/kernel", () => ({
 mock.module("@/lib/muse/client", () => ({
   reason: async (opts: ReasonCall) => {
     reasonCalls.push(opts);
+    executionOrder.push("reason");
     if (reasonDown) throw new Error("muse down");
     opts.onDelta?.("hi");
     return { text: "hi", usage: {} };
@@ -91,10 +105,13 @@ mock.module("@/lib/muse/client", () => ({
 }));
 
 mock.module("@/lib/tools/stockbot", () => ({
-  invoke: async (name: string, args: unknown, sessionId: string) => {
+  invoke: async (name: string, args: unknown, sessionId: string, timeoutMs?: number) => {
     invoked.push([name, args, sessionId]);
+    invokeTimeouts.push(timeoutMs);
+    executionOrder.push(name);
     if (toolThrows !== null) throw toolThrows;
     if (toolFailure !== null) return { ok: false, ...toolFailure };
+    if (name === "set_chart_symbol") return { ok: true, chartSelection: chartReceipt, evidence: { ...bridgeEvidence, content: "ticker: MSFT\nresult_type: chart_selection" } };
     return { ok: true, evidence: { ...bridgeEvidence, source: name } };
   },
   newSessionId: () => {
@@ -124,9 +141,14 @@ function reset(): void {
   toolFailure = null;
   toolThrows = null;
   endThrows = false;
-  runCalls.length = 0;
+  chartReceipt = { result_type: "chart_selection", ticker: "MSFT" };
+  emitChartUpdate = false;
+  executionOrder.length = 0;
+  kernelOpts.length = 0;
+  invokeTimeouts.length = 0;
   reasonCalls.length = 0;
   kernelCalls.length = 0;
+  runCalls.length = 0;
   invoked.length = 0;
   ended.length = 0;
   sessionsCreated = 0;
@@ -136,12 +158,12 @@ function reset(): void {
 
 type AgentEventShape = { type: string;[k: string]: unknown };
 
-async function eventsFor(prompt: string, ticker?: unknown, watchlist?: unknown): Promise<AgentEventShape[]> {
+async function eventsFor(prompt: string, ticker?: unknown, watchlist?: unknown, currentChartTicker?: unknown): Promise<AgentEventShape[]> {
   const { POST } = await import("./route");
   const req = new Request("http://localhost/api/agent", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt, ...(ticker === undefined ? {} : { ticker }), ...(watchlist === undefined ? {} : { watchlist }) }),
+    body: JSON.stringify({ prompt, ...(ticker === undefined ? {} : { ticker }), ...(watchlist === undefined ? {} : { watchlist }), ...(currentChartTicker === undefined ? {} : { currentChartTicker }) }),
   });
   const res = await POST(req);
   const text = await res.text();
@@ -174,7 +196,7 @@ describe("agent entry route", () => {
         const events = await eventsFor(prompt, ticker);
         expect(events).toEqual([
           { type: "agent_start", prompt },
-          { type: "answer_delta", text: "Which stock, ETF, sector, or holding do you want buying advice on? Give a ticker (for example NVDA) or a company name, and I will research it." },
+          { type: "answer_delta", text: "Which stock, ETF, sector, or holding do you want advice on? Give a ticker (for example NVDA) or a company name, and I will research it." },
           {
             type: "done",
             metrics: {
@@ -187,7 +209,7 @@ describe("agent entry route", () => {
             },
           },
         ]);
-        expect(kernelCalls).toEqual([{ op: "route", prompt, ...(ticker ? { ticker } : {}) }]);
+        expect(kernelCalls).toEqual([{ op: "route", prompt, ...(ticker ? { ticker, currentChartTicker: ticker } : {}) }]);
         expect(reasonCalls).toEqual([]);
         expect(runCalls).toEqual([]);
         expect(invoked).toEqual([]);
@@ -808,5 +830,297 @@ describe("agent entry route", () => {
       method: "POST", body: JSON.stringify({ prompt: "hello" }), signal: controller.signal,
     }));
     expect(await response.text()).toBe("");
+  });
+
+  test("the selected focus updates the chart before a direct answer without factual evidence or another route", async () => {
+    reset();
+    delete process.env.STOCKBOT_DEBUG;
+    routeReply = { route: "reasoning_required", personas: null, chartTicker: "MSFT" };
+    const prompt = "Compare Apple and Microsoft";
+    const events = await eventsFor(prompt, "AAPL");
+    expect(executionOrder).toEqual(["set_chart_symbol", "reason"]);
+    expect(events[0]).toEqual({ type: "chart_update", ticker: "MSFT" });
+    expect(events.findIndex((event) => event.type === "chart_update")).toBeLessThan(events.findIndex((event) => event.type === "reasoning_start"));
+    expect(kernelCalls).toEqual([
+      { op: "route", prompt, ticker: "AAPL", currentChartTicker: "AAPL" },
+      { op: "arguments", tool: "set_chart_symbol", objective: prompt, ticker: "MSFT" },
+    ]);
+    expect(invoked).toEqual([["set_chart_symbol", { ticker: "MSFT" }, "sess-test"]]);
+    expect(reasonCalls[0]).toMatchObject({ prompt, ticker: "MSFT", evidence: [] });
+    expect(ended).toEqual(["sess-test"]);
+    expect(events.some((event) => event.type === "evidence")).toBe(false);
+    expect(runCalls).toEqual([]);
+  });
+
+  test("research and every explicit persona selection apply the chart pre-action first", async () => {
+    for (const selection of [null, ...Array.from({ length: (1 << FINAL_PERSONAS.length) - 1 }, (_, mask) => FINAL_PERSONAS.filter((_, i) => ((mask + 1) >> i) & 1))]) {
+      reset();
+      routeReply = { route: selection === null ? "research_required" : "reasoning_required", personas: selection, chartTicker: "MSFT" };
+      const prompt = "Compare Apple and Microsoft";
+      const events = await eventsFor(prompt, "AAPL");
+      expect(executionOrder).toEqual(["set_chart_symbol", "research"]);
+      expect(events).toEqual([{ type: "chart_update", ticker: "MSFT" }]);
+      expect(runCalls[0]?.[0]).toBe(prompt);
+      expect(runCalls[0]?.[2]).toMatchObject({ ticker: "MSFT", currentChartTicker: "MSFT", seedEvidence: [] });
+      if (selection !== null) expect(runCalls[0]?.[2]).toMatchObject({ personas: selection });
+      expect(kernelCalls.map((call) => call.op)).toEqual(["route", "arguments"]);
+      expect(ended).toEqual(["sess-test"]);
+    }
+  });
+
+  test("single-tool reasoning uses the applied chart without treating its receipt as evidence", async () => {
+    reset();
+    routeReply = { route: "get_sec_document", personas: null, chartTicker: "MSFT" };
+    await eventsFor("Microsoft risk factors?", "AAPL");
+    expect(executionOrder).toEqual(["set_chart_symbol", "get_sec_document", "reason"]);
+    expect(reasonCalls[0]).toMatchObject({ ticker: "MSFT", evidence: [expect.objectContaining({ id: "ev:bridge", content: bridgeEvidence.content })] });
+    expect(kernelCalls.filter((call) => call.op === "arguments").map((call) => call.ticker)).toEqual(["MSFT", "MSFT"]);
+    expect(kernelCalls.filter((call) => call.op === "assess_entry")).toHaveLength(1);
+    expect(ended).toEqual(["sess-test", "sess-test"]);
+  });
+
+  test("a single-tool research fallback never seeds the chart receipt", async () => {
+    reset();
+    routeReply = { route: "get_sec_document", personas: null, chartTicker: "MSFT" };
+    verdicts = ["research_required"];
+    await eventsFor("Microsoft risk factors?", "AAPL");
+    expect(runCalls[0]?.[2]).toMatchObject({ ticker: "MSFT", currentChartTicker: "MSFT", seedEvidence: [expect.objectContaining({ content: bridgeEvidence.content })] });
+    expect(JSON.stringify(runCalls[0]?.[2])).not.toContain("chart_selection");
+  });
+
+  test("chart metadata errors preserve the original route and explicit personas", async () => {
+    for (const chart of [
+      { chartTicker: null },
+      { chartTicker: "SEC" },
+      { chartTicker: "MSFT", chartError: "ambiguous" },
+      { chartError: 7 },
+      { chartError: "" },
+      { chartError: "No SEC entity matched the selected focus." },
+    ]) {
+      for (const selection of [null, ["stockbot"]]) {
+        reset();
+        routeReply = { route: "reasoning_required", personas: selection, ...chart };
+        const events = await eventsFor("Microsoft outlook?", "AAPL");
+        expect(events[0]?.type).toBe("answer_delta");
+        expect(String(events[0]?.text)).toContain("Chart update failed:");
+        expect(events.some((event) => event.type === "chart_update")).toBe(false);
+        expect(invoked).toEqual([]);
+        expect(kernelCalls.map((call) => call.op)).toEqual(["route"]);
+        if (selection === null) {
+          expect(reasonCalls[0]).toMatchObject({ ticker: "AAPL", evidence: [] });
+          expect(events.at(-2)).toEqual({ type: "answer_delta", text: "hi" });
+        } else {
+          expect(runCalls[0]?.[2]).toMatchObject({ personas: selection, ticker: "AAPL", currentChartTicker: "AAPL" });
+        }
+      }
+    }
+  });
+
+  test("malformed chart metadata never authorizes an action", async () => {
+    await fc.assert(fc.asyncProperty(
+      fc.jsonValue().filter((value) => realParseTicker(value) === undefined),
+      async (chartTicker) => {
+        reset();
+        routeReply = { route: "reasoning_required", personas: null, chartTicker };
+        const events = await eventsFor("Microsoft outlook?", "AAPL");
+        expect(invoked).toEqual([]);
+        expect(reasonCalls[0]?.ticker).toBe("AAPL");
+        expect(events.some((event) => event.type === "chart_update")).toBe(false);
+        expect(String(events[0]?.text)).toContain("Chart update failed:");
+      },
+    ), { seed: 2119, numRuns: 30 });
+  });
+
+  test("invalid chart arguments disclose failure without changing the route or context", async () => {
+    for (const reply of [
+      { error: "Needle unavailable" },
+      { tool: "search_web", arguments: { ticker: "MSFT" } },
+      { tool: "set_chart_symbol", arguments: null },
+      { tool: "set_chart_symbol", arguments: [] },
+      { tool: "set_chart_symbol", arguments: { ticker: "AAPL" } },
+      { tool: "set_chart_symbol", arguments: { ticker: "SEC" } },
+      { tool: "set_chart_symbol", arguments: { ticker: "MSFT", q: "extra" } },
+    ]) {
+      reset();
+      routeReply = { route: "reasoning_required", personas: null, chartTicker: "MSFT" };
+      argsReply = reply;
+      const events = await eventsFor("Microsoft outlook?", "AAPL");
+      expect(invoked).toEqual([]);
+      expect(reasonCalls[0]).toMatchObject({ ticker: "AAPL", evidence: [] });
+      expect(runCalls).toEqual([]);
+      expect(events.some((event) => event.type === "chart_update")).toBe(false);
+      expect(String(events[0]?.text)).toContain("Chart update failed:");
+      expect(kernelCalls.map((call) => call.op)).toEqual(["route", "arguments"]);
+    }
+  });
+
+  test("generated tickers cannot replace JEV's selected focus", async () => {
+    await fc.assert(fc.asyncProperty(
+      fc.jsonValue().filter((value) => realParseTicker(value) !== "MSFT"),
+      async (ticker) => {
+        reset();
+        routeReply = { route: "reasoning_required", personas: null, chartTicker: "MSFT" };
+        argsReply = { tool: "set_chart_symbol", arguments: { ticker } };
+        const events = await eventsFor("Compare Apple and Microsoft", "AAPL");
+        expect(invoked).toEqual([]);
+        expect(events.some((event) => event.type === "chart_update")).toBe(false);
+        expect(reasonCalls[0]?.ticker).toBe("AAPL");
+        expect(String(events[0]?.text)).toContain("Chart update failed:");
+      },
+    ), { seed: 2120, numRuns: 30 });
+  });
+
+  test("Needle failure preserves the answer without a chart session", async () => {
+    reset();
+    routeReply = { route: "reasoning_required", personas: null, chartTicker: "MSFT" };
+    argsDown = true;
+    const events = await eventsFor("Microsoft outlook?", "AAPL");
+    expect(String(events[0]?.text)).toContain("Chart update failed: needle down");
+    expect(reasonCalls[0]?.ticker).toBe("AAPL");
+    expect(sessionsCreated).toBe(0);
+    expect(runCalls).toEqual([]);
+  });
+
+  test("failed tools and malformed receipts warn and continue with the prior chart", async () => {
+    for (const failure of ["returned", "thrown", "missing", "string", "array", "kind", "ticker", "lowercase"]) {
+      reset();
+      delete process.env.STOCKBOT_DEBUG;
+      routeReply = { route: "reasoning_required", personas: null, chartTicker: "MSFT" };
+      if (failure === "returned") toolFailure = { category: "tool_error", error: "chart tool unavailable" };
+      if (failure === "thrown") toolThrows = new Error("chart tool unavailable");
+      if (failure === "missing") chartReceipt = undefined;
+      if (failure === "string") chartReceipt = JSON.stringify({ result_type: "chart_selection", ticker: "MSFT" });
+      if (failure === "array") chartReceipt = [{ result_type: "chart_selection", ticker: "MSFT" }];
+      if (failure === "kind") chartReceipt = { result_type: "research", ticker: "MSFT" };
+      if (failure === "ticker") chartReceipt = { result_type: "chart_selection", ticker: "AAPL" };
+      if (failure === "lowercase") chartReceipt = { result_type: "chart_selection", ticker: "msft" };
+      const events = await eventsFor("Microsoft outlook?", "AAPL");
+      expect(events.some((event) => event.type === "chart_update")).toBe(false);
+      expect(events.some((event) => event.type === "error" || event.type === "failed")).toBe(false);
+      expect(String(events[0]?.text)).toContain("Chart update failed:");
+      expect(events.at(-2)).toEqual({ type: "answer_delta", text: "hi" });
+      expect(reasonCalls[0]).toMatchObject({ ticker: "AAPL", evidence: [] });
+      expect(ended).toEqual(["sess-test"]);
+      expect(runCalls).toEqual([]);
+    }
+  });
+
+  test("chart failure still researches for explicit personas without receipt evidence", async () => {
+    reset();
+    routeReply = { route: "reasoning_required", personas: ["stockbot", "bearbot", "bullbot"], chartTicker: "MSFT" };
+    toolFailure = { category: "tool_error", error: "chart tool unavailable" };
+    const events = await eventsFor("Microsoft outlook?", "AAPL");
+    expect(events).toEqual([{ type: "answer_delta", text: "Chart update failed: chart tool unavailable I will continue with your original question.\n\n" }]);
+    expect(runCalls[0]?.[2]).toMatchObject({ personas: ["stockbot", "bearbot", "bullbot"], ticker: "AAPL", currentChartTicker: "AAPL", seedEvidence: [] });
+    expect(ended).toEqual(["sess-test"]);
+  });
+
+  test("chart cleanup failure does not undo an applied chart or interrupt the answer", async () => {
+    reset();
+    routeReply = { route: "reasoning_required", personas: null, chartTicker: "MSFT" };
+    endThrows = true;
+    const events = await eventsFor("Microsoft outlook?", "AAPL");
+    expect(events[0]).toEqual({ type: "chart_update", ticker: "MSFT" });
+    expect(reasonCalls[0]?.ticker).toBe("MSFT");
+    expect(ended).toEqual(["sess-test"]);
+  });
+
+  test("watchlist scope stays exclusive while the displayed chart travels separately", async () => {
+    for (const route of ["research_required", "reasoning_required", "get_sec_document"]) {
+      reset();
+      routeReply = { route, personas: null, chartTicker: "MSFT" };
+      const prompt = "Compare Microsoft with my watchlist";
+      const events = await eventsFor(prompt, "AAPL", ["NVDA", "MSFT"]);
+      expect(kernelCalls[0]).toEqual({ op: "route", prompt, watchlist: ["NVDA", "MSFT"], currentChartTicker: "AAPL" });
+      expect(events[0]).toEqual({ type: "chart_update", ticker: "MSFT" });
+      if (route === "research_required") {
+        expect(runCalls[0]?.[2]).toMatchObject({ watchlist: ["NVDA", "MSFT"], currentChartTicker: "MSFT", seedEvidence: [] });
+        expect("ticker" in (runCalls[0]?.[2] as object)).toBe(false);
+      } else {
+        expect(reasonCalls).toHaveLength(1);
+        expect("ticker" in reasonCalls[0]).toBe(false);
+      }
+      for (const call of kernelCalls.filter((call) => call.tool !== "set_chart_symbol")) expect("ticker" in call).toBe(false);
+    }
+  });
+
+  test("a separate displayed-stock channel supplies reasoner context without changing research scope", async () => {
+    reset();
+    await eventsFor("How is it doing?", "NVDA", undefined, " msft ");
+    expect(kernelCalls[0]).toMatchObject({ ticker: "NVDA", currentChartTicker: "MSFT" });
+    expect(reasonCalls[0]?.ticker).toBe("MSFT");
+    for (const invalid of ["SEC", 7, "NVDA!", null]) {
+      reset();
+      await eventsFor("Explain valuation", "AAPL", undefined, invalid);
+      expect(kernelCalls[0]?.currentChartTicker).toBe("AAPL");
+      expect(reasonCalls[0]?.ticker).toBe("AAPL");
+    }
+  });
+
+  test("production retains dedicated research chart events while it redacts ordinary progress", async () => {
+    reset();
+    delete process.env.STOCKBOT_DEBUG;
+    winner = "research_required";
+    emitChartUpdate = true;
+    emitProgress = true;
+    const events = await eventsFor("Microsoft outlook?", "AAPL");
+    expect(events).toEqual([{ type: "chart_update", ticker: "MSFT" }, { type: "progress", stage: "working" }]);
+  });
+
+  test("the chart tool cannot replace the original entry route", async () => {
+    reset();
+    routeReply = { route: "set_chart_symbol", personas: null, chartTicker: "MSFT" };
+    const events = await eventsFor("Microsoft outlook?", "AAPL");
+    expect(events.map((event) => event.type)).toEqual(["agent_start", "failed", "error"]);
+    expect(invoked).toEqual([]);
+    expect(reasonCalls).toEqual([]);
+    expect(runCalls).toEqual([]);
+  });
+
+  test("post-tool assessment cannot chain into a chart receipt as factual evidence", async () => {
+    reset();
+    winner = "get_sec_document";
+    verdicts = ["set_chart_symbol"];
+    await eventsFor("Microsoft risk factors?", "MSFT");
+    expect(invoked.map((call) => call[0])).toEqual(["get_sec_document"]);
+    expect(runCalls[0]?.[2]).toMatchObject({ seedEvidence: [expect.objectContaining({ content: bridgeEvidence.content })] });
+    expect(reasonCalls).toEqual([]);
+  });
+
+  test("chart pre-action shares the existing request deadline and keeps original metrics scope", async () => {
+    reset();
+    routeReply = { route: "reasoning_required", personas: null, chartTicker: "MSFT" };
+    await eventsFor("Microsoft outlook?", "AAPL");
+    const needleOpts = kernelOpts[1];
+    if (!needleOpts || typeof needleOpts !== "object" || !("timeoutMs" in needleOpts)) throw new Error("expected timeout on chart arguments call");
+    const needleTimeout = needleOpts.timeoutMs;
+    if (typeof needleTimeout !== "number") throw new Error("expected numeric chart arguments timeout");
+    expect(needleTimeout).toBeGreaterThan(0);
+    expect(needleTimeout).toBeLessThanOrEqual(120_000);
+    const chartTimeout = invokeTimeouts[0];
+    if (typeof chartTimeout !== "number") throw new Error("expected numeric chart tool timeout");
+    expect(chartTimeout).toBeGreaterThan(0);
+    expect(chartTimeout).toBeLessThanOrEqual(120_000);
+  });
+
+  test("an expired chart deadline preserves research instead of changing the context", async () => {
+    reset();
+    routeReply = { route: "research_required", personas: null, chartTicker: "MSFT" };
+    const realNow = Date.now;
+    const baseline = realNow();
+    let calls = 0;
+    const dateSpy = spyOn(Date, "now").mockImplementation(() => {
+      calls += 1;
+      return calls === 1 ? baseline : baseline + 180_000;
+    });
+    try {
+      const events = await eventsFor("Microsoft outlook?", "AAPL");
+      expect(String(events[0]?.text)).toContain("request deadline expired");
+      expect(invoked).toEqual([]);
+      expect(kernelOpts).toHaveLength(1);
+      expect(runCalls[0]?.[2]).toMatchObject({ ticker: "AAPL", currentChartTicker: "AAPL" });
+    } finally {
+      dateSpy.mockRestore();
+    }
   });
 });

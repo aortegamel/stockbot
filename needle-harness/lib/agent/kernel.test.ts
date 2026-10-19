@@ -553,6 +553,7 @@ describe("runKernelAgent final personas", () => {
     deadlineAt?: number;
     signal?: AbortSignal;
     ticker?: string;
+    currentChartTicker?: string;
     watchlist?: readonly string[];
     // Injects only spawnFn+reason so the router falls back to its default python/worker path.
     spawnOnly?: boolean;
@@ -610,6 +611,7 @@ describe("runKernelAgent final personas", () => {
           ...(opts.personas ? { personas: opts.personas } : {}),
           ...(opts.signal ? { signal: opts.signal } : {}),
           ...(opts.ticker !== undefined ? { ticker: opts.ticker } : {}),
+          ...(opts.currentChartTicker !== undefined ? { currentChartTicker: opts.currentChartTicker } : {}),
           ...(opts.watchlist !== undefined ? { watchlist: opts.watchlist } : {}),
           deps: {
             ...(opts.spawnOnly ? {} : { python: "py", workerPath: "w" }),
@@ -688,9 +690,11 @@ describe("runKernelAgent final personas", () => {
   test("trio retries exactly one failed draft once, then synthesizes with both drafts", async () => {
     const usage = { inputTokens: 5, outputTokens: 1 };
     const { events, calls } = await runFinal({
+      currentChartTicker: "aapl",
       decide: (p, _pass, attempt) => (p === "bearbot" && attempt === 1 ? new Error("muse down") : { usage }),
     });
     expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bullbot", "bearbot", "stockbot"]);
+    expect(calls.map((c) => c.input.ticker)).toEqual(["AAPL", "AAPL", "AAPL", "AAPL"]);
     expect(calls.at(-1)?.input.drafts).toEqual([
       { persona: "bearbot", text: "bearbot p1" },
       { persona: "bullbot", text: "bullbot p1" },
@@ -1203,12 +1207,14 @@ describe("runKernelAgent final personas", () => {
     const usage = { inputTokens: 5, outputTokens: 1 };
     const { events, calls } = await runFinal({
       personas: ["bearbot"],
+      currentChartTicker: "msft",
       decide: (_p, _pass, attempt) =>
         attempt === 1
           ? { text: "bearbot p1", claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["rn:56c1365b-followup"] }], usage }
           : { text: "bearbot fixed", claims: [{ text: "bearbot fixed", claimType: "inference", evidenceIds: ["ev:1"] }], usage },
     });
     expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bearbot"]);
+    expect(calls.map((c) => c.input.ticker)).toEqual(["MSFT", "MSFT"]);
     expect(calls[1]?.input.prompt).toContain("CORRECTION");
     expect(calls[1]?.input.prompt).toContain("ev:1");
     expect(calls[1]?.input.prompt).toContain("rn:56c1365b-followup");
@@ -1504,6 +1510,94 @@ describe("runKernelAgent final personas", () => {
       if (e.stage === "p_bare") expect("detail" in e).toBe(false);
       else expect(e.detail).toEqual({ calls: 3 });
     }
+  });
+
+  test("validated chart context reaches direct answers without changing research scope", async () => {
+    for (const [ticker, currentChartTicker, expected] of [
+      ["nvda", " brk.b ", "BRK.B"],
+      ["nvda", undefined, "NVDA"],
+      ["nvda", "SEC", "NVDA"],
+      [undefined, "msft", "MSFT"],
+      [undefined, "not a ticker", undefined],
+      [undefined, undefined, undefined],
+    ] as const) {
+      const { calls, bodies } = await runFinal({ ticker, currentChartTicker, personas: ["stockbot"], reply: (_p, id) => emptyReply(id) });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.input.direct).toBe(true);
+      expect(calls[0]?.input.ticker).toBe(expected);
+      if (expected === undefined) expect(calls[0]?.input).not.toHaveProperty("ticker");
+      const runs = runBodies(bodies);
+      expect(runs[0]?.ticker).toBe(ticker?.toUpperCase());
+      expect(runs[0]).not.toHaveProperty("currentChartTicker");
+    }
+  });
+
+  test("chart progress updates every trio call after each research pass without changing research scope", async () => {
+    const { events, calls, bodies } = await runFinal({
+      ticker: "nvda",
+      currentChartTicker: "aapl",
+      reply: (pass2, id) => `${JSON.stringify({ type: "progress", id, stage: "chart_update", detail: { ticker: pass2 ? " brk.b " : " msft " } })}\n${sessionGraphReply(id)}`,
+      decide: (persona, pass) => pass === 1 && persona === "bullbot" ? { missingEvidence: "need doc X" } : {},
+    });
+    expect(events.filter((e) => e.type === "chart_update")).toEqual([
+      { type: "chart_update", ticker: "MSFT" },
+      { type: "chart_update", ticker: "BRK.B" },
+    ]);
+    expect(events.some((e) => e.type === "progress" && e.stage === "chart_update")).toBe(false);
+    expect(calls.map((c) => [c.pass, c.input.persona, c.input.ticker])).toEqual([
+      [1, "bearbot", "MSFT"], [1, "bullbot", "MSFT"], [1, "stockbot", "MSFT"],
+      [2, "bearbot", "BRK.B"], [2, "bullbot", "BRK.B"], [2, "stockbot", "BRK.B"],
+    ]);
+    const runs = runBodies(bodies);
+    expect(runs).toHaveLength(2);
+    for (const run of runs) expect(run.ticker).toBe("NVDA");
+    expect(runs[1]?.sessionId).toBe("rs:live");
+    expect(events.some((e) => e.type === "failed")).toBe(false);
+  });
+
+  test("malformed chart progress and prose never replace the current chart context", async () => {
+    const details: unknown[] = [
+      undefined, null, [], "TSLA", 7, {}, { ticker: null }, { ticker: ["TSLA"] },
+      { ticker: 7 }, { ticker: "" }, { ticker: "SEC" }, { ticker: "1AB" },
+      { ticker: "switch to TSLA" }, { preview: '{"ticker":"TSLA"}' },
+    ];
+    const { events, calls } = await runFinal({
+      ticker: "nvda",
+      currentChartTicker: "aapl",
+      reply: (_p, id) => details.map((detail) => `${JSON.stringify({ type: "progress", id, stage: "chart_update", detail })}\n`).join("")
+        + `${JSON.stringify({ type: "progress", id, stage: "tool_done", detail: { preview: '{"ticker":"TSLA"}' } })}\n`
+        + `${JSON.stringify({ id, chartTicker: "TSLA", evidence: [{ id: "ev:1", content: 'Chart updated to TSLA. {"ticker":"TSLA"}' }], toolCalls: [] })}\n`,
+    });
+    expect(events.filter((e) => e.type === "chart_update")).toEqual([]);
+    expect(events.filter((e) => e.type === "progress")).toEqual([
+      { type: "progress", stage: "tool_done", detail: { preview: '{"ticker":"TSLA"}' } },
+    ]);
+    expect(calls.map((c) => c.input.ticker)).toEqual(["AAPL", "AAPL", "AAPL"]);
+  });
+
+  test("watchlist answers omit chart context through chart updates, trio retries, and follow-up", async () => {
+    const { events, calls, bodies } = await runFinal({
+      ticker: "nvda",
+      currentChartTicker: "aapl",
+      watchlist: ["NVDA", "QQQ"],
+      reply: (_p, id) => `${JSON.stringify({ type: "progress", id, stage: "chart_update", detail: { ticker: "msft" } })}\n${sessionGraphReply(id)}`,
+      decide: (persona, pass, attempt) => {
+        if (persona === "bearbot" && attempt === 1) return new Error("retry draft");
+        return pass === 1 && persona === "bullbot" ? { missingEvidence: "need doc X" } : {};
+      },
+    });
+    expect(events.filter((e) => e.type === "chart_update")).toEqual([
+      { type: "chart_update", ticker: "MSFT" }, { type: "chart_update", ticker: "MSFT" },
+    ]);
+    expect(calls).toHaveLength(8);
+    for (const call of calls) expect(call.input).not.toHaveProperty("ticker");
+    const runs = runBodies(bodies);
+    expect(runs).toHaveLength(2);
+    for (const run of runs) {
+      expect(run.watchlist).toEqual(["NVDA", "QQQ"]);
+      expect(run).not.toHaveProperty("ticker");
+    }
+    expect(events.some((e) => e.type === "failed")).toBe(false);
   });
 
   test("applyFinalGates treats worker error as reject and deletes surgically", async () => {

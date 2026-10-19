@@ -5,6 +5,7 @@ from collections.abc import Mapping
 import pytest
 
 from app import tools
+from app.policy import Capability, RequestContext
 from app.security.action_policy import TOOL_DOMAINS
 from app.security.context_gateway import TOOL_ENVELOPES
 
@@ -90,7 +91,7 @@ def test_discovery_coordinates_complete():
 
     kebab = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
     snake = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
-    assert len(tools.TOOL_DISCOVERY_REGISTRY) == 61
+    assert len(tools.TOOL_DISCOVERY_REGISTRY) == 62
     assert "research_read_search" in tools.TOOL_DISCOVERY_REGISTRY
     for name, meta in tools.TOOL_DISCOVERY_REGISTRY.items():
         assert meta.domain and kebab.match(meta.domain), name
@@ -224,3 +225,92 @@ def test_jev_option_lines_keep_selection_restrictions_without_descriptions():
     descriptions = {name: str(fn.get("description", "")) for name, fn in _schema_functions().items()}
     for name, line in lines.items():
         assert descriptions[name] not in line, name
+
+
+@pytest.mark.parametrize(
+    ("ticker", "expected"),
+    [("AAPL", "AAPL"), (" msft ", "MSFT"), ("brk.b", "BRK.B"), ("BRK-B", "BRK-B"), ("A123456789", "A123456789")],
+)
+def test_set_chart_symbol_returns_validated_selection(ticker: str, expected: str) -> None:
+    context = RequestContext("research", frozenset({Capability.RESEARCH}))
+    arguments: dict[str, object] = {"ticker": ticker}
+
+    result = tools.execute_tool("set_chart_symbol", arguments, "test", context=context)
+
+    assert result == {"result_type": "chart_selection", "ticker": expected}
+    assert arguments == {"ticker": ticker}
+
+
+@pytest.mark.parametrize(
+    "ticker",
+    [
+        None,
+        "",
+        "   ",
+        7,
+        True,
+        [],
+        {},
+        "FINRA",
+        "sec",
+        "NYSE",
+        "NASDAQ",
+        "OTC",
+        "EDGAR",
+        "SHO",
+        "REG",
+        "AAPL MSFT",
+        "$AAPL",
+        "123",
+        "A1234567890",
+        "AAPL/NYSE",
+    ],
+)
+def test_set_chart_symbol_rejects_invalid_ticker(ticker: object) -> None:
+    context = RequestContext("research", frozenset({Capability.RESEARCH}))
+
+    result = tools.execute_tool("set_chart_symbol", {"ticker": ticker}, "test", context=context)
+
+    assert result["error_type"] == "invalid_tool_arguments"
+    assert result["tool"] == "set_chart_symbol"
+    assert "ticker" in str(result["error"])
+    assert result["required"] == ["ticker"]
+    assert result["optional"] == []
+    assert "result_type" not in result
+
+
+def test_set_chart_symbol_requires_ticker_and_research_capability() -> None:
+    context = RequestContext("research", frozenset({Capability.RESEARCH}))
+    missing = tools.execute_tool("set_chart_symbol", {}, "test", context=context)
+    assert missing["error_type"] == "invalid_tool_arguments"
+    assert missing["required"] == ["ticker"]
+    assert "ticker" in str(missing["error"])
+
+    denied = tools.execute_tool(
+        "set_chart_symbol", {"ticker": "AAPL"}, "test", context=RequestContext("none", frozenset())
+    )
+    assert denied == {"error": "Tool is not permitted: set_chart_symbol"}
+
+
+def test_set_chart_symbol_uses_existing_research_registry_collection() -> None:
+    from app.research.scheduler import build_registry
+
+    assert tools.TOOL_CAPABILITIES["set_chart_symbol"] is Capability.RESEARCH
+    assert "set_chart_symbol" not in tools.PORTFOLIO_AUTHORIZED_TOOLS
+    assert "set_chart_symbol" not in tools._ROBINHOOD_HANDLERS
+    parameters = _schema_functions()["set_chart_symbol"]["parameters"]
+    assert parameters == {
+        "type": "object",
+        "properties": {"ticker": {"type": "string"}},
+        "required": ["ticker"],
+    }
+    entry = next(entry for entry in build_registry() if entry["name"] == "set_chart_symbol")
+    assert entry["parameters"] == parameters
+    assert entry["keyInputs"] == "req(ticker)"
+    assert entry["outputKind"] == "chart_selection"
+
+    context = RequestContext("research", frozenset({Capability.RESEARCH}))
+    described = tools.execute_tool("describe_tool", {"name": "set_chart_symbol"}, "test", context=context)
+    assert described["name"] == "set_chart_symbol"
+    assert described["required_arguments"] == ["ticker"]
+    assert described["optional_arguments"] == []

@@ -131,7 +131,7 @@ export function originalSourceUrl(source: SourceDocument, resolved: boolean): st
   if (!quote) return safe;
   const encode = (text: string) => encodeURIComponent(text).replace(/-/gu, "%2D");
   let directive: string;
-  if (quote.length > 80 || /[\r\n\u2028\u2029]/u.test(source.quote)) {
+  if ((quote.length > 80 && quote.split(" ").length > 10) || /[\r\n\u2028\u2029]/u.test(source.quote)) {
     const lines = source.quote.split(/[\r\n\u2028\u2029]/u).map((line) => line.trim()).filter(Boolean);
     const start = lines[0].split(/\s+/u).slice(0, 5).join(" ");
     const end = lines[lines.length - 1].split(/\s+/u).slice(-5).join(" ");

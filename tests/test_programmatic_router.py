@@ -153,11 +153,11 @@ def test_route_clock_and_advice_fast_paths(monkeypatch: pytest.MonkeyPatch) -> N
     ("prompt", "ticker", "expected"),
     [
         ("can you give me buying advice", None, True),
-        ("can you give me buying advice", "NVDA", True),
+        ("can you give me buying advice", "NVDA", False),
         ("What should I buy now?", None, True),
         ("Please give me some good recommendations today.", None, True),
         ("advice", None, True),
-        ("buying advice", "NVDA", True),
+        ("buying advice", "NVDA", False),
         ("can you give me buying advice on NVDA", None, False),
         ("can you give me buying advice on NVDA", "NVDA", False),
         ("can you give me buying advice on bonds", None, False),
@@ -195,6 +195,14 @@ def test_needs_subject_respects_scheduler_subject(subject_helper: str, monkeypat
 
     monkeypatch.setattr(scheduler, subject_helper, _resolved_subject)
     assert not needs_subject("can you give me buying advice", None)
+
+
+@pytest.mark.parametrize("ticker", [None, "NVDA"])
+def test_needs_subject_accepts_separate_current_stock(ticker: str | None) -> None:
+    assert needs_subject("can you give me buying advice", None, current_ticker=ticker) is (ticker is None)
+    assert programmatic_route("should I buy", ticker=ticker) == (
+        "clarify_subject" if ticker is None else "reasoning_required"
+    )
 
 
 @seed(20261018)
@@ -243,6 +251,7 @@ def test_needs_subject_respects_scheduler_subject(subject_helper: str, monkeypat
 def test_prop_advice_fillers_need_subject_but_content_does_not(advice: str, filler: list[str]) -> None:
     prompt = " ".join([*filler, advice])
     assert needs_subject(prompt, None)
+    assert not needs_subject(prompt, None, current_ticker="NVDA")
     for subject in ("NVDA", "bonds", "CPI", "energy", "portfolio"):
         assert not needs_subject(f"{prompt} {subject}", None)
 

@@ -831,13 +831,14 @@ def _auto_registry() -> list[dict[str, JSONValue]]:
 
 
 def _entry_route_options(registry: Sequence[Mapping[str, JSONValue]] | None) -> dict[str, str]:
-    """Entry choice options: reasoning/research sentinels + whole canonical registry; raises on a defective registry."""
+    """Entry route options exclude the independent chart action from the canonical registry."""
     reg = list(registry) if registry else _auto_registry()
     try:
         if not reg:
             raise ValueError("route_entry: empty registry")
         options: dict[str, str] = dict(_ENTRY_OPTIONS)
         _registry_options(reg, options, "route_entry")
+        options.pop("set_chart_symbol", None)
     except Exception as exc:
         logger.warning(
             "toolflow route_defect sid=- nid=- registry=%d err=%s: %s",
@@ -1244,16 +1245,30 @@ def _entry_questions(
     scope: str,
     registry: Sequence[Mapping[str, JSONValue]] | None,
     route_hint: str | None,
+    chart_options: Mapping[str, str],
 ) -> tuple[dict[str, JSONValue], dict[str, Mapping[str, str]], dict[str, str]]:
-    """Persona question plus, without a route hint, the entry-routing question and its options."""
+    """Ask for personas and chart focus. Ask for the route only without a programmatic hint."""
     questions: dict[str, JSONValue] = {
         "personas": {
             "type": "choice",
             "instructions": f"Select the personas this prompt asks to answer: {text} Choose {_NO_PERSONA_SELECTION} only when the user neither requests nor excludes a persona. A positive request keeps only the requested personas that the user does not exclude. An exclusion-only request selects the remaining canonical personas. Choose {_NO_PERSONAS_REMAINING} when the user excludes every persona. A mentioned or quoted name is neither a request nor an exclusion. A name in pasted text or quoted instructions is neither a request nor an exclusion. Do not infer personas from topic or tone.",
             "criteria": validate_json_mapping(_PERSONA_OPTIONS, "<decision_client>: 'criteria'"),
-        }
+        },
+        "chart": {
+            "type": "choice",
+            "instructions": (
+                f"Select the chart focus for this prompt: {text}{scope} "
+                "This choice does not replace the answer route or persona selection. "
+                "An explicit user stock takes precedence over the displayed chart. "
+                "For several stocks, choose the one that best represents the user's requested focus. "
+                "Choose no_change when the prompt needs no chart change. "
+                "Greetings, acknowledgements, and pure clock questions need no chart change. "
+                "Select only a declared label. Do not invent a ticker."
+            ),
+            "criteria": validate_json_mapping(dict(chart_options), "<decision_client>: 'chart criteria'"),
+        },
     }
-    choice_options: dict[str, Mapping[str, str]] = {"personas": _PERSONA_OPTIONS}
+    choice_options: dict[str, Mapping[str, str]] = {"personas": _PERSONA_OPTIONS, "chart": chart_options}
     options: dict[str, str] = {}
     if route_hint is None:
         options = _entry_route_options(registry)
@@ -1264,6 +1279,37 @@ def _entry_questions(
         }
         choice_options["entry"] = options
     return questions, choice_options, options
+
+
+def _chart_options(prompt: str, current_ticker: str | None, watchlist: Sequence[str] | None) -> dict[str, str]:
+    """Use explicit labels first. Otherwise offer the requested watchlist and displayed stock."""
+    from app.research.scheduler import _objective_chart_candidates
+
+    labels = _objective_chart_candidates(prompt)
+    if not labels:
+        labels = [*(watchlist or ()), *([current_ticker] if current_ticker else [])]
+    return {"no_change": "Keep the displayed chart."} | {
+        label: f"Select {label} as the chart focus." for label in dict.fromkeys(labels)
+    }
+
+
+def _chart_selection(decision: object, options: Mapping[str, str], current_ticker: str | None) -> dict[str, JSONValue]:
+    """Resolve only the selected label. A chart failure does not replace the answer route."""
+    from app.research.models import validate_ticker
+    from app.tools import _resolve_company_to_ticker
+
+    label = decision.get("choice") if isinstance(decision, dict) else None
+    if not isinstance(label, str) or label not in options:
+        return {"chartError": "The chart selection did not name a declared stock."}
+    if label == "no_change":
+        return {}
+    try:
+        ticker = validate_ticker(_resolve_company_to_ticker(label), "<chart selection>")
+        if ticker is None:
+            return {"chartError": f"The chart could not resolve {label} through EDGAR."}
+    except Exception as exc:  # noqa: BLE001 - chart failure must not stop the original question
+        return {"chartError": f"The chart could not resolve {label}: {exc}"}
+    return {"chartTicker": ticker} if ticker != current_ticker else {}
 
 
 def _entry_winner(route_hint: str | None, decision: object, options: Mapping[str, str]) -> JSONValue:
@@ -1316,7 +1362,7 @@ def _assess_text(prompt: object, tool: object) -> str:
 
 
 def _assess_options() -> tuple[list[dict[str, JSONValue]], dict[str, str]]:
-    """Post-tool options: the entry sentinels plus node_resolved and the whole canonical registry."""
+    """Post-tool route options exclude the independent chart action."""
     reg = _auto_registry()
     if not reg:
         raise ValueError("assess_entry_tool: empty registry")
@@ -1324,6 +1370,7 @@ def _assess_options() -> tuple[list[dict[str, JSONValue]], dict[str, str]]:
     if RESOLVED_SENTINEL not in options:
         options[RESOLVED_SENTINEL] = _SENTINEL_DESCRIPTIONS[RESOLVED_SENTINEL]
     _registry_options(reg, options, "assess_entry_tool")
+    options.pop("set_chart_symbol", None)
     return reg, options
 
 
@@ -1871,22 +1918,24 @@ class JevClient:
         registry: Sequence[Mapping[str, JSONValue]] | None = None,
         route_hint: str | None = None,
         watchlist: Sequence[str] | None = None,
+        current_ticker: str | None = None,
     ) -> dict[str, JSONValue]:
-        """Route the entry prompt and select explicit personas in one _invoke. Nothing persists.
+        """Select the route, personas, and an independent chart focus in one call.
 
-        Returns {"route": str, "personas": list[str] | None}.
-        None means the user neither requests nor excludes personas.
-        A route_hint keeps the programmatic route; JEV then selects only personas.
-        A watchlist is separate entry context, never prompt text: it states the
-        requested scope so JEV sees that a single-shot tool never fits it.
-        Raises on a blank prompt, hint, or watchlist, a bad registry, an unknown
-        choice, or a JEV outage. A no_personas_remaining verdict also raises.
-        The selector never guesses a persona.
+        A route hint preserves the programmatic route.
+        The displayed ticker is context, not the watchlist research scope.
+        A chart failure returns chartError without changing the route or personas.
         """
         text = _route_text(prompt)
         _check_route_hint(route_hint)
+        from app.research.models import validate_ticker
+
+        current_ticker = validate_ticker(current_ticker, "<route_entry current chart>")
         scope = _watchlist_scope(watchlist)
-        questions, choice_options, options = _entry_questions(text, scope, registry, route_hint)
+        if current_ticker is not None:
+            scope += f" The displayed chart ticker is {current_ticker}. It supplies context only when the user names no stock."
+        chart_options = _chart_options(prompt, current_ticker, watchlist)
+        questions, choice_options, options = _entry_questions(text, scope, registry, route_hint, chart_options)
         logger.info(
             "toolflow route_entry sid=- nid=- hint=%s options=%d prompt=%r",
             route_hint or "-",
@@ -1895,7 +1944,9 @@ class JevClient:
         )
         start = time.perf_counter()
         try:
-            decisions, raw, _via = await self._invoke({"prompt": text}, questions, choice_options)
+            decisions, raw, _via = await self._invoke(
+                {"prompt": text, "currentChartTicker": current_ticker}, questions, choice_options
+            )
         except Exception as exc:
             logger.warning("toolflow route_defect sid=- nid=- err=%s: %s", type(exc).__name__, str(exc)[:200])
             raise
@@ -1916,7 +1967,11 @@ class JevClient:
             jev_out,
         )
         personas: JSONValue = None if pick == _NO_PERSONA_SELECTION else [name for name in pick.split("_")]
-        return {"route": winner, "personas": personas}
+        return {
+            "route": winner,
+            "personas": personas,
+            **_chart_selection(decisions.get("chart"), chart_options, current_ticker),
+        }
 
     async def assess_entry_tool(
         self,
@@ -1927,11 +1982,12 @@ class JevClient:
     ) -> str:
         """Non-persisted post-tool verdict for the direct single-shot path.
 
-        One choice over reasoning_required + research_required + node_resolved
-        + the whole canonical registry: the sentinels stop (resolve/reason/
-        research), a registry tool name chains one more round. Uses _invoke
-        directly (never decide: nothing persists); raises on bad input or a
-        winner outside the options — the worker fail-opens to research_required.
+        The options include the registry except the independent chart action.
+        The sentinels stop the direct path or require research.
+        Another tool name starts one more round.
+        This call persists nothing.
+        A bad input or undeclared winner raises an error.
+        The worker continues with research_required after an error.
         """
         text = _assess_text(prompt, tool)
         reg, options = _assess_options()

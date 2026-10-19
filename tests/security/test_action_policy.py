@@ -106,6 +106,39 @@ def test_research_intent_allows_research_and_web_tools():
         assert allowed is True, name
 
 
+def test_chart_selection_uses_public_research_policy() -> None:
+    from app.security.context import Integrity, Sensitivity
+    from app.security.context_gateway import envelope_for_tool
+
+    run_security = _run_security(["What is Apple's revenue?"])
+    allowed, reason = authorize_tool_call("set_chart_symbol", {"ticker": "AAPL"}, run_security)
+    assert allowed is True
+    assert reason == ""
+    assert run_security.authorization.portfolio_read is False
+    assert TOOL_DOMAINS["set_chart_symbol"] == "financial_research"
+    envelope = envelope_for_tool("set_chart_symbol", {"result_type": "chart_selection", "ticker": "AAPL"})
+    assert envelope.sensitivity is Sensitivity.PUBLIC
+    assert envelope.integrity is Integrity.DERIVED
+    assert envelope.external is False
+
+
+@pytest.mark.parametrize(
+    "source_policy",
+    [
+        {"mode": "all", "denied": ["set_chart_symbol"]},
+        {"mode": "allowlist", "allowed": ["SEC"], "denied": []},
+    ],
+)
+def test_chart_selection_respects_source_policy(source_policy: dict[str, object]) -> None:
+    run_security = _run_security(["What is Apple's revenue?"])
+    run_security.source_policy = source_policy
+
+    allowed, reason = authorize_tool_call("set_chart_symbol", {"ticker": "AAPL"}, run_security)
+
+    assert allowed is False
+    assert "POLICY_DENIED" in reason
+
+
 def test_unknown_tool_is_denied():
     run_security = _run_security(["Research AMD news."])
     allowed, _ = authorize_tool_call("some_new_tool", {}, run_security)

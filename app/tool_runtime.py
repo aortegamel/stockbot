@@ -1355,6 +1355,22 @@ def _success_meta(
     if isinstance(handle, dict) and handle:
         safe_meta["source_handle"] = dict(handle)
     _copy_navigation_meta(result, safe_meta)
+    if (
+        name == "set_chart_symbol"
+        and status == "completed"
+        and isinstance(result, dict)
+        and result.get("result_type") == "chart_selection"
+        and "error" not in result
+        and "error_type" not in result
+    ):
+        from app.research.models import validate_ticker
+
+        try:
+            ticker = validate_ticker(result.get("ticker"), "set_chart_symbol")
+        except ValueError:
+            ticker = None
+        if ticker is not None:
+            safe_meta["chart_selection"] = {"result_type": "chart_selection", "ticker": ticker}
     if name in ("search_tools", "browse_tools") and isinstance(result, dict):
         # Deferred loading: the TS extension activates these schemas additively.
         # Names are already model-visible in content; meta carries them structured.

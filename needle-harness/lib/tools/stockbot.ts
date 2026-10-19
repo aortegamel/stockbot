@@ -1,16 +1,16 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { makeEvidence } from "../agent/evidence";
+import { parseTicker } from "../agent/kernel";
 import { sourceReferences } from "../agent/types";
 import type { FailureCategory, ToolResult } from "../agent/types";
-
 const ROOT = process.cwd().endsWith("needle-harness")
   ? process.cwd().replace(/\/needle-harness$/, "")
   : process.cwd();
 const BRIDGE_CMD = `${ROOT}/venv/bin/python`;
 const BRIDGE_ARGS = [`${ROOT}/scripts/tool_bridge.py`];
 
-type BridgeResultMeta = { source_handle?: unknown; source_refs?: unknown; sources?: unknown };
+type BridgeResultMeta = { source_handle?: unknown; source_refs?: unknown; sources?: unknown; chart_selection?: unknown };
 type BridgeReply = {
   id?: unknown;
   result?: { content?: unknown; error?: unknown; error_type?: unknown; meta?: BridgeResultMeta };
@@ -209,6 +209,15 @@ function replyMeta(meta: BridgeResult["meta"]): {
   };
 }
 
+function chartSelection(meta: BridgeResultMeta | undefined): Record<string, unknown> | undefined {
+  const selection = meta?.chart_selection;
+  if (!selection || typeof selection !== "object" || Array.isArray(selection)) return undefined;
+  const candidate = selection as Record<string, unknown>;
+  if (Object.keys(candidate).length !== 2 || candidate.result_type !== "chart_selection") return undefined;
+  if (typeof candidate.ticker !== "string" || parseTicker(candidate.ticker) !== candidate.ticker) return undefined;
+  return candidate;
+}
+
 function succeeded(name: string, result: BridgeResult): ToolResult {
   const { sourceHandle, sourceRefs, sources } = replyMeta(result.meta);
   const evidence = makeEvidence(name, replyContent(result), {
@@ -218,13 +227,18 @@ function succeeded(name: string, result: BridgeResult): ToolResult {
   });
   const refs = sourceReferences(sources);
   if (refs.length) evidence.sources = refs;
-  return { ok: true, evidence };
+  const selection = name === "set_chart_symbol" ? chartSelection(result.meta) : undefined;
+  return {
+    ok: true,
+    evidence,
+    ...(selection !== undefined ? { chartSelection: selection } : {}),
+  };
 }
 
-export async function invoke(name: string, args: Record<string, unknown>, sessionId: string): Promise<ToolResult> {
+export async function invoke(name: string, args: Record<string, unknown>, sessionId: string, timeoutMs?: number): Promise<ToolResult> {
   let msg: BridgeReply;
   try {
-    msg = await bridge.call({ op: "tool.invoke", name, arguments: args, session_id: sessionId });
+    msg = await bridge.call({ op: "tool.invoke", name, arguments: args, session_id: sessionId }, timeoutMs);
   } catch (err) {
     return failed({ error: err instanceof Error ? err.message : String(err) });
   }

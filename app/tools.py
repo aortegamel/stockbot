@@ -2288,6 +2288,18 @@ TOOLS: list[dict[str, object]] = [
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_chart_symbol",
+            "description": "Select one stock for the chart and linked stock panels. The frontend applies the selection. The receipt is not factual research evidence.",
+            "parameters": {
+                "type": "object",
+                "properties": {"ticker": {"type": "string"}},
+                "required": ["ticker"],
+            },
+        },
+    },
 ]
 # TOOL_REGISTRY_VERSION moved below TOOL_DISCOVERY_REGISTRY (hashes schemas + routing metadata).
 
@@ -3365,6 +3377,19 @@ def _utc_now() -> datetime:
 def _get_current_time(args: dict[str, object], model: str) -> dict[str, object]:
     del args, model
     return {"utc_now": _utc_now().isoformat(), "source": "system-clock"}
+
+
+def _set_chart_symbol(args: dict[str, object], model: str) -> dict[str, object]:
+    from app.research.models import validate_ticker
+
+    del model
+    try:
+        ticker = validate_ticker(args.get("ticker"), "set_chart_symbol")
+    except ValueError as exc:
+        return _invalid_args_error("set_chart_symbol", str(exc))
+    if ticker is None:
+        return _invalid_args_error("set_chart_symbol", "set_chart_symbol: 'ticker' must be a non-empty string")
+    return {"result_type": "chart_selection", "ticker": ticker}
 
 
 def _wrap_one(record: object) -> object:
@@ -4816,6 +4841,21 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         summary="Current UTC date and time from the system clock.",
         choose_when=("What time is it now; the current UTC date and time.",),
         reject_when=("Not for market data, filings, or historical point-in-time facts.",),
+        conflicts_with=(),
+        related_tools=(),
+        prerequisites=(),
+    ),
+    "set_chart_symbol": ToolDiscovery(
+        domain="market",
+        family="chart",
+        intent="select_chart_symbol",
+        output_kind="chart_selection",
+        source="local",
+        entity_scope="single_security",
+        time_mode="current",
+        summary="Select one stock for the chart and linked stock panels.",
+        choose_when=("The chart needs to focus on another stock.",),
+        reject_when=("The receipt is not factual research evidence. Continue the original answer or research.",),
         conflicts_with=(),
         related_tools=(),
         prerequisites=(),
@@ -6940,6 +6980,7 @@ _MODEL_HANDLERS: dict[str, ModelHandler] = {
     "get_macro_context": _get_macro_context,
     "search_company_patents": _search_company_patents,
     "get_current_time": _get_current_time,
+    "set_chart_symbol": _set_chart_symbol,
 }
 
 
@@ -7301,6 +7342,7 @@ TOOL_CAPABILITIES: dict[str, Capability] = {
     "get_macro_context": Capability.RESEARCH,
     "search_company_patents": Capability.RESEARCH,
     "get_current_time": Capability.RESEARCH,
+    "set_chart_symbol": Capability.RESEARCH,
     "list_finra_datasets": Capability.RESEARCH,
     "describe_finra_dataset": Capability.RESEARCH,
     "get_finra_datapoints": Capability.RESEARCH,
