@@ -472,7 +472,7 @@ def test_committee_prompts_carry_identical_freeze_payload() -> None:
         evidence_text=payload,
     )
     assert len(prompts) == 3
-    bodies = [p.split("Evidence (cite ids; do not invent):\n", 1)[1] for p in prompts]
+    bodies = [p.split("Evidence (cite ids):\n", 1)[1] for p in prompts]
     assert bodies[0] == bodies[1] == bodies[2]
     assert "EV-1" in bodies[0] and "c-ev-1" in bodies[0].lower()
 
@@ -2170,9 +2170,7 @@ def test_scout_prompt_renders_context_baseline_and_queries() -> None:
     assert "Context concepts: accelerated computing" in prompt
     assert "Context relationships: NVDA supplies hyperscalers" in prompt
     assert "dropped" not in prompt and "not-a-triple" not in prompt
-    assert "Latest-filing baseline (as_of-filtered, target searches with its terms):" in prompt
     assert "- NVDA 10-K competition" in prompt
-    assert "Assigned queries (search each; skip exact repeats already executed):" in prompt
     assert "- NVDA data center revenue" in prompt
 
     bare = build_scout_prompt(
@@ -2186,9 +2184,9 @@ def test_scout_prompt_renders_context_baseline_and_queries() -> None:
         )
     )
     assert "Context " not in bare and "Latest-filing baseline" not in bare
-    assert "Assigned queries" not in bare and "NO ticker and NO cik" not in bare
+    assert "Assigned queries" not in bare
     assert "scope tickers TBD" in bare and "As of: unbounded" in bare
-    assert "Workflow:" in bare and "Respond with JSON only" in bare
+    assert "Respond with JSON only" in bare
 
 
 def test_merge_context_unions_model_terms() -> None:
@@ -2386,45 +2384,6 @@ def test_role_assignments_dispatch_every_material_query() -> None:
     ):
         assert len(groups[family]) > 2, (family, groups[family])
         assert [q for q in by_role[role] if q in set(groups[family])] == groups[family], family
-
-
-def test_scout_prompt_demands_global_search_for_non_filers() -> None:
-    """Scout prompt: counterparty queries are listed as global - no ticker, no cik, no scope shortcut."""
-    from app.research.agents.scout import ScoutAssignment, build_scout_prompt
-
-    assignment = ScoutAssignment(
-        assignment_id="scout-filings",
-        session_id="rs:t",
-        as_of="2026-08-10",
-        role="filings",
-        question="What happens to Microsoft if OpenAI goes bankrupt?",
-        tickers=["MSFT"],
-        queries=["MSFT OpenAI"],
-        unscoped_queries=["OpenAI", "OpenAI exposure"],
-    )
-    prompt = build_scout_prompt(assignment)
-    assert "NO ticker and NO cik" in prompt
-    assert "- OpenAI exposure" in prompt
-    assert "never conclude a relationship is absent from a scoped search" in prompt
-    # The branch must be truthful about what already ran: the unscoped searches execute
-    # before the model call and the documents their hits named are opened for it.
-    assert "these queries have already run with NO ticker and NO cik" in prompt
-    assert "already run" in prompt and "opened below" in prompt
-    # ...and it leads the prompt, before the scoped query list.
-    assert prompt.index("Counterparty branch first") < prompt.index("Assigned queries")
-    # Without counterparty queries the block is absent: no instruction drift for ordinary questions.
-    scoped_only = build_scout_prompt(
-        ScoutAssignment(
-            assignment_id="scout-filings",
-            session_id="rs:t",
-            as_of="2026-08-10",
-            role="filings",
-            question="NVDA data center revenue growth",
-            tickers=["NVDA"],
-            queries=["NVDA"],
-        )
-    )
-    assert "NO ticker and NO cik" not in scoped_only
 
 
 def test_no_date_means_latest_available(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5300,7 +5259,6 @@ def test_unbounded_as_of_is_no_cutoff_for_every_pit_gate() -> None:
 
 def test_counterparty_queries_are_assigned_unscoped() -> None:
     """A private counterparty's queries reach the filings scout as global (no ticker/cik) queries."""
-    from app.research.agents.scout import build_scout_prompt
     from app.research.agents.source_agent import (
         _grouped_queries,
         build_research_context,
@@ -5319,8 +5277,6 @@ def test_counterparty_queries_are_assigned_unscoped() -> None:
     )
     filings = next(a for a in assignments if a.role == "filings")
     assert "OpenAI" in filings.unscoped_queries
-    prompt = build_scout_prompt(filings)
-    assert "NO ticker and NO cik" in prompt
     # Other scouts keep their scoped assignment: no global counterparty work.
     assert all(not a.unscoped_queries for a in assignments if a.role != "filings")
     # A question without a counterparty assigns no global queries.

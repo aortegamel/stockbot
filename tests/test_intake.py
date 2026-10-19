@@ -458,7 +458,6 @@ def test_intake_prompt_carries_raw_query_and_digest() -> None:
     prompt = kw._intake_reasoner_prompt("rs:t", "how will orcl's manjure affect AAPL?", None, "DIGEST-BYTES")
     assert "how will orcl's manjure affect AAPL?" in prompt
     assert "DIGEST-BYTES" in prompt
-    assert "at most 4 questions" in prompt
 
 
 def test_reasoner_no_retry_on_config_error(monkeypatch: pytest.MonkeyPatch) -> None:

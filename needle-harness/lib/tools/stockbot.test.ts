@@ -415,7 +415,6 @@ describe("muse reason personas (fake provider)", () => {
     expect(synthUser).toContain("Bear draft [E1].");
     expect(synthUser).toContain("── Bullbot ──");
     expect(synthUser).toContain("Bull draft [E1].");
-    expect(synthUser).toContain("middle verdict");
     expect(synthUser).toContain("cite only evidence");
     expect(bearUser).not.toContain("SIBLING DRAFTS");
     expect(bullUser).not.toContain("SIBLING DRAFTS");
@@ -483,7 +482,6 @@ describe("muse reason personas (fake provider)", () => {
     const [call] = seen;
     if (!call) throw new Error("expected one provider call");
     expect(call.path).toBe("/v1/responses");
-    expect(systemOf(call.body)).toContain("Answer the user directly and briefly");
     expect(systemOf(call.body)).not.toContain("Missing-Evidence:");
     expect(userOf(call.body)).toBe("USER REQUEST\nWhat is ACME?");
     expect(userOf(call.body)).not.toContain("EVIDENCE");
@@ -494,7 +492,6 @@ describe("muse reason personas (fake provider)", () => {
     expect(r.text).toBe("Stockbot read [E1].");
     const [call] = seen;
     if (!call) throw new Error("expected one provider call");
-    expect(systemOf(call.body)).toContain("Answer only from the EVIDENCE below");
     expect(systemOf(call.body)).not.toContain("Bearbot");
     expect(userOf(call.body)).toContain("EVIDENCE\n[E1]\nsource: sec");
     expect(userOf(call.body)).not.toContain("SIBLING DRAFTS");

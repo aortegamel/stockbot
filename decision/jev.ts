@@ -3,7 +3,7 @@
 // choice = exclusive routing/category/explanation: exactly one winner among
 // mutually exclusive labels (use DISPOSITION_OPTIONS / EVIDENCE_STATE_OPTIONS).
 // noul = independent propositions: each id gets its own probability, no
-// cross-id winner. score = ordinal judgments only, never deterministic calcs.
+// cross-id winner. score = ordinal judgments.
 // Raw vs policy: parsers return raw probabilities/choices/scores unchanged;
 // classifyProbability is the separate policy step callers apply to noul
 // probabilities (yes/unsure/no), never collapsed inside a parser.
@@ -54,7 +54,7 @@ export const EVIDENCE_STATE_OPTIONS: Record<
   conflicted: "The evidence both supports and contradicts the claim; do not resolve by guessing.",
   insufficient: "The evidence is missing or too weak to support or contradict the claim.",
 };
-// Ordinal materiality rubric for score questions (never deterministic calcs).
+// Ordinal materiality rubric for score questions.
 export const MATERIALITY_LEVELS = ["Immaterial", "Low", "Moderate", "High", "Critical"] as const;
 
 function isObj(v: unknown): v is Record<string, unknown> {
@@ -354,17 +354,11 @@ function attemptLines(attempts?: ToolSelectionAttempt[]): string {
 }
 
 function toolSelectionContext(node: ToolSelectionNode, evidence?: unknown[], attempts?: ToolSelectionAttempt[]): string {
-  let prompt = `Which single tool runs next for research node ${node.nodeId}? Question: ${node.question} JEV owns this selection and every transition over the whole canonical registry; Needle runs args only and never selects, chains, or judges. Choose exactly one winner.`;
+  let prompt = `Which single tool runs next for research node ${node.nodeId}? Question: ${node.question} Choose exactly one winner.`;
   if (typeof node.whyItMatters === "string" && node.whyItMatters) prompt += ` Why it matters: ${node.whyItMatters}`;
   const ids = evidenceIds(evidence);
   prompt += ` Evidence on hand: ${Array.isArray(evidence) ? evidence.length : 0} item(s)${ids.length ? ` [${ids.join(", ")}]` : ""}.`;
   return prompt + attemptLines(attempts);
-}
-
-function revenueFilingHint(question: string): string {
-  if (/revenue/i.test(question) && /\b10-?\s?q\b/i.test(question) && /\b(?:latest|most recent)\b/i.test(question)) return ` Latest-10-Q revenue answers come from the 10-Q, not the 8-K: after the filing list, open the 10-Q accession via get_sec_document section reads (Item 1, Item 2, Item 1A) before re-reading any 8-K.`;
-  if (/revenue/i.test(question) && /quarter/i.test(question)) return ` Revenue-quarter answers come from the 10-Q (MD&A/segment revenue), not the 8-K: after the filing list, open the 10-Q accession via get_sec_document with a revenue query before re-reading any 8-K.`;
-  return "";
 }
 
 export function buildToolSelectionQuestion(
@@ -379,7 +373,5 @@ export function buildToolSelectionQuestion(
   const options = toolSelectionOptions(registry);
   let prompt = toolSelectionContext(node, evidence, attempts);
   prompt += ` Today UTC is ${new Date().toISOString().slice(0, 10)}; decode relative dates before choosing: 'last quarter filing' = latest 10-Q/10-K/8-K with no start/end window, 'this week'/'last week' = Monday-now NYC range (one YYYY-MM-DD per biz day, latest first); 'today'/'now' = Today UTC date; never pass phrases like 'this week' or 'today' or 'last quarter' as arg values.`;
-  prompt += ` Search packets list candidates only — page with research_read_search beyond display_limit and open each accession via get_sec_filing/get_sec_document until answered or guard trips.`;
-  prompt += revenueFilingHint(node.question);
   return { id: "tool_selection", prompt: withTodayUtc(prompt), options };
 }

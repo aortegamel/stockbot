@@ -355,11 +355,9 @@ def _context_prompt(question: str, tickers: Sequence[str]) -> str:
         "List scope tickers as primary entities; other named issuers (customers, "
         "competitors, suppliers, peers, funds) as related entities; "
         "subject matter as concepts/risks/catalysts. "
-        "The map drives later searches, not the answer: search results are navigation artifacts and "
-        "only raw SEC documents become evidence. "
-        "Expand dynamically to the causal channels the question implies "
+        "Explore the causal channels the question implies "
         "(counterparty, credit, concentration, lending, commitments, derivatives, "
-        "off-balance-sheet, supply-chain, funding/liquidity) — never a fixed issuer list. "
+        "off-balance-sheet, supply-chain, funding/liquidity). "
         f"{SOURCE_WORKFLOW} JSON only."
     )
 

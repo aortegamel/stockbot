@@ -98,9 +98,8 @@ def run_bullbot(
     wave = _coerce_wave(wave_id)
     frozen = list(evidence_ids)
     prompt = (
-        "Role: bull case. Build the strongest evidence-supported resilience case: where the cited "
-        "disclosures show limited damage, buffers, mitigants, contractual protection, or diversified "
-        f"revenue. Do not fabricate optimism. Question: {question}\n"
+        "Role: bull case. Build the strongest resilience case: limited damage, buffers, mitigants, "
+        f"contractual protection, or diversified revenue. Question: {question}\n"
         f"Freeze: {freeze_id} as of {as_of} evidence={len(frozen)}\n"
         'Respond with one JSON object only: {"role": "bullbot", "executive_view": "<bullish read>", '
         '"claims": [{"text": "<finding>", "claim_type": "observed_fact|inference|unknown|contradicted|conditional_risk|attributed_report", "evidence_ids": ["<freeze-id>", ...]}], '
@@ -116,12 +115,10 @@ def run_bullbot(
         "unknown when the frozen evidence does not establish it (for example no disclosure located within the searched scope). "
         "Cite both sides when evidence conflicts and declare contradicted. "
         "observed_fact/inference/contradicted/conditional_risk/attributed_report need at least one freeze id; unknown may cite none. "
-        "Cite only freeze ids; never invent ids, filings, or numbers. Every favorable claim needs a passage that supports it; "
-        "if the freeze supports no resilience case, say so instead of asserting one. "
-        "Populate uncertainties and what_would_change with at least one concrete item each."
+        "Cite only freeze ids."
     )
     if evidence_text.strip():
-        prompt += f"\nEvidence (cite ids; do not invent):\n{evidence_text.strip()}"
+        prompt += f"\nEvidence (cite ids):\n{evidence_text.strip()}"
     text = model(prompt).strip()
     extra = _tag_requests(list(follow_ups or []))
     env = parse_committee_envelope(text, frozen=frozen, agent="bullbot")

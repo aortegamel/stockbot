@@ -177,28 +177,7 @@ def test_tool_options_prompt_keeps_last_three_failures() -> None:
     assert "t7" in prompt and "t8" in prompt and "t9" in prompt
     assert "t0" not in prompt and "t6" not in prompt
     assert "Today UTC is" in prompt and "decode relative dates before choosing" in prompt
-    assert "page with research_read_search beyond display_limit" in prompt
     assert "[Today UTC " in prompt and "q?" in prompt
-    for question, wanted, absent in (
-        (
-            "What did NVDA's latest 10-Q disclose about revenue?",
-            "get_sec_document section reads (Item 1, Item 2, Item 1A)",
-            "with a revenue query",
-        ),
-        (
-            "What drove NVDA revenue last quarter?",
-            "get_sec_document with a revenue query",
-            "section reads",
-        ),
-        (
-            "What is ORCL's latest revenue?",
-            "Latest revenue means the latest reported financial period",
-            "with invented start",
-        ),
-    ):
-        _, revenue_prompt = _tool_options_prompt(reg, {"node_id": "n1", "question": question}, [], [])
-        assert wanted in revenue_prompt and absent not in revenue_prompt
-    assert "open the 10-Q accession" not in prompt
 
 
 def test_tool_options_prompt_stamp_idempotent() -> None:

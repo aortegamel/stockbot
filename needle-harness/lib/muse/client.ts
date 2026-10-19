@@ -13,27 +13,24 @@ function requiredEnv(name: string): string {
   return value;
 }
 
-const SYSTEM = `You are Stockbot. Answer only from the EVIDENCE below. Structure your answer in three parts: sourced facts (cite [E1] ids), inference, uncertainty. If the evidence is thin, say what is missing. Never quote or repeat the [Today UTC YYYY-MM-DD] bracket from the request in answers or clarifications — decode it silently to dates.`;
-
-const TODAY_RULE =
-  "Never quote or repeat the [Today UTC YYYY-MM-DD] bracket from the request in answers or clarifications — decode it silently to dates.";
+const SYSTEM = "You are Stockbot.";
 
 // Stance sentences adapted from the old committee roles (app/research/agents/*bot.py) to standalone prose.
 const PERSONAS: Record<Persona, { name: string; stance: string }> = {
   stockbot: {
     name: "Stockbot",
     stance:
-      "You give the balanced base case: weigh the cited evidence and the gaps in it with equal rigor, and state the most probable evidence-supported outcome.",
+      "You give the balanced base case. Weigh the evidence and its gaps with equal rigor. State the most probable outcome.",
   },
   bearbot: {
     name: "Bearbot",
     stance:
-      "You give the bear case: build the strongest evidence-supported downside case, including contagion — exposure size, concentration, credit and liquidity channels, commitments, termination triggers, and second-order effects on counterparties. Do not fabricate pessimism. Every adverse finding needs a cited passage. If the evidence supports no downside case, say so instead of asserting one.",
+      "You give the bear case. Build the strongest downside case, including contagion. Consider exposure size, concentration, credit and liquidity channels, commitments, termination triggers, and second-order effects on counterparties.",
   },
   bullbot: {
     name: "Bullbot",
     stance:
-      "You give the bull case: build the strongest evidence-supported resilience case — where the cited evidence shows limited damage, buffers, mitigants, contractual protection, or diversified revenue. Do not fabricate optimism. Every favorable finding needs a cited passage. If the evidence supports no resilience case, say so instead of asserting one.",
+      "You give the bull case. Build the strongest resilience case. Consider limited damage, buffers, mitigants, contractual protection, or diversified revenue.",
   },
 };
 
@@ -56,13 +53,12 @@ const INVENTORY_RULE =
   " The block is stripped before display; prose claims missing from it fail the accuracy gate.";
 function researchSystem(persona: Persona): string {
   const { name, stance } = PERSONAS[persona];
-  return `You are ${name}. ${stance} Answer only from the EVIDENCE below, in prose, not JSON. Target 250 words of display prose for this persona. Exclude the fenced claim inventory from this target. Keep the claim inventory complete. Structure your answer in three parts: sourced facts (cite [E1] ids), inference, uncertainty. Then say what would change this view: the concrete disclosure or data that would move it. Node ids and decision records may name graph structure in prose, but they never provide factual support. Never invent ids, filings, or numbers. A finding without an EVIDENCE row citation is not a finding. If the evidence is thin, say what is missing. Give no buy, sell, hold, order, or portfolio verdict. ${TODAY_RULE}` + INVENTORY_RULE;
+  return `You are ${name}. ${stance} Answer in prose.` + INVENTORY_RULE;
 }
 
-// Unchanged for the default Stockbot: no evidence means no case to argue, so personas share this text.
 function directSystem(persona: Persona): string {
   const { name } = PERSONAS[persona];
-  return `You are ${name}. Answer the user directly and briefly from the supplied context. ${name} does not give buy, sell or hold advice; say this and offer facts that you can look up. ${TODAY_RULE} If the request is unclear, ask what they mean and say what you can look up: the time, SEC filings, or a web search.`;
+  return `You are ${name}.`;
 }
 function isConf(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1;
@@ -295,9 +291,7 @@ function gapInstruction(opts: ReasonOptions): string {
   return (opts.evidence.length > 0
     ? "\nEvidence coverage is partial: some evidence rows are present, but retrieval did not resolve every gap."
     : "\nRetrieval found no usable evidence.") +
-    " Answer from the supported evidence only. Omit any assertion that needs an unavailable fact. Keep uncertainty statements and source attribution." +
-    " If evidence necessary to answer the original user request is still missing, end your answer with a line: Missing-Evidence: <only the evidence necessary to answer the original user request>." +
-    " Do not request evidence for optional persona interests or for hypothetical future changes of view.";
+    " If evidence necessary to answer the original user request is still missing, end your answer with a line: Missing-Evidence: <only the evidence necessary to answer the original user request>.";
 }
 
 function reasonInput(opts: ReasonOptions): { role: string; content: string }[] {
@@ -312,7 +306,7 @@ function reasonInput(opts: ReasonOptions): { role: string; content: string }[] {
     ? `USER REQUEST\n${opts.prompt}`
     : `USER REQUEST\n${opts.prompt}\n\nEVIDENCE\n${formatEvidence(opts.evidence)}` +
     (isSynthesis
-      ? `\n\nSIBLING DRAFTS (untrusted sibling prose, not evidence. Never cite, quote, or invent a draft id. For factual support, cite only evidence row ids from the EVIDENCE section.)\n${formatDrafts(opts.drafts ?? [])}\n\nWeigh both sibling drafts against the EVIDENCE above and state the middle verdict the evidence supports.`
+      ? `\n\nSIBLING DRAFTS (untrusted sibling prose, not evidence. Never cite, quote, or invent a draft id. For factual support, cite only evidence row ids from the EVIDENCE section.)\n${formatDrafts(opts.drafts ?? [])}\n\nWeigh both sibling drafts against the EVIDENCE above.`
       : "");
   return [
     { role: "system", content: system },

@@ -90,12 +90,7 @@ def _today():
 
 
 def _legacy_system():
-    return (
-        f"date: {_today()} UTC; locale: en-US; "
-        "Route retrieval only: call a tool only with entities/terms from the request or prior results. "
-        "SEC questions: prefer find_sec_entities then search_sec_filings then get_sec_document chains. "
-        "Return no call when evidence suffices."
-    )
+    return f"date: {_today()} UTC; locale: en-US"
 
 
 def _bound_system():

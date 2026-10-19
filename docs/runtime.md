@@ -100,12 +100,12 @@ No remaining persona also fails the request.
 Without an explicit selection, direct and single-tool answers use one Stockbot call.
 Research uses all three personas.
 An explicit selection always enters research.
-Partial selections run the selected personas concurrently over the same graph, evidence, decisions, unresolved items, and authority limits.
+Partial selections run the selected personas concurrently over the same graph, evidence, decisions, and unresolved items.
 Partial selections use no synthesis or draft retry.
 
 The full trio uses synthesis.
 Bearbot and Bullbot draft concurrently over the shared snapshot.
-Stockbot judges both drafts against that snapshot and writes the middle verdict.
+Stockbot weighs both drafts against that snapshot and writes its response.
 The kernel buffers drafts instead of streaming them.
 An empty graph retains the direct prompt without evidence.
 Exactly one failed or empty draft retries once.
@@ -138,12 +138,15 @@ A gate failure, an empty persona, or rejection of all claims fails the report wi
 
 A remaining gap does not emit `failed` when the final gates pass.
 The kernel emits one `answer_delta` with labeled persona sections.
-The trio emits Bearbot and Bullbot drafts before the Stockbot verdict.
+The trio emits Bearbot and Bullbot drafts before the Stockbot response.
 Partial selections emit sections in canonical order.
 Metrics count all attempted calls and token usage across retries and passes.
 Metrics also report the final stage duration.
-Each research persona targets 250 words of display prose.
-The fenced claim inventory stays outside that target.
+Runtime model prompts retain persona tasks, required response formats, and untrusted-data protections.
+They no longer impose advice bans, authority bans, evidence-only reasoning, word targets, or a prose outline.
+Required JSON shapes, claim inventories, tool arguments, identifiers, and date formats remain.
+Existing code validation, risk checks, authorization, and execution limits remain unchanged.
+The configured provider can still add a disclaimer.
 Muse receives all projected evidence without an aggregate character cap.
 
 Research wall: the 120-second `REQUEST_WALL_MS` deadline applies to each worker research pass.

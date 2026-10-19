@@ -20,7 +20,6 @@ import json
 import logging
 import math
 import os
-import re
 import subprocess
 import threading
 import time
@@ -84,7 +83,6 @@ _SYSTEM_PROMPT = (
     'For a score question, return {"type":"score","score":s}. '
     "Here, s is the expected ordinal score. Its range is 0 to the number of rubric levels minus 1. "
     "The rubric is the question's criteria or levels array. "
-    "Do not calculate deterministic quantities as ordinal scores. "
     "These probabilities are model estimates, not calibrated measurements. "
     "Do not add Markdown, explanations, or unrelated fields."
 )
@@ -685,28 +683,6 @@ def _today_guidance() -> str:
     )
 
 
-def _hint_text(stamped: object, question: object) -> str:
-    """Question text used for the revenue hints (the same string the question shows)."""
-    if isinstance(stamped, str):
-        return stamped
-    return question if isinstance(question, str) else ""
-
-
-def _revenue_hint(text: str) -> str:
-    """Question-shaped steering for SEC paging (revenue questions only)."""
-    low = text.lower()
-    if "revenue" not in low:
-        return ""
-    latest = re.search(r"\b(?:latest|most recent)\b", low)
-    if re.search(r"\b10-?\s?q\b", low) and latest:
-        return " Latest-10-Q revenue answers come from the 10-Q, not the 8-K: after the filing list, open the 10-Q accession via get_sec_document section reads (Item 1, Item 2, Item 1A) before re-reading any 8-K."
-    if "quarter" in low:
-        return " Revenue-quarter answers come from the 10-Q (MD&A/segment revenue), not the 8-K: after the filing list, open the 10-Q accession via get_sec_document with a revenue query before re-reading any 8-K."
-    if latest:
-        return " Latest revenue means the latest reported financial period. List 10-Q/10-K filings without invented start/end dates. Open the selected accession with a revenue query. State whether the figure covers a quarter or a year."
-    return ""
-
-
 def _selection_prompt(
     node: Mapping[str, JSONValue],
     node_id: JSONValue,
@@ -716,11 +692,7 @@ def _selection_prompt(
 ) -> str:
     """Selection instructions: the node question, evidence on hand, prior failures, and date guidance."""
     stamped = query_with_today_utc(question) if isinstance(question, str) else question
-    prompt = (
-        f"Which single tool runs next for research node {node_id}? Question: {stamped} "
-        "JEV owns this selection and every transition over the whole canonical registry; "
-        "Needle runs args only and never selects, chains, or judges. Choose exactly one winner."
-    )
+    prompt = f"Which single tool runs next for research node {node_id}? Question: {stamped} Choose exactly one winner."
     why = node.get("why_it_matters")
     if isinstance(why, str) and why:
         prompt += f" Why it matters: {why}"
@@ -729,8 +701,6 @@ def _selection_prompt(
         prompt += f" Observed {line}."
     prompt += _prior_failures(attempts)
     prompt += " " + _today_guidance()
-    prompt += " Search packets list candidates only — page with research_read_search beyond display_limit and open each accession via get_sec_filing/get_sec_document until answered or guard trips."
-    prompt += _revenue_hint(_hint_text(stamped, question))
     return prompt
 
 

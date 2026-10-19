@@ -99,8 +99,8 @@ def run_stockbot(
     wave = _coerce_wave(wave_id)
     frozen = list(evidence_ids)
     prompt = (
-        "Role: balanced base case. Weigh the cited disclosures and the gaps between them with equal "
-        f"rigor and state the most probable evidence-supported outcome. Question: {question}\n"
+        "Role: balanced base case. Weigh the disclosures and the gaps between them with equal rigor. "
+        f"State the most probable outcome. Question: {question}\n"
         f"Freeze: {freeze_id} as of {as_of} evidence={len(frozen)}\n"
         'Respond with one JSON object only: {"role": "stockbot", "executive_view": "<balanced read>", '
         '"claims": [{"text": "<finding>", "claim_type": "observed_fact|inference|unknown|contradicted|conditional_risk|attributed_report", "evidence_ids": ["<freeze-id>", ...]}], '
@@ -116,11 +116,10 @@ def run_stockbot(
         "unknown when the frozen evidence does not establish it (for example no disclosure located within the searched scope). "
         "Cite both sides when evidence conflicts and declare contradicted. "
         "observed_fact/inference/contradicted/conditional_risk/attributed_report need at least one freeze id; unknown may cite none. "
-        "Cite only freeze ids; never invent ids, filings, or numbers. "
-        "Populate uncertainties and what_would_change with at least one concrete item each."
+        "Cite only freeze ids."
     )
     if evidence_text.strip():
-        prompt += f"\nEvidence (cite ids; do not invent):\n{evidence_text.strip()}"
+        prompt += f"\nEvidence (cite ids):\n{evidence_text.strip()}"
     text = model(prompt).strip()
     extra = _tag_requests(list(follow_ups or []))
     env = parse_committee_envelope(text, frozen=frozen, agent="stockbot")

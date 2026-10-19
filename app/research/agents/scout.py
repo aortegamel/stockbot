@@ -33,24 +33,16 @@ ROLE_PROMPTS: dict[str, str] = {
     "filings": (
         "Temporary assignment: filings/material-event scout. List material "
         "events (8-K/6-K, offerings, insider transactions) for the tickers in "
-        "scope. Use the research context and the as_of-filtered latest-filing "
-        "baseline (segments, customers, suppliers, competition, risks, "
-        "terminology) below to drive targeted searches. Cite evidence ids "
-        "only; record gaps as unknowns."
+        "scope."
     ),
     "financials": (
         "Temporary assignment: financial/XBRL-trend scout. Summarize reported "
-        "XBRL/financial-statement trends for the tickers in scope. Use the "
-        "research context and the as_of-filtered latest-filing baseline below "
-        "to drive targeted searches. Never recalculate tool-computed metrics; "
-        "cite evidence ids only."
+        "XBRL/financial-statement trends for the tickers in scope."
     ),
     "risk": (
         "Temporary assignment: risk-factor/language-diff scout. Compare risk "
         "factor language across filings and flag new/removed/softened "
-        "language. Use the research context and the as_of-filtered "
-        "latest-filing baseline below to drive targeted searches. Quote "
-        "briefly with evidence ids; gaps go to unknowns."
+        "language."
     ),
 }
 
@@ -181,21 +173,12 @@ def _context_lines(context: Mapping[str, object]) -> list[str]:
     return out
 
 
-SOURCE_WORKFLOW = (
-    "Workflow: build a material branch map (entities, relationship types, forms, exhibits, open "
-    "questions) -> search SEC (search results are navigation artifacts, never evidence) -> open the "
-    "underlying filings -> inspect documents, exhibits, and passages -> record only raw-document-backed "
-    "evidence -> continue with materially new searches -> submit structured coverage (entities, "
-    "relationship types, forms, exhibits, open questions) once the material branches are covered. "
-    "There is no maximum number of searches, filing reads, document reads, exhibit reads, or waves; "
-    "continue while the searches stay materially new. Only exact no-progress repeats (same query, "
-    "same filing, same passage) are wasteful."
-)
-"""Research workflow: navigation is not evidence; only raw documents are, and volume is unbounded."""
+SOURCE_WORKFLOW = "Explore material entities, relationship types, forms, exhibits, and open questions."
+"""Research scope for the model."""
 
 
 def build_scout_prompt(assignment: ScoutAssignment) -> str:
-    """Deterministic prompt: role template + context + baseline + scope + research workflow."""
+    """Deterministic prompt: role template + context + baseline + scope."""
     template = ROLE_PROMPTS[assignment.role]
     tickers = ", ".join(assignment.tickers) if assignment.tickers else "scope tickers TBD"
     prompt = (
@@ -207,37 +190,25 @@ def build_scout_prompt(assignment: ScoutAssignment) -> str:
         for line in _context_lines(assignment.context):
             prompt += f"Context {line}\n"
     if assignment.baseline:
-        prompt += "Latest-filing baseline (as_of-filtered, target searches with its terms):\n"
+        prompt += "Latest-filing baseline (as_of-filtered):\n"
         prompt += "".join(f"- {line}\n" for line in assignment.baseline)
     if assignment.unscoped_queries:
         prompt += (
-            "Counterparty branch first - these queries have already run with NO ticker and NO cik "
-            "(a scoped search shows only the scope issuer's own disclosures) and the documents their "
-            "hits named are opened below; the hits are other filers disclosing the counterparty, and "
-            "they are the branch a scope-only search cannot reach. Re-run one only to open a hit the "
-            "acquired list does not cover.\n"
+            "Counterparty queries ran without ticker or CIK filters. "
+            "The acquired evidence includes passages from their documents.\n"
         )
         prompt += "".join(f"- {q}\n" for q in assignment.unscoped_queries)
-        prompt += (
-            "Cite what those filings state; never conclude a relationship is absent from a scoped "
-            "search, and do not end the assignment with every counterparty query unopened.\n"
-        )
     if assignment.queries:
-        prompt += "Assigned queries (search each; skip exact repeats already executed):\n"
+        prompt += "Assigned queries:\n"
         prompt += "".join(f"- {q}\n" for q in assignment.queries)
-        prompt += (
-            "If a candidate issuer is not in scope tickers, search it as a concept "
-            "(customer/supplier/fund/risk-factor/8-K/proxy/N-PX/agreement mentions), never dead-end.\n"
-        )
     return (
         prompt
         + SOURCE_WORKFLOW
         + "\n"
         + 'Respond with JSON only: [{"text": "<finding>", "claim_type": '
         + '"observed_fact|inference", "evidence_ids": ["<id>", ...]}, ...]. '
-        + "Cite only the acquired ids listed below, one or more per claim: observed_fact when the "
-        + "passage states it directly, inference when reasoned from cited passages. "
-        + "Findings without a raw-document citation are not findings."
+        + "Cite only the acquired ids listed below, one or more per claim. "
+        + "Use observed_fact when the passage states it directly. Use inference when reasoned from cited passages."
     )
 
 
