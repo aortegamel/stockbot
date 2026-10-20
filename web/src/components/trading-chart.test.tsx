@@ -4,7 +4,7 @@ import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import type { Root } from "react-dom/client";
 import { JSDOM } from "jsdom";
-import TradingChart from "./trading-chart";
+import TradingChart, { ChartControls, chartSettings, chartSrc, INTERVALS, STUDIES, STYLES } from "./trading-chart";
 
 const dom = new JSDOM(`<body><div id="root"></div></body>`, { url: "https://example.com/" });
 const registry = globalThis as Record<string, unknown>;
@@ -192,5 +192,70 @@ describe("TradingChart", () => {
     await click(control(root, "Retry chart"));
     await until(() => frame(root) !== null);
     expect(root.querySelector('[role="alert"]')).toBeNull();
+  });
+});
+
+describe("chart settings", () => {
+  const query = (src: string) => new URL(src).searchParams;
+
+  test("the default chart keeps the original embed URL", () => {
+    expect(chartSrc("NVDA")).toBe("https://s.tradingview.com/widgetembed/?symbol=NVDA&interval=D&theme=dark&style=1&locale=en&timezone=exchange");
+    expect(chartSrc("NVDA", {})).toBe(chartSrc("NVDA"));
+  });
+
+  test("maps every interval and style to the embed values", () => {
+    const intervals = INTERVALS.map((interval) => query(chartSrc("NVDA", { interval })).get("interval"));
+    expect(intervals).toEqual(["5", "15", "60", "240", "D", "W"]);
+    const styles = STYLES.map((style) => query(chartSrc("NVDA", { style })).get("style"));
+    expect(styles).toEqual(["1", "2", "3"]);
+  });
+
+  test("maps indicators to embed studies and Volume to the built-in volume pane", () => {
+    const all = query(chartSrc("NVDA", { studies: STUDIES }));
+    expect(all.get("hide_volume")).toBeNull();
+    expect(JSON.parse(all.get("studies") ?? "[]")).toEqual([
+      { id: "MASimple@tv-basicstudies", inputs: { length: 20 } },
+      { id: "MASimple@tv-basicstudies", inputs: { length: 50 } },
+      { id: "MASimple@tv-basicstudies", inputs: { length: 200 } },
+      { id: "MAExp@tv-basicstudies" },
+      { id: "RSI@tv-basicstudies" },
+      { id: "MACD@tv-basicstudies" },
+      { id: "BB@tv-basicstudies" },
+      { id: "VWAP@tv-basicstudies" },
+    ]);
+    const none = query(chartSrc("NVDA", { studies: [] }));
+    expect(none.get("hide_volume")).toBe("1");
+    expect(none.get("studies")).toBeNull();
+  });
+
+  test("unknown saved values fall back to the defaults and studies keep the menu order", () => {
+    expect(chartSettings({ interval: "2m", style: 3, studies: ["RSI", "evil", "MA20", "RSI"] })).toEqual({ interval: "D", style: "candles", studies: ["MA20", "RSI"] });
+    expect(chartSettings({ studies: "RSI" })).toEqual({ interval: "D", style: "candles", studies: ["Volume"] });
+  });
+
+  test("the chart frame follows its params and the controls report full settings", async () => {
+    const changes: unknown[] = [];
+    const root = await mount(
+      <>
+        <ChartControls params={{ interval: "1h", studies: ["Volume"] }} onChange={(next) => changes.push(next)} />
+        <TradingChart sym="NVDA" params={{ interval: "1h", style: "area" }} />
+      </>,
+    );
+    await until(() => frame(root) !== null);
+    expect(query(frame(root)?.src ?? "").get("interval")).toBe("60");
+    expect(query(frame(root)?.src ?? "").get("style")).toBe("3");
+    const select = (label: string) => root.querySelector<HTMLSelectElement>(`select[aria-label="${label}"]`)!;
+    expect(select("Chart interval").value).toBe("1h");
+    await act(async () => {
+      select("Chart style").value = "line";
+      select("Chart style").dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+    });
+    const box = [...root.querySelectorAll("label")].find((label) => label.textContent === "MA 20")?.querySelector("input");
+    if (!box) throw new Error("missing MA 20 indicator");
+    await click(box);
+    expect(changes).toEqual([
+      { interval: "1h", style: "line", studies: ["Volume"] },
+      { interval: "1h", style: "candles", studies: ["Volume", "MA20"] },
+    ]);
   });
 });

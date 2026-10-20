@@ -6,6 +6,8 @@ import type {
   ResearchRun,
 } from "./harness-viewer-types";
 import { fetchSnapshot, type ResearchSnapshot } from "../lib/research-client";
+import { sessionTitle } from "../lib/session-title";
+import { ago } from "../lib/time";
 
 function snapshotToRun(sessionId: string, snapshot: ResearchSnapshot): ResearchRun | null {
   const session = snapshot.session;
@@ -362,8 +364,10 @@ function SessionsList({ runs, selected, onSelect }: { runs: Run[]; selected: str
             <button onClick={() => onSelect(run.sessionId)} aria-pressed={selected === run.sessionId}>
               {run.sessionId}
             </button>{" "}
-            wave {run.waveId} [{run.status}] {run.question} — {run.evidence.length} evidence, {run.freezes.length}{" "}
-            freezes, {run.dossiers.length} dossiers, waves [{(run.waves ?? []).join(", ")}]
+            <b title={run.question}>{sessionTitle(run.question)}</b>{" "}
+            {[run.status, run.updatedAt && ago(run.updatedAt, Date.now())].filter(Boolean).join(" · ")} — wave {run.waveId},{" "}
+            {run.evidence.length} evidence, {run.freezes.length} freezes, {run.dossiers.length} dossiers, waves [
+            {(run.waves ?? []).join(", ")}]
           </li>
         ))}
       </ul>

@@ -284,6 +284,14 @@ def validate_ticker(value: object, where: str = "<session>") -> str | None:
     return text
 
 
+def require_ticker(value: object, where: str) -> str:
+    """validate_ticker, but absent or blank is a ValueError too."""
+    ticker = validate_ticker(value, where)
+    if ticker is None:
+        raise ValueError(f"{where}: 'ticker' must be a non-empty string")
+    return ticker
+
+
 def resolve_source_policy(policy: object, where: str = "<session>") -> dict[str, JSONValue]:
     """Build source_policy from a full policy or a bare research_sources mapping.
 

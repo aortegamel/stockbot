@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { fetchScans, searchTickers, type ScanDef, type SearchHit } from "../lib/market-data";
+import { sessionTitle } from "../lib/session-title";
+import { ago } from "../lib/time";
 import type { ShellState } from "./Shell";
 
 type Thesis = { thesis_id: string; scope: string; user_thesis: string };
@@ -84,7 +86,10 @@ export default function CommandBar({ watchlist, sessions, onTicker, onScan, onSe
       group: "Theses", label: t.scope, detail: t.user_thesis.slice(0, 60), run: () => onTicker(t.scope),
     })), theses === null ? "theses unavailable" : "no theses"),
     ...group("Recent sessions", sessions.filter((s) => s.session_id && has(s.session_id, s.query)).map((s) => ({
-      group: "Recent sessions", label: s.query || s.session_id!, detail: s.status, run: () => onSession(s.session_id!),
+      group: "Recent sessions",
+      label: sessionTitle(s.query ?? "") || s.session_id!,
+      detail: [s.status, s.updated_at && ago(s.updated_at, Date.now())].filter(Boolean).join(" · "),
+      run: () => onSession(s.session_id!),
     })), "no recent sessions"),
     ...(q ? [{ group: "Ask", label: `Ask Stockbot: ${q}`, run: () => onAsk(q) }] : []),
   ];

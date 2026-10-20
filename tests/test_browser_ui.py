@@ -472,7 +472,11 @@ def drain(queue: Queue[str]) -> None:
 
 
 def sources_text(browser: webdriver.Chrome, sym: str) -> str:
-    return browser.find_element(By.CSS_SELECTOR, f'[aria-label="{sym} sources"]').text
+    return str(
+        browser.execute_script(
+            "return arguments[0].textContent;", browser.find_element(By.CSS_SELECTOR, f'[aria-label="{sym} sources"]')
+        )
+    ).strip()
 
 
 def test_page_load_fetches_every_watchlist_source_once(browser: webdriver.Chrome, local_ui: UI) -> None:

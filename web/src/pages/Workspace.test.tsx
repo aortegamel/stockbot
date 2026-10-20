@@ -102,6 +102,10 @@ function button(label: string): HTMLButtonElement {
   if (!el) throw new Error(`missing ${label}`);
   return el;
 }
+async function escape() {
+  await act(async () => dom.window.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape" })));
+  await settle();
+}
 
 describe("Workspace", () => {
   test("persists open tickers, opens another ticker with the pick flow, and keeps at least one tab", async () => {
@@ -134,7 +138,15 @@ describe("Workspace", () => {
     expect(text()).toContain("10.0%");
     expect(text()).toContain("-10.0%");
     await click(find('[aria-label="Expand Monthly returns · NVDA"]'));
-    expect(find('[aria-label="Monthly returns · NVDA"]').classList.contains("ws-widget-wide")).toBe(true);
+    expect(find(".ws-grid").classList.contains("ws-grid-focus")).toBe(true);
+    expect(find('[aria-label="Monthly returns · NVDA"]').classList.contains("ws-widget-focus")).toBe(true);
+    expect(container().querySelectorAll(".ws-widget-focus")).toHaveLength(1);
+    await escape();
+    expect(find(".ws-grid").classList.contains("ws-grid-focus")).toBe(false);
+    expect(container().querySelectorAll(".ws-widget-focus")).toHaveLength(0);
+    await click(find('[aria-label="Expand Monthly returns · NVDA"]'));
+    await click(find('[aria-label="Collapse Monthly returns · NVDA"]'));
+    expect(find(".ws-grid").classList.contains("ws-grid-focus")).toBe(false);
     const before = requests.filter((r) => r.path.startsWith("/api/candles")).length;
     await click(find('[aria-label="Refresh Monthly returns · NVDA"]'));
     expect(requests.filter((r) => r.path.startsWith("/api/candles")).length).toBe(before + 1);
@@ -175,21 +187,69 @@ describe("Workspace", () => {
     expect(requests.filter((r) => r.method === "PUT")).toHaveLength(1);
   });
 
-  test("switches bottom panels and loads only pending alerts scoped to the ticker", async () => {
+  test("saves chart settings in the ticker workspace and restores them after a reload", async () => {
+    const { docs, requests } = serve();
+    await render(<Page />);
+    const change = async (label: string, value: string) => {
+      await act(async () => {
+        const select = find<HTMLSelectElement>(`select[aria-label="${label}"]`);
+        select.value = value;
+        select.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      });
+      await settle();
+    };
+    await change("Chart interval", "4h");
+    await change("Chart style", "area");
+    const rsi = [...container().querySelectorAll("label")].find((label) => label.textContent === "RSI")?.querySelector("input");
+    if (!rsi) throw new Error("missing RSI indicator");
+    await click(rsi);
+    expect(requests.filter((r) => r.method === "PUT").map((r) => r.path)).toEqual(Array(3).fill("/api/workspaces/NVDA"));
+    expect(docs.NVDA.widgets.find((w) => w.type === "price-volume")?.params).toEqual({ interval: "4h", style: "area", studies: ["Volume", "RSI"] });
+    expect(docs.NVDA.widgets.find((w) => w.type === "financials")?.params).toBeUndefined();
+    expect(text()).toContain("saved 12:00:00");
+
+    await act(async () => mounted!.unmount());
+    mounted = null;
+    await render(<Page />);
+    expect(find<HTMLSelectElement>('select[aria-label="Chart interval"]').value).toBe("4h");
+    expect(find<HTMLSelectElement>('select[aria-label="Chart style"]').value).toBe("area");
+    const src = new URL(find<HTMLIFrameElement>("iframe").src).searchParams;
+    expect([src.get("symbol"), src.get("interval"), src.get("style")]).toEqual(["NVDA", "240", "3"]);
+    expect(JSON.parse(src.get("studies") ?? "[]")).toEqual([{ id: "RSI@tv-basicstudies" }]);
+  });
+
+  test("collapses and toggles bottom panels, restores the open tab, and loads only pending alerts scoped to the ticker", async () => {
     const { requests } = serve();
     await render(<Page />);
     const panel = (name: string) => find<HTMLElement>(`[role="tabpanel"][aria-label="${name}"]`);
-    expect(panel("Theses").hidden).toBe(false);
+    const opened = () => find(".ws-bottom").classList.contains("ws-bottom-open");
+    expect(opened()).toBe(false);
+    expect(["Theses", "Alerts", "Sessions", "Journal"].every((name) => panel(name).hidden)).toBe(true);
     await click(find('button[role="tab"]:nth-child(2)'));
+    expect(opened()).toBe(true);
     expect(panel("Alerts").hidden).toBe(false);
+    expect(dom.window.localStorage.getItem("stockbot.bottom")).toBe("Alerts");
     expect(text()).toContain("New evidence");
     expect(text()).not.toContain("Old evidence");
     expect(requests.some((r) => r.path === "/api/theses/t2")).toBe(false);
     await click(button("Sessions"));
     expect(panel("Sessions").hidden).toBe(false);
     expect(panel("Alerts").hidden).toBe(true);
+    await click(button("Sessions"));
+    expect(opened()).toBe(false);
+    expect(panel("Sessions").hidden).toBe(true);
+    expect(dom.window.localStorage.getItem("stockbot.bottom")).toBeNull();
     await click(button("Journal"));
     expect(panel("Journal").hidden).toBe(false);
+    await escape();
+    expect(opened()).toBe(false);
+    expect(panel("Journal").hidden).toBe(true);
+    await click(button("Theses"));
+    await act(async () => mounted!.unmount());
+    mounted = null;
+    await render(<Page />);
+    expect(opened()).toBe(true);
+    expect(panel("Theses").hidden).toBe(false);
   });
 
   test("renders one summary card per ticker with the workspace link", async () => {

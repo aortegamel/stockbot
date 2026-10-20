@@ -5,11 +5,11 @@ import { AgentConsole } from "./agent-console";
 import { useLoad } from "./home-panels";
 import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
 import type { JournalPage, ResearchSnapshot } from "../lib/research-client";
+import { sessionTitle } from "../lib/session-title";
+import { ago } from "../lib/time";
 
+// Panels sit inside a glass card or tab, which already draws the surface and border.
 const panel: React.CSSProperties = {
-  background: "var(--panel, #11161F)",
-  border: "1px solid var(--border, #1E2635)",
-  borderRadius: 6,
   padding: 16,
   overflow: "hidden",
 };
@@ -110,10 +110,12 @@ export function WatchlistPanel({ selected, onSelect, symbols }: { selected: stri
             display: "flex",
             flexWrap: "wrap",
             justifyContent: "space-between",
+            alignContent: "center",
             alignItems: "center",
             lineHeight: "20px",
             width: "100%",
-            padding: "4px 8px",
+            height: 44,
+            padding: "0 8px",
             textAlign: "left",
             background: sym === selected ? "var(--panel2, #151C29)" : "transparent",
             border: sym === selected ? "1px solid var(--accent, #2962FF)" : "1px solid transparent",
@@ -125,9 +127,9 @@ export function WatchlistPanel({ selected, onSelect, symbols }: { selected: stri
         >
           <b style={{ fontWeight: 600 }}>{sym}</b>
           <span className="num">{prices[sym] == null ? "—" : prices[sym]!.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
-          <span style={{ flexBasis: "100%", display: "flex", gap: 4, flexWrap: "wrap", lineHeight: 1.4, color: muted, fontSize: "var(--fs-xs)" }}>
+          <span style={{ flexBasis: "100%", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", lineHeight: "16px", color: muted, fontSize: 11 }}>
             DELAYED
-            <span aria-label={`${sym} sources`}>
+            <span aria-label={`${sym} sources`} style={{ marginLeft: 4 }}>
               {sources
                 .filter((row) => row.symbol === sym)
                 .map((row) => (
@@ -262,6 +264,7 @@ export function AIPanel({
   );
 }
 type SessionSummary = { session_id?: string; status?: string; updated_at?: string; query?: string };
+const clip: React.CSSProperties = { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" };
 
 // Backend-state panel: durable sessions from research.sqlite + live snapshot.
 export function SessionPanel({
@@ -286,6 +289,7 @@ export function SessionPanel({
       {sessions.slice(0, 8).map((s) => (
         <button
           key={s.session_id ?? "?"}
+          title={s.session_id}
           onClick={() => onSelect(s.session_id ? (s.session_id === sessionId ? null : s.session_id) : null)}
           style={{
             display: "block",
@@ -300,9 +304,12 @@ export function SessionPanel({
             fontSize: 12,
           }}
         >
-          <b>{(s.session_id ?? "?").slice(0, 8)}</b>{" "}
-          <span style={{ color: "var(--muted, #7A8599)" }}>{s.status ?? "?"}</span>
-          <div style={{ color: "var(--muted, #7A8599)", fontSize: 12 }}>{(s.query ?? "").slice(0, 60)}</div>
+          <div style={{ ...clip, fontSize: 14, fontWeight: 600 }}>
+            {sessionTitle(s.query ?? "") || (s.session_id ?? "?").slice(0, 8)}
+          </div>
+          <div style={{ ...clip, color: "var(--muted, #7A8599)", fontSize: 12 }}>
+            {[s.status ?? "?", s.updated_at && ago(s.updated_at, Date.now())].filter(Boolean).join(" · ")}
+          </div>
         </button>
       ))}
       {snapshot && !snapshot.error && (

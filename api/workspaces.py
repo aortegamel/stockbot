@@ -2,20 +2,23 @@
 
 - GET /api/workspaces/<sym> — {sym, widgets, updated_at}; never saved is widgets [] and updated_at null.
 - PUT /api/workspaces/<sym> — {widgets: [{id, type, ticker, params?}]} (max 24); unknown keys are 400.
+  price-volume params allow only known interval/style/studies. tv-link params are exactly
+  {url: https tradingview.com link ≤300 chars, label: 1-60 chars}. A violation is 400.
 - GET /api/widget-data?type=&sym= — short-interest | short-volume | insider | multiples rows.
   Best-effort: source failures come back as an "error" string, never a 500.
 """
 
 import json
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, cast
+from typing import Annotated, Self, cast
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Body, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from app import cache
 from app.config import get_data_root
-from app.research.models import validate_ticker
+from app.research.models import require_ticker
 from app.thesis.models import JSONValue
 from app.thesis.yaml import atomic_write_json
 from calculations.valuation import earnings_yield, pe
@@ -25,13 +28,41 @@ from . import market_providers as mp
 router = APIRouter()
 
 _INSIDER_DAYS = 180
+# Price-volume chart settings; must match INTERVALS/STYLES/STUDIES in web/src/components/trading-chart.tsx.
+_CHART_CHOICES = {"interval": ("5m", "15m", "1h", "4h", "D", "W"), "style": ("candles", "line", "area")}
+_CHART_STUDIES = ("Volume", "MA20", "MA50", "MA200", "EMA", "RSI", "MACD", "BB", "VWAP")
+# Allowed (scheme, host, username, port) of a tv-link url.
+_TV_URL_PARTS = {("https", host, None, None) for host in ("tradingview.com", "www.tradingview.com")}
 
 
-def _ticker(value: object, where: str) -> str:
-    ticker = validate_ticker(value, where)
-    if ticker is None:
-        raise ValueError(f"{where}: 'ticker' must be a non-empty string")
-    return ticker
+def _chart_params(params: dict[str, object]) -> None:
+    if not set(params) <= {"interval", "style", "studies"}:
+        raise ValueError("price-volume params allow only interval, style, studies")
+    for key, choices in _CHART_CHOICES.items():
+        if params.get(key, choices[0]) not in choices:
+            raise ValueError(f"{key} must be one of {', '.join(choices)}")
+    studies = params.get("studies", [])
+    # Unique known studies iff every item is a distinct known name; `in` avoids hashing unhashable items.
+    if not isinstance(studies, list) or len(studies) != sum(s in studies for s in _CHART_STUDIES):
+        raise ValueError(f"studies must be unique values from {', '.join(_CHART_STUDIES)}")
+
+
+def _tradingview_url(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+        return (parts.scheme, parts.hostname, parts.username, parts.port) in _TV_URL_PARTS
+    except ValueError as exc:
+        raise ValueError("tv-link url is not a valid URL") from exc
+
+
+def _tv_link_params(params: dict[str, object]) -> None:
+    url, label = params.get("url"), params.get("label")
+    if set(params) != {"url", "label"} or not isinstance(url, str) or not isinstance(label, str):
+        raise ValueError("tv-link params must be exactly {url, label} strings")
+    if len(url) > 300 or len(label) > 60 or not label.strip():
+        raise ValueError("tv-link url must be at most 300 characters and label 1-60 characters")
+    if not _tradingview_url(url):
+        raise ValueError("tv-link url must be an https tradingview.com link")
 
 
 class Widget(BaseModel):
@@ -54,7 +85,16 @@ class Widget(BaseModel):
     @field_validator("ticker", mode="before")
     @classmethod
     def _valid_ticker(cls, value: object) -> str:
-        return _ticker(value, "widget")
+        return require_ticker(value, "widget")
+
+    @model_validator(mode="after")
+    def _valid_params(self) -> Self:
+        if check := _PARAM_CHECKS.get(self.type):
+            check(self.params)
+        return self
+
+
+_PARAM_CHECKS = {"price-volume": _chart_params, "tv-link": _tv_link_params}
 
 
 class Workspace(BaseModel):
@@ -65,7 +105,7 @@ class Workspace(BaseModel):
 
 def _sym(raw: str, what: str) -> str:
     try:
-        return _ticker(raw, what)
+        return require_ticker(raw, what)
     except ValueError as exc:
         raise HTTPException(400, f"invalid {what}: {exc}") from exc
 

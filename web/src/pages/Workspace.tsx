@@ -6,6 +6,7 @@ import { ThesisPanel } from "../components/thesis-panel";
 import { PortfolioPanel } from "../components/portfolio-panel";
 import { EnableNotifications } from "../components/action-cards";
 import { isWidgetType, WidgetGrid, widgetLabel } from "../components/widgets";
+import { TvLinkForm } from "../components/tv-link";
 import { fetchQuote, fetchWorkspace, saveWorkspace, type WorkspaceWidget } from "../lib/market-data";
 import { routeHash, TICKER_RE } from "../lib/route";
 import type { ShellState } from "../layout/Shell";
@@ -13,11 +14,27 @@ import type { ShellState } from "../layout/Shell";
 const TABS_KEY = "stockbot.tabs";
 const DEFAULT_WIDGETS = ["price-volume", "financials", "news"];
 const BOTTOM_TABS = ["Theses", "Alerts", "Sessions", "Journal"] as const;
+type BottomTab = (typeof BOTTOM_TABS)[number];
+// stockbot.bottom holds the open bottom tab; absent or unknown means the panel is collapsed to its tab bar.
+const BOTTOM_KEY = "stockbot.bottom";
+function savedBottom(): BottomTab | undefined {
+  try {
+    const saved = window.localStorage.getItem(BOTTOM_KEY);
+    return BOTTOM_TABS.find((tab) => tab === saved);
+  } catch {
+    return undefined;
+  }
+}
+
 // Agent widget receipts apply once per page load, even when the page remounts.
 const applied = new WeakSet<AgentEvent>();
 
-// One widget per type: the type doubles as the widget id.
+// One widget per type: the type doubles as the widget id. tv-link is the exception: ids tv-link-1, tv-link-2, ….
 const widgetOf = (type: string, sym: string): WorkspaceWidget => ({ id: type, type, ticker: sym });
+function nextTvLinkId(widgets: WorkspaceWidget[]): string {
+  const used = widgets.filter((w) => w.type === "tv-link").map((w) => Number(w.id.slice("tv-link-".length)) || 0);
+  return `tv-link-${Math.max(0, ...used) + 1}`;
+}
 const defaults = (sym: string) => DEFAULT_WIDGETS.map((type) => widgetOf(type, sym));
 
 function savedTabs(): string[] {
@@ -76,17 +93,114 @@ function AlertsPanel({ sym }: { sym: string }) {
   );
 }
 
+// Open-ticker tabs with their last delayed price, plus the + input that opens another ticker.
+function TickerTabs({ shown, sym, prices, onClose, onPick }: {
+  shown: string[];
+  sym: string;
+  prices: Record<string, number | null>;
+  onClose: (tab: string) => void;
+  onPick: (sym: string) => void;
+}) {
+  const [adding, setAdding] = useState(false);
+  return (
+    <span role="tablist" aria-label="Open workspaces" className="ws-tablist">
+      {shown.map((tab) => (
+        <span key={tab} className="ws-tab">
+          <a role="tab" aria-selected={tab === sym} href={routeHash({ page: "workspace", sym: tab })} className="pill">
+            <span style={{ fontWeight: 600 }}>{tab}</span>{" "}
+            <span className="ws-tab-price">{prices[tab] == null ? "—" : prices[tab]!.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
+          </a>
+          {shown.length > 1 && <button type="button" aria-label={`Close ${tab}`} onClick={() => onClose(tab)} className="ws-tool">×</button>}
+        </span>
+      ))}
+      {adding ? (
+        <input
+          autoFocus
+          aria-label="Open ticker"
+          placeholder="Ticker"
+          className="ws-tab-input"
+          onBlur={() => setAdding(false)}
+          onKeyDown={(e) => {
+            const value = e.currentTarget.value.trim().toUpperCase();
+            if (e.key === "Escape") setAdding(false);
+            if (e.key === "Enter" && TICKER_RE.test(value)) {
+              setAdding(false);
+              onPick(value);
+            }
+          }}
+        />
+      ) : (
+        <button type="button" aria-label="Open another ticker" onClick={() => setAdding(true)} className="ws-tool">+</button>
+      )}
+    </span>
+  );
+}
+
+// Theses, Alerts, Sessions, and Journal under the grid. The open tab persists; Esc collapses the panel.
+function BottomPanel({ s }: { s: ShellState }) {
+  const sym = s.selected;
+  const [bottom, setBottom] = useState<BottomTab>(() => savedBottom() ?? "Theses");
+  const [open, setOpen] = useState(() => savedBottom() !== undefined);
+
+  useEffect(() => {
+    try {
+      if (open) window.localStorage.setItem(BOTTOM_KEY, bottom);
+      else window.localStorage.removeItem(BOTTOM_KEY);
+    } catch {
+      // Storage can be disabled; the panel state then lasts for this page load only.
+    }
+  }, [open, bottom]);
+
+  // Esc collapses the bottom panel to its tab bar.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  // A click on the open tab collapses the panel; any other tab opens and shows that panel.
+  function toggleBottom(tab: BottomTab) {
+    setOpen(!open || bottom !== tab);
+    setBottom(tab);
+  }
+
+  const shows = (tab: BottomTab) => open && bottom === tab;
+  return (
+    <div className={`glass ws-bottom${open ? " ws-bottom-open" : ""}`}>
+      <div role="tablist" aria-label={`${sym} panels`} className="ws-tablist">
+        {BOTTOM_TABS.map((tab) => (
+          <button key={tab} type="button" role="tab" aria-selected={shows(tab)} aria-expanded={shows(tab)} onClick={() => toggleBottom(tab)} className="pill">{tab}</button>
+        ))}
+      </div>
+      {/* Hidden panels stay mounted: their polls and selections survive a tab switch or a collapse. */}
+      <div role="tabpanel" aria-label="Theses" hidden={!shows("Theses")}>
+        <ThesisPanel onSelectTicker={s.pick} />
+      </div>
+      <div role="tabpanel" aria-label="Alerts" hidden={!shows("Alerts")}>
+        {shows("Alerts") && <AlertsPanel key={sym} sym={sym} />}
+      </div>
+      <div role="tabpanel" aria-label="Sessions" hidden={!shows("Sessions")}>
+        <SessionPanel sessions={s.sessions} sessionId={s.sessionId} onSelect={s.setSessionId} snapshot={s.snapshot} />
+      </div>
+      <div role="tabpanel" aria-label="Journal" hidden={!shows("Journal")}>
+        <JournalPanel journal={s.journal} seq={s.seq} />
+      </div>
+    </div>
+  );
+}
+
 export default function Workspace(s: ShellState) {
   const sym = s.selected;
   const [tabs, setTabs] = useState(() => [...new Set([...savedTabs(), sym])]);
   // The open ticker always has a tab; a pick or a hash adds it.
   const shown = tabs.includes(sym) ? tabs : [...tabs, sym];
   const tabList = shown.join(",");
-  const [adding, setAdding] = useState(false);
+  // The Add widget menu opened the TradingView link form.
+  const [linking, setLinking] = useState(false);
   // status: the last edit or save outcome for this ticker's workspace.
   const [doc, setDoc] = useState<{ sym: string; widgets: WorkspaceWidget[]; status: string } | null>(null);
   const [attempt, setAttempt] = useState(0);
-  const [bottom, setBottom] = useState<(typeof BOTTOM_TABS)[number]>("Theses");
   const loaded = doc?.sym === sym ? doc : null;
   const widgets = loaded?.widgets ?? defaults(sym);
 
@@ -144,6 +258,14 @@ export default function Workspace(s: ShellState) {
     setDoc((d) => d?.sym === sym ? { ...d, widgets: d.widgets.filter((w) => w.id !== id), status: "unsaved" } : d);
   }, [sym]);
 
+  // Chart settings save at once, so a reload restores them.
+  const setParams = useCallback((id: string, params: Record<string, unknown>) => {
+    if (!loaded) return;
+    const next = loaded.widgets.map((w) => w.id === id ? { ...w, params } : w);
+    setDoc({ sym, widgets: next, status: "" });
+    void save(next);
+  }, [loaded, sym]);
+
   // A validated agent receipt adds its widget to this workspace and saves it.
   useEffect(() => {
     if (!loaded) return;
@@ -151,7 +273,7 @@ export default function Workspace(s: ShellState) {
     for (const event of s.events) {
       if (event.type !== "widget_update" || event.ticker !== sym || applied.has(event)) continue;
       applied.add(event);
-      if (isWidgetType(event.widgetType) && !loaded.widgets.some((w) => w.type === event.widgetType) && !added.includes(event.widgetType)) added.push(event.widgetType);
+      if (isWidgetType(event.widgetType) && event.widgetType !== "tv-link" && !loaded.widgets.some((w) => w.type === event.widgetType) && !added.includes(event.widgetType)) added.push(event.widgetType);
     }
     if (added.length === 0) return;
     const next = [...loaded.widgets, ...added.map((type) => widgetOf(type, sym))];
@@ -166,7 +288,8 @@ export default function Workspace(s: ShellState) {
     if (tab === sym) s.pick(rest[0]);
   }
 
-  const missing = WIDGET_TYPES.filter((type) => !widgets.some((w) => w.type === type));
+  // tv-link stays in the menu: a workspace holds any number of TradingView links.
+  const missing = WIDGET_TYPES.filter((type) => type === "tv-link" || !widgets.some((w) => w.type === type));
   const status = loaded?.status ?? "";
 
   return (
@@ -181,42 +304,16 @@ export default function Workspace(s: ShellState) {
       </div>
       <div className="ws-mid">
         <div className="strip ws-tabs">
-          <span role="tablist" aria-label="Open workspaces" className="ws-tablist">
-            {shown.map((tab) => (
-              <span key={tab} className="ws-tab">
-                <a role="tab" aria-selected={tab === sym} href={routeHash({ page: "workspace", sym: tab })} className="pill">
-                  <span style={{ fontWeight: 600 }}>{tab}</span>{" "}
-                  <span className="ws-tab-price">{prices[tab] == null ? "—" : prices[tab]!.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
-                </a>
-                {shown.length > 1 && <button type="button" aria-label={`Close ${tab}`} onClick={() => close(tab)} className="ws-tool">×</button>}
-              </span>
-            ))}
-            {adding ? (
-              <input
-                autoFocus
-                aria-label="Open ticker"
-                placeholder="Ticker"
-                className="ws-tab-input"
-                onBlur={() => setAdding(false)}
-                onKeyDown={(e) => {
-                  const value = e.currentTarget.value.trim().toUpperCase();
-                  if (e.key === "Escape") setAdding(false);
-                  if (e.key === "Enter" && TICKER_RE.test(value)) {
-                    setAdding(false);
-                    s.pick(value);
-                  }
-                }}
-              />
-            ) : (
-              <button type="button" aria-label="Open another ticker" onClick={() => setAdding(true)} className="ws-tool">+</button>
-            )}
-          </span>
+          <TickerTabs shown={shown} sym={sym} prices={prices} onClose={close} onPick={s.pick} />
           <span className="ws-actions">
             <select
               aria-label="Add widget"
               value=""
               disabled={!loaded}
-              onChange={(e) => isWidgetType(e.target.value) && edit([...widgets, widgetOf(e.target.value, sym)])}
+              onChange={(e) => {
+                if (e.target.value === "tv-link") setLinking(true);
+                else if (isWidgetType(e.target.value)) edit([...widgets, widgetOf(e.target.value, sym)]);
+              }}
               className="pill"
             >
               <option value="">Add widget</option>
@@ -228,27 +325,19 @@ export default function Workspace(s: ShellState) {
             {status === "save failed" && <button type="button" className="pill" onClick={() => void save(widgets)}>Retry</button>}
           </span>
         </div>
-        {!loaded ? <span className="skeleton" aria-label="Loading workspace" aria-busy="true" /> : <WidgetGrid widgets={widgets} onRemove={removeWidget} />}
-        <div className="glass ws-bottom">
-          <div role="tablist" aria-label={`${sym} panels`} className="ws-tablist">
-            {BOTTOM_TABS.map((tab) => (
-              <button key={tab} type="button" role="tab" aria-selected={bottom === tab} onClick={() => setBottom(tab)} className="pill">{tab}</button>
-            ))}
+        {linking && loaded && (
+          <div className="glass" style={{ padding: 12, flexShrink: 0, maxHeight: "50%", overflow: "auto" }}>
+            <TvLinkForm
+              onSubmit={(params) => {
+                setLinking(false);
+                edit([...widgets, { id: nextTvLinkId(widgets), type: "tv-link", ticker: sym, params }]);
+              }}
+              onCancel={() => setLinking(false)}
+            />
           </div>
-          {/* Hidden panels stay mounted: their polls and selections survive a tab switch. */}
-          <div role="tabpanel" aria-label="Theses" hidden={bottom !== "Theses"}>
-            <ThesisPanel onSelectTicker={s.pick} />
-          </div>
-          <div role="tabpanel" aria-label="Alerts" hidden={bottom !== "Alerts"}>
-            {bottom === "Alerts" && <AlertsPanel key={sym} sym={sym} />}
-          </div>
-          <div role="tabpanel" aria-label="Sessions" hidden={bottom !== "Sessions"}>
-            <SessionPanel sessions={s.sessions} sessionId={s.sessionId} onSelect={s.setSessionId} snapshot={s.snapshot} />
-          </div>
-          <div role="tabpanel" aria-label="Journal" hidden={bottom !== "Journal"}>
-            <JournalPanel journal={s.journal} seq={s.seq} />
-          </div>
-        </div>
+        )}
+        {!loaded ? <span className="skeleton" aria-label="Loading workspace" aria-busy="true" /> : <WidgetGrid widgets={widgets} onRemove={removeWidget} onParams={setParams} />}
+        <BottomPanel s={s} />
       </div>
     </div>
   );

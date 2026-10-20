@@ -430,16 +430,16 @@ describe("AIPanel", () => {
 });
 
 describe("SessionPanel and JournalPanel", () => {
-  test("selects and toggles sessions, truncates their text, and counts only queued or running jobs as open", async () => {
+  test("selects and toggles sessions, shows readable titles with status and age, and counts only queued or running jobs as open", async () => {
     const chosen: (string | null)[] = [];
-    const sessions = [{ session_id: "session-one", status: "active", query: "Q".repeat(70) }, { session_id: "session-two" }, {}];
+    const twoHoursAgo = new Date(Date.now() - 2 * 3600_000).toISOString();
+    const sessions = [{ session_id: "session-one", status: "active", updated_at: twoHoursAgo, query: `${"Q".repeat(90)}\nsecond line` }, { session_id: "session-two" }, {}];
     const snapshot = { session: { status: "researching" }, jobs: [{ status: "running" }, { status: "queued" }, { status: "done" }, { status: "failed" }] };
     const root = await mount(<SessionPanel sessions={sessions} sessionId="session-one" onSelect={(id) => chosen.push(id)} snapshot={snapshot} />);
     const buttons = [...root.querySelectorAll("button")];
-    expect(buttons[0]?.textContent).toContain("session-");
-    expect(buttons[0]?.textContent).toContain("Q".repeat(60));
-    expect(buttons[0]?.textContent).not.toContain("Q".repeat(61));
-    expect(buttons[1]?.textContent).toContain("?");
+    expect(buttons[0]?.textContent).toBe(`${"Q".repeat(79)}…active · 2h`);
+    expect(buttons[0]?.getAttribute("title")).toBe("session-one");
+    expect(buttons[1]?.textContent).toBe("session-?");
     await click(buttons[0]!);
     await click(buttons[1]!);
     await click(buttons[2]!);

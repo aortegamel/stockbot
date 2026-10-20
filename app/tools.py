@@ -108,6 +108,7 @@ _THESIS_DELTA_PROPERTIES = {
 _THESIS_PROPOSAL_KEYS = tuple(_THESIS_DELTA_PROPERTIES)
 
 # Defined before TOOLS because the add_widget schema enum reads it at import time.
+# Saved workspace widget kinds; must match WIDGET_TYPES in needle-harness/lib/agent/types.ts.
 WIDGET_TYPES: tuple[str, ...] = (
     "price-volume",
     "financials",
@@ -118,7 +119,10 @@ WIDGET_TYPES: tuple[str, ...] = (
     "insider",
     "filings",
     "multiples",
+    "tv-link",
 )
+# tv-link needs a user-pasted URL, so the agent's add_widget cannot create it.
+_AGENT_WIDGET_TYPES: tuple[str, ...] = tuple(t for t in WIDGET_TYPES if t != "tv-link")
 
 TOOLS: list[dict[str, object]] = [
     {
@@ -2332,7 +2336,10 @@ TOOLS: list[dict[str, object]] = [
             "description": "Add one widget to the stock's workspace. The frontend applies the change. The receipt is not factual research evidence.",
             "parameters": {
                 "type": "object",
-                "properties": {"type": {"type": "string", "enum": list(WIDGET_TYPES)}, "ticker": {"type": "string"}},
+                "properties": {
+                    "type": {"type": "string", "enum": list(_AGENT_WIDGET_TYPES)},
+                    "ticker": {"type": "string"},
+                },
                 "required": ["type", "ticker"],
             },
         },
@@ -3446,18 +3453,16 @@ def _update_watchlist(args: dict[str, object], model: str) -> dict[str, object]:
 
 
 def _add_widget(args: dict[str, object], model: str) -> dict[str, object]:
-    from app.research.models import validate_ticker
+    from app.research.models import require_ticker
 
     del model
     widget_type = args.get("type")
-    if widget_type not in WIDGET_TYPES:
-        return _invalid_args_error("add_widget", f"add_widget: 'type' must be one of {', '.join(WIDGET_TYPES)}")
+    if widget_type not in _AGENT_WIDGET_TYPES:
+        return _invalid_args_error("add_widget", f"add_widget: 'type' must be one of {', '.join(_AGENT_WIDGET_TYPES)}")
     try:
-        ticker = validate_ticker(args.get("ticker"), "add_widget")
+        ticker = require_ticker(args.get("ticker"), "add_widget")
     except ValueError as exc:
         return _invalid_args_error("add_widget", str(exc))
-    if ticker is None:
-        return _invalid_args_error("add_widget", "add_widget: 'ticker' must be a non-empty string")
     return {"result_type": "widget_selection", "widget_type": widget_type, "ticker": ticker}
 
 

@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { fetchFeed, type FeedItem } from "../lib/market-data";
 import { toastAlert } from "../components/toasts";
 import { routeHash } from "../lib/route";
+import { ago } from "../lib/time";
 import type { ShellState } from "../layout/Shell";
 
 const POLL_MS = 60_000;
@@ -11,15 +12,6 @@ const KINDS = ["news", "filing", "insider", "alert", "short"];
 
 function newestFirst(list: FeedItem[]): FeedItem[] {
   return [...list].sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
-}
-
-function ago(at: string, now: number): string {
-  const s = Math.max(0, Math.floor((now - Date.parse(at)) / 1000));
-  if (Number.isNaN(s)) return "";
-  if (s < 60) return `${s}s`;
-  if (s < 3600) return `${Math.floor(s / 60)}m`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h`;
-  return `${Math.floor(s / 86400)}d`;
 }
 
 type Props = Pick<ShellState, "selected" | "watchlist" | "setInput"> & { openDrawer?: () => void };

@@ -5,6 +5,7 @@ the network or cache.db.
 """
 
 import json
+import re
 import sys
 import types
 from collections.abc import Iterator
@@ -1533,23 +1534,108 @@ def test_workspace_never_saved_reads_empty(agg: dict[str, object]) -> None:
 
 def test_workspace_put_round_trip(agg: dict[str, object]) -> None:
     client = TestClient(app)
+    tv = {"url": "https://www.tradingview.com/x/8ot166mV/", "label": "NVDA snapshot"}
     widgets = [
-        {"id": "w1", "type": "price-volume", "ticker": "nvda", "params": {"range": "6mo"}},
+        {
+            "id": "w1",
+            "type": "price-volume",
+            "ticker": "nvda",
+            "params": {"interval": "1h", "style": "line", "studies": ["MA50"]},
+        },
         {"id": "w2", "type": "short-volume", "ticker": "NVDA"},
+        {"id": "tv-link-1", "type": "tv-link", "ticker": "NVDA", "params": tv},
+        {
+            "id": "tv-link-2",
+            "type": "tv-link",
+            "ticker": "NVDA",
+            "params": {**tv, "url": "https://tradingview.com/chart/?symbol=NASDAQ%3ANVDA"},
+        },
     ]
     res = client.put("/api/workspaces/nvda", json={"widgets": widgets})
     assert res.status_code == 200
     body = res.json()
     assert body["sym"] == "NVDA"
     assert body["widgets"] == [
-        {"id": "w1", "type": "price-volume", "ticker": "NVDA", "params": {"range": "6mo"}},
+        {
+            "id": "w1",
+            "type": "price-volume",
+            "ticker": "NVDA",
+            "params": {"interval": "1h", "style": "line", "studies": ["MA50"]},
+        },
         {"id": "w2", "type": "short-volume", "ticker": "NVDA"},
+        {"id": "tv-link-1", "type": "tv-link", "ticker": "NVDA", "params": tv},
+        {
+            "id": "tv-link-2",
+            "type": "tv-link",
+            "ticker": "NVDA",
+            "params": {**tv, "url": "https://tradingview.com/chart/?symbol=NASDAQ%3ANVDA"},
+        },
     ]
     assert isinstance(body["updated_at"], str) and body["updated_at"].endswith("+00:00")
     assert json.loads((_root(agg) / "workspaces" / "NVDA.json").read_text()) == body
     assert client.get("/api/workspaces/NVDA").json() == body
     assert client.put("/api/workspaces/NVDA", json={"widgets": []}).json()["widgets"] == []
     assert client.get("/api/workspaces/nvda").json()["widgets"] == []
+
+
+_TV = "https://www.tradingview.com/x/8ot166mV/"
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"url": _TV},
+        {"label": "x"},
+        {"url": _TV, "label": "x", "extra": 1},
+        {"url": _TV, "label": ""},
+        {"url": _TV, "label": "x" * 61},
+        {"url": _TV + "a" * (301 - len(_TV)), "label": "x"},
+        {"url": 1, "label": "x"},
+        {"url": "http://www.tradingview.com/x/8ot166mV/", "label": "x"},
+        {"url": "javascript:alert(1)", "label": "x"},
+        {"url": "https://evil.example/x/8ot166mV/", "label": "x"},
+        {"url": "https://tradingview.com.evil.example/x/", "label": "x"},
+        {"url": "https://user@www.tradingview.com/x/8ot166mV/", "label": "x"},
+        {"url": "https://www.tradingview.com:8443/x/8ot166mV/", "label": "x"},
+        {"url": "https://www.tradingview.com:bad/", "label": "x"},
+    ],
+)
+def test_workspace_put_rejects_invalid_tv_link(agg: dict[str, object], params: dict[str, object]) -> None:
+    widget = {"id": "tv-link-1", "type": "tv-link", "ticker": "NVDA", "params": params}
+    res = TestClient(app).put("/api/workspaces/NVDA", json={"widgets": [widget]})
+    assert res.status_code == 400
+    assert res.json()["detail"].startswith("invalid workspace:")
+    assert not (_root(agg) / "workspaces").exists()
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"range": "6mo"},
+        {"interval": "2h"},
+        {"interval": 5},
+        {"style": "bars"},
+        {"studies": "MA20"},
+        {"studies": ["MA20", "MA20"]},
+        {"studies": ["Ichimoku"]},
+        {"studies": [{"id": "RSI"}]},
+    ],
+)
+def test_workspace_put_rejects_invalid_chart_params(agg: dict[str, object], params: dict[str, object]) -> None:
+    widget = {"id": "price-volume", "type": "price-volume", "ticker": "NVDA", "params": params}
+    res = TestClient(app).put("/api/workspaces/NVDA", json={"widgets": [widget]})
+    assert res.status_code == 400
+    assert res.json()["detail"].startswith("invalid workspace:")
+    assert not (_root(agg) / "workspaces").exists()
+
+
+def test_widget_types_match_harness_list() -> None:
+    from app.tools import WIDGET_TYPES
+
+    source = (Path(__file__).parents[1] / "needle-harness/lib/agent/types.ts").read_text(encoding="utf-8")
+    match = re.search(r"export const WIDGET_TYPES: readonly string\[\] = (\[[^\]]*\]);", source)
+    assert match is not None
+    assert tuple(json.loads(match.group(1))) == WIDGET_TYPES
 
 
 @pytest.mark.parametrize(

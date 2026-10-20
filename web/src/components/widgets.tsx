@@ -1,11 +1,12 @@
-import { memo, useCallback, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useState, type ReactNode } from "react";
 import { WIDGET_TYPES } from "../../../needle-harness/lib/agent/types";
 import { fetchCandles, fetchFilings, fetchWidgetData, type Candle, type FilingItem, type WidgetData, type WorkspaceWidget } from "../lib/market-data";
 import { FinancialsPanel, NewsPanel } from "./market-panels";
-import TradingChart from "./trading-chart";
+import TradingChart, { ChartControls } from "./trading-chart";
 import { useLoad } from "./home-panels";
+import { TvLinkForm, TvLinkWidget } from "./tv-link";
 
-// Menu labels for the fixed widget set; WIDGET_TYPES (the add_widget whitelist) sets the order.
+// Menu labels for the fixed widget set; WIDGET_TYPES (the saved widget kinds) sets the order.
 const LABELS: Record<string, string> = {
   "price-volume": "Price & volume",
   financials: "Financials",
@@ -16,6 +17,7 @@ const LABELS: Record<string, string> = {
   insider: "Insider timeline",
   filings: "Filings timeline",
   multiples: "Multiples",
+  "tv-link": "TradingView link",
 };
 
 export const isWidgetType = (type: unknown): type is string => typeof type === "string" && WIDGET_TYPES.includes(type);
@@ -151,58 +153,81 @@ function Multiples({ sym }: { sym: string }) {
   );
 }
 
-const WIDGETS: Record<string, (sym: string) => ReactNode> = {
-  "price-volume": (sym) => <TradingChart sym={sym} />,
-  financials: (sym) => <FinancialsPanel sym={sym} />,
-  news: (sym) => <NewsPanel sym={sym} />,
-  "monthly-returns": (sym) => <MonthlyReturns sym={sym} />,
-  "short-interest": (sym) => <SeriesTable type="short-interest" sym={sym} columns={[["date", "Settled"], ["short_qty", "Short shares"], ["days_to_cover", "Days to cover"]]} />,
-  "short-volume": (sym) => <SeriesTable type="short-volume" sym={sym} columns={[["date", "Date"], ["short_pct", "Short %"], ["short_qty", "Short"], ["total_qty", "Total"]]} />,
-  insider: (sym) => <SeriesTable type="insider" sym={sym} columns={[["date", "Filed"], ["title", "Transaction"]]} />,
-  filings: (sym) => <FilingsTimeline sym={sym} />,
-  multiples: (sym) => <Multiples sym={sym} />,
+const WIDGETS: Record<string, (w: WorkspaceWidget) => ReactNode> = {
+  "price-volume": (w) => <TradingChart sym={w.ticker} params={w.params} />,
+  financials: (w) => <FinancialsPanel sym={w.ticker} />,
+  news: (w) => <NewsPanel sym={w.ticker} />,
+  "monthly-returns": (w) => <MonthlyReturns sym={w.ticker} />,
+  "short-interest": (w) => <SeriesTable type="short-interest" sym={w.ticker} columns={[["date", "Settled"], ["short_qty", "Short shares"], ["days_to_cover", "Days to cover"]]} />,
+  "short-volume": (w) => <SeriesTable type="short-volume" sym={w.ticker} columns={[["date", "Date"], ["short_pct", "Short %"], ["short_qty", "Short"], ["total_qty", "Total"]]} />,
+  insider: (w) => <SeriesTable type="insider" sym={w.ticker} columns={[["date", "Filed"], ["title", "Transaction"]]} />,
+  filings: (w) => <FilingsTimeline sym={w.ticker} />,
+  multiples: (w) => <Multiples sym={w.ticker} />,
+  "tv-link": (w) => <TvLinkWidget params={w.params} />,
 };
 
 function WidgetBody({ widget }: { widget: WorkspaceWidget }) {
-  return (WIDGETS[widget.type]?.(widget.ticker) as ReactNode) ?? null;
+  return (WIDGETS[widget.type]?.(widget) as ReactNode) ?? null;
 }
 
 function Tool({ label, onClick, children }: { label: string; onClick: () => void; children: ReactNode }) {
   return <button type="button" aria-label={label} title={label} onClick={onClick} className="ws-tool">{children}</button>;
 }
 
-const WidgetFrame = memo(function WidgetFrame({ widget, expanded, onExpand, onRemove }: {
+const WidgetFrame = memo(function WidgetFrame({ widget, focused, onFocus, onRemove, onParams }: {
   widget: WorkspaceWidget;
-  expanded: boolean;
-  onExpand: (id: string) => void;
+  focused: boolean;
+  onFocus: (id: string) => void;
   onRemove: (id: string) => void;
+  onParams: (id: string, params: Record<string, unknown>) => void;
 }) {
   const [rev, setRev] = useState(0);
-  const label = `${widgetLabel(widget.type)} · ${widget.ticker}`;
+  const [editing, setEditing] = useState(false);
+  const tvLink = widget.type === "tv-link";
+  const title = tvLink && typeof widget.params?.label === "string" ? widget.params.label : widgetLabel(widget.type);
+  const label = `${title} · ${widget.ticker}`;
   return (
-    <section aria-label={label} className={`glass ws-widget${expanded ? " ws-widget-wide" : ""}`}>
+    <section aria-label={label} className={`glass ws-widget${focused ? " ws-widget-focus" : ""}`}>
       <header className="card-head">
         <span>{label}</span>
         <span className="card-head-actions">
+          {widget.type === "price-volume" && <ChartControls params={widget.params} onChange={(next) => onParams(widget.id, next)} />}
+          {tvLink && <Tool label={`Edit ${label}`} onClick={() => setEditing((on) => !on)}>✎</Tool>}
           <Tool label={`Refresh ${label}`} onClick={() => setRev((n) => n + 1)}>↻</Tool>
-          <Tool label={`${expanded ? "Collapse" : "Expand"} ${label}`} onClick={() => onExpand(widget.id)}>⤢</Tool>
+          <Tool label={`${focused ? "Collapse" : "Expand"} ${label}`} onClick={() => onFocus(widget.id)}>⤢</Tool>
           <Tool label={`Remove ${label}`} onClick={() => onRemove(widget.id)}>×</Tool>
         </span>
       </header>
-      <div className="ws-widget-body"><WidgetBody key={rev} widget={widget} /></div>
+      <div className="ws-widget-body">
+        {editing
+          ? <TvLinkForm initial={widget.params} onSubmit={(params) => { setEditing(false); onParams(widget.id, params); }} onCancel={() => setEditing(false)} />
+          : <WidgetBody key={rev} widget={widget} />}
+      </div>
     </section>
   );
 });
 
-// Refresh remounts one widget. Expand spans the full row.
-export function WidgetGrid({ widgets, onRemove }: { widgets: WorkspaceWidget[]; onRemove: (id: string) => void }) {
-  const [expanded, setExpanded] = useState<string | null>(null);
-  const expand = useCallback((id: string) => setExpanded((previous) => previous === id ? null : id), []);
+// Refresh remounts one widget. Expand focuses one widget over the whole grid; Esc restores the grid.
+// Hidden widgets stay mounted, so charts and loads survive a focus round trip.
+export function WidgetGrid({ widgets, onRemove, onParams }: {
+  widgets: WorkspaceWidget[];
+  onRemove: (id: string) => void;
+  onParams: (id: string, params: Record<string, unknown>) => void;
+}) {
+  const [focused, setFocused] = useState<string | null>(null);
+  const focus = useCallback((id: string) => setFocused((previous) => previous === id ? null : id), []);
   const visible = widgets.filter((w) => isWidgetType(w.type));
+  const focusing = focused !== null && visible.some((w) => w.id === focused);
+  useEffect(() => {
+    if (!focusing) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setFocused(null);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [focusing]);
   return (
-    <div className="ws-grid">
+    <div className={`ws-grid${focusing ? " ws-grid-focus" : ""}`}>
       {visible.length === 0 && <p className="feed-muted">No widgets yet. Choose Add widget or ask for a chart.</p>}
-      {visible.map((widget) => <WidgetFrame key={widget.id} widget={widget} expanded={expanded === widget.id} onExpand={expand} onRemove={onRemove} />)}
+      {visible.map((widget) => <WidgetFrame key={widget.id} widget={widget} focused={focusing && focused === widget.id} onFocus={focus} onRemove={onRemove} onParams={onParams} />)}
     </div>
   );
 }

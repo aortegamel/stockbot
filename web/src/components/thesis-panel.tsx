@@ -101,24 +101,25 @@ export function ThesisPanel({ onSelectTicker }: { onSelectTicker: (ticker: strin
               width: "100%",
               textAlign: "left",
               padding: "4px 6px",
-              background: t.thesis_id === openId ? "var(--panel2, #151C29)" : "transparent",
+              background: t.thesis_id === openId ? "var(--fill-active)" : "transparent",
               border: t.thesis_id === openId ? "1px solid var(--accent, #2962FF)" : "1px solid transparent",
               borderRadius: 4,
               color: "var(--text, #D5DBE5)",
               cursor: "pointer",
-              ...small,
+              lineHeight: "20px",
+              fontSize: 14,
             }}
           >
-            <b>{t.scope}</b> <span style={{ color: muted }}>{t.status}</span>
+            <b style={{ fontWeight: 600 }}>{t.scope}</b> <span style={{ ...small, color: muted }}>{t.status}</span>
             {t.alerts > 0 && (
               <span
                 aria-label={`${t.alerts} alerts, ${t.pending} pending`}
-                style={{ marginLeft: 6, padding: "0 5px", borderRadius: 8, background: t.pending > 0 ? down : "var(--accent, #2962FF)", color: "#fff" }}
+                style={{ ...small, marginLeft: 6, padding: "0 5px", borderRadius: 8, background: t.pending > 0 ? down : "var(--accent, #2962FF)", color: "#fff" }}
               >
                 {t.alerts}
               </span>
             )}
-            <div style={{ color: muted, fontSize: 12 }}>{t.user_thesis.slice(0, 80)}</div>
+            <div style={{ ...small, lineHeight: "16px", color: muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.user_thesis}</div>
           </button>
           {t.thesis_id === openId && shown && (
             <div style={{ ...small, padding: "6px 8px", color: "var(--text, #D5DBE5)" }}>

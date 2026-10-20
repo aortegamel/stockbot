@@ -383,6 +383,7 @@ def test_add_widget_returns_validated_receipt(widget_type: str) -> None:
     [
         ({"ticker": "NVDA"}, "type"),
         ({"type": "heatmap", "ticker": "NVDA"}, "type"),
+        ({"type": "tv-link", "ticker": "NVDA"}, "type"),
         ({"type": "news"}, "ticker"),
         ({"type": "news", "ticker": ""}, "ticker"),
         ({"type": "news", "ticker": "AMD/NYSE"}, "ticker"),

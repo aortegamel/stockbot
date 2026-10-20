@@ -230,7 +230,7 @@ input.pill{cursor:text}
 .feed-muted{color:var(--muted, #93A0B8);font-size:var(--fs-label)}
 .feed-new{background:rgba(31,111,235,0.35)}
 
-/* Workspace: 260px left column, 40px tab bar, widget grid, bottom panels. */
+/* Workspace: 260px left column, 40px tab bar, widget grid, bottom panel (36px tab bar, 260px open). */
 .workspace{flex:1;min-height:0;display:grid;grid-template-columns:260px minmax(0,1fr);gap:8px;padding:8px;position:relative;z-index:1}
 .ws-left{overflow-y:auto;min-height:0;display:flex;flex-direction:column;gap:8px}
 .ws-left > .glass{flex-shrink:0}
@@ -248,20 +248,25 @@ input.pill{cursor:text}
 .ws-tab-input{width:90px;height:var(--h-ctl);padding:0 8px;border:1px solid var(--hair);border-radius:var(--r-ctl);background:var(--fill);color:inherit;font:inherit;font-size:var(--fs-body)}
 .ws-tool{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:24px;padding:0 4px;border:0;border-radius:var(--r-ctl);background:transparent;color:var(--muted, #93A0B8);font-size:var(--fs-body);cursor:pointer}
 .ws-tool:hover{background:var(--fill);color:var(--text)}
-.ws-grid{flex:1;min-height:240px;overflow:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-content:start}
-.ws-widget{display:flex;flex-direction:column;min-height:240px;min-width:0}
-.ws-widget:first-child{grid-column:1/-1}
-.ws-widget-wide{grid-column:1/-1;min-height:500px}
-.ws-widget-body{overflow:auto;flex:1;padding:var(--sp-3);min-height:200px;font-size:var(--fs-body)}
+/* The grid fills the mid column: the chart row takes 3fr (~60%), each later row 2fr; rows scroll only below their minimums. */
+.ws-grid{flex:1;min-height:0;overflow:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:minmax(420px,3fr);grid-auto-rows:minmax(240px,2fr);gap:8px}
+.ws-mid > .skeleton{flex:1;height:auto}
+.ws-widget{display:flex;flex-direction:column;min-height:0;min-width:0}
+/* The first widget and a lone last widget span the row, so no grid cell stays empty. */
+.ws-widget:first-child,.ws-widget:last-child:nth-child(even){grid-column:1/-1}
+/* Focus mode: one widget takes the whole grid; the others stay mounted but hidden. */
+.ws-grid-focus{grid-template-rows:minmax(0,1fr)}
+.ws-grid-focus > .ws-widget:not(.ws-widget-focus){display:none}
+.ws-widget-focus{grid-column:1/-1}
+.ws-widget-body{overflow:auto;flex:1;padding:var(--sp-3);min-height:0;font-size:var(--fs-body)}
 .ws-widget-body table{border-collapse:collapse}
 .ws-widget-body :is(th,td){height:var(--h-row);padding:0 8px;font-size:var(--fs-body)}
 .ws-widget-body th{font-size:var(--fs-label);font-weight:500;color:var(--muted)}
-.ws-widget:has(iframe){min-height:380px}
 .ws-widget:has(iframe) .ws-widget-body{padding:0}
-.chart-head{display:flex;align-items:center;gap:var(--sp-2);height:36px;flex-shrink:0;padding:0 var(--sp-3);border-bottom:1px solid var(--hair)}
-.chart-sym{font-size:var(--fs-num);font-weight:700;color:#F5F7FF}
-.ws-bottom{flex:0 0 220px;min-height:0;overflow:auto}
-.ws-bottom > .ws-tablist{padding:6px 12px}
+.ws-bottom{flex:0 0 36px;min-height:0;display:flex;flex-direction:column}
+.ws-bottom-open{flex-basis:260px}
+.ws-bottom > .ws-tablist{flex:none;height:36px;padding:0 12px}
+.ws-bottom > [role="tabpanel"]{overflow:auto}
 .ws-alerts{padding:var(--sp-3);font-size:var(--fs-body)}
 @media (max-width:800px){.workspace{grid-template-columns:1fr;overflow:auto}.ws-left{max-height:220px}.ws-mid{overflow:visible}.ws-grid{overflow:visible;grid-template-columns:1fr}.ws-widget{grid-column:1/-1}}
 

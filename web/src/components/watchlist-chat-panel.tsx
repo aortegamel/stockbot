@@ -32,7 +32,7 @@ export function WatchlistChatPanel({ selected, onSelect, events, onChange, symbo
   }, [events]);
   useEffect(() => onChange(symbols), [symbols, onChange]);
   return <>
-    <p role="status" style={{ color: "var(--muted, #93A0B8)", padding: "8px 16px", margin: 0 }}>
+    <p role="status" style={{ color: "var(--muted, #93A0B8)", padding: "8px 16px 0", margin: 0, fontSize: 11, lineHeight: "16px" }}>
       Quotes are delayed. A dash means unavailable. Source dates show freshness. Failed sources show error or timeout.
     </p>
     {symbols.length > 0

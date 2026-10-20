@@ -213,7 +213,7 @@ describe("App terminal shell", () => {
     expect(text(root)).toContain("delayed feed · Yahoo OHLCV");
     expect(text(root)).toContain("select a session for logs");
     expect(findButton(root, "Search or do anything /")).not.toBeNull();
-    expect(root.querySelectorAll("header input")).toHaveLength(0);
+    expect(root.querySelectorAll("header > input, header > span > input")).toHaveLength(0);
     expect(text(root)).not.toContain("· DEBUG");
     expect(findLink(root, "Harness")).toBeNull();
   });
@@ -577,7 +577,7 @@ describe("App research session polling", () => {
       });
       await until(() => text(root).includes("NVDA100DELAYEDSEC none"));
       await settle();
-      await click(button(root, "s-1 runningnvda research"));
+      await click(button(root, "nvda researchrunning"));
       await settle();
       expect(text(root)).toContain("jobs 2 · open 1 · running");
       expect(text(root)).toContain("#3 job_started");
@@ -633,7 +633,7 @@ describe("App research session polling", () => {
       });
       await until(() => text(root).includes("NVDA100DELAYEDSEC none"));
       await settle();
-      await click(button(root, "s-9 done"));
+      await click(button(root, "s-9done"));
       await settle();
       expect(text(root)).toContain("unnamed");
       expect(text(root)).toContain("LOGS · seq 0");
@@ -671,12 +671,12 @@ describe("App research session polling", () => {
       return undefined;
     });
     const root = await mount(<App />);
-    await until(() => findButton(root, "s-1 running") !== null);
+    await until(() => findButton(root, "s-1running") !== null);
     selected = true;
-    await click(button(root, "s-1 running"));
+    await click(button(root, "s-1running"));
     await until(() => text(root).includes("snapshot unavailable"));
     await until(() => text(root).includes("journal unavailable"));
-    await click(button(root, "s-2 stale"));
+    await click(button(root, "s-2stale"));
     await until(() => text(root).includes("snapshot stale"));
   });
 });

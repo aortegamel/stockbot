@@ -111,8 +111,9 @@ export type FinalPersonaResult = {
 export const FINAL_PERSONAS = ["stockbot", "bearbot", "bullbot"] as const;
 export type Persona = (typeof FINAL_PERSONAS)[number];
 
-// Workspace widget kinds the canonical add_widget tool accepts, in fixed order.
-export const WIDGET_TYPES: readonly string[] = ["price-volume", "financials", "news", "monthly-returns", "short-interest", "short-volume", "insider", "filings", "multiples"];
+// Saved workspace widget kinds in fixed order; must match WIDGET_TYPES in app/tools.py.
+// The add_widget tool accepts every kind except tv-link (it needs a user-pasted URL).
+export const WIDGET_TYPES: readonly string[] = ["price-volume", "financials", "news", "monthly-returns", "short-interest", "short-volume", "insider", "filings", "multiples", "tv-link"];
 
 export type ToolResult = { ok: true; evidence: Evidence; chartSelection?: unknown; watchlistUpdate?: unknown; widgetSelection?: unknown } | { ok: false; error: string; category: FailureCategory; retryable: boolean };
 
