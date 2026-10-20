@@ -100,7 +100,8 @@ export function AgentEventView({ event, debug = false, onRetry }: { event: Agent
       );
     }
     case "error":
-      return debug ? <div className="text-red-400">✗ {event.message}</div> : <FailureView text="The connection stopped before the answer finished." onRetry={onRetry} />;
+      // Transport-level text (request failed, stalled, ended early): bounded client prose, not a stack.
+      return <FailureView text={event.message} onRetry={onRetry} />;
     case "failed":
       return debug ? <div className="text-red-400">✗ {event.category}: {event.message}</div> : <FailureView text={FAILURE_TEXT[event.category] ?? MODEL} onRetry={onRetry} />;
     default:

@@ -150,7 +150,7 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
             url = urlsplit(self.path)
             query = parse_qs(url.query)
             sym = query.get("sym", ["NVDA"])[0]
-            bodies: dict[str, dict[str, object]] = {
+            bodies: dict[str, object] = {
                 "/api/health": {"debug": False},
                 "/api/research/sessions": {"sessions": []},
                 "/api/search": {
@@ -180,11 +180,19 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
                 "/api/news": {"sym": sym, "items": []},
                 "/api/filings": FILINGS.get(sym, {"sym": sym, "cik": None, "items": []}),
                 "/api/watchlist": {"watchlist": watchlist_rows(query.get("symbols", [""])[0].split(","))},
-                f"/api/research/sources/{quote(SOURCE_ID, safe='')}": SOURCE,
+                "/api/theses": [],
             }
             port = server.server_port
             if url.path == f"/api/research/sources/{quote(SOURCE_ID, safe='')}":
                 bodies[url.path] = {**SOURCE, "url": f"http://127.0.0.1:{port}{FIXTURE_SOURCE_PATH}"}
+            if url.path == "/api/portfolio":
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                missing = json.dumps({"detail": "Robinhood portfolio unavailable."}).encode()
+                self.send_header("Content-Length", str(len(missing)))
+                self.end_headers()
+                self.wfile.write(missing)
+                return
             if url.path == "/api/watchlist":
                 watch.put(query.get("symbols", [""])[0])
             if url.path not in bodies:
@@ -363,6 +371,7 @@ def test_agent_request_keeps_question_separate_from_selected_ticker(browser: web
     assert local_ui[1].get(timeout=10) == {
         "prompt": "What is the latest revenue?",
         "ticker": "ORCL",
+        "currentChartTicker": "ORCL",
         "watchlist": ["ORCL", *WATCH_DEFAULTS],
     }
 
@@ -408,6 +417,7 @@ def test_watchlist_question_sends_actual_watchlist_with_verbatim_prompt(
     assert local_ui[1].get(timeout=10) == {
         "prompt": "Summarize the latest filings for my watchlist",
         "ticker": "ORCL",
+        "currentChartTicker": "ORCL",
         "watchlist": ["ORCL", *WATCH_DEFAULTS],
     }
 
@@ -489,6 +499,7 @@ def test_agent_transcript_scrolls_inside_panel(
     assert local_ui[1].get(timeout=10) == {
         "prompt": "Show the long answer.",
         "ticker": "NVDA",
+        "currentChartTicker": "NVDA",
         "watchlist": WATCH_DEFAULTS,
     }
     WebDriverWait(browser, 10).until(EC.presence_of_element_located((By.XPATH, "//div[text()='── metrics ──']")))

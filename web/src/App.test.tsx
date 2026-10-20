@@ -56,6 +56,8 @@ function serve(extra: Handler = () => undefined): { urls: string[]; bodies: stri
     if (url.includes("/api/filings")) return Promise.resolve(json({ cik: 1, items: [] }));
     if (url.includes("/api/news")) return Promise.resolve(json({ sym: "X", items: [] }));
     if (url.includes("/api/research/sessions")) return Promise.resolve(json({ sessions: [] }));
+    if (url.includes("/api/theses")) return Promise.resolve(json([]));
+    if (url.includes("/api/portfolio")) return Promise.resolve(new Response(null, { status: 404 }));
     return Promise.reject(new Error(`unexpected request: ${url}`));
   }) as unknown as typeof fetch;
   return { urls, bodies };
@@ -307,7 +309,7 @@ describe("App agent send", () => {
     expect(prompt.disabled).toBe(true);
     expect(urls.filter((url) => url.includes("/api/agent")).length).toBe(1);
     expect(bodies.filter((body) => body.includes("nvda risks?"))).toHaveLength(1);
-    expect(JSON.parse(bodies.at(-1) ?? "{}")).toEqual({ prompt: "nvda risks?", ticker: "NVDA", watchlist: WATCHLIST });
+    expect(JSON.parse(bodies.at(-1) ?? "{}")).toEqual({ prompt: "nvda risks?", ticker: "NVDA", currentChartTicker: "NVDA", watchlist: WATCHLIST });
 
     await act(async () => {
       // Frames split across chunks, a keepalive frame with no data line, and one malformed frame.
@@ -338,7 +340,7 @@ describe("App agent send", () => {
     await type(prompt, question);
     await click(button(root, "Send"));
     await settle();
-    expect(JSON.parse(bodies.at(-1) ?? "{}")).toEqual({ prompt: question, ticker: "NVDA", watchlist: WATCHLIST });
+    expect(JSON.parse(bodies.at(-1) ?? "{}")).toEqual({ prompt: question, ticker: "NVDA", currentChartTicker: "NVDA", watchlist: WATCHLIST });
     await act(async () => {
       live.send('data: {"type":"answer_delta","text":"The comparison "}\n\n');
       live.send(`data: ${JSON.stringify({ type: "chart_update", ticker })}\n\n`);

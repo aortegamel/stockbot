@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { HarnessSessionViewer } from "./components/harness-viewer";
 import TradingChart from "./components/trading-chart";
 import {
@@ -109,6 +109,7 @@ async function receiveAgentResponse(response: Response, push: (event: AgentEvent
 export default function App() {
   const [selected, setSelected] = useState("NVDA");
   const [watchlist, setWatchlist] = useState(() => watchlistFor("NVDA"));
+  const onWatchlist = useCallback((symbols: string[]) => setWatchlist(symbols), []);
   const [query, setQuery] = useState("");
   const [view, setView] = useState<"terminal" | "harness">("terminal");
   const [hits, setHits] = useState<SearchHit[]>([]);
@@ -434,7 +435,7 @@ export default function App() {
         >
           <div style={{ overflowY: "auto", minHeight: 0, display: "flex", flexDirection: "column", gap: 8 }}>
             <div className="glass" style={{ flexShrink: 0 }}>
-              <WatchlistChatPanel selected={selected} onSelect={pick} events={events} onChange={setWatchlist} />
+              <WatchlistChatPanel selected={selected} onSelect={pick} events={events} onChange={onWatchlist} />
             </div>
             <div className="glass" style={{ flexShrink: 0 }}>
               <ThesisPanel onSelectTicker={pick} />
