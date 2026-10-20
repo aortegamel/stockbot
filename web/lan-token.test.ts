@@ -21,20 +21,16 @@ async function serve(env: NodeJS.ProcessEnv): Promise<string> {
 }
 
 describe("LAN token gate", () => {
-  test("passes every request through when STOCKBOT_LAN is not 1", async () => {
-    for (const env of [{}, { STOCKBOT_LAN: "0", STOCKBOT_LAN_TOKEN: TOKEN }, { STOCKBOT_LAN: "true" }]) {
+  test("passes every request through when no token is set", async () => {
+    for (const env of [{}, { STOCKBOT_LAN_TOKEN: "" }, { STOCKBOT_LAN: "0" }, { STOCKBOT_LAN: "1" }]) {
       const base = await serve(env);
-      const res = await fetch(`${base}/api/health?token=${encodeURIComponent(TOKEN)}`, { redirect: "manual" });
+      const res = await fetch(`${base}/api/health`, { redirect: "manual" });
       expect(res.status).toBe(200);
       expect(await res.text()).toBe("passed");
       server!.close();
     }
   });
 
-  test("refuses to start in LAN mode without a token", () => {
-    expect(() => lanTokenMiddleware({ STOCKBOT_LAN: "1" })).toThrow("STOCKBOT_LAN_TOKEN");
-    expect(() => lanTokenMiddleware({ STOCKBOT_LAN: "1", STOCKBOT_LAN_TOKEN: "" })).toThrow("STOCKBOT_LAN_TOKEN");
-  });
 
   test("answers 401 JSON on /api without a token or with a wrong one", async () => {
     const base = await serve(LAN);

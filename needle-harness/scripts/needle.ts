@@ -181,8 +181,8 @@ export async function buildWeb(childEnv: NodeJS.ProcessEnv, spawnBuild: typeof s
 export function webSettings(env: NodeJS.ProcessEnv): { mode: "prod" | "dev"; host: string } {
   const mode = env.STOCKBOT_WEB_MODE || "prod";
   if (mode !== "prod" && mode !== "dev") fail(`needle [web]: STOCKBOT_WEB_MODE must be "prod" or "dev", got "${mode}"`);
-  if (env.STOCKBOT_LAN !== "1") return { mode, host: "127.0.0.1" };
-  if (!env.STOCKBOT_LAN_TOKEN) fail("needle [web]: STOCKBOT_LAN=1 requires a non-empty STOCKBOT_LAN_TOKEN (the token LAN devices send once as ?token=…)");
+  // Default is the LAN bind; STOCKBOT_LAN=0 keeps the UI on loopback only.
+  if (env.STOCKBOT_LAN === "0") return { mode, host: "127.0.0.1" };
   return { mode, host: "0.0.0.0" };
 }
 
@@ -266,7 +266,9 @@ if (import.meta.main) {
   const WEB_UNHEALTHY_MARKER = join(HARNESS_DIR, ".needle-web-unhealthy");
   const webCfg = webSettings(process.env);
   const viteLabel = webCfg.mode === "dev" ? "vite dev" : "vite preview";
-  const reach = webCfg.host === "0.0.0.0" ? "all IPv4 interfaces, LAN token required on /api" : "localhost only";
+  const reach = webCfg.host === "0.0.0.0"
+    ? (process.env.STOCKBOT_LAN_TOKEN ? "all IPv4 interfaces, LAN token required on /api" : "all IPv4 interfaces, no token set (open LAN)")
+    : "localhost only (STOCKBOT_LAN=0)";
   process.stdout.write(`needle [web]: harness ${HARNESS_DIR} → http://${webCfg.host}:${PORT} (${reach}, ${viteLabel}, cwd ${process.cwd()})\n`);
   process.stdout.write(dotenvLoaded ? `needle [web]: env loaded ${DOTENV}\n` : `needle [web]: no .env at ${DOTENV}, using shell env\n`);
 

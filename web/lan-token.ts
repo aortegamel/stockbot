@@ -5,11 +5,10 @@ const COOKIE = "stockbot_lan_token";
 
 type Middleware = (req: IncomingMessage, res: ServerResponse, next: () => void) => void;
 
-/** LAN gate for the web listener. A no-op unless STOCKBOT_LAN=1; then /api/* needs the token. */
+/** LAN gate for the web listener. Open when no token is set; /api/* needs the token once set. */
 export function lanTokenMiddleware(env: NodeJS.ProcessEnv = process.env): Middleware {
-  if (env.STOCKBOT_LAN !== "1") return (_req, _res, next) => next();
   const token = env.STOCKBOT_LAN_TOKEN;
-  if (!token) throw new Error("STOCKBOT_LAN=1 requires a non-empty STOCKBOT_LAN_TOKEN");
+  if (!token) return (_req, _res, next) => next();
   const expected = Buffer.from(token);
   // The cookie stores the URL-encoded token, so the cookie compare needs no decode step.
   const expectedCookie = Buffer.from(encodeURIComponent(token));

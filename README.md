@@ -120,30 +120,25 @@ security gates over the stdio bridge. `cli.py` remains for admin tasks only
 
 ### LAN access
 
-By default, `bun run stockbot` serves on localhost only. It starts three listeners:
+`bun run stockbot` serves the UI on every IPv4 interface (`0.0.0.0`) by default,
+so other devices on your network can open it. It starts three listeners:
 
-- Vite UI on `PORT` (free-picked from 3000), bound to `127.0.0.1`.
+- Vite UI on `PORT` (free-picked from 3000), bound to `0.0.0.0`.
 - Bun API on `STOCKBOT_API_PORT` (free-picked above the Vite port), always bound to `127.0.0.1`.
 - FastAPI market service on `STOCKBOT_MARKET_PORT` (free-picked above the API port), always bound to `127.0.0.1`.
 
 The browser reaches the Bun API and the market service only through the Vite `/api/*` proxy.
 The startup log prints each selected port.
+`STOCKBOT_LAN=0 bun run stockbot` keeps the UI on loopback only.
 
-To open the UI from another device on your network, set a token:
-
-```bash
-STOCKBOT_LAN=1 STOCKBOT_LAN_TOKEN=<long random string> bun run stockbot
-```
-
-With `STOCKBOT_LAN=1`, the Vite UI binds every IPv4 interface (`0.0.0.0`).
-The launcher exits with an error when `STOCKBOT_LAN_TOKEN` is empty.
-On each device, open `http://<host LAN IP>:<PORT>/?token=<token>` once.
-Vite stores the token in an HttpOnly cookie and removes it from the address bar.
-After that, every `/api/*` request must carry the cookie or an `x-stockbot-token` header, else it gets HTTP 401.
+Open `http://<host LAN IP>:<PORT>/` from the other device.
 Find the host LAN IP with `ip -4 addr` on Linux.
 `0.0.0.0` is a bind address, not a client address. Do not put it in a browser.
 
-The token travels over plain HTTP. Use LAN mode only on a trusted network.
+Optional token: set `STOCKBOT_LAN_TOKEN` to require it on `/api/*` (header
+`x-stockbot-token` or an HttpOnly cookie set once via `?token=…`).
+Without a token the LAN UI is open to anyone on your network: they can run the
+agent, spend model quota, and read theses. Use it only on a trusted network.
 Do not forward the port through a router or expose it to the internet.
 
 ## Running tests

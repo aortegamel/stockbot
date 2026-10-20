@@ -351,19 +351,15 @@ describe("Needle thesis monitors", () => {
 });
 
 describe("Needle web listener", () => {
-  test("defaults to a production build on loopback and binds every interface only in LAN mode", () => {
-    expect(webSettings({})).toEqual({ mode: "prod", host: "127.0.0.1" });
-    expect(webSettings({ STOCKBOT_WEB_MODE: "dev" })).toEqual({ mode: "dev", host: "127.0.0.1" });
+  test("defaults to a production build on every interface; STOCKBOT_LAN=0 keeps loopback", () => {
+    expect(webSettings({})).toEqual({ mode: "prod", host: "0.0.0.0" });
+    expect(webSettings({ STOCKBOT_WEB_MODE: "dev" })).toEqual({ mode: "dev", host: "0.0.0.0" });
     expect(webSettings({ STOCKBOT_LAN: "0", STOCKBOT_LAN_TOKEN: "t" })).toEqual({ mode: "prod", host: "127.0.0.1" });
-    expect(webSettings({ STOCKBOT_LAN: "1", STOCKBOT_LAN_TOKEN: "t", STOCKBOT_WEB_MODE: "dev" })).toEqual({ mode: "dev", host: "0.0.0.0" });
+    expect(webSettings({ STOCKBOT_LAN_TOKEN: "t", STOCKBOT_WEB_MODE: "dev" })).toEqual({ mode: "dev", host: "0.0.0.0" });
   });
 
-  test("refuses LAN mode without a token and an unknown web mode", () => {
+  test("refuses an unknown web mode", () => {
     const output = captureOutput();
-    for (const env of [{ STOCKBOT_LAN: "1" }, { STOCKBOT_LAN: "1", STOCKBOT_LAN_TOKEN: "" }]) {
-      expect(() => webSettings(env)).toThrow("process.exit(1)");
-      expect(output.stderr).toHaveBeenLastCalledWith("needle [web]: STOCKBOT_LAN=1 requires a non-empty STOCKBOT_LAN_TOKEN (the token LAN devices send once as ?token=…)\n");
-    }
     expect(() => webSettings({ STOCKBOT_WEB_MODE: "preview" })).toThrow("process.exit(1)");
     expect(output.stderr).toHaveBeenLastCalledWith('needle [web]: STOCKBOT_WEB_MODE must be "prod" or "dev", got "preview"\n');
   });

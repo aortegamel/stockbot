@@ -743,6 +743,6 @@ bridge response errors return HTTP 502.
 
 The Bun API and the market service always bind `127.0.0.1`
 (`needle-harness/scripts/api.ts`, `needle-harness/scripts/needle.ts`).
-The Vite listener binds `127.0.0.1` by default. `STOCKBOT_LAN=1` binds it to
-`0.0.0.0` and requires `STOCKBOT_LAN_TOKEN` on every `/api/*` request
-(`web/lan-token.ts`). See the README "LAN access" section.
+The Vite listener binds `0.0.0.0` by default (`STOCKBOT_LAN=0` keeps
+`127.0.0.1`); `STOCKBOT_LAN_TOKEN`, when set, is required on every `/api/*`
+request (`web/lan-token.ts`). See the README "LAN access" section.

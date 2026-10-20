@@ -30,16 +30,16 @@ Values in .env replace inherited shell exports. An inherited PORT is the one exc
 
 ```bash
 cp ../.env.example ../.env  # once from repo root, then fill values
-bun run stockbot  # from repo root → vite build, then vite preview on PORT (free-picked from 3000), localhost only
+bun run stockbot  # from repo root → vite build, then vite preview on PORT (free-picked from 3000), every IPv4 interface
 bun run dev       # from repo root → same launcher with the vite dev server (STOCKBOT_WEB_MODE=dev)
 # staged logs per step; browser misbehaves? first check the Bun API port in the startup log, then curl that /api/health
 bun run lint && bun run typecheck
 BENCHMARK=1 bun run stockbot   # write benchmarks/*.json per run
 ```
 
-Vite (`PORT`) binds `127.0.0.1` by default. The Bun API (`STOCKBOT_API_PORT`) and the FastAPI market service (`STOCKBOT_MARKET_PORT`) always bind `127.0.0.1` and are reached through the Vite `/api/*` proxy.
+Vite (`PORT`) binds `0.0.0.0` by default (`STOCKBOT_LAN=0` keeps `127.0.0.1`). The Bun API (`STOCKBOT_API_PORT`) and the FastAPI market service (`STOCKBOT_MARKET_PORT`) always bind `127.0.0.1` and are reached through the Vite `/api/*` proxy.
 The startup log prints each selected port.
-`STOCKBOT_LAN=1 STOCKBOT_LAN_TOKEN=<token> bun run stockbot` binds Vite to `0.0.0.0`; open `http://<host LAN IP>:<PORT>/?token=<token>` once per device.
+`STOCKBOT_LAN_TOKEN=<token> bun run stockbot` requires the token on `/api/*`; open `http://<host LAN IP>:<PORT>/?token=<token>` once per device.
 See the root README "LAN access" section.
 
 ## 5. Architecture
