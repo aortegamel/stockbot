@@ -1739,8 +1739,9 @@ _OBJECTIVE_COMPANY_RE = re.compile(
     r"\b(?:for|with)\s+([A-Z][a-zA-Z&.'\- ]{2,40}?)(?:\s+this\s+week|\s+last\s+|\s+daily|\s+now|\s*$)",
     flags=re.IGNORECASE,
 )
-# ponytail: role/market acronyms that must never win as an explicit stock subject;
-# both _objective_ticker and _objective_chart_candidates honor this one set.
+# ponytail: role/market acronyms that lose to chart context; _objective_subject_ticker
+# skips them only when a chart ticker is present, so standalone "AI earnings?" still
+# resolves C3.ai. _objective_ticker itself stays global (router callers pass no chart).
 _ACRONYM_NON_SUBJECTS = frozenset(
     {"ceo", "cfo", "cto", "ai", "etf", "etfs", "ipo", "cpi", "gdp", "fed", "fomc", "eps", "pe", "usa", "us"}
 )
@@ -1827,7 +1828,7 @@ def _objective_ticker(objective: object) -> str | None:
     from app.tools import _resolve_company_to_ticker as _resolve
 
     for _tok in _OBJECTIVE_TICKER_RE.findall(objective):
-        if _tok.upper() in _ORG or _tok.upper() in ("SHO", "REG") or _tok.lower() in _ACRONYM_NON_SUBJECTS:
+        if _tok.upper() in _ORG or _tok.upper() in ("SHO", "REG"):
             continue
         _rt = _resolve(_tok)
         if _rt is not None:
@@ -1913,6 +1914,16 @@ def _objective_subject_ticker(objective: object, supplied_ticker: object = None)
     """Prefer the explicit objective subject. Use chart context when no explicit label resolves."""
     if isinstance(objective, str):
         objective = re.sub(r"^\[Today UTC \d{4}-\d{2}-\d{2}\]\s*", "", objective).strip()
+    chart = supplied_ticker.strip().upper() if isinstance(supplied_ticker, str) and supplied_ticker.strip() else None
+    if chart is not None and isinstance(objective, str):
+        # Acronyms lose to the chart before any explicit path runs, so AI/CFO/IPO/FED/US
+        # (real tickers) never beat the displayed stock on vague prompts.
+        for _tok in _OBJECTIVE_TICKER_RE.findall(objective):
+            if _tok.lower() in _ACRONYM_NON_SUBJECTS:
+                return chart
+        for candidate in _objective_chart_candidates(objective):
+            if candidate.lower() in _ACRONYM_NON_SUBJECTS:
+                return chart
     _ticker = _objective_ticker(objective)
     if _ticker is not None:
         return _ticker
@@ -1932,7 +1943,7 @@ def _objective_subject_ticker(objective: object, supplied_ticker: object = None)
             resolved = _resolve_company_to_ticker(candidate)
             if resolved is not None:
                 return resolved
-    return supplied_ticker.strip().upper() if isinstance(supplied_ticker, str) and supplied_ticker.strip() else None
+    return chart
 
 
 def _fallback_sec_args(
