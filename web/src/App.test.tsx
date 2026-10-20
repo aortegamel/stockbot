@@ -160,11 +160,11 @@ function findLink(root: HTMLElement, label: string): HTMLAnchorElement | null {
   return [...root.querySelectorAll("a")].find((entry) => entry.textContent === label) ?? null;
 }
 
-const PALETTE = 'input[aria-label="Search or ask anything"]';
+const PALETTE = 'input[aria-label="Search or do anything"]';
 
 // The header has one search field: the closed palette trigger.
 async function openPalette(root: HTMLElement): Promise<HTMLInputElement> {
-  await click(button(root, "Search or ask anything /"));
+  await click(button(root, "Search or do anything /"));
   return find<HTMLInputElement>(root, PALETTE);
 }
 
@@ -212,7 +212,7 @@ describe("App terminal shell", () => {
     expect(text(root)).toContain("AGENT · viewing NVDA");
     expect(text(root)).toContain("delayed feed · Yahoo OHLCV");
     expect(text(root)).toContain("select a session for logs");
-    expect(findButton(root, "Search or ask anything /")).not.toBeNull();
+    expect(findButton(root, "Search or do anything /")).not.toBeNull();
     expect(root.querySelectorAll("header input")).toHaveLength(0);
     expect(text(root)).not.toContain("· DEBUG");
     expect(findLink(root, "Harness")).toBeNull();
@@ -369,9 +369,8 @@ describe("App agent send", () => {
     });
     const selected = ticker.trim().toUpperCase();
     await until(() => root.querySelector("footer")?.lastElementChild?.textContent === selected);
-    expect(text(root)).toContain(`AGENT · viewing ${selected}`);
-    expect(text(root)).toContain(`FILINGS · ${selected}`);
-    expect(text(root)).toContain(`NEWS · ${selected}`);
+    expect(text(root)).toContain(`Financials · ${selected}`);
+    expect(text(root)).toContain(`News · ${selected}`);
     expect(root.querySelector(`[role="region"][aria-label="${selected} price chart"]`)).not.toBeNull();
     const chart = find<HTMLIFrameElement>(root, `iframe[title="${selected} TradingView chart"]`);
     expect(new URL(chart.src).searchParams.get("symbol")).toBe(selected);
@@ -756,7 +755,7 @@ describe("App command bar", () => {
     });
     await press(find<HTMLInputElement>(root, PALETTE), "Escape");
     expect(root.querySelector(PALETTE)).toBeNull();
-    await click(button(root, "Search or ask anything /"));
+    await click(button(root, "Search or do anything /"));
     await until(() => text(root).includes("theses unavailable"));
     const palette = find<HTMLInputElement>(root, PALETTE);
     await type(palette, "why is nvda up?");

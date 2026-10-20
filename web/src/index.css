@@ -139,10 +139,10 @@ input.pill{cursor:text}
 .drawer .input,.drawer .btn-primary{height:34px}
 @media (max-width:1023px){.drawer{position:absolute;top:0;right:0;bottom:0;width:min(380px,100%);margin:8px;z-index:5}}
 
-/* Markets table: 28px rows, tabular numbers, sticky 12px headers. */
+/* Markets table: 28px rows, tabular numbers, sticky 11px headers. Tight padding fits the 1440px column with the agent drawer open. */
 .home-table{width:100%;border-collapse:separate;border-spacing:0}
-.home-table :is(th,td){height:var(--h-row);padding:0 8px;border-bottom:1px solid var(--hair);white-space:nowrap}
-.home-table th{font-size:var(--fs-label);font-weight:500;letter-spacing:0.06em;text-transform:uppercase;color:var(--muted)}
+.home-table :is(th,td){height:var(--h-row);padding:0 4px;border-bottom:1px solid var(--hair);white-space:nowrap}
+.home-table th{font-size:var(--fs-xs);font-weight:500;letter-spacing:0.04em;text-transform:uppercase;color:var(--muted)}
 .home-table thead th{position:sticky;top:0;z-index:1;background:#141A30}
 .home-table :is(th,td){text-align:right}
 .home-table :is(th,td):nth-child(2){text-align:left}
@@ -155,19 +155,21 @@ input.pill{cursor:text}
 .home-sort{padding:0;border:0;background:transparent;color:var(--muted);font:inherit;letter-spacing:inherit;text-transform:inherit;cursor:pointer}
 .home-sort[aria-pressed="true"]{color:var(--text)}
 .home-heart{padding:0;border:0;background:transparent;color:#FF6B8A;font:inherit;font-size:var(--fs-label);line-height:1;cursor:pointer}
-.home-form{font-weight:600;margin-right:4px}
+.home-form{display:inline-block;max-width:7ch;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom;font-weight:600;margin-right:4px}
+ .home-table td:last-child .home-muted{font-size:var(--fs-xs)}
+ .home-err{display:block;white-space:normal;line-height:1.3}
 
 /* Pages. */
 .page-scroll{flex:1;min-height:0;overflow-y:auto;padding:8px;position:relative;z-index:1}
 .page-card{padding:var(--sp-3) var(--sp-4);display:flex;flex-direction:column;gap:8px}
-.page-card a{text-decoration:underline}
+.page-card a:not(.pill){text-decoration:underline}
 
 /* Home: tape, chart + briefing, scans + markets + detail. Fills the height; each card scrolls inside. */
 .home{display:grid;grid-template-rows:auto minmax(0,1.1fr) minmax(0,1fr);gap:8px;height:100%;overflow:hidden}
 .home-tape{display:flex;overflow-x:auto;overflow-y:hidden}
 .home-tape > [role="status"]{display:flex;gap:8px;padding:2px}
 .home-tape > .home-error{padding:var(--sp-3)}
-.home-tile{flex:1 0 150px;display:grid;grid-template-columns:auto auto 1fr;align-items:baseline;column-gap:6px;height:52px;padding:8px 10px;line-height:16px;min-width:0}
+.home-tile{flex:1 0 auto;display:grid;grid-template-columns:auto auto 1fr;align-items:baseline;column-gap:6px;height:52px;padding:8px 10px;line-height:16px;min-width:176px}
 .home-tile + .home-tile{border-left:1px solid var(--hair)}
 .home-tile > b{font-size:var(--fs-label);font-weight:600}
 .home-tile-price{font-size:var(--fs-num)}
@@ -175,7 +177,7 @@ input.pill{cursor:text}
 .home-tile > .spark{grid-column:1 / -1;width:100%;height:20px}
 .home-tile > .home-muted{grid-column:1 / -1;line-height:20px}
 .home-mid{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:8px;min-height:0}
-.home-grid{display:grid;grid-template-columns:220px minmax(0,1fr) 340px;gap:8px;min-height:0}
+.home-grid{display:grid;grid-template-columns:200px minmax(0,1fr) 300px;gap:8px;min-height:0}
 .home-card{display:flex;flex-direction:column;min-width:0;min-height:0;padding:0}
 .home-scroll{flex:1;min-height:0;overflow:auto;padding:8px 12px}
 .home-markets .home-scroll{padding:0}

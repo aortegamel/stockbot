@@ -88,8 +88,7 @@ export function ThesisPanel({ onSelectTicker }: { onSelectTicker: (ticker: strin
 
   const shown = detail?.thesis_id === openId ? detail : null;
   return (
-    <div style={{ background: "var(--panel, #11161F)", border: "1px solid var(--border, #1E2635)", borderRadius: 6, padding: 16 }}>
-      <div style={{ fontSize: 12, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--muted, #93A0B8)", marginBottom: 10, fontWeight: 600 }}>THESES</div>
+    <div style={{ padding: "var(--sp-3)" }}>
       {error && <div style={{ ...small, color: down }}>{error}</div>}
       {theses.length === 0 && !error && <div style={{ ...small, color: muted }}>no theses yet</div>}
       {theses.map((t) => (

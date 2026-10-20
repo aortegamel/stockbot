@@ -155,7 +155,7 @@ export function FinancialsPanel({ sym }: { sym: string }) {
   const error = transportError ?? data?.error;
   const loading = !data && !error;
   return (
-    <div style={{ ...panel, height: "100%", minHeight: 0, overflowY: "auto" }}>
+    <div style={{ height: "100%", minHeight: 0, overflowY: "auto" }}>
       <div style={h}>FILINGS · {sym}</div>
       {loading && <span className="skeleton" role="status" aria-label="Loading filings" aria-busy="true" />}
       {error && (
@@ -193,7 +193,7 @@ export function NewsPanel({ sym }: { sym: string }) {
   const error = transportError ?? data?.error;
   const loading = !data && !error;
   return (
-    <div style={{ ...panel, height: "100%", minHeight: 0, overflowY: "auto" }}>
+    <div style={{ height: "100%", minHeight: 0, overflowY: "auto" }}>
       <div style={h}>NEWS · {sym}</div>
       {loading && <span className="skeleton" role="status" aria-label="Loading news" aria-busy="true" />}
       {error && (

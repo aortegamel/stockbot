@@ -10,6 +10,19 @@ export const SEEN_ALERTS_KEY = "stockbot.seen_alerts";
 const SEEN_LIMIT = 500;
 // This tab's ids: dedups even when storage is unavailable or full.
 const seenHere = new Set<string>();
+// Opaque so drawer text never shows through. z-[1] ties .shell-body and paints after it, but stays under the header (z 2) and its palette.
+const TOAST = "rounded-xl border border-white/12 bg-[#141A30] px-3 py-2 shadow-lg";
+const STACK = "flex flex-col gap-2";
+
+// One bottom-right corner, above the 30px footer, holds both the alert stack and the agent toast stack.
+function toastHost(): HTMLElement {
+  let host = document.getElementById("toasts");
+  if (!host) {
+    host = Object.assign(document.createElement("div"), { id: "toasts", className: `fixed bottom-10 right-4 z-[1] w-72 text-xs ${STACK}` });
+    document.body.append(host);
+  }
+  return host;
+}
 
 function seenAlerts(): string[] {
   try {
@@ -32,14 +45,14 @@ export function toastAlert(item: FeedItem): void {
     // Storage unavailable or full: seenHere still dedups this tab.
   }
   if (typeof Notification !== "undefined" && Notification.permission === "granted") new Notification(item.title, { body: item.source });
-  let stack = document.querySelector<HTMLElement>('[aria-label="Alerts"]');
+  let stack = document.querySelector<HTMLElement>('#toasts [aria-label="Alerts"]');
   if (!stack) {
-    stack = Object.assign(document.createElement("div"), { className: "fixed right-4 top-4 z-50 flex w-72 flex-col gap-2 text-xs" });
+    stack = Object.assign(document.createElement("div"), { className: STACK });
     stack.setAttribute("role", "status");
     stack.setAttribute("aria-label", "Alerts");
-    document.body.append(stack);
+    toastHost().append(stack);
   }
-  const toast = Object.assign(document.createElement("div"), { className: "strip rounded-xl px-3 py-2 text-zinc-200", textContent: `Alert: ${item.title}` });
+  const toast = Object.assign(document.createElement("div"), { className: `${TOAST} text-zinc-200`, textContent: `Alert: ${item.title}` });
   stack.append(toast);
   setTimeout(() => toast.remove(), TOAST_MS);
 }
@@ -54,10 +67,10 @@ function toastFor(event: AgentEvent): { text: string; sym?: string; failed: bool
 
 // ponytail: one timer drops the oldest toast at a time; per-toast timers if stacks grow long.
 export function Toasts({ events, onRetry }: { events: AgentEvent[]; onRetry?: () => void }) {
-  // The stack portals to <body>: a backdrop-filter ancestor would otherwise pin "fixed" to the panel.
+  // The stack portals to the shared corner host: a backdrop-filter ancestor would otherwise pin "fixed" to the panel.
   const [host, setHost] = useState<HTMLElement | null>(null);
   const [gone, setGone] = useState<ReadonlySet<AgentEvent>>(new Set());
-  useEffect(() => setHost(document.body), []);
+  useEffect(() => setHost(toastHost()), []);
   const shown = events.flatMap((event, i) => {
     const toast = gone.has(event) ? undefined : toastFor(event);
     return toast ? [{ event, i, ...toast }] : [];
@@ -71,9 +84,9 @@ export function Toasts({ events, onRetry }: { events: AgentEvent[]; onRetry?: ()
   }, [oldest]);
   if (!host || shown.length === 0) return null;
   return createPortal(
-    <div role="status" aria-label="Notifications" className="fixed bottom-4 right-4 z-50 flex w-72 flex-col gap-2 text-xs">
+    <div role="status" aria-label="Notifications" className={STACK}>
       {shown.map((toast) => (
-        <div key={toast.i} className={`strip flex items-center justify-between gap-2 rounded-xl px-3 py-2 ${toast.failed ? "text-red-300" : "text-zinc-200"}`}>
+        <div key={toast.i} className={`${TOAST} flex items-center justify-between gap-2 ${toast.failed ? "text-red-300" : "text-zinc-200"}`}>
           <span>{toast.failed ? "✗ " : ""}{toast.text}</span>
           {toast.sym && <OpenWorkspace sym={toast.sym} />}
           {toast.failed && onRetry && (

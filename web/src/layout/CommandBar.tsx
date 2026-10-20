@@ -64,7 +64,7 @@ export default function CommandBar({ watchlist, sessions, onTicker, onScan, onSe
   if (!open) {
     return (
       <button type="button" className="cmd-trigger" onClick={() => setOpen(true)}>
-        Search or ask anything <kbd>/</kbd>
+        Search or do anything <kbd>/</kbd>
       </button>
     );
   }
@@ -110,10 +110,10 @@ export default function CommandBar({ watchlist, sessions, onTicker, onScan, onSe
         role="combobox"
         aria-expanded="true"
         aria-controls="cmd-list"
-        aria-label="Search or ask anything"
+        aria-label="Search or do anything"
         className="cmd-input"
         value={query}
-        placeholder="Search or ask anything"
+        placeholder="Search or do anything"
         onBlur={close}
         onChange={(e) => {
           setQuery(e.target.value);
