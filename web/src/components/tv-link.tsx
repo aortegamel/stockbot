@@ -76,7 +76,7 @@ export function TvLinkForm({ initial, onSubmit, onCancel }: {
     if (draft) onSubmit({ url: draft.href, label: draft.name.slice(0, MAX_LABEL) });
   }
   return (
-    <form aria-label="TradingView link" onSubmit={submit} onKeyDown={(e) => e.key === "Escape" && onCancel()} style={{ display: "flex", flexDirection: "column", gap: 8, padding: 4, minHeight: 0 }}>
+    <form aria-label="TradingView link" onSubmit={submit} onKeyDown={(e) => { if (e.key === "Escape") { e.preventDefault(); onCancel(); } }} style={{ display: "flex", flexDirection: "column", gap: 8, padding: 4, minHeight: 0 }}>
       <span style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
         <input autoFocus aria-label="TradingView URL" placeholder="https://www.tradingview.com/x/…" value={url} maxLength={MAX_URL} onChange={(e) => setUrl(e.target.value)} style={{ ...field, flex: "2 1 240px" }} />
         <input aria-label="Widget label" placeholder="Label" value={label} maxLength={MAX_LABEL} onChange={(e) => setLabel(e.target.value)} style={{ ...field, flex: "1 1 120px" }} />

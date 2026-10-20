@@ -5,7 +5,7 @@ import { WatchlistChatPanel } from "../components/watchlist-chat-panel";
 import { ThesisPanel } from "../components/thesis-panel";
 import { PortfolioPanel } from "../components/portfolio-panel";
 import { EnableNotifications } from "../components/action-cards";
-import { isWidgetType, WidgetGrid, widgetLabel } from "../components/widgets";
+import { freeEscape, isWidgetType, WidgetGrid, widgetLabel } from "../components/widgets";
 import { TvLinkForm } from "../components/tv-link";
 import { fetchQuote, fetchWorkspace, saveWorkspace, type WorkspaceWidget } from "../lib/market-data";
 import { routeHash, TICKER_RE } from "../lib/route";
@@ -151,10 +151,10 @@ function BottomPanel({ s }: { s: ShellState }) {
     }
   }, [open, bottom]);
 
-  // Esc collapses the bottom panel to its tab bar.
+  // Esc collapses the bottom panel to its tab bar, after focus mode, fields, and forms take their own Esc.
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    const onKey = (e: KeyboardEvent) => freeEscape(e) && setOpen(false);
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open]);
@@ -330,7 +330,9 @@ export default function Workspace(s: ShellState) {
             <TvLinkForm
               onSubmit={(params) => {
                 setLinking(false);
-                edit([...widgets, { id: nextTvLinkId(widgets), type: "tv-link", ticker: sym, params }]);
+                const next = [...widgets, { id: nextTvLinkId(widgets), type: "tv-link", ticker: sym, params }];
+                setDoc({ sym, widgets: next, status: "" });
+                void save(next);
               }}
               onCancel={() => setLinking(false)}
             />

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 // Present-day market data via the public TradingView Advanced-chart
 // embed: a plain iframe, no scraping/automation/credentials/dependency.
@@ -55,6 +55,15 @@ export function chartSrc(symbol: string, params?: Record<string, unknown>): stri
 // Card-title controls; each change reports the full normalized settings.
 export function ChartControls({ params, onChange }: { params?: Record<string, unknown>; onChange: (next: ChartParams) => void }) {
   const s = chartSettings(params);
+  const menu = useRef<HTMLDetailsElement>(null);
+  // Close the indicators menu on any click outside it.
+  useEffect(() => {
+    const onDown = (e: MouseEvent) => {
+      if (menu.current?.open && !menu.current.contains(e.target as Node)) menu.current.open = false;
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, []);
   return (
     <>
       <select aria-label="Chart interval" value={s.interval} onChange={(e) => onChange({ ...s, interval: e.target.value })} className="ws-tool">
@@ -63,7 +72,17 @@ export function ChartControls({ params, onChange }: { params?: Record<string, un
       <select aria-label="Chart style" value={s.style} onChange={(e) => onChange({ ...s, style: e.target.value })} className="ws-tool">
         {STYLES.map((v) => <option key={v} value={v}>{v}</option>)}
       </select>
-      <details style={{ position: "relative" }}>
+      <details
+        ref={menu}
+        style={{ position: "relative" }}
+        onKeyDown={(e) => {
+          // Esc closes the open menu first and claims the key, so window Esc listeners skip it.
+          if (e.key !== "Escape" || e.defaultPrevented || !menu.current?.open) return;
+          e.preventDefault();
+          menu.current.open = false;
+          menu.current.querySelector("summary")?.focus();
+        }}
+      >
         <summary className="ws-tool" style={{ listStyle: "none", cursor: "pointer" }}>Indicators</summary>
         <div role="group" aria-label="Indicators" className="glass" style={{ position: "absolute", right: 0, top: "100%", zIndex: 20, padding: 8, display: "grid", gap: 4, minWidth: 160 }}>
           {STUDIES.map((study) => (

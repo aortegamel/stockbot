@@ -102,8 +102,9 @@ function button(label: string): HTMLButtonElement {
   if (!el) throw new Error(`missing ${label}`);
   return el;
 }
-async function escape() {
-  await act(async () => dom.window.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape" })));
+// A real keydown starts at the focused element (the body when nothing has focus), bubbles, and is cancelable.
+async function escape(target: Element = dom.window.document.body) {
+  await act(async () => target.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
   await settle();
 }
 
@@ -250,6 +251,38 @@ describe("Workspace", () => {
     await render(<Page />);
     expect(opened()).toBe(true);
     expect(panel("Theses").hidden).toBe(false);
+  });
+
+  test("Esc closes the innermost owner first: the link form, then focus mode, then the bottom panel", async () => {
+    serve();
+    await render(<Page />);
+    const opened = () => find(".ws-bottom").classList.contains("ws-bottom-open");
+    const focusing = () => find(".ws-grid").classList.contains("ws-grid-focus");
+    await click(button("Journal"));
+    await click(find('[aria-label="Expand News · NVDA"]'));
+    await add("tv-link");
+    await escape(find('input[aria-label="TradingView URL"]'));
+    expect(container().querySelector('form[aria-label="TradingView link"]')).toBeNull();
+    expect([focusing(), opened()]).toEqual([true, true]);
+    await escape();
+    expect([focusing(), opened()]).toEqual([false, true]);
+    await escape();
+    expect(opened()).toBe(false);
+  });
+
+  test("adding a TradingView link saves the workspace without Save", async () => {
+    const { docs, requests } = serve();
+    await render(<Page />);
+    await add("tv-link");
+    await act(async () => {
+      const input = find<HTMLInputElement>('input[aria-label="TradingView URL"]');
+      Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set?.call(input, "https://www.tradingview.com/x/8ot166mV/");
+      input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+    });
+    await click(button("Add link"));
+    expect(requests.filter((r) => r.method === "PUT").map((r) => r.path)).toEqual(["/api/workspaces/NVDA"]);
+    expect(docs.NVDA.widgets.at(-1)).toEqual({ id: "tv-link-1", type: "tv-link", ticker: "NVDA", params: { url: "https://www.tradingview.com/x/8ot166mV/", label: "TradingView snapshot" } });
+    expect(text()).toContain("saved 12:00:00");
   });
 
   test("renders one summary card per ticker with the workspace link", async () => {

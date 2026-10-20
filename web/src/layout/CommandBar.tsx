@@ -85,7 +85,7 @@ export default function CommandBar({ watchlist, sessions, onTicker, onScan, onSe
     ...group("Theses", (theses ?? []).filter((t) => has(t.scope, t.user_thesis)).map((t) => ({
       group: "Theses", label: t.scope, detail: t.user_thesis.slice(0, 60), run: () => onTicker(t.scope),
     })), theses === null ? "theses unavailable" : "no theses"),
-    ...group("Recent sessions", sessions.filter((s) => s.session_id && has(s.session_id, s.query)).map((s) => ({
+    ...group("Recent sessions", sessions.filter((s) => s.session_id && has(s.session_id, s.query, sessionTitle(s.query ?? ""))).map((s) => ({
       group: "Recent sessions",
       label: sessionTitle(s.query ?? "") || s.session_id!,
       detail: [s.status, s.updated_at && ago(s.updated_at, Date.now())].filter(Boolean).join(" · "),
@@ -125,7 +125,10 @@ export default function CommandBar({ watchlist, sessions, onTicker, onScan, onSe
           setActive(0);
         }}
         onKeyDown={(e) => {
-          if (e.key === "Escape") close();
+          if (e.key === "Escape") {
+            e.preventDefault();
+            close();
+          }
           else if (e.key === "Enter") run(current);
           else if ((e.key === "ArrowDown" || e.key === "ArrowUp") && actions.length) {
             e.preventDefault();

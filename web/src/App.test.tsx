@@ -740,6 +740,22 @@ describe("App command bar", () => {
     expect(root.querySelector(PALETTE)).toBeNull();
   });
 
+  test("Recent sessions match on the computed title, not only the raw query", async () => {
+    // A thesis alert prompt; "thesis check" appears only in its computed title.
+    const query = 'thesis_id: thesis:1\ntrigger summary: 4 filed\nCURRENT THESIS STATE:\n{"thesis": {"scope": "NVDA"}}';
+    serve((url) => {
+      if (url.includes("/api/search")) return json({ query: "thesis check", hits: [] });
+      if (url.includes("/api/scans")) return new Response(null, { status: 404 });
+      if (url.includes("/api/research/sessions")) return json({ sessions: [{ session_id: "s-1", status: "done", query }] });
+      return undefined;
+    });
+    const root = await mount(<App />);
+    const palette = await openPalette(root);
+    await type(palette, "thesis check");
+    await until(() => text(root).includes("no matching tickers"));
+    expect(options(root)).toContain("NVDA thesis check: 4 filed done");
+  });
+
   test("Ctrl-K opens, Esc closes, failed groups show one line, and the Ask row sends the raw query", async () => {
     const live = liveStream();
     const { bodies } = serve((url) => {

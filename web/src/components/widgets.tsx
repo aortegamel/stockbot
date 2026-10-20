@@ -207,6 +207,12 @@ const WidgetFrame = memo(function WidgetFrame({ widget, focused, onFocus, onRemo
   );
 });
 
+// A window Esc belongs to the innermost owner: a field, a form, or the palette handles its own Esc first.
+export function freeEscape(e: KeyboardEvent): boolean {
+  return e.key === "Escape" && !e.defaultPrevented
+    && !(e.target instanceof window.Element && e.target.closest("input,textarea,select,form,[role=combobox]"));
+}
+
 // Refresh remounts one widget. Expand focuses one widget over the whole grid; Esc restores the grid.
 // Hidden widgets stay mounted, so charts and loads survive a focus round trip.
 export function WidgetGrid({ widgets, onRemove, onParams }: {
@@ -218,11 +224,16 @@ export function WidgetGrid({ widgets, onRemove, onParams }: {
   const focus = useCallback((id: string) => setFocused((previous) => previous === id ? null : id), []);
   const visible = widgets.filter((w) => isWidgetType(w.type));
   const focusing = focused !== null && visible.some((w) => w.id === focused);
+  // Capture phase: Esc leaves focus mode before the bottom panel sees it, and the handled event stays with focus mode.
   useEffect(() => {
     if (!focusing) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setFocused(null);
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    const onKey = (e: KeyboardEvent) => {
+      if (!freeEscape(e)) return;
+      e.preventDefault();
+      setFocused(null);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, [focusing]);
   return (
     <div className={`ws-grid${focusing ? " ws-grid-focus" : ""}`}>

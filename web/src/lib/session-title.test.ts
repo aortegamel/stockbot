@@ -23,6 +23,8 @@ describe("sessionTitle", () => {
     expect(sessionTitle(thesisPrompt("4 filed", "unknown"))).toBe("Thesis check: 4 filed");
     expect(sessionTitle("thesis_id: thesis:x\ntrigger summary: ")).toBe("Thesis check");
     expect(sessionTitle(thesisPrompt("x".repeat(200)))).toHaveLength(80);
+    // Withheld summaries leave the bare scope title.
+    expect(sessionTitle(thesisPrompt("[unsafe content withheld: prompt injection]"))).toBe("NVDA thesis check");
   });
 
   test("uses the first line of a user question, cut to 80 characters", () => {
