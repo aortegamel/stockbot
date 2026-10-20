@@ -32,6 +32,16 @@ Example: "If the OpenAI IPO does terrible, how does NVDA move?"
 -> assumption `openai-ipo-terrible` (invented, labeled) carries the 30% haircut; it needs no evidence ref.
 NVDA's 12.5% OpenAI exposure is quoted verbatim from `ev-nvda-10k`; code computes `12.5 x 30% = 3.75`, the model does not.
 
+## Quick start
+
+On a fresh machine:
+
+1. Install [uv](https://docs.astral.sh/uv/) and [Bun](https://bun.sh), then clone this repository.
+2. Run `bun run setup && bun install --cwd web && bun install --cwd needle-harness`.
+3. Run `cp .env.example .env`. Fill every key that `.env.example` labels `MVP-required`: SEC, JEV decisions, and OpenCode reasoner.
+4. Run `bun run doctor`. Apply the `Fix:` on each `✗` line. Repeat until the doctor exits 0.
+5. Run `bun run stockbot`. Open the Vite URL from the startup log, for example `http://localhost:3000`.
+
 ## Requirements
 
 - uv (installs and manages Python 3.14)

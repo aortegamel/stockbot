@@ -241,3 +241,26 @@ describe("AgentConsole event presentation", () => {
     expect(production.join("")).not.toContain("archive saved");
   });
 });
+
+describe("AgentConsole trio offer", () => {
+  const offered: AgentEvent[] = [
+    { type: "agent_start", prompt: "NVDA risks?" },
+    { type: "answer_delta", text: "Stockbot view." },
+    { type: "offer_trio", sessionId: "rs:1" },
+    { type: "done", metrics: metrics() },
+  ];
+
+  test("a finished stockbot answer asks for the trio with Yes and No in prod and debug", () => {
+    for (const debug of [false, true]) {
+      const out = rows(offered, true, debug);
+      expect(out.at(-1)).toBe("Do you want the trio team (bull + bear views)? Yes No");
+      // The offer event itself never renders as a work row.
+      expect(out.join("")).not.toContain("rs:1");
+    }
+  });
+
+  test("no offer before the answer is final or without an offer event", () => {
+    expect(html(offered.slice(0, 3))).not.toContain("trio team");
+    expect(html(offered.filter((e) => e.type !== "offer_trio"))).not.toContain("trio team");
+  });
+});

@@ -1,5 +1,5 @@
 import { reason } from "@/lib/muse/client";
-import { asksWatchlist, kernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, type KernelResponse } from "@/lib/agent/kernel";
+import { asksWatchlist, kernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type KernelResponse } from "@/lib/agent/kernel";
 import { tools } from "@/lib/tools";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
 import { FINAL_PERSONAS, redactArgs, sourceReferences, type AgentEvent, type Evidence, type FailureCategory, type Persona, type Timings } from "@/lib/agent/types";
@@ -16,16 +16,29 @@ function parsePersonas(v: unknown): Persona[] | null | undefined {
   const canonical = FINAL_PERSONAS.filter((p) => v.includes(p));
   return v.length > 0 && v.length === canonical.length && canonical.every((p, i) => v[i] === p) ? canonical : undefined;
 }
-async function readAgentRequest(req: Request): Promise<Response | { prompt: string; ticker: unknown; currentChartTicker: unknown; parsedWatchlist: string[] | undefined }> {
+// Trio follow-up request: persona and gate stages over an offered session (same id shape as /api/research).
+type PersonasRequest = { op: "personas"; sessionId: string; personas: Persona[] };
+async function readAgentRequest(req: Request): Promise<Response | PersonasRequest | { prompt: string; ticker: unknown; currentChartTicker: unknown; parsedWatchlist: string[] | undefined }> {
   let prompt: unknown;
   let ticker: unknown;
   let currentChartTicker: unknown;
   let watchlistRaw: unknown;
+  let op: unknown;
+  let sessionId: unknown;
+  let personasRaw: unknown;
   try {
-    ({ prompt, ticker, currentChartTicker, watchlist: watchlistRaw } = await req.json());
+    ({ prompt, ticker, currentChartTicker, watchlist: watchlistRaw, op, sessionId, personas: personasRaw } = await req.json());
   } catch {
     console.error("[web] [agent-api] invalid JSON");
     return Response.json({ error: "invalid JSON" }, { status: 400 });
+  }
+  if (op === "personas") {
+    const personas = parsePersonas(personasRaw);
+    if (typeof sessionId !== "string" || !/^[A-Za-z0-9:_-]{1,128}$/.test(sessionId) || !personas) {
+      console.error("[web] [agent-api] invalid personas request");
+      return Response.json({ error: "sessionId and personas required" }, { status: 400 });
+    }
+    return { op: "personas", sessionId, personas };
   }
   if (typeof prompt !== "string" || !prompt.trim()) {
     console.error("[web] [agent-api] prompt required");
@@ -124,11 +137,32 @@ async function selectEntry(body: Record<string, unknown>, signal: AbortSignal): 
   return parseEntrySelection(routed) ?? { error: routeError };
 }
 
+const SSE_HEADERS = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" };
+
+// Trio follow-up: no route round, intake, nodes, or tools; the kernel replays
+// only the persona and final-gate stages over the offered session.
+function personasResponse(req: Request, input: PersonasRequest, requestAt: number): Response {
+  console.log(`[web] [agent-api] POST personas=${input.personas.join(",")}`);
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = streamSender(req, controller, requestAt, {});
+      try {
+        await runPersonaAgent(input.sessionId, input.personas, send, { signal: req.signal });
+      } catch (err) {
+        send({ type: "error", message: err instanceof Error ? err.message : String(err) });
+      }
+      controller.close();
+    },
+  });
+  return new Response(stream, { headers: SSE_HEADERS });
+}
+
 export async function POST(req: Request): Promise<Response> {
   const deadlineAt = Date.now() + REQUEST_WALL_MS;
   const requestAt = performance.now();
   const input = await readAgentRequest(req);
   if (input instanceof Response) return input;
+  if ("op" in input) return personasResponse(req, input, requestAt);
   const { prompt, ticker, currentChartTicker: chartInput, parsedWatchlist } = input;
   // Only a prompt that names the watchlist uses its symbols instead of the selected ticker.
   const watchlist = parsedWatchlist !== undefined && asksWatchlist(prompt) ? parsedWatchlist : undefined;
@@ -340,7 +374,5 @@ export async function POST(req: Request): Promise<Response> {
       console.log("[web] [agent-api] stream close");
     },
   });
-  return new Response(stream, {
-    headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
-  });
+  return new Response(stream, { headers: SSE_HEADERS });
 }

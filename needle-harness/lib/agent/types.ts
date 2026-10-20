@@ -131,6 +131,8 @@ export type AgentEvent =
   | { type: "answer_delta"; text: string }
   | { type: "done"; metrics: Metrics }
   | { type: "error"; message: string }
+  // A stockbot-only research answer offers the trio over the same session evidence.
+  | { type: "offer_trio"; sessionId: string }
   | { type: "tool_failed"; tool: string; category: FailureCategory; preview: string }
   | { type: "failed"; category: FailureCategory; message: string };
 

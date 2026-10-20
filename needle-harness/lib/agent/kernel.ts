@@ -1215,8 +1215,54 @@ async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
     gate: (body, gateOpts) => run.router.call(body, { ...(run.signal ? { signal: run.signal } : {}), ...gateOpts }),
   });
   addTiming(run, "gatesMs", performance.now() - gatesAt);
-  if ("failure" in gated) endFailed(run, "muse", "provider_error", gated.failure);
-  else endReport(run, gated.text);
+  if ("failure" in gated) {
+    endFailed(run, "muse", "provider_error", gated.failure);
+    return;
+  }
+  run.emit({ type: "answer_delta", text: gated.text });
+  offerTrio(run);
+  run.emit({ type: "done", metrics: metricsOf(run, run.escalations) });
+}
+
+// The research snapshot a trio follow-up answers over: evidence plus the graph projection.
+type TrioSnapshot = Pick<KernelRun, "prompt" | "objective" | "evidence" | "nodes" | "records" | "unresolved" | "guard" | "escalated" | "watchlist" | "scope" | "currentChartTicker">;
+// ponytail: process-local, newest 20 sessions, lost on restart; read evidence from the research store if follow-ups must survive restarts.
+const TRIO_SNAPSHOTS = new Map<string, TrioSnapshot>();
+const TRIO_SNAPSHOT_LIMIT = 20;
+
+// A gated stockbot-only research answer offers the trio over the same snapshot.
+function offerTrio(run: KernelRun): void {
+  const sessionId = run.sessionId;
+  if (run.personas.length !== 1 || run.personas[0] !== "stockbot" || typeof sessionId !== "string" || !sessionId) return;
+  TRIO_SNAPSHOTS.delete(sessionId);
+  TRIO_SNAPSHOTS.set(sessionId, {
+    prompt: run.prompt, objective: run.objective, evidence: [...run.evidence], nodes: run.nodes, records: run.records,
+    unresolved: run.unresolved, guard: run.guard, escalated: run.escalated, watchlist: run.watchlist, scope: run.scope, currentChartTicker: run.currentChartTicker,
+  });
+  const oldest = TRIO_SNAPSHOTS.keys().next().value;
+  if (TRIO_SNAPSHOTS.size > TRIO_SNAPSHOT_LIMIT && oldest !== undefined) TRIO_SNAPSHOTS.delete(oldest);
+  run.emit({ type: "offer_trio", sessionId });
+}
+
+// Trio follow-up: only the persona and final-gate stages, over the offered
+// snapshot. No worker run, so no intake, nodes, or tool calls. The answer is
+// final (pass 2): a gap never starts research. The gates judge the same session.
+export async function runPersonaAgent(
+  sessionId: string,
+  personas: readonly Persona[],
+  emit: (e: AgentEvent) => void,
+  opts?: Pick<KernelRunOptions, "signal" | "deps">,
+): Promise<void> {
+  const snap = TRIO_SNAPSHOTS.get(sessionId);
+  const run = openRun(snap?.prompt ?? "", emit, { ...opts, personas });
+  emit({ type: "agent_start", prompt: run.prompt });
+  if (snap === undefined) {
+    endFailed(run, null, "provider_error", "unknown or expired session");
+    return;
+  }
+  Object.assign(run, snap, { evidence: [...snap.evidence], sessionId, direct: false });
+  emitEvidence(run, sessionId);
+  await answerPass(run, 2);
 }
 
 // One answer pass over the current snapshot: reasoning_start, the stage set, the
@@ -1273,7 +1319,8 @@ function openRun(prompt: string, emit: (e: AgentEvent) => void, opts: KernelRunO
   // A watchlist request carries the list as context and never the selected-ticker scope.
   const requested = opts?.watchlist?.length ? [...opts.watchlist] : undefined;
   const ticker = requested ? undefined : parseTicker(opts?.ticker);
-  const personas = opts?.personas ?? FINAL_PERSONAS;
+  // Default is stockbot alone; the trio runs only on an explicit JEV selection or the offer follow-up.
+  const personas = opts?.personas ?? ["stockbot"];
   return {
     t0,
     prompt,

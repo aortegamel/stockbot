@@ -31,6 +31,9 @@ let chartReceipt: unknown = { result_type: "chart_selection", ticker: "MSFT" };
 let emitChartUpdate = false;
 const executionOrder: string[] = [];
 const runCalls: unknown[][] = [];
+const personaCalls: unknown[][] = [];
+// runKernelAgent offers the trio for rs:test when true.
+let emitOffer = false;
 type ReasonCall = { prompt: string; ticker?: string; evidence: Evidence[]; onDelta?: (t: string) => void };
 const reasonCalls: ReasonCall[] = [];
 type KernelCall = { op?: unknown; tool?: unknown; prompt?: unknown; objective?: unknown; ticker?: unknown; currentChartTicker?: unknown; watchlist?: unknown };
@@ -92,10 +95,21 @@ mock.module("@/lib/agent/kernel", () => ({
       emit({ type: "evidence", evidence: [bridgeEvidence], sessionId: "rs:test" });
       emit({ type: "answer_delta", text: "A fact [ev:bridge]" });
     }
+    if (emitOffer) {
+      const emit = args[1] as (e: Record<string, unknown>) => void;
+      emit({ type: "offer_trio", sessionId: "rs:test" });
+    }
     if (kernelDone !== null) {
       const emit = args[1] as (e: Record<string, unknown>) => void;
       emit({ type: "done", metrics: kernelDone });
     }
+  },
+  runPersonaAgent: async (...args: unknown[]) => {
+    personaCalls.push(args);
+    const emit = args[2] as (e: Record<string, unknown>) => void;
+    emit({ type: "agent_start", prompt: "q" });
+    emit({ type: "answer_delta", text: "trio" });
+    emit({ type: "done", metrics: { totalMs: 1, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 3, totalMs: 1 }, evidence: { count: 1, characters: 1 }, failures: {}, timings: { personasMs: 40, gatesMs: 5 } } });
   },
 }));
 
@@ -149,6 +163,8 @@ function reset(): void {
   endThrows = false;
   chartReceipt = { result_type: "chart_selection", ticker: "MSFT" };
   emitChartUpdate = false;
+  emitOffer = false;
+  personaCalls.length = 0;
   executionOrder.length = 0;
   kernelOpts.length = 0;
   invokeTimeouts.length = 0;
@@ -187,6 +203,14 @@ function metricCalls(events: AgentEventShape[], key: string): unknown {
   const section = (metrics as Record<string, unknown>)[key];
   if (!section || typeof section !== "object" || !("calls" in section)) throw new Error(`missing ${key} calls`);
   return section.calls;
+}
+
+async function personasEvents(body: Record<string, unknown>): Promise<{ status: number; events: AgentEventShape[] }> {
+  const { POST } = await import("./route");
+  const res = await POST(new Request("http://localhost/api/agent", { method: "POST", body: JSON.stringify({ op: "personas", ...body }) }));
+  if (res.status !== 200) return { status: res.status, events: [] };
+  const text = await res.text();
+  return { status: res.status, events: text.split("\n\n").filter((c) => c.trim()).map((c) => JSON.parse(c.replace(/^data: /, "")) as AgentEventShape) };
 }
 
 describe("agent entry route", () => {
@@ -1090,5 +1114,50 @@ describe("agent entry route", () => {
     } finally {
       dateSpy.mockRestore();
     }
+  });
+
+  test("the trio follow-up skips the route round, intake, and tools and runs only the persona stage", async () => {
+    reset();
+    const { status, events } = await personasEvents({ sessionId: "rs:test", personas: FINAL_PERSONAS });
+    expect(status).toBe(200);
+    expect(personaCalls).toHaveLength(1);
+    expect(personaCalls[0]?.slice(0, 2)).toEqual(["rs:test", [...FINAL_PERSONAS]]);
+    expect(kernelCalls).toEqual([]);
+    expect(runCalls).toEqual([]);
+    expect(reasonCalls).toEqual([]);
+    expect(invoked).toEqual([]);
+    expect(events.map((e) => e.type)).toEqual(["agent_start", "answer_delta", "done"]);
+    // No route round ran, so routeMs stays absent; first text is the request's own.
+    const metrics = events.at(-1)?.metrics;
+    if (!metrics || typeof metrics !== "object" || !("timings" in metrics) || !metrics.timings || typeof metrics.timings !== "object") throw new Error("expected done timings");
+    expect(Object.keys(metrics.timings).sort()).toEqual(["firstTextMs", "gatesMs", "personasMs"]);
+  });
+
+  test("a malformed trio follow-up is rejected before any kernel call", async () => {
+    for (const body of [
+      { personas: FINAL_PERSONAS },
+      { sessionId: 7, personas: FINAL_PERSONAS },
+      { sessionId: "../rs", personas: FINAL_PERSONAS },
+      { sessionId: "rs:test" },
+      { sessionId: "rs:test", personas: ["bullbot", "stockbot"] },
+      { sessionId: "rs:test", personas: null },
+    ]) {
+      reset();
+      const { status } = await personasEvents(body);
+      expect(status).toBe(400);
+      expect(personaCalls).toEqual([]);
+      expect(kernelCalls).toEqual([]);
+    }
+  });
+
+  test("production streams the trio offer beside the research answer", async () => {
+    reset();
+    delete process.env.STOCKBOT_DEBUG;
+    winner = "research_required";
+    emitEvidence = true;
+    emitOffer = true;
+    const events = await eventsFor("filing facts?");
+    expect(events.map((e) => e.type)).toEqual(["evidence", "answer_delta", "offer_trio"]);
+    expect(events.at(-1)).toEqual({ type: "offer_trio", sessionId: "rs:test" });
   });
 });

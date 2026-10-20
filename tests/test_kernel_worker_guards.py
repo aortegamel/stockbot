@@ -129,6 +129,20 @@ def test_graph_prompt_registry_failure_is_terminal() -> None:
     assert isinstance(terminal, dict) and "registry guard forbids" in str(terminal.get("message"))
 
 
+def test_research_registry_excludes_portfolio_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The live research registry exposes no portfolio tool, even with the broker enabled."""
+    from app.tools import PORTFOLIO_AUTHORIZED_TOOLS
+
+    monkeypatch.setenv("BROKER_ENABLED", "true")
+    names = {entry["name"] for entry in sched.build_registry()}
+    assert PORTFOLIO_AUTHORIZED_TOOLS
+    assert not names & PORTFOLIO_AUTHORIZED_TOOLS
+    assert kw._registry_portfolio_hit() == []
+    leaked = [*sched.build_registry(), {"name": "get_portfolio_snapshot"}]
+    with mock.patch("app.research.scheduler.build_registry", return_value=leaked):
+        assert kw._registry_portfolio_hit() == ["get_portfolio_snapshot"]
+
+
 class _JevRoute(JevClient):
     def __init__(
         self,

@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
-import { applyFinalGates, asksWatchlist, inventoryDefect, KernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
+import { applyFinalGates, asksWatchlist, inventoryDefect, KernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
 import { FINAL_PERSONAS, type AgentEvent, type Evidence, type FinalClaim, type Metrics, type Persona } from "./types";
 
 class FakeChild implements KernelChild {
@@ -608,7 +608,8 @@ describe("runKernelAgent final personas", () => {
         },
         {
           ...(opts.deadlineAt !== undefined ? { deadlineAt: opts.deadlineAt } : {}),
-          ...(opts.personas ? { personas: opts.personas } : {}),
+          // The kernel default is stockbot alone; this block drives the trio unless a test names its personas.
+          personas: opts.personas ?? FINAL_PERSONAS,
           ...(opts.signal ? { signal: opts.signal } : {}),
           ...(opts.ticker !== undefined ? { ticker: opts.ticker } : {}),
           ...(opts.currentChartTicker !== undefined ? { currentChartTicker: opts.currentChartTicker } : {}),
@@ -660,7 +661,7 @@ describe("runKernelAgent final personas", () => {
   const trioAnswer = (pass: number): string =>
     (["bearbot", "bullbot", "stockbot"] as const).map((p) => `${label(p)}\n${p} p${pass}`).join("\n\n");
 
-  test("default trio drafts bear+bull concurrently then synthesizes stockbot with both drafts", async () => {
+  test("trio drafts bear+bull concurrently then synthesizes stockbot with both drafts", async () => {
     const { events, calls, maxInFlight } = await runFinal({});
     // Drafts first (concurrent), synthesis last with both drafts attached.
     expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bullbot", "stockbot"]);
@@ -1833,5 +1834,97 @@ describe("runKernelAgent worker replies", () => {
     expect(results[2]?.type === "tool_result" ? results[2].preview : "").toBe("slow");
     expect(toolFailedOf(events)).toEqual(["get_news", "timeout"]);
     expect(events.some((e) => e.type === "failed")).toBe(false);
+  });
+});
+
+describe("trio offer and persona follow-up", () => {
+  // One scripted worker per run: op:run answers with a one-row session graph,
+  // and every gate passes. Every worker body and reasoner call is recorded.
+  function trioDeps(bodies: Record<string, unknown>[], calls: KernelReasonInput[]) {
+    const spawnFn: KernelSpawn = (): KernelChild => {
+      const child = new FakeChild();
+      child.reply = (id) => {
+        const body = JSON.parse(child.written.at(-1) ?? "{}") as Record<string, unknown>;
+        bodies.push(body);
+        if (typeof body.op === "string" && body.op.startsWith("assess_final")) return `${JSON.stringify({ id, support_answer: "yes" })}\n`;
+        return `${JSON.stringify({ id, objective: "q", sessionId: "rs:trio", evidence: [{ id: "ev:1", content: "fact" }], nodes: [{ node_id: "n1", question: "q", status: "resolved", depends_on: [] }], decisions: [], unresolved: [], incomplete_guard: false, toolExecutions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false })}\n`;
+      };
+      queueMicrotask(() => child.emitStdout('{"type":"ready"}\n'));
+      return child;
+    };
+    return {
+      python: "py", workerPath: "w", spawnFn,
+      reason: async (o: KernelReasonInput): Promise<KernelReasonResult> => {
+        calls.push(o);
+        return { text: `${o.persona} view`, usage: {}, claims: [] };
+      },
+    };
+  }
+  const doneOf = (events: AgentEvent[]): Metrics => {
+    const last = events.at(-1);
+    if (last?.type !== "done") throw new Error("expected done last");
+    return last.metrics;
+  };
+
+  test("a default research run calls stockbot once, then offers the trio for its session", async () => {
+    process.env.OPENCODE_MODEL = "test-model";
+    const events: AgentEvent[] = [];
+    const calls: KernelReasonInput[] = [];
+    await runKernelAgent("q", (e) => { events.push(e); }, { deps: trioDeps([], calls) });
+    expect(calls.map((c) => c.persona)).toEqual(["stockbot"]);
+    expect(events.slice(-3).map((e) => e.type)).toEqual(["answer_delta", "offer_trio", "done"]);
+    expect(events.find((e) => e.type === "offer_trio")).toEqual({ type: "offer_trio", sessionId: "rs:trio" });
+    expect(doneOf(events).muse.calls).toBe(1);
+  });
+
+  test("an explicit bull and bear selection runs the trio and never offers it", async () => {
+    process.env.OPENCODE_MODEL = "test-model";
+    const events: AgentEvent[] = [];
+    const calls: KernelReasonInput[] = [];
+    await runKernelAgent("Give me the bull and bear case on NVDA", (e) => { events.push(e); }, { personas: FINAL_PERSONAS, deps: trioDeps([], calls) });
+    expect(calls.map((c) => c.persona)).toEqual(["bearbot", "bullbot", "stockbot"]);
+    expect(events.some((e) => e.type === "offer_trio")).toBe(false);
+    expect(doneOf(events).muse.calls).toBe(3);
+  });
+
+  test("the trio follow-up reuses the offered evidence with no worker run, intake, or tool call", async () => {
+    process.env.OPENCODE_MODEL = "test-model";
+    await runKernelAgent("q", () => { }, { deps: trioDeps([], []) });
+    const events: AgentEvent[] = [];
+    const bodies: Record<string, unknown>[] = [];
+    const calls: KernelReasonInput[] = [];
+    await runPersonaAgent("rs:trio", FINAL_PERSONAS, (e) => { events.push(e); }, { deps: trioDeps(bodies, calls) });
+    // Only the final gates reach the worker, judged against the offered session.
+    expect(bodies.length).toBeGreaterThan(0);
+    for (const b of bodies) {
+      expect(String(b.op).startsWith("assess_final")).toBe(true);
+      expect(b.sessionId).toBe("rs:trio");
+    }
+    expect(calls.map((c) => c.persona)).toEqual(["bearbot", "bullbot", "stockbot"]);
+    for (const c of calls) {
+      expect(c.evidence.map((e) => e.id)).toEqual(["ev:1"]);
+      expect(c.nodes.map((n) => n.node_id)).toEqual(["n1"]);
+      expect(c.direct).toBe(false);
+    }
+    expect(events[0]).toEqual({ type: "agent_start", prompt: "q" });
+    expect(events.find((e) => e.type === "evidence")).toMatchObject({ sessionId: "rs:trio" });
+    expect(events.some((e) => e.type === "offer_trio" || e.type === "tool_start" || e.type === "progress")).toBe(false);
+    const metrics = doneOf(events);
+    expect(metrics.tools.calls).toBe(0);
+    expect(metrics.needle.calls).toBe(0);
+    expect(metrics.muse.calls).toBe(3);
+    // Worker phases never ran, so they stay absent, never 0.
+    expect(Object.keys(metrics.timings ?? {}).sort()).toEqual(["gatesMs", "personasMs"]);
+  });
+
+  test("an unknown session fails closed with no worker or reasoner call", async () => {
+    process.env.OPENCODE_MODEL = "test-model";
+    const events: AgentEvent[] = [];
+    const bodies: Record<string, unknown>[] = [];
+    const calls: KernelReasonInput[] = [];
+    await runPersonaAgent("rs:unknown", FINAL_PERSONAS, (e) => { events.push(e); }, { deps: trioDeps(bodies, calls) });
+    expect(events.map((e) => e.type)).toEqual(["agent_start", "failed", "done"]);
+    expect(bodies).toEqual([]);
+    expect(calls).toEqual([]);
   });
 });

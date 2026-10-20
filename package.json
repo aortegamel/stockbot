@@ -44,6 +44,7 @@
     "update-tool-catalog": "venv/bin/python scripts/update_tool_catalog.py",
     "verify": "bun run clean-env && bun run setup && bun run test && bun run typecheck && bun run typecheck-ts && bun run lint && bun run verify-integrity && bun run verify-secrets && bun run verify-deps && bun run verify-tools && bun run verify-tool-health && bun run verify-judge-self-check && bun run verify-harness",
     "sandbox-doctor": "venv/bin/python scripts/sandbox_doctor.py",
+    "doctor": "venv/bin/python scripts/doctor.py",
     "stockbot": "bun needle-harness/scripts/needle.ts",
     "llama": "llama-server --models-dir ${HOME}/.cache/huggingface/hub --models-preset ${HOME}/.config/llama-server/presets.ini --models-max 1 --host 127.0.0.1 --port 8080",
     "lint": "venv/bin/ruff check . && venv/bin/ruff format --check . && (cd needle-harness && bun run typecheck) && (cd web && bunx tsc --noEmit)"

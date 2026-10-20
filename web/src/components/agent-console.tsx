@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { AgentEvent, Evidence, SourceReference } from "../../../needle-harness/lib/agent/types";
+import { FINAL_PERSONAS, type AgentEvent, type Evidence, type SourceReference } from "../../../needle-harness/lib/agent/types";
 import { fetchSourceDocument } from "../lib/research-client";
 import { originalSourceUrl, safeSourceUrl } from "../lib/source-viewer";
 import { AgentEventView } from "./agent-event";
@@ -60,6 +60,33 @@ function useCitationUrls(parts: AnswerPart[]): Map<string, string | undefined> {
 }
 
 type SourceSelection = { evidenceId: string; position: number } | null;
+// One trio follow-up per offered session; null events means the user declined.
+type TrioState = { sessionId: string; events: AgentEvent[] | null } | null;
+
+// ponytail: the kernel buffers the trio answer, so the reply is read whole, not streamed.
+async function fetchTrio(sessionId: string): Promise<AgentEvent[]> {
+  try {
+    const response = await fetch("/api/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ op: "personas", sessionId, personas: FINAL_PERSONAS }),
+    });
+    if (!response.ok) return [{ type: "error", message: `request failed: ${response.status}` }];
+    const events: AgentEvent[] = [];
+    for (const line of (await response.text()).split("\n")) {
+      if (!line.startsWith("data: ")) continue;
+      try {
+        events.push(JSON.parse(line.slice(6)));
+      } catch {
+        // A malformed frame never hides the rest of the answer.
+      }
+    }
+    if (!events.some((e) => e.type === "done" || e.type === "error" || e.type === "failed")) events.push({ type: "error", message: "stream ended without a terminal event" });
+    return events;
+  } catch (error) {
+    return [{ type: "error", message: error instanceof Error ? error.message : String(error) }];
+  }
+}
 
 function SelectedSource({
   selected,
@@ -80,6 +107,7 @@ function SelectedSource({
 // ponytail: selection keeps evidence id + index so follow-up merges refresh the panel instead of a stale snapshot.
 export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[]; reasoning: boolean; debug: boolean }) {
   const [selected, setSelected] = useState<SourceSelection>(null);
+  const [trio, setTrio] = useState<TrioState>(null);
   const known = evidenceById(events);
   const sourceControls = [...known.values()].filter((entry) => entry.sources?.length);
   const answer = events.filter((e) => e.type === "answer_delta").map((e) => e.text).join("");
@@ -111,10 +139,17 @@ export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[
   // The evidence event stays out of prod rows: citations + source controls read it directly.
   const visible = debug ? events : events.filter((e) => e.type === "agent_start" || e.type === "answer_delta" || e.type === "reasoning_start" || e.type === "done" || e.type === "error" || e.type === "failed");
   const head = visible.filter(
-    (e) => e.type !== "answer_delta" && e.type !== "done" && e.type !== "error" && e.type !== "failed" && e.type !== "reasoning_start" && e.type !== "evidence",
+    (e) => e.type !== "answer_delta" && e.type !== "done" && e.type !== "error" && e.type !== "failed" && e.type !== "reasoning_start" && e.type !== "evidence" && e.type !== "offer_trio",
   );
   const tail = visible.filter((e) => e.type === "done" || e.type === "error" || e.type === "failed");
   const streaming = reasoning && tail.length === 0;
+  // The offer appears once the stockbot answer is final; Yes or No answers it once per session.
+  const offer = tail.length > 0 ? events.findLast((e) => e.type === "offer_trio") : undefined;
+  const current = offer && trio?.sessionId === offer.sessionId ? trio : null;
+  const askTrio = (sessionId: string): void => {
+    setTrio({ sessionId, events: [{ type: "reasoning_start", model: "stockbot" }] });
+    void fetchTrio(sessionId).then((trioEvents) => setTrio((state) => (state?.sessionId === sessionId ? { sessionId, events: trioEvents } : state)));
+  };
   return (
     <div className="flex-1 space-y-2 overflow-y-auto px-4 py-4 text-sm">
       {head.map((e, i) => (
@@ -142,6 +177,12 @@ export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[
       {tail.map((e, i) => (
         <AgentEventView key={`tail-${i}`} event={e} debug={debug} />
       ))}
+      {offer && !current && <div className="pt-2 text-zinc-300" role="group" aria-label="Trio offer">
+        Do you want the trio team (bull + bear views)?{" "}
+        <button type="button" onClick={() => askTrio(offer.sessionId)} className="rounded border border-zinc-700 px-2 py-1 text-xs hover:border-zinc-400">Yes</button>{" "}
+        <button type="button" onClick={() => setTrio({ sessionId: offer.sessionId, events: null })} className="rounded border border-zinc-700 px-2 py-1 text-xs hover:border-zinc-400">No</button>
+      </div>}
+      {current?.events && <AgentConsole events={current.events} reasoning={current.events.some((e) => e.type === "reasoning_start")} debug={debug} />}
     </div>
   );
 }
