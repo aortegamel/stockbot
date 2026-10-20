@@ -18,8 +18,7 @@ const FAILURE_TEXT: Record<FailureCategory, string> = {
 function FailureView({ text, onRetry }: { text: string; onRetry?: () => void }) {
   return (
     <div className="text-red-400" role="alert">
-      ✗ {text}{" "}
-      {onRetry && <button type="button" onClick={onRetry} className="rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:border-zinc-400">Try again</button>}
+      {onRetry ? <>✗ {text} <button type="button" onClick={onRetry} className="rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:border-zinc-400">Try again</button></> : <>✗ {text}</>}
     </div>
   );
 }

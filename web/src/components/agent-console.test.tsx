@@ -228,14 +228,14 @@ describe("AgentConsole event presentation", () => {
     expect(debug[4]).toBe("├─ archive saved");
     expect(debug[5]).toBe("First second.");
     expect(debug[6]).toContain("── metrics ──");
-    expect(debug[7]).toBe("✗ Connection closed ");
+    expect(debug[7]).toBe("✗ Connection closed");
     expect(debug[8]).toBe("✗ tool_error: Provider failed");
     const production = rows(events, true, false);
     expect(production).toHaveLength(5);
     expect(production[0]).toBe("> Research request");
     expect(production[1]).toBe("First second.");
     expect(production[2]).toContain("── metrics ──");
-    expect(production.slice(3)).toEqual(["✗ Connection closed ", "✗ A data source failed while answering. "]);
+    expect(production.slice(3)).toEqual(["✗ Connection closed", "✗ A data source failed while answering."]);
     expect(production.join("")).not.toContain("needle /");
     expect(production.join("")).not.toContain("Report found");
     expect(production.join("")).not.toContain("archive saved");
