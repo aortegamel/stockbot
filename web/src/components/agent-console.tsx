@@ -143,13 +143,13 @@ export function AgentConsole({ events, reasoning, debug, onRetry }: { events: Ag
   const citationUrls = useCitationUrls(parts);
   if (events.length === 0) {
     return (
-      <div className="flex-1 space-y-3 overflow-y-auto px-4 py-4 text-sm">
+      <div className="flex-1 space-y-3 overflow-y-auto p-3 text-sm">
         <div className="text-zinc-100">Stockbot — local-first investment research</div>
-        <div className="text-zinc-500">
+        <div className="text-xs text-zinc-500">
           Hedge-fund-style research infrastructure for individual investors — research and data foundation, not automated trading or portfolio management. I read
           primary sources and show my evidence; deterministic calculations, not model arithmetic.
         </div>
-        <div className="space-y-1 text-zinc-500">
+        <div className="space-y-1 text-xs text-zinc-500">
           <div>· SEC EDGAR — resolve a company to its CIK, search and list filings (10-K/10-Q/8-K), read bounded document windows, diff risk factors across periods.</div>
           <div>· Fundamentals — EPS, dividends, balance-sheet items, full statements, XBRL facts, obligations and valuation multiples.</div>
           <div>· Ownership &amp; insiders — beneficial stakes, holder changes, Forms 3/4/5 trades, Form 144 planned sales, offerings and dilution.</div>
@@ -159,7 +159,7 @@ export function AgentConsole({ events, reasoning, debug, onRetry }: { events: Ag
           <div>· Deep research — multi-question sessions with evidence, point-in-time known_at/as_of, raw archiving and provenance.</div>
           <div>· Full Stockbot optionally reads Robinhood portfolio, quotes, and options when BROKER_ENABLED — disabled here. Research only, not investment advice.</div>
         </div>
-        <div className="text-zinc-600">Try: “What time is it?” · “NVDA risk factors?” · “AAPL insider sales last quarter?”</div>
+        <div className="text-xs text-zinc-600">Try: “What time is it?” · “NVDA risk factors?” · “AAPL insider sales last quarter?”</div>
       </div>
     );
   }
@@ -179,7 +179,7 @@ export function AgentConsole({ events, reasoning, debug, onRetry }: { events: Ag
     void fetchTrio(sessionId).then((trioEvents) => setTrio((state) => (state?.sessionId === sessionId ? { sessionId, events: trioEvents } : state)));
   };
   return (
-    <div className="flex-1 space-y-2 overflow-y-auto px-4 py-4 text-sm">
+    <div className="flex-1 space-y-2 overflow-y-auto p-3 text-sm">
       {head.map((e, i) => (
         <AgentEventView key={i} event={e} />
       ))}

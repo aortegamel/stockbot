@@ -54,8 +54,6 @@ export default function TradingChart({ sym }: { sym: string }) {
     setLoaded(false);
   }, [src]);
 
-  const bdr = "rgba(255,255,255,0.12)";
-
   if (!symbol) {
     return <PlainAlert text="chart unavailable — no symbol selected. Try: search a ticker above." />;
   }
@@ -82,20 +80,8 @@ export default function TradingChart({ sym }: { sym: string }) {
         color: "#F5F7FF",
       }}
     >
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          padding: "6px 14px",
-          borderBottom: `1px solid ${bdr}`,
-          flexShrink: 0,
-          minHeight: 38,
-        }}
-      >
-        <span style={{ fontSize: 16, fontWeight: 700, letterSpacing: "-0.01em", color: "#F5F7FF" }}>
-          {symbol}
-        </span>
+      <div className="chart-head">
+        <span className="chart-sym">{symbol}</span>
       </div>
       {!loaded && <div className="skeleton" style={{ flex: 1, minHeight: 200 }} aria-label="Loading chart" />}
       <iframe

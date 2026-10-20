@@ -20,7 +20,6 @@ let mounted: Root | null = null;
 const WATCHLIST = ["NVDA", "AAPL", "MSFT", "TSLA", "SPY", "QQQ", "AMZN", "META", "GOOG"];
 
 const AGENT_PROMPT = '[aria-label="Ask the research agent"]';
-const SEARCH = 'input[placeholder="Search any US ticker…"]';
 
 afterEach(async () => {
   await unmount();
@@ -163,6 +162,12 @@ function findLink(root: HTMLElement, label: string): HTMLAnchorElement | null {
 
 const PALETTE = 'input[aria-label="Search or ask anything"]';
 
+// The header has one search field: the closed palette trigger.
+async function openPalette(root: HTMLElement): Promise<HTMLInputElement> {
+  await click(button(root, "Search or ask anything /"));
+  return find<HTMLInputElement>(root, PALETTE);
+}
+
 function options(root: HTMLElement): string[] {
   return [...root.querySelectorAll('#cmd-list [role="option"]')].map((option) => (option.textContent ?? "").replace(/\s+/g, " ").trim());
 }
@@ -207,7 +212,8 @@ describe("App terminal shell", () => {
     expect(text(root)).toContain("AGENT · viewing NVDA");
     expect(text(root)).toContain("delayed feed · Yahoo OHLCV");
     expect(text(root)).toContain("select a session for logs");
-    expect(find<HTMLInputElement>(root, SEARCH)).toBeDefined();
+    expect(findButton(root, "Search or ask anything /")).not.toBeNull();
+    expect(root.querySelectorAll("header input")).toHaveLength(0);
     expect(text(root)).not.toContain("· DEBUG");
     expect(findLink(root, "Harness")).toBeNull();
   });
@@ -256,52 +262,54 @@ describe("App terminal shell", () => {
 });
 
 describe("App ticker search", () => {
-  test("suggests tickers after two characters and adopts the first hit on Enter", async () => {
+  test("the palette lists ticker hits and Enter adopts the first hit in its workspace", async () => {
     const { urls } = serve((url) =>
       url.includes("/api/search")
         ? json({ query: "br", hits: [{ sym: "brk.b", name: "Berkshire Hathaway" }, { sym: "BRK.A" }] })
         : undefined,
     );
     const root = await mount(<App />);
-    const search = find<HTMLInputElement>(root, SEARCH);
+    const search = await openPalette(root);
     await type(search, "br");
-    await until(() => root.querySelector('[role="listbox"]') !== null);
-    const options = [...root.querySelectorAll('[role="option"]')].map((option) => (option.textContent ?? "").replace(/\s+/g, " ").trim());
-    expect(options).toEqual(["brk.b Berkshire Hathaway", "BRK.A"]);
+    await until(() => options(root)[0] === "brk.b Berkshire Hathaway");
+    expect(options(root)).toEqual(["brk.b Berkshire Hathaway", "BRK.A", "Ask Stockbot: br"]);
     await press(search, "Enter");
     await until(() => root.querySelector("footer")?.lastElementChild?.textContent === "BRK.B");
-    expect(search.value).toBe("");
-    expect(root.querySelector('[role="listbox"]')).toBeNull();
+    // A palette pick always opens the ticker workspace.
+    expect(dom.window.location.hash).toBe("#/workspace/BRK.B");
+    expect(root.querySelector(PALETTE)).toBeNull();
     // The selected ticker joins the front of the watchlist the agent receives.
     await until(() => urls.some((url) => url.includes("symbols=BRK.B%2CNVDA")));
     await until(() => text(root).includes("BRK.B100DELAYEDSEC none"));
   });
 
-  test("clears the query on Escape and ignores a blank pick", async () => {
+  test("Escape closes without a pick and a blank query offers no ticker or Ask row", async () => {
     serve((url) => (url.includes("/api/search") ? json({ query: "aa", hits: [{ sym: "AAPL" }] }) : undefined));
     const root = await mount(<App />);
-    const search = find<HTMLInputElement>(root, SEARCH);
+    let search = await openPalette(root);
     await type(search, "aa");
-    await until(() => root.querySelector('[role="option"]') !== null);
+    // The Tickers hit precedes the matching watchlist row.
+    await until(() => options(root).join("|") === "AAPL|AAPL|Ask Stockbot: aa");
     await press(search, "Escape");
-    await until(() => search.value === "");
-    await until(() => root.querySelector('[role="listbox"]') === null);
-    await press(search, "Enter");
+    expect(root.querySelector(PALETTE)).toBeNull();
     expect(root.querySelector("footer")?.lastElementChild?.textContent).toBe("NVDA");
+    search = await openPalette(root);
+    expect(search.value).toBe("");
     await type(search, "  ");
-    await press(search, "Enter");
     await settle();
+    const groups = [...root.querySelectorAll(".cmd-group")].map((g) => g.textContent);
+    expect(groups).not.toContain("Tickers");
+    expect(groups).not.toContain("Ask");
     expect(root.querySelector("footer")?.lastElementChild?.textContent).toBe("NVDA");
   });
 
-  test("a failed search leaves no suggestions and no error row", async () => {
+  test("a failed search shows one notice row and hides the raw error", async () => {
     const { urls } = serve((url) => (url.includes("/api/search") ? Promise.reject(new Error("search down")) : undefined));
     const root = await mount(<App />);
-    const search = find<HTMLInputElement>(root, SEARCH);
-    await type(search, "zz");
+    await type(await openPalette(root), "zz");
     await until(() => urls.some((url) => url.includes("/api/search")));
-    await settle();
-    expect(root.querySelector('[role="listbox"]')).toBeNull();
+    await until(() => text(root).includes("ticker search unavailable"));
+    expect(options(root)).toEqual(["Ask Stockbot: zz"]);
     expect(text(root)).not.toContain("search down");
   });
 });
@@ -771,7 +779,7 @@ describe("App command bar", () => {
     serve();
     let root = await mount(<App />);
     const toggle = find<HTMLButtonElement>(root, '[aria-label="Close agent drawer"]');
-    expect(toggle.textContent).toBe(">>");
+    expect(toggle.querySelector("svg")).not.toBeNull();
     await click(toggle);
     expect(dom.window.localStorage.getItem("stockbot.drawer")).toBe("closed");
     expect(root.querySelector(AGENT_PROMPT)).toBeNull();

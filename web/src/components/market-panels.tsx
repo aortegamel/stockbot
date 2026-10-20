@@ -14,12 +14,13 @@ const panel: React.CSSProperties = {
   overflow: "hidden",
 };
 const h: React.CSSProperties = {
-  fontSize: 14,
-  letterSpacing: "0.08em",
+  fontSize: 12,
+  letterSpacing: "0.06em",
   color: "var(--muted, #93A0B8)",
-  marginBottom: 10,
-  fontWeight: 700,
+  marginBottom: 8,
+  fontWeight: 600,
 };
+const muted = "var(--muted, #93A0B8)";
 const down = "var(--down, #EF5350)";
 
 const WATCH_DEFAULTS = ["NVDA", "AAPL", "MSFT", "TSLA", "SPY", "QQQ", "AMZN", "META", "GOOG"];
@@ -97,7 +98,7 @@ export function WatchlistPanel({ selected, onSelect, symbols }: { selected: stri
     <div style={{ ...panel, height: "100%", overflowY: "auto" }}>
       <div style={h}>WATCHLIST · DELAYED</div>
       {sourceError && (
-        <p role="alert" style={{ fontSize: 14, color: "var(--muted, #93A0B8)", marginBottom: 8 }}>
+        <p role="alert" style={{ fontSize: 14, color: muted, marginBottom: 8 }}>
           We could not load this data. <button type="button" className="pill" onClick={() => setSourceAttempt((attempt) => attempt + 1)}>Retry</button>
         </p>
       )}
@@ -107,22 +108,26 @@ export function WatchlistPanel({ selected, onSelect, symbols }: { selected: stri
           onClick={() => onSelect(sym)}
           style={{
             display: "flex",
+            flexWrap: "wrap",
             justifyContent: "space-between",
+            alignItems: "center",
+            lineHeight: "20px",
             width: "100%",
-            padding: "10px 12px",
+            padding: "4px 8px",
+            textAlign: "left",
             background: sym === selected ? "var(--panel2, #151C29)" : "transparent",
             border: sym === selected ? "1px solid var(--accent, #2962FF)" : "1px solid transparent",
             borderRadius: 4,
             color: "var(--text, #E6ECF5)",
             cursor: "pointer",
-            fontSize: 20,
+            fontSize: 14,
           }}
         >
-          <b>{sym}</b>
-          <span style={{ textAlign: "right" }}>
-            <div>{prices[sym] == null ? "—" : prices[sym]!.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
-            <div style={{ color: "var(--muted, #93A0B8)", fontSize: 14 }}>DELAYED</div>
-            <div aria-label={`${sym} sources`} style={{ color: "var(--muted, #93A0B8)", fontSize: 12 }}>
+          <b style={{ fontWeight: 600 }}>{sym}</b>
+          <span className="num">{prices[sym] == null ? "—" : prices[sym]!.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
+          <span style={{ flexBasis: "100%", display: "flex", gap: 4, flexWrap: "wrap", lineHeight: 1.4, color: muted, fontSize: "var(--fs-xs)" }}>
+            DELAYED
+            <span aria-label={`${sym} sources`}>
               {sources
                 .filter((row) => row.symbol === sym)
                 .map((row) => (
@@ -134,7 +139,7 @@ export function WatchlistPanel({ selected, onSelect, symbols }: { selected: stri
                     {`${SOURCE_LABEL[row.source]} ${sourceText(row)} `}
                   </span>
                 ))}
-            </div>
+            </span>
           </span>
         </button>
       ))}
@@ -154,16 +159,16 @@ export function FinancialsPanel({ sym }: { sym: string }) {
       <div style={h}>FILINGS · {sym}</div>
       {loading && <span className="skeleton" role="status" aria-label="Loading filings" aria-busy="true" />}
       {error && (
-        <p role="alert" style={{ fontSize: 18, color: "var(--muted, #93A0B8)" }}>
+        <p role="alert" style={{ fontSize: 14, color: muted }}>
           We could not load this data. <button type="button" className="pill" onClick={retry}>Retry</button>
         </p>
       )}
       {!loading && filings.length === 0 && !error && (
-        <p style={{ fontSize: 20, color: "var(--muted, #93A0B8)" }}>No filings for {sym}. Try asking: Summarize the latest {sym} disclosures.</p>
+        <p style={{ fontSize: 14, color: muted }}>No filings for {sym}. Try asking: Summarize the latest {sym} disclosures.</p>
       )}
       {filings.map((f, i) => (
-        <div key={i} style={{ fontSize: 20, marginBottom: 12, lineHeight: 1.5 }}>
-          <span style={{ color: "var(--muted, #93A0B8)", fontSize: 18 }} title={`updated ${f.updated}`}>
+        <div key={i} style={{ fontSize: 14, marginBottom: 8, lineHeight: 1.4 }}>
+          <span style={{ color: muted, fontSize: 12 }} title={`updated ${f.updated}`}>
             filed {f.filed}
           </span>
           <div>
@@ -192,13 +197,13 @@ export function NewsPanel({ sym }: { sym: string }) {
       <div style={h}>NEWS · {sym}</div>
       {loading && <span className="skeleton" role="status" aria-label="Loading news" aria-busy="true" />}
       {error && (
-        <p role="alert" style={{ fontSize: 18, color: "var(--muted, #93A0B8)" }}>
+        <p role="alert" style={{ fontSize: 14, color: muted }}>
           We could not load this data. <button type="button" className="pill" onClick={retry}>Retry</button>
         </p>
       )}
       {items.map((n, i) => (
-        <div key={i} style={{ fontSize: 20, marginBottom: 12, lineHeight: 1.5 }}>
-          <span style={{ color: "var(--muted, #93A0B8)", fontSize: 18 }}>
+        <div key={i} style={{ fontSize: 14, marginBottom: 8, lineHeight: 1.4 }}>
+          <span style={{ color: muted, fontSize: 12 }}>
             {(n.published || "").slice(0, 16)} · {n.source}
           </span>
           <div>
@@ -213,7 +218,7 @@ export function NewsPanel({ sym }: { sym: string }) {
         </div>
       ))}
       {!loading && items.length === 0 && !error && (
-        <p style={{ fontSize: 20, color: "var(--muted, #93A0B8)" }}>No news for {sym}. Try asking: What moved {sym} today?</p>
+        <p style={{ fontSize: 14, color: muted }}>No news for {sym}. Try asking: What moved {sym} today?</p>
       )}
     </div>
   );
@@ -237,40 +242,21 @@ export function AIPanel({
   debug: boolean;
 }) {
   return (
-    <div style={{ ...panel, display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
-      <div style={h}>AGENT · viewing {sym}{debug ? " · DEBUG" : ""}</div>
+    <div style={{ ...panel, padding: 0, display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
+      {/* Mixed case on purpose: the ticker context reads "viewing NVDA", not "VIEWING". */}
+      <div className="card-head" style={{ textTransform: "none" }}>AGENT · viewing {sym}{debug ? " · DEBUG" : ""}</div>
       <AgentConsole events={events} reasoning={events.some((event) => event.type === "reasoning_start")} debug={debug} />
-      <form onSubmit={(event) => { event.preventDefault(); onSend(); }} style={{ display: "flex", gap: 6 }}>
+      <form onSubmit={(event) => { event.preventDefault(); onSend(); }} style={{ display: "flex", gap: 6, padding: "0 12px 12px" }}>
         <input
           aria-label="Ask the research agent"
           value={input}
           onChange={(event) => setInput(event.target.value)}
           disabled={busy}
           placeholder={busy ? "Research in progress…" : "Ask about this symbol…"}
-          style={{
-            flex: 1,
-            minWidth: 0,
-            background: "var(--panel2, #151C29)",
-            border: "1px solid var(--border, #1E2635)",
-            borderRadius: 4,
-            color: "var(--text, #E6ECF5)",
-            padding: "10px 12px",
-            fontSize: 20,
-          }}
+          className="input"
+          style={{ flex: 1, minWidth: 0 }}
         />
-        <button
-          type="submit"
-          disabled={busy || !input.trim()}
-          style={{
-            background: "var(--accent, #2962FF)",
-            color: "#fff",
-            border: 0,
-            borderRadius: 4,
-            padding: "10px 18px",
-            cursor: busy ? "wait" : "pointer",
-            fontSize: 20,
-          }}
-        >
+        <button type="submit" disabled={busy || !input.trim()} className="btn-primary" style={{ cursor: busy ? "wait" : "pointer" }}>
           {busy ? "Thinking…" : "Send"}
         </button>
       </form>
@@ -313,20 +299,20 @@ export function SessionPanel({
             borderRadius: 4,
             color: "var(--text, #D5DBE5)",
             cursor: "pointer",
-            fontSize: 11,
+            fontSize: 12,
           }}
         >
           <b>{(s.session_id ?? "?").slice(0, 8)}</b>{" "}
           <span style={{ color: "var(--muted, #7A8599)" }}>{s.status ?? "?"}</span>
-          <div style={{ color: "var(--muted, #7A8599)", fontSize: 10 }}>{(s.query ?? "").slice(0, 60)}</div>
+          <div style={{ color: "var(--muted, #7A8599)", fontSize: 12 }}>{(s.query ?? "").slice(0, 60)}</div>
         </button>
       ))}
       {snapshot && !snapshot.error && (
-        <div style={{ fontSize: 11, marginTop: 6, color: "var(--muted, #7A8599)" }}>
+        <div style={{ fontSize: 12, marginTop: 6, color: "var(--muted, #7A8599)" }}>
           jobs {jobs.length} · open {open.length} · {String(snapshot.session?.status ?? "?")}
         </div>
       )}
-      {snapshot?.error && <div style={{ fontSize: 11, color: down }}>{snapshot.error}</div>}
+      {snapshot?.error && <div style={{ fontSize: 12, color: down }}>{snapshot.error}</div>}
     </div>
   );
 }
@@ -337,12 +323,12 @@ export function JournalPanel({ journal, seq }: { journal: JournalPage | null; se
   return (
     <div style={panel}>
       <div style={h}>LOGS · seq {seq}</div>
-      {journal?.error && <div style={{ fontSize: 11, color: down }}>{journal.error}</div>}
-      {!journal && <div style={{ fontSize: 11, color: "var(--muted, #7A8599)" }}>select a session for logs</div>}
+      {journal?.error && <div style={{ fontSize: 12, color: down }}>{journal.error}</div>}
+      {!journal && <div style={{ fontSize: 12, color: "var(--muted, #7A8599)" }}>select a session for logs</div>}
       {journal && !journal.error && events.length === 0 && (
-        <div style={{ fontSize: 11, color: "var(--muted, #7A8599)" }}>no journal rows yet</div>
+        <div style={{ fontSize: 12, color: "var(--muted, #7A8599)" }}>no journal rows yet</div>
       )}
-      <div style={{ maxHeight: 220, overflowY: "auto", fontSize: 11 }}>
+      <div style={{ maxHeight: 220, overflowY: "auto", fontSize: 12 }}>
         {events.slice(-60).map((e) => (
           <div key={e.event_id ?? `${e.sequence}`} style={{ marginBottom: 4 }}>
             <span style={{ color: "var(--muted, #7A8599)" }}>

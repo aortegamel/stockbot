@@ -6,7 +6,7 @@ import { ThesisPanel } from "../components/thesis-panel";
 import { PortfolioPanel } from "../components/portfolio-panel";
 import { EnableNotifications } from "../components/action-cards";
 import { isWidgetType, WidgetGrid, widgetLabel } from "../components/widgets";
-import { fetchWorkspace, saveWorkspace, type WorkspaceWidget } from "../lib/market-data";
+import { fetchQuote, fetchWorkspace, saveWorkspace, type WorkspaceWidget } from "../lib/market-data";
 import { routeHash, TICKER_RE } from "../lib/route";
 import type { ShellState } from "../layout/Shell";
 
@@ -102,6 +102,19 @@ export default function Workspace(s: ShellState) {
     }
   }, [tabList]);
 
+  // Last delayed price per open tab; a failed quote shows a dash.
+  const [prices, setPrices] = useState<Record<string, number | null>>({});
+  useEffect(() => {
+    const ctrl = new AbortController();
+    for (const tab of tabList.split(",")) {
+      fetchQuote(tab, ctrl.signal).then(
+        (q) => setPrices((p) => ({ ...p, [tab]: typeof q.price === "number" ? q.price : null })),
+        () => undefined,
+      );
+    }
+    return () => ctrl.abort();
+  }, [tabList]);
+
   // A never-saved (or unreachable) workspace shows the default chart, financials, and news.
   useEffect(() => {
     const ctrl = new AbortController();
@@ -171,7 +184,10 @@ export default function Workspace(s: ShellState) {
           <span role="tablist" aria-label="Open workspaces" className="ws-tablist">
             {shown.map((tab) => (
               <span key={tab} className="ws-tab">
-                <a role="tab" aria-selected={tab === sym} href={routeHash({ page: "workspace", sym: tab })} className="pill">{tab}</a>
+                <a role="tab" aria-selected={tab === sym} href={routeHash({ page: "workspace", sym: tab })} className="pill">
+                  <span style={{ fontWeight: 600 }}>{tab}</span>{" "}
+                  <span className="ws-tab-price">{prices[tab] == null ? "—" : prices[tab]!.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
+                </a>
                 {shown.length > 1 && <button type="button" aria-label={`Close ${tab}`} onClick={() => close(tab)} className="ws-tool">×</button>}
               </span>
             ))}

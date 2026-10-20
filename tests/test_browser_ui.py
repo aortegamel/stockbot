@@ -29,8 +29,10 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
 
 ROOT = Path(__file__).resolve().parents[1]
-SEARCH = (By.CSS_SELECTOR, 'input[placeholder="Search any US ticker…"]')
-FIRST_HIT = (By.CSS_SELECTOR, 'header [role="option"]')
+# The header's one search field is the closed palette trigger; ticker hits are palette rows.
+SEARCH = (By.CSS_SELECTOR, "header button.cmd-trigger")
+PALETTE = (By.CSS_SELECTOR, 'input[role="combobox"]')
+FIRST_HIT = (By.XPATH, "//*[@id='cmd-list']//*[@role='option'][b='ORCL']")
 AGENT_INPUT = (By.CSS_SELECTOR, 'input[aria-label="Ask the research agent"]')
 SEND = (By.CSS_SELECTOR, 'button[type="submit"]')
 SOURCE_ID = "capture:fixture-long"
@@ -414,11 +416,18 @@ def browser(local_ui: UI) -> Iterator[webdriver.Chrome]:
         yield client
 
 
+def search_orcl(browser: webdriver.Chrome) -> WebElement:
+    wait = WebDriverWait(browser, 10)
+    browser.find_element(*SEARCH).click()
+    wait.until(EC.visibility_of_element_located(PALETTE)).send_keys("ORCL")
+    return wait.until(EC.visibility_of_element_located(FIRST_HIT))
+
+
 def test_first_search_result_receives_pointer_click(browser: webdriver.Chrome) -> None:
     wait = WebDriverWait(browser, 10)
-    browser.find_element(*SEARCH).send_keys("ORCL")
-    first = wait.until(EC.visibility_of_element_located(FIRST_HIT))
-    assert first.text == "ORCL Oracle Corporation"
+    first = search_orcl(browser)
+    # The flex row lays out the symbol and name as separate items, so Selenium reads a line break between them.
+    assert " ".join(first.text.split()) == "ORCL Oracle Corporation"
     # The quote strip lives in the footer, so the header dropdown never overlaps it.
     assert browser.execute_script(
         "const hit = arguments[0].getBoundingClientRect();"
@@ -434,14 +443,15 @@ def test_first_search_result_receives_pointer_click(browser: webdriver.Chrome) -
     first.click()  # WebDriver sends a native pointer click, not a synthetic JavaScript click.
     wait.until(EC.text_to_be_present_in_element((By.CSS_SELECTOR, "footer > span:last-child"), "ORCL"))
     assert browser.execute_script("return window.searchPointerTrusted") is True
-    assert browser.find_element(*SEARCH).get_attribute("value") == ""
+    # A palette pick always opens the ticker workspace and closes the palette.
+    wait.until(EC.url_contains("#/workspace/ORCL"))
+    assert not browser.find_elements(*PALETTE)
     assert not browser.find_elements(*FIRST_HIT)
 
 
 def test_agent_request_keeps_question_separate_from_selected_ticker(browser: webdriver.Chrome, local_ui: UI) -> None:
     wait = WebDriverWait(browser, 10)
-    browser.find_element(*SEARCH).send_keys("ORCL")
-    wait.until(EC.visibility_of_element_located(FIRST_HIT)).click()
+    search_orcl(browser).click()
     wait.until(EC.text_to_be_present_in_element((By.CSS_SELECTOR, "footer > span:last-child"), "ORCL"))
     agent_input = browser.find_element(*AGENT_INPUT)
     wait.until(EC.element_to_be_clickable(AGENT_INPUT))
@@ -488,8 +498,7 @@ def test_watchlist_question_sends_actual_watchlist_with_verbatim_prompt(
     wait = WebDriverWait(browser, 10)
     wait.until(lambda b: "SEC" in sources_text(b, "GOOG"))
     drain(local_ui[2])
-    browser.find_element(*SEARCH).send_keys("ORCL")
-    wait.until(EC.visibility_of_element_located(FIRST_HIT)).click()
+    search_orcl(browser).click()
     # Selecting a ticker outside the defaults changes the actual watchlist, so its sources load once more.
     assert local_ui[2].get(timeout=10) == ",".join(["ORCL", *WATCH_DEFAULTS])
     wait.until(EC.element_to_be_clickable(AGENT_INPUT)).send_keys("Summarize the latest filings for my watchlist")
@@ -621,8 +630,7 @@ def test_filings_panel_shows_fund_filing_date_and_provider_error(browser: webdri
     assert "N-CSR - Certified Shareholder Report" in shown
     assert "2026-03-12" not in shown
 
-    browser.find_element(*SEARCH).send_keys("ORCL")
-    wait.until(EC.visibility_of_element_located(FIRST_HIT)).click()
+    search_orcl(browser).click()
     orcl = (By.XPATH, "//div[normalize-space()='FILINGS · ORCL']/..")
     wait.until(EC.text_to_be_present_in_element(orcl, "We could not load this data."))
     panel = browser.find_element(*orcl)

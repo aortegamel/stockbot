@@ -23,7 +23,8 @@ export const widgetLabel = (type: string): string => LABELS[type] ?? type;
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const muted = { color: "var(--muted, #93A0B8)" } as const;
-const cell = { padding: "2px 6px", textAlign: "right" } as const;
+const cell = { padding: "0 8px", height: 28, textAlign: "right" } as const;
+const head = { ...cell, ...muted, fontSize: 12, fontWeight: 500 } as const;
 
 // Month-over-month close returns keyed by UTC year; a second bar in one month (the live bar) replaces the first.
 export function monthlyReturns(candles: Candle[]): Map<number, (number | null)[]> {
@@ -63,12 +64,12 @@ function MonthlyReturns({ sym }: { sym: string }) {
     <>
       <Status error={error ?? data?.error} empty={years.length === 0 ? `No monthly returns for ${sym}. Try asking about its price history.` : null} retry={retry} />
       {years.length > 0 && (
-        <table className="num" aria-label={`${sym} monthly returns`} style={{ fontSize: 12, borderCollapse: "collapse" }}>
-          <thead><tr><th />{MONTHS.map((m) => <th key={m} style={cell}>{m}</th>)}</tr></thead>
+        <table className="num" aria-label={`${sym} monthly returns`} style={{ fontSize: 14, borderCollapse: "collapse" }}>
+          <thead><tr><th />{MONTHS.map((m) => <th key={m} style={head}>{m}</th>)}</tr></thead>
           <tbody>
             {years.map(([year, row]) => (
               <tr key={year}>
-                <th style={cell}>{year}</th>
+                <th style={head}>{year}</th>
                 {row.map((r, i) => (
                   <td key={i} style={{ ...cell, background: r === null ? undefined : `rgba(${r < 0 ? "239,83,80" : "38,166,154"},${Math.min(Math.abs(r) * 4, 0.8)})` }}>
                     {r === null ? "" : pct(r)}
@@ -92,8 +93,8 @@ function SeriesTable({ type, sym, columns }: { type: string; sym: string; column
     <>
       <Status error={error ?? data?.error} empty={rows.length === 0 ? `No ${widgetLabel(type).toLowerCase()} data for ${sym}. Try asking about its latest activity.` : null} retry={retry} />
       {rows.length > 0 && (
-        <table className="num" style={{ fontSize: 12, borderCollapse: "collapse", width: "100%" }}>
-          <thead><tr>{columns.map(([key, label]) => <th key={key} style={cell}>{label}</th>)}</tr></thead>
+        <table className="num" style={{ fontSize: 14, borderCollapse: "collapse", width: "100%" }}>
+          <thead><tr>{columns.map(([key, label]) => <th key={key} style={head}>{label}</th>)}</tr></thead>
           <tbody>
             {rows.map((row, i) => (
               <tr key={i}>
@@ -117,7 +118,7 @@ function FilingsTimeline({ sym }: { sym: string }) {
     <>
       <Status error={error ?? data?.error} empty={items.length === 0 ? `No filings for ${sym}. Try asking about its latest disclosures.` : null} retry={retry} />
       {items.map((f, i) => (
-        <div key={i} style={{ fontSize: 13, marginBottom: 6 }}>
+        <div key={i} style={{ fontSize: 14, marginBottom: 8 }}>
           <span className="num" style={muted}>{f.filed}</span>{" "}
           {f.link ? <a href={f.link} target="_blank" rel="noreferrer" style={{ color: "inherit" }}>{f.title}</a> : f.title}
         </div>
@@ -136,12 +137,12 @@ function Multiples({ sym }: { sym: string }) {
     <>
       <Status error={error ?? d?.error} empty={empty ? `No multiples for ${sym}. Try asking about its earnings.` : null} retry={retry} />
       {d && !error && !d.error && !empty && (
-        <table className="num" style={{ fontSize: 13 }}>
+        <table className="num" style={{ fontSize: 14 }}>
           <tbody>
-            <tr><th style={cell}>Price</th><td style={cell}>{num(d.price)}</td></tr>
-            <tr><th style={cell}>TTM EPS</th><td style={cell}>{num(d.ttm_eps)}</td></tr>
-            <tr><th style={cell}>P/E</th><td style={cell}>{num(d.pe)}</td></tr>
-            <tr><th style={cell}>Earnings yield</th><td style={cell}>{typeof d.earnings_yield === "number" ? pct(d.earnings_yield) : "—"}</td></tr>
+            <tr><th style={head}>Price</th><td style={cell}>{num(d.price)}</td></tr>
+            <tr><th style={head}>TTM EPS</th><td style={cell}>{num(d.ttm_eps)}</td></tr>
+            <tr><th style={head}>P/E</th><td style={cell}>{num(d.pe)}</td></tr>
+            <tr><th style={head}>Earnings yield</th><td style={cell}>{typeof d.earnings_yield === "number" ? pct(d.earnings_yield) : "—"}</td></tr>
           </tbody>
         </table>
       )}
@@ -180,9 +181,9 @@ const WidgetFrame = memo(function WidgetFrame({ widget, expanded, onExpand, onRe
   const label = `${widgetLabel(widget.type)} · ${widget.ticker}`;
   return (
     <section aria-label={label} className={`glass ws-widget${expanded ? " ws-widget-wide" : ""}`}>
-      <header className="ws-widget-bar">
+      <header className="card-head">
         <span>{label}</span>
-        <span>
+        <span className="card-head-actions">
           <Tool label={`Refresh ${label}`} onClick={() => setRev((n) => n + 1)}>↻</Tool>
           <Tool label={`${expanded ? "Collapse" : "Expand"} ${label}`} onClick={() => onExpand(widget.id)}>⤢</Tool>
           <Tool label={`Remove ${label}`} onClick={() => onRemove(widget.id)}>×</Tool>

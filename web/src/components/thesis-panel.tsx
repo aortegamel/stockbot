@@ -23,7 +23,7 @@ const POLL_MS = 60_000;
 const TICKER = /^[A-Za-z]{1,5}$/;
 const muted = "var(--muted, #7A8599)";
 const down = "var(--down, #EF5350)";
-const small = { fontSize: 11 } as const;
+const small = { fontSize: 12 } as const;
 
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, { ...init, headers: { Accept: "application/json" } });
@@ -89,7 +89,7 @@ export function ThesisPanel({ onSelectTicker }: { onSelectTicker: (ticker: strin
   const shown = detail?.thesis_id === openId ? detail : null;
   return (
     <div style={{ background: "var(--panel, #11161F)", border: "1px solid var(--border, #1E2635)", borderRadius: 6, padding: 16 }}>
-      <div style={{ fontSize: 20, letterSpacing: "0.08em", color: "var(--muted, #93A0B8)", marginBottom: 10, fontWeight: 700 }}>THESES</div>
+      <div style={{ fontSize: 12, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--muted, #93A0B8)", marginBottom: 10, fontWeight: 600 }}>THESES</div>
       {error && <div style={{ ...small, color: down }}>{error}</div>}
       {theses.length === 0 && !error && <div style={{ ...small, color: muted }}>no theses yet</div>}
       {theses.map((t) => (
@@ -119,7 +119,7 @@ export function ThesisPanel({ onSelectTicker }: { onSelectTicker: (ticker: strin
                 {t.alerts}
               </span>
             )}
-            <div style={{ color: muted, fontSize: 10 }}>{t.user_thesis.slice(0, 80)}</div>
+            <div style={{ color: muted, fontSize: 12 }}>{t.user_thesis.slice(0, 80)}</div>
           </button>
           {t.thesis_id === openId && shown && (
             <div style={{ ...small, padding: "6px 8px", color: "var(--text, #D5DBE5)" }}>

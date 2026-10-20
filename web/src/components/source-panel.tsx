@@ -107,7 +107,7 @@ function useSourceHighlight(content: React.RefObject<HTMLDivElement | null>, sou
 
 function SourceHeader({ source }: { source: SourceDocument }) {
   return (<>
-    <h3 className="mt-3 text-base font-semibold">{source.title}</h3>
+    <h3 className="mt-3 text-sm font-semibold">{source.title}</h3>
     <p className="mt-1 text-amber-200">{CAPTURE_LABELS[source.captureKind]}</p>
     <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs text-zinc-400">
       <dt>Publisher</dt><dd>{source.publisher || "Not recorded"}</dd>

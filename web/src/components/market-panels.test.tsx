@@ -185,7 +185,7 @@ describe("WatchlistPanel", () => {
     expect(root.textContent).not.toContain("source service offline");
     expect(root.querySelectorAll("button b")).toHaveLength(9);
     expect(root.querySelector("button b")?.parentElement?.textContent).toContain("—");
-    expect(root.firstElementChild?.firstElementChild?.getAttribute("style")).toContain("font-size: 14px");
+    expect(root.firstElementChild?.firstElementChild?.getAttribute("style")).toContain("font-size: 12px");
     const retry = root.querySelector('[role="alert"] button');
     expect(retry?.textContent).toBe("Retry");
     await click(retry!);

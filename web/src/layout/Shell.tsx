@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { AIPanel, watchlistFor } from "../components/market-panels";
 import { HealthDot } from "../components/health-dot";
-import { fetchQuote, searchTickers, type SearchHit } from "../lib/market-data";
+import { fetchQuote } from "../lib/market-data";
 import { parseRoute, routeHash, TICKER_RE, useHashRoute, type Route } from "../lib/route";
 import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
 import { fetchJournal, fetchSnapshot, listSessions, type JournalPage, type ResearchSnapshot } from "../lib/research-client";
@@ -136,8 +136,6 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
   if (selected !== lastSym) setLastSym(selected);
   const [watchlist, setWatchlist] = useState(() => watchlistFor("NVDA"));
   const onWatchlist = useCallback((symbols: string[]) => setWatchlist(symbols), []);
-  const [query, setQuery] = useState("");
-  const [hits, setHits] = useState<SearchHit[]>([]);
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [busy, setBusy] = useState(false);
   const [debug, setDebug] = useState(false);
@@ -252,31 +250,6 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
       clearInterval(id);
     };
   }, [sessionId]);
-  // Any-ticker search: Yahoo validates the symbol, selecting it loads real data.
-  useEffect(() => {
-    const q = query.trim();
-    let alive = true;
-    const ctrl = new AbortController();
-    if (q.length < 2) {
-      const id = setTimeout(() => alive && setHits([]), 0);
-      return () => {
-        alive = false;
-        clearTimeout(id);
-        ctrl.abort();
-      };
-    }
-    const id = setTimeout(() => {
-      searchTickers(q, ctrl.signal)
-        .then((page) => alive && setHits(page.hits.slice(0, 8)))
-        .catch(() => { });
-    }, 250);
-    return () => {
-      alive = false;
-      clearTimeout(id);
-      ctrl.abort();
-    };
-  }, [query]);
-
   // A pick never changes the page. On the workspace it also rewrites the hash.
   // Read the live hash: an agent stream can call pick after the user leaves the workspace.
   function pick(sym: string) {
@@ -284,8 +257,6 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
     if (!clean) return;
     setLastSym(clean);
     if ((parseRoute(window.location.hash) ?? route).page === "workspace") navigate({ page: "workspace", sym: clean });
-    setQuery("");
-    setHits([]);
   }
   function setDrawer(open: boolean) {
     setDrawerState(open);
@@ -399,30 +370,6 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
             {navLink("Feed", { page: "feed" })}
             {debug && navLink("Harness", { page: "harness" })}
           </nav>
-          <span className="search">
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") pick(hits[0]?.sym ?? query);
-                if (e.key === "Escape") {
-                  setQuery("");
-                  setHits([]);
-                }
-              }}
-              placeholder="Search any US ticker…"
-              className="search-input"
-            />
-            {hits.length > 0 && (
-              <div role="listbox" aria-label="Ticker suggestions" className="search-hits">
-                {hits.map((h) => (
-                  <button key={h.sym} role="option" aria-selected="false" onClick={() => pick(h.sym)} className="search-hit">
-                    <b>{h.sym}</b> <span className="search-hit-name">{h.name ?? ""}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </span>
           <CommandBar
             watchlist={watchlist}
             sessions={sessions}
@@ -442,9 +389,12 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
               onClick={() => setDrawer(!drawer)}
               aria-label={drawer ? "Close agent drawer" : "Open agent drawer"}
               aria-expanded={drawer}
-              className="pill"
+              className="icon-btn"
             >
-              {drawer ? ">>" : "<<"}
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5" />
+                <path d="M10 2.75v10.5" />
+              </svg>
             </button>
           </span>
         </span>

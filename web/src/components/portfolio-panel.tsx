@@ -57,65 +57,66 @@ export function PortfolioPanel({ onSelectTicker }: { onSelectTicker: (ticker: st
       .finally(() => setBusy(false));
   };
   if (view === null || (view === undefined && !error)) return null;
-  const cell: React.CSSProperties = { padding: "4px 6px", textAlign: "right" };
+  const cell: React.CSSProperties = { padding: "0 8px", height: 28, textAlign: "right" };
   return (
     <div
       style={{
         background: "var(--panel, #11161F)",
         border: "1px solid var(--border, #1E2635)",
         borderRadius: 6,
-        padding: 16,
         height: "100%",
         minHeight: 0,
         overflowY: "auto",
       }}
     >
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-        <div style={{ fontSize: 20, letterSpacing: "0.08em", color: muted, fontWeight: 700 }}>PORTFOLIO</div>
-        <button type="button" onClick={sync} disabled={busy} style={{ fontSize: 16, cursor: busy ? "wait" : "pointer" }}>
+      <div className="card-head">
+        PORTFOLIO
+        <button type="button" onClick={sync} disabled={busy} className="ghost" style={{ cursor: busy ? "wait" : "pointer" }}>
           {busy ? "Syncing…" : "Sync"}
         </button>
       </div>
-      <div style={{ fontSize: 14, color: muted, marginBottom: 8 }}>
-        {view?.synced_at ? `last sync ${view.synced_at}` : "never synced"}
-        {view?.total_value != null && ` · total ${money(view.total_value)}`}
+      <div style={{ padding: "8px 12px" }}>
+        <div style={{ fontSize: 12, color: muted, marginBottom: 8 }}>
+          {view?.synced_at ? `last sync ${view.synced_at}` : "never synced"}
+          {view?.total_value != null && ` · total ${money(view.total_value)}`}
+        </div>
+        {error && <div style={{ fontSize: 14, color: down, marginBottom: 8 }}>{error}</div>}
+        {view && view.positions.length > 0 && (
+          <table className="num" style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+            <thead>
+              <tr style={{ color: muted, fontSize: 12, fontWeight: 500 }}>
+                <th style={{ ...cell, textAlign: "left" }}>Ticker</th>
+                <th style={cell}>Qty</th>
+                <th style={cell}>Avg cost</th>
+                <th style={cell}>Mkt value</th>
+                <th style={cell}>P/L</th>
+              </tr>
+            </thead>
+            <tbody>
+              {view.positions.map((p, i) => {
+                const gain = p.unrealized_gain === null ? null : Number(p.unrealized_gain);
+                return (
+                  <tr key={i} onClick={() => onSelectTicker(p.ticker)} style={{ cursor: "pointer" }}>
+                    <td style={{ ...cell, textAlign: "left" }}>
+                      <button type="button" style={{ background: "none", border: 0, color: "inherit", font: "inherit", padding: 0, cursor: "pointer" }}>
+                        {p.ticker}
+                      </button>
+                    </td>
+                    <td style={cell}>{p.quantity}</td>
+                    <td style={cell}>{money(p.average_cost)}</td>
+                    <td style={cell}>{money(p.market_value)}</td>
+                    <td style={{ ...cell, color: gain === null ? muted : gain < 0 ? down : up }}>
+                      {money(p.unrealized_gain)}
+                      {p.unrealized_gain_pct !== null && ` (${(Number(p.unrealized_gain_pct) * 100).toFixed(2)}%)`}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+        {view && view.positions.length === 0 && <div style={{ fontSize: 14, color: muted }}>no holdings in the last sync</div>}
       </div>
-      {error && <div style={{ fontSize: 14, color: down, marginBottom: 8 }}>{error}</div>}
-      {view && view.positions.length > 0 && (
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 16 }}>
-          <thead>
-            <tr style={{ color: muted }}>
-              <th style={{ ...cell, textAlign: "left" }}>Ticker</th>
-              <th style={cell}>Qty</th>
-              <th style={cell}>Avg cost</th>
-              <th style={cell}>Mkt value</th>
-              <th style={cell}>P/L</th>
-            </tr>
-          </thead>
-          <tbody>
-            {view.positions.map((p, i) => {
-              const gain = p.unrealized_gain === null ? null : Number(p.unrealized_gain);
-              return (
-                <tr key={i} onClick={() => onSelectTicker(p.ticker)} style={{ cursor: "pointer" }}>
-                  <td style={{ ...cell, textAlign: "left" }}>
-                    <button type="button" style={{ background: "none", border: 0, color: "inherit", font: "inherit", padding: 0, cursor: "pointer" }}>
-                      {p.ticker}
-                    </button>
-                  </td>
-                  <td style={cell}>{p.quantity}</td>
-                  <td style={cell}>{money(p.average_cost)}</td>
-                  <td style={cell}>{money(p.market_value)}</td>
-                  <td style={{ ...cell, color: gain === null ? muted : gain < 0 ? down : up }}>
-                    {money(p.unrealized_gain)}
-                    {p.unrealized_gain_pct !== null && ` (${(Number(p.unrealized_gain_pct) * 100).toFixed(2)}%)`}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      )}
-      {view && view.positions.length === 0 && <div style={{ fontSize: 16, color: muted }}>no holdings in the last sync</div>}
     </div>
   );
 }

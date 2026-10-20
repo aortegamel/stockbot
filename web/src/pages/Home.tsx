@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { PortfolioPanel } from "../components/portfolio-panel";
-import { Briefing, Detail, IndexBand, MarketsTable, Scans, useLoad, View } from "../components/home-panels";
+import { Briefing, Detail, IndexTape, indexSyms, MarketsTable, Scans, SpyChart, useLoad, View } from "../components/home-panels";
 import type { ShellState } from "../layout/Shell";
-import { fetchMarkets, type MarketSort, type ScanDef } from "../lib/market-data";
+import { fetchMarkets, fetchSparklines, type MarketSort, type ScanDef } from "../lib/market-data";
 
 const MAX_ROWS = 200;
 
@@ -10,6 +10,9 @@ export default function Home(s: Pick<ShellState, "watchlist" | "onWatchlist" | "
   const [scan, setScan] = useState<ScanDef | null>(null);
   const [sort, setSort] = useState<MarketSort>("chg_pct");
   const [picked, setPicked] = useState<string | null>(null);
+  // One sparkline request feeds both the SPY chart and the index tape.
+  const idxSyms = indexSyms(s.watchlist);
+  const indexes = useLoad(idxSyms.join(","), (signal) => fetchSparklines(idxSyms, "1d", signal));
   // Custom scans store only a filter: run the watchlist scan over their symbols.
   const custom = scan?.kind === "custom";
   const scanId = custom || !scan ? "watchlist" : scan.id;
@@ -19,8 +22,9 @@ export default function Home(s: Pick<ShellState, "watchlist" | "onWatchlist" | "
   const sel = picked ?? rows[0]?.sym;
   return (
     <div className="page-scroll home">
-      <div className="home-band">
-        <IndexBand watchlist={s.watchlist} />
+      <IndexTape load={indexes} syms={idxSyms.slice(1)} />
+      <div className="home-mid">
+        <SpyChart load={indexes} />
         <Briefing watchlist={s.watchlist} />
       </div>
       <div className="home-grid">
@@ -35,19 +39,20 @@ export default function Home(s: Pick<ShellState, "watchlist" | "onWatchlist" | "
             s.openDrawer();
           }}
         />
-        <section className="glass home-card">
-          <b>Markets · {scan?.name ?? "Watchlist"}</b>
-          <View load={markets} empty={(d) => (d.rows.length || d.errors.length ? null : "No rows for this scan. Try: Ask Stockbot: scan for unusual volume")}>
-            {(d) => (
-              <>
-                {d.errors.length > 0 && (
-                  <p className="home-error" role="alert">
-                    Some market data is unavailable. <button type="button" className="pill" onClick={markets.retry}>Retry</button>
-                  </p>
-                )}
+        <section className="glass home-card home-markets">
+          <header className="card-head">
+            <b>Markets · {scan?.name ?? "Watchlist"}</b>
+            {(markets.data?.errors.length ?? 0) > 0 && (
+              <span className="home-note" role="alert">
+                Some market data is unavailable. <button type="button" className="ghost" onClick={markets.retry}>Retry</button>
+              </span>
+            )}
+          </header>
+          <div className="home-scroll">
+            <View load={markets} empty={(d) => (d.rows.length || d.errors.length ? null : "No rows for this scan. Try: Ask Stockbot: scan for unusual volume")}>
+              {(d) => (
                 <MarketsTable
                   rows={d.rows.slice(0, MAX_ROWS)}
-                  total={d.rows.length}
                   sel={sel}
                   sort={sort}
                   watchlist={s.watchlist}
@@ -56,9 +61,11 @@ export default function Home(s: Pick<ShellState, "watchlist" | "onWatchlist" | "
                   onWatchlist={s.onWatchlist}
                   onRetry={markets.retry}
                 />
-              </>
-            )}
-          </View>
+              )}
+            </View>
+          </div>
+          {/* ponytail: slice at 200 rows; add virtualization if scans grow past that. */}
+          {rows.length > MAX_ROWS && <footer className="home-foot">showing {MAX_ROWS} of {rows.length}</footer>}
         </section>
         <div className="home-right">
           {sel && <Detail sym={sel} />}
