@@ -213,7 +213,7 @@ describe("App terminal shell", () => {
     expect(text(root)).toContain("delayed feed · Yahoo OHLCV");
     expect(text(root)).toContain("select a session for logs");
     expect(findButton(root, "Search or do anything /")).not.toBeNull();
-    expect(root.querySelectorAll("header > input, header > span > input")).toHaveLength(0);
+    expect(root.querySelectorAll("header.app-header input")).toHaveLength(0);
     expect(text(root)).not.toContain("· DEBUG");
     expect(findLink(root, "Harness")).toBeNull();
   });
