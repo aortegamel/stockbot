@@ -81,7 +81,7 @@ body {
 .card-head > :first-child{margin-right:auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 .card-head a{color:var(--text);text-transform:none;letter-spacing:normal;font-weight:500}
 .card-head .num{letter-spacing:normal}
-.card-head-actions{display:inline-flex;align-items:center;gap:2px;flex-shrink:0;text-transform:none}
+.card-head-actions{display:inline-flex;align-items:center;gap:2px;flex-shrink:0;text-transform:none;letter-spacing:normal}
 
 /* Controls: compact flat buttons, one accent primary, hairline inputs. */
 .pill{display:inline-flex;align-items:center;height:var(--h-ctl);padding:0 10px;border:0;border-radius:var(--r-ctl);background:var(--fill);color:var(--text);font:inherit;font-size:var(--fs-body);line-height:1.2;white-space:nowrap;text-decoration:none;cursor:pointer}
