@@ -108,8 +108,11 @@ An inherited `PORT` stays in effect, so `PORT=3101 bun run stockbot` works.
 ## Running research
 
 ```bash
-bun run stockbot
+bun run stockbot   # production build: vite build, then vite preview
+bun run dev        # same launcher with STOCKBOT_WEB_MODE=dev: vite dev server with hot reload
 ```
+
+`STOCKBOT_WEB_MODE` selects the web listener: `prod` (default) or `dev`.
 
 Pi owns model selection and the agent loop; Stockbot exposes its tools and
 security gates over the stdio bridge. `cli.py` remains for admin tasks only
@@ -117,22 +120,31 @@ security gates over the stdio bridge. `cli.py` remains for admin tasks only
 
 ### LAN access
 
-`bun run stockbot` binds three listeners to every IPv4 interface (`0.0.0.0`):
+By default, `bun run stockbot` serves on localhost only. It starts three listeners:
 
-- Vite UI on `PORT` (free-picked from 3000).
-- Bun API on `STOCKBOT_API_PORT` (free-picked above the Vite port).
-- FastAPI market service on `STOCKBOT_MARKET_PORT` (free-picked above the API port).
+- Vite UI on `PORT` (free-picked from 3000), bound to `127.0.0.1`.
+- Bun API on `STOCKBOT_API_PORT` (free-picked above the Vite port), always bound to `127.0.0.1`.
+- FastAPI market service on `STOCKBOT_MARKET_PORT` (free-picked above the API port), always bound to `127.0.0.1`.
 
+The browser reaches the Bun API and the market service only through the Vite `/api/*` proxy.
 The startup log prints each selected port.
-From another device, use the host LAN IP, for example `http://192.168.1.20:3000`.
+
+To open the UI from another device on your network, set a token:
+
+```bash
+STOCKBOT_LAN=1 STOCKBOT_LAN_TOKEN=<long random string> bun run stockbot
+```
+
+With `STOCKBOT_LAN=1`, the Vite UI binds every IPv4 interface (`0.0.0.0`).
+The launcher exits with an error when `STOCKBOT_LAN_TOKEN` is empty.
+On each device, open `http://<host LAN IP>:<PORT>/?token=<token>` once.
+Vite stores the token in an HttpOnly cookie and removes it from the address bar.
+After that, every `/api/*` request must carry the cookie or an `x-stockbot-token` header, else it gets HTTP 401.
 Find the host LAN IP with `ip -4 addr` on Linux.
 `0.0.0.0` is a bind address, not a client address. Do not put it in a browser.
-Each service also answers health checks directly, for example `http://192.168.1.20:3001/api/health`.
 
-These endpoints have no login protection.
-Anyone who can reach the host can use the UI, run research, and read market and research data.
-Run Stockbot only on a trusted network.
-Do not forward these ports through a router or expose them to the internet.
+The token travels over plain HTTP. Use LAN mode only on a trusted network.
+Do not forward the port through a router or expose it to the internet.
 
 ## Running tests
 ```bash

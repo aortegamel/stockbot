@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { redactArgs, type AgentEvent, type FailureCategory } from "../../../needle-harness/lib/agent/types";
 
 const LIMIT = "The research reached its work limit before it finished.";
@@ -14,6 +15,98 @@ const FAILURE_TEXT: Record<FailureCategory, string> = {
   model_error: MODEL, model_output_failure: MODEL, provider_error: MODEL, synthesis_failed: MODEL, committee_deadlock: MODEL,
   no_evidence: "No evidence was found for this question.",
 };
+
+export function failureText(category: FailureCategory): string {
+  return FAILURE_TEXT[category] ?? MODEL;
+}
+
+// Prod step text: one plain line per needle catalog tool (.needle-catalog.json). Debug shows the raw name.
+const TOOL_PHRASES: Record<string, string> = {
+  get_fundamentals: "Read a reported fundamental", find_sec_entities: "Looked up the company at the SEC",
+  find_sec_entities_bounded: "Looked up the company at the SEC", search_sec_filings: "Searched SEC filings",
+  search_sec_filings_bounded: "Searched SEC filings", list_sec_filings: "Listed SEC filings",
+  search_sec_relationships: "Checked ownership and deal links", get_sec_search_coverage: "Checked SEC data coverage",
+  get_sec_filing: "Read an SEC filing record", list_sec_documents: "Listed filing documents", get_sec_document: "Read SEC filing",
+  diff_sec_filings: "Compared SEC filings", get_material_events: "Read recent material events",
+  get_beneficial_ownership: "Read major shareholder stakes", get_ownership_changes: "Compared shareholder stakes",
+  get_insider_activity: "Read insider trades", get_planned_insider_sales: "Read planned insider sales",
+  get_offering_history: "Read offering history", get_dilution_profile: "Calculated dilution",
+  get_governance_events: "Read governance filings", get_transaction_status: "Read deal filings",
+  get_short_pressure_profile: "Checked short pressure", get_recent_ownership_filings: "Read recent ownership filings",
+  diff_risk_factors: "Compared risk factors", get_financial_statements: "Read financial statements",
+  get_xbrl_facts: "Read a reported financial fact", get_short_interest: "Read short interest",
+  get_short_interest_leaderboard: "Read the most-shorted list", get_reg_sho_volume: "Read short-sale volume",
+  get_threshold_securities: "Read threshold securities", get_analyst_estimates: "Read analyst estimates",
+  get_sp500_weight: "Read the S&P 500 weight", get_obligations: "Read future obligations",
+  get_valuation_metrics: "Calculated valuation multiples", list_finra_datasets: "Listed FINRA datasets",
+  describe_finra_dataset: "Read a FINRA dataset description", get_finra_datapoints: "Read FINRA data",
+  query_finra: "Analyzed FINRA data", search_web: "Searched the web",
+  thesis_create: "Saved a thesis", thesis_show: "Read a thesis", thesis_refine: "Updated a thesis",
+  thesis_watch: "Checked thesis watch rules", thesis_journal: "Added a thesis note", thesis_status: "Changed thesis monitoring",
+  research_start: "Started a research session", research_resume: "Resumed a research session",
+  research_status: "Checked research status", research_cancel: "Cancelled a research session",
+  research_read: "Read saved research", research_read_search: "Read saved search results",
+  research_add_evidence: "Recorded a finding", research_submit_source_result: "Completed a source check",
+  research_add_analysis: "Recorded an analysis", research_finalize: "Finalized the research",
+  find_alternative_signals: "Read alternative signals", get_trend_evidence: "Read search trends",
+  investigate_social_arbitrage_candidate: "Checked a trend candidate", get_macro_context: "Read macro data",
+  search_company_patents: "Searched company patents", get_current_time: "Checked the current time",
+  set_chart_symbol: "Changed the chart", update_watchlist: "Updated the watchlist",
+};
+// Worker progress stages (app/research/kernel_worker.py) plus the kernel's evidence_gap.
+const STAGE_PHRASES: Record<string, string> = {
+  session: "Opened a research session", intake_start: "Started gathering sources", intake_done: "Gathered first sources",
+  intake_evidence: "Reviewed first evidence", reasoner_start: "Planned the research", reasoner_retry: "Re-planned the research",
+  reasoner_done: "Finished the plan", nodes_done: "Finished the research steps", evidence_gap: "Looked for missing evidence",
+};
+
+type Step = Extract<AgentEvent, { type: "tool_start" | "progress" }>;
+
+function stepLine(step: Step, debug: boolean): string {
+  if (step.type === "tool_start") return debug ? step.tool : TOOL_PHRASES[step.tool] ?? "Used a research tool";
+  return debug ? step.stage : STAGE_PHRASES[step.stage] ?? "Worked on the research";
+}
+
+// ponytail: events carry no timestamps, so the first render that sees an event stamps it.
+const SEEN_AT = new WeakMap<AgentEvent, number>();
+function seenAt(event: AgentEvent): number {
+  const at = SEEN_AT.get(event) ?? Date.now();
+  SEEN_AT.set(event, at);
+  return at;
+}
+
+// One live line while the run works, one summary line after it ends; the steps fold out below.
+export function WorkRow({ events, debug }: { events: AgentEvent[]; debug: boolean }) {
+  const [, tick] = useState(0);
+  const terminal = events.find((e) => e.type === "done" || e.type === "error" || e.type === "failed");
+  const live = terminal === undefined;
+  const steps = events.filter((e): e is Step => e.type === "tool_start" || e.type === "progress");
+  const ticking = live && steps.length > 0;
+  useEffect(() => {
+    if (!ticking) return;
+    const id = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [ticking]);
+  if (steps.length === 0) return null;
+  const count = `${steps.length} ${steps.length === 1 ? "step" : "steps"}`;
+  const start = seenAt(events[0]);
+  const label = live
+    ? `Working · ${count} · ${Math.max(0, Math.floor((Date.now() - start) / 1000))}s`
+    : `Worked for ${Math.round((terminal.type === "done" ? terminal.metrics.totalMs : seenAt(terminal) - start) / 1000)}s · ${count}`;
+  // The early brief streams over the intake rows; the full answer follows it.
+  const briefing = live && events.some((e) => e.type === "answer_delta") && steps.some((e) => e.type === "progress" && e.stage === "intake_evidence");
+  return (
+    <div className="pt-2 text-xs text-zinc-400">
+      {briefing && <div>Full answer coming…</div>}
+      <details>
+        <summary className="cursor-pointer">{label}</summary>
+        <ol className="pl-4 text-zinc-500">
+          {steps.map((step, i) => <li key={i}>{stepLine(step, debug)}</li>)}
+        </ol>
+      </details>
+    </div>
+  );
+}
 
 function FailureView({ text, onRetry }: { text: string; onRetry?: () => void }) {
   return (
@@ -102,7 +195,7 @@ export function AgentEventView({ event, debug = false, onRetry }: { event: Agent
       // Transport-level text (request failed, stalled, ended early): bounded client prose, not a stack.
       return <FailureView text={event.message} onRetry={onRetry} />;
     case "failed":
-      return debug ? <div className="text-red-400">✗ {event.category}: {event.message}</div> : <FailureView text={FAILURE_TEXT[event.category] ?? MODEL} onRetry={onRetry} />;
+      return debug ? <div className="text-red-400">✗ {event.category}: {event.message}</div> : <FailureView text={failureText(event.category)} onRetry={onRetry} />;
     default:
       return <WorkEventView event={event} />;
   }

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+import app.config  # noqa: F401 — loads the repo root .env before any os.environ read.
 from app.research.evidence import evidence_domain
 
 GOLDEN_SCENARIO = "hedgefund-growth-thesis-multisource"

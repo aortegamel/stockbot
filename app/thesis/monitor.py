@@ -20,12 +20,16 @@ feeds, out of scope here).
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import re
+import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypedDict
+from urllib.parse import urlsplit
 
 from app.thesis.models import Checkpoint, JSONValue, Thesis, Trigger, WatchRule
 from app.thesis.repository import ThesisRepository
@@ -34,6 +38,8 @@ from app.thesis.yaml import load_raw_yaml, thesis_lock
 
 if TYPE_CHECKING:
     from app.sec.models import Filing, RegulatoryEvent
+
+logger = logging.getLogger(__name__)
 
 _MAX_DUP_MARKERS = 1_000
 # ponytail: recent-hash markers capped at newest 1_000; stable per-source
@@ -207,7 +213,7 @@ def _filing_to_event(target: str, filing: Filing, *, known_at: str, source: str)
         content_hash=_digest(ref, summary, ka),
         cursor=_day(ka) or None,
         file_id=filing.accession_no,
-        metadata={"amendment": _filing_is_amendment(filing), "form": filing.form},
+        metadata={"amendment": _filing_is_amendment(filing), "form": filing.form, "link": filing.source},
     )
 
 
@@ -1149,6 +1155,24 @@ def _advance_checkpoint(
     return checkpoint
 
 
+def _ntfy(thesis: Thesis, trig: Trigger) -> None:
+    """Best-effort phone push of one new trigger to $NTFY_TOPIC_URL (http/https); never raises."""
+    url = os.environ.get("NTFY_TOPIC_URL", "").strip()
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return
+    link = trig.metadata.get("link")
+    headers = {"Title": f"{thesis.slug}: {trig.trigger_type}"}
+    if isinstance(link, str) and link.startswith(("http://", "https://")):
+        headers["Click"] = link
+    body = f"{trig.summary}\n{headers.get('Click') or ', '.join(trig.canonical_refs)}"
+    req = urllib.request.Request(url, data=body.encode(), headers=headers, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=5).close()
+    except Exception:  # intentional best-effort boundary: a failed push never aborts a tick
+        logger.warning("ntfy push failed for %s", trig.trigger_id, exc_info=True)
+
+
 def tick(
     repository: ThesisRepository,
     thesis_id: str,
@@ -1193,6 +1217,8 @@ def tick(
             queried_ok,
         )
     created, new_hashes = _persist_triggers(repository, tid, grouped, seen_refs, seen_hashes)
+    for trig in created:
+        _ntfy(thesis, trig)
     runs = _run_pending(repository, tid, cutoff)
     checkpoint = _advance_checkpoint(repository, tid, checkpoint, sources, pending_states, new_hashes, cutoff)
     no_op = not created and not runs

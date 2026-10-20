@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { makeEvidence } from "../agent/evidence";
 import { parseTicker } from "../agent/kernel";
-import { sourceReferences } from "../agent/types";
+import { sourceReferences, WIDGET_TYPES } from "../agent/types";
 import type { FailureCategory, ToolResult } from "../agent/types";
 const ROOT = process.cwd().endsWith("needle-harness")
   ? process.cwd().replace(/\/needle-harness$/, "")
@@ -10,7 +10,7 @@ const ROOT = process.cwd().endsWith("needle-harness")
 const BRIDGE_CMD = `${ROOT}/venv/bin/python`;
 const BRIDGE_ARGS = [`${ROOT}/scripts/tool_bridge.py`];
 
-type BridgeResultMeta = { source_handle?: unknown; source_refs?: unknown; sources?: unknown; chart_selection?: unknown; watchlist_update?: unknown };
+type BridgeResultMeta = { source_handle?: unknown; source_refs?: unknown; sources?: unknown; chart_selection?: unknown; watchlist_update?: unknown; widget_selection?: unknown };
 type BridgeReply = {
   id?: unknown;
   result?: { content?: unknown; error?: unknown; error_type?: unknown; meta?: BridgeResultMeta };
@@ -227,6 +227,15 @@ function watchlistUpdate(meta: BridgeResultMeta | undefined): Record<string, unk
   return candidate;
 }
 
+function widgetSelection(meta: BridgeResultMeta | undefined): Record<string, unknown> | undefined {
+  const selection = meta?.widget_selection;
+  if (!selection || typeof selection !== "object" || Array.isArray(selection)) return undefined;
+  const candidate = selection as Record<string, unknown>;
+  if (Object.keys(candidate).length !== 3 || candidate.result_type !== "widget_selection" || typeof candidate.widget_type !== "string" || !WIDGET_TYPES.includes(candidate.widget_type)) return undefined;
+  if (typeof candidate.ticker !== "string" || parseTicker(candidate.ticker) !== candidate.ticker) return undefined;
+  return candidate;
+}
+
 function succeeded(name: string, result: BridgeResult): ToolResult {
   const { sourceHandle, sourceRefs, sources } = replyMeta(result.meta);
   const evidence = makeEvidence(name, replyContent(result), {
@@ -238,11 +247,13 @@ function succeeded(name: string, result: BridgeResult): ToolResult {
   if (refs.length) evidence.sources = refs;
   const selection = name === "set_chart_symbol" ? chartSelection(result.meta) : undefined;
   const update = name === "update_watchlist" ? watchlistUpdate(result.meta) : undefined;
+  const widget = name === "add_widget" ? widgetSelection(result.meta) : undefined;
   return {
     ok: true,
     evidence,
     ...(selection !== undefined ? { chartSelection: selection } : {}),
     ...(update !== undefined ? { watchlistUpdate: update } : {}),
+    ...(widget !== undefined ? { widgetSelection: widget } : {}),
   };
 }
 

@@ -8006,7 +8006,7 @@ def test_service_finra_citation_keys_and_tool_gate(tmp_path: Path, monkeypatch: 
 
 
 def test_service_record_ownership_pins_session_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stored rows keep the caller session/job, claim, and default id prefix; events name the job."""
+    """Stored rows keep the caller session/job, claim, and short default id; events name the job."""
     from app.research import service as _svc
 
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
@@ -8026,7 +8026,7 @@ def test_service_record_ownership_pins_session_job(tmp_path: Path, monkeypatch: 
         {k: v for k, v in _svc_item("unused", passage="An unclaimed passage").items() if k != "evidence_id"},
         repo=repo,
     )
-    assert str(defaulted["evidence_id"]).startswith(f"{sid}:ev:")
+    assert str(defaulted["evidence_id"]).startswith("ev:")
     accepted = [e for e in repo.list_events(sid) if e.event_type == "evidence.accepted"]
     assert accepted and all(e.payload.get("job_id") == src for e in accepted)
     cov = _absence_cov()

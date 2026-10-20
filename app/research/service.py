@@ -1475,13 +1475,16 @@ def _live_evidence_job(store: ResearchRepository, session_id: str, job_id: str):
     return found, job
 
 
-def _evidence_id_name(data: Mapping[str, object], session_id: str, job: Job) -> tuple[str, str]:
+def _evidence_id_name(data: Mapping[str, object], job: Job) -> tuple[str, str]:
     """Coerce evidence_id + source_name with job fallbacks."""
+    # Short ids: the session link lives in the row's session_id column, not the
+    # id. Models cite the full bracketed id verbatim; a session prefix gets
+    # truncated and breaks every exact-match (chips, gates, counters).
     evidence_id_raw = data.get("evidence_id")
     evidence_id = (
         evidence_id_raw
         if isinstance(evidence_id_raw, str) and evidence_id_raw.strip()
-        else f"{session_id}:ev:{uuid.uuid4().hex[:8]}"
+        else f"ev:{uuid.uuid4().hex[:12]}"
     )
     source_name_raw = data.get("source_name", data.get("source", job.source_domain or "pi"))
     source_name = source_name_raw if isinstance(source_name_raw, str) and source_name_raw.strip() else "pi"
@@ -1493,11 +1496,9 @@ def _str_tuple(raw: object) -> tuple[str, ...]:
     return tuple(s for s in raw if isinstance(s, str)) if isinstance(raw, (list, tuple)) else ()
 
 
-def _evidence_ids_names(
-    data: Mapping[str, object], session_id: str, job: Job
-) -> tuple[str, str, tuple[str, ...], tuple[str, ...]]:
+def _evidence_ids_names(data: Mapping[str, object], job: Job) -> tuple[str, str, tuple[str, ...], tuple[str, ...]]:
     """Coerce evidence_id/source_name/supports/contradicts with job fallbacks."""
-    evidence_id, source_name = _evidence_id_name(data, session_id, job)
+    evidence_id, source_name = _evidence_id_name(data, job)
     return evidence_id, source_name, _str_tuple(data.get("supports", ())), _str_tuple(data.get("contradicts", ()))
 
 
@@ -2003,7 +2004,7 @@ def record_evidence(
     content, claim = _evidence_content(data)
     wave = _evidence_wave(data, job.wave_id)
     _evidence_live_wave(found, job, session_id)
-    evidence_id, source_name, supports, contradicts = _evidence_ids_names(data, session_id, job)
+    evidence_id, source_name, supports, contradicts = _evidence_ids_names(data, job)
     metadata, subject = _evidence_typed(data, found)
     observed = _observed_provenance(data, job, store=store, session_id=session_id, as_of=found.as_of)
     provenance = observed.provenance if isinstance(observed, MaterializedEvidenceSource) else observed

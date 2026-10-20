@@ -1,8 +1,16 @@
+// This import must stay first: it installs the jsdom globals (see test-dom.ts).
+import { dom } from "../test-dom";
 import { describe, expect, test } from "bun:test";
+import { act } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { JSDOM } from "jsdom";
 import { AgentConsole } from "./agent-console";
+import { SEEN_ALERTS_KEY, toastAlert } from "./toasts";
+import type { FeedItem } from "../lib/market-data";
 import type { AgentEvent, Metrics } from "../../../needle-harness/lib/agent/types";
+
+// react-dom reads canUseDOM once at module load, so it must load after the jsdom globals exist.
+const { createRoot } = await import("react-dom/client");
 
 function metrics(): Metrics {
   return {
@@ -127,13 +135,16 @@ describe("AgentConsole event presentation", () => {
       { type: "tool_result", tool: "ownership", preview: "No ownership evidence" },
       { type: "tool_failed", tool: "web", category: "timeout", preview: "Search deadline expired" },
     ];
-    expect(rows(events, false)).toEqual([
+    const debugRows = rows(events, false);
+    expect(debugRows.slice(0, 4)).toEqual([
       "├─ filings…",
       "├─ filings / ✓ ev-7 — Annual report captured",
       "├─ ownership / ✗ — No ownership evidence",
       "├─ web / ✗ timeout — Search deadline expired",
     ]);
-    expect(rows(events, false, false)).toEqual([]);
+    // The show-work row follows: debug keeps the raw tool name, prod shows only the plain line.
+    expect(debugRows[4]).toBe("Working · 1 step · 0sfilings");
+    expect(rows(events, false, false)).toEqual(["Working · 1 step · 0sUsed a research tool"]);
   });
 
   test("debug progress shows optional detail and limits long detail to 160 characters", () => {
@@ -148,7 +159,10 @@ describe("AgentConsole event presentation", () => {
     expect(rendered[2]).toBe(`├─ long preview {"text":"${"x".repeat(151)}`);
     expect(rendered[2].slice("├─ long preview ".length)).toHaveLength(160);
     expect(rendered[2]).not.toContain("must not appear");
-    expect(rows(events, false, false)).toEqual([]);
+    const production = rows(events, false, false);
+    expect(production).toHaveLength(1);
+    expect(production[0]).toStartWith("Working · 3 steps");
+    expect(production[0]).not.toContain("archive");
   });
 
   test("reasoning appears once while streaming and disappears when reasoning stops or a terminal row arrives", () => {
@@ -220,23 +234,26 @@ describe("AgentConsole event presentation", () => {
       { type: "evidence", evidence: [] },
     ];
     const debug = rows(events);
-    expect(debug).toHaveLength(9);
+    expect(debug).toHaveLength(10);
     expect(debug[0]).toBe("> Research request");
     expect(debug[1]).toContain("needle / filings / confidence 50%");
     expect(debug[2]).toBe("├─ filings…");
     expect(debug[3]).toBe("├─ filings / ✓ ev-1 — Report found");
     expect(debug[4]).toBe("├─ archive saved");
     expect(debug[5]).toBe("First second.");
-    expect(debug[6]).toContain("── metrics ──");
-    expect(debug[7]).toBe("✗ Connection closed");
-    expect(debug[8]).toBe("✗ tool_error: Provider failed");
+    expect(debug[6]).toBe("Worked for 0s · 2 stepsfilingsarchive saved");
+    expect(debug[7]).toContain("── metrics ──");
+    expect(debug[8]).toBe("✗ Connection closed");
+    expect(debug[9]).toBe("✗ tool_error: Provider failed");
     const production = rows(events, true, false);
-    expect(production).toHaveLength(5);
+    expect(production).toHaveLength(6);
     expect(production[0]).toBe("> Research request");
     expect(production[1]).toBe("First second.");
-    expect(production[2]).toContain("── metrics ──");
-    expect(production.slice(3)).toEqual(["✗ Connection closed", "✗ A data source failed while answering."]);
+    expect(production[2]).toBe("Worked for 0s · 2 stepsUsed a research toolWorked on the research");
+    expect(production[3]).toContain("── metrics ──");
+    expect(production.slice(4)).toEqual(["✗ Connection closed", "✗ A data source failed while answering."]);
     expect(production.join("")).not.toContain("needle /");
+    expect(production.join("")).not.toContain("filings");
     expect(production.join("")).not.toContain("Report found");
     expect(production.join("")).not.toContain("archive saved");
   });
@@ -262,5 +279,170 @@ describe("AgentConsole trio offer", () => {
   test("no offer before the answer is final or without an offer event", () => {
     expect(html(offered.slice(0, 3))).not.toContain("trio team");
     expect(html(offered.filter((e) => e.type !== "offer_trio"))).not.toContain("trio team");
+  });
+});
+
+describe("AgentConsole show-work row", () => {
+  const work: AgentEvent[] = [
+    { type: "agent_start", prompt: "NVDA risks?" },
+    { type: "progress", stage: "intake_start", detail: { calls: 2 } },
+    { type: "needle_decision", step: 1, tool: "get_sec_document", arguments: {}, confidence: 0.9 },
+    { type: "tool_start", tool: "get_sec_document" },
+    { type: "tool_result", tool: "get_sec_document", evidenceId: "ev-1", preview: "Risk factors" },
+    { type: "tool_start", tool: "search_web" },
+  ];
+
+  function row(events: AgentEvent[], debug = false): { summary: string; steps: string[]; text: string } {
+    const page = new JSDOM(html(events, false, debug));
+    try {
+      const details = page.window.document.querySelector("details");
+      return {
+        summary: details?.querySelector("summary")?.textContent ?? "",
+        steps: [...(details?.querySelectorAll("li") ?? [])].map((li) => li.textContent ?? ""),
+        text: page.window.document.body.textContent ?? "",
+      };
+    } finally {
+      page.window.close();
+    }
+  }
+
+  test("the live line counts tool and progress steps", () => {
+    expect(row(work).summary).toMatch(/^Working · 3 steps · \d+s$/);
+    expect(row(work.slice(0, 2)).summary).toMatch(/^Working · 1 step · \d+s$/);
+    expect(row(work.slice(0, 1)).summary).toBe("");
+  });
+
+  test("the collapsible lists plain phrases in prod and raw names only in debug", () => {
+    const prod = row(work);
+    expect(prod.steps).toEqual(["Started gathering sources", "Read SEC filing", "Searched the web"]);
+    for (const raw of ["get_sec_document", "search_web", "intake_start"]) expect(prod.text).not.toContain(raw);
+    expect(row(work, true).steps).toEqual(["intake_start", "get_sec_document", "search_web"]);
+  });
+
+  test("the done line reads the run time from the done metrics", () => {
+    const done: AgentEvent = { type: "done", metrics: { ...metrics(), totalMs: 12_400, timings: { intakeMs: 3_000, nodesMs: 8_000 } } };
+    expect(row([...work, done]).summary).toBe("Worked for 12s · 3 steps");
+  });
+
+  test("the early brief shows Full answer coming… under it until the run ends", () => {
+    const briefed: AgentEvent[] = [...work, { type: "progress", stage: "intake_evidence" }, { type: "answer_delta", text: "Brief view." }];
+    const out = rows(briefed, false, false);
+    expect(out.slice(-2)).toEqual(["Brief view.", expect.stringMatching(/^Full answer coming…Working · 4 steps · \d+s/)]);
+    expect(html([...briefed, { type: "done", metrics: metrics() }], false)).not.toContain("Full answer coming");
+    expect(html(work, false)).not.toContain("Full answer coming");
+  });
+});
+
+describe("AgentConsole result cards", () => {
+  test("chart, watchlist, and saved-thesis events render cards with the workspace link", () => {
+    const events: AgentEvent[] = [
+      { type: "agent_start", prompt: "show NVDA" },
+      { type: "chart_update", ticker: "NVDA" },
+      { type: "watchlist_update", action: "remove", ticker: "AMD" },
+      { type: "tool_result", tool: "thesis_create", evidenceId: "ev-9", preview: "created" },
+      { type: "tool_result", tool: "thesis_create", preview: "failed" },
+      { type: "answer_delta", text: "Done." },
+      { type: "done", metrics: metrics() },
+    ];
+    const page = new JSDOM(html(events));
+    try {
+      const cards = [...page.window.document.querySelectorAll('[aria-label="Results"] > div')];
+      expect(cards.map((card) => card.textContent)).toEqual(["Chart set to NVDAOpen workspace", "Removed AMD from the watchlistOpen workspace", "Thesis saved"]);
+      expect(cards.map((card) => card.querySelector("a")?.getAttribute("href"))).toEqual(["#/workspace/NVDA", "#/workspace/AMD", undefined]);
+    } finally {
+      page.window.close();
+    }
+    expect(html(events.filter((e) => e.type !== "chart_update" && e.type !== "watchlist_update" && e.type !== "tool_result"))).not.toContain('aria-label="Results"');
+  });
+
+  test("a thesis_watch add renders an alert card whose button asks for notifications once", async () => {
+    const added = "thesis_id: thesis:1\nadded: rule_id: rule:1, rule_type: material_short_interest_change, enabled: True";
+    const events: AgentEvent[] = [
+      { type: "agent_start", prompt: "alert me when NVDA short interest changes" },
+      { type: "tool_result", tool: "thesis_watch", evidenceId: "ev-1", preview: added },
+      { type: "tool_result", tool: "thesis_watch", evidenceId: "ev-2", preview: "thesis_id: thesis:1\nrules: rule_type: new_filing" },
+      { type: "tool_result", tool: "thesis_watch", preview: added },
+    ];
+    const registry = globalThis as Record<string, unknown>;
+    const asked: string[] = [];
+    registry.Notification = { permission: "default", requestPermission: async () => { asked.push("ask"); return "granted"; } };
+    const container = dom.window.document.getElementById("root");
+    if (!container) throw new Error("missing test root");
+    const root = createRoot(container);
+    try {
+      await act(async () => root.render(<AgentConsole events={events} reasoning={false} debug={false} />));
+      const cards = () => [...container.querySelectorAll('[aria-label="Results"] > div')].map((card) => card.textContent);
+      expect(cards()).toEqual(["Alert set: material short interest changeEnable notifications"]);
+      const enable = [...container.querySelectorAll("button")].find((b) => b.textContent === "Enable notifications");
+      await act(async () => enable?.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true })));
+      expect(asked).toEqual(["ask"]);
+      expect(cards()).toEqual(["Alert set: material short interest change"]);
+      delete registry.Notification;
+      expect(html(events)).not.toContain("Enable notifications");
+    } finally {
+      delete registry.Notification;
+      await act(async () => root.unmount());
+    }
+  });
+});
+
+describe("AgentConsole toasts", () => {
+  test("an error event fires a toast whose Try again reruns the request", async () => {
+    const container = dom.window.document.getElementById("root");
+    if (!container) throw new Error("missing test root");
+    const root = createRoot(container);
+    let retried = 0;
+    try {
+      await act(async () => root.render(<AgentConsole events={[{ type: "agent_start", prompt: "q" }, { type: "error", message: "request failed: 502" }]} reasoning={false} debug={false} onRetry={() => { retried += 1; }} />));
+      const stack = dom.window.document.body.querySelector('[aria-label="Notifications"]');
+      expect(stack?.textContent).toBe("✗ The request failed. Please retry.Try again");
+      const retry = [...(stack?.querySelectorAll("button") ?? [])].find((b) => b.textContent === "Try again");
+      await act(async () => retry?.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true })));
+      expect(retried).toBe(1);
+      expect(dom.window.document.body.querySelector('[aria-label="Notifications"]')).toBeNull();
+      await act(async () => root.render(<AgentConsole events={[{ type: "agent_start", prompt: "q" }, { type: "chart_update", ticker: "AAPL" }]} reasoning={false} debug={false} />));
+      expect(dom.window.document.body.querySelector('[aria-label="Notifications"]')?.textContent).toBe("Chart set to AAPLOpen workspace");
+    } finally {
+      await act(async () => root.unmount());
+    }
+  });
+});
+
+describe("toastAlert", () => {
+  const alert = (id: string): FeedItem => ({ id, kind: "alert", title: `8-K filed by NVDA ${id}`, at: "2026-10-20T00:00:00Z", source: "thesis:nvda" });
+  const toasts = () => [...dom.window.document.querySelectorAll('[aria-label="Alerts"] > div')].map((t) => t.textContent);
+
+  test("an unseen alert id toasts once, marks the seen key, and notifies only when granted", () => {
+    const registry = globalThis as Record<string, unknown>;
+    const shown: { title: string; body?: string }[] = [];
+    let permission = "denied";
+    registry.localStorage = dom.window.localStorage;
+    registry.Notification = class {
+      static get permission() { return permission; }
+      constructor(title: string, options?: { body?: string }) { shown.push({ title, body: options?.body }); }
+    };
+    dom.window.localStorage.setItem(SEEN_ALERTS_KEY, JSON.stringify(["old"]));
+    try {
+      toastAlert(alert("old"));
+      toastAlert({ ...alert("news-1"), kind: "news" });
+      expect(toasts()).toEqual([]);
+      toastAlert(alert("a"));
+      toastAlert(alert("a"));
+      expect(toasts()).toEqual(["Alert: 8-K filed by NVDA a"]);
+      expect(shown).toEqual([]);
+      expect(JSON.parse(dom.window.localStorage.getItem(SEEN_ALERTS_KEY) ?? "[]")).toEqual(["old", "a"]);
+      permission = "granted";
+      toastAlert(alert("b"));
+      expect(shown).toEqual([{ title: "8-K filed by NVDA b", body: "thesis:nvda" }]);
+      dom.window.localStorage.clear();
+      delete registry.localStorage;
+      toastAlert(alert("c"));
+      toastAlert(alert("c"));
+      expect(toasts()).toEqual(["Alert: 8-K filed by NVDA a", "Alert: 8-K filed by NVDA b", "Alert: 8-K filed by NVDA c"]);
+    } finally {
+      delete registry.localStorage;
+      delete registry.Notification;
+      dom.window.document.querySelector('[aria-label="Alerts"]')?.remove();
+    }
   });
 });

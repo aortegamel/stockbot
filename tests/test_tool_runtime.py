@@ -765,6 +765,42 @@ def test_success_meta_withholds_invalid_watchlist_receipt(name: str, status: str
     assert "watchlist_update" not in out
 
 
+def test_execute_add_widget_returns_normalized_receipt_meta(tmp_path: Path) -> None:
+    out = execute_agent_tool(
+        "add_widget",
+        {"type": "insider", "ticker": " nvda "},
+        RuntimeToolSession(session_id="gw-widget"),
+        data_root=tmp_path,
+    )
+
+    meta = out["meta"]
+    assert isinstance(meta, dict) and meta["status"] == "completed"
+    assert meta["widget_selection"] == {"result_type": "widget_selection", "widget_type": "insider", "ticker": "NVDA"}
+    assert "watchlist_update" not in meta
+
+
+@pytest.mark.parametrize(
+    ("name", "status", "result"),
+    [
+        pytest.param("update_watchlist", "completed", {}, id="other-tool"),
+        pytest.param("add_widget", "failed", {}, id="failed"),
+        pytest.param("add_widget", "completed", {"result_type": "watchlist_update"}, id="wrong-result-type"),
+        pytest.param("add_widget", "completed", {"widget_type": "heatmap"}, id="widget-type"),
+        pytest.param("add_widget", "completed", {"ticker": "NVDA!"}, id="ticker"),
+        pytest.param("add_widget", "completed", {"ticker": ""}, id="blank"),
+        pytest.param("add_widget", "completed", {"error": None}, id="error"),
+        pytest.param("add_widget", "completed", {"error_type": "x"}, id="error-type"),
+    ],
+)
+def test_success_meta_withholds_invalid_widget_receipt(name: str, status: str, result: dict[str, object]) -> None:
+    from app.security.context_gateway import envelope_for_tool
+
+    receipt: dict[str, object] = {"result_type": "widget_selection", "widget_type": "news", "ticker": "NVDA", **result}
+    out = rt._success_meta(name, receipt, rt._tool_result_meta(receipt), envelope_for_tool(name, receipt), status)
+
+    assert "widget_selection" not in out
+
+
 def test_success_meta_copies_discovery_names_and_paging_fields_only() -> None:
     from app.security.context_gateway import envelope_for_tool
 

@@ -5,14 +5,15 @@ import { WatchlistPanel, watchlistFor } from "./market-panels";
 const TICKER_RE = /^[A-Z][A-Z0-9.\-]{0,9}$/;
 const ORGANIZATIONS: Record<string, true> = { FINRA: true, SEC: true, NYSE: true, NASDAQ: true, OTC: true, EDGAR: true, SHO: true, REG: true };
 
-// The list lives only in this mounted terminal, like the chart selection.
-export function WatchlistChatPanel({ selected, onSelect, events, onChange }: {
+// `symbols` seeds the list from the app-wide watchlist; agent changes report back through onChange.
+export function WatchlistChatPanel({ selected, onSelect, events, onChange, symbols: seed }: {
   selected: string;
   onSelect: (ticker: string) => void;
   events: AgentEvent[];
   onChange: (symbols: string[]) => void;
+  symbols?: string[];
 }) {
-  const [symbols, setSymbols] = useState(() => watchlistFor(selected));
+  const [symbols, setSymbols] = useState(() => seed ?? watchlistFor(selected));
   const seen = useRef(new WeakSet<object>());
   useEffect(() => {
     setSymbols((previous) => previous.includes(selected) ? previous : [selected, ...previous]);

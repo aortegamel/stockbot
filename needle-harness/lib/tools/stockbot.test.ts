@@ -172,6 +172,22 @@ describe("stockbot bridge chart metadata", () => {
     reply = { error: "tool failed", meta: { watchlist_update: update } };
     expect(await invoke("update_watchlist", {}, "watch-test")).not.toHaveProperty("watchlistUpdate");
   });
+
+  test("the widget tool preserves a valid receipt and rejects malformed or foreign ones", async () => {
+    const selection = { result_type: "widget_selection", widget_type: "short-volume", ticker: "AAPL" };
+    reply = { content: "Widget added.", meta: { widget_selection: selection } };
+    const result = await invoke("add_widget", {}, "widget-test");
+    if (!result.ok) throw new Error(result.error);
+    expect(result.widgetSelection).toEqual(selection);
+    for (const bad of [null, [], { ...selection, widget_type: "options-flow" }, { ...selection, ticker: "aapl" }, { ...selection, extra: 1 }, { widget_type: "short-volume", ticker: "AAPL" }]) {
+      reply = { content: "Widget added.", meta: { widget_selection: bad } };
+      expect(await invoke("add_widget", {}, "widget-test")).not.toHaveProperty("widgetSelection");
+    }
+    reply = { content: "Widget added.", meta: { widget_selection: selection } };
+    expect(await invoke("update_watchlist", {}, "widget-test")).not.toHaveProperty("widgetSelection");
+    reply = { error: "tool failed", meta: { widget_selection: selection } };
+    expect(await invoke("add_widget", {}, "widget-test")).not.toHaveProperty("widgetSelection");
+  });
 });
 
 describe("categorizeFailure ordered rules", () => {
@@ -485,7 +501,7 @@ describe("muse reason personas (fake provider)", () => {
     const user = [...users][0];
     for (const fact of ["OBJECTIVE", "[E1]", "[E2]", "Revolver matures 2027", "Top customer is 38%"]) expect(user).toContain(fact);
     expect(user).toStartWith(`USER REQUEST\n${input.prompt}\n\nEVIDENCE\n`);
-    // Roles differ, and each keeps the open-node gap instruction.
+    // Roles differ, and each keeps the open-node gap instruction and the inline citation instruction.
     const systems = seen.map((s) => systemOf(s.body));
     expect(new Set(systems).size).toBe(3);
     for (const s of systems) {
@@ -493,6 +509,7 @@ describe("muse reason personas (fake provider)", () => {
       expect(s).toContain("CURRENT STOCK CONTEXT\nThe current chart stock is NVDA.");
       expect(s).toContain("Use this stock only if the user request does not name a stock.");
       expect(s).toContain("An explicit stock in the user request takes precedence.");
+      expect(s).toContain("After a fact from EVIDENCE, put its row id in brackets, e.g. [ev:abc123].");
     }
   });
 
@@ -602,6 +619,7 @@ describe("muse reason personas (fake provider)", () => {
     expect(systemOf(call.body)).not.toContain("Bearbot");
     expect(systemOf(call.body)).not.toContain("CURRENT STOCK CONTEXT");
     expect(userOf(call.body)).toContain("EVIDENCE\n[E1]\nsource: sec");
+    expect(systemOf(call.body)).toContain("After a fact from EVIDENCE, put its row id in brackets, e.g. [ev:abc123].");
     expect(userOf(call.body)).not.toContain("SIBLING DRAFTS");
   });
 

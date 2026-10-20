@@ -8,6 +8,9 @@ import json
 import sys
 import types
 from collections.abc import Iterator
+from datetime import date, timedelta
+from itertools import pairwise
+from pathlib import Path
 from typing import Self
 
 import pytest
@@ -17,6 +20,8 @@ from hypothesis import strategies as st
 
 from api import market_providers as mp
 from api.main import app
+from app import cache as real_cache
+from app.sec.models import Filing, InsiderTransaction
 
 
 class FakeCache:
@@ -1245,3 +1250,686 @@ def test_viewer_context_preserves_call_order_clock_and_numeric_rows(monkeypatch:
     assert out["news"] == []
     assert out["filings"] == []
     assert out["cik"] == 1341439
+
+
+# ---------------------------------------------------------------------------
+# Aggregates: sparklines, markets, scans, briefing, feed, positioning.
+# Real cache.db under a tmp STOCKBOT_DATA_DIR; every provider is faked.
+# ---------------------------------------------------------------------------
+
+
+def _bars(closes: list[float], t0: int = 1767225600) -> dict[str, object]:
+    return {"candles": [{"t": t0 + i * 60, "close": c, "vol": 100 * (i + 1)} for i, c in enumerate(closes)]}
+
+
+def _filing(sym: str, acc: str, form: str, filed: str) -> Filing:
+    return Filing(
+        accession_no=acc,
+        form=form,
+        filer_cik=1,
+        filer_name=f"{sym} Corp",
+        filed_at=filed,
+        accepted_at=None,
+        known_at=f"{filed}T12:00:00+00:00",
+        report_period=None,
+        primary_document="doc.xml",
+        is_amendment=False,
+        amendment_of=None,
+        source=f"https://sec.example/{acc}",
+    )
+
+
+class Sec:
+    """list_sec_filings + ownership seams keyed by (sym, first form) and accession."""
+
+    def __init__(self) -> None:
+        self.filings: dict[tuple[str, str], list[Filing]] = {}
+        self.txns: dict[str, list[tuple[str, int | None]]] = {}
+        self.calls: list[tuple[str, str]] = []
+        self.fail: set[str] = set()
+
+    def list_sec_filings(self, sym: str, forms: list[str], **_kw: object) -> list[Filing]:
+        self.calls.append((sym, forms[0]))
+        if sym in self.fail:
+            raise RuntimeError("edgar down")
+        return self.filings.get((sym, forms[0]), [])
+
+    def normalize(self, obj: object, **kw: object) -> list[InsiderTransaction]:
+        return [
+            InsiderTransaction(
+                insider_name="Jane Doe",
+                insider_cik=None,
+                issuer=str(kw["issuer"]),
+                form=str(kw["form"]),
+                filed_at=str(kw["filed_at"]),
+                accession_no=str(kw["accession_no"]),
+                transaction_kind=kind,
+                shares=shares,
+                known_at=str(kw["known_at"]),
+            )
+            for kind, shares in self.txns.get(str(obj), [])
+        ]
+
+
+@pytest.fixture
+def agg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    import app.finra_client as finra
+    import app.sec.filings as sec_filings
+    from app.analytics import screens
+    from app.sec import insider
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    closes = {"AAA": [10.0, 11.0], "BBB": [10.0, 9.0], "CCC": [10.0, 10.5], "NVDA": [100.0, 102.0]}
+    candle_calls: list[tuple[str, str, str]] = []
+    news_calls: list[str] = []
+    sec = Sec()
+    state: dict[str, object] = {
+        "board": {
+            "settlement_date": "2026-01-15",
+            "entries": [
+                {"ticker": "AAA", "short_interest_percent": 30.0},
+                {"ticker": "BBB", "short_interest_percent": 20.0},
+                {"ticker": "CCC", "short_interest_percent": 10.0},
+            ],
+        },
+        "threshold": {"error": "No data found for X: thresholdList"},
+        "candle_calls": candle_calls,
+        "news_calls": news_calls,
+        "sec": sec,
+        "root": tmp_path,
+    }
+
+    def candles(sym: str, range_: str = "6mo", interval: str = "1d") -> dict[str, object]:
+        candle_calls.append((sym, range_, interval))
+        if sym not in closes:
+            return {"error": f"candles unavailable for {sym}: no data"}
+        return _bars(closes[sym])
+
+    def news(sym: str, limit: int = 12) -> dict[str, object]:
+        news_calls.append(sym)
+        item = {
+            "title": f"{sym} headline",
+            "link": f"https://n.example/{sym}",
+            "published": "Thu, 01 Jan 2026 10:00:00 GMT",
+            "source": "Wire",
+        }
+        return {"sym": sym, "items": [item][:limit]}
+
+    def filings(sym: str, limit: int = 10) -> dict[str, object]:
+        return {"sym": sym, "items": [{"title": "8-K - Current report", "filed": "2026-01-02"}][:limit]}
+
+    def threshold(sym: str) -> object:
+        return state["threshold"]
+
+    monkeypatch.setattr(mp, "get_candles", candles)
+    monkeypatch.setattr(mp, "get_news", news)
+    monkeypatch.setattr(mp, "get_filings", filings)
+    monkeypatch.setattr(mp, "get_universe", lambda: {"count": 0, "tickers": []})
+    monkeypatch.setattr(screens, "get_short_interest_leaderboard", lambda limit=None: state["board"])
+    monkeypatch.setattr(finra, "get_threshold_securities", threshold)
+    monkeypatch.setattr(sec_filings, "list_sec_filings", sec.list_sec_filings)
+    monkeypatch.setattr(insider, "load_ownership", str)
+    monkeypatch.setattr(insider, "normalize_ownership_filing", sec.normalize)
+    return state
+
+
+def _sec(agg: dict[str, object]) -> Sec:
+    sec = agg["sec"]
+    assert isinstance(sec, Sec)
+    return sec
+
+
+def _root(agg: dict[str, object]) -> Path:
+    root = agg["root"]
+    assert isinstance(root, Path)
+    return root
+
+
+def test_sparklines_shape_per_symbol_error_and_60s_cache(
+    agg: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = TestClient(app)
+    body = client.get("/api/sparklines?syms=nvda,BAD,NVDA&range=1d").json()
+    assert list(body["syms"]) == ["NVDA", "BAD"]
+    assert body["syms"]["NVDA"] == {
+        "t": [1767225600, 1767225660],
+        "closes": [100.0, 102.0],
+        "as_of": "2026-01-01T00:01:00+00:00",
+    }
+    assert body["syms"]["BAD"] == {"error": "candles unavailable for BAD: no data"}
+    calls = agg["candle_calls"]
+    assert isinstance(calls, list)
+    assert sorted(calls) == [("BAD", "1d", "5m"), ("NVDA", "1d", "5m")]
+    assert client.get("/api/sparklines?syms=NVDA,BAD&range=1d").json() == body
+    assert len(calls) == 2
+    real = real_cache.time.time()
+    monkeypatch.setattr(real_cache.time, "time", lambda: real + 61)
+    client.get("/api/sparklines?syms=NVDA,BAD&range=1d")
+    assert len(calls) == 4
+
+
+def test_sparklines_rejects_more_than_20_symbols(agg: dict[str, object]) -> None:
+    syms = ",".join(f"S{i}" for i in range(21))
+    res = TestClient(app).get(f"/api/sparklines?syms={syms}")
+    assert res.status_code == 400
+    assert "at most 20" in res.json()["detail"]
+
+
+def test_markets_most_shorted_rows_and_sorts(agg: dict[str, object]) -> None:
+    client = TestClient(app)
+    by_short = client.get("/api/markets?scan=most-shorted&sort=short_pct").json()
+    assert by_short["universe"] == ["AAA", "BBB", "CCC"]
+    assert [r["sym"] for r in by_short["rows"]] == ["AAA", "BBB", "CCC"]
+    assert by_short["rows"][0] == {
+        "sym": "AAA",
+        "last": 11.0,
+        "chg_pct": pytest.approx(10.0),
+        "volume": 200,
+        "short_pct": 30.0,
+        "last_filing": {"form": "8-K", "filed": "2026-01-02"},
+    }
+    by_chg = client.get("/api/markets?scan=most-shorted").json()
+    assert [r["sym"] for r in by_chg["rows"]] == ["AAA", "CCC", "BBB"]
+    calls = agg["candle_calls"]
+    assert isinstance(calls, list) and ("AAA", "5d", "1d") in calls
+
+
+def test_markets_watchlist_bad_symbol_sorts_last_with_error(agg: dict[str, object]) -> None:
+    rows = TestClient(app).get("/api/markets?scan=watchlist&syms=BAD,NVDA&sort=volume").json()["rows"]
+    assert [r["sym"] for r in rows] == ["NVDA", "BAD"]
+    assert rows[0]["short_pct"] is None
+    assert rows[1]["last"] is None
+    assert rows[1]["error"].startswith("candles unavailable")
+
+
+def test_markets_movers_adds_index_universe(agg: dict[str, object]) -> None:
+    body = TestClient(app).get("/api/markets?scan=movers&syms=NVDA,SPY").json()
+    assert body["universe"] == ["NVDA", "SPY", "QQQ", "DIA", "IWM"]
+
+
+def test_markets_rejects_unknown_scan_and_sort(agg: dict[str, object]) -> None:
+    client = TestClient(app)
+    assert client.get("/api/markets?scan=nope").status_code == 400
+    assert client.get("/api/markets?scan=watchlist&sort=price").status_code == 400
+
+
+def test_markets_insider_buying_and_new_8k_filter_the_universe(agg: dict[str, object]) -> None:
+    sec = _sec(agg)
+    sec.filings[("NVDA", "4")] = [_filing("NVDA", "a-1", "4", "2026-01-03")]
+    sec.txns["a-1"] = [("open_market_purchase", 500)]
+    sec.filings[("BBB", "4")] = [_filing("BBB", "b-1", "4", "2026-01-03")]
+    sec.txns["b-1"] = [("open_market_sale", 900)]
+    sec.filings[("CCC", "8-K")] = [_filing("CCC", "c-1", "8-K", "2026-01-04")]
+    client = TestClient(app)
+    assert client.get("/api/markets?scan=insider-buying&syms=NVDA").json()["universe"] == ["NVDA"]
+    assert {s for s, _f in sec.calls} == {"NVDA", "AAA", "BBB", "CCC"}
+    assert client.get("/api/markets?scan=new-8k&syms=NVDA").json()["universe"] == ["CCC"]
+
+
+def test_markets_scan_universe_is_capped(agg: dict[str, object]) -> None:
+    syms = ",".join(f"S{i}" for i in range(20))
+    TestClient(app).get(f"/api/markets?scan=new-8k&syms={syms}")
+    probed = [s for s, _f in _sec(agg).calls]
+    assert len(probed) == 20
+    assert "AAA" not in probed
+
+
+def test_markets_short_board_error_reads_as_null_short_pct(agg: dict[str, object]) -> None:
+    agg["board"] = {"error": "Short-interest leaderboard is unavailable: no FINRA credentials"}
+    body = TestClient(app).get("/api/markets?scan=watchlist&syms=NVDA").json()
+    assert body["rows"][0]["short_pct"] is None
+    assert body["errors"] == [
+        {
+            "sym": "",
+            "source": "finra_short_interest",
+            "error": "Short-interest leaderboard is unavailable: no FINRA credentials",
+        }
+    ]
+
+
+def test_scans_crud_round_trip(agg: dict[str, object]) -> None:
+    client = TestClient(app)
+    presets = client.get("/api/scans").json()["scans"]
+    assert [s["id"] for s in presets] == ["watchlist", "most-shorted", "insider-buying", "new-8k", "movers"]
+    assert {s["kind"] for s in presets} == {"preset"}
+    res = client.post("/api/scans", json={"name": " Chips ", "filter": {"symbols": [" nvda", "amd"], "min_chg_pct": 2}})
+    assert res.status_code == 201
+    scan = res.json()
+    assert scan["name"] == "Chips"
+    assert scan["kind"] == "custom"
+    assert scan["filter"] == {"symbols": ["NVDA", "AMD"], "min_chg_pct": 2.0}
+    assert json.loads((_root(agg) / "scans" / f"{scan['id']}.json").read_text()) == scan
+    assert client.get("/api/scans").json()["scans"][-1] == scan
+    assert client.delete(f"/api/scans/{scan['id']}").json() == {"deleted": scan["id"]}
+    assert len(client.get("/api/scans").json()["scans"]) == 5
+    assert client.delete(f"/api/scans/{scan['id']}").status_code == 404
+    assert client.delete("/api/scans/most-shorted").status_code == 400
+    assert client.delete("/api/scans/scan-zz").status_code == 404
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"name": "x", "filter": {"price_above": 5}},
+        {"name": "x", "extra": 1},
+        {"name": "x", "kind": "preset"},
+        {"name": "   "},
+        {"name": "x", "filter": {"symbols": [1]}},
+    ],
+)
+def test_scans_reject_invalid_payloads(agg: dict[str, object], payload: dict[str, object]) -> None:
+    res = TestClient(app).post("/api/scans", json=payload)
+    assert res.status_code == 400
+    assert res.json()["detail"].startswith("invalid scan:")
+    assert not (_root(agg) / "scans").exists()
+
+
+def test_workspace_never_saved_reads_empty(agg: dict[str, object]) -> None:
+    res = TestClient(app).get("/api/workspaces/nvda")
+    assert res.status_code == 200
+    assert res.json() == {"sym": "NVDA", "widgets": [], "updated_at": None}
+    assert not (_root(agg) / "workspaces").exists()
+
+
+def test_workspace_put_round_trip(agg: dict[str, object]) -> None:
+    client = TestClient(app)
+    widgets = [
+        {"id": "w1", "type": "price-volume", "ticker": "nvda", "params": {"range": "6mo"}},
+        {"id": "w2", "type": "short-volume", "ticker": "NVDA"},
+    ]
+    res = client.put("/api/workspaces/nvda", json={"widgets": widgets})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["sym"] == "NVDA"
+    assert body["widgets"] == [
+        {"id": "w1", "type": "price-volume", "ticker": "NVDA", "params": {"range": "6mo"}},
+        {"id": "w2", "type": "short-volume", "ticker": "NVDA"},
+    ]
+    assert isinstance(body["updated_at"], str) and body["updated_at"].endswith("+00:00")
+    assert json.loads((_root(agg) / "workspaces" / "NVDA.json").read_text()) == body
+    assert client.get("/api/workspaces/NVDA").json() == body
+    assert client.put("/api/workspaces/NVDA", json={"widgets": []}).json()["widgets"] == []
+    assert client.get("/api/workspaces/nvda").json()["widgets"] == []
+
+
+@pytest.mark.parametrize(
+    ("sym", "payload"),
+    [
+        ("NVDA", {"widgets": [{"id": "w1", "type": "candles", "ticker": "NVDA"}]}),
+        ("NVDA", {"widgets": [{"id": "w1", "type": "news", "ticker": "NVDA", "size": 2}]}),
+        ("NVDA", {"widgets": [], "layout": "grid"}),
+        ("NVDA", {"widgets": [{"id": f"w{i}", "type": "news", "ticker": "NVDA"} for i in range(25)]}),
+        ("NVDA", {"widgets": [{"id": "", "type": "news", "ticker": "NVDA"}]}),
+        ("NVDA", {"widgets": [{"id": "w1", "type": "news", "ticker": "A/B"}]}),
+        ("NVDA", {"widgets": [{"id": "w1", "type": "news", "ticker": "NVDA", "params": None}]}),
+        ("NVDA", {"widgets": [{"id": "w" * 65, "type": "news", "ticker": "NVDA"}]}),
+        ("NVDA", []),
+        ("NVDA", {}),
+        ("NVDA", None),
+        ("A/B", {"widgets": []}),
+    ],
+)
+def test_workspace_put_rejects_invalid(agg: dict[str, object], sym: str, payload: object) -> None:
+    res = TestClient(app).put(f"/api/workspaces/{sym}", json=payload)
+    assert res.status_code == 400
+    assert res.json()["detail"].startswith("invalid workspace:")
+    assert not (_root(agg) / "workspaces").exists()
+
+
+def test_widget_data_rejects_unknown_type_and_bad_sym(agg: dict[str, object]) -> None:
+    client = TestClient(app)
+    assert client.get("/api/widget-data?type=news&sym=NVDA").status_code == 400
+    assert client.get("/api/widget-data?sym=NVDA").status_code == 400
+    assert client.get("/api/widget-data?type=insider&sym=A/B").status_code == 400
+
+
+def _finra(monkeypatch: pytest.MonkeyPatch, pages: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Fake get_finra_datapoints: one canned answer per call, in order; records every call's kwargs."""
+    import app.finra_client as finra
+
+    calls: list[dict[str, object]] = []
+
+    def fake(dataset: str, **kw: object) -> dict[str, object]:
+        calls.append({"dataset": dataset, **kw})
+        return pages[len(calls) - 1]
+
+    monkeypatch.setattr(finra, "get_finra_datapoints", fake)
+    return calls
+
+
+def test_widget_data_short_volume_sums_market_codes_per_date(
+    agg: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def row(day: str, short: int, total: int) -> dict[str, object]:
+        return {"tradeReportDate": day, "shortParQuantity": short, "totalParQuantity": total}
+
+    no_data: dict[str, object] = {"error": "No data found for NVDA: regShoDaily"}
+    calls = _finra(
+        monkeypatch,
+        [
+            {"records": [row("2026-10-19", 300, 1000), row("2026-10-16", 50, 100), row("2026-10-19", 200, 1000)]},
+            no_data,
+            {"records": [row("2026-10-09", 0, 0)]},
+            no_data,
+        ],
+    )
+    body = TestClient(app).get("/api/widget-data?type=short-volume&sym=nvda").json()
+    assert body == {
+        "sym": "NVDA",
+        "type": "short-volume",
+        "rows": [
+            {"date": "2026-10-09", "short_qty": 0.0, "total_qty": 0.0, "short_pct": None},
+            {"date": "2026-10-16", "short_qty": 50.0, "total_qty": 100.0, "short_pct": 50.0},
+            {"date": "2026-10-19", "short_qty": 500.0, "total_qty": 2000.0, "short_pct": 25.0},
+        ],
+    }
+    assert len(calls) == 4
+    assert {c["dataset"] for c in calls} == {"otcMarket/regShoDaily"}
+    assert all(c["ticker"] == "NVDA" and c["limit"] == 25 for c in calls)
+    assert calls[0]["fields"] == ["tradeReportDate", "shortParQuantity", "totalParQuantity"]
+    assert [str(c["end_date"]) > str(c["start_date"]) for c in calls] == [True] * 4
+    assert str(calls[1]["end_date"]) < str(calls[0]["start_date"])
+    newest = date.fromisoformat(str(calls[0]["end_date"]))
+    oldest = date.fromisoformat(str(calls[-1]["start_date"]))
+    assert newest - oldest == timedelta(days=13)
+    for previous, current in pairwise(calls):
+        assert date.fromisoformat(str(previous["start_date"])) - date.fromisoformat(
+            str(current["end_date"])
+        ) == timedelta(days=1)
+
+
+def test_widget_data_short_interest_maps_records_oldest_first(
+    agg: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _finra(
+        monkeypatch,
+        [
+            {
+                "records": [
+                    {"settlementDate": "2026-09-30", "currentShortPositionQuantity": 900, "daysToCoverQuantity": 1.5},
+                    {"settlementDate": "2026-09-15", "currentShortPositionQuantity": 800, "daysToCoverQuantity": None},
+                ]
+            }
+        ],
+    )
+    body = TestClient(app).get("/api/widget-data?type=short-interest&sym=NVDA").json()
+    assert body == {
+        "sym": "NVDA",
+        "type": "short-interest",
+        "rows": [
+            {"date": "2026-09-15", "short_qty": 800, "days_to_cover": None},
+            {"date": "2026-09-30", "short_qty": 900, "days_to_cover": 1.5},
+        ],
+    }
+    (call,) = calls
+    assert call["dataset"] == "otcMarket/consolidatedShortInterest"
+    assert call["fields"] == ["settlementDate", "currentShortPositionQuantity", "daysToCoverQuantity"]
+    assert call["limit"] == 25 and call["ticker"] == "NVDA"
+
+
+@pytest.mark.parametrize("kind", ["short-interest", "short-volume"])
+def test_widget_data_finra_errors_surface_without_raising(
+    agg: dict[str, object], monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    _finra(monkeypatch, [{"error": "FINRA request failed (503): down"}] * 4)
+    res = TestClient(app).get(f"/api/widget-data?type={kind}&sym=NVDA")
+    assert res.status_code == 200
+    assert res.json() == {"sym": "NVDA", "type": kind, "rows": [], "error": "FINRA request failed (503): down"}
+
+
+def test_widget_data_finra_exception_becomes_error(agg: dict[str, object], monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.finra_client as finra
+
+    def boom(dataset: str, **kw: object) -> dict[str, object]:
+        raise RuntimeError("socket closed")
+
+    monkeypatch.setattr(finra, "get_finra_datapoints", boom)
+    res = TestClient(app).get("/api/widget-data?type=short-interest&sym=NVDA")
+    assert res.status_code == 200
+    assert res.json() == {
+        "sym": "NVDA",
+        "type": "short-interest",
+        "error": "short-interest unavailable for NVDA: socket closed",
+    }
+
+
+def test_widget_data_short_volume_all_windows_empty_reports_no_data(
+    agg: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _finra(monkeypatch, [{"error": "No data found for NVDA: regShoDaily"}] * 4)
+    body = TestClient(app).get("/api/widget-data?type=short-volume&sym=NVDA").json()
+    assert body["rows"] == [] and body["error"] == "No data found for NVDA: regShoDaily"
+
+
+def test_widget_data_short_volume_rejects_truncated_window(
+    agg: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _finra(monkeypatch, [{"records": [], "may_have_more": True, "next_offset": 25}] * 4)
+    body = TestClient(app).get("/api/widget-data?type=short-volume&sym=NVDA").json()
+    assert body == {
+        "sym": "NVDA",
+        "type": "short-volume",
+        "rows": [],
+        "error": "Short-volume data is incomplete: a date window exceeds the 25-record limit.",
+    }
+    assert len(calls) == 4
+
+
+@pytest.mark.parametrize(
+    "failed",
+    [
+        {"error": "FINRA request failed (503): down"},
+        {"records": [], "may_have_more": True},
+    ],
+)
+def test_widget_data_short_volume_retains_error_with_partial_rows(
+    agg: dict[str, object], monkeypatch: pytest.MonkeyPatch, failed: dict[str, object]
+) -> None:
+    good: dict[str, object] = {
+        "records": [{"tradeReportDate": "2026-10-19", "shortParQuantity": 25, "totalParQuantity": 100}]
+    }
+    calls = _finra(monkeypatch, [good, failed, {"records": []}, {"records": []}])
+    body = TestClient(app).get("/api/widget-data?type=short-volume&sym=NVDA").json()
+    assert body["rows"] == [{"date": "2026-10-19", "short_qty": 25, "total_qty": 100, "short_pct": 25}]
+    assert body["error"] == failed.get(
+        "error", "Short-volume data is incomplete: a date window exceeds the 25-record limit."
+    )
+    assert len(calls) == 4
+
+
+def test_widget_data_cache_uses_canonical_symbol_and_900s_ttl(
+    agg: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _finra(monkeypatch, [{"records": []}, {"records": []}])
+    client = TestClient(app)
+    first = client.get("/api/widget-data?type=short-interest&sym=nvda").json()
+    assert real_cache.get("widget:short-interest:NVDA", ttl=900) == first
+    assert client.get("/api/widget-data?type=short-interest&sym=NVDA").json() == first
+    assert len(calls) == 1
+    now = real_cache.time.time()
+    monkeypatch.setattr(real_cache.time, "time", lambda: now + 901)
+    assert client.get("/api/widget-data?type=short-interest&sym=NVDA").json() == first
+    assert len(calls) == 2
+
+
+def test_widget_data_insider_rows_newest_first(agg: dict[str, object]) -> None:
+    sec = _sec(agg)
+    sec.filings[("NVDA", "4")] = [
+        _filing("NVDA", "i-1", "4", "2026-10-01"),
+        _filing("NVDA", "i-2", "4", "2026-10-08"),
+    ]
+    sec.txns["i-1"] = [("open_market_purchase", 1500), ("grant_award", 10)]
+    sec.txns["i-2"] = [("open_market_sale", None)]
+    body = TestClient(app).get("/api/widget-data?type=insider&sym=NVDA").json()
+    assert body == {
+        "sym": "NVDA",
+        "type": "insider",
+        "rows": [
+            {"date": "2026-10-08", "title": "Jane Doe sold", "kind": "open_market_sale", "shares": None},
+            {"date": "2026-10-01", "title": "Jane Doe bought 1,500 sh", "kind": "open_market_purchase", "shares": 1500},
+        ],
+    }
+    sec.fail.add("BAD")
+    failed = TestClient(app).get("/api/widget-data?type=insider&sym=BAD").json()
+    assert failed["rows"] == [] and "edgar down" in failed["error"]
+
+
+@pytest.mark.parametrize(
+    ("price", "eps", "pe", "ey", "error"),
+    [
+        (100.0, {"ttm_eps_diluted": 4.0}, 25.0, 0.04, None),
+        (100.0, {"ttm_eps_diluted": 0}, None, 0.0, None),
+        (0.0, {"ttm_eps_diluted": 4.0}, 0.0, None, None),
+        (100.0, {"ttm_eps_diluted": -4.0}, -25.0, -0.04, None),
+        (100.0, {"error": "company facts not available"}, None, None, "company facts not available"),
+        (None, {"ttm_eps_diluted": 4.0}, None, None, None),
+    ],
+)
+def test_widget_data_multiples_current_only(
+    agg: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    price: float | None,
+    eps: dict[str, object],
+    pe: float | None,
+    ey: float | None,
+    error: str | None,
+) -> None:
+    seen: list[tuple[str, str]] = []
+
+    def fundamentals(sym: str, metric: str, as_of: str | None = None) -> dict[str, object]:
+        seen.append((sym, metric))
+        return eps
+
+    def quote(sym: str) -> dict[str, object]:
+        return {"sym": sym, "price": price, "retrieved_at": "2026-10-20T14:00:00Z"}
+
+    monkeypatch.setattr(mp, "get_quote", quote)
+    monkeypatch.setattr("app.services.sec_facts.get_fundamentals", fundamentals)
+    body = TestClient(app).get("/api/widget-data?type=multiples&sym=nvda").json()
+    expected: dict[str, object] = {
+        "sym": "NVDA",
+        "type": "multiples",
+        "price": price,
+        "ttm_eps": eps.get("ttm_eps_diluted"),
+        "pe": pe,
+        "earnings_yield": ey,
+        "as_of": "2026-10-20T14:00:00Z",
+        "history": None,
+    }
+    if error:
+        expected["error"] = error
+    assert body == expected
+    assert seen == [("NVDA", "eps")]
+
+
+def test_briefing_builds_reads_cache_and_refreshes(agg: dict[str, object]) -> None:
+    sec = _sec(agg)
+    sec.filings[("NVDA", "8-K")] = [_filing("NVDA", "k-1", "8-K", "2026-01-05")]
+    sec.filings[("NVDA", "4")] = [_filing("NVDA", "f-1", "4", "2026-01-04")]
+    sec.txns["f-1"] = [("open_market_sale", 1200), ("grant_award", 50)]
+    client = TestClient(app)
+    first = client.get("/api/briefing?syms=NVDA").json()
+    assert first["cached"] is False
+    assert first["syms"] == ["NVDA"]
+    assert first["items"] == [
+        {
+            "kind": "filing",
+            "sym": "NVDA",
+            "title": "8-K filed by NVDA",
+            "link": "https://sec.example/k-1",
+            "filed": "2026-01-05",
+            "filing_form": "8-K",
+        },
+        {
+            "kind": "insider",
+            "sym": "NVDA",
+            "title": "Jane Doe sold 1,200 sh",
+            "link": "https://sec.example/f-1",
+            "filed": "2026-01-04",
+            "filing_form": "4",
+        },
+        {
+            "kind": "news",
+            "sym": "NVDA",
+            "title": "NVDA headline",
+            "link": "https://n.example/NVDA",
+            "published": "2026-01-01T10:00:00+00:00",
+        },
+    ]
+    assert (_root(agg) / "briefing" / f"{first['date']}.json").is_file()
+    news_calls = agg["news_calls"]
+    assert isinstance(news_calls, list)
+    assert client.get("/api/briefing?syms=NVDA").json() == dict(first, cached=True)
+    assert len(news_calls) == 1
+    assert client.get("/api/briefing?syms=NVDA&refresh=1").json()["cached"] is False
+    assert client.get("/api/briefing?syms=AAA").json()["syms"] == ["AAA"]
+    assert len(news_calls) == 3
+
+
+def test_feed_merges_newest_first_and_filters_since(agg: dict[str, object]) -> None:
+    from app.thesis.repository import ThesisRepository
+
+    repo = ThesisRepository(_root(agg) / "thesis")
+    thesis = repo.create_thesis(
+        "NVDA thesis", scope="NVDA", claims=["NVDA demand grows"], effective_at="2026-01-01T00:00:00+00:00"
+    )
+    cid = repo.load_thesis(thesis.thesis_id).claims[0].claim_id
+    trigger = repo.create_trigger(thesis.thesis_id, claim_ids=[cid], summary="New 10-K", summary_origin="deterministic")
+    sec = _sec(agg)
+    sec.filings[("NVDA", "8-K")] = [_filing("NVDA", "k-1", "8-K", "2026-01-05")]
+    sec.filings[("NVDA", "4")] = [_filing("NVDA", "f-1", "4", "2026-01-04")]
+    sec.txns["f-1"] = [("open_market_purchase", 10)]
+    sec.fail.add("BAD")
+    client = TestClient(app)
+    body = client.get("/api/feed?syms=NVDA,BAD").json()
+    assert [i["kind"] for i in body["items"]] == ["alert", "filing", "insider", "news", "news"]
+    assert body["items"][0]["id"] == trigger.trigger_id
+    assert body["items"][0]["title"] == "New 10-K"
+    assert body["items"][2] == {
+        "id": "insider:f-1:0",
+        "kind": "insider",
+        "sym": "NVDA",
+        "title": "Jane Doe bought 10 sh",
+        "link": "https://sec.example/f-1",
+        "at": "2026-01-04T12:00:00+00:00",
+        "source": "SEC Form 4",
+    }
+    assert {(e["sym"], e["source"]) for e in body["errors"]} == {("BAD", "sec_8k"), ("BAD", "sec_form4")}
+    since = client.get("/api/feed?syms=NVDA&since=2026-01-04T12:00:00Z").json()["items"]
+    assert [i["kind"] for i in since] == ["alert", "filing"]
+    repo.mark_trigger_processed(thesis.thesis_id, trigger.trigger_id)
+    assert [i["kind"] for i in client.get("/api/feed?syms=NVDA").json()["items"]] == ["filing", "insider", "news"]
+    assert client.get("/api/feed?since=yesterday").status_code == 400
+
+
+def test_positioning_sums_insider_shares_and_nulls_unavailable(agg: dict[str, object]) -> None:
+    sec = _sec(agg)
+    sec.filings[("AAA", "4")] = [_filing("AAA", "p-1", "4", "2026-01-04")]
+    sec.txns["p-1"] = [
+        ("open_market_purchase", 300),
+        ("open_market_sale", 100),
+        ("open_market_sale", None),
+        ("exercise", 50),
+    ]
+    client = TestClient(app)
+    assert client.get("/api/positioning?sym=aaa").json() == {
+        "sym": "AAA",
+        "short_pct": 30.0,
+        "short_as_of": "2026-01-15",
+        "insider_net_90d": {"buys": 300, "sells": 100, "net": 200},
+        "threshold_listed": False,
+        "threshold_as_of": None,
+        "errors": {},
+    }
+    agg["threshold"] = {"error": "FINRA query failed: 503"}
+    sec.fail.add("ZZZ")
+    out = client.get("/api/positioning?sym=ZZZ").json()
+    assert out["short_pct"] is None
+    assert out["short_as_of"] is None
+    assert out["insider_net_90d"] is None
+    assert out["threshold_listed"] is None
+    assert set(out["errors"]) == {"insider", "threshold"}
+    agg["threshold"] = {"records": [{"tradeDate": "2026-01-14"}], "as_of_date": "2026-01-14"}
+    listed = client.get("/api/positioning?sym=CCC").json()
+    assert listed["threshold_listed"] is True
+    assert listed["threshold_as_of"] == "2026-01-14"

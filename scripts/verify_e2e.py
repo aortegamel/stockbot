@@ -52,6 +52,9 @@ class Run:
     total_ms: float | None = None
     route: str | None = None
     citation_count: int = 0
+    answer: str = ""
+    known: list[str] = field(default_factory=list)
+    claims: list[dict[str, object]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     timings: object = None
     chart_updates: list[str] = field(default_factory=list)
@@ -77,6 +80,7 @@ def parse_stream(lines: Iterable[tuple[float, bytes]]) -> Run:
     answer: list[str] = []
     tools: list[str] = []
     known: set[str] = set()
+    claims: list[dict[str, object]] = []
     last_ms: float | None = None
     for ms, raw in lines:
         last_ms = ms
@@ -95,6 +99,10 @@ def parse_stream(lines: Iterable[tuple[float, bytes]]) -> Run:
         elif kind == "evidence":
             # Each evidence event carries the full merged list, so the last one wins (agent-console.tsx).
             known = {str(e.get("id")) for e in event.get("evidence") or [] if isinstance(e, dict)}
+            run.known = sorted(known)
+        elif kind == "claims":
+            # The gated claim inventory: the console chips each claim whose text appears in the answer.
+            claims = [c for c in event.get("claims") or [] if isinstance(c, dict)]
         elif kind in ("failed", "error"):
             run.errors.append(f"{kind}: {event.get('message')}")
         elif kind == "tool_start":
@@ -106,7 +114,14 @@ def parse_stream(lines: Iterable[tuple[float, bytes]]) -> Run:
     if run.total_ms is None:
         run.total_ms = last_ms
     text = "".join(answer)
-    run.citation_count = sum(f"[{i}]" in text for i in known)
+    cited = {i for i in known if f"[{i}]" in text}
+    for c in claims:
+        ids = c.get("evidenceIds")
+        if c.get("text") and str(c["text"]) in text and isinstance(ids, list):
+            cited |= {str(i) for i in ids if str(i) in known}
+    run.citation_count = len(cited)
+    run.answer = text
+    run.claims = claims
     run.route = _route(run.events, tools, run.timings)
     return run
 

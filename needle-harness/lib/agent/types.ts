@@ -111,7 +111,10 @@ export type FinalPersonaResult = {
 export const FINAL_PERSONAS = ["stockbot", "bearbot", "bullbot"] as const;
 export type Persona = (typeof FINAL_PERSONAS)[number];
 
-export type ToolResult = { ok: true; evidence: Evidence; chartSelection?: unknown; watchlistUpdate?: unknown } | { ok: false; error: string; category: FailureCategory; retryable: boolean };
+// Workspace widget kinds the canonical add_widget tool accepts, in fixed order.
+export const WIDGET_TYPES: readonly string[] = ["price-volume", "financials", "news", "monthly-returns", "short-interest", "short-volume", "insider", "filings", "multiples"];
+
+export type ToolResult = { ok: true; evidence: Evidence; chartSelection?: unknown; watchlistUpdate?: unknown; widgetSelection?: unknown } | { ok: false; error: string; category: FailureCategory; retryable: boolean };
 
 export type Tool = {
   description: string;
@@ -123,6 +126,7 @@ export type AgentEvent =
   | { type: "agent_start"; prompt: string }
   | { type: "chart_update"; ticker: string }
   | { type: "watchlist_update"; action: "add" | "remove"; ticker: string }
+  | { type: "widget_update"; ticker: string; widgetType: string }
   | { type: "needle_decision"; step: number; tool: string | null; arguments: Record<string, unknown>; confidence: number | null }
   | { type: "tool_start"; tool: string }
   | { type: "tool_result"; tool: string; evidenceId?: string; preview: string }
@@ -131,6 +135,8 @@ export type AgentEvent =
   | { type: "reasoning_start"; model: string }
   | { type: "answer_delta"; text: string }
   | { type: "done"; metrics: Metrics }
+  // The gated research answer's cited claim inventory; each text is a verbatim answer substring.
+  | { type: "claims"; claims: FinalClaim[] }
   | { type: "error"; message: string }
   // A stockbot-only research answer offers the trio over the same session evidence.
   | { type: "offer_trio"; sessionId: string }

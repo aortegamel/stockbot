@@ -15,12 +15,15 @@ function requiredEnv(name: string): string {
 
 const SYSTEM = "You are Stockbot.";
 
+// Single-tool/direct callers: no inventory, but inline row ids still count as citations.
+const CITE_IDS = " After a fact from EVIDENCE, put its row id in brackets, e.g. [ev:abc123].";
+
 // Stance sentences adapted from the old committee roles (app/research/agents/*bot.py) to standalone prose.
 const PERSONAS: Record<Persona, { name: string; stance: string }> = {
   stockbot: {
     name: "Stockbot",
     stance:
-      "You give the balanced base case. Weigh the evidence and its gaps with equal rigor. State the most probable outcome.",
+      "You give the balanced base case. Weigh the evidence and its gaps with equal rigor. State the most probable outcome. Open your answer with a 2–3 sentence conclusion before any details.",
   },
   bearbot: {
     name: "Bearbot",
@@ -53,7 +56,7 @@ const INVENTORY_RULE =
   " The block is stripped before display; prose claims missing from it fail the accuracy gate.";
 function researchSystem(persona: Persona): string {
   const { name, stance } = PERSONAS[persona];
-  return `You are ${name}. ${stance} Answer in prose.` + INVENTORY_RULE;
+  return `You are ${name}. ${stance} Answer in prose. After a fact from EVIDENCE, put its row id in brackets, e.g. [ev:abc123].` + INVENTORY_RULE;
 }
 
 function directSystem(persona: Persona): string {
@@ -132,7 +135,7 @@ function formatEvidence(evidence: Evidence[]): string {
 }
 
 // Synthesis only: labeled sibling drafts for the Stockbot judge. Bear/Bull
-// calls never receive drafts; direct and omitted-persona prompts stay byte-identical.
+// calls never receive drafts; direct callers keep the bare persona prompt.
 function formatDrafts(drafts: { persona: Persona; text: string }[]): string {
   return drafts.map((d) => `── ${PERSONAS[d.persona].name} ──\n${d.text}`).join("\n\n");
 }
@@ -300,7 +303,7 @@ function reasonInput(opts: ReasonOptions): { role: string; content: string }[] {
   // An omitted persona retains the original prompt for direct and single-tool callers.
   const system = opts.direct
     ? directSystem(persona)
-    : (opts.persona ? researchSystem(opts.persona) : SYSTEM) + gapInstruction(opts);
+    : (opts.persona ? researchSystem(opts.persona) : SYSTEM + CITE_IDS) + gapInstruction(opts);
   const stockContext = opts.ticker
     ? `\n\nCURRENT STOCK CONTEXT\nThe current chart stock is ${opts.ticker}. Use this stock only if the user request does not name a stock. An explicit stock in the user request takes precedence.`
     : "";

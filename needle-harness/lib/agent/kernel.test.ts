@@ -852,12 +852,12 @@ describe("runKernelAgent final personas", () => {
         progress(id, "intake_evidence", { evidence: [{ id: "ev:0", content: "intake fact" }] }) +
         sessionGraphReply(id),
     });
-    const brief = calls.find((c) => c.input.direct === true);
+    const brief = calls.find((c) => c.input.direct === false && c.input.persona === "stockbot" && !("drafts" in c.input));
     expect(brief?.input.evidence.map((e) => e.id)).toEqual(["ev:0"]);
     const deltas = answers(events);
-    expect(deltas[0]).toContain("draft-stockbot");
+    // Buffered brief: one delta with the stripped text, not streamed draft fragments.
+    expect(deltas[0]).toContain("stockbot p");
     expect(deltas.at(-1)).toMatch(/^── Full answer ──\n/);
-    expect(events.at(-1)?.type).toBe("done");
   });
 
   test("a brief over the full evidence ends the stream with no second answer", async () => {
@@ -870,6 +870,18 @@ describe("runKernelAgent final personas", () => {
     });
     expect(events.filter((e) => e.type === "answer_delta").length).toBe(1);
     expect(events.map((e) => e.type).slice(-2)).toEqual(["offer_trio", "done"]);
+  });
+
+  test("a gated research answer emits its kept claims once, right before done", async () => {
+    const cited: FinalClaim = { text: "stockbot p1", claimType: "observed_fact", evidenceIds: ["ev:1"] };
+    const open: FinalClaim = { text: "p1", claimType: "unknown", evidenceIds: [] };
+    const { events } = await runFinal({ personas: ["stockbot"], reply: (_p, id) => sessionGraphReply(id), decide: () => ({ claims: [cited, open] }) });
+    expect(events.map((e) => e.type).slice(-3)).toEqual(["offer_trio", "claims", "done"]);
+    expect(events.filter((e) => e.type === "claims")).toEqual([{ type: "claims", claims: [cited, open] }]);
+    // An answer without an inventory emits no claims event.
+    const bare = await runFinal({ personas: ["stockbot"], reply: (_p, id) => sessionGraphReply(id), decide: () => ({ claims: [] }) });
+    expect(bare.events.at(-1)?.type).toBe("done");
+    expect(bare.events.some((e) => e.type === "claims")).toBe(false);
   });
 
   test("done timings sum worker progress phases, skip malformed values, and omit unmeasured phases", async () => {
@@ -1404,6 +1416,8 @@ describe("runKernelAgent final personas", () => {
     expect(out.length).toBe(1);
     expect(out[0]).toContain(kept);
     expect(out[0]).not.toContain(cut);
+    // The claims event carries only the claim the gates kept.
+    expect(events.filter((e) => e.type === "claims")).toEqual([{ type: "claims", claims: [{ text: kept, claimType: "observed_fact", evidenceIds: ["ev:1"] }] }]);
     expect(gates.some((g) => g.op === "assess_final_claim")).toBe(true);
     expect(events.some((e) => e.type === "failed")).toBe(false);
   });
@@ -1705,6 +1719,34 @@ describe("runKernelAgent final personas", () => {
       { type: "progress", stage: "tool_done", detail: { preview: '{"ticker":"TSLA"}' } },
     ]);
     expect(calls.map((c) => c.input.ticker)).toEqual(["AAPL", "AAPL", "AAPL"]);
+  });
+
+  test("widget progress relays only a canonical ticker and known widget type without changing chart context", async () => {
+    const details: unknown[] = [
+      { ticker: "AAPL", widgetType: "short-volume" },
+      undefined, null, [], "AAPL", 7, {},
+      { ticker: "AAPL" }, { widgetType: "short-volume" },
+      { ticker: "aapl", widgetType: "short-volume" },
+      { ticker: " AAPL ", widgetType: "short-volume" },
+      { ticker: "SEC", widgetType: "short-volume" },
+      { ticker: ["AAPL"], widgetType: "short-volume" },
+      { ticker: "AAPL", widgetType: "unknown" },
+      { ticker: "AAPL", widgetType: ["short-volume"] },
+      { ticker: "AAPL", widgetType: null },
+    ];
+    const { events, calls, bodies } = await runFinal({
+      ticker: "nvda",
+      currentChartTicker: "aapl",
+      reply: (_p, id) => details.map((detail) => `${JSON.stringify({ type: "progress", id, stage: "widget_update", detail })}\n`).join("")
+        + `${sessionGraphReply(id)}`,
+    });
+    expect(events.filter((e) => e.type === "widget_update")).toEqual([
+      { type: "widget_update", ticker: "AAPL", widgetType: "short-volume" },
+    ]);
+    expect(events.some((e) => e.type === "progress" && e.stage === "widget_update")).toBe(false);
+    expect(calls.map((c) => c.input.ticker)).toEqual(["AAPL", "AAPL", "AAPL"]);
+    expect(runBodies(bodies)[0]?.ticker).toBe("NVDA");
+    expect(events.some((e) => e.type === "failed")).toBe(false);
   });
 
   test("watchlist answers omit chart context through chart updates, trio retries, and follow-up", async () => {

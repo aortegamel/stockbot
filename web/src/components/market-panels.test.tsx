@@ -104,6 +104,15 @@ describe("WatchlistChatPanel", () => {
     await until(() => actual[0] === "ORCL");
     expect(actual).not.toContain("AAPL");
   });
+
+  test("seeds from the app-wide watchlist and still adds the open ticker", async () => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => String(input).startsWith("/api/watchlist")
+      ? Response.json({ watchlist: [] }) : Response.json({ price: null })) as unknown as typeof fetch;
+    let actual: string[] = [];
+    await mount(<WatchlistChatPanel selected="NVDA" onSelect={() => { }} events={[]} onChange={(symbols) => { actual = symbols; }} symbols={["GME", "AMC"]} />);
+    await until(() => actual[0] === "NVDA");
+    expect(actual).toEqual(["NVDA", "GME", "AMC"]);
+  });
 });
 
 describe("WatchlistPanel", () => {
@@ -141,7 +150,10 @@ describe("WatchlistPanel", () => {
     const sourceBox = root.querySelector('[aria-label="BRK/B sources"]');
     expect(sourceBox?.textContent).toBe("SEC 2026-10-13 SI none VOL error THR timeout ");
     expect(sourceBox?.querySelector("span")?.title).toBe("sec-filings · ok · 2026-10-13T22:15:00Z · sec-record");
-    expect(sourceBox?.querySelectorAll("span")[2]?.title).toContain("volume failed");
+    expect(sourceBox?.querySelectorAll("span")[2]?.title).toBe("short-volume · error");
+    expect(sourceBox?.querySelectorAll("span")[3]?.title).toBe("threshold · timeout");
+    expect(sourceBox?.innerHTML).not.toContain("volume failed");
+    expect(sourceBox?.innerHTML).not.toContain("deadline");
     expect(root.querySelector('[aria-label="AAPL sources"]')?.textContent).toBe("SEC ok ");
     await click(buttons[2]!);
     expect(selected).toEqual(["AAPL"]);
@@ -153,15 +165,35 @@ describe("WatchlistPanel", () => {
     expect(signals.every((signal) => signal.aborted)).toBe(true);
   });
 
-  test("reports a failed source fan-out without hiding the watchlist", async () => {
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      if (String(input).startsWith("/api/watchlist")) throw "source service offline";
+  test("hides source transport errors and retries without hiding the watchlist", async () => {
+    let sourceCalls = 0;
+    let quoteCalls = 0;
+    const sourceSignals: AbortSignal[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).startsWith("/api/watchlist")) {
+        if (init?.signal) sourceSignals.push(init.signal);
+        sourceCalls++;
+        if (sourceCalls === 1) throw "source service offline";
+        return Response.json({ watchlist: [{ symbol: "NVDA", source: "sec_filings", tool: "sec-filings", status: "ok" }] });
+      }
+      quoteCalls++;
       return Response.json({ price: null });
     }) as unknown as typeof fetch;
     const root = await mount(<WatchlistPanel selected="NVDA" onSelect={() => { }} />);
-    await until(() => root.textContent?.includes("sources unavailable: source service offline") ?? false);
-    expect(root.querySelectorAll("button")).toHaveLength(9);
-    expect(root.querySelector("button")?.textContent).toContain("—");
+    await until(() => root.querySelector('[role="alert"]') !== null);
+    expect(root.textContent).toContain("We could not load this data.");
+    expect(root.textContent).not.toContain("source service offline");
+    expect(root.querySelectorAll("button b")).toHaveLength(9);
+    expect(root.querySelector("button b")?.parentElement?.textContent).toContain("—");
+    expect(root.firstElementChild?.firstElementChild?.getAttribute("style")).toContain("font-size: 14px");
+    const retry = root.querySelector('[role="alert"] button');
+    expect(retry?.textContent).toBe("Retry");
+    await click(retry!);
+    await until(() => root.querySelector('[aria-label="NVDA sources"]')?.textContent === "SEC ok ");
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+    expect(sourceCalls).toBe(2);
+    expect(quoteCalls).toBe(9);
+    expect(sourceSignals[0]?.aborted).toBe(true);
   });
 
   test("aborts replaced requests and stops an obsolete quote from overwriting the current symbol", async () => {
@@ -254,28 +286,37 @@ describe("FinancialsPanel and NewsPanel", () => {
     expect(panel(root).style.minHeight).toBe("0");
   });
 
-  test("distinguishes empty results, a server warning, and a rejected request", async () => {
+  test("distinguishes empty results from errors without exposing provider or transport details", async () => {
     globalThis.fetch = (async () => Response.json({ items: [] })) as unknown as typeof fetch;
     const root = await mount(<FinancialsPanel sym="EMPTY" />);
-    await until(() => (root.textContent ?? "").includes("no SEC filings found"));
+    await until(() => (root.textContent ?? "").includes("No filings for EMPTY."));
+    expect(root.textContent).toContain("Try asking: Summarize the latest EMPTY disclosures.");
+    expect(root.querySelector('[aria-busy="true"]')).toBeNull();
     await rerender(<NewsPanel sym="EMPTY" />);
-    await until(() => (root.textContent ?? "").includes("loading headlines…"));
+    await until(() => (root.textContent ?? "").includes("No news for EMPTY."));
+    expect(root.textContent).toContain("Try asking: What moved EMPTY today?");
+    expect(root.querySelector('[aria-busy="true"]')).toBeNull();
     globalThis.fetch = (async () => Response.json({ items: [], error: "provider has no access" })) as unknown as typeof fetch;
     await rerender(<FinancialsPanel sym="WARN" />);
-    await until(() => (root.textContent ?? "").includes("provider has no access"));
-    expect(root.textContent).not.toContain("no SEC filings found");
+    await until(() => (root.textContent ?? "").includes("We could not load this data."));
+    expect(root.textContent).not.toContain("provider has no access");
+    expect(root.textContent).not.toContain("No filings");
     await rerender(<NewsPanel sym="WARN" />);
-    await until(() => (root.textContent ?? "").includes("provider has no access"));
-    expect(root.textContent).not.toContain("loading headlines…");
+    await until(() => (root.textContent ?? "").includes("We could not load this data."));
+    expect(root.textContent).not.toContain("provider has no access");
+    expect(root.textContent).not.toContain("No news");
     globalThis.fetch = (() => Promise.reject(new Error("filing outage"))) as unknown as typeof fetch;
     await rerender(<FinancialsPanel sym="FAIL" />);
-    await until(() => (root.textContent ?? "").includes("filings unavailable: filing outage"));
+    await until(() => (root.textContent ?? "").includes("We could not load this data."));
+    expect(root.textContent).not.toContain("filing outage");
     globalThis.fetch = (() => Promise.reject("upstream unavailable")) as unknown as typeof fetch;
     await rerender(<FinancialsPanel sym="FAIL-STRING" />);
-    await until(() => (root.textContent ?? "").includes("filings unavailable: upstream unavailable"));
+    await until(() => (root.textContent ?? "").includes("We could not load this data."));
+    expect(root.textContent).not.toContain("upstream unavailable");
     await rerender(<NewsPanel sym="FAIL" />);
-    await until(() => (root.textContent ?? "").includes("news unavailable"));
-    expect(root.textContent).not.toContain("loading headlines…");
+    await until(() => (root.textContent ?? "").includes("We could not load this data."));
+    expect(root.textContent).not.toContain("upstream unavailable");
+    expect(root.querySelector('[aria-busy="true"]')).toBeNull();
   });
 
   const renderers: [string, (sym: string) => ReactNode][] = [
@@ -283,6 +324,44 @@ describe("FinancialsPanel and NewsPanel", () => {
     ["news", (sym) => <NewsPanel sym={sym} />],
   ];
   for (const [name, render] of renderers) {
+    test(`${name} shows a loading skeleton and retries the same symbol after a provider error`, async () => {
+      const first = Promise.withResolvers<Response>();
+      const retried = Promise.withResolvers<Response>();
+      const requests: { url: string; signal: AbortSignal | null | undefined }[] = [];
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({ url: String(input), signal: init?.signal });
+        return requests.length === 1 ? first.promise : retried.promise;
+      }) as unknown as typeof fetch;
+      const root = await mount(render("NVDA"));
+      expect(root.querySelector('.skeleton[role="status"][aria-busy="true"]')).not.toBeNull();
+      expect(root.textContent).not.toContain("Try asking:");
+      await act(async () => {
+        first.resolve(Response.json({
+          items: [{ title: "Available result", link: "", filed: "2026-10-14", updated: "acceptance", published: "2026-10-14", source: "Wire" }],
+          error: "private provider details",
+        }));
+      });
+      await until(() => root.querySelector('[role="alert"]') !== null);
+      expect(root.textContent).toContain("We could not load this data.");
+      expect(root.textContent).toContain("Available result");
+      expect(root.textContent).not.toContain("private provider details");
+      expect(root.querySelector(".skeleton")).toBeNull();
+      const retry = root.querySelector("button");
+      expect(retry?.textContent).toBe("Retry");
+      await click(retry!);
+      expect(root.querySelector('.skeleton[aria-busy="true"]')).not.toBeNull();
+      expect(root.querySelector('[role="alert"]')).toBeNull();
+      expect(root.textContent).not.toContain("Available result");
+      expect(requests.map((request) => request.url)).toEqual([`/api/${name}?sym=NVDA`, `/api/${name}?sym=NVDA`]);
+      expect(requests[0]?.signal?.aborted).toBe(true);
+      await act(async () => {
+        retried.resolve(Response.json({ items: [{ title: "Retried result", link: "", filed: "2026-10-14", updated: "acceptance", published: "2026-10-14", source: "Wire" }] }));
+      });
+      await until(() => (root.textContent ?? "").includes("Retried result"));
+      expect(root.querySelector(".skeleton")).toBeNull();
+      expect(root.querySelector('[role="alert"]')).toBeNull();
+    });
+
     test(`${name} follows the selected symbol and ignores a stale success and a stale failure`, async () => {
       const first = Promise.withResolvers<Response>();
       const second = Promise.withResolvers<Response>();

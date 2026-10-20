@@ -355,6 +355,51 @@ def test_identical_events_within_one_tick_coalesce_to_one_call(tmp_path: Path, m
     assert len(res.triggers_created) == 1 and fake.calls == 1
 
 
+def test_new_trigger_pushes_ntfy_only_with_http_topic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import urllib.request
+
+    posts: list[urllib.request.Request] = []
+
+    class _Resp:
+        def close(self) -> None:
+            return None
+
+    def _urlopen(req: urllib.request.Request, timeout: float) -> _Resp:
+        assert timeout == 5
+        posts.append(req)
+        if req.full_url.endswith("/down"):
+            raise OSError("ntfy down")
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    _kernel(monkeypatch)
+    r, t = _make(tmp_path)
+    link = "https://www.sec.gov/Archives/edgar/data/1045810/x-index.htm"
+    filing = CanonicalEvent(
+        event_id="sec:1",
+        canonical_ref="sec:1",
+        source="sec_filings",
+        known_at=T1,
+        entity="NVDA",
+        summary="8-K filed by NVDA",
+        metadata={"link": link},
+    )
+    monkeypatch.delenv("NTFY_TOPIC_URL", raising=False)
+    assert len(tick(r, t.thesis_id, {"sec_filings": _Src([_ev("ev:a")])}, known_at=T2).triggers_created) == 1
+    monkeypatch.setenv("NTFY_TOPIC_URL", "file:///etc/passwd")
+    assert len(tick(r, t.thesis_id, {"sec_filings": _Src([_ev("ev:b")])}, known_at=T2).triggers_created) == 1
+    assert posts == []
+    monkeypatch.setenv("NTFY_TOPIC_URL", "https://ntfy.example/alerts")
+    assert len(tick(r, t.thesis_id, {"sec_filings": _Src([filing])}, known_at=T2).triggers_created) == 1
+    [req] = posts
+    assert req.full_url == "https://ntfy.example/alerts" and req.get_method() == "POST"
+    assert req.get_header("Title") == f"{t.slug}: new_filing" and req.get_header("Click") == link
+    assert req.data == f"8-K filed by NVDA\n{link}".encode()
+    monkeypatch.setenv("NTFY_TOPIC_URL", "https://ntfy.example/down")
+    assert len(tick(r, t.thesis_id, {"sec_filings": _Src([_ev("ev:c")])}, known_at=T2).triggers_created) == 1
+    assert posts[-1].data == b"NVDA files 10-K noting steady demand\nev:c" and posts[-1].get_header("Click") is None
+
+
 def test_relevant_filing_produces_one_bounded_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     r = ThesisRepository(tmp_path / "theses")
     t = r.create_thesis("NVDA thesis", scope="NVDA", claims=["NVDA demand grows"], effective_at=T0)

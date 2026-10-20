@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { fetchFilings, fetchNews, fetchQuote, fetchWatchlistSources, type FilingItem, type NewsItem, type SourceRow } from "../lib/market-data";
+import { fetchFilings, fetchNews, fetchQuote, fetchWatchlistSources, type SourceRow } from "../lib/market-data";
 
 import { AgentConsole } from "./agent-console";
+import { useLoad } from "./home-panels";
 import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
 import type { JournalPage, ResearchSnapshot } from "../lib/research-client";
 
@@ -13,7 +14,7 @@ const panel: React.CSSProperties = {
   overflow: "hidden",
 };
 const h: React.CSSProperties = {
-  fontSize: 20,
+  fontSize: 14,
   letterSpacing: "0.08em",
   color: "var(--muted, #93A0B8)",
   marginBottom: 10,
@@ -49,22 +50,23 @@ export function WatchlistPanel({ selected, onSelect, symbols }: { selected: stri
   const symKey = syms.join(",");
   const [prices, setPrices] = useState<Record<string, number | null>>({});
   const [sources, setSources] = useState<SourceRow[]>([]);
-  const [sourceError, setSourceError] = useState<string | null>(null);
+  const [sourceError, setSourceError] = useState(false);
+  const [sourceAttempt, setSourceAttempt] = useState(0);
   useEffect(() => {
     const ctrl = new AbortController();
     // Deferred one tick: a StrictMode remount cancels the timer, so one page load sends one request.
     const id = setTimeout(() => {
       setSources([]);
-      setSourceError(null);
+      setSourceError(false);
       fetchWatchlistSources(symKey.split(","), ctrl.signal)
         .then(setSources)
-        .catch((e: unknown) => !ctrl.signal.aborted && setSourceError(`sources unavailable: ${e instanceof Error ? e.message : String(e)}`));
+        .catch(() => !ctrl.signal.aborted && setSourceError(true));
     }, 0);
     return () => {
       clearTimeout(id);
       ctrl.abort();
     };
-  }, [symKey]);
+  }, [symKey, sourceAttempt]);
   useEffect(() => {
     const current = symKey.split(",");
     let alive = true;
@@ -94,7 +96,11 @@ export function WatchlistPanel({ selected, onSelect, symbols }: { selected: stri
   return (
     <div style={{ ...panel, height: "100%", overflowY: "auto" }}>
       <div style={h}>WATCHLIST · DELAYED</div>
-      {sourceError && <div style={{ fontSize: 14, color: down, marginBottom: 8 }}>{sourceError}</div>}
+      {sourceError && (
+        <p role="alert" style={{ fontSize: 14, color: "var(--muted, #93A0B8)", marginBottom: 8 }}>
+          We could not load this data. <button type="button" className="pill" onClick={() => setSourceAttempt((attempt) => attempt + 1)}>Retry</button>
+        </p>
+      )}
       {syms.map((sym) => (
         <button
           key={sym}
@@ -122,7 +128,7 @@ export function WatchlistPanel({ selected, onSelect, symbols }: { selected: stri
                 .map((row) => (
                   <span
                     key={row.source}
-                    title={[row.tool, row.status, row.as_of, row.ref?.record_id, row.error].filter(Boolean).join(" · ")}
+                    title={[row.tool, row.status, row.as_of, row.ref?.record_id].filter(Boolean).join(" · ")}
                     style={{ color: row.status === "error" || row.status === "timeout" ? down : undefined }}
                   >
                     {`${SOURCE_LABEL[row.source]} ${sourceText(row)} `}
@@ -139,29 +145,21 @@ export function WatchlistPanel({ selected, onSelect, symbols }: { selected: stri
 // Financials: delayed window stats from the same /api/candles the chart draws
 // plus the latest SEC filing link. No static table.
 export function FinancialsPanel({ sym }: { sym: string }) {
-  const [filings, setFilings] = useState<FilingItem[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    let alive = true;
-    const ctrl = new AbortController();
-    fetchFilings(sym, ctrl.signal)
-      .then((page) => {
-        if (!alive) return;
-        setFilings(page.items.slice(0, 3));
-        setError(page.error ?? null);
-      })
-      .catch((e: unknown) => alive && setError(`filings unavailable: ${e instanceof Error ? e.message : String(e)}`));
-    return () => {
-      alive = false;
-      ctrl.abort();
-    };
-  }, [sym]);
+  const { data, error: transportError, retry } = useLoad(sym, (signal) => fetchFilings(sym, signal));
+  const filings = data?.items.slice(0, 3) ?? [];
+  const error = transportError ?? data?.error;
+  const loading = !data && !error;
   return (
     <div style={{ ...panel, height: "100%", minHeight: 0, overflowY: "auto" }}>
       <div style={h}>FILINGS · {sym}</div>
-      {error && <div style={{ fontSize: 18, color: "var(--muted, #93A0B8)", marginBottom: 8 }}>{error}</div>}
-      {filings.length === 0 && !error && (
-        <div style={{ fontSize: 20, color: "var(--muted, #93A0B8)" }}>no SEC filings found</div>
+      {loading && <span className="skeleton" role="status" aria-label="Loading filings" aria-busy="true" />}
+      {error && (
+        <p role="alert" style={{ fontSize: 18, color: "var(--muted, #93A0B8)" }}>
+          We could not load this data. <button type="button" className="pill" onClick={retry}>Retry</button>
+        </p>
+      )}
+      {!loading && filings.length === 0 && !error && (
+        <p style={{ fontSize: 20, color: "var(--muted, #93A0B8)" }}>No filings for {sym}. Try asking: Summarize the latest {sym} disclosures.</p>
       )}
       {filings.map((f, i) => (
         <div key={i} style={{ fontSize: 20, marginBottom: 12, lineHeight: 1.5 }}>
@@ -185,27 +183,19 @@ export function FinancialsPanel({ sym }: { sym: string }) {
 
 // News: Google News RSS headlines via /api/news. No hardcoded headlines.
 export function NewsPanel({ sym }: { sym: string }) {
-  const [items, setItems] = useState<NewsItem[]>([]);
-  const [stale, setStale] = useState<string | null>(null);
-  useEffect(() => {
-    let alive = true;
-    const ctrl = new AbortController();
-    fetchNews(sym, ctrl.signal)
-      .then((page) => {
-        if (!alive) return;
-        setItems(page.items.slice(0, 8));
-        setStale(page.error ?? null);
-      })
-      .catch(() => alive && setStale("news unavailable"));
-    return () => {
-      alive = false;
-      ctrl.abort();
-    };
-  }, [sym]);
+  const { data, error: transportError, retry } = useLoad(sym, (signal) => fetchNews(sym, signal));
+  const items = data?.items.slice(0, 8) ?? [];
+  const error = transportError ?? data?.error;
+  const loading = !data && !error;
   return (
     <div style={{ ...panel, height: "100%", minHeight: 0, overflowY: "auto" }}>
       <div style={h}>NEWS · {sym}</div>
-      {stale && <div style={{ fontSize: 18, color: "var(--muted, #93A0B8)", marginBottom: 8 }}>{stale}</div>}
+      {loading && <span className="skeleton" role="status" aria-label="Loading news" aria-busy="true" />}
+      {error && (
+        <p role="alert" style={{ fontSize: 18, color: "var(--muted, #93A0B8)" }}>
+          We could not load this data. <button type="button" className="pill" onClick={retry}>Retry</button>
+        </p>
+      )}
       {items.map((n, i) => (
         <div key={i} style={{ fontSize: 20, marginBottom: 12, lineHeight: 1.5 }}>
           <span style={{ color: "var(--muted, #93A0B8)", fontSize: 18 }}>
@@ -222,8 +212,8 @@ export function NewsPanel({ sym }: { sym: string }) {
           </div>
         </div>
       ))}
-      {items.length === 0 && !stale && (
-        <div style={{ fontSize: 20, color: "var(--muted, #93A0B8)" }}>loading headlines…</div>
+      {!loading && items.length === 0 && !error && (
+        <p style={{ fontSize: 20, color: "var(--muted, #93A0B8)" }}>No news for {sym}. Try asking: What moved {sym} today?</p>
       )}
     </div>
   );

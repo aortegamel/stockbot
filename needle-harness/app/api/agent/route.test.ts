@@ -29,6 +29,7 @@ let toolThrows: unknown = null;
 let endThrows = false;
 let chartReceipt: unknown = { result_type: "chart_selection", ticker: "MSFT" };
 let watchlistReceipt: unknown = { result_type: "watchlist_update", action: "add", ticker: "AMD" };
+let widgetReceipt: unknown = { result_type: "widget_selection", widget_type: "short-volume", ticker: "AAPL" };
 let emitChartUpdate = false;
 const executionOrder: string[] = [];
 const runCalls: unknown[][] = [];
@@ -133,6 +134,7 @@ mock.module("@/lib/tools/stockbot", () => ({
     if (toolFailure !== null) return { ok: false, ...toolFailure };
     if (name === "set_chart_symbol") return { ok: true, chartSelection: chartReceipt, evidence: { ...bridgeEvidence, content: "ticker: MSFT\nresult_type: chart_selection" } };
     if (name === "update_watchlist") return { ok: true, watchlistUpdate: watchlistReceipt, evidence: { ...bridgeEvidence, content: "action: add\nticker: AMD" } };
+    if (name === "add_widget") return { ok: true, widgetSelection: widgetReceipt, evidence: { ...bridgeEvidence, content: "widget_type: short-volume\nticker: AAPL" } };
     return { ok: true, evidence: { ...bridgeEvidence, source: name } };
   },
   newSessionId: () => {
@@ -165,6 +167,7 @@ function reset(): void {
   endThrows = false;
   chartReceipt = { result_type: "chart_selection", ticker: "MSFT" };
   watchlistReceipt = { result_type: "watchlist_update", action: "add", ticker: "AMD" };
+  widgetReceipt = { result_type: "widget_selection", widget_type: "short-volume", ticker: "AAPL" };
   emitChartUpdate = false;
   emitOffer = false;
   personaCalls.length = 0;
@@ -1214,6 +1217,60 @@ describe("watchlist chat action", () => {
     reset();
     winner = "get_sec_document";
     verdicts = ["update_watchlist"];
+    await eventsFor("Microsoft risk factors?", "MSFT");
+    expect(invoked.map((call) => call[0])).toEqual(["get_sec_document"]);
+    expect(runCalls).toHaveLength(1);
+  });
+});
+
+describe("workspace widget chat action", () => {
+  test("a validated receipt for the displayed stock emits widget_update and answers without evidence, reasoning, or research", async () => {
+    reset();
+    delete process.env.STOCKBOT_DEBUG;
+    winner = "add_widget";
+    argsReply = { tool: "add_widget", arguments: { type: "short-volume", ticker: "aapl" }, confidence: 1 };
+    const prompt = "add a short volume widget";
+    const events = await eventsFor(prompt, undefined, undefined, "AAPL");
+    expect(events.slice(0, 3)).toEqual([
+      { type: "agent_start", prompt },
+      { type: "widget_update", ticker: "AAPL", widgetType: "short-volume" },
+      { type: "answer_delta", text: "Added the short-volume widget to the AAPL workspace." },
+    ]);
+    expect(events.at(-1)?.type).toBe("done");
+    expect(invoked).toEqual([["add_widget", { type: "short-volume", ticker: "aapl" }, "sess-test"]]);
+    expect(ended).toEqual(["sess-test"]);
+    expect(events.some((event) => event.type === "evidence")).toBe(false);
+    expect(reasonCalls).toEqual([]);
+    expect(runCalls).toEqual([]);
+    expect(kernelCalls.map((call) => call.op)).toEqual(["route", "arguments"]);
+  });
+
+  test("failed tools, malformed or foreign receipts, and failed arguments answer visibly without an update or research", async () => {
+    for (const failure of ["returned", "missing", "kind", "type", "ticker", "focus", "args"]) {
+      reset();
+      winner = "add_widget";
+      if (failure === "returned") toolFailure = { category: "tool_error", error: "tool failed" };
+      if (failure === "missing") widgetReceipt = undefined;
+      if (failure === "kind") widgetReceipt = { result_type: "watchlist_update", widget_type: "short-volume", ticker: "AAPL" };
+      if (failure === "type") widgetReceipt = { result_type: "widget_selection", widget_type: "options-flow", ticker: "AAPL" };
+      if (failure === "ticker") widgetReceipt = { result_type: "widget_selection", widget_type: "short-volume", ticker: "aapl" };
+      if (failure === "focus") widgetReceipt = { result_type: "widget_selection", widget_type: "short-volume", ticker: "MSFT" };
+      if (failure === "args") argsDown = true;
+      const events = await eventsFor("add a short volume widget", "AAPL");
+      expect(events.some((event) => event.type === "widget_update")).toBe(false);
+      expect(String(events.find((event) => event.type === "answer_delta")?.text)).toContain("Widget update failed:");
+      expect(events.at(-1)?.type).toBe("done");
+      expect(invoked).toHaveLength(failure === "args" ? 0 : 1);
+      expect(ended).toEqual(failure === "args" ? [] : ["sess-test"]);
+      expect(runCalls).toEqual([]);
+      expect(reasonCalls).toEqual([]);
+    }
+  });
+
+  test("post-tool assessment cannot chain into the widget action", async () => {
+    reset();
+    winner = "get_sec_document";
+    verdicts = ["add_widget"];
     await eventsFor("Microsoft risk factors?", "MSFT");
     expect(invoked.map((call) => call[0])).toEqual(["get_sec_document"]);
     expect(runCalls).toHaveLength(1);

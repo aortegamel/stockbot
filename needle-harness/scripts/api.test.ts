@@ -213,16 +213,17 @@ describe("bun api host", () => {
     }
   }, 130_000);
 
-  test("listener answers health on a non-primary loopback address, so it binds every IPv4 interface", async () => {
-    // A 127.0.0.1-only bind refuses 127.0.0.2 on Linux; 0.0.0.0 accepts it. No LAN interface needed.
+  test("listener answers health only on 127.0.0.1 and refuses another loopback address", async () => {
+    // A 127.0.0.1-only bind refuses 127.0.0.2 on Linux; a 0.0.0.0 bind would accept it. No LAN interface needed.
     const saved = { api: process.env.STOCKBOT_API_PORT, prewarmed: process.env.KERNEL_PREWARMED };
     const before = { SIGINT: process.listeners("SIGINT"), SIGTERM: process.listeners("SIGTERM") };
     process.env.STOCKBOT_API_PORT = "0";
     const server = await startApiServer();
     try {
-      const res = await fetch(`http://127.0.0.2:${server.port}/api/health`);
+      const res = await fetch(`http://127.0.0.1:${server.port}/api/health`);
       expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({ ok: true, port: String(server.port) });
+      expect(await fetch(`http://127.0.0.2:${server.port}/api/health`).then(() => "answered", () => "refused")).toBe("refused");
     } finally {
       await server.stop(true);
       for (const sig of ["SIGINT", "SIGTERM"] as const) {

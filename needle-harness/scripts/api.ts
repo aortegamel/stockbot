@@ -69,7 +69,8 @@ export async function registerPrewarm(): Promise<void> {
 
 export async function startApiServer(): Promise<Server<undefined>> {
   const requested = resolveApiPort();
-  const server = Bun.serve({ hostname: "0.0.0.0", port: requested, idleTimeout: 0, fetch: dispatch });
+  // Loopback only: browsers reach this API through the vite proxy and its LAN token gate.
+  const server = Bun.serve({ hostname: "127.0.0.1", port: requested, idleTimeout: 0, fetch: dispatch });
   process.env.STOCKBOT_API_PORT = String(server.port ?? requested);
   await registerPrewarm();
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
@@ -84,7 +85,7 @@ export async function startApiServer(): Promise<Server<undefined>> {
       process.exit(0);
     });
   }
-  console.log(`[web] bun api listening http://0.0.0.0:${server.port ?? requested} (all IPv4 interfaces, no login)`);
+  console.log(`[web] bun api listening http://127.0.0.1:${server.port ?? requested} (loopback only, reached through the vite proxy)`);
   return server;
 }
 

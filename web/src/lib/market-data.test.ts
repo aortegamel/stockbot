@@ -5,6 +5,10 @@ import {
   fetchQuote,
   fetchViewerContext,
   fetchWatchlistSources,
+  fetchCandles,
+  fetchWorkspace,
+  fetchWidgetData,
+  saveWorkspace,
   searchTickers,
 } from "./market-data";
 import type { SourceRow } from "./market-data";
@@ -91,5 +95,31 @@ describe("market data requests", () => {
     expect(forwarded).toEqual([controller.signal]);
     expect(failure).toBeInstanceOf(DOMException);
     expect((failure as DOMException).name).toBe("AbortError");
+  });
+
+  test("fetches workspace widgets and candles, and saves the workspace with PUT", async () => {
+    const signal = new AbortController().signal;
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const doc = { sym: "BRK.B", widgets: [{ id: "news", type: "news", ticker: "BRK.B" }], updated_at: "2026-10-20" };
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return Response.json(doc);
+    }) as typeof fetch;
+    expect(await fetchWorkspace("BRK.B", signal)).toEqual(doc);
+    await fetchCandles("BRK.B", "5y", "1mo", signal);
+    await fetchWidgetData("short-interest", "BRK.B", signal);
+    expect(await saveWorkspace("BRK.B", doc.widgets)).toEqual(doc);
+    expect(calls.map((c) => c.url)).toEqual([
+      "/api/workspaces/BRK.B",
+      "/api/candles?sym=BRK.B&range=5y&interval=1mo",
+      "/api/widget-data?type=short-interest&sym=BRK.B",
+      "/api/workspaces/BRK.B",
+    ]);
+    expect(calls.slice(0, 3).every((c) => c.init?.signal === signal)).toBe(true);
+    expect(calls[3].init).toEqual({
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ widgets: doc.widgets }),
+    });
+    globalThis.fetch = (async () => new Response(null, { status: 503 })) as unknown as typeof fetch;
+    await expect(saveWorkspace("BRK.B", [])).rejects.toThrow("request failed: 503");
   });
 });

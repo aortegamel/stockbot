@@ -2,7 +2,7 @@ import { reason } from "@/lib/muse/client";
 import { asksWatchlist, kernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type KernelResponse } from "@/lib/agent/kernel";
 import { tools } from "@/lib/tools";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
-import { FINAL_PERSONAS, redactArgs, sourceReferences, type AgentEvent, type Evidence, type FailureCategory, type Persona, type Timings } from "@/lib/agent/types";
+import { FINAL_PERSONAS, redactArgs, sourceReferences, WIDGET_TYPES, type AgentEvent, type Evidence, type FailureCategory, type Persona, type Timings } from "@/lib/agent/types";
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
@@ -286,7 +286,7 @@ export async function POST(req: Request): Promise<Response> {
             await answerFromEvidence();
             return true;
           }
-          if (verdict === "research_required" || verdict === "set_chart_symbol" || verdict === "update_watchlist") return false;
+          if (verdict === "research_required" || verdict === "set_chart_symbol" || verdict === "update_watchlist" || verdict === "add_widget") return false;
           // ponytail: worker output is untrusted — only identifier-shaped tool names chain; anything else researches.
           if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(verdict)) return false;
           current = verdict;
@@ -328,6 +328,41 @@ export async function POST(req: Request): Promise<Response> {
         send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: generated ? 1 : 0, totalMs: 0, escalations: 0 }, tools: { calls: generated ? 1 : 0, totalMs: 0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures: {} } });
         return true;
       };
+      // The widget action is a UI receipt for the displayed stock's workspace, never evidence.
+      // Only a validated canonical receipt for that stock emits widget_update. A failure answers visibly, never researches.
+      const applyWidget = async (): Promise<boolean> => {
+        const t0 = performance.now();
+        send({ type: "agent_start", prompt });
+        const generated = await generateArguments("add_widget");
+        let text = "Widget update failed: no valid widget and stock.";
+        if (generated) {
+          const sessionId = newSessionId();
+          try {
+            const result = await invoke("add_widget", generated.args, sessionId, Math.max(deadlineAt - Date.now(), 1));
+            if (!result.ok) throw new Error(result.error);
+            const receipt = result.widgetSelection;
+            if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) throw new Error("The widget tool returned an invalid receipt.");
+            const { result_type, widget_type, ticker } = receipt as Record<string, unknown>;
+            if (result_type !== "widget_selection" || typeof widget_type !== "string" || !WIDGET_TYPES.includes(widget_type) || typeof ticker !== "string" || parseTicker(ticker) !== ticker) {
+              throw new Error("The widget tool returned an invalid receipt.");
+            }
+            if (ticker !== currentChartTicker) throw new Error(`The widget targets ${ticker}, but the displayed stock is ${currentChartTicker ?? "not set"}.`);
+            send({ type: "widget_update", ticker, widgetType: widget_type });
+            text = `Added the ${widget_type} widget to the ${ticker} workspace.`;
+          } catch (err) {
+            text = `Widget update failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 160)}`;
+          } finally {
+            try {
+              await endSession(sessionId);
+            } catch {
+              // Cleanup does not change an applied widget receipt.
+            }
+          }
+        }
+        send({ type: "answer_delta", text });
+        send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: generated ? 1 : 0, totalMs: 0, escalations: 0 }, tools: { calls: generated ? 1 : 0, totalMs: 0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures: {} } });
+        return true;
+      };
       const tryEntryAnswer = async (winner: string): Promise<boolean> => {
         try {
           if (winner === "clarify_subject") {
@@ -339,6 +374,7 @@ export async function POST(req: Request): Promise<Response> {
           }
           if (winner === "no_session" || winner === "reasoning_required") return await answerDirect();
           if (winner === "update_watchlist") return await applyWatchlist();
+          if (winner === "add_widget") return await applyWidget();
           // Only identifier-shaped tool names can enter the single-tool path.
           if (winner !== "research_required" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(winner)) return await answerSingleShot(winner);
         } catch {

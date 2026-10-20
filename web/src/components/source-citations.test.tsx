@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { AgentConsole } from "./agent-console";
-import type { AgentEvent, Evidence, Metrics } from "../../../needle-harness/lib/agent/types";
+import type { AgentEvent, Evidence, FinalClaim, Metrics } from "../../../needle-harness/lib/agent/types";
 
 function metrics(): Metrics {
   return {
@@ -83,5 +83,46 @@ describe("AgentConsole source citations", () => {
     const out = renderToStaticMarkup(<AgentConsole events={events} reasoning={true} debug={false} />);
     expect(out).toContain("Open source for ev:abc124");
     expect(out).not.toContain("Open source for ev:abc123");
+  });
+
+  // A gated research answer: prose, then the claim inventory, then done.
+  function claimed(text: string, claims: FinalClaim[]): string {
+    const events: AgentEvent[] = [
+      { type: "agent_start", prompt: "risk?" },
+      { type: "evidence", evidence: [evidence("ev:abc123", [SEC_SOURCE]), evidence("ev:abc124", [SEC_SOURCE])] },
+      { type: "answer_delta", text },
+      { type: "claims", claims },
+      { type: "done", metrics: metrics() },
+    ];
+    return renderToStaticMarkup(<AgentConsole events={events} reasoning={true} debug={false} />);
+  }
+  const chip = (n: number, id: string): string => `aria-label="Open source for ${id}" class="rounded border border-blue-800 px-1 text-blue-300 underline decoration-dotted hover:bg-blue-950">[${n}]</button>`;
+
+  test("a claim with evidence ids gets a numbered chip after its first exact occurrence", () => {
+    const out = claimed("Risk grew this year. Risk grew again.", [{ text: "Risk grew", claimType: "observed_fact", evidenceIds: ["ev:abc123"] }]);
+    expect(out).toContain(`<span>Risk grew</span><button type="button" ${chip(1, "ev:abc123")}<span> this year. Risk grew again.</span>`);
+    expect(out.match(/\[1\]<\/button>/g)).toHaveLength(1);
+  });
+
+  test("unmatched claim text, empty evidence ids, and unknown ids add no chip", () => {
+    for (const claim of [
+      { text: "Not in the answer", claimType: "observed_fact", evidenceIds: ["ev:abc123"] },
+      { text: "Risk grew", claimType: "unknown", evidenceIds: [] },
+      { text: "Risk grew", claimType: "observed_fact", evidenceIds: ["ev:missing"] },
+    ] satisfies FinalClaim[]) {
+      const out = claimed("Risk grew this year.", [claim]);
+      expect(out).toContain("Risk grew this year.");
+      expect(out).not.toContain("Open source for");
+    }
+  });
+
+  test("a sentence with an inline marker for the same id gets no second chip; numbering is shared", () => {
+    const out = claimed("Risk grew [ev:abc123]. Revenue fell.", [
+      { text: "Risk grew", claimType: "observed_fact", evidenceIds: ["ev:abc123"] },
+      { text: "Revenue fell", claimType: "observed_fact", evidenceIds: ["ev:abc124"] },
+    ]);
+    expect(out.match(/Open source for ev:abc123/g)).toHaveLength(1);
+    expect(out).toContain(">[ev:abc123]</button>");
+    expect(out).toContain(`<span>. Revenue fell</span><button type="button" ${chip(2, "ev:abc124")}<span>.</span>`);
   });
 });

@@ -3337,6 +3337,25 @@ def test_e2e_parse_research_stream_times_text_and_counts_known_citations() -> No
     ]
 
 
+def test_e2e_parse_counts_claim_citations_with_inline_markers() -> None:
+    claims: list[dict[str, object]] = [
+        {"text": "Revenue grew", "claimType": "observed_fact", "evidenceIds": ["ev:b"]},
+        {"text": "Risk rose", "claimType": "observed_fact", "evidenceIds": ["ev:a"]},  # Already inline.
+        {"text": "Not in prose", "claimType": "observed_fact", "evidenceIds": ["ev:c"]},
+        {"text": "Margins held", "claimType": "unknown", "evidenceIds": []},
+        {"text": "Revenue grew", "claimType": "inference", "evidenceIds": ["ev:zz"]},  # Unknown id.
+    ]
+    run = e2e.parse_stream(
+        _sse(
+            (1, {"type": "evidence", "evidence": [{"id": "ev:a"}, {"id": "ev:b"}, {"id": "ev:c"}]}),
+            (2, {"type": "answer_delta", "text": "Risk rose [ev:a]. Revenue grew. Margins held."}),
+            (3, {"type": "claims", "claims": claims}),
+            (4, _done(tools=1)),
+        )
+    )
+    assert run.citation_count == 2  # ev:a inline, ev:b by claim; ev:c unmatched, ev:zz unknown.
+
+
 def test_e2e_parse_routes_direct_clarify_and_single_tool() -> None:
     start = (1, {"type": "agent_start", "prompt": "p"})
     text = (2, {"type": "answer_delta", "text": "hi"})

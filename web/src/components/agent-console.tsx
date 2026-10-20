@@ -1,25 +1,52 @@
 import { useEffect, useRef, useState } from "react";
-import { FINAL_PERSONAS, type AgentEvent, type Evidence, type SourceReference } from "../../../needle-harness/lib/agent/types";
+import { FINAL_PERSONAS, type AgentEvent, type Evidence, type FinalClaim, type SourceReference } from "../../../needle-harness/lib/agent/types";
 import { fetchSourceDocument } from "../lib/research-client";
 import { originalSourceUrl, safeSourceUrl } from "../lib/source-viewer";
-import { AgentEventView } from "./agent-event";
+import { ActionCards, TrioCard } from "./action-cards";
+import { AgentEventView, WorkRow } from "./agent-event";
 import { SourcePanel } from "./source-panel";
+import { Toasts } from "./toasts";
 
 type AnswerPart = { text: string; citation?: Evidence };
 
+// The sentence around [start, end): a newline or a terminator before the next sentence bounds it.
+// A terminator followed by a bracket marker does not end the sentence, so trailing markers stay inside.
+function sentenceAround(answer: string, start: number, end: number): string {
+  const head = answer.slice(0, start);
+  const from = Math.max(head.lastIndexOf("\n"), ...[...head.matchAll(/[.!?]\s/g)].map((m) => m.index + 1)) + 1;
+  const stop = answer.slice(end).search(/[.!?](?=\s+[^\s\[]|\s*$)|\n/);
+  return answer.slice(from, stop < 0 ? answer.length : end + stop + 1);
+}
+
 // ponytail: citations are exact Evidence.ids in brackets, never a parsed link scheme.
-function splitAnswer(answer: string, known: Map<string, Evidence>): AnswerPart[] {
+// A gated claim adds a numbered chip after the first exact occurrence of its text, one per known
+// evidence id, unless its sentence already cites that id inline. Distinct ids number in answer order.
+function splitAnswer(answer: string, known: Map<string, Evidence>, claims: FinalClaim[]): AnswerPart[] {
   const entries = [...known.keys()];
   if (entries.length === 0) return [{ text: answer }];
-  const parts: AnswerPart[] = [];
+  const marks: { at: number; end: number; id: string; marker?: string }[] = [];
   const pattern = new RegExp(`\\[(${entries.map((id) => id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\]`, "g");
+  for (const m of answer.matchAll(pattern)) marks.push({ at: m.index, end: m.index + m[0].length, id: m[1], marker: m[0] });
+  for (const claim of claims) {
+    const at = claim.text ? answer.indexOf(claim.text) : -1;
+    if (at < 0) continue;
+    const end = at + claim.text.length;
+    const sentence = sentenceAround(answer, at, end);
+    for (const id of claim.evidenceIds) {
+      if (known.has(id) && !sentence.includes(`[${id}]`) && !marks.some((m) => m.at === end && m.id === id && !m.marker)) marks.push({ at: end, end, id });
+    }
+  }
+  marks.sort((a, b) => a.at - b.at);
+  const numbers = new Map<string, number>();
+  const parts: AnswerPart[] = [];
   let last = 0;
-  answer.replace(pattern, (match, id, offset) => {
-    if (offset > last) parts.push({ text: answer.slice(last, offset) });
-    parts.push({ text: match, citation: known.get(id) });
-    last = offset + match.length;
-    return match;
-  });
+  for (const mark of marks) {
+    const at = Math.max(mark.at, last);
+    if (at > last) parts.push({ text: answer.slice(last, at) });
+    if (!numbers.has(mark.id)) numbers.set(mark.id, numbers.size + 1);
+    parts.push({ text: mark.marker ?? `[${numbers.get(mark.id)}]`, citation: known.get(mark.id) });
+    last = Math.max(last, mark.end);
+  }
   if (last < answer.length) parts.push({ text: answer.slice(last) });
   return parts;
 }
@@ -105,13 +132,14 @@ function SelectedSource({
 }
 
 // ponytail: selection keeps evidence id + index so follow-up merges refresh the panel instead of a stale snapshot.
-export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[]; reasoning: boolean; debug: boolean }) {
+// onRetry reruns the request behind these events; without it failures offer no Try again.
+export function AgentConsole({ events, reasoning, debug, onRetry }: { events: AgentEvent[]; reasoning: boolean; debug: boolean; onRetry?: () => void }) {
   const [selected, setSelected] = useState<SourceSelection>(null);
   const [trio, setTrio] = useState<TrioState>(null);
   const known = evidenceById(events);
   const sourceControls = [...known.values()].filter((entry) => entry.sources?.length);
   const answer = events.filter((e) => e.type === "answer_delta").map((e) => e.text).join("");
-  const parts = splitAnswer(answer, known);
+  const parts = splitAnswer(answer, known, events.findLast((e) => e.type === "claims")?.claims ?? []);
   const citationUrls = useCitationUrls(parts);
   if (events.length === 0) {
     return (
@@ -136,10 +164,10 @@ export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[
     );
   }
   // Prod hides internal work rows; debug (.env STOCKBOT_DEBUG=1) shows all.
-  // The evidence event stays out of prod rows: citations + source controls read it directly.
+  // The evidence and claims events stay out of prod rows: citations + source controls read them directly.
   const visible = debug ? events : events.filter((e) => e.type === "agent_start" || e.type === "answer_delta" || e.type === "reasoning_start" || e.type === "done" || e.type === "error" || e.type === "failed");
   const head = visible.filter(
-    (e) => e.type !== "answer_delta" && e.type !== "done" && e.type !== "error" && e.type !== "failed" && e.type !== "reasoning_start" && e.type !== "evidence" && e.type !== "offer_trio",
+    (e) => e.type !== "answer_delta" && e.type !== "done" && e.type !== "error" && e.type !== "failed" && e.type !== "reasoning_start" && e.type !== "evidence" && e.type !== "claims" && e.type !== "offer_trio",
   );
   const tail = visible.filter((e) => e.type === "done" || e.type === "error" || e.type === "failed");
   const streaming = reasoning && tail.length === 0;
@@ -166,6 +194,8 @@ export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[
           ? <a key={i} href={url} target="_blank" rel="noopener noreferrer" aria-label={`Open source for ${citation.id}`} className={className}>{part.text}</a>
           : <button key={i} type="button" onClick={() => setSelected({ evidenceId: citation.id, position: 0 })} aria-label={`Open source for ${citation.id}`} className={className}>{part.text}</button>;
       })}</div>}
+      <WorkRow events={events} debug={debug} />
+      <ActionCards events={events} />
       {sourceControls.length > 0 && <div className="flex flex-wrap gap-2 pt-2" role="group" aria-label="Captured sources">
         {sourceControls.map((entry) => (
           <button key={entry.id} type="button" onClick={() => setSelected({ evidenceId: entry.id, position: 0 })} className="rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:border-zinc-400" aria-label={`Open captured sources for ${entry.id}`}>
@@ -175,14 +205,11 @@ export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[
       </div>}
       <SelectedSource selected={selected} known={known} setSelected={setSelected} />
       {tail.map((e, i) => (
-        <AgentEventView key={`tail-${i}`} event={e} debug={debug} />
+        <AgentEventView key={`tail-${i}`} event={e} debug={debug} onRetry={onRetry} />
       ))}
-      {offer && !current && <div className="pt-2 text-zinc-300" role="group" aria-label="Trio offer">
-        Do you want the trio team (bull + bear views)?{" "}
-        <button type="button" onClick={() => askTrio(offer.sessionId)} className="rounded border border-zinc-700 px-2 py-1 text-xs hover:border-zinc-400">Yes</button>{" "}
-        <button type="button" onClick={() => setTrio({ sessionId: offer.sessionId, events: null })} className="rounded border border-zinc-700 px-2 py-1 text-xs hover:border-zinc-400">No</button>
-      </div>}
-      {current?.events && <AgentConsole events={current.events} reasoning={current.events.some((e) => e.type === "reasoning_start")} debug={debug} />}
+      {offer && !current && <TrioCard onYes={() => askTrio(offer.sessionId)} onNo={() => setTrio({ sessionId: offer.sessionId, events: null })} />}
+      {current?.events && <AgentConsole events={current.events} reasoning={current.events.some((e) => e.type === "reasoning_start")} debug={debug} onRetry={() => askTrio(current.sessionId)} />}
+      <Toasts events={events} onRetry={onRetry} />
     </div>
   );
 }

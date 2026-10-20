@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, mock, spyOn, test, vi } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fetchCatalog, killService, parseCatalog, readBridgeReply, runAssets, waitForFirstExit } from "./needle";
+import { buildWeb, fetchCatalog, killService, monitoredTheses, parseCatalog, readBridgeReply, runAssets, waitForFirstExit, webSettings } from "./needle";
 
 const HARNESS_DIR = join(import.meta.dir, "..");
 const ROOT_DIR = join(HARNESS_DIR, "..");
@@ -323,5 +323,64 @@ describe("Needle child supervision", () => {
       expect(await failure).toBe("process.exit(1)");
       expect(output.stderr).toHaveBeenLastCalledWith(`needle assets failed: copy-pdfjs-assets exited ${code === "error" ? 1 : code ?? "signal"}\n`);
     }
+  });
+});
+
+describe("Needle thesis monitors", () => {
+  test("start for theses with an enabled watch rule, or for every thesis when forced", async () => {
+    const root = await mkdtemp(join(tmpdir(), "needle-thesis-"));
+    const watch = {
+      watched: "rules:\n- claim_ids:\n  - claim:1\n  enabled: true\n  rule_type: new_filing\nschema_version: 1\n",
+      disabled: "rules:\n- claim_ids:\n  - claim:1\n  enabled: false\n  rule_type: new_external_evidence\nschema_version: 1\n",
+      empty: "rules: []\nschema_version: 1\n",
+    };
+    try {
+      for (const [slug, text] of Object.entries(watch)) {
+        await mkdir(join(root, slug));
+        await writeFile(join(root, slug, "watch.yaml"), text);
+      }
+      await mkdir(join(root, "no-watch-file"));
+      await writeFile(join(root, "stray.yaml"), "enabled: true\n");
+      expect(monitoredTheses(root, false)).toEqual(["watched"]);
+      expect(monitoredTheses(root, true).sort()).toEqual(["disabled", "empty", "no-watch-file", "watched"]);
+      expect(monitoredTheses(join(root, "missing"), true)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Needle web listener", () => {
+  test("defaults to a production build on loopback and binds every interface only in LAN mode", () => {
+    expect(webSettings({})).toEqual({ mode: "prod", host: "127.0.0.1" });
+    expect(webSettings({ STOCKBOT_WEB_MODE: "dev" })).toEqual({ mode: "dev", host: "127.0.0.1" });
+    expect(webSettings({ STOCKBOT_LAN: "0", STOCKBOT_LAN_TOKEN: "t" })).toEqual({ mode: "prod", host: "127.0.0.1" });
+    expect(webSettings({ STOCKBOT_LAN: "1", STOCKBOT_LAN_TOKEN: "t", STOCKBOT_WEB_MODE: "dev" })).toEqual({ mode: "dev", host: "0.0.0.0" });
+  });
+
+  test("refuses LAN mode without a token and an unknown web mode", () => {
+    const output = captureOutput();
+    for (const env of [{ STOCKBOT_LAN: "1" }, { STOCKBOT_LAN: "1", STOCKBOT_LAN_TOKEN: "" }]) {
+      expect(() => webSettings(env)).toThrow("process.exit(1)");
+      expect(output.stderr).toHaveBeenLastCalledWith("needle [web]: STOCKBOT_LAN=1 requires a non-empty STOCKBOT_LAN_TOKEN (the token LAN devices send once as ?token=…)\n");
+    }
+    expect(() => webSettings({ STOCKBOT_WEB_MODE: "preview" })).toThrow("process.exit(1)");
+    expect(output.stderr).toHaveBeenLastCalledWith('needle [web]: STOCKBOT_WEB_MODE must be "prod" or "dev", got "preview"\n');
+  });
+
+  test("builds the web bundle in the web directory and fails fast on a build error", async () => {
+    const output = captureOutput();
+    const ok = new StubChild();
+    const { spawnFn, calls } = spawnRecorder(ok);
+    const env = { PORT: "33000" };
+    const pending = buildWeb(env, spawnFn);
+    ok.emit("close", 0);
+    await pending;
+    expect(calls).toEqual([["bun", ["x", "vite", "build"], { cwd: join(ROOT_DIR, "web"), stdio: "inherit", env, detached: true }]]);
+    const broken = new StubChild();
+    const failure = exitFailure(buildWeb(env, spawnRecorder(broken).spawnFn));
+    broken.emit("close", 2);
+    expect(await failure).toBe("process.exit(1)");
+    expect(output.stderr).toHaveBeenLastCalledWith("needle web build failed: vite build exited 2\n");
   });
 });

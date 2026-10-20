@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { reason, type MuseUsage } from "../muse/client";
-import { FINAL_PERSONAS, redactArgs, sourceReferences } from "./types";
+import { FINAL_PERSONAS, redactArgs, sourceReferences, WIDGET_TYPES } from "./types";
 import type { AgentEvent, Evidence, FailureCategory, FinalClaim, FinalPersonaResult, Metrics, Persona, Timings } from "./types";
 
 // ponytail: persistent worker bridge (spawn-once, ready-gated); spawn/exit/stderr handling mirrors lib/needle/client.ts.
@@ -835,6 +835,14 @@ function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSign
       }
       return;
     }
+    if (stage === "widget_update") {
+      const ticker = parseTicker(detail?.ticker);
+      const widgetType = detail?.widgetType;
+      if (ticker !== undefined && ticker === detail?.ticker && typeof widgetType === "string" && WIDGET_TYPES.includes(widgetType)) {
+        run.emit({ type: "widget_update", ticker, widgetType });
+      }
+      return;
+    }
     if (stage === "intake_evidence" && run.briefPromise === undefined) startBrief(run, detail);
     run.emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage });
   };
@@ -849,12 +857,16 @@ function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSign
     run.briefPromise = (async (): Promise<string | undefined> => {
       try {
         const started = performance.now();
+        // Buffered, not streamed: r.text already has any inventory fence stripped,
+        // so a habitual trailing ```json block never reaches the display.
         const r = await run.reasonFn({
           prompt: `${run.prompt}\n\nBrief: say what the sources below establish so far, citing their ids. Two sentences max.`,
           ...(run.scope.watchlist === undefined && run.currentChartTicker !== undefined ? { ticker: run.currentChartTicker } : {}),
           evidence: rows,
           escalated: false,
-          direct: true,
+          // Non-direct: the EVIDENCE section is included so ids exist to cite.
+          // No drafts, so no inventory fence — the brief stays two sentences.
+          direct: false,
           persona: "stockbot",
           objective: run.objective,
           nodes: [],
@@ -862,10 +874,11 @@ function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSign
           unresolved: [],
           incompleteGuard: false,
           ...(run.signal ? { signal: run.signal } : {}),
-          onDelta: (text) => run.emit({ type: "answer_delta", text }),
+          onDelta: () => { },
         });
         run.museCalls += 1;
         run.museMs += performance.now() - started;
+        run.emit({ type: "answer_delta", text: r.text });
         return r.text;
       } catch {
         return undefined;
@@ -1302,6 +1315,9 @@ async function finishAnswer(run: KernelRun, pass: Pass, note = ""): Promise<void
   }
   run.emit({ type: "answer_delta", text: (run.briefText !== undefined ? "── Full answer ──\n" : "") + citedOrThin(gated.text, results) + note });
   offerTrio(run);
+  // The inventory claims the gates kept: each text still stands in the shown answer.
+  const claims = results.flatMap((r) => r.claims.filter((c) => c.text !== "" && gated.text.includes(c.text)));
+  if (claims.length > 0) run.emit({ type: "claims", claims });
   run.emit({ type: "done", metrics: metricsOf(run, run.escalations) });
 }
 

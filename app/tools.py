@@ -107,6 +107,19 @@ _THESIS_DELTA_PROPERTIES = {
 
 _THESIS_PROPOSAL_KEYS = tuple(_THESIS_DELTA_PROPERTIES)
 
+# Defined before TOOLS because the add_widget schema enum reads it at import time.
+WIDGET_TYPES: tuple[str, ...] = (
+    "price-volume",
+    "financials",
+    "news",
+    "monthly-returns",
+    "short-interest",
+    "short-volume",
+    "insider",
+    "filings",
+    "multiples",
+)
+
 TOOLS: list[dict[str, object]] = [
     {
         "type": "function",
@@ -2312,6 +2325,18 @@ TOOLS: list[dict[str, object]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_widget",
+            "description": "Add one widget to the stock's workspace. The frontend applies the change. The receipt is not factual research evidence.",
+            "parameters": {
+                "type": "object",
+                "properties": {"type": {"type": "string", "enum": list(WIDGET_TYPES)}, "ticker": {"type": "string"}},
+                "required": ["type", "ticker"],
+            },
+        },
+    },
 ]
 # TOOL_REGISTRY_VERSION moved below TOOL_DISCOVERY_REGISTRY (hashes schemas + routing metadata).
 
@@ -3418,6 +3443,22 @@ def _update_watchlist(args: dict[str, object], model: str) -> dict[str, object]:
     if ticker is None:
         return _invalid_args_error("update_watchlist", "update_watchlist: 'ticker' must be a non-empty string")
     return {"result_type": "watchlist_update", "action": action, "ticker": ticker}
+
+
+def _add_widget(args: dict[str, object], model: str) -> dict[str, object]:
+    from app.research.models import validate_ticker
+
+    del model
+    widget_type = args.get("type")
+    if widget_type not in WIDGET_TYPES:
+        return _invalid_args_error("add_widget", f"add_widget: 'type' must be one of {', '.join(WIDGET_TYPES)}")
+    try:
+        ticker = validate_ticker(args.get("ticker"), "add_widget")
+    except ValueError as exc:
+        return _invalid_args_error("add_widget", str(exc))
+    if ticker is None:
+        return _invalid_args_error("add_widget", "add_widget: 'ticker' must be a non-empty string")
+    return {"result_type": "widget_selection", "widget_type": widget_type, "ticker": ticker}
 
 
 def _wrap_one(record: object) -> object:
@@ -4899,6 +4940,21 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         summary="Add one stock to, or remove one stock from, the local watchlist.",
         choose_when=("The user asks to add a stock to, or remove a stock from, the watchlist.",),
         reject_when=("The receipt is not factual research evidence. Not for questions about watchlist stocks.",),
+        conflicts_with=(),
+        related_tools=(),
+        prerequisites=(),
+    ),
+    "add_widget": ToolDiscovery(
+        domain="market",
+        family="workspace",
+        intent="add_widget",
+        output_kind="widget_selection",
+        source="local",
+        entity_scope="single_security",
+        time_mode="current",
+        summary="Add one widget to the stock workspace.",
+        choose_when=("The user asks to add a chart, table, or data widget to a stock workspace.",),
+        reject_when=("The receipt is not factual research evidence. Not for questions about the widget data.",),
         conflicts_with=(),
         related_tools=(),
         prerequisites=(),
@@ -7025,6 +7081,7 @@ _MODEL_HANDLERS: dict[str, ModelHandler] = {
     "get_current_time": _get_current_time,
     "set_chart_symbol": _set_chart_symbol,
     "update_watchlist": _update_watchlist,
+    "add_widget": _add_widget,
 }
 
 
@@ -7388,6 +7445,7 @@ TOOL_CAPABILITIES: dict[str, Capability] = {
     "get_current_time": Capability.RESEARCH,
     "set_chart_symbol": Capability.RESEARCH,
     "update_watchlist": Capability.RESEARCH,
+    "add_widget": Capability.RESEARCH,
     "list_finra_datasets": Capability.RESEARCH,
     "describe_finra_dataset": Capability.RESEARCH,
     "get_finra_datapoints": Capability.RESEARCH,

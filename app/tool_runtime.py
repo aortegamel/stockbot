@@ -1354,6 +1354,31 @@ def _watchlist_receipt(name: str, result: object, status: str) -> dict[str, obje
     return {"result_type": "watchlist_update", "action": result["action"], "ticker": ticker}
 
 
+def _widget_receipt(name: str, result: object, status: str) -> dict[str, object] | None:
+    """Validated widget receipt for meta; None for any other tool, failure, or malformed result."""
+    from app.tools import WIDGET_TYPES
+
+    if not (
+        name == "add_widget"
+        and status == "completed"
+        and isinstance(result, dict)
+        and result.get("result_type") == "widget_selection"
+        and result.get("widget_type") in WIDGET_TYPES
+        and "error" not in result
+        and "error_type" not in result
+    ):
+        return None
+    from app.research.models import validate_ticker
+
+    try:
+        ticker = validate_ticker(result.get("ticker"), "add_widget")
+    except ValueError:
+        return None
+    if ticker is None:
+        return None
+    return {"result_type": "widget_selection", "widget_type": result["widget_type"], "ticker": ticker}
+
+
 def _success_meta(
     name: str,
     result: object,
@@ -1397,6 +1422,9 @@ def _success_meta(
     receipt = _watchlist_receipt(name, result, status)
     if receipt is not None:
         safe_meta["watchlist_update"] = receipt
+    widget = _widget_receipt(name, result, status)
+    if widget is not None:
+        safe_meta["widget_selection"] = widget
     if name in ("search_tools", "browse_tools") and isinstance(result, dict):
         # Deferred loading: the TS extension activates these schemas additively.
         # Names are already model-visible in content; meta carries them structured.

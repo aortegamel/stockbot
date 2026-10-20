@@ -26,6 +26,9 @@ afterEach(async () => {
   await unmount();
   globalThis.fetch = realFetch;
   jest.useRealTimers();
+  // The hash route survives in the shared jsdom URL; each test starts on the default page.
+  dom.window.history.replaceState(null, "", "/");
+  dom.window.localStorage.clear();
 });
 
 type Handler = (url: string, init: RequestInit | undefined) => Response | Promise<Response> | undefined;
@@ -154,6 +157,16 @@ function findButton(root: HTMLElement, label: string): HTMLButtonElement | null 
   return [...root.querySelectorAll("button")].find((entry) => entry.textContent === label) ?? null;
 }
 
+function findLink(root: HTMLElement, label: string): HTMLAnchorElement | null {
+  return [...root.querySelectorAll("a")].find((entry) => entry.textContent === label) ?? null;
+}
+
+const PALETTE = 'input[aria-label="Search or ask anything"]';
+
+function options(root: HTMLElement): string[] {
+  return [...root.querySelectorAll('#cmd-list [role="option"]')].map((option) => (option.textContent ?? "").replace(/\s+/g, " ").trim());
+}
+
 function button(root: HTMLElement, label: string): HTMLButtonElement {
   const found = findButton(root, label);
   if (!found) throw new Error(`missing ${label} button`);
@@ -196,6 +209,7 @@ describe("App terminal shell", () => {
     expect(text(root)).toContain("select a session for logs");
     expect(find<HTMLInputElement>(root, SEARCH)).toBeDefined();
     expect(text(root)).not.toContain("· DEBUG");
+    expect(findLink(root, "Harness")).toBeNull();
   });
 
   test("shows the debug label only when the health endpoint reports debug", async () => {
@@ -661,18 +675,111 @@ describe("App research session polling", () => {
 });
 
 describe("App view switch", () => {
-  test("switches between the terminal grid and the harness viewer", async () => {
-    serve();
+  test("nav links switch pages and the Harness link shows only in debug", async () => {
+    serve((url) => (url.includes("/api/health") ? json({ debug: true }) : undefined));
     const root = await mount(<App />);
-    await until(() => findButton(root, "Harness") !== null);
-    expect(button(root, "Terminal").getAttribute("aria-pressed")).toBe("true");
-    await click(button(root, "Harness"));
+    await until(() => findLink(root, "Harness") !== null);
+    expect(findLink(root, "Workspaces")?.getAttribute("aria-current")).toBe("page");
+    expect(findLink(root, "Workspaces")?.getAttribute("href")).toBe("#/workspace/NVDA");
+    await click(findLink(root, "Harness")!);
     await until(() => text(root).includes("No trace persisted for this session"));
-    expect(button(root, "Harness").getAttribute("aria-pressed")).toBe("true");
-    expect(button(root, "Terminal").getAttribute("aria-pressed")).toBe("false");
+    expect(findLink(root, "Harness")?.getAttribute("aria-current")).toBe("page");
+    expect(findLink(root, "Workspaces")?.hasAttribute("aria-current")).toBe(false);
     expect(text(root)).not.toContain("WATCHLIST · DELAYED");
-    await click(button(root, "Terminal"));
+    // The agent drawer stays on every page.
+    expect(text(root)).toContain("AGENT · viewing NVDA");
+    await click(findLink(root, "Workspaces")!);
     await until(() => text(root).includes("WATCHLIST · DELAYED"));
     await until(() => text(root).includes("NVDA100DELAYEDSEC none"));
+  });
+
+  test("Feed Ask about this opens the closed drawer with the prompt prefilled", async () => {
+    dom.window.localStorage.setItem("stockbot.drawer", "closed");
+    dom.window.history.replaceState(null, "", "/#/feed");
+    serve((url) =>
+      url.includes("/api/feed")
+        ? json({ items: [{ id: "a", kind: "news", sym: "AAPL", title: "Apple ships", link: "https://n.example/a", at: "2026-10-20T09:00:00Z", source: "wire" }], as_of: "2026-10-20T09:00:00Z", errors: [] })
+        : undefined,
+    );
+    const root = await mount(<App />, false);
+    await until(() => findButton(root, "Ask about this") !== null);
+    expect(root.querySelector(AGENT_PROMPT)).toBeNull();
+    await click(button(root, "Ask about this"));
+    await until(() => root.querySelector(AGENT_PROMPT) !== null);
+    expect(find<HTMLInputElement>(root, AGENT_PROMPT).value).toBe("About news AAPL: Apple ships (https://n.example/a) — ");
+  });
+});
+
+describe("App command bar", () => {
+  test("opens on /, groups watchlist, scans, and tickers, and Enter on a ticker opens its workspace", async () => {
+    serve((url) => {
+      if (url.includes("/api/search")) return json({ query: "amd", hits: [{ sym: "AMD", name: "Advanced Micro Devices" }] });
+      if (url.includes("/api/scans")) return json({ scans: [{ id: "movers", name: "movers", kind: "preset", filter: {}, created_at: null }] });
+      if (url.includes("/api/theses")) return json([{ thesis_id: "t1", scope: "NVDA", user_thesis: "demand grows" }]);
+      return undefined;
+    });
+    const root = await mount(<App />);
+    expect(root.querySelector(PALETTE)).toBeNull();
+    await press(dom.window.document.body, "/");
+    await until(() => options(root).includes("movers") && options(root).includes("NVDA demand grows"));
+    expect(text(root)).toContain("Saved scans");
+    expect(options(root)).toContain("AAPL");
+    await type(find<HTMLInputElement>(root, PALETTE), "amd");
+    await until(() => options(root)[0] === "AMD Advanced Micro Devices");
+    expect(options(root).at(-1)).toBe("Ask Stockbot: amd");
+    await press(find<HTMLInputElement>(root, PALETTE), "Enter");
+    await until(() => root.querySelector("footer")?.lastElementChild?.textContent === "AMD");
+    expect(dom.window.location.hash).toBe("#/workspace/AMD");
+    expect(root.querySelector(PALETTE)).toBeNull();
+  });
+
+  test("Ctrl-K opens, Esc closes, failed groups show one line, and the Ask row sends the raw query", async () => {
+    const live = liveStream();
+    const { bodies } = serve((url) => {
+      if (url.includes("/api/search")) return Promise.reject(new Error("search down"));
+      if (url.includes("/api/scans")) return new Response(null, { status: 404 });
+      if (url.includes("/api/theses")) return json({ detail: "down" }, 500);
+      if (url.includes("/api/agent")) return new Response(live.stream, { status: 200 });
+      return undefined;
+    });
+    const root = await mount(<App />);
+    await act(async () => {
+      dom.window.document.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+    });
+    await press(find<HTMLInputElement>(root, PALETTE), "Escape");
+    expect(root.querySelector(PALETTE)).toBeNull();
+    await click(button(root, "Search or ask anything /"));
+    await until(() => text(root).includes("theses unavailable"));
+    const palette = find<HTMLInputElement>(root, PALETTE);
+    await type(palette, "why is nvda up?");
+    await until(() => text(root).includes("ticker search unavailable"));
+    expect(text(root)).not.toContain("Saved scans");
+    expect(text(root)).not.toContain("search down");
+    // Up from the first row wraps to the last row, the Ask row.
+    await press(palette, "ArrowUp");
+    await press(palette, "Enter");
+    await until(() => bodies.some((body) => body.includes("why is nvda up?")));
+    expect(JSON.parse(bodies.at(-1) ?? "{}")).toEqual({ prompt: "why is nvda up?", ticker: "NVDA", currentChartTicker: "NVDA", watchlist: WATCHLIST });
+    await act(async () => {
+      live.send(`data: {"type":"done","metrics":${JSON.stringify(metrics())}}\n\n`);
+      live.close();
+    });
+    await until(() => findButton(root, "Send") !== null);
+  });
+
+  test("the drawer toggle persists its state in localStorage", async () => {
+    serve();
+    let root = await mount(<App />);
+    const toggle = find<HTMLButtonElement>(root, '[aria-label="Close agent drawer"]');
+    expect(toggle.textContent).toBe(">>");
+    await click(toggle);
+    expect(dom.window.localStorage.getItem("stockbot.drawer")).toBe("closed");
+    expect(root.querySelector(AGENT_PROMPT)).toBeNull();
+    await unmount();
+    root = await mount(<App />);
+    expect(root.querySelector(AGENT_PROMPT)).toBeNull();
+    await click(find<HTMLButtonElement>(root, '[aria-label="Open agent drawer"]'));
+    expect(dom.window.localStorage.getItem("stockbot.drawer")).toBe("open");
+    expect(root.querySelector(AGENT_PROMPT)).not.toBeNull();
   });
 });

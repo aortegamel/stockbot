@@ -30,17 +30,17 @@ Values in .env replace inherited shell exports. An inherited PORT is the one exc
 
 ```bash
 cp ../.env.example ../.env  # once from repo root, then fill values
-bun run stockbot  # from repo root → Vite on PORT, free-picked from 3000, bound to all IPv4 interfaces
+bun run stockbot  # from repo root → vite build, then vite preview on PORT (free-picked from 3000), localhost only
+bun run dev       # from repo root → same launcher with the vite dev server (STOCKBOT_WEB_MODE=dev)
 # staged logs per step; browser misbehaves? first check the Bun API port in the startup log, then curl that /api/health
 bun run lint && bun run typecheck
 BENCHMARK=1 bun run stockbot   # write benchmarks/*.json per run
 ```
 
-Vite (`PORT`), the Bun API (`STOCKBOT_API_PORT`), and the FastAPI market service (`STOCKBOT_MARKET_PORT`) bind `0.0.0.0`.
+Vite (`PORT`) binds `127.0.0.1` by default. The Bun API (`STOCKBOT_API_PORT`) and the FastAPI market service (`STOCKBOT_MARKET_PORT`) always bind `127.0.0.1` and are reached through the Vite `/api/*` proxy.
 The startup log prints each selected port.
-From another device, open `http://<host LAN IP>:<PORT>`, for example `http://192.168.1.20:3000`.
-`0.0.0.0` is a bind address, not a client address.
-These endpoints have no login protection. Use them only on a trusted network. Never forward the ports to the internet.
+`STOCKBOT_LAN=1 STOCKBOT_LAN_TOKEN=<token> bun run stockbot` binds Vite to `0.0.0.0`; open `http://<host LAN IP>:<PORT>/?token=<token>` once per device.
+See the root README "LAN access" section.
 
 ## 5. Architecture
 
@@ -98,6 +98,11 @@ The receipt supplies no factual evidence. The route answers without research or 
 `WatchlistChatPanel` applies each event once and keeps the list for the mounted terminal.
 It preserves the existing page-load source requests and their 15-second budget.
 The component requires App integration. The default `WatchlistPanel` behavior does not change.
+
+Chat can select `add_widget` to add one widget to the displayed stock's workspace.
+Needle generates `type` and `ticker`. The canonical tool validates both fields, and the bridge preserves its `widget_selection` receipt.
+The route emits `{type:"widget_update", ticker, widgetType}` only after canonical success and only when the receipt ticker equals `currentChartTicker`. Kernel worker progress relays this event only for a canonical ticker and a known widget type.
+The receipt supplies no factual evidence. A failure answers as text without research, and a post-tool assessment cannot chain into `add_widget`.
 
 ### Captured evidence
 

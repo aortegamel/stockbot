@@ -67,6 +67,8 @@ domains:
         path: "/market/index-membership"
       - watchlist:
         path: "/market/watchlist"
+      - workspace:
+        path: "/market/workspace"
   offerings:
     description: "Financing history, offering terms, and dilution math."
     families:
@@ -436,6 +438,18 @@ tools:
     summary: "Add one stock to, or remove one stock from, the local watchlist."
     version: 2
     keywords: [add, ask, local, one, remove, stock, update, user, watchlist]
+  - name: add_widget
+    domain: market
+    family: workspace
+    path: "/market/workspace/add_widget"
+    intent: add_widget
+    output_kind: widget_selection
+    source: local
+    entity_scope: single_security
+    time_mode: current
+    summary: "Add one widget to the stock workspace."
+    version: 2
+    keywords: [add, ask, chart, data, one, stock, table, user, widget, workspace]
   - name: get_dilution_profile
     domain: offerings
     family: capital-raising

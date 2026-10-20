@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -154,14 +154,9 @@ export async function fetchCatalog(catalogPath: string, spawnBridge: typeof spaw
   process.stdout.write(`needle [ai]: catalog ok ${catalogPath} (${catalog.map((c) => c.name).join(",")})\n`);
 }
 
-export async function runAssets(childEnv: NodeJS.ProcessEnv, spawnAssets: typeof spawn = spawn): Promise<void> {
-  process.stdout.write("needle [web]: copying pdfjs assets…\n");
-  const child = spawnAssets("bun", ["scripts/copy-pdfjs-assets.ts"], {
-    cwd: HARNESS_DIR,
-    stdio: "inherit",
-    env: childEnv,
-    detached: true,
-  });
+// One-shot child that must exit 0 before services start.
+async function runStep(failure: string, args: string[], cwd: string, childEnv: NodeJS.ProcessEnv, spawnStep: typeof spawn): Promise<void> {
+  const child = spawnStep("bun", args, { cwd, stdio: "inherit", env: childEnv, detached: true });
   owned.add(child);
   const code = await new Promise<number | null>((resolve) => {
     child.on("error", () => resolve(1));
@@ -169,11 +164,42 @@ export async function runAssets(childEnv: NodeJS.ProcessEnv, spawnAssets: typeof
   });
   owned.delete(child);
   if (gotSignal) process.exit(1);
-  if (code !== 0) fail(`needle assets failed: copy-pdfjs-assets exited ${code ?? "signal"}`);
+  if (code !== 0) fail(`${failure} exited ${code ?? "signal"}`);
+}
+
+export async function runAssets(childEnv: NodeJS.ProcessEnv, spawnAssets: typeof spawn = spawn): Promise<void> {
+  process.stdout.write("needle [web]: copying pdfjs assets…\n");
+  await runStep("needle assets failed: copy-pdfjs-assets", ["scripts/copy-pdfjs-assets.ts"], HARNESS_DIR, childEnv, spawnAssets);
+}
+
+export async function buildWeb(childEnv: NodeJS.ProcessEnv, spawnBuild: typeof spawn = spawn): Promise<void> {
+  process.stdout.write(`needle [web]: building production bundle (vite build, cwd ${WEB_DIR})…\n`);
+  await runStep("needle web build failed: vite build", ["x", "vite", "build"], WEB_DIR, childEnv, spawnBuild);
+}
+
+/** Web listener mode and bind host. Bun API and uvicorn always bind 127.0.0.1 behind the vite proxy. */
+export function webSettings(env: NodeJS.ProcessEnv): { mode: "prod" | "dev"; host: string } {
+  const mode = env.STOCKBOT_WEB_MODE || "prod";
+  if (mode !== "prod" && mode !== "dev") fail(`needle [web]: STOCKBOT_WEB_MODE must be "prod" or "dev", got "${mode}"`);
+  if (env.STOCKBOT_LAN !== "1") return { mode, host: "127.0.0.1" };
+  if (!env.STOCKBOT_LAN_TOKEN) fail("needle [web]: STOCKBOT_LAN=1 requires a non-empty STOCKBOT_LAN_TOKEN (the token LAN devices send once as ?token=…)");
+  return { mode, host: "0.0.0.0" };
 }
 
 type ServiceName = "api" | "market" | "web";
 type FirstExit = { name: ServiceName; child: ChildProcess; code: number | null; signal: NodeJS.Signals | null };
+
+// Thesis dirs that get a monitor: every one when forced, else those whose watch.yaml has an enabled rule.
+// ponytail: a line match on the repository's own YAML dump; parse it if the format ever changes.
+export function monitoredTheses(thesisRoot: string, all: boolean): string[] {
+  if (!existsSync(thesisRoot)) return [];
+  return readdirSync(thesisRoot, { withFileTypes: true })
+    .filter((d) => {
+      const watch = join(thesisRoot, d.name, "watch.yaml");
+      return d.isDirectory() && (all || (existsSync(watch) && /^\s+enabled: true$/m.test(readFileSync(watch, "utf8"))));
+    })
+    .map((d) => d.name);
+}
 
 export function waitForFirstExit(services: { name: ServiceName; child: ChildProcess }[]): Promise<FirstExit> {
   const { promise, resolve } = Promise.withResolvers<FirstExit>();
@@ -238,7 +264,10 @@ if (import.meta.main) {
 
   // Vite owns its subtree; the supervisor only marks an unhealthy web child.
   const WEB_UNHEALTHY_MARKER = join(HARNESS_DIR, ".needle-web-unhealthy");
-  process.stdout.write(`needle [web]: harness ${HARNESS_DIR} → http://0.0.0.0:${PORT} (all IPv4 interfaces, no login, cwd ${process.cwd()})\n`);
+  const webCfg = webSettings(process.env);
+  const viteLabel = webCfg.mode === "dev" ? "vite dev" : "vite preview";
+  const reach = webCfg.host === "0.0.0.0" ? "all IPv4 interfaces, LAN token required on /api" : "localhost only";
+  process.stdout.write(`needle [web]: harness ${HARNESS_DIR} → http://${webCfg.host}:${PORT} (${reach}, ${viteLabel}, cwd ${process.cwd()})\n`);
   process.stdout.write(dotenvLoaded ? `needle [web]: env loaded ${DOTENV}\n` : `needle [web]: no .env at ${DOTENV}, using shell env\n`);
 
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
@@ -279,10 +308,12 @@ if (import.meta.main) {
   process.stdout.write("needle [needle]: loading weights\n");
   await runAssets(childEnv);
   if (gotSignal) process.exit(1);
-  process.stdout.write(`needle [api]: starting bun scripts/api.ts (cwd ${HARNESS_DIR}, STOCKBOT_API_PORT=${STOCKBOT_API_PORT})…\n`);
-  process.stdout.write(`needle [market]: starting uvicorn api.main:app (cwd ${ROOT_DIR}, STOCKBOT_MARKET_PORT=${STOCKBOT_MARKET_PORT})…\n`);
-  process.stdout.write(`needle [web]: starting vite dev (cwd ${WEB_DIR}, PORT=${PORT})…\n`);
-  process.stdout.write("needle [web]: vite dev output follows — wait for Ready…\n");
+  // ponytail: build runs before services start; overlap it with api/market startup if launch time matters.
+  if (webCfg.mode === "prod") await buildWeb(childEnv);
+  process.stdout.write(`needle [api]: starting bun scripts/api.ts on 127.0.0.1 (cwd ${HARNESS_DIR}, STOCKBOT_API_PORT=${STOCKBOT_API_PORT})…\n`);
+  process.stdout.write(`needle [market]: starting uvicorn api.main:app on 127.0.0.1 (cwd ${ROOT_DIR}, STOCKBOT_MARKET_PORT=${STOCKBOT_MARKET_PORT})…\n`);
+  process.stdout.write(`needle [web]: starting ${viteLabel} (cwd ${WEB_DIR}, PORT=${PORT})…\n`);
+  process.stdout.write(`needle [web]: ${viteLabel} output follows — wait for Ready…\n`);
   const api = spawn("bun", [join(HARNESS_DIR, "scripts/api.ts")], {
     cwd: HARNESS_DIR,
     stdio: "inherit",
@@ -290,21 +321,19 @@ if (import.meta.main) {
     detached: true,
   });
   owned.add(api);
-  const market = spawn(REPO_PYTHON, ["-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", STOCKBOT_MARKET_PORT], {
+  const market = spawn(REPO_PYTHON, ["-m", "uvicorn", "api.main:app", "--host", "127.0.0.1", "--port", STOCKBOT_MARKET_PORT], {
     cwd: ROOT_DIR,
     stdio: "inherit",
     env: childEnv,
     detached: true,
   });
   owned.add(market);
-  if (process.env.STOCKBOT_THESIS_MONITOR === "1") {
-    const thesisRoot = resolve(ROOT_DIR, process.env.STOCKBOT_DATA_DIR ?? "data", "thesis");
-    for (const d of existsSync(thesisRoot) ? readdirSync(thesisRoot, { withFileTypes: true }) : []) {
-      if (!d.isDirectory()) continue;
-      owned.add(spawn(REPO_PYTHON, ["cli.py", "thesis", "monitor", d.name, "--interval-seconds", "900"], { cwd: ROOT_DIR, stdio: "inherit", env: childEnv, detached: true }));
-    }
+  const thesisRoot = resolve(ROOT_DIR, process.env.STOCKBOT_DATA_DIR ?? "data", "thesis");
+  for (const slug of monitoredTheses(thesisRoot, process.env.STOCKBOT_THESIS_MONITOR === "1")) {
+    owned.add(spawn(REPO_PYTHON, ["cli.py", "thesis", "monitor", slug, "--interval-seconds", "900"], { cwd: ROOT_DIR, stdio: "inherit", env: childEnv, detached: true }));
   }
-  const web = spawn("bun", ["x", "vite", "--host", "0.0.0.0", "--port", PORT, "--strictPort"], {
+  const viteArgs = webCfg.mode === "dev" ? ["x", "vite"] : ["x", "vite", "preview"];
+  const web = spawn("bun", [...viteArgs, "--host", webCfg.host, "--port", PORT, "--strictPort"], {
     cwd: WEB_DIR,
     stdio: "inherit",
     env: childEnv,
@@ -339,12 +368,12 @@ if (import.meta.main) {
   const exitCode = first.code ?? 1;
   if (first.name === "web") {
     if (exitCode === 0) {
-      process.stdout.write(`needle [web]: vite dev exited with code ${exitCode}\n`);
+      process.stdout.write(`needle [web]: ${viteLabel} exited with code ${exitCode}\n`);
     } else {
       const detail = typeof first.code === "number" ? `code ${first.code}` : first.signal ? `signal ${first.signal}` : "signal exit";
       await writeFile(WEB_UNHEALTHY_MARKER, `unhealthy ${detail} at ${new Date().toISOString()}\n`);
       process.stderr.write(`needle [web]: unhealthy web child (${detail}); marker ${WEB_UNHEALTHY_MARKER}\n`);
-      process.stderr.write(`needle [web]: vite dev exited with code ${exitCode}\n`);
+      process.stderr.write(`needle [web]: ${viteLabel} exited with code ${exitCode}\n`);
     }
   } else {
     const detail = typeof first.code === "number" ? `code ${first.code}` : first.signal ? `signal ${first.signal}` : "spawn failed";

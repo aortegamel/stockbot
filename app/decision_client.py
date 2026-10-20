@@ -1372,6 +1372,7 @@ def _assess_options() -> tuple[list[dict[str, JSONValue]], dict[str, str]]:
     _registry_options(reg, options, "assess_entry_tool")
     options.pop("set_chart_symbol", None)
     options.pop("update_watchlist", None)
+    options.pop("add_widget", None)
     return reg, options
 
 

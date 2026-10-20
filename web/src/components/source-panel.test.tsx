@@ -594,5 +594,7 @@ describe("AgentConsole trio follow-up", () => {
     const root = await mount(<AgentConsole events={offered} reasoning={false} debug={false} />);
     await click(root, "Yes");
     await until(() => root.textContent?.includes("stream ended without a terminal event") ?? false);
+    expect(root.textContent).toContain("half");
+    expect([...root.querySelectorAll("button")].some((button) => button.textContent === "Try again")).toBe(true);
   });
 });

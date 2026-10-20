@@ -91,7 +91,7 @@ def test_discovery_coordinates_complete():
 
     kebab = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
     snake = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
-    assert len(tools.TOOL_DISCOVERY_REGISTRY) == 63
+    assert len(tools.TOOL_DISCOVERY_REGISTRY) == 64
     assert "research_read_search" in tools.TOOL_DISCOVERY_REGISTRY
     for name, meta in tools.TOOL_DISCOVERY_REGISTRY.items():
         assert meta.domain and kebab.match(meta.domain), name
@@ -367,3 +367,54 @@ def test_update_watchlist_stays_outside_node_selection() -> None:
     registry = build_registry()
     assert "update_watchlist" in {entry.get("name") for entry in registry}
     assert "update_watchlist" not in {entry.get("name") for entry in _without_control_tools(registry, "s", "n")}
+
+
+@pytest.mark.parametrize("widget_type", ["short-interest", "multiples", "price-volume"])
+def test_add_widget_returns_validated_receipt(widget_type: str) -> None:
+    context = RequestContext("research", frozenset({Capability.RESEARCH}))
+
+    result = tools.execute_tool("add_widget", {"type": widget_type, "ticker": " nvda "}, "test", context=context)
+
+    assert result == {"result_type": "widget_selection", "widget_type": widget_type, "ticker": "NVDA"}
+
+
+@pytest.mark.parametrize(
+    ("arguments", "field"),
+    [
+        ({"ticker": "NVDA"}, "type"),
+        ({"type": "heatmap", "ticker": "NVDA"}, "type"),
+        ({"type": "news"}, "ticker"),
+        ({"type": "news", "ticker": ""}, "ticker"),
+        ({"type": "news", "ticker": "AMD/NYSE"}, "ticker"),
+    ],
+)
+def test_add_widget_rejects_invalid_arguments(arguments: dict[str, object], field: str) -> None:
+    context = RequestContext("research", frozenset({Capability.RESEARCH}))
+
+    result = tools.execute_tool("add_widget", arguments, "test", context=context)
+
+    assert result["error_type"] == "invalid_tool_arguments"
+    assert field in str(result["error"])
+    assert result["required"] == ["type", "ticker"]
+    assert "result_type" not in result
+
+
+def test_add_widget_is_a_research_ui_action_outside_portfolio() -> None:
+    from app.research.scheduler import build_registry
+
+    assert tools.TOOL_CAPABILITIES["add_widget"] is Capability.RESEARCH
+    assert "add_widget" not in tools.PORTFOLIO_AUTHORIZED_TOOLS
+    denied = tools.execute_tool(
+        "add_widget", {"type": "news", "ticker": "NVDA"}, "test", context=RequestContext("none", frozenset())
+    )
+    assert denied == {"error": "Tool is not permitted: add_widget"}
+    entry = next(entry for entry in build_registry() if entry["name"] == "add_widget")
+    assert entry["outputKind"] == "widget_selection"
+
+
+def test_add_widget_stays_outside_node_selection() -> None:
+    from app.research.scheduler import _without_control_tools, build_registry
+
+    registry = build_registry()
+    assert "add_widget" in {entry.get("name") for entry in registry}
+    assert "add_widget" not in {entry.get("name") for entry in _without_control_tools(registry, "s", "n")}

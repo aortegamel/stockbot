@@ -23,9 +23,10 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.actions.wheel_input import ScrollOrigin
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import Select, WebDriverWait
 
 ROOT = Path(__file__).resolve().parents[1]
 SEARCH = (By.CSS_SELECTOR, 'input[placeholder="Search any US ticker…"]')
@@ -95,6 +96,7 @@ SOURCES = ["sec_filings", "finra_short_interest", "finra_short_sale_volume", "fi
 CHART_PROMPT = "Show the AMD chart"
 CITATION_PROMPT = "Cite the fixture source inline"
 WATCHLIST_PROMPT = "Add AMD to my watchlist"
+ALERT_PROMPT = "Alert me when NVDA short interest changes"
 FIXTURE_SOURCE_PATH = "/fixture/source-doc"
 
 
@@ -181,8 +183,75 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
                 "/api/filings": FILINGS.get(sym, {"sym": sym, "cik": None, "items": []}),
                 "/api/watchlist": {"watchlist": watchlist_rows(query.get("symbols", [""])[0].split(","))},
                 "/api/theses": [],
+                "/api/scans": {
+                    "scans": [
+                        {"id": "watchlist", "name": "Watchlist", "kind": "preset", "filter": {}, "created_at": None}
+                    ]
+                },
+                "/api/sparklines": {
+                    "syms": {
+                        ticker: {"t": [1, 2, 3], "closes": [100, 102, 101], "as_of": None}
+                        for ticker in query.get("syms", [""])[0].split(",")
+                    }
+                },
+                "/api/briefing": {
+                    "date": "2026-10-20",
+                    "syms": ["NVDA"],
+                    "items": [],
+                    "generated_at": "",
+                    "cached": True,
+                    "errors": [],
+                },
+                "/api/markets": {
+                    "scan": query.get("scan", ["watchlist"])[0],
+                    "sort": query.get("sort", ["chg_pct"])[0],
+                    "universe": ["NVDA", "AAPL"],
+                    "rows": [
+                        {
+                            "sym": ticker,
+                            "last": 150.0,
+                            "chg_pct": 1.0,
+                            "volume": 1000,
+                            "short_pct": None,
+                            "last_filing": None,
+                        }
+                        for ticker in ["NVDA", "AAPL"]
+                    ],
+                    "errors": [],
+                },
+                "/api/positioning": {
+                    "sym": sym,
+                    "short_pct": None,
+                    "short_as_of": None,
+                    "insider_net_90d": None,
+                    "threshold_listed": None,
+                    "threshold_as_of": None,
+                    "errors": {},
+                },
+                "/api/identity": {
+                    "sym": sym,
+                    "resolved": True,
+                    "entity_id": "fixture-company",
+                    "security_id": "fixture-security",
+                },
+                "/api/feed": {
+                    "items": [
+                        {
+                            "id": "fixture-news",
+                            "kind": "news",
+                            "sym": "NVDA",
+                            "title": "Fixture market update",
+                            "at": "2026-10-20T12:00:00Z",
+                            "source": "Fixture",
+                        }
+                    ],
+                    "as_of": "2026-10-20T12:00:00Z",
+                    "errors": [],
+                },
             }
             port = server.server_port
+            if url.path.startswith("/api/workspaces/"):
+                bodies[url.path] = {"sym": url.path.rsplit("/", 1)[-1], "widgets": [], "updated_at": None}
             if url.path == f"/api/research/sources/{quote(SOURCE_ID, safe='')}":
                 bodies[url.path] = {**SOURCE, "url": f"http://127.0.0.1:{port}{FIXTURE_SOURCE_PATH}"}
             if url.path == "/api/portfolio":
@@ -245,6 +314,17 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
                 body = sse(
                     {"type": "watchlist_update", "action": "add", "ticker": "AMD"},
                     {"type": "answer_delta", "text": "Added AMD to your watchlist."},
+                    {"type": "done", "metrics": METRICS},
+                )
+            elif prompt == ALERT_PROMPT:
+                body = sse(
+                    {
+                        "type": "tool_result",
+                        "tool": "thesis_watch",
+                        "evidenceId": "ev:alert",
+                        "preview": "thesis_id: thesis:fixture\nadded: rule_id: rule:fixture, rule_type: material_short_interest_change, enabled: True",
+                    },
+                    {"type": "answer_delta", "text": "The alert is set."},
                     {"type": "done", "metrics": METRICS},
                 )
             else:
@@ -339,11 +419,11 @@ def test_first_search_result_receives_pointer_click(browser: webdriver.Chrome) -
     browser.find_element(*SEARCH).send_keys("ORCL")
     first = wait.until(EC.visibility_of_element_located(FIRST_HIT))
     assert first.text == "ORCL Oracle Corporation"
-    # The first result crosses the ticker strip. This reproduces the reported geometry.
+    # The quote strip lives in the footer, so the header dropdown never overlaps it.
     assert browser.execute_script(
         "const hit = arguments[0].getBoundingClientRect();"
-        "const strip = document.querySelector('.strip').getBoundingClientRect();"
-        "return hit.top < strip.bottom && hit.bottom > strip.top;",
+        "const strip = document.querySelector('footer .strip').getBoundingClientRect();"
+        "return hit.bottom <= strip.top;",
         first,
     )
     browser.execute_script(
@@ -544,8 +624,13 @@ def test_filings_panel_shows_fund_filing_date_and_provider_error(browser: webdri
     browser.find_element(*SEARCH).send_keys("ORCL")
     wait.until(EC.visibility_of_element_located(FIRST_HIT)).click()
     orcl = (By.XPATH, "//div[normalize-space()='FILINGS · ORCL']/..")
-    wait.until(EC.text_to_be_present_in_element(orcl, "filings unavailable: HTTP Error 503"))
-    assert "no SEC filings found" not in browser.find_element(*orcl).text
+    wait.until(EC.text_to_be_present_in_element(orcl, "We could not load this data."))
+    panel = browser.find_element(*orcl)
+    assert "filings unavailable: HTTP Error 503" not in panel.text
+    assert "No filings for ORCL" not in panel.text
+    retry = panel.find_element(By.XPATH, ".//button[normalize-space()='Retry']")
+    retry.click()
+    wait.until(EC.text_to_be_present_in_element(orcl, "We could not load this data."))
 
 
 def send_chat(browser: webdriver.Chrome, local_ui: UI, prompt: str) -> None:
@@ -595,3 +680,85 @@ def test_chat_watchlist_update_shows_amd_without_moving_chart(browser: webdriver
     wait.until(lambda b: "AMD" in b.find_element(By.XPATH, "//div[normalize-space()='WATCHLIST · DELAYED']/..").text)
     assert browser.find_element(By.XPATH, "//button[b='AMD']")
     wait.until(EC.text_to_be_present_in_element((By.CSS_SELECTOR, "footer > span:last-child"), "NVDA"))
+
+
+def test_page_navigation_uses_nav_links(browser: webdriver.Chrome) -> None:
+    wait = WebDriverWait(browser, 10)
+    for label, route, content in [
+        ("Home", "#/home", ".home-table"),
+        ("Workspaces", "#/workspace/NVDA", ".ws-grid"),
+        ("Feed", "#/feed", ".feed-row"),
+    ]:
+        link = browser.find_element(By.LINK_TEXT, label)
+        browser.execute_script(
+            "arguments[0].addEventListener('click', event => { window.navTrusted = event.isTrusted; }, {once: true});",
+            link,
+        )
+        link.click()
+        wait.until(EC.url_contains(route))
+        wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, content)))
+        assert browser.execute_script("return window.navTrusted") is True
+        assert browser.find_element(By.LINK_TEXT, label).get_attribute("aria-current") == "page"
+
+
+def test_palette_keyboard_opens_ticker_workspace(browser: webdriver.Chrome) -> None:
+    wait = WebDriverWait(browser, 10)
+    ActionChains(browser).send_keys("/").perform()
+    palette = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 'input[role="combobox"]')))
+    palette.send_keys("ORCL")
+    wait.until(EC.text_to_be_present_in_element((By.ID, "cmd-list"), "Oracle Corporation"))
+    palette.send_keys(Keys.ENTER)
+    wait.until(EC.url_contains("#/workspace/ORCL"))
+    assert not browser.find_elements(By.CSS_SELECTOR, 'input[role="combobox"]')
+
+    agent_input = wait.until(EC.element_to_be_clickable(AGENT_INPUT))
+    agent_input.send_keys("/")
+    assert agent_input.get_attribute("value") == "/"
+    assert not browser.find_elements(By.CSS_SELECTOR, 'input[role="combobox"]')
+    agent_input.clear()
+    browser.find_element(By.LINK_TEXT, "Home").click()
+    ActionChains(browser).send_keys("/").perform()
+    palette = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 'input[role="combobox"]')))
+    palette.send_keys(Keys.ESCAPE)
+    wait.until(EC.invisibility_of_element_located((By.CSS_SELECTOR, 'input[role="combobox"]')))
+
+
+def test_add_widget_increases_workspace_grid(browser: webdriver.Chrome) -> None:
+    wait = WebDriverWait(browser, 10)
+    browser.find_element(By.LINK_TEXT, "Workspaces").click()
+    menu = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'select[aria-label="Add widget"]')))
+    before = len(browser.find_elements(By.CSS_SELECTOR, ".ws-grid > section"))
+    Select(menu).select_by_visible_text("Monthly returns")
+    wait.until(lambda client: len(client.find_elements(By.CSS_SELECTOR, ".ws-grid > section")) == before + 1)
+    widget = wait.until(
+        EC.visibility_of_element_located((By.CSS_SELECTOR, 'section[aria-label="Monthly returns · NVDA"]'))
+    )
+    assert widget.find_element(By.CSS_SELECTOR, 'table[aria-label="NVDA monthly returns"]')
+
+
+def test_offline_alert_receipt_renders_card(browser: webdriver.Chrome, local_ui: UI) -> None:
+    send_chat(browser, local_ui, ALERT_PROMPT)
+    result = WebDriverWait(browser, 10).until(
+        EC.visibility_of_element_located((By.CSS_SELECTOR, '[aria-label="Results"]'))
+    )
+    assert "Alert set: material short interest change" in result.text
+    assert "thesis_watch" not in result.text
+    assert "rule:fixture" not in result.text
+
+
+def test_markets_rows_support_arrow_navigation(browser: webdriver.Chrome) -> None:
+    wait = WebDriverWait(browser, 10)
+    browser.find_element(By.LINK_TEXT, "Home").click()
+    first = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, ".home-table tbody tr[tabindex='0']")))
+    assert "NVDA" in first.text
+    ActionChains(browser).click(first).send_keys(Keys.ARROW_DOWN).perform()
+    wait.until(lambda client: "AAPL" in client.switch_to.active_element.text)
+    selected = browser.switch_to.active_element
+    assert selected.tag_name == "tr"
+    assert selected.get_attribute("tabindex") == "0"
+    assert selected.get_attribute("aria-selected") == "true"
+    selected.send_keys(Keys.ARROW_DOWN)
+    assert browser.switch_to.active_element == selected
+    selected.send_keys(Keys.ARROW_UP)
+    wait.until(lambda client: client.switch_to.active_element == first)
+    assert first.get_attribute("tabindex") == "0"

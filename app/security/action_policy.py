@@ -79,6 +79,7 @@ TOOL_DOMAINS: dict[str, str] = {
     "get_current_time": "financial_research",
     "set_chart_symbol": "financial_research",
     "update_watchlist": "financial_research",
+    "add_widget": "financial_research",
     # Bounded local thesis operations (RESEARCH-scoped, never broker data).
     "thesis_create": "financial_research",
     "thesis_show": "financial_research",

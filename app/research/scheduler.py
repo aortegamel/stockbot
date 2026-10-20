@@ -333,9 +333,10 @@ _JEV_REGISTRY_EXCLUDED = frozenset({"call_tool", "browse_tools", "search_tools",
 
 # research_start creates a new session. research_resume re-enters the current
 # node. Fresh nodes lack the resource handles that research_read and
-# research_read_search require. set_chart_symbol and update_watchlist are UI
-# actions for the entry route, not node research. Keep these tools in
-# build_registry for entry and assessment paths, but exclude them from node selection.
+# research_read_search require. set_chart_symbol, update_watchlist, and
+# add_widget are UI actions for the entry route, not node research. Keep these
+# tools in build_registry for entry and assessment paths, but exclude them from
+# node selection.
 _NODE_INVALID_CONTROL_TOOLS = frozenset(
     {
         "research_start",
@@ -344,6 +345,7 @@ _NODE_INVALID_CONTROL_TOOLS = frozenset(
         "research_resume",
         "set_chart_symbol",
         "update_watchlist",
+        "add_widget",
     }
 )
 

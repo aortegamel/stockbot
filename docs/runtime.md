@@ -741,7 +741,8 @@ The research API uses an asynchronous Python subprocess with a 15-second
 timeout. Unknown sessions return HTTP 404. Import, database, execution, and
 bridge response errors return HTTP 502.
 
-The harness binds all three listeners to `0.0.0.0`
+The Bun API and the market service always bind `127.0.0.1`
 (`needle-harness/scripts/api.ts`, `needle-harness/scripts/needle.ts`).
-It provides no authentication for remote use. Run it only on a trusted
-network. See the README "LAN access" section.
+The Vite listener binds `127.0.0.1` by default. `STOCKBOT_LAN=1` binds it to
+`0.0.0.0` and requires `STOCKBOT_LAN_TOKEN` on every `/api/*` request
+(`web/lan-token.ts`). See the README "LAN access" section.
