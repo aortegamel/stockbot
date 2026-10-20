@@ -51,3 +51,49 @@ unbounded persona time (`kernel.ts` `REQUEST_WALL_MS`).
 | direct (hello/time/clarify) | pass, 2 ms - 7 s | keep passing |
 | aapl_buy_now (reasoning) | 5-13 s, flaky over 10 s | first < 10 s always |
 | research ×8 | p90 188 s, 0 citations | first p90 < 10 s, done p90 < 45 s, ≥ 1 citation |
+
+---
+
+# MVP final numbers (release e2e, commits through `6a8b975`)
+
+Measured 2026-10-20 UTC, harness `bun run stockbot` on 127.0.0.1:3000,
+`TIMEOUT_S=400`. Raw runs: `data/verify/20261020T051921Z/e2e.json`,
+`data/verify/20261020T052740Z/e2e.json`,
+`data/verify/20261020T053536Z/e2e.json`.
+Phase timings at `runs[].timings.timings` in those files.
+
+Targets: research first `answer_delta` p90 < 10 s, `done` p90 < 45 s,
+each research answer ≥ 1 citation.
+
+## Aggregate (research_required rows, 8 prompts × 3 runs = 24 rows)
+
+| metric | p50 | p90 | target | met |
+|---|---|---|---|---|
+| first_text_ms | 7505 | 22564 | < 10000 | NO (p90 2.3×) |
+| total_ms | 63505 | 82100 | < 45000 | NO (p90 1.8×) |
+| citations | 0 on all 24 rows | ≥ 1 | NO |
+
+Baseline (pre-Phase 2): first/total p90 188 s. First-text improved 21×;
+totals improved 2.3× but still miss.
+
+## What improved vs baseline
+
+- Direct prompts (hello/time/clarify/aapl_buy_now): 4/4 pass every run.
+- Early brief works: research first deltas at 5–12 s (was 80–350 s).
+- Single-shot: `aapl_insider` → `get_insider_activity` (26–36 s),
+  `gme_short` → `get_short_interest` (5–11 s, first < 10 s twice).
+- Stockbot-only default + trio offer observed live (`offer_trio` in streams).
+
+## Gaps (not criteria-met)
+
+1. **Citations 0 everywhere.** The citation gate + thin-evidence form exist
+   in code but live answers carry no `[ev:]` markers. Single-shot answers
+   (gme 5 s) also cite nothing. Next: make the model emit evidence ids
+   (prompt/inventory pressure), not more plumbing.
+2. **Totals 38–120 s vs 45 s target.** Node rounds + trio/persona time
+   dominate after the brief. Next: round caps already at 3; profile a live
+   trace for the remaining wall before further changes.
+3. **Single-shot routing flaky:** `nvda_risk`/`msft_revenue` went
+   `research_required` all 3 runs instead of `list_sec_filings`;
+   `aapl_insider` first-text 26–34 s (over 10 s). Next: tighten
+   `_single_shot_tool` anchors and re-measure with `--only`.
