@@ -369,8 +369,8 @@ describe("App agent send", () => {
     });
     const selected = ticker.trim().toUpperCase();
     await until(() => root.querySelector("footer")?.lastElementChild?.textContent === selected);
+    expect(text(root)).toContain(`AGENT · viewing ${selected}`);
     expect(text(root)).toContain(`Financials · ${selected}`);
-    expect(text(root)).toContain(`News · ${selected}`);
     expect(root.querySelector(`[role="region"][aria-label="${selected} price chart"]`)).not.toBeNull();
     const chart = find<HTMLIFrameElement>(root, `iframe[title="${selected} TradingView chart"]`);
     expect(new URL(chart.src).searchParams.get("symbol")).toBe(selected);

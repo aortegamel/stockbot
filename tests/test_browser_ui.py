@@ -624,14 +624,14 @@ def test_agent_transcript_scrolls_inside_panel(
 def test_filings_panel_shows_fund_filing_date_and_provider_error(browser: webdriver.Chrome) -> None:
     wait = WebDriverWait(browser, 10)
     browser.find_element(By.XPATH, "//button[b='SPY']").click()
-    spy = (By.XPATH, "//div[normalize-space()='FILINGS · SPY']/..")
+    spy = (By.XPATH, "//section[@aria-label='Financials · SPY']")
     wait.until(EC.text_to_be_present_in_element(spy, "filed 2026-03-13"))
     shown = browser.find_element(*spy).text
     assert "N-CSR - Certified Shareholder Report" in shown
     assert "2026-03-12" not in shown
 
     search_orcl(browser).click()
-    orcl = (By.XPATH, "//div[normalize-space()='FILINGS · ORCL']/..")
+    orcl = (By.XPATH, "//section[@aria-label='Financials · ORCL']")
     wait.until(EC.text_to_be_present_in_element(orcl, "We could not load this data."))
     panel = browser.find_element(*orcl)
     assert "filings unavailable: HTTP Error 503" not in panel.text

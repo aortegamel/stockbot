@@ -309,7 +309,7 @@ const MarketTableRow = memo(function MarketTableRow({ row: r, selected, favorite
       <td className="num">{r.short_pct === null ? "—" : `${r.short_pct.toFixed(1)}%`}</td>
       <td>
         {r.last_filing ? <><span className="home-form">{r.last_filing.form}</span> <span className="home-muted">{r.last_filing.filed}</span></> : "—"}
-        {r.error && <span className="home-err"><LoadError retry={onRetry} /></span>}
+        {r.error && <div className="home-err"><LoadError retry={onRetry} /></div>}
       </td>
     </tr>
   );

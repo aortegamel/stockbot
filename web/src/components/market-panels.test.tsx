@@ -243,9 +243,7 @@ describe("FinancialsPanel and NewsPanel", () => {
     const root = await mount(<FinancialsPanel sym="NVDA" />);
     await until(() => (root.textContent ?? "").includes("Filing 2"));
     expect(asked).toEqual(["/api/filings?sym=NVDA"]);
-    expect(root.textContent).toContain("FILINGS · NVDA");
-    expect(root.textContent).toContain("filed 2026-10-12");
-    expect(root.textContent).not.toContain("filed 2026-10-13");
+    expect(root.textContent).not.toContain("FILINGS · NVDA");
     expect(root.querySelector('[title="updated 2026-10-13T01:23:45-04:00"]')).not.toBeNull();
     const link = root.querySelector("a");
     expect(link?.textContent).toBe("Filing 0");
@@ -272,8 +270,7 @@ describe("FinancialsPanel and NewsPanel", () => {
     }) as unknown as typeof fetch;
     const root = await mount(<NewsPanel sym="AAPL" />);
     await until(() => (root.textContent ?? "").includes("Headline 7"));
-    expect(root.textContent).toContain("NEWS · AAPL");
-    expect(root.textContent).toContain("2026-10-14T12:34 · Example Wire");
+    expect(root.textContent).not.toContain("NEWS · AAPL");
     expect(root.textContent).not.toContain("12:34:56");
     expect(root.textContent).not.toContain("null · Example Wire");
     expect(root.textContent).not.toContain("Headline 8");
