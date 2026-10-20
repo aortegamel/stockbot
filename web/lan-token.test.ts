@@ -75,4 +75,43 @@ describe("LAN token gate", () => {
     expect(res.status).toBe(401);
     expect(res.headers.get("set-cookie")).toBeNull();
   });
+
+  describe("CSRF guard (runs with and without a token)", () => {
+    for (const env of [{}, LAN]) {
+      test(`foreign-Origin POST to /api/agent is 403 (token ${env.STOCKBOT_LAN_TOKEN ? "set" : "unset"})`, async () => {
+        const base = await serve(env);
+        const res = await fetch(`${base}/api/agent`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Origin: "https://evil.example", host: new URL(base).host, ...(env.STOCKBOT_LAN_TOKEN ? { "x-stockbot-token": TOKEN } : {}) },
+          body: JSON.stringify({ prompt: "x" }),
+        });
+        expect(res.status).toBe(403);
+        expect(await res.json()).toEqual({ error: "forbidden_origin" });
+      });
+      test(`same-host Origin POST passes CSRF (token ${env.STOCKBOT_LAN_TOKEN ? "set" : "unset"})`, async () => {
+        const base = await serve(env);
+        const host = new URL(base).host;
+        const res = await fetch(`${base}/api/agent`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Origin: `http://${host}`, host, ...(env.STOCKBOT_LAN_TOKEN ? { "x-stockbot-token": TOKEN } : {}) },
+          body: JSON.stringify({ prompt: "x" }),
+        });
+        expect(res.status).toBe(200);
+      });
+      test(`form-encoded POST is 403 (token ${env.STOCKBOT_LAN_TOKEN ? "set" : "unset"})`, async () => {
+        const base = await serve(env);
+        const res = await fetch(`${base}/api/agent`, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain", host: new URL(base).host, ...(env.STOCKBOT_LAN_TOKEN ? { "x-stockbot-token": TOKEN } : {}) },
+          body: "prompt=x",
+        });
+        expect(res.status).toBe(403);
+      });
+    }
+    test("GET with a foreign Origin still passes", async () => {
+      const base = await serve({});
+      const res = await fetch(`${base}/api/health`, { headers: { Origin: "https://evil.example", host: new URL(base).host } });
+      expect(res.status).toBe(200);
+    });
+  });
 });
