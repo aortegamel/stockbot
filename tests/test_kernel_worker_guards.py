@@ -446,11 +446,11 @@ def test_arguments_context_carries_ticker_without_raw_evidence(monkeypatch: pyte
     [
         ("can you give me buying advice", "NVDA"),
         ("Should I buy Apple?", "AAPL"),
-        ("Should I buy MissingCo?", None),
+        ("Should I buy MissingCo?", "NVDA"),
     ],
 )
 def test_arguments_context_and_withhold_preserve_subject_precedence(
-    monkeypatch: pytest.MonkeyPatch, objective: str, expected: str | None
+    monkeypatch: pytest.MonkeyPatch, objective: str, expected: str
 ) -> None:
     def _resolve(name: str) -> str | None:
         return {"Apple": "AAPL", "NVDA": "NVDA"}.get(name)
@@ -466,13 +466,9 @@ def test_arguments_context_and_withhold_preserve_subject_precedence(
     assert context.get("ticker") == expected
     grounded = context["grounded_arguments"]
     assert isinstance(grounded, dict)
-    if expected is None:
-        assert "identifier" not in grounded
-        assert "arguments" not in out and "error" in out
-    else:
-        assert grounded["identifier"] == expected
-        arguments = out["arguments"]
-        assert isinstance(arguments, dict) and arguments["identifier"] == expected
+    assert grounded["identifier"] == expected
+    arguments = out["arguments"]
+    assert isinstance(arguments, dict) and arguments["identifier"] == expected
 
 
 class _FailGenerate:
@@ -2916,10 +2912,10 @@ def test_graph_intake_fetches_only_new_scope(
     [
         ("can you give me buying advice", ["NVDA"]),
         ("Should I buy Apple?", ["AAPL"]),
-        ("Should I buy MissingCo?", []),
+        ("Should I buy MissingCo?", ["NVDA"]),
     ],
 )
-def test_graph_intake_uses_current_context_only_without_explicit_stock(
+def test_graph_intake_uses_current_context_only_without_resolved_stock(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, objective: str, expected: list[str]
 ) -> None:
     def _resolve(name: str) -> str | None:

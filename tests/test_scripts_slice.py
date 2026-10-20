@@ -3279,3 +3279,104 @@ def test_run_kernel_scenario_reports_crash(monkeypatch: pytest.MonkeyPatch, caps
     assert result.failed_count == 1 and result.answer_text == ""
     assert result.requires_evidence is False
     assert "CRASH RuntimeError: no kernel" in capsys.readouterr().err
+
+
+# ---- scripts/verify_e2e.py: SSE fold + limits (canned bytes, no network) ----
+
+
+from scripts import verify_e2e as e2e
+
+
+def _sse(*events: tuple[float, object]) -> list[tuple[float, bytes]]:
+    return [(ms, ev if isinstance(ev, bytes) else f"data: {json.dumps(ev)}\n".encode()) for ms, ev in events]
+
+
+def _done(tools: int = 0, muse: int = 1) -> dict[str, object]:
+    return {"type": "done", "metrics": {"totalMs": 1, "tools": {"calls": tools}, "muse": {"calls": muse}}}
+
+
+def _golden() -> list[e2e.Case]:
+    golden: list[e2e.Case] = json.loads(e2e.GOLDEN.read_text(encoding="utf-8"))
+    return golden
+
+
+def _case() -> e2e.Case:
+    return next(c for c in _golden() if c["id"] == "nvda_risk")
+
+
+def test_e2e_golden_set_shape() -> None:
+    golden = _golden()
+    assert len(golden) == 12 and len({c["id"] for c in golden}) == 12
+
+
+def test_e2e_parse_research_stream_times_text_and_counts_known_citations() -> None:
+    run = e2e.parse_stream(
+        _sse(
+            (5, {"type": "agent_start", "prompt": "p"}),
+            (6, b": keepalive\n"),
+            (50, {"type": "progress", "stage": "working"}),
+            (60, {"type": "chart_update", "ticker": "NVDA"}),
+            (70, {"type": "evidence", "evidence": [{"id": "ev:a"}, {"id": "ev:b"}]}),
+            (900, {"type": "answer_delta", "text": "Risk [ev:a] and [ev:a] "}),
+            (950, {"type": "answer_delta", "text": "plus [ev:zz]."}),
+            (1200, _done(tools=2)),
+        )
+    )
+    assert run.events == ["agent_start", "progress", "chart_update", "evidence", "answer_delta", "answer_delta", "done"]
+    assert (run.first_text_ms, run.total_ms, run.route) == (900, 1200, "research_required")
+    assert run.citation_count == 1  # ev:a once; ev:zz is not a streamed evidence id.
+    assert run.timings == _done(tools=2)["metrics"] and run.errors == []
+    assert e2e.evaluate(_case(), run) == []
+    strict = _case()
+    strict["min_citations"], strict["max_first_text_ms"], strict["ticker"] = 2, 800, "AMD"
+    assert e2e.evaluate(strict, run) == [
+        "first_text_ms",
+        "citations",
+        "ticker",
+    ]
+
+
+def test_e2e_parse_routes_direct_clarify_and_single_tool() -> None:
+    start = (1, {"type": "agent_start", "prompt": "p"})
+    text = (2, {"type": "answer_delta", "text": "hi"})
+    clarify = e2e.parse_stream(_sse(start, text, (3, _done(muse=0))))
+    direct = e2e.parse_stream(_sse(start, (2, {"type": "reasoning_start", "model": "stockbot"}), text, (3, _done())))
+    single = e2e.parse_stream(_sse(start, text, (3, _done(tools=1))))
+    named = e2e.parse_stream(
+        _sse(start, (2, {"type": "tool_start", "tool": "get_current_time"}), text, (3, _done(tools=1)))
+    )
+    fallback = e2e.parse_stream(_sse(start, start, text, (3, _done(tools=1))))
+    assert [r.route for r in (clarify, direct, single, named, fallback)] == [
+        "clarify_subject",
+        "reasoning_required",
+        "single_tool",
+        "get_current_time",
+        "research_required",
+    ]
+
+
+def test_e2e_parse_captures_failures_and_stream_end() -> None:
+    run = e2e.parse_stream(
+        _sse(
+            (1, {"type": "agent_start", "prompt": "p"}),
+            (2, b"data: {broken\n"),
+            (3, {"type": "failed", "category": "provider_error", "message": "jev down"}),
+            (4, {"type": "error", "message": "Stockbot couldn't complete that request. Try again."}),
+        )
+    )
+    assert run.errors[0].startswith("malformed SSE data")
+    assert run.errors[1:] == ["failed: jev down", "error: Stockbot couldn't complete that request. Try again."]
+    assert (run.route, run.first_text_ms, run.total_ms) == (None, None, 4)
+    assert e2e.evaluate(_case(), run) == ["route", "first_text_ms", "citations", "terminal"]
+
+
+def test_e2e_main_requires_opt_in_then_credentials(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("STOCKBOT_E2E", raising=False)
+    assert e2e.main([]) == 2
+    assert "STOCKBOT_E2E=1" in capsys.readouterr().err
+    monkeypatch.setenv("STOCKBOT_E2E", "1")
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    assert e2e.main([]) == 2
+    assert "EXA_API_KEY" in capsys.readouterr().err

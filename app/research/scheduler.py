@@ -325,9 +325,12 @@ _JEV_REGISTRY_EXCLUDED = frozenset({"call_tool", "browse_tools", "search_tools",
 
 # research_start creates a new session. research_resume re-enters the current
 # node. Fresh nodes lack the resource handles that research_read and
-# research_read_search require. Keep these tools in build_registry for entry
-# and assessment paths, but exclude them from node selection.
-_NODE_INVALID_CONTROL_TOOLS = frozenset({"research_start", "research_read", "research_read_search", "research_resume"})
+# research_read_search require. set_chart_symbol is a UI action for the entry
+# route, not node research. Keep these tools in build_registry for entry and
+# assessment paths, but exclude them from node selection.
+_NODE_INVALID_CONTROL_TOOLS = frozenset(
+    {"research_start", "research_read", "research_read_search", "research_resume", "set_chart_symbol"}
+)
 
 
 # Required params that name an upstream handle (a prior tool's output) rather
@@ -1788,6 +1791,21 @@ def _objective_chart_candidates(objective: str) -> list[str]:
         "et",
         "am",
         "pm",
+        "ceo",
+        "cfo",
+        "cto",
+        "ai",
+        "etf",
+        "etfs",
+        "ipo",
+        "cpi",
+        "gdp",
+        "fed",
+        "fomc",
+        "eps",
+        "pe",
+        "usa",
+        "us",
     }
     labels.extend(
         (position, label)
@@ -1901,7 +1919,7 @@ def _company_token_allowed(candidate: str) -> bool:
 
 
 def _objective_subject_ticker(objective: object, supplied_ticker: object = None) -> str | None:
-    """Prefer the explicit objective subject. Use chart context only without an explicit label."""
+    """Prefer the explicit objective subject. Use chart context when no explicit label resolves."""
     if isinstance(objective, str):
         objective = re.sub(r"^\[Today UTC \d{4}-\d{2}-\d{2}\]\s*", "", objective).strip()
     _ticker = _objective_ticker(objective)
@@ -1921,8 +1939,6 @@ def _objective_subject_ticker(objective: object, supplied_ticker: object = None)
             resolved = _resolve_company_to_ticker(candidate)
             if resolved is not None:
                 return resolved
-        if candidates:
-            return None
     return supplied_ticker.strip().upper() if isinstance(supplied_ticker, str) and supplied_ticker.strip() else None
 
 

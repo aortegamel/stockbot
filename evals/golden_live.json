@@ -1,0 +1,14 @@
+[
+  {"id": "hello", "prompt": "hello", "chart_ticker": null, "expected_route": "reasoning_required", "ticker": null, "min_citations": 0, "max_first_text_ms": 10000, "max_total_ms": 10000},
+  {"id": "time", "prompt": "What time is it?", "chart_ticker": null, "expected_route": ["get_current_time", "single_tool"], "ticker": null, "min_citations": 0, "max_first_text_ms": 10000, "max_total_ms": 10000},
+  {"id": "clarify_advice", "prompt": "can you give me buying advice", "chart_ticker": null, "expected_route": "clarify_subject", "ticker": null, "min_citations": 0, "max_first_text_ms": 1000, "max_total_ms": 1000},
+  {"id": "aapl_buy_now", "prompt": "Should I buy now?", "chart_ticker": "AAPL", "expected_route": "reasoning_required", "ticker": "AAPL", "min_citations": 0, "max_first_text_ms": 10000, "max_total_ms": 10000},
+  {"id": "aapl_ceo", "prompt": "What do you think about the CEO?", "chart_ticker": "AAPL", "expected_route": "research_required", "ticker": "AAPL", "min_citations": 1, "max_first_text_ms": 10000, "max_total_ms": 45000},
+  {"id": "nvda_risk", "prompt": "NVDA risk factors?", "chart_ticker": null, "expected_route": "research_required", "ticker": "NVDA", "min_citations": 1, "max_first_text_ms": 10000, "max_total_ms": 45000},
+  {"id": "aapl_insider", "prompt": "AAPL insider sales last quarter?", "chart_ticker": null, "expected_route": "research_required", "ticker": "AAPL", "min_citations": 1, "max_first_text_ms": 10000, "max_total_ms": 45000},
+  {"id": "gme_short", "prompt": "GME short interest?", "chart_ticker": null, "expected_route": "research_required", "ticker": "GME", "min_citations": 1, "max_first_text_ms": 10000, "max_total_ms": 45000},
+  {"id": "msft_revenue", "prompt": "MSFT latest quarterly revenue?", "chart_ticker": null, "expected_route": "research_required", "ticker": "MSFT", "min_citations": 1, "max_first_text_ms": 10000, "max_total_ms": 45000},
+  {"id": "nvda_amd_compare", "prompt": "Compare NVDA and AMD margins and risks", "chart_ticker": null, "expected_route": "research_required", "ticker": null, "min_citations": 1, "max_first_text_ms": 10000, "max_total_ms": 45000},
+  {"id": "tsla_move", "prompt": "Why did TSLA move this week?", "chart_ticker": null, "expected_route": "research_required", "ticker": "TSLA", "min_citations": 1, "max_first_text_ms": 10000, "max_total_ms": 45000},
+  {"id": "pltr_bull_bear", "prompt": "Give me the bull and bear case for PLTR", "chart_ticker": null, "expected_route": "research_required", "ticker": "PLTR", "min_citations": 1, "max_first_text_ms": 10000, "max_total_ms": 45000}
+]

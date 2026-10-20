@@ -7,10 +7,11 @@ opt-in via tests/test_finra_smoke.py (pytest -m finra_smoke).
 
 import json
 from collections.abc import Iterator
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Self, override
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 import requests
@@ -1560,15 +1561,23 @@ def test_reg_sho_volume_ratio_not_elevated(http: dict[str, MagicMock]) -> None:
     assert result["short_volume_ratio_elevated"] is False
 
 
-def test_reg_sho_no_date_queries_monday_nyc_to_today(http: dict[str, MagicMock]) -> None:
-    """No-tradeDate path: Monday-NYC start through today, single tradeDate stays single-day."""
-    from datetime import UTC, datetime
-    from zoneinfo import ZoneInfo
+def _reg_sho_no_date_body(
+    http: dict[str, MagicMock], monkeypatch: pytest.MonkeyPatch, frozen: datetime
+) -> dict[str, object]:
+    """Run the no-tradeDate get_reg_sho_volume tool with app.tools' clock frozen at frozen."""
 
+    class _FrozenClock(datetime):
+        @classmethod
+        @override
+        def now(cls, tz: tzinfo | None = None) -> Self:
+            moment = cls.fromtimestamp(frozen.timestamp(), tz or UTC)
+            return moment if tz else moment.replace(tzinfo=None)
+
+    monkeypatch.setattr(tools_module, "datetime", _FrozenClock)
     records = [
         {
             "securitiesInformationProcessorSymbolIdentifier": "AAPL",
-            "tradeReportDate": "2026-09-22",
+            "tradeReportDate": "2026-09-21",
             "shortParQuantity": 10,
             "shortExemptParQuantity": 5,
             "totalParQuantity": 100,
@@ -1577,9 +1586,31 @@ def test_reg_sho_no_date_queries_monday_nyc_to_today(http: dict[str, MagicMock])
     http["post"].side_effect = [_token_response(), _response(records)]
     result = execute_tool("get_reg_sho_volume", {"ticker": "AAPL"}, model="test", context=LOCAL_CONTEXT)
     assert "error" not in result, result
-    body = _data_body(http["post"])
-    nyc_today = datetime.now(UTC).astimezone(ZoneInfo("America/New_York")).date()
-    monday = (nyc_today - timedelta(days=nyc_today.weekday())).isoformat()
-    today = nyc_today.isoformat()
-    assert body["dateRangeFilters"] == [{"fieldName": "tradeReportDate", "startDate": monday, "endDate": today}]
     assert result["short_volume_ratio_pct"] == 15.0
+    body = _data_body(http["post"])
+    assert isinstance(body, dict)
+    return body
+
+
+_NYC = ZoneInfo("America/New_York")
+
+
+def test_reg_sho_no_date_queries_monday_nyc_to_today(
+    http: dict[str, MagicMock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No-tradeDate path on a Wednesday: dateRangeFilters from Monday-NYC through today-NYC."""
+    body = _reg_sho_no_date_body(http, monkeypatch, datetime(2026, 9, 23, 12, 0, tzinfo=_NYC))
+    assert body["dateRangeFilters"] == [
+        {"fieldName": "tradeReportDate", "startDate": "2026-09-21", "endDate": "2026-09-23"}
+    ]
+
+
+def test_reg_sho_no_date_on_monday_queries_single_day(
+    http: dict[str, MagicMock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No-tradeDate path on a Monday: start equals today, so one EQUAL row and no range."""
+    body = _reg_sho_no_date_body(http, monkeypatch, datetime(2026, 9, 21, 12, 0, tzinfo=_NYC))
+    assert "dateRangeFilters" not in body
+    compare = body["compareFilters"]
+    assert isinstance(compare, list)
+    assert {"compareType": "EQUAL", "fieldName": "tradeReportDate", "fieldValue": "2026-09-21"} in compare

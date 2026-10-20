@@ -293,17 +293,7 @@ export async function POST(req: Request): Promise<Response> {
         let sessionId: string | undefined;
         try {
           if (Date.now() >= deadlineAt) throw new Error("The request deadline expired before the chart action.");
-          const generated = await kernelRouter.call(
-            { op: "arguments", tool: "set_chart_symbol", objective: prompt, ticker: focus },
-            { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) },
-          );
-          const args = generated.arguments;
-          if (generated.error || generated.tool !== "set_chart_symbol" || !args || typeof args !== "object" || Array.isArray(args)
-            || Object.keys(args).length !== 1 || parseTicker(args.ticker) !== focus) {
-            throw new Error("Needle did not return arguments for the selected stock.");
-          }
           if (req.signal.aborted) throw new Error("The request was cancelled before the chart action.");
-          if (Date.now() >= deadlineAt) throw new Error("The request deadline expired before the chart action.");
           sessionId = newSessionId();
           const result = await invoke("set_chart_symbol", { ticker: focus }, sessionId, Math.max(deadlineAt - Date.now(), 1));
           if (!result.ok) throw new Error(result.error);

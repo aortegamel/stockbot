@@ -8082,14 +8082,14 @@ def _resolve_chart_test_subject(label: str) -> str | None:
         ("how is Apple doing?", "NVDA", "AAPL"),
         ("tell me about Apple", "NVDA", "AAPL"),
         ("What are Apple's margins? Compare MSFT", "NVDA", "MSFT"),
-        ("buy Unlisted Company", "NVDA", None),
-        ("compare ZZZZX and Unknown Company", "NVDA", None),
+        ("buy Unlisted Company", "NVDA", "NVDA"),
+        ("compare ZZZZX and Unknown Company", "NVDA", "NVDA"),
     ],
 )
 def test_objective_subject_prefers_explicit_labels_over_chart_context(
     objective: str, supplied: object, expected: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Explicit subjects retain old precedence and unresolved labels refuse the chart ticker."""
+    """Explicit subjects retain old precedence and unresolved labels fall back to the chart ticker."""
     from app import tools
 
     resolver = mock.Mock(side_effect=_resolve_chart_test_subject)
@@ -8128,19 +8128,44 @@ def test_fallback_args_use_normalized_chart_context_without_an_explicit_subject(
 
 
 @pytest.mark.parametrize(
-    "tool_name", ["list_sec_filings", "search_sec_filings", "get_reg_sho_volume", "set_chart_symbol"]
+    ("tool_name", "expected"),
+    [
+        ("list_sec_filings", {"identifier": "NVDA"}),
+        ("search_sec_filings", {"ticker": "NVDA", "query": "buy Unlisted Company"}),
+        ("get_reg_sho_volume", {"ticker": "NVDA"}),
+        ("set_chart_symbol", {"ticker": "NVDA"}),
+        ("find_sec_entities", {"query": "NVDA"}),
+    ],
 )
-def test_fallback_args_refuse_chart_context_for_unresolved_explicit_subject(
-    tool_name: str, monkeypatch: pytest.MonkeyPatch
+def test_fallback_args_use_chart_context_for_unresolved_explicit_subject(
+    tool_name: str, expected: dict[str, JSONValue], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unresolved explicit company cannot silently become the selected chart company."""
+    """An unresolved explicit company falls back to the selected chart ticker."""
     from app import tools
 
     monkeypatch.setattr(tools, "_resolve_company_to_ticker", mock.Mock(return_value=None))
-    assert sched._fallback_sec_args(tool_name, "buy Unlisted Company", "NVDA") is None
-    assert sched._fallback_sec_args("find_sec_entities", "buy Unlisted Company", "NVDA") == {
-        "query": "buy Unlisted Company"
-    }
+    assert sched._fallback_sec_args(tool_name, "buy Unlisted Company", "NVDA") == expected
+
+
+@pytest.mark.parametrize(
+    ("objective", "supplied"),
+    [("What do you think about the CEO?", "AAPL"), ("Is AI hype hurting it?", "NVDA")],
+)
+def test_objective_subject_uses_chart_context_for_unresolved_acronyms(
+    objective: str, supplied: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Role and topic acronyms that do not resolve leave the chart ticker in place."""
+    from app import tools
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_chart_test_subject)
+    assert sched._objective_subject_ticker(objective, supplied) == supplied
+
+
+def test_node_registry_excludes_chart_symbol_tool() -> None:
+    """Node selection drops the chart UI action. Entry and assessment registries keep it."""
+    registry = sched.build_registry()
+    assert "set_chart_symbol" in {e.get("name") for e in registry}
+    assert "set_chart_symbol" not in {e.get("name") for e in sched._without_control_tools(registry, "s", "n")}
 
 
 @pytest.mark.parametrize(
@@ -8148,7 +8173,7 @@ def test_fallback_args_refuse_chart_context_for_unresolved_explicit_subject(
     [
         ("How is it doing?", "NVDA"),
         ("buy Apple", "AAPL"),
-        ("buy Unlisted Company", None),
+        ("buy Unlisted Company", "NVDA"),
     ],
 )
 def test_needle_context_and_grounded_values_share_explicit_subject_precedence(
@@ -8184,7 +8209,10 @@ def test_needle_context_and_grounded_values_share_explicit_subject_precedence(
         ("set_chart_symbol", "ticker"),
     ],
 )
-@pytest.mark.parametrize(("objective", "ticker"), [("How is it doing?", "NVDA"), ("buy Apple", "AAPL")])
+@pytest.mark.parametrize(
+    ("objective", "ticker"),
+    [("How is it doing?", "NVDA"), ("buy Apple", "AAPL"), ("buy Unlisted Company", "NVDA")],
+)
 def test_generate_arguments_recovers_with_session_chart_ticker(
     failure: str, tool_name: str, selector: str, objective: str, ticker: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -8223,41 +8251,6 @@ def test_generate_arguments_recovers_with_session_chart_ticker(
     assert args == expected
     assert reasoning
     assert withheld is False
-
-
-@pytest.mark.parametrize("failure", ["unavailable", "withhold"])
-def test_generate_arguments_recovery_reselects_unresolved_subject_despite_chart(
-    failure: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Recovery never changes an unresolved explicit company into the chart company."""
-    from app import tools
-
-    monkeypatch.setattr(tools, "_resolve_company_to_ticker", mock.Mock(return_value=None))
-    calls: list[str] = []
-
-    async def generate(**kwargs: object) -> dict[str, JSONValue]:
-        calls.append(str(kwargs["tool"]))
-        context = kwargs["context"]
-        assert isinstance(context, dict) and "ticker" not in context
-        if failure == "unavailable":
-            raise RuntimeError("needle worker closed")
-        return {"tool": None, "arguments": {}, "reasoning": "withheld"}
-
-    with pytest.raises(sched._ReselectRequest, match="re-selecting"):
-        asyncio.run(
-            sched._generate_tool_arguments(
-                generate,
-                "search_sec_filings",
-                sched.build_registry(),
-                {"session_id": "s1", "objective": "buy Unlisted Company", "ticker": "NVDA"},
-                _node(),
-                [],
-                [],
-                None,
-                _Kernel(),
-            )
-        )
-    assert calls == ["search_sec_filings"]
 
 
 @pytest.mark.parametrize(

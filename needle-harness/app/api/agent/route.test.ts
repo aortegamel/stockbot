@@ -62,7 +62,6 @@ mock.module("@/lib/agent/kernel", () => ({
       if (routeDown) throw new Error("worker down");
       if (body.op === "arguments") {
         if (argsDown) throw new Error("needle down");
-        if (body.tool === "set_chart_symbol" && argsReply === null) return { tool: body.tool, arguments: { ticker: body.ticker } };
         return argsReply ?? { tool: body.tool, arguments: { q: "x" }, confidence: 1, reasoning: "t" };
       }
       if (body.op === "assess_entry") {
@@ -841,10 +840,7 @@ describe("agent entry route", () => {
     expect(executionOrder).toEqual(["set_chart_symbol", "reason"]);
     expect(events[0]).toEqual({ type: "chart_update", ticker: "MSFT" });
     expect(events.findIndex((event) => event.type === "chart_update")).toBeLessThan(events.findIndex((event) => event.type === "reasoning_start"));
-    expect(kernelCalls).toEqual([
-      { op: "route", prompt, ticker: "AAPL", currentChartTicker: "AAPL" },
-      { op: "arguments", tool: "set_chart_symbol", objective: prompt, ticker: "MSFT" },
-    ]);
+    expect(kernelCalls).toEqual([{ op: "route", prompt, ticker: "AAPL", currentChartTicker: "AAPL" }]);
     expect(invoked).toEqual([["set_chart_symbol", { ticker: "MSFT" }, "sess-test"]]);
     expect(reasonCalls[0]).toMatchObject({ prompt, ticker: "MSFT", evidence: [] });
     expect(ended).toEqual(["sess-test"]);
@@ -863,7 +859,7 @@ describe("agent entry route", () => {
       expect(runCalls[0]?.[0]).toBe(prompt);
       expect(runCalls[0]?.[2]).toMatchObject({ ticker: "MSFT", currentChartTicker: "MSFT", seedEvidence: [] });
       if (selection !== null) expect(runCalls[0]?.[2]).toMatchObject({ personas: selection });
-      expect(kernelCalls.map((call) => call.op)).toEqual(["route", "arguments"]);
+      expect(kernelCalls.map((call) => call.op)).toEqual(["route"]);
       expect(ended).toEqual(["sess-test"]);
     }
   });
@@ -874,7 +870,8 @@ describe("agent entry route", () => {
     await eventsFor("Microsoft risk factors?", "AAPL");
     expect(executionOrder).toEqual(["set_chart_symbol", "get_sec_document", "reason"]);
     expect(reasonCalls[0]).toMatchObject({ ticker: "MSFT", evidence: [expect.objectContaining({ id: "ev:bridge", content: bridgeEvidence.content })] });
-    expect(kernelCalls.filter((call) => call.op === "arguments").map((call) => call.ticker)).toEqual(["MSFT", "MSFT"]);
+    expect(kernelCalls.filter((call) => call.op === "arguments").map((call) => [call.tool, call.ticker])).toEqual([["get_sec_document", "MSFT"]]);
+    expect(kernelCalls.some((call) => call.op === "arguments" && call.tool === "set_chart_symbol")).toBe(false);
     expect(kernelCalls.filter((call) => call.op === "assess_entry")).toHaveLength(1);
     expect(ended).toEqual(["sess-test", "sess-test"]);
   });
@@ -929,56 +926,6 @@ describe("agent entry route", () => {
         expect(String(events[0]?.text)).toContain("Chart update failed:");
       },
     ), { seed: 2119, numRuns: 30 });
-  });
-
-  test("invalid chart arguments disclose failure without changing the route or context", async () => {
-    for (const reply of [
-      { error: "Needle unavailable" },
-      { tool: "search_web", arguments: { ticker: "MSFT" } },
-      { tool: "set_chart_symbol", arguments: null },
-      { tool: "set_chart_symbol", arguments: [] },
-      { tool: "set_chart_symbol", arguments: { ticker: "AAPL" } },
-      { tool: "set_chart_symbol", arguments: { ticker: "SEC" } },
-      { tool: "set_chart_symbol", arguments: { ticker: "MSFT", q: "extra" } },
-    ]) {
-      reset();
-      routeReply = { route: "reasoning_required", personas: null, chartTicker: "MSFT" };
-      argsReply = reply;
-      const events = await eventsFor("Microsoft outlook?", "AAPL");
-      expect(invoked).toEqual([]);
-      expect(reasonCalls[0]).toMatchObject({ ticker: "AAPL", evidence: [] });
-      expect(runCalls).toEqual([]);
-      expect(events.some((event) => event.type === "chart_update")).toBe(false);
-      expect(String(events[0]?.text)).toContain("Chart update failed:");
-      expect(kernelCalls.map((call) => call.op)).toEqual(["route", "arguments"]);
-    }
-  });
-
-  test("generated tickers cannot replace JEV's selected focus", async () => {
-    await fc.assert(fc.asyncProperty(
-      fc.jsonValue().filter((value) => realParseTicker(value) !== "MSFT"),
-      async (ticker) => {
-        reset();
-        routeReply = { route: "reasoning_required", personas: null, chartTicker: "MSFT" };
-        argsReply = { tool: "set_chart_symbol", arguments: { ticker } };
-        const events = await eventsFor("Compare Apple and Microsoft", "AAPL");
-        expect(invoked).toEqual([]);
-        expect(events.some((event) => event.type === "chart_update")).toBe(false);
-        expect(reasonCalls[0]?.ticker).toBe("AAPL");
-        expect(String(events[0]?.text)).toContain("Chart update failed:");
-      },
-    ), { seed: 2120, numRuns: 30 });
-  });
-
-  test("Needle failure preserves the answer without a chart session", async () => {
-    reset();
-    routeReply = { route: "reasoning_required", personas: null, chartTicker: "MSFT" };
-    argsDown = true;
-    const events = await eventsFor("Microsoft outlook?", "AAPL");
-    expect(String(events[0]?.text)).toContain("Chart update failed: needle down");
-    expect(reasonCalls[0]?.ticker).toBe("AAPL");
-    expect(sessionsCreated).toBe(0);
-    expect(runCalls).toEqual([]);
   });
 
   test("failed tools and malformed receipts warn and continue with the prior chart", async () => {
@@ -1040,7 +987,7 @@ describe("agent entry route", () => {
         expect(reasonCalls).toHaveLength(1);
         expect("ticker" in reasonCalls[0]).toBe(false);
       }
-      for (const call of kernelCalls.filter((call) => call.tool !== "set_chart_symbol")) expect("ticker" in call).toBe(false);
+      for (const call of kernelCalls) expect("ticker" in call).toBe(false);
     }
   });
 
@@ -1091,12 +1038,6 @@ describe("agent entry route", () => {
     reset();
     routeReply = { route: "reasoning_required", personas: null, chartTicker: "MSFT" };
     await eventsFor("Microsoft outlook?", "AAPL");
-    const needleOpts = kernelOpts[1];
-    if (!needleOpts || typeof needleOpts !== "object" || !("timeoutMs" in needleOpts)) throw new Error("expected timeout on chart arguments call");
-    const needleTimeout = needleOpts.timeoutMs;
-    if (typeof needleTimeout !== "number") throw new Error("expected numeric chart arguments timeout");
-    expect(needleTimeout).toBeGreaterThan(0);
-    expect(needleTimeout).toBeLessThanOrEqual(120_000);
     const chartTimeout = invokeTimeouts[0];
     if (typeof chartTimeout !== "number") throw new Error("expected numeric chart tool timeout");
     expect(chartTimeout).toBeGreaterThan(0);
