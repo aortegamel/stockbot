@@ -31,7 +31,7 @@ from scripts.verify_hedgefund_live import _missing_env
 
 GOLDEN = REPO_ROOT / "evals" / "golden_live.json"
 DEFAULT_BASE_URL = "http://127.0.0.1:3000"  # needle.ts PORT default; Vite proxies /api/agent to the Bun API.
-TIMEOUT_S = 130
+TIMEOUT_S = 400  # two 120s server walls + persona time; per-read idle and total guard share it.
 
 
 class Case(TypedDict):
