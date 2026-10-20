@@ -65,6 +65,8 @@ domains:
         path: "/market/chart"
       - index-membership:
         path: "/market/index-membership"
+      - watchlist:
+        path: "/market/watchlist"
   offerings:
     description: "Financing history, offering terms, and dilution math."
     families:
@@ -422,6 +424,18 @@ tools:
     summary: "A company's current weight and rank in the S&P 500 index from the constituent list."
     version: 2
     keywords: [500, answering, company, constituent, current, get, index, list, percent, rank, represent, retrieve, sp500, ticker, weight]
+  - name: update_watchlist
+    domain: market
+    family: watchlist
+    path: "/market/watchlist/update_watchlist"
+    intent: update_watchlist
+    output_kind: watchlist_update
+    source: local
+    entity_scope: single_security
+    time_mode: current
+    summary: "Add one stock to, or remove one stock from, the local watchlist."
+    version: 2
+    keywords: [add, ask, local, one, remove, stock, update, user, watchlist]
   - name: get_dilution_profile
     domain: offerings
     family: capital-raising

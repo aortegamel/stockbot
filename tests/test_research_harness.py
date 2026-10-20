@@ -7178,7 +7178,8 @@ def test_needle_execution_context_excludes_raw_evidence(tmp_path: Path, monkeypa
 
     repo = ResearchRepository(data_root=tmp_path)
     objective = "What is ORCL's filing history?"
-    sid = _svc.create_research(objective, ticker="ORCL", repo=repo)
+    # A cutoff retains generation, so this test checks the Needle context boundary.
+    sid = _svc.create_research(objective, ticker="ORCL", as_of="2026-01-01", repo=repo)
     source_job = repo.list_jobs(sid)[0].job_id
     _svc.record_evidence(
         sid,
@@ -7243,7 +7244,7 @@ def test_needle_execution_context_excludes_raw_evidence(tmp_path: Path, monkeypa
     assert "private stored claim" not in serialized
     assert context["ticker"] == "ORCL"
     scope = context["temporal_scope"]
-    assert isinstance(scope, dict) and scope["mode"] == "latest-available" and "raw" not in scope
+    assert scope == {"mode": "as_of", "as_of": "2026-01-01"}
     assert context["grounded_arguments"] == {"identifier": "ORCL"}
 
 

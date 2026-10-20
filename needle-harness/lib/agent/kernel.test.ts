@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
-import { applyFinalGates, asksWatchlist, inventoryDefect, KernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
+import { applyFinalGates, asksWatchlist, citedOrThin, inventoryDefect, KernelRouter, parseTicker, parseWatchlist, PASS2_MIN_WALL_MS, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type FinalGateCaller, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
 import { FINAL_PERSONAS, type AgentEvent, type Evidence, type FinalClaim, type Metrics, type Persona } from "./types";
 
 class FakeChild implements KernelChild {
@@ -450,7 +450,9 @@ describe("runKernelAgent final personas", () => {
           writes += 1;
           seen.push(o.evidence.map((e) => e.content));
           o.onDelta(`answer ${writes}`);
-          return writes === 1 ? { text: "answer 1", usage: {}, missingEvidence: "missing" } : { text: "answer 2", usage: {} };
+          return writes === 1
+            ? { text: "answer 1", usage: {}, missingEvidence: "missing" }
+            : { text: "answer 2", usage: {}, claims: [{ text: "answer 2", claimType: "inference", evidenceIds: ["ev:2"] }] };
         }
       },
     });
@@ -629,10 +631,13 @@ describe("runKernelAgent final personas", () => {
               inFlight -= 1;
               const d: Outcome = opts.decide?.(o.persona, pass, attempt) ?? {};
               if (d instanceof Error) throw d;
+              const text = d.text ?? `${o.persona} p${pass}`;
+              // Default answers cite the first evidence row so the citation gate keeps the prose.
+              const cite = o.evidence[0]?.id;
               return {
-                text: d.text ?? `${o.persona} p${pass}`,
+                text,
                 usage: d.usage ?? {},
-                claims: d.claims ?? [],
+                claims: d.claims ?? (cite ? [{ text, claimType: "inference", evidenceIds: [cite] }] : []),
                 ...(d.confidence !== undefined ? { confidence: d.confidence } : {}),
                 ...(d.missingEvidence ? { missingEvidence: d.missingEvidence } : {}),
               };
@@ -839,6 +844,34 @@ describe("runKernelAgent final personas", () => {
     expect(m.evidence.count).toBe(2);
   });
 
+  test("intake evidence starts a brief first; the full answer follows below a divider", async () => {
+    const progress = (id: string, stage: string, detail: Record<string, unknown>): string => `${JSON.stringify({ type: "progress", id, stage, detail })}\n`;
+    const { events, calls } = await runFinal({
+      personas: ["stockbot"],
+      reply: (_pass2, id) =>
+        progress(id, "intake_evidence", { evidence: [{ id: "ev:0", content: "intake fact" }] }) +
+        sessionGraphReply(id),
+    });
+    const brief = calls.find((c) => c.input.direct === true);
+    expect(brief?.input.evidence.map((e) => e.id)).toEqual(["ev:0"]);
+    const deltas = answers(events);
+    expect(deltas[0]).toContain("draft-stockbot");
+    expect(deltas.at(-1)).toMatch(/^── Full answer ──\n/);
+    expect(events.at(-1)?.type).toBe("done");
+  });
+
+  test("a brief over the full evidence ends the stream with no second answer", async () => {
+    const progress = (id: string, stage: string, detail: Record<string, unknown>): string => `${JSON.stringify({ type: "progress", id, stage, detail })}\n`;
+    const reply = (id: string): string =>
+      `${JSON.stringify({ id, objective: "q", sessionId: "s1", evidence: [{ id: "ev:0", content: "intake fact" }], nodes: [], decisions: [], unresolved: [], incomplete_guard: false, toolExecutions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false })}\n`;
+    const { events } = await runFinal({
+      personas: ["stockbot"],
+      reply: (_pass2, id) => progress(id, "intake_evidence", { evidence: [{ id: "ev:0", content: "intake fact" }] }) + reply(id),
+    });
+    expect(events.filter((e) => e.type === "answer_delta").length).toBe(1);
+    expect(events.map((e) => e.type).slice(-2)).toEqual(["offer_trio", "done"]);
+  });
+
   test("done timings sum worker progress phases, skip malformed values, and omit unmeasured phases", async () => {
     const progress = (id: string, stage: string, detail: Record<string, unknown>): string => `${JSON.stringify({ type: "progress", id, stage, detail })}\n`;
     const { events } = await runFinal({
@@ -958,9 +991,37 @@ describe("runKernelAgent final personas", () => {
     expect(Object.keys(m.failures)).not.toContain("incomplete_evidence");
   });
 
-  test("first gap after persona time passes the original wall still runs one follow-up with a fresh wall", async () => {
+  // Skip note the answer carries when a first gap leaves too little request wall.
+  const skipNote = (gap: string): string => `\n\nMissing evidence (not researched: under ${PASS2_MIN_WALL_MS / 1000}s of request time left): ${gap}`;
+
+  test("a first gap with under 20s of request wall left answers pass 1 with the missing evidence and no follow-up", async () => {
     const deadlineAt = Date.now() + 5_000;
-    const resumedAt = deadlineAt + 60_000;
+    // 19.999s left, then past the wall: both skip. The clock stays frozen at the set time.
+    for (const resumedAt of [deadlineAt - PASS2_MIN_WALL_MS + 1, deadlineAt + 60_000]) {
+      try {
+        const { events, bodies, gates } = await runFinal({
+          deadlineAt,
+          decide: (p, pass) => {
+            if (pass === 1) setSystemTime(new Date(resumedAt));
+            return pass === 1 && p === "bearbot" ? { missingEvidence: "need doc X" } : {};
+          },
+        });
+        expect(runBodies(bodies).length).toBe(1);
+        expect(events.filter((e) => e.type === "reasoning_start").length).toBe(1);
+        expect(events.some((e) => e.type === "progress" && e.stage === "evidence_gap")).toBe(false);
+        expect(gates.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_response", "assess_final_response"]);
+        expect(answers(events)).toEqual([trioAnswer(1) + skipNote("need doc X")]);
+        expect(events.some((e) => e.type === "failed")).toBe(false);
+        expect(doneMetrics(events).timings?.pass2Ms).toBeUndefined();
+      } finally {
+        setSystemTime();
+      }
+    }
+  });
+
+  test("a first gap with exactly 20s of request wall left still runs one follow-up with a fresh wall", async () => {
+    const deadlineAt = Date.now() + 5_000;
+    const resumedAt = deadlineAt - PASS2_MIN_WALL_MS;
     try {
       const { events, bodies, runTimeouts } = await runFinal({
         deadlineAt,
@@ -969,13 +1030,10 @@ describe("runKernelAgent final personas", () => {
           return pass === 1 && p === "bearbot" ? { missingEvidence: "need doc X" } : {};
         },
       });
-      const after = Date.now();
       const runs = runBodies(bodies);
       expect(runs.length).toBe(2);
       expect(runs[0]?.deadlineAt).toBe(deadlineAt);
-      const fresh = Number(runs[1]?.deadlineAt);
-      expect(fresh).toBeGreaterThanOrEqual(resumedAt + REQUEST_WALL_MS);
-      expect(fresh).toBeLessThanOrEqual(after + REQUEST_WALL_MS);
+      expect(runs[1]?.deadlineAt).toBe(resumedAt + REQUEST_WALL_MS);
       expect(runTimeouts[1]).toBe(REQUEST_WALL_MS);
       expect(answers(events)).toEqual([trioAnswer(2)]);
       expect(events.some((e) => e.type === "failed")).toBe(false);
@@ -1026,11 +1084,12 @@ describe("runKernelAgent final personas", () => {
     expect(failed?.type === "failed" ? failed.message : "").toContain("unknown evidence id: ev:9");
   });
 
-  test("property: any persona elapsed time or follow-up evidence runs exactly one fresh follow-up and no third pass", async () => {
+  test("property: a first gap runs exactly one fresh follow-up iff 20s of request wall remain, and never a third pass", async () => {
     await fc.assert(
-      fc.asyncProperty(fc.integer({ min: 0, max: 24 * 3_600_000 }), fc.boolean(), fc.boolean(), async (elapsedMs, newEvidence, gapAgain) => {
+      fc.asyncProperty(fc.integer({ min: -24 * 3_600_000, max: 600_000 }), fc.boolean(), fc.boolean(), async (leftMs, newEvidence, gapAgain) => {
         const deadlineAt = Date.now() + 1_000;
-        const resumedAt = deadlineAt + elapsedMs;
+        const resumedAt = deadlineAt - leftMs;
+        const follows = leftMs >= PASS2_MIN_WALL_MS;
         try {
           const { events, bodies, runTimeouts } = await runFinal({
             deadlineAt,
@@ -1040,18 +1099,20 @@ describe("runKernelAgent final personas", () => {
               return (pass === 1 || gapAgain) && p === "bullbot" ? { missingEvidence: "need doc X" } : {};
             },
           });
-          const after = Date.now();
           const runs = runBodies(bodies);
-          expect(runs.length).toBe(2);
+          expect(runs.length).toBe(follows ? 2 : 1);
           expect(runs[0]?.deadlineAt).toBe(deadlineAt);
-          const fresh = Number(runs[1]?.deadlineAt);
-          expect(fresh).toBeGreaterThanOrEqual(resumedAt + REQUEST_WALL_MS);
-          expect(fresh).toBeLessThanOrEqual(after + REQUEST_WALL_MS);
+          expect(events.filter((e) => e.type === "reasoning_start").length).toBe(follows ? 2 : 1);
+          expect(events.some((e) => e.type === "failed")).toBe(false);
+          if (!follows) {
+            expect(answers(events)).toEqual([trioAnswer(1) + skipNote("need doc X")]);
+            expect(doneMetrics(events).evidence.count).toBe(1);
+            return;
+          }
+          expect(runs[1]?.deadlineAt).toBe(resumedAt + REQUEST_WALL_MS);
           expect(runTimeouts[1]).toBe(REQUEST_WALL_MS);
           if (newEvidence) expect(runs[1]?.sessionId).toBe("s1");
-          expect(events.filter((e) => e.type === "reasoning_start").length).toBe(2);
           expect(answers(events)).toEqual([trioAnswer(2)]);
-          expect(events.some((e) => e.type === "failed")).toBe(false);
           expect(doneMetrics(events).evidence.count).toBe(newEvidence ? 2 : 1);
         } finally {
           setSystemTime();
@@ -1389,6 +1450,56 @@ describe("runKernelAgent final personas", () => {
     expect(inventoryDefect("prose has it", [{ text: "has it", claimType: "unknown", evidenceIds: [] }], known)).toBeUndefined();
   });
 
+  test("citedOrThin keeps an answer with a surviving cited claim and thins every other answer", () => {
+    const result = (claims: FinalClaim[]) => [{ persona: "bearbot" as const, text: "", claims }];
+    const cited: FinalClaim = { text: "kept fact", claimType: "observed_fact", evidenceIds: ["ev:1"] };
+    expect(citedOrThin("kept fact here", result([cited]))).toBe("kept fact here");
+    for (const [text, claims] of [
+      ["prose", []],
+      ["prose", [{ text: "prose", claimType: "unknown", evidenceIds: [] }]],
+      // The gates deleted the only cited claim from the prose.
+      ["prose left", [cited]],
+      ["prose", [{ ...cited, text: "" }]],
+    ] as [string, FinalClaim[]][]) {
+      const out = citedOrThin(text, result(claims));
+      expect(out).toStartWith("Thin evidence:");
+      expect(out).toContain("Sourced facts: none.");
+      expect(out).toContain(`Inference (uncited):\n${text}`);
+      expect(out).toContain("Uncertainty:");
+    }
+  });
+
+  test("a research answer with no cited claim returns the thin-evidence form", async () => {
+    const { events } = await runFinal({
+      personas: ["bearbot"],
+      decide: () => ({ text: "bearbot guess", claims: [{ text: "bearbot guess", claimType: "unknown", evidenceIds: [] }] }),
+    });
+    expect(answers(events)).toEqual([citedOrThin(`${label("bearbot")}\nbearbot guess`, [])]);
+    expect(answers(events)[0]).toStartWith("Thin evidence:");
+    expect(events.some((e) => e.type === "failed")).toBe(false);
+  });
+
+  test("a cited claim the gates delete leaves the thin-evidence form", async () => {
+    const kept = "bearbot uncited opinion";
+    const cut = "bearbot cited fact";
+    const { events } = await runFinal({
+      personas: ["bearbot"],
+      decide: () => ({
+        text: `${kept} ${cut}`,
+        claims: [
+          { text: kept, claimType: "unknown", evidenceIds: [] },
+          { text: cut, claimType: "observed_fact", evidenceIds: ["ev:1"] },
+        ],
+      }),
+      gate: (body) => (body.op === "assess_final_claim" && (body.claim as Record<string, unknown>).text === kept ? { support_answer: "yes" } : { support_answer: "no" }),
+    });
+    const out = answers(events);
+    expect(out.length).toBe(1);
+    expect(out[0]).toStartWith("Thin evidence:");
+    expect(out[0]).toContain(kept);
+    expect(out[0]).not.toContain(cut);
+  });
+
   test("all claims rejected fails closed with no prose", async () => {
     const { events } = await runFinal({
       personas: ["bearbot"],
@@ -1637,6 +1748,85 @@ describe("runKernelAgent final personas", () => {
     if (!("text" in gated)) throw new Error("expected gated text");
     expect(gated.text).toContain("KEEP");
     expect(gated.text).not.toContain("CUT");
+  });
+
+  // Scripted gate replies for the parallel-gate tests: each persona's whole
+  // response and each claim (`<persona>-c<j>`) has its own verdict.
+  type GateScript = "yes" | "no" | "error" | "throw";
+  const gateEvidence = [{ id: "ev:1", source: "kernel", retrievedAt: "t", content: "fact" }];
+  const scriptedReply = async (v: GateScript) => {
+    if (v === "throw") throw new Error("down");
+    return v === "error" ? { error: "boom" } : { support_answer: v };
+  };
+  const scriptKey = (body: Record<string, unknown>): string => {
+    const claim = body.claim;
+    return claim && typeof claim === "object" && "text" in claim ? String(claim.text) : String(body.persona);
+  };
+  const gateResults = (personas: readonly Persona[], claimCounts: readonly number[], defectAt?: number) =>
+    personas.map((p, i) => {
+      const claims: FinalClaim[] = Array.from({ length: claimCounts[i] ?? 0 }, (_, j) => ({
+        text: `${p}-c${j}`, claimType: "inference", evidenceIds: [defectAt === i && j === 0 ? "ev:9" : "ev:1"],
+      }));
+      return { persona: p, text: `${p} lead. ${claims.map((c) => c.text).join(" ")}`, claims };
+    });
+
+  test("applyFinalGates checks every persona and every rejected claim concurrently", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const ops: string[] = [];
+    const gate: FinalGateCaller = async (body) => {
+      ops.push(String(body.op));
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await Promise.resolve();
+      inFlight -= 1;
+      return scriptedReply(body.op === "assess_final_response" ? "no" : scriptKey(body).endsWith("-c0") ? "yes" : "no");
+    };
+    const personas: Persona[] = ["bearbot", "bullbot", "stockbot"];
+    const gated = await applyFinalGates({ results: gateResults(personas, [2, 2, 2]), evidence: gateEvidence, personaOrder: personas, gate });
+    expect(gated).toEqual({ text: personas.map((p) => `${label(p)}\n${p} lead. ${p}-c0`).join("\n\n") });
+    // Three whole-response checks in flight at once, then all six claim checks.
+    expect(ops.slice(0, 3)).toEqual(["assess_final_response", "assess_final_response", "assess_final_response"]);
+    expect(maxInFlight).toBe(6);
+  });
+
+  test("property: parallel final gates give the serial verdict under any completion order", async () => {
+    const script = fc.constantFrom<GateScript>("yes", "no", "error", "throw");
+    await fc.assert(
+      fc.asyncProperty(
+        fc.subarray([...FINAL_PERSONAS], { minLength: 1 }),
+        fc.array(fc.array(script, { maxLength: 3 }), { minLength: 3, maxLength: 3 }),
+        fc.array(script, { minLength: 3, maxLength: 3 }),
+        fc.option(fc.nat(2), { nil: undefined }),
+        fc.array(fc.nat(6), { minLength: 16, maxLength: 16 }),
+        async (personas, claimScripts, wholeScripts, defectAt, ticks) => {
+          const verdicts = new Map<string, GateScript>();
+          personas.forEach((p, i) => {
+            verdicts.set(p, wholeScripts[i] ?? "yes");
+            (claimScripts[i] ?? []).forEach((v, j) => verdicts.set(`${p}-c${j}`, v));
+          });
+          const replyFor = (body: Record<string, unknown>) => scriptedReply(verdicts.get(scriptKey(body)) ?? "yes");
+          // Serial reference: one gate call at a time, in issue order.
+          let chain: Promise<unknown> = Promise.resolve();
+          const serial: FinalGateCaller = (body) => {
+            const next = chain.then(() => replyFor(body));
+            chain = next.catch(() => undefined);
+            return next;
+          };
+          // Shuffled completion: each call settles after a scripted number of microtask ticks.
+          let n = 0;
+          const shuffled: FinalGateCaller = async (body) => {
+            const wait = ticks[n++ % ticks.length] ?? 0;
+            for (let t = 0; t < wait; t++) await Promise.resolve();
+            return replyFor(body);
+          };
+          const results = gateResults(personas, claimScripts.map((c) => c.length), defectAt);
+          const run = (gate: FinalGateCaller) => applyFinalGates({ results, evidence: gateEvidence, personaOrder: personas, gate });
+          expect(await run(shuffled)).toEqual(await run(serial));
+        },
+      ),
+      { seed: 20261019, numRuns: 200 },
+    );
   });
 });
 

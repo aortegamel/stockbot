@@ -454,6 +454,61 @@ def test_digest_strips_tags_keeps_text() -> None:
     assert "12%" in digest and "<b>" not in digest and "<td>" not in digest
 
 
+def _web_evidence(eid: str, content: str) -> dict[str, object]:
+    ev = _stored_evidence(eid, content, source_uri=f"https://news.test/{eid}", accession=eid)
+    return {**ev, "provenance": {"kind": "web_source", "url": f"https://news.test/{eid}", "excerpt": content}}
+
+
+def test_intake_evidence_preview_caps_rows_and_bytes() -> None:
+    """The early-brief preview carries evidence ids with capped content."""
+    rows = [_stored_evidence(f"ev-{i}", f"content {i}") for i in range(10)]
+    assert [r["id"] for r in kw._intake_evidence_preview(rows)] == [f"ev-{i}" for i in range(8)]
+    long_rows = [_stored_evidence(f"ev-{i}", f"content {i} " * 100) for i in range(10)]
+    long_preview = kw._intake_evidence_preview(long_rows)
+    assert sum(len(str(r["content"])) for r in long_preview) <= 4000
+    assert kw._intake_evidence_preview([]) == []
+
+
+def test_digest_drops_off_subject_web_results() -> None:
+    """Web text naming neither company nor ticker is dropped; on-subject web and SEC rows stay."""
+    on_name = _web_evidence("ev-name", "Nvidia shipped new data-center chips.")
+    on_ticker = _web_evidence("ev-ticker", "NVDA rose 3% after hours.")
+    off = _web_evidence("ev-off", "Avocado prices hit a record high.")
+    partial = _web_evidence("ev-partial", "NVIDIAN folklore and NVDAX funds.")
+    sec = _stored_evidence("ev-sec", "Revenue rose 12% in the quarter.", accession="0000000000-26-000009")
+    digest = kw._build_digest([on_name, on_ticker, off, partial, sec], ("NVIDIA", "NVDA"))
+    assert "ev-name" in digest and "ev-ticker" in digest and "ev-sec" in digest
+    assert "ev-off" not in digest and "ev-partial" not in digest
+    assert "ev-off" in kw._build_digest([off])
+
+
+def test_intake_web_query_scoped_with_company_and_ticker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A subject prompt searches the web as "<company> <ticker> <prompt>", suffix stripped."""
+    queries: list[object] = []
+
+    def _find(query: str, limit: int = 10) -> list[dict[str, object]]:
+        return [
+            {"name": "NVIDIA CORP", "cik": 1045810, "tickers": ["NVDA"], "exchange": None},
+            {"name": "OTHER NVDA FUND", "cik": 1, "tickers": ["NVDX"], "exchange": None},
+        ]
+
+    async def _one_round(
+        query: object, *a: object, **k: object
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
+        queries.append(query)
+        return ([], [], {"calls": 1, "admitted": 0})
+
+    def _decompose(*a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
+        return ([_proposal("s-q1", "s")], {})
+
+    monkeypatch.setattr("app.sec.client.find_sec_company", _find)
+    monkeypatch.setattr(kw, "_intake_round", _one_round)
+    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
+    asyncio.run(kw._graph_intake("is NVDA a buy?", None, "s1", {}, [], None, _IntakeKernel(), None))
+    assert queries == ["NVIDIA NVDA is NVDA a buy?"]
+    assert kw._intake_subject([]) == ()
+
+
 def test_intake_prompt_carries_raw_query_and_digest() -> None:
     prompt = kw._intake_reasoner_prompt("rs:t", "how will orcl's manjure affect AAPL?", None, "DIGEST-BYTES")
     assert "how will orcl's manjure affect AAPL?" in prompt
@@ -595,6 +650,45 @@ def test_two_round_ceiling_without_new_hints(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(kw4, "_reasoner_decompose_with_retry", _decompose)
     out = asyncio.run(kw4._graph_intake("q?", None, "s1", {}, [], None, _IntakeKernel(), None))
     assert len(out) == 1 and rounds["n"] == 1
+
+
+def _graph_intake_decompose_calls(monkeypatch: pytest.MonkeyPatch, objective: str) -> tuple[list[str], list[str]]:
+    """Run _graph_intake over one AAPL round with a non-empty digest: (decompose calls, proposal questions)."""
+    calls: list[str] = []
+
+    async def _one_round(
+        *a: object, **k: object
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
+        return ([_stored_evidence("ev-1", "Apple revenue rose 8% year over year.", subject="AAPL")], [], {})
+
+    def _decompose(obj: str, *a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
+        calls.append(obj)
+        return ([_proposal("s1-q1", "s1"), _proposal("s1-q2", "s1")], {})
+
+    def _aapl(*a: object, **k: object) -> list[str]:
+        return ["AAPL"]
+
+    monkeypatch.setattr(kw, "_intake_start_tickers", _aapl)
+    monkeypatch.setattr(kw, "_intake_round", _one_round)
+    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
+    out = asyncio.run(kw._graph_intake(objective, None, "s1", {}, [], None, _IntakeKernel(), None))
+    return calls, [str(p["question"]) for p in out]
+
+
+def test_single_subject_digest_skips_reasoner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One subject + non-empty digest: the objective is the only proposal and decompose never runs."""
+    calls, questions = _graph_intake_decompose_calls(monkeypatch, "How is AAPL doing this quarter?")
+    assert calls == [] and questions == ["How is AAPL doing this quarter?"]
+
+
+@pytest.mark.parametrize(
+    "objective",
+    ["Compare AAPL margins over time?", "AAPL vs MSFT margins?", "AAPL and MSFT margins?", "Is AAPL up? Why?"],
+)
+def test_multipart_objective_still_calls_reasoner(monkeypatch: pytest.MonkeyPatch, objective: str) -> None:
+    """compare/vs/and, a second subject, or a second question keeps the Reasoner decompose."""
+    calls, questions = _graph_intake_decompose_calls(monkeypatch, objective)
+    assert calls == [objective] and questions == ["Q?", "Q?"]
 
 
 def test_intake_never_searches_filings_and_chains_8k(
@@ -810,10 +904,10 @@ def test_reasoner_transient_retries_once(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_intake_budget_and_reasoner_timeouts_pinned() -> None:
-    """Intake caps: 15s budget, 15s call timeout, 45s Reasoner decompose bound."""
-    assert kw._INTAKE_BUDGET_S == 15.0
-    assert kw._INTAKE_CALL_TIMEOUT_S == 15.0
-    assert kw._INTAKE_REASONER_TIMEOUT_S == 45.0
+    """Intake caps: 8s budget, 8s call timeout, 20s Reasoner decompose bound."""
+    assert kw._INTAKE_BUDGET_S == 8.0
+    assert kw._INTAKE_CALL_TIMEOUT_S == 8.0
+    assert kw._INTAKE_REASONER_TIMEOUT_S == 20.0
 
 
 def test_reasoner_timeout_returns_without_waiting(

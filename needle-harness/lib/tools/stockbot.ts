@@ -10,7 +10,7 @@ const ROOT = process.cwd().endsWith("needle-harness")
 const BRIDGE_CMD = `${ROOT}/venv/bin/python`;
 const BRIDGE_ARGS = [`${ROOT}/scripts/tool_bridge.py`];
 
-type BridgeResultMeta = { source_handle?: unknown; source_refs?: unknown; sources?: unknown; chart_selection?: unknown };
+type BridgeResultMeta = { source_handle?: unknown; source_refs?: unknown; sources?: unknown; chart_selection?: unknown; watchlist_update?: unknown };
 type BridgeReply = {
   id?: unknown;
   result?: { content?: unknown; error?: unknown; error_type?: unknown; meta?: BridgeResultMeta };
@@ -218,6 +218,15 @@ function chartSelection(meta: BridgeResultMeta | undefined): Record<string, unkn
   return candidate;
 }
 
+function watchlistUpdate(meta: BridgeResultMeta | undefined): Record<string, unknown> | undefined {
+  const update = meta?.watchlist_update;
+  if (!update || typeof update !== "object" || Array.isArray(update)) return undefined;
+  const candidate = update as Record<string, unknown>;
+  if (Object.keys(candidate).length !== 3 || candidate.result_type !== "watchlist_update" || (candidate.action !== "add" && candidate.action !== "remove")) return undefined;
+  if (typeof candidate.ticker !== "string" || parseTicker(candidate.ticker) !== candidate.ticker) return undefined;
+  return candidate;
+}
+
 function succeeded(name: string, result: BridgeResult): ToolResult {
   const { sourceHandle, sourceRefs, sources } = replyMeta(result.meta);
   const evidence = makeEvidence(name, replyContent(result), {
@@ -228,10 +237,12 @@ function succeeded(name: string, result: BridgeResult): ToolResult {
   const refs = sourceReferences(sources);
   if (refs.length) evidence.sources = refs;
   const selection = name === "set_chart_symbol" ? chartSelection(result.meta) : undefined;
+  const update = name === "update_watchlist" ? watchlistUpdate(result.meta) : undefined;
   return {
     ok: true,
     evidence,
     ...(selection !== undefined ? { chartSelection: selection } : {}),
+    ...(update !== undefined ? { watchlistUpdate: update } : {}),
   };
 }
 

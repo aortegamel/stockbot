@@ -13,8 +13,10 @@ function requiredEnv(name: string): string {
 const WORKER_TIMEOUT_MS = 10 * 60 * 1000;
 // Research wall per pass: pass 1 and the one gap follow-up each get their own
 // 120s from their own start. Persona generation, retries, and synthesis run
-// with no time limit, so the follow-up never depends on persona elapsed time.
+// with no time limit. The follow-up starts only while PASS2_MIN_WALL_MS of the
+// request wall remains; otherwise pass 1 answers and states what is missing.
 export const REQUEST_WALL_MS = 120_000;
+export const PASS2_MIN_WALL_MS = 20_000;
 const PREWARM_TIMEOUT_MS = 120_000;
 
 const ROOT =
@@ -242,19 +244,24 @@ async function gateResult(r: FinalPersonaResult, ctx: FinalGateContext): Promise
   if (gatePasses(whole.verdict)) return { text: r.text };
   return deleteRejectedClaims(r, ctx);
 }
-// Per-claim ops run only after a whole-response reject: each rejected claim loses
-// its substring, and prose left empty by the deletions fails the run.
+// Per-claim ops run only after a whole-response reject, all claims at once. The
+// verdict reads them in inventory order, as a serial loop would: the first
+// failed op fails the persona, and each rejected claim loses its substring.
+// Prose left empty by the deletions fails the run.
 async function deleteRejectedClaims(r: FinalPersonaResult, ctx: FinalGateContext): Promise<{ text: string } | { failure: string }> {
-  let kept = r.text;
-  for (const c of r.claims) {
-    const one = await callGate(ctx, {
+  const checked = await Promise.all(r.claims.map(async (c) => ({
+    c,
+    one: await callGate(ctx, {
       op: "assess_final_claim",
       ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
       persona: r.persona,
       claim: toWireClaim(c),
       evidence: ctx.evidence,
       ...(c.confidence !== undefined ? { confidence: c.confidence } : {}),
-    });
+    }),
+  })));
+  let kept = r.text;
+  for (const { c, one } of checked) {
     if ("failure" in one) return { failure: `${r.persona}: ${one.failure}` };
     if (!gatePasses(one.verdict)) kept = kept.split(c.text).join("");
   }
@@ -274,7 +281,9 @@ function assembleGated(gated: readonly { persona: Persona; text: string }[], per
 }
 // Final accuracy gates: inventory -> whole-response JEV via Python worker ops ->
 // on reject per-claim gates -> surgical deletion of rejected substrings ->
-// single answer_delta. Fail closed; never deletes evidence rows.
+// single answer_delta. Fail closed; never deletes evidence rows. Personas
+// before the first inventory defect gate at once; the verdict is the first
+// failure in result order, the same verdict a serial loop gives.
 // `sessionId` is the run's session: the worker judges gates against that
 // session's persisted rows, and its request-id fallback (the numeric kernel
 // request id) fails closed with "unknown session_id" for every call.
@@ -293,14 +302,15 @@ export async function applyFinalGates(opts: {
     ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
     opts: opts.gateOpts,
   };
+  const defects = opts.results.map((r) => inventoryDefect(r.text, r.claims, known));
+  const cut = defects.findIndex((d) => d !== undefined);
+  const checked = await Promise.all(opts.results.slice(0, cut < 0 ? undefined : cut).map(async (r) => ({ persona: r.persona, outcome: await gateResult(r, ctx) })));
   const gated: { persona: Persona; text: string }[] = [];
-  for (const r of opts.results) {
-    const defect = inventoryDefect(r.text, r.claims, known);
-    if (defect !== undefined) return { failure: `${r.persona}: ${defect}` };
-    const outcome = await gateResult(r, ctx);
+  for (const { persona, outcome } of checked) {
     if ("failure" in outcome) return outcome;
-    gated.push({ persona: r.persona, text: outcome.text });
+    gated.push({ persona, text: outcome.text });
   }
+  if (cut >= 0) return { failure: `${opts.results[cut]?.persona}: ${defects[cut]}` };
   return assembleGated(gated, opts.personaOrder);
 }
 type RunKernelDeps = {
@@ -671,6 +681,10 @@ type KernelRun = {
   usage: MuseUsage;
   timings: Timings;
   pass2At: number | undefined;
+  briefAt: number | undefined;
+  briefRows: Evidence[] | undefined;
+  briefPromise: Promise<string | undefined> | undefined;
+  briefText: string | undefined;
 };
 
 // One answer pass: the reasoner stages plus the drafts and gaps that the gate and
@@ -821,8 +835,43 @@ function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSign
       }
       return;
     }
+    if (stage === "intake_evidence" && run.briefPromise === undefined) startBrief(run, detail);
     run.emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage });
   };
+
+  // Early brief: one short streamed stockbot call over the intake rows while the
+  // nodes continue. Never throws; a failed brief leaves no trace.
+  function startBrief(run: KernelRun, detail: Record<string, unknown> | undefined): void {
+    const rows = kernelEvidence(detail?.evidence);
+    if (rows.length === 0) return;
+    run.briefRows = rows;
+    run.briefAt = performance.now();
+    run.briefPromise = (async (): Promise<string | undefined> => {
+      try {
+        const started = performance.now();
+        const r = await run.reasonFn({
+          prompt: `${run.prompt}\n\nBrief: say what the sources below establish so far, citing their ids. Two sentences max.`,
+          ...(run.scope.watchlist === undefined && run.currentChartTicker !== undefined ? { ticker: run.currentChartTicker } : {}),
+          evidence: rows,
+          escalated: false,
+          direct: true,
+          persona: "stockbot",
+          objective: run.objective,
+          nodes: [],
+          decisions: [],
+          unresolved: [],
+          incompleteGuard: false,
+          ...(run.signal ? { signal: run.signal } : {}),
+          onDelta: (text) => run.emit({ type: "answer_delta", text }),
+        });
+        run.museCalls += 1;
+        run.museMs += performance.now() - started;
+        return r.text;
+      } catch {
+        return undefined;
+      }
+    })();
+  }
   return { ...(run.signal ? { signal: run.signal } : {}), timeoutMs, onProgress };
 }
 
@@ -988,6 +1037,7 @@ async function researchPass(run: KernelRun): Promise<boolean> {
     return false;
   }
   run.workerMs += performance.now() - workerStart;
+  if (run.briefPromise !== undefined) run.briefText = (await run.briefPromise) ?? undefined;
   adoptFirst(run, res);
   if (typeof res.error === "string" && res.error) {
     endFailed(run, "needle", "provider_error", res.error);
@@ -1194,13 +1244,39 @@ function endStageFailure(run: KernelRun, pass: Pass): boolean {
   return true;
 }
 
+// Citation gate: a research answer must keep at least one inventory claim that
+// cites an evidence row and survived the gates. Otherwise the answer takes the
+// thin-evidence form: the same sourced-facts/inference/uncertainty split the
+// inventory uses, with no sourced facts and the gated prose as uncited inference.
+export function citedOrThin(text: string, results: readonly FinalPersonaResult[]): string {
+  if (results.some((r) => r.claims.some((c) => c.evidenceIds.length > 0 && c.text !== "" && text.includes(c.text)))) return text;
+  return [
+    "Thin evidence: no statement in this answer cites an evidence row.",
+    "Sourced facts: none.",
+    `Inference (uncited):\n${text}`,
+    "Uncertainty: treat every statement above as unverified until a cited source supports it.",
+  ].join("\n\n");
+}
+
 // A research answer is gated before display; a direct answer carries no
-// inventory and shows every selected persona as-is.
-async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
+// inventory and shows every selected persona as-is. A skipped follow-up's
+// missing-evidence note trails either answer.
+// Briefed and nothing new: the brief already answered over these rows.
+function briefCoversAll(run: KernelRun): boolean {
+  return run.briefText !== undefined && run.briefRows !== undefined
+    && run.evidence.every((e) => run.briefRows?.some((b) => b.id === e.id));
+}
+
+async function finishAnswer(run: KernelRun, pass: Pass, note = ""): Promise<void> {
   const results = pass.results;
   if (run.direct || results === undefined) {
     const blocks = results === undefined ? [] : results.map((r) => `── ${r.persona.charAt(0).toUpperCase()}${r.persona.slice(1)} ──\n${r.text}`);
-    endReport(run, blocks.join("\n\n"));
+    if (briefCoversAll(run) && blocks.length === 0) {
+      offerTrio(run);
+      run.emit({ type: "done", metrics: metricsOf(run, run.escalations) });
+      return;
+    }
+    endReport(run, (run.briefText !== undefined ? "── Full answer ──\n" : "") + blocks.join("\n\n") + note);
     return;
   }
   const order: Persona[] = run.isTrio ? ["bearbot", "bullbot", "stockbot"] : [...run.personas];
@@ -1219,7 +1295,12 @@ async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
     endFailed(run, "muse", "provider_error", gated.failure);
     return;
   }
-  run.emit({ type: "answer_delta", text: gated.text });
+  if (briefCoversAll(run)) {
+    offerTrio(run);
+    run.emit({ type: "done", metrics: metricsOf(run, run.escalations) });
+    return;
+  }
+  run.emit({ type: "answer_delta", text: (run.briefText !== undefined ? "── Full answer ──\n" : "") + citedOrThin(gated.text, results) + note });
   offerTrio(run);
   run.emit({ type: "done", metrics: metricsOf(run, run.escalations) });
 }
@@ -1277,12 +1358,14 @@ async function answerPass(run: KernelRun, pass: number): Promise<PassOutcome> {
   run.museMs += performance.now() - started;
   if (endStageFailure(run, stage)) return { ended: true };
   // Final accuracy gates on the research path only, and pass 2 is final even when
-  // gaps remain: the gates check the prose and drop unsupported claims.
-  const last = stage.gaps.length === 0 || pass >= 2;
+  // gaps remain: the gates check the prose and drop unsupported claims. Under
+  // PASS2_MIN_WALL_MS of request wall left, pass 1 is final and states the gap.
+  const skipped = stage.gaps.length > 0 && pass < 2 && run.deadlineAt - Date.now() < PASS2_MIN_WALL_MS;
+  const last = stage.gaps.length === 0 || pass >= 2 || skipped;
   if (last && !run.direct && stage.results !== undefined) await correctInventory(stage, input);
   if (endStageFailure(run, stage)) return { ended: true };
   if (last) {
-    await finishAnswer(run, stage);
+    await finishAnswer(run, stage, skipped ? `\n\nMissing evidence (not researched: under ${PASS2_MIN_WALL_MS / 1000}s of request time left): ${stage.gaps.join("; ")}` : "");
     return { ended: true };
   }
   return { gap: stage.gaps.join("; ") };
@@ -1292,7 +1375,8 @@ async function answerPass(run: KernelRun, pass: number): Promise<PassOutcome> {
 // shared snapshot; the full trio synthesizes (bear+bull draft concurrently,
 // then stockbot judges both drafts against the same snapshot). Drafts stay
 // buffered. Any Missing-Evidence line on pass 1 runs exactly one shared
-// same-session follow-up with a fresh research wall, merges, and regenerates.
+// same-session follow-up with a fresh research wall, merges, and regenerates,
+// unless under PASS2_MIN_WALL_MS of the request wall remains.
 // Pass 2 is final even with gaps: the final gates check the prose and drop
 // unsupported claims. Any failure after the trio's one draft retry fails.
 export async function runKernelAgent(
@@ -1359,6 +1443,10 @@ function openRun(prompt: string, emit: (e: AgentEvent) => void, opts: KernelRunO
     usage: {},
     timings: {},
     pass2At: undefined,
+    briefAt: undefined,
+    briefRows: undefined,
+    briefPromise: undefined,
+    briefText: undefined,
   };
 }
 

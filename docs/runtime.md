@@ -233,7 +233,7 @@ Watchlist sources load at two triggers through one worker path:
 Each symbol gets four fixed-argument calls through the existing tool handlers.
 `list_sec_filings` uses `limit=5` and no forms filter, so fund forms stay in.
 The three FINRA calls are `get_short_interest`, `get_reg_sho_volume` (the handler's current NYC week), and `get_threshold_securities`.
-Every call is an independent task on the existing SEC and tool pools under the 15s intake budget.
+Every call is an independent task on the existing SEC and tool pools under the 8s intake budget.
 A call past the budget is cancelled and reported as a timeout.
 Each (symbol, source) row carries `status` (`ok`, `no_records`, `error`, `timeout`), `as_of`, source references, and the evidence ID when admitted.
 A FINRA "No data found" answer is `no_records`. Any other failure is `error`.

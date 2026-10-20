@@ -16,6 +16,10 @@ those come only from JEV decisions. Reasoner path: JEV escalates -> reasoner
 analyze -> JEV adjudicates -> reasoner expand over unresolved context -> JEV
 disposition -> JEV selects the actual tool action.
 
+The scheduler seeds known arguments for undated calls before Needle. A missing required
+argument or date constraint retains generation. Every ready node starts in the same gather.
+Each node stops after three rounds, even when a caller requests a larger budget.
+
 Only stdlib + existing modules here; the ``_default_*`` resolvers build the
 production kernel, JEV, reasoner and Needle clients.
 """
@@ -308,8 +312,12 @@ class _Executors(TypedDict):
     deadline_at: float
 
 
-# ponytail: tight node budget; a trip blocks as visibly incomplete, never convergence.
-_MAX_TOOL_ROUNDS = 5
+# ponytail: MVP node budget, hard cap even over a larger max_rounds hook; a trip blocks
+# as visibly incomplete, never convergence.
+_MAX_TOOL_ROUNDS = 3
+
+# ponytail: absolute session ceiling (DAG depth), separate from the per-node budget.
+_MAX_SESSION_ROUNDS = 5
 
 # ponytail: 120s wall ceiling; stop starting new rounds after ~90s, finalize by 120s.
 _RUN_DEADLINE_S = 90.0
@@ -325,11 +333,18 @@ _JEV_REGISTRY_EXCLUDED = frozenset({"call_tool", "browse_tools", "search_tools",
 
 # research_start creates a new session. research_resume re-enters the current
 # node. Fresh nodes lack the resource handles that research_read and
-# research_read_search require. set_chart_symbol is a UI action for the entry
-# route, not node research. Keep these tools in build_registry for entry and
-# assessment paths, but exclude them from node selection.
+# research_read_search require. set_chart_symbol and update_watchlist are UI
+# actions for the entry route, not node research. Keep these tools in
+# build_registry for entry and assessment paths, but exclude them from node selection.
 _NODE_INVALID_CONTROL_TOOLS = frozenset(
-    {"research_start", "research_read", "research_read_search", "research_resume", "set_chart_symbol"}
+    {
+        "research_start",
+        "research_read",
+        "research_read_search",
+        "research_resume",
+        "set_chart_symbol",
+        "update_watchlist",
+    }
 )
 
 
@@ -931,10 +946,10 @@ def _context_evidence(
     cap_last: int | None = None,
 ) -> list[dict[str, JSONValue]]:
     """Admitted evidence + recent unadmitted observation summaries (success or failure)."""
-    ctx = [item for item in evidence if item.get("tool") != "set_chart_symbol"]
+    ctx = [item for item in evidence if item.get("tool") not in ("set_chart_symbol", "update_watchlist")]
     tail = attempts[-_OBSERVATION_TAIL:] if cap_last is None else attempts[-cap_last:]
     for attempt in tail:
-        if attempt.get("tool") == "set_chart_symbol" or attempt.get("evidence_id"):
+        if attempt.get("tool") in ("set_chart_symbol", "update_watchlist") or attempt.get("evidence_id"):
             continue  # admitted evidence already covers it
         summary = attempt.get("outcome_summary")
         if not isinstance(summary, str) or not summary:
@@ -1088,12 +1103,16 @@ def _latest_revenue_objective(objective: object) -> bool:
 
 def _latest_revenue_requested(session: Mapping[str, JSONValue], node: object, as_of: str | None) -> bool:
     """True when no date constrains the latest-revenue ask: request text, scope window, and cutoff all stay empty."""
-    objective = _session_objective(session)
-    if not _latest_revenue_objective(objective):
+    if not _latest_revenue_objective(_session_objective(session)):
         return False
-    dated = _DATE_CONSTRAINT_RE.search(_requested_text(objective, node, session.get("temporal_scope")).lower())
-    scoped_dates = _scope_has_dates(session)
-    return not dated and not scoped_dates and not session.get("as_of") and as_of is None
+    return _undated_request(session, node, as_of)
+
+
+def _undated_request(session: Mapping[str, JSONValue], node: object, as_of: str | None) -> bool:
+    """True when request text, scope window, and cutoff all stay empty, so no date needs generation."""
+    text = _requested_text(_session_objective(session), node, session.get("temporal_scope"))
+    dated = _DATE_CONSTRAINT_RE.search(text.lower())
+    return not dated and not _scope_has_dates(session) and not session.get("as_of") and as_of is None
 
 
 def _requested_text(objective: object, node: object, scope: object) -> str:
@@ -2650,6 +2669,10 @@ async def _generate_tool_arguments(
     )
     if grounded is not None:
         return grounded
+    seeded = _seeded_arguments(tool_name, objective, session, node, as_of, schema, scoped, sid, nid)
+    if seeded is not None:
+        _validate_repaired_args(tool_name, seeded[0], objective, session, node, evidence, attempts, kernel)
+        return seeded
     try:
         generated = await _call_needle(needle_generate, tool_name, schema, objective, node, context)
     except (RuntimeError, ValueError) as exc:
@@ -2786,6 +2809,36 @@ def _grounded_revenue_arguments(
     if _missing_required_argument(schema, grounded):
         return None
     return grounded, reasoning, False
+
+
+def _seeded_arguments(
+    tool_name: str,
+    objective: object,
+    session: Mapping[str, JSONValue],
+    node: object,
+    as_of: str | None,
+    schema: Mapping[str, JSONValue],
+    scoped: Mapping[str, JSONValue],
+    sid: str,
+    nid: str,
+) -> tuple[dict[str, JSONValue], str, bool] | None:
+    """Undated call whose values are already known (node question, objective subject): no Needle call.
+
+    None when a date needs generation, nothing seeds, or the seed misses a required key. SEC
+    full-text search never seeds: its seed query is the raw objective, which Needle sharpens.
+    """
+    if tool_name in ("search_sec_filings", "search_sec_filings_bounded") or not _undated_request(session, node, as_of):
+        return None
+    seeded = _fallback_search_web_args(tool_name, node) or _fallback_sec_args(
+        tool_name, objective, session.get("ticker")
+    )
+    if seeded is None:
+        return None
+    seeded = _repair_tool_arguments(tool_name, seeded, objective, sid, nid, question=_f(node, "question"), scope=scoped)
+    if _missing_required_argument(schema, seeded):
+        return None
+    _log_args_stage("args_seed", sid, nid, tool_name, ",".join(sorted(seeded)))
+    return seeded, "scheduler seeded known arguments. No Needle generation needed", False
 
 
 def _listing_carry_args(
@@ -3491,7 +3544,7 @@ def _grounded_allowed_ids(evidence: Sequence[object], attempts: Sequence[object]
     allowed: set[str] = set()
     items: list[object] = [*evidence, *attempts]
     for item in items:
-        if _f(item, "tool", default=None) == "set_chart_symbol":
+        if _f(item, "tool", default=None) in ("set_chart_symbol", "update_watchlist"):
             continue
         for key in ("evidence_id", "tool_result_ref", "tool_result_id"):
             value = _f(item, key, default=None)
@@ -3607,10 +3660,12 @@ async def _reasoner_expand(
 
 def _has_trusted_evidence(evidence: Sequence[object], attempts: Sequence[Mapping[str, JSONValue]]) -> bool:
     """Admitted/trusted evidence present: stored records or an in-run admission."""
-    non_chart = [item for item in evidence if _f(item, "tool", default=None) != "set_chart_symbol"]
+    non_chart = [
+        item for item in evidence if _f(item, "tool", default=None) not in ("set_chart_symbol", "update_watchlist")
+    ]
     if non_chart:
         return True
-    return any(a.get("evidence_id") and a.get("tool") != "set_chart_symbol" for a in attempts)
+    return any(a.get("evidence_id") and a.get("tool") not in ("set_chart_symbol", "update_watchlist") for a in attempts)
 
 
 def _normalize_expansion_item(item: object) -> dict[str, str] | None:
@@ -4228,7 +4283,7 @@ def _admittable_candidate(
     kernel: _Kernel,
 ) -> dict[str, object] | None:
     """Admit a candidate only when JEV permits its state and the kernel can cite its bytes."""
-    if tool == "set_chart_symbol":
+    if tool in ("set_chart_symbol", "update_watchlist"):
         return None
     if not (isinstance(ev_state, str) and ev_state in _ADMITTABLE_EVIDENCE_STATES and _f(outcome, "error") is None):
         return None
@@ -4879,7 +4934,9 @@ def _node_hooks(hooks: Mapping[str, object]) -> _Executors:
         "invoke": _callable_hook(hooks, "invoke") or execute_agent_tool,
         "to_outcome": _callable_hook(hooks, "to_outcome") or outcome_from_result,
         "select_round": _callable_hook(hooks, "select_round") or _select_round,
-        "max_rounds": max_rounds if isinstance(max_rounds, int) and max_rounds > 0 else _MAX_TOOL_ROUNDS,
+        "max_rounds": min(max_rounds, _MAX_TOOL_ROUNDS)
+        if isinstance(max_rounds, int) and max_rounds > 0
+        else _MAX_TOOL_ROUNDS,
         "deadline_at": deadline_at if isinstance(deadline_at, float) else _time.perf_counter() + _RUN_DEADLINE_S,
     }
 
@@ -5419,11 +5476,9 @@ async def _run_one_node(
     session_id: str,
     hooks: Mapping[str, object],
     kernel: _Kernel,
-    cap: asyncio.Semaphore,
 ) -> dict[str, JSONValue]:
-    """One node under the per-run 2-lane cap; Needle stays serial so more lanes never help."""
-    async with cap:
-        return await run_node(node, session_id, **{**hooks, "kernel": kernel})
+    """Start one node. Every ready node shares the gather. Seeded args skip Needle's serial lock."""
+    return await run_node(node, session_id, **{**hooks, "kernel": kernel})
 
 
 async def run(session_id: str, **hooks: object) -> dict[str, JSONValue]:
@@ -5438,13 +5493,10 @@ async def run(session_id: str, **hooks: object) -> dict[str, JSONValue]:
             return _run_failed(session_id, f"default kernel unavailable: {exc}")
     deadline_hook = hooks.get("deadline_at")
     deadline_at = deadline_hook if isinstance(deadline_hook, float) else _time.perf_counter() + _RUN_DEADLINE_S
-    # ponytail: per-run cap; a module-level Semaphore binds to the first loop and breaks
-    # the second asyncio.run request with "bound to a different event loop".
-    cap = asyncio.Semaphore(2)
     run_hooks = dict(hooks)
     run_hooks["deadline_at"] = deadline_at
     run_hooks["run_deadline_at"] = deadline_at
-    return await _session_rounds(session_id, kernel, cap, run_hooks, deadline_at)
+    return await _session_rounds(session_id, kernel, run_hooks, deadline_at)
 
 
 def _run_failed(session_id: str, error: str, nodes: list[JSONValue] | None = None) -> dict[str, JSONValue]:
@@ -5469,7 +5521,6 @@ def _ready_nodes(
 async def _session_rounds(
     session_id: str,
     kernel: _Kernel,
-    cap: asyncio.Semaphore,
     run_hooks: Mapping[str, object],
     deadline_at: float,
 ) -> dict[str, JSONValue]:
@@ -5491,10 +5542,10 @@ async def _session_rounds(
         rounds += 1
         remaining = deadline_at - _time.perf_counter()
         # ponytail: absolute emergency ceiling only; a trip is visibly incomplete, never convergence.
-        if rounds > _MAX_TOOL_ROUNDS:
-            guard_reason = f"incomplete: runtime guard ({_MAX_TOOL_ROUNDS} session rounds without convergence)"
+        if rounds > _MAX_SESSION_ROUNDS:
+            guard_reason = f"incomplete: runtime guard ({_MAX_SESSION_ROUNDS} session rounds without convergence)"
             break
-        round_results, timed_out = await _gather_round(nodes, session_id, run_hooks, kernel, cap, remaining)
+        round_results, timed_out = await _gather_round(nodes, session_id, run_hooks, kernel, remaining)
         if timed_out:
             guard_reason = "incomplete: run deadline reached during session round"
             _block_cancelled_round(kernel, session_id, nodes, guard_reason, node_results)
@@ -5511,14 +5562,13 @@ async def _gather_round(
     session_id: str,
     run_hooks: Mapping[str, object],
     kernel: _Kernel,
-    cap: asyncio.Semaphore,
     remaining: float,
 ) -> tuple[list[dict[str, JSONValue]], bool]:
     """Gather one session round under the remaining deadline; True reports a deadline timeout."""
     try:
         return (
             await asyncio.wait_for(
-                asyncio.gather(*(_run_one_node(node, session_id, run_hooks, kernel, cap) for node in nodes)),
+                asyncio.gather(*(_run_one_node(node, session_id, run_hooks, kernel) for node in nodes)),
                 timeout=max(remaining, 0.01),
             ),
             False,

@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { HarnessSessionViewer } from "./components/harness-viewer";
 import TradingChart from "./components/trading-chart";
 import {
-  WatchlistPanel,
   watchlistFor,
   FinancialsPanel,
   NewsPanel,
@@ -10,6 +9,10 @@ import {
   SessionPanel,
   JournalPanel,
 } from "./components/market-panels";
+import { WatchlistChatPanel } from "./components/watchlist-chat-panel";
+import { ThesisPanel } from "./components/thesis-panel";
+import { PortfolioPanel } from "./components/portfolio-panel";
+import { HealthDot } from "./components/health-dot";
 import { fetchQuote, searchTickers, type SearchHit } from "./lib/market-data";
 import type { AgentEvent } from "../../needle-harness/lib/agent/types";
 import { fetchJournal, fetchSnapshot, listSessions, type JournalPage, type ResearchSnapshot } from "./lib/research-client";
@@ -105,6 +108,7 @@ async function receiveAgentResponse(response: Response, push: (event: AgentEvent
 
 export default function App() {
   const [selected, setSelected] = useState("NVDA");
+  const [watchlist, setWatchlist] = useState(() => watchlistFor("NVDA"));
   const [query, setQuery] = useState("");
   const [view, setView] = useState<"terminal" | "harness">("terminal");
   const [hits, setHits] = useState<SearchHit[]>([]);
@@ -294,7 +298,7 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         // Watchlist rides as separate context; the prompt stays verbatim and the server decides scope.
-        body: JSON.stringify({ prompt, ticker: selected, watchlist: watchlistFor(selected) }),
+        body: JSON.stringify({ prompt, ticker: selected, currentChartTicker: selected, ...(watchlist.length ? { watchlist } : {}) }),
         signal: ctrl.signal,
       });
       await receiveAgentResponse(response, push, arm);
@@ -391,6 +395,7 @@ export default function App() {
             )}
           </span>
           <span style={{ display: "inline-flex", gap: 8, marginLeft: 12 }}>
+            <HealthDot />
             <button onClick={() => setView("terminal")} aria-pressed={view === "terminal"} style={{ fontSize: 14, padding: "4px 10px", borderRadius: 999, border: "1px solid rgba(255,255,255,0.12)", background: view === "terminal" ? "rgba(255,255,255,0.16)" : "transparent", color: "#E6ECF5", cursor: "pointer" }}>
               Terminal
             </button>
@@ -429,7 +434,13 @@ export default function App() {
         >
           <div style={{ overflowY: "auto", minHeight: 0, display: "flex", flexDirection: "column", gap: 8 }}>
             <div className="glass" style={{ flexShrink: 0 }}>
-              <WatchlistPanel selected={selected} onSelect={pick} />
+              <WatchlistChatPanel selected={selected} onSelect={pick} events={events} onChange={setWatchlist} />
+            </div>
+            <div className="glass" style={{ flexShrink: 0 }}>
+              <ThesisPanel onSelectTicker={pick} />
+            </div>
+            <div className="glass" style={{ flexShrink: 0 }}>
+              <PortfolioPanel onSelectTicker={pick} />
             </div>
             <div className="glass" style={{ flexShrink: 0 }}>
               <SessionPanel sessions={sessions} sessionId={sessionId} onSelect={setSessionId} snapshot={snapshot} />

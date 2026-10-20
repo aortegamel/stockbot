@@ -1,4 +1,28 @@
-import { redactArgs, type AgentEvent } from "../../../needle-harness/lib/agent/types";
+import { redactArgs, type AgentEvent, type FailureCategory } from "../../../needle-harness/lib/agent/types";
+
+const LIMIT = "The research reached its work limit before it finished.";
+const MODEL = "The model could not produce a checked answer.";
+const SOURCE = "A data source failed while answering.";
+// Prod failure text: one plain sentence per category. No raw message, stack, or tool name.
+const FAILURE_TEXT: Record<FailureCategory, string> = {
+  timeout: "The research took too long and stopped.", deadline_exceeded: "The research took too long and stopped.",
+  token_budget_exhausted: LIMIT, tool_budget_exhausted: LIMIT, job_budget_exhausted: LIMIT, wave_budget_exhausted: LIMIT,
+  parallelism_exceeded: LIMIT, depth_exceeded: LIMIT, context_capacity_exceeded: LIMIT, response_too_large: LIMIT,
+  tool_output_limit: LIMIT, duplicate_research_action: LIMIT, research_loop_detected: LIMIT,
+  policy_denied: "This request is not allowed.", policy_rejection: "This request is not allowed.",
+  tool_error: SOURCE, storage_error: SOURCE, freeze_mismatch: SOURCE,
+  model_error: MODEL, model_output_failure: MODEL, provider_error: MODEL, synthesis_failed: MODEL, committee_deadlock: MODEL,
+  no_evidence: "No evidence was found for this question.",
+};
+
+function FailureView({ text, onRetry }: { text: string; onRetry?: () => void }) {
+  return (
+    <div className="text-red-400" role="alert">
+      ✗ {text}{" "}
+      {onRetry && <button type="button" onClick={onRetry} className="rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:border-zinc-400">Try again</button>}
+    </div>
+  );
+}
 
 function conf(c: number | null): string {
   return c === null ? "n/a" : `${Math.round(c * 100)}%`;
@@ -42,7 +66,7 @@ function WorkEventView({ event }: { event: AgentEvent }) {
   }
 }
 
-export function AgentEventView({ event, debug = false }: { event: AgentEvent; debug?: boolean }) {
+export function AgentEventView({ event, debug = false, onRetry }: { event: AgentEvent; debug?: boolean; onRetry?: () => void }) {
   switch (event.type) {
     case "agent_start":
       return <div className="text-zinc-100">&gt; {event.prompt}</div>;
@@ -76,9 +100,9 @@ export function AgentEventView({ event, debug = false }: { event: AgentEvent; de
       );
     }
     case "error":
-      return <div className="text-red-400">✗ {event.message}</div>;
+      return debug ? <div className="text-red-400">✗ {event.message}</div> : <FailureView text="The connection stopped before the answer finished." onRetry={onRetry} />;
     case "failed":
-      return <div className="text-red-400">✗ {event.category}: {event.message}</div>;
+      return debug ? <div className="text-red-400">✗ {event.category}: {event.message}</div> : <FailureView text={FAILURE_TEXT[event.category] ?? MODEL} onRetry={onRetry} />;
     default:
       return <WorkEventView event={event} />;
   }

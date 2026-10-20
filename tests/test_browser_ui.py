@@ -92,6 +92,14 @@ FILINGS: dict[str, dict[str, object]] = {
 }
 WATCH_DEFAULTS = ["NVDA", "AAPL", "MSFT", "TSLA", "SPY", "QQQ", "AMZN", "META", "GOOG"]
 SOURCES = ["sec_filings", "finra_short_interest", "finra_short_sale_volume", "finra_threshold_list"]
+CHART_PROMPT = "Show the AMD chart"
+CITATION_PROMPT = "Cite the fixture source inline"
+WATCHLIST_PROMPT = "Add AMD to my watchlist"
+FIXTURE_SOURCE_PATH = "/fixture/source-doc"
+
+
+def sse(*frames: dict[str, object]) -> bytes:
+    return b"".join(b"data: " + json.dumps(frame).encode() + b"\n\n" for frame in frames)
 
 
 def watchlist_rows(symbols: list[str]) -> list[dict[str, object]]:
@@ -131,6 +139,14 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
 
     class Provider(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
+            if urlsplit(self.path).path == FIXTURE_SOURCE_PATH:
+                page = b'<html><head><link rel="icon" href="data:,"></head><body><h1>Fixture source document</h1><p>Revenue grew in the fixture year.</p></body></html>'
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+                return
             url = urlsplit(self.path)
             query = parse_qs(url.query)
             sym = query.get("sym", ["NVDA"])[0]
@@ -166,6 +182,9 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
                 "/api/watchlist": {"watchlist": watchlist_rows(query.get("symbols", [""])[0].split(","))},
                 f"/api/research/sources/{quote(SOURCE_ID, safe='')}": SOURCE,
             }
+            port = server.server_port
+            if url.path == f"/api/research/sources/{quote(SOURCE_ID, safe='')}":
+                bodies[url.path] = {**SOURCE, "url": f"http://127.0.0.1:{port}{FIXTURE_SOURCE_PATH}"}
             if url.path == "/api/watchlist":
                 watch.put(query.get("symbols", [""])[0])
             if url.path not in bodies:
@@ -185,8 +204,43 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
                 unknown.put(self.path)
                 self.send_error(500, "The browser test has no fixture for this route.")
                 return
-            requests.put(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
-            body = STREAM
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.put(payload)
+            prompt = payload.get("prompt") if isinstance(payload, dict) else None
+            if prompt == CHART_PROMPT:
+                body = sse(
+                    {"type": "reasoning_start", "model": "stockbot"},
+                    {"type": "chart_update", "ticker": "AMD"},
+                    {"type": "answer_delta", "text": "Chart moved to AMD."},
+                    {"type": "done", "metrics": METRICS},
+                )
+            elif prompt == CITATION_PROMPT:
+                origin = f"http://127.0.0.1:{server.server_port}"
+                body = sse(
+                    {"type": "reasoning_start", "model": "stockbot"},
+                    {
+                        "type": "evidence",
+                        "evidence": [
+                            {
+                                "id": "ev:fixture",
+                                "source": "sec",
+                                "retrievedAt": "2026-10-10T00:00:00Z",
+                                "content": "",
+                                "sources": [{"id": SOURCE_ID, "title": "10-K", "url": origin + FIXTURE_SOURCE_PATH}],
+                            }
+                        ],
+                    },
+                    {"type": "answer_delta", "text": "Revenue grew [ev:fixture] this year."},
+                    {"type": "done", "metrics": METRICS},
+                )
+            elif prompt == WATCHLIST_PROMPT:
+                body = sse(
+                    {"type": "watchlist_update", "action": "add", "ticker": "AMD"},
+                    {"type": "answer_delta", "text": "Added AMD to your watchlist."},
+                    {"type": "done", "metrics": METRICS},
+                )
+            else:
+                body = STREAM
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Content-Length", str(len(body)))
@@ -481,3 +535,52 @@ def test_filings_panel_shows_fund_filing_date_and_provider_error(browser: webdri
     orcl = (By.XPATH, "//div[normalize-space()='FILINGS · ORCL']/..")
     wait.until(EC.text_to_be_present_in_element(orcl, "filings unavailable: HTTP Error 503"))
     assert "no SEC filings found" not in browser.find_element(*orcl).text
+
+
+def send_chat(browser: webdriver.Chrome, local_ui: UI, prompt: str) -> None:
+    while not local_ui[1].empty():
+        local_ui[1].get_nowait()
+    WebDriverWait(browser, 10).until(EC.element_to_be_clickable(AGENT_INPUT)).send_keys(prompt)
+    browser.find_element(*SEND).click()
+    request = local_ui[1].get(timeout=10)
+    assert isinstance(request, dict) and request["prompt"] == prompt
+
+
+def test_chat_chart_update_moves_chart_to_amd(browser: webdriver.Chrome, local_ui: UI) -> None:
+    wait = WebDriverWait(browser, 10)
+    send_chat(browser, local_ui, CHART_PROMPT)
+    wait.until(EC.text_to_be_present_in_element((By.CSS_SELECTOR, "footer > span:last-child"), "AMD"))
+    assert browser.find_element(By.CSS_SELECTOR, 'iframe[title="AMD TradingView chart"]')
+    assert "AGENT · viewing AMD" in browser.find_element(By.CSS_SELECTOR, "main").text
+
+
+def test_chat_citation_opens_fixture_source_in_new_tab(browser: webdriver.Chrome, local_ui: UI) -> None:
+    wait = WebDriverWait(browser, 10)
+    send_chat(browser, local_ui, CITATION_PROMPT)
+    citation = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'a[aria-label="Open source for ev:fixture"]')))
+    assert citation.text == "[ev:fixture]"
+    href = citation.get_attribute("href") or ""
+    assert FIXTURE_SOURCE_PATH in href and href.startswith("http://127.0.0.1:")
+    original = browser.current_window_handle
+    tabs_before = set(browser.window_handles)
+    citation.click()
+    wait.until(lambda _: len(set(browser.window_handles) - tabs_before) == 1)
+    new_tab = (set(browser.window_handles) - tabs_before).pop()
+    browser.switch_to.window(new_tab)
+    try:
+        wait.until(EC.url_contains(FIXTURE_SOURCE_PATH))
+        assert "Fixture source document" in browser.page_source
+    finally:
+        browser.close()
+        browser.switch_to.window(original)
+    assert browser.current_window_handle == original
+    assert FIXTURE_SOURCE_PATH not in browser.current_url
+
+
+def test_chat_watchlist_update_shows_amd_without_moving_chart(browser: webdriver.Chrome, local_ui: UI) -> None:
+    wait = WebDriverWait(browser, 10)
+    wait.until(lambda b: "SEC" in sources_text(b, "GOOG"))
+    send_chat(browser, local_ui, WATCHLIST_PROMPT)
+    wait.until(lambda b: "AMD" in b.find_element(By.XPATH, "//div[normalize-space()='WATCHLIST · DELAYED']/..").text)
+    assert browser.find_element(By.XPATH, "//button[b='AMD']")
+    wait.until(EC.text_to_be_present_in_element((By.CSS_SELECTOR, "footer > span:last-child"), "NVDA"))

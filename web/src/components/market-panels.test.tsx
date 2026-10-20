@@ -14,6 +14,8 @@ import {
   watchlistFor,
 } from "./market-panels";
 import type { JournalPage } from "../lib/research-client";
+import { WatchlistChatPanel } from "./watchlist-chat-panel";
+import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
 
 // react-dom reads canUseDOM once at module load, so it must load after the jsdom globals
 // exist. A static import runs before this module body, so this one import stays dynamic.
@@ -79,6 +81,30 @@ function expectScrollable(root: HTMLElement): void {
   expect(computed.overflowY).toBe("auto");
   expect(computed.height).toBe("100%");
 }
+
+describe("WatchlistChatPanel", () => {
+  test("applies add/remove once, preserves the chart, and reports the actual list", async () => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => String(input).startsWith("/api/watchlist")
+      ? Response.json({ watchlist: [] }) : Response.json({ price: null })) as unknown as typeof fetch;
+    let actual: string[] = [];
+    const onChange = (symbols: string[]) => { actual = symbols; };
+    const onSelect = () => { throw new Error("A watchlist update must not select the chart."); };
+    const add: AgentEvent = { type: "watchlist_update", action: "add", ticker: "AMD" };
+    const remove: AgentEvent = { type: "watchlist_update", action: "remove", ticker: "AAPL" };
+    const root = await mount(<WatchlistChatPanel selected="NVDA" onSelect={onSelect} events={[add, remove]} onChange={onChange} />);
+    await until(() => actual.includes("AMD") && !actual.includes("AAPL"));
+    expect(root.querySelectorAll("b").length).toBe(9);
+    expect(root.textContent).toContain("A dash means unavailable");
+    const removeAmd: AgentEvent = { type: "watchlist_update", action: "remove", ticker: "AMD" };
+    await rerender(<WatchlistChatPanel selected="NVDA" onSelect={onSelect} events={[add, remove, removeAmd]} onChange={onChange} />);
+    await until(() => !actual.includes("AMD"));
+    await rerender(<WatchlistChatPanel selected="NVDA" onSelect={onSelect} events={[add]} onChange={onChange} />);
+    expect(actual).not.toContain("AMD");
+    await rerender(<WatchlistChatPanel selected="ORCL" onSelect={onSelect} events={[]} onChange={onChange} />);
+    await until(() => actual[0] === "ORCL");
+    expect(actual).not.toContain("AAPL");
+  });
+});
 
 describe("WatchlistPanel", () => {
   test("keeps default order, adds only an extra selection, and renders quote and source outcomes", async () => {

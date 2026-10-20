@@ -1362,7 +1362,7 @@ def _assess_text(prompt: object, tool: object) -> str:
 
 
 def _assess_options() -> tuple[list[dict[str, JSONValue]], dict[str, str]]:
-    """Post-tool route options exclude the independent chart action."""
+    """Post-tool route options exclude the independent chart and watchlist UI actions."""
     reg = _auto_registry()
     if not reg:
         raise ValueError("assess_entry_tool: empty registry")
@@ -1371,6 +1371,7 @@ def _assess_options() -> tuple[list[dict[str, JSONValue]], dict[str, str]]:
         options[RESOLVED_SENTINEL] = _SENTINEL_DESCRIPTIONS[RESOLVED_SENTINEL]
     _registry_options(reg, options, "assess_entry_tool")
     options.pop("set_chart_symbol", None)
+    options.pop("update_watchlist", None)
     return reg, options
 
 

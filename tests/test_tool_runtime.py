@@ -726,6 +726,45 @@ def test_success_meta_withholds_invalid_chart_selection(name: str, status: str, 
     assert "chart_selection" not in out
 
 
+def test_execute_watchlist_returns_normalized_receipt_meta(tmp_path: Path) -> None:
+    out = execute_agent_tool(
+        "update_watchlist",
+        {"action": "add", "ticker": " amd "},
+        RuntimeToolSession(session_id="gw-watch"),
+        data_root=tmp_path,
+    )
+
+    meta = out["meta"]
+    assert isinstance(meta, dict) and meta["status"] == "completed"
+    assert meta["watchlist_update"] == {"result_type": "watchlist_update", "action": "add", "ticker": "AMD"}
+    assert "chart_selection" not in meta
+
+
+@pytest.mark.parametrize(
+    ("name", "status", "result"),
+    [
+        pytest.param("get_current_time", "completed", {"result_type": "watchlist_update"}, id="other-tool"),
+        pytest.param("update_watchlist", "failed", {}, id="failed"),
+        pytest.param("update_watchlist", "completed", {"result_type": "chart_selection"}, id="wrong-result-type"),
+        pytest.param(
+            "update_watchlist", "completed", {"result_type": "watchlist_update", "action": "clear"}, id="action"
+        ),
+        pytest.param(
+            "update_watchlist", "completed", {"result_type": "watchlist_update", "ticker": "AMD!"}, id="ticker"
+        ),
+        pytest.param("update_watchlist", "completed", {"result_type": "watchlist_update", "ticker": ""}, id="blank"),
+        pytest.param("update_watchlist", "completed", {"result_type": "watchlist_update", "error": None}, id="error"),
+    ],
+)
+def test_success_meta_withholds_invalid_watchlist_receipt(name: str, status: str, result: dict[str, object]) -> None:
+    from app.security.context_gateway import envelope_for_tool
+
+    receipt: dict[str, object] = {"result_type": "watchlist_update", "action": "add", "ticker": "AMD", **result}
+    out = rt._success_meta(name, receipt, rt._tool_result_meta(receipt), envelope_for_tool(name, receipt), status)
+
+    assert "watchlist_update" not in out
+
+
 def test_success_meta_copies_discovery_names_and_paging_fields_only() -> None:
     from app.security.context_gateway import envelope_for_tool
 

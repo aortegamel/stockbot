@@ -90,6 +90,15 @@ A successful canonical research invocation emits the same event through validate
 Production SSE retains `chart_update` while ordinary progress remains redacted.
 The API does not infer chart actions from tool previews or answer prose.
 
+Chat can select `update_watchlist` for a local add or remove request.
+Needle generates `action` and `ticker`. The canonical tool validates both fields.
+The bridge preserves its structured `watchlist_update` receipt.
+The route emits `{type:"watchlist_update", action, ticker}` only after canonical success.
+The receipt supplies no factual evidence. The route answers without research or an assessment call.
+`WatchlistChatPanel` applies each event once and keeps the list for the mounted terminal.
+It preserves the existing page-load source requests and their 15-second budget.
+The component requires App integration. The default `WatchlistPanel` behavior does not change.
+
 ### Captured evidence
 
 Answer citations open the original page in a new tab when the source supplies a safe HTTP or HTTPS URL.

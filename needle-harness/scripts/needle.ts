@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fingerprintKey, loadDotenvAuthoritative } from "../lib/env";
 import { pickFreePort } from "../lib/port";
@@ -297,6 +297,13 @@ if (import.meta.main) {
     detached: true,
   });
   owned.add(market);
+  if (process.env.STOCKBOT_THESIS_MONITOR === "1") {
+    const thesisRoot = resolve(ROOT_DIR, process.env.STOCKBOT_DATA_DIR ?? "data", "thesis");
+    for (const d of existsSync(thesisRoot) ? readdirSync(thesisRoot, { withFileTypes: true }) : []) {
+      if (!d.isDirectory()) continue;
+      owned.add(spawn(REPO_PYTHON, ["cli.py", "thesis", "monitor", d.name, "--interval-seconds", "900"], { cwd: ROOT_DIR, stdio: "inherit", env: childEnv, detached: true }));
+    }
+  }
   const web = spawn("bun", ["x", "vite", "--host", "0.0.0.0", "--port", PORT, "--strictPort"], {
     cwd: WEB_DIR,
     stdio: "inherit",

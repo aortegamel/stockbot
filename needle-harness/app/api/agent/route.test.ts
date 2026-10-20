@@ -28,6 +28,7 @@ let toolFailure: { category: string; error: string } | null = null;
 let toolThrows: unknown = null;
 let endThrows = false;
 let chartReceipt: unknown = { result_type: "chart_selection", ticker: "MSFT" };
+let watchlistReceipt: unknown = { result_type: "watchlist_update", action: "add", ticker: "AMD" };
 let emitChartUpdate = false;
 const executionOrder: string[] = [];
 const runCalls: unknown[][] = [];
@@ -131,6 +132,7 @@ mock.module("@/lib/tools/stockbot", () => ({
     if (toolThrows !== null) throw toolThrows;
     if (toolFailure !== null) return { ok: false, ...toolFailure };
     if (name === "set_chart_symbol") return { ok: true, chartSelection: chartReceipt, evidence: { ...bridgeEvidence, content: "ticker: MSFT\nresult_type: chart_selection" } };
+    if (name === "update_watchlist") return { ok: true, watchlistUpdate: watchlistReceipt, evidence: { ...bridgeEvidence, content: "action: add\nticker: AMD" } };
     return { ok: true, evidence: { ...bridgeEvidence, source: name } };
   },
   newSessionId: () => {
@@ -162,6 +164,7 @@ function reset(): void {
   toolThrows = null;
   endThrows = false;
   chartReceipt = { result_type: "chart_selection", ticker: "MSFT" };
+  watchlistReceipt = { result_type: "watchlist_update", action: "add", ticker: "AMD" };
   emitChartUpdate = false;
   emitOffer = false;
   personaCalls.length = 0;
@@ -1159,5 +1162,60 @@ describe("agent entry route", () => {
     const events = await eventsFor("filing facts?");
     expect(events.map((e) => e.type)).toEqual(["evidence", "answer_delta", "offer_trio"]);
     expect(events.at(-1)).toEqual({ type: "offer_trio", sessionId: "rs:test" });
+  });
+});
+
+describe("watchlist chat action", () => {
+  test("a validated receipt emits watchlist_update and answers without evidence, reasoning, or research", async () => {
+    for (const [action, text] of [["add", "Added AMD to your watchlist."], ["remove", "Removed AMD from your watchlist."]] as const) {
+      reset();
+      delete process.env.STOCKBOT_DEBUG;
+      winner = "update_watchlist";
+      watchlistReceipt = { result_type: "watchlist_update", action, ticker: "AMD" };
+      argsReply = { tool: "update_watchlist", arguments: { action, ticker: "amd" }, confidence: 1 };
+      const prompt = `${action} AMD to my watchlist`;
+      const events = await eventsFor(prompt, "NVDA", ["NVDA", "AAPL"]);
+      expect(events.slice(0, 3)).toEqual([
+        { type: "agent_start", prompt },
+        { type: "watchlist_update", action, ticker: "AMD" },
+        { type: "answer_delta", text },
+      ]);
+      expect(events.at(-1)?.type).toBe("done");
+      expect(invoked).toEqual([["update_watchlist", { action, ticker: "amd" }, "sess-test"]]);
+      expect(ended).toEqual(["sess-test"]);
+      expect(events.some((event) => event.type === "evidence")).toBe(false);
+      expect(reasonCalls).toEqual([]);
+      expect(runCalls).toEqual([]);
+      expect(kernelCalls.map((call) => call.op)).toEqual(["route", "arguments"]);
+    }
+  });
+
+  test("failed tools, malformed receipts, and failed arguments answer visibly without an update or research", async () => {
+    for (const failure of ["returned", "missing", "kind", "action", "ticker", "args"]) {
+      reset();
+      winner = "update_watchlist";
+      if (failure === "returned") toolFailure = { category: "tool_error", error: "tool failed" };
+      if (failure === "missing") watchlistReceipt = undefined;
+      if (failure === "kind") watchlistReceipt = { result_type: "chart_selection", action: "add", ticker: "AMD" };
+      if (failure === "action") watchlistReceipt = { result_type: "watchlist_update", action: "clear", ticker: "AMD" };
+      if (failure === "ticker") watchlistReceipt = { result_type: "watchlist_update", action: "add", ticker: "amd" };
+      if (failure === "args") argsDown = true;
+      const events = await eventsFor("add AMD to my watchlist", "NVDA");
+      expect(events.some((event) => event.type === "watchlist_update")).toBe(false);
+      expect(String(events.find((event) => event.type === "answer_delta")?.text)).toContain("Watchlist update failed:");
+      expect(events.at(-1)?.type).toBe("done");
+      expect(invoked).toHaveLength(failure === "args" ? 0 : 1);
+      expect(runCalls).toEqual([]);
+      expect(reasonCalls).toEqual([]);
+    }
+  });
+
+  test("post-tool assessment cannot chain into the watchlist action", async () => {
+    reset();
+    winner = "get_sec_document";
+    verdicts = ["update_watchlist"];
+    await eventsFor("Microsoft risk factors?", "MSFT");
+    expect(invoked.map((call) => call[0])).toEqual(["get_sec_document"]);
+    expect(runCalls).toHaveLength(1);
   });
 });

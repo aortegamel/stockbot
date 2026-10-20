@@ -108,6 +108,95 @@ def test_route_fast_path_marks_research():
 
 
 @pytest.mark.parametrize(
+    "prompt",
+    [
+        "Create a thesis for NVDA: AI datacenter demand stays strong.",
+        "Please create a new thesis for Nvidia: revenue grows through 2027.",
+        "CREATE THESIS: cloud demand remains durable.",
+        "Can you create a thesis for NVDA: AI demand grows?",
+    ],
+)
+def test_thesis_create_enters_research_without_subject_resolution(prompt: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Research keeps the thesis result in the session that offers the trio."""
+
+    def _no_subject(prompt: object) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "_objective_ticker", _no_subject)
+    monkeypatch.setattr(scheduler, "_objective_company", _no_subject)
+    assert programmatic_route(prompt) == "research_required"
+
+
+@pytest.mark.parametrize("prompt", ["Refine my thesis", "Please refine thesis t:nvda: margins improve."])
+def test_thesis_refine_keeps_the_research_snapshot(prompt: str) -> None:
+    assert programmatic_route(prompt) == "research_required"
+
+
+def test_thesis_create_selects_once_across_session_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A shared objective never deterministically creates twice, including a pass-2 gap."""
+    from app.research import programmatic_router as router
+
+    monkeypatch.setattr(router, "_THESIS_CREATED", set())
+    fallback: list[str] = []
+
+    async def _fallback(*args: object) -> tuple[str, ToolDecision]:
+        fallback.append(str(args[3]))
+        return "reason", ToolDecision(action="reason", probabilities={})
+
+    monkeypatch.setattr(scheduler, "_select_round", _fallback)
+    objective = "Create a thesis for NVDA: AI datacenter revenue grows."
+    kernel = _Kernel()
+
+    def select(sid: str, nid: str, registry: list[dict[str, JSONValue]]) -> tuple[str, ToolDecision]:
+        return asyncio.run(
+            programmatic_select_round(
+                _BoomJev(),
+                kernel,
+                sid,
+                nid,
+                {"objective": objective},
+                _node("What supports this investment view?"),
+                registry,
+                [],
+                [],
+            )
+        )
+
+    registry: list[dict[str, JSONValue]] = [{"name": "thesis_create"}, {"name": "thesis_refine"}]
+    assert select("rs:create", "unavailable", [{"name": "thesis_refine"}])[0] == "reason"
+    action, decision = select("rs:create", "n1", registry)
+    assert (action, decision.tool_name) == ("invoke", "thesis_create")
+    assert select("rs:create", "n2", registry)[0] == "reason"
+    assert select("rs:create", "gap", registry)[0] == "reason"
+    assert select("rs:other", "n1", registry)[1].tool_name == "thesis_create"
+    assert fallback == ["unavailable", "n2", "gap"]
+    assert kernel.recorded == [("tool_selection", "thesis_create"), ("tool_selection", "thesis_create")]
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Show my thesis",
+        "Recreate the thesis",
+        "Create a chart",
+        "Do not create a thesis",
+        "How do I create a thesis?",
+    ],
+)
+def test_other_intents_do_not_create_thesis(prompt: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _no_subject(prompt: object) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "_objective_ticker", _no_subject)
+    monkeypatch.setattr(scheduler, "_objective_company", _no_subject)
+    norm, _ = _signals(prompt)
+    from app.research.programmatic_router import _THESIS_CREATE_RE
+
+    assert _THESIS_CREATE_RE.search(norm) is None
+    assert programmatic_route(prompt) is None
+
+
+@pytest.mark.parametrize(
     ("prompt", "expected", "expected_requests"),
     [
         ("What drove NVDA revenue last quarter?", "research_required", ["NVDA"]),
@@ -132,7 +221,7 @@ def test_route_resolves_only_required_tickers(
 
 
 def test_route_clock_and_advice_fast_paths(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Clock asks single-shot; pure advice answers direct; mixed/insider asks research."""
+    """Clock asks single-shot; pure advice answers direct; mixed advice asks research; single-intent insider single-shots."""
     import app.tools as _tools
 
     def _resolve(name: str) -> str | None:
@@ -146,7 +235,62 @@ def test_route_clock_and_advice_fast_paths(monkeypatch: pytest.MonkeyPatch) -> N
     assert programmatic_route("what time is it") == "get_current_time"
     assert programmatic_route("should I buy NVDA") == "reasoning_required"
     assert programmatic_route("should I buy NVDA after its Q3 revenue") == "research_required"
-    assert programmatic_route("did NVDA insiders sell") == "research_required"
+    assert programmatic_route("did NVDA insiders sell") == "get_insider_activity"
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        ("NVDA risk factors?", "list_sec_filings"),
+        ("AAPL insider sales last quarter?", "get_insider_activity"),
+        ("GME short interest?", "get_short_interest"),
+        ("MSFT latest quarterly revenue?", "list_sec_filings"),
+    ],
+)
+def test_single_intent_ticker_prompts_run_single_shot(
+    prompt: str, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One ticker plus one intent anchor routes to the tool answerSingleShot runs."""
+    import app.tools as _tools
+
+    def _resolve(name: str) -> str | None:
+        return {"NVDA": "NVDA", "AAPL": "AAPL", "GME": "GME", "MSFT": "MSFT"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
+    assert programmatic_route(prompt) == expected
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "GME short interest and insider sales?",
+        "NVDA and AMD short interest?",
+        "Why is GME short interest rising?",
+        "NVDA risk factors and revenue?",
+        "What drove NVDA revenue last quarter?",
+        "should I buy NVDA after insider sales",
+    ],
+)
+def test_ambiguous_or_multi_intent_prompts_stay_on_research(prompt: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Multiple anchors, extra words, or mixed advice never take the single-shot path."""
+    import app.tools as _tools
+
+    def _resolve(name: str) -> str | None:
+        return {"NVDA": "NVDA", "AAPL": "AAPL", "GME": "GME", "MSFT": "MSFT", "AMD": "AMD"}.get(name)
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
+    assert programmatic_route(prompt) == "research_required"
+
+
+def test_caller_ticker_grounds_single_intent_short_ask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tickerless short ask with a caller ticker still single-shots."""
+    import app.tools as _tools
+
+    def _resolve(_name: str) -> str | None:
+        return None
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
+    assert programmatic_route("short interest?", ticker="GME") == "get_short_interest"
 
 
 @pytest.mark.parametrize(
@@ -1045,3 +1189,14 @@ def test_prop_pick_is_deterministic_and_membership_gated(text: str) -> None:
         assert pick == _router_pick(text, norm, toks, names, ranked, [], [])
         assert pick is None or (pick[0] in names and bool(pick[1]))
         assert _router_pick(text, norm, toks, set(), [], [], []) is None
+
+
+@pytest.mark.parametrize(
+    "prompt", ["add AMD to my watchlist", "Remove AAPL from my watch-list", "add Apple to my watch list"]
+)
+def test_watchlist_mutation_keeps_jev_entry_selection(prompt: str) -> None:
+    assert programmatic_route(prompt, ticker="NVDA") is None
+
+
+def test_watchlist_research_keeps_the_ticker_research_hint() -> None:
+    assert programmatic_route("Summarize my watchlist", ticker="NVDA") == "research_required"

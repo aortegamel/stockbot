@@ -111,7 +111,7 @@ export type FinalPersonaResult = {
 export const FINAL_PERSONAS = ["stockbot", "bearbot", "bullbot"] as const;
 export type Persona = (typeof FINAL_PERSONAS)[number];
 
-export type ToolResult = { ok: true; evidence: Evidence; chartSelection?: unknown } | { ok: false; error: string; category: FailureCategory; retryable: boolean };
+export type ToolResult = { ok: true; evidence: Evidence; chartSelection?: unknown; watchlistUpdate?: unknown } | { ok: false; error: string; category: FailureCategory; retryable: boolean };
 
 export type Tool = {
   description: string;
@@ -122,6 +122,7 @@ export type Tool = {
 export type AgentEvent =
   | { type: "agent_start"; prompt: string }
   | { type: "chart_update"; ticker: string }
+  | { type: "watchlist_update"; action: "add" | "remove"; ticker: string }
   | { type: "needle_decision"; step: number; tool: string | null; arguments: Record<string, unknown>; confidence: number | null }
   | { type: "tool_start"; tool: string }
   | { type: "tool_result"; tool: string; evidenceId?: string; preview: string }

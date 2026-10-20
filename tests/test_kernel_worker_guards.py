@@ -2834,25 +2834,25 @@ def test_jev_kept_keeps_everything_but_an_explicit_reject() -> None:
 @pytest.mark.parametrize(
     ("hints", "queries", "identifiers", "reasoner_calls"),
     [
-        ({}, ["What is happening with Oracle now"], ["ORCL"], 1),
-        ({"corrected_query": "fixed"}, ["What is happening with Oracle now"], ["ORCL"], 1),
-        ({"tickers": "NVDA"}, ["What is happening with Oracle now"], ["ORCL"], 1),
-        ({"tickers": ["NVDA"]}, ["What is happening with Oracle now"], ["ORCL", "NVDA"], 1),
+        ({}, ["ORACLE ORCL What is happening with Oracle now"], ["ORCL"], 1),
+        ({"corrected_query": "fixed"}, ["ORACLE ORCL What is happening with Oracle now"], ["ORCL"], 1),
+        ({"tickers": "NVDA"}, ["ORACLE ORCL What is happening with Oracle now"], ["ORCL"], 1),
+        ({"tickers": ["NVDA"]}, ["ORACLE ORCL What is happening with Oracle now"], ["ORCL", "NVDA"], 1),
         (
             {"tickers": ["orcl", "ORCL", 7, " ", "nvda", "nvda"], "corrected_query": " fixed "},
-            ["What is happening with Oracle now", "fixed"],
+            ["ORACLE ORCL What is happening with Oracle now", "fixed"],
             ["ORCL", "NVDA"],
             2,
         ),
         (
             {"tickers": ["NVDA"], "corrected_query": "What is happening with Oracle now"},
-            ["What is happening with Oracle now"],
+            ["ORACLE ORCL What is happening with Oracle now", "What is happening with Oracle now"],
             ["ORCL", "NVDA"],
             2,
         ),
         (
             {"tickers": ["NVDA"], "corrected_query": " "},
-            ["What is happening with Oracle now"],
+            ["ORACLE ORCL What is happening with Oracle now"],
             ["ORCL", "NVDA"],
             2,
         ),

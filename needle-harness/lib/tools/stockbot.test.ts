@@ -156,6 +156,22 @@ describe("stockbot bridge chart metadata", () => {
     expect(result.ok).toBe(false);
     expect(result).not.toHaveProperty("chartSelection");
   });
+
+  test("the watchlist tool preserves a valid receipt and rejects malformed or foreign ones", async () => {
+    const update = { result_type: "watchlist_update", action: "remove", ticker: "AMD" };
+    reply = { content: "Watchlist updated.", meta: { watchlist_update: update } };
+    const result = await invoke("update_watchlist", {}, "watch-test");
+    if (!result.ok) throw new Error(result.error);
+    expect(result.watchlistUpdate).toEqual(update);
+    for (const bad of [null, [], { ...update, action: "clear" }, { ...update, ticker: "amd" }, { ...update, extra: 1 }, { action: "add", ticker: "AMD" }]) {
+      reply = { content: "Watchlist updated.", meta: { watchlist_update: bad } };
+      expect(await invoke("update_watchlist", {}, "watch-test")).not.toHaveProperty("watchlistUpdate");
+    }
+    reply = { content: "Watchlist updated.", meta: { watchlist_update: update } };
+    expect(await invoke("set_chart_symbol", {}, "watch-test")).not.toHaveProperty("watchlistUpdate");
+    reply = { error: "tool failed", meta: { watchlist_update: update } };
+    expect(await invoke("update_watchlist", {}, "watch-test")).not.toHaveProperty("watchlistUpdate");
+  });
 });
 
 describe("categorizeFailure ordered rules", () => {

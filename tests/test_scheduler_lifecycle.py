@@ -834,7 +834,7 @@ def test_session_ceiling_yields_incomplete_guard() -> None:
 
     with (
         mock.patch.object(sched, "run_node", trip),
-        mock.patch.object(sched, "_MAX_TOOL_ROUNDS", 0),
+        mock.patch.object(sched, "_MAX_SESSION_ROUNDS", 0),
     ):
         out = asyncio.run(sched.run("s1", kernel=_KS(), repo=None))
     assert "runtime guard" in str(out["reason"])
@@ -1893,7 +1893,8 @@ def test_search_web_fallback_uses_node_question_once(failure: str, question: str
             generate,
             "search_web",
             [],
-            {"session_id": "s1", "objective": "Explain the full investment thesis."},
+            # A cutoff requires generation instead of the undated seed.
+            {"session_id": "s1", "objective": "Explain the full investment thesis.", "as_of": "2026-01-01"},
             node,
             [],
             [],
@@ -1952,7 +1953,7 @@ def test_search_web_fallback_preserves_other_generation_errors(tool_name: str, m
                 generate,
                 tool_name,
                 [],
-                {"session_id": "s1", "objective": "Read NVDA filing history."},
+                {"session_id": "s1", "objective": "Read NVDA filing history.", "as_of": "2026-01-01"},
                 _node(),
                 [],
                 [],
@@ -3870,7 +3871,7 @@ def test_sec_pool_caps_concurrency_at_four() -> None:
 
 
 def test_session_run_survives_second_event_loop() -> None:
-    """Two asyncio.run sessions with 3 contending nodes; loop-bound cap would fail run 2 (bug 2)."""
+    """Two asyncio.run sessions with three ready nodes complete independently."""
     from unittest import mock
 
     class _KS(_Kernel):
@@ -3886,7 +3887,7 @@ def test_session_run_survives_second_event_loop() -> None:
             return [_node(f"n{i}", session_id) for i in range(3)]
 
     async def done(n: ResearchNode, sid: str, **kw: object) -> dict[str, JSONValue]:
-        await asyncio.sleep(0)  # yield so the 3rd node actually waits on the 2-lane cap
+        await asyncio.sleep(0)  # Allow the other ready nodes to start.
         return {
             "node_id": n.node_id,
             "status": "resolved",
@@ -4201,7 +4202,7 @@ def test_duplicate_guard_uses_full_history_beyond_generation_window() -> None:
     out = asyncio.run(
         sched._attempt_tool(
             tool_name="search_web",
-            node=_node(),
+            node=dataclasses.replace(_node(), question="NVDA revenue 0"),
             session={"session_id": "s1", "objective": "NVDA revenue"},
             registry=[],
             evidence=[],
@@ -4431,7 +4432,7 @@ def test_duplicate_call_reselects() -> None:
     out = asyncio.run(
         sched._attempt_tool(
             tool_name="search_web",
-            node=_node(),
+            node=dataclasses.replace(_node(), question="q"),
             session={"session_id": "s1", "objective": "q"},
             registry=[],
             evidence=[],
@@ -4498,7 +4499,7 @@ def test_no_new_evidence_stops_after_two() -> None:
     out = asyncio.run(
         sched._drive_rounds(
             _node(),
-            {"session_id": "s1", "objective": "o"},
+            {"session_id": "s1", "objective": "o", "as_of": "2026-01-01"},
             [{"name": "search_web"}],
             kernel,
             _J(),
@@ -4619,7 +4620,6 @@ def test_mid_round_timeout_blocks_each_node() -> None:
         session_id: str,
         hooks: Mapping[str, object],
         kernel: sched._Kernel,
-        cap: asyncio.Semaphore,
     ) -> dict[str, JSONValue]:
         await asyncio.sleep(60)
         return {"node_id": "?", "status": "resolved"}
@@ -4637,7 +4637,9 @@ def test_mid_round_timeout_blocks_each_node() -> None:
     assert sorted(blocked) == [("s1", nid, out["reason"]) for nid in ("n1", "n2")]
 
 
-@pytest.mark.parametrize(("cap", "expected"), [(None, 5), (2, 2)], ids=["default", "caller-cap"])
+@pytest.mark.parametrize(
+    ("cap", "expected"), [(None, 3), (2, 2), (4, 3)], ids=["default", "caller-cap", "hook-above-cap-clamps"]
+)
 def test_node_round_limit_blocks_even_when_each_round_admits(cap: int | None, expected: int) -> None:
     calls = 0
 
@@ -4952,7 +4954,7 @@ def test_sync_kwargs_generate_does_not_freeze_deadline() -> None:
             sched._attempt_tool(
                 tool_name="search_web",
                 node=_node(),
-                session={"session_id": "s1", "objective": "q"},
+                session={"session_id": "s1", "objective": "q", "as_of": "2026-01-01"},
                 registry=[{"name": "search_web", "parameters": {}}],
                 evidence=[],
                 attempts=[],
@@ -5001,7 +5003,7 @@ def test_sync_dict_generate_does_not_freeze_deadline() -> None:
             sched._attempt_tool(
                 tool_name="search_web",
                 node=_node(),
-                session={"session_id": "s1", "objective": "q"},
+                session={"session_id": "s1", "objective": "q", "as_of": "2026-01-01"},
                 registry=[{"name": "search_web", "parameters": {}}],
                 evidence=[],
                 attempts=[],
@@ -5039,7 +5041,7 @@ def test_async_dict_generate_stays_supported() -> None:
             async_gen,
             "search_web",
             [{"name": "search_web", "parameters": {}}],
-            {"session_id": "s1", "objective": "q"},
+            {"session_id": "s1", "objective": "q", "as_of": "2026-01-01"},
             _node(),
             [],
             [],
@@ -5065,7 +5067,7 @@ def test_sync_wrapper_returning_coroutine_stays_supported() -> None:
             wrapper,
             "search_web",
             [{"name": "search_web", "parameters": {}}],
-            {"session_id": "s1", "objective": "q"},
+            {"session_id": "s1", "objective": "q", "as_of": "2026-01-01"},
             _node(),
             [],
             [],
@@ -5340,6 +5342,7 @@ def test_needle_context_carries_ticker_scope_grounded_without_evidence(
         "session_id": "s1",
         "objective": "What is ORCL's filing history?",
         "ticker": "ORCL",
+        "as_of": "2026-01-01",
         "temporal_scope": {"mode": "latest-available", "raw": "private scope text", "as_of": None},
     }
     registry: list[dict[str, JSONValue]] = [
@@ -7724,7 +7727,7 @@ def test_sched_session_round_deadline_before_first_round() -> None:
         def ready_nodes(self, session_id: str) -> list[ResearchNode]:
             raise AssertionError("no ready read past the deadline")
 
-    out = asyncio.run(sched._session_rounds("S", _K(), asyncio.Semaphore(2), {}, time.perf_counter() - 1))
+    out = asyncio.run(sched._session_rounds("S", _K(), {}, time.perf_counter() - 1))
     assert out["session_id"] == "S" and out["status"] == "incomplete_guard"
     assert out["rounds"] == 0 and out["reason"] == "incomplete: run deadline reached before session round 1"
     assert out["incomplete_guard"] is True
@@ -7802,7 +7805,7 @@ def test_sched_session_round_guard_ceiling_reports_incomplete() -> None:
             )
 
     async def _fake(
-        node: object, session_id: str, hooks: Mapping[str, object], kernel: sched._Kernel, cap: asyncio.Semaphore
+        node: object, session_id: str, hooks: Mapping[str, object], kernel: sched._Kernel
     ) -> dict[str, JSONValue]:
         return {"node_id": "a", "status": "resolved", "admitted": 1}
 
@@ -7810,7 +7813,7 @@ def test_sched_session_round_guard_ceiling_reports_incomplete() -> None:
         orig = sched._run_one_node
         sched._run_one_node = _fake
         try:
-            return await sched._session_rounds("S", _K(), asyncio.Semaphore(2), {}, time.perf_counter() + 30)
+            return await sched._session_rounds("S", _K(), {}, time.perf_counter() + 30)
         finally:
             sched._run_one_node = orig
 
@@ -8251,7 +8254,7 @@ def test_generate_arguments_recovers_with_session_chart_ticker(
             generate,
             tool_name,
             sched.build_registry(),
-            {"session_id": "s1", "objective": objective, "ticker": " nvda "},
+            {"session_id": "s1", "objective": objective, "ticker": " nvda ", "as_of": "2026-01-01"},
             _node(),
             [],
             [],
@@ -8513,7 +8516,7 @@ def test_chart_context_does_not_hide_unrecoverable_generation_errors(
                 generate,
                 "list_sec_filings",
                 sched.build_registry(),
-                {"session_id": "s1", "objective": "How is it doing?", "ticker": "NVDA"},
+                {"session_id": "s1", "objective": "How is it doing?", "ticker": "NVDA", "as_of": "2026-01-01"},
                 _node(),
                 [],
                 [],
@@ -8562,3 +8565,107 @@ def test_run_node_rejects_chart_receipt_from_a_non_chart_tool(monkeypatch: pytes
     assert updates == []
     assert result["status"] == "blocked"
     assert result["admitted"] == 0
+
+
+@pytest.mark.parametrize(
+    ("tool", "expected"),
+    [
+        ("search_web", {"query": "What changed?"}),
+        ("list_sec_filings", {"identifier": "NVDA"}),
+        ("find_sec_entities", {"query": "NVDA"}),
+        ("get_reg_sho_volume", {"ticker": "NVDA"}),
+        ("get_short_interest", {"ticker": "NVDA"}),
+        ("get_insider_activity", {"ticker": "NVDA"}),
+        ("get_planned_insider_sales", {"ticker": "NVDA"}),
+        ("get_fundamentals", {"ticker": "NVDA", "metric": "eps"}),
+    ],
+)
+def test_known_arguments_skip_needle(
+    tool: str, expected: dict[str, JSONValue], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import tools
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_chart_test_subject)
+    generate = mock.AsyncMock(side_effect=AssertionError("Known arguments must skip Needle"))
+    args, reasoning, withheld = asyncio.run(
+        sched._generate_tool_arguments(
+            generate,
+            tool,
+            sched.build_registry(),
+            {
+                "session_id": "s1",
+                "objective": "What is its EPS?" if tool == "get_fundamentals" else "How is it doing?",
+                "ticker": "NVDA",
+            },
+            dataclasses.replace(_node(), question="What changed?"),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
+    )
+    assert args == expected
+    assert reasoning and withheld is False
+    generate.assert_not_called()
+
+
+def test_missing_required_seed_argument_still_calls_needle(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import tools
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_chart_test_subject)
+    generate = mock.AsyncMock(
+        return_value={"tool": "list_sec_filings", "arguments": {"identifier": "NVDA", "forms": ["8-K"]}}
+    )
+    args, _, _ = asyncio.run(
+        sched._generate_tool_arguments(
+            generate,
+            "list_sec_filings",
+            [{"name": "list_sec_filings", "parameters": {"required": ["identifier", "forms"]}}],
+            {"session_id": "s1", "objective": "How is it doing?", "ticker": "NVDA"},
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
+    )
+    assert args == {"identifier": "NVDA", "forms": ["8-K"]}
+    generate.assert_awaited_once()
+
+
+def test_all_independent_nodes_start_before_any_finishes() -> None:
+    """Four ready nodes overlap. Their dependent starts only after all four resolve."""
+    resolved: set[str] = set()
+    entered: set[str] = set()
+
+    class _KS(_Kernel):
+        @override
+        def ready_nodes(self, session_id: str) -> list[ResearchNode]:
+            if not resolved:
+                return [_node(f"n{i}", session_id) for i in range(4)]
+            if "dependent" not in resolved:
+                assert resolved == {f"n{i}" for i in range(4)}
+                return [dataclasses.replace(_node("dependent", session_id), depends_on=tuple(sorted(resolved)))]
+            return []
+
+    async def scenario() -> dict[str, JSONValue]:
+        all_entered = asyncio.Event()
+
+        async def finish(node: ResearchNode, sid: str, **kw: object) -> dict[str, JSONValue]:
+            if node.node_id != "dependent":
+                entered.add(node.node_id)
+                if len(entered) == 4:
+                    all_entered.set()
+                await all_entered.wait()
+            else:
+                assert len(resolved) == 4
+            resolved.add(node.node_id)
+            return {"node_id": node.node_id, "status": "resolved", "admitted": 0}
+
+        with mock.patch.object(sched, "run_node", finish):
+            return await asyncio.wait_for(sched.run("s1", kernel=_KS()), timeout=1.0)
+
+    out = asyncio.run(scenario())
+    assert out["status"] == "complete" and out["rounds"] == 2
+    assert entered == {f"n{i}" for i in range(4)}
+    assert resolved == {*entered, "dependent"}

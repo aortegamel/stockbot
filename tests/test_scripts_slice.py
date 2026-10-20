@@ -3306,7 +3306,7 @@ def _case() -> e2e.Case:
 
 def test_e2e_golden_set_shape() -> None:
     golden = _golden()
-    assert len(golden) == 12 and len({c["id"] for c in golden}) == 12
+    assert len(golden) == 13 and len({c["id"] for c in golden}) == 13
 
 
 def test_e2e_parse_research_stream_times_text_and_counts_known_citations() -> None:
@@ -3326,8 +3326,9 @@ def test_e2e_parse_research_stream_times_text_and_counts_known_citations() -> No
     assert (run.first_text_ms, run.total_ms, run.route) == (900, 1200, "research_required")
     assert run.citation_count == 1  # ev:a once; ev:zz is not a streamed evidence id.
     assert run.timings == _done(tools=2)["metrics"] and run.errors == []
-    assert e2e.evaluate(_case(), run) == []
-    strict = _case()
+    case: e2e.Case = {**_case(), "expected_route": "research_required"}
+    assert e2e.evaluate(case, run) == []
+    strict: e2e.Case = {**_case(), "expected_route": "research_required"}
     strict["min_citations"], strict["max_first_text_ms"], strict["ticker"] = 2, 800, "AMD"
     assert e2e.evaluate(strict, run) == [
         "first_text_ms",

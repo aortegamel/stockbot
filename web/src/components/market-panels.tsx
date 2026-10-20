@@ -44,8 +44,8 @@ function sourceText(row: SourceRow): string {
 
 // Watchlist: real delayed quotes from /api/quote, plus one page-load fan-out of
 // SEC filings and the three FINRA datasets per symbol. Every source shows its own status.
-export function WatchlistPanel({ selected, onSelect }: { selected: string; onSelect: (s: string) => void }) {
-  const syms = watchlistFor(selected);
+export function WatchlistPanel({ selected, onSelect, symbols }: { selected: string; onSelect: (s: string) => void; symbols?: string[] }) {
+  const syms = symbols ?? watchlistFor(selected);
   const symKey = syms.join(",");
   const [prices, setPrices] = useState<Record<string, number | null>>({});
   const [sources, setSources] = useState<SourceRow[]>([]);

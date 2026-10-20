@@ -2300,6 +2300,18 @@ TOOLS: list[dict[str, object]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_watchlist",
+            "description": "Add one stock to, or remove one stock from, the local watchlist. The frontend applies the change. The receipt is not factual research evidence.",
+            "parameters": {
+                "type": "object",
+                "properties": {"action": {"type": "string", "enum": ["add", "remove"]}, "ticker": {"type": "string"}},
+                "required": ["action", "ticker"],
+            },
+        },
+    },
 ]
 # TOOL_REGISTRY_VERSION moved below TOOL_DISCOVERY_REGISTRY (hashes schemas + routing metadata).
 
@@ -3390,6 +3402,22 @@ def _set_chart_symbol(args: dict[str, object], model: str) -> dict[str, object]:
     if ticker is None:
         return _invalid_args_error("set_chart_symbol", "set_chart_symbol: 'ticker' must be a non-empty string")
     return {"result_type": "chart_selection", "ticker": ticker}
+
+
+def _update_watchlist(args: dict[str, object], model: str) -> dict[str, object]:
+    from app.research.models import validate_ticker
+
+    del model
+    action = args.get("action")
+    if action not in ("add", "remove"):
+        return _invalid_args_error("update_watchlist", "update_watchlist: 'action' must be 'add' or 'remove'")
+    try:
+        ticker = validate_ticker(args.get("ticker"), "update_watchlist")
+    except ValueError as exc:
+        return _invalid_args_error("update_watchlist", str(exc))
+    if ticker is None:
+        return _invalid_args_error("update_watchlist", "update_watchlist: 'ticker' must be a non-empty string")
+    return {"result_type": "watchlist_update", "action": action, "ticker": ticker}
 
 
 def _wrap_one(record: object) -> object:
@@ -4856,6 +4884,21 @@ TOOL_DISCOVERY_REGISTRY: dict[str, ToolDiscovery] = {
         summary="Select one stock for the chart and linked stock panels.",
         choose_when=("The chart needs to focus on another stock.",),
         reject_when=("The receipt is not factual research evidence. Continue the original answer or research.",),
+        conflicts_with=(),
+        related_tools=(),
+        prerequisites=(),
+    ),
+    "update_watchlist": ToolDiscovery(
+        domain="market",
+        family="watchlist",
+        intent="update_watchlist",
+        output_kind="watchlist_update",
+        source="local",
+        entity_scope="single_security",
+        time_mode="current",
+        summary="Add one stock to, or remove one stock from, the local watchlist.",
+        choose_when=("The user asks to add a stock to, or remove a stock from, the watchlist.",),
+        reject_when=("The receipt is not factual research evidence. Not for questions about watchlist stocks.",),
         conflicts_with=(),
         related_tools=(),
         prerequisites=(),
@@ -6981,6 +7024,7 @@ _MODEL_HANDLERS: dict[str, ModelHandler] = {
     "search_company_patents": _search_company_patents,
     "get_current_time": _get_current_time,
     "set_chart_symbol": _set_chart_symbol,
+    "update_watchlist": _update_watchlist,
 }
 
 
@@ -7343,6 +7387,7 @@ TOOL_CAPABILITIES: dict[str, Capability] = {
     "search_company_patents": Capability.RESEARCH,
     "get_current_time": Capability.RESEARCH,
     "set_chart_symbol": Capability.RESEARCH,
+    "update_watchlist": Capability.RESEARCH,
     "list_finra_datasets": Capability.RESEARCH,
     "describe_finra_dataset": Capability.RESEARCH,
     "get_finra_datapoints": Capability.RESEARCH,

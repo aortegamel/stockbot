@@ -286,13 +286,47 @@ export async function POST(req: Request): Promise<Response> {
             await answerFromEvidence();
             return true;
           }
-          if (verdict === "research_required" || verdict === "set_chart_symbol") return false;
+          if (verdict === "research_required" || verdict === "set_chart_symbol" || verdict === "update_watchlist") return false;
           // ponytail: worker output is untrusted — only identifier-shaped tool names chain; anything else researches.
           if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(verdict)) return false;
           current = verdict;
         }
         // Cap reached with another tool pending — research owns the longer chain.
         return false;
+      };
+      // The watchlist action is a UI receipt, never evidence: Needle fills its arguments and only
+      // a validated canonical receipt emits watchlist_update. A failure answers visibly, never researches.
+      const applyWatchlist = async (): Promise<boolean> => {
+        const t0 = performance.now();
+        send({ type: "agent_start", prompt });
+        const generated = await generateArguments("update_watchlist");
+        let text = "Watchlist update failed: no valid stock and action.";
+        if (generated) {
+          const sessionId = newSessionId();
+          try {
+            const result = await invoke("update_watchlist", generated.args, sessionId, Math.max(deadlineAt - Date.now(), 1));
+            if (!result.ok) throw new Error(result.error);
+            const receipt = result.watchlistUpdate;
+            if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) throw new Error("The watchlist tool returned an invalid receipt.");
+            const { result_type, action, ticker } = receipt as Record<string, unknown>;
+            if (result_type !== "watchlist_update" || (action !== "add" && action !== "remove") || typeof ticker !== "string" || parseTicker(ticker) !== ticker) {
+              throw new Error("The watchlist tool returned an invalid receipt.");
+            }
+            send({ type: "watchlist_update", action, ticker });
+            text = action === "add" ? `Added ${ticker} to your watchlist.` : `Removed ${ticker} from your watchlist.`;
+          } catch (err) {
+            text = `Watchlist update failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 160)}`;
+          } finally {
+            try {
+              await endSession(sessionId);
+            } catch {
+              // Cleanup does not change an applied watchlist receipt.
+            }
+          }
+        }
+        send({ type: "answer_delta", text });
+        send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: generated ? 1 : 0, totalMs: 0, escalations: 0 }, tools: { calls: generated ? 1 : 0, totalMs: 0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures: {} } });
+        return true;
       };
       const tryEntryAnswer = async (winner: string): Promise<boolean> => {
         try {
@@ -304,6 +338,7 @@ export async function POST(req: Request): Promise<Response> {
             return true;
           }
           if (winner === "no_session" || winner === "reasoning_required") return await answerDirect();
+          if (winner === "update_watchlist") return await applyWatchlist();
           // Only identifier-shaped tool names can enter the single-tool path.
           if (winner !== "research_required" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(winner)) return await answerSingleShot(winner);
         } catch {

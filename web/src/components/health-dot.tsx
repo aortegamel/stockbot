@@ -11,6 +11,8 @@ export function healthStatus(body: unknown): Status {
   if (typeof body !== "object" || body === null || !("ok" in body) || body.ok !== true) return { tone: "down", failing: ["api"] };
   const deps = "deps" in body && typeof body.deps === "object" && body.deps !== null ? Object.entries(body.deps) : [];
   const failing = deps.filter(([, dep]: [string, Dep | null]) => dep?.ok !== true);
+  const prewarmed = "kernelPrewarmed" in body ? body.kernelPrewarmed === true : true;
+  if (!failing.length && !prewarmed) return { tone: "checking", failing: ["warming up"] };
   const tone = failing.some(([, dep]: [string, Dep | null]) => dep?.required !== false) ? "down" : failing.length ? "warn" : "ok";
   return { tone, failing: failing.map(([name]) => name) };
 }

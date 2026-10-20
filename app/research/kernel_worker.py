@@ -240,10 +240,10 @@ _INTAKE_SEC_FORMS = ("8-K", "10-Q", "10-K", "4")
 _INTAKE_SEC_LIMIT = 5
 _INTAKE_DIGEST_CHARS = 6000
 _INTAKE_MAX_ROUNDS = 2
-_INTAKE_CALL_TIMEOUT_S = 15.0
-_INTAKE_BUDGET_S = 15.0
-_INTAKE_REASONER_TIMEOUT_S = 45.0
-_INTAKE_DOC_TIMEOUT_S = 10.0
+_INTAKE_CALL_TIMEOUT_S = 8.0
+_INTAKE_BUDGET_S = 8.0
+_INTAKE_REASONER_TIMEOUT_S = 20.0
+_INTAKE_DOC_TIMEOUT_S = 5.0
 _INTAKE_DOC_CHARS = 3000
 
 # One wall budget per op:run. Setup stops at _SETUP_S so the scheduler keeps
@@ -461,7 +461,7 @@ async def _intake_ticker_chain(
     if acc is None:
         return out
     start = _time.perf_counter()
-    # ponytail: 10s doc deadline sits inside the 20s intake budget, so the
+    # ponytail: 5s doc deadline sits inside the 8s intake budget, so the
     # chain returns the finished list result itself; no shield, no CancelledError
     # catch — real cancellations propagate (a sync SEC call already running in
     # its worker thread may still finish; only the coroutine is cancelled).
@@ -579,13 +579,27 @@ def _digest_candidates(
             yield ev, key, tkey, content
 
 
-def _build_digest(admitted: Sequence[Mapping[str, object]]) -> str:
-    """Dedupe by URL/accession/title, verbatim-substring cuts, 6k cap, newest first."""
+def _off_subject(ev: Mapping[str, object], content: str, named: re.Pattern[str] | None) -> bool:
+    """True for a web result whose title and text name no subject term."""
+    provenance = ev.get("provenance")
+    if named is None or not isinstance(provenance, Mapping) or provenance.get("kind") != "web_source":
+        return False
+    return named.search(f"{_ev_field(ev, 'title')}\n{content}") is None
+
+
+def _build_digest(admitted: Sequence[Mapping[str, object]], subject: Sequence[str] = ()) -> str:
+    """Dedupe by URL/accession/title, verbatim-substring cuts, 6k cap, newest first.
+
+    With subject terms (company name, ticker), web results naming none of them are dropped.
+    """
+    named = re.compile("|".join(rf"(?<!\w){re.escape(t)}(?!\w)" for t in subject), re.IGNORECASE) if subject else None
     seen: set[str] = set()
     seen_titles: set[str] = set()
     items: list[str] = []
     used = 0
     for ev, key, tkey, content in _digest_candidates(admitted, seen, seen_titles):
+        if _off_subject(ev, content, named):
+            continue
         room_total = _INTAKE_DIGEST_CHARS - used
         if room_total <= 200:
             break
@@ -1084,6 +1098,25 @@ def _intake_admit_call(
     scheduler._complete_attempt_job(kernel, record, tool)
 
 
+def _intake_evidence_preview(
+    admitted: Sequence[Mapping[str, object]], limit: int = 8, chars: int = 4000
+) -> list[dict[str, object]]:
+    """First-N admitted rows (evidence_id/content/sources) for the early brief; byte-capped."""
+    preview: list[dict[str, object]] = []
+    used = 0
+    for row in admitted:
+        if len(preview) >= limit or used >= chars:
+            break
+        eid = row.get("evidence_id")
+        content = row.get("content")
+        text = content if isinstance(content, str) else ""
+        preview.append(
+            {"id": eid if isinstance(eid, str) else "", "content": text[: chars - used], "sources": row.get("sources")}
+        )
+        used += len(text)
+    return preview
+
+
 def _intake_admit_all(
     kernel: _Kernel,
     sid: str,
@@ -1188,6 +1221,7 @@ async def _intake_round(
             "per_source": per_source,
         },
     )
+    _notify(progress, "intake_evidence", {"evidence": _intake_evidence_preview(admitted)})
     stats: dict[str, object] = {
         "calls": len(calls),
         "admitted": len(admitted),
@@ -1216,6 +1250,29 @@ def _intake_start_tickers(objective: str, supplied_ticker: str | None = None) ->
     if isinstance(resolved, str) and resolved.strip():
         return [resolved.strip().upper()]
     return []
+
+
+def _intake_subject(tickers: Sequence[str]) -> tuple[str, ...]:
+    """(company name, ticker) for the intake subject; (ticker,) when EDGAR names none; () without one."""
+    if not tickers:
+        return ()
+    from app.research.scheduler import _COMPANY_SUFFIX
+    from app.sec.client import find_sec_company
+
+    ticker = tickers[0]
+    try:
+        rows = find_sec_company(ticker, limit=3)
+    except Exception as exc:
+        logger.debug("intake subject name lookup failed ticker=%s: %s", ticker, exc, exc_info=True)
+        return (ticker,)
+    for row in rows:
+        row_tickers = row.get("tickers")
+        if isinstance(row_tickers, list) and ticker in row_tickers:
+            words = str(row.get("name") or "").replace(",", " ").split()
+            while len(words) > 1 and words[-1].lower() in _COMPANY_SUFFIX:
+                words.pop()
+            return (" ".join(words), ticker) if words else (ticker,)
+    return (ticker,)
 
 
 def _intake_round2_spent(setup_deadline: float | None, rounds: int) -> bool:
@@ -1271,6 +1328,19 @@ def _intake_corrected_query(hints: Mapping[str, object], fetched_queries: Sequen
     return query if query and query not in fetched_queries else None
 
 
+# compare/and/vs, or two questions (two intents), marks a multi-part objective.
+_INTAKE_MULTIPART_RE = re.compile(r"\b(?:compare|and|vs|versus)\b|\?.*\?", re.IGNORECASE | re.DOTALL)
+
+
+def _intake_single_subject(objective: str, tickers: Sequence[str], watchlist: list[str] | None) -> bool:
+    """One resolved subject and no multi-part cue: the objective is the only proposal, no Reasoner."""
+    from app.research import scheduler
+
+    if len(tickers) != 1 or len(watchlist or []) >= 2 or _INTAKE_MULTIPART_RE.search(objective):
+        return False
+    return len(scheduler._objective_chart_candidates(objective)) <= 1
+
+
 async def _graph_intake(
     objective: str,
     as_of: str | None,
@@ -1297,7 +1367,9 @@ async def _graph_intake(
     fetched_tickers: list[str] = []
     fetched_queries: list[str] = []
     tickers = _intake_start_tickers(objective, None if watchlist else supplied_ticker)
-    query_text: str | None = objective
+    single_subject = _intake_single_subject(objective, tickers, watchlist)
+    subject = _intake_subject(tickers)
+    query_text: str | None = " ".join((*subject, objective))
     while True:
         if _intake_round2_spent(setup_deadline, rounds):
             break
@@ -1320,8 +1392,12 @@ async def _graph_intake(
         all_raw.extend(raw)
         all_stats.append(stats)
         prior_digest = digest
-        digest = _build_digest(admitted)
+        digest = _build_digest(admitted, subject)
         if _intake_digest_unchanged(rounds, digest, prior_digest, hints):
+            _log_intake_round(sid, objective, raw, digest, {"proposals": proposals, "hints": hints}, stats, kernel)
+            break
+        if rounds == 0 and digest and single_subject:
+            proposals = _objective_or_admitted(objective, sid, [])
             _log_intake_round(sid, objective, raw, digest, {"proposals": proposals, "hints": hints}, stats, kernel)
             break
         proposals, hints = _reasoner_decompose_with_retry(

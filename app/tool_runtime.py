@@ -1331,6 +1331,29 @@ def _copy_navigation_meta(result: object, safe_meta: dict[str, object]) -> None:
                 safe_meta[key] = result[key]
 
 
+def _watchlist_receipt(name: str, result: object, status: str) -> dict[str, object] | None:
+    """Validated watchlist receipt for meta; None for any other tool, failure, or malformed result."""
+    if not (
+        name == "update_watchlist"
+        and status == "completed"
+        and isinstance(result, dict)
+        and result.get("result_type") == "watchlist_update"
+        and result.get("action") in ("add", "remove")
+        and "error" not in result
+        and "error_type" not in result
+    ):
+        return None
+    from app.research.models import validate_ticker
+
+    try:
+        ticker = validate_ticker(result.get("ticker"), "update_watchlist")
+    except ValueError:
+        return None
+    if ticker is None:
+        return None
+    return {"result_type": "watchlist_update", "action": result["action"], "ticker": ticker}
+
+
 def _success_meta(
     name: str,
     result: object,
@@ -1371,6 +1394,9 @@ def _success_meta(
             ticker = None
         if ticker is not None:
             safe_meta["chart_selection"] = {"result_type": "chart_selection", "ticker": ticker}
+    receipt = _watchlist_receipt(name, result, status)
+    if receipt is not None:
+        safe_meta["watchlist_update"] = receipt
     if name in ("search_tools", "browse_tools") and isinstance(result, dict):
         # Deferred loading: the TS extension activates these schemas additively.
         # Names are already model-visible in content; meta carries them structured.

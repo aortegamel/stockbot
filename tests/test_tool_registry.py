@@ -91,7 +91,7 @@ def test_discovery_coordinates_complete():
 
     kebab = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
     snake = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
-    assert len(tools.TOOL_DISCOVERY_REGISTRY) == 62
+    assert len(tools.TOOL_DISCOVERY_REGISTRY) == 63
     assert "research_read_search" in tools.TOOL_DISCOVERY_REGISTRY
     for name, meta in tools.TOOL_DISCOVERY_REGISTRY.items():
         assert meta.domain and kebab.match(meta.domain), name
@@ -314,3 +314,56 @@ def test_set_chart_symbol_uses_existing_research_registry_collection() -> None:
     assert described["name"] == "set_chart_symbol"
     assert described["required_arguments"] == ["ticker"]
     assert described["optional_arguments"] == []
+
+
+@pytest.mark.parametrize("action", ["add", "remove"])
+def test_update_watchlist_returns_validated_receipt(action: str) -> None:
+    context = RequestContext("research", frozenset({Capability.RESEARCH}))
+
+    result = tools.execute_tool("update_watchlist", {"action": action, "ticker": " amd "}, "test", context=context)
+
+    assert result == {"result_type": "watchlist_update", "action": action, "ticker": "AMD"}
+
+
+@pytest.mark.parametrize(
+    ("arguments", "field"),
+    [
+        ({"ticker": "AMD"}, "action"),
+        ({"action": "clear", "ticker": "AMD"}, "action"),
+        ({"action": "ADD", "ticker": "AMD"}, "action"),
+        ({"action": "add"}, "ticker"),
+        ({"action": "add", "ticker": ""}, "ticker"),
+        ({"action": "remove", "ticker": "AMD/NYSE"}, "ticker"),
+    ],
+)
+def test_update_watchlist_rejects_invalid_arguments(arguments: dict[str, object], field: str) -> None:
+    context = RequestContext("research", frozenset({Capability.RESEARCH}))
+
+    result = tools.execute_tool("update_watchlist", arguments, "test", context=context)
+
+    assert result["error_type"] == "invalid_tool_arguments"
+    assert field in str(result["error"])
+    assert result["required"] == ["action", "ticker"]
+    assert "result_type" not in result
+
+
+def test_update_watchlist_is_a_research_ui_action_outside_portfolio() -> None:
+    from app.research.scheduler import build_registry
+
+    assert tools.TOOL_CAPABILITIES["update_watchlist"] is Capability.RESEARCH
+    assert "update_watchlist" not in tools.PORTFOLIO_AUTHORIZED_TOOLS
+    denied = tools.execute_tool(
+        "update_watchlist", {"action": "add", "ticker": "AMD"}, "test", context=RequestContext("none", frozenset())
+    )
+    assert denied == {"error": "Tool is not permitted: update_watchlist"}
+    entry = next(entry for entry in build_registry() if entry["name"] == "update_watchlist")
+    assert entry["keyInputs"] == "req(action, ticker)"
+    assert entry["outputKind"] == "watchlist_update"
+
+
+def test_update_watchlist_stays_outside_node_selection() -> None:
+    from app.research.scheduler import _without_control_tools, build_registry
+
+    registry = build_registry()
+    assert "update_watchlist" in {entry.get("name") for entry in registry}
+    assert "update_watchlist" not in {entry.get("name") for entry in _without_control_tools(registry, "s", "n")}

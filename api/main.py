@@ -21,8 +21,11 @@ import os
 from fastapi import FastAPI
 
 from . import market_providers as providers
+from . import portfolio_routes, theses_routes
 
 app = FastAPI()
+app.include_router(theses_routes.router)
+app.include_router(portfolio_routes.router)
 
 
 @app.get("/")

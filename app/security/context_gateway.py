@@ -132,6 +132,7 @@ TOOL_ENVELOPES: dict[str, ContextEnvelope] = {
     ),
     "get_current_time": _envelope("system", SourceType.TOOL_RESULT, Sensitivity.PUBLIC, Integrity.DERIVED),
     "set_chart_symbol": _envelope("local", SourceType.TOOL_RESULT, Sensitivity.PUBLIC, Integrity.DERIVED),
+    "update_watchlist": _envelope("local", SourceType.TOOL_RESULT, Sensitivity.PUBLIC, Integrity.DERIVED),
     # Bounded local thesis operations (locally derived, never canonical market data).
     "thesis_create": _envelope("thesis", SourceType.TOOL_RESULT, Sensitivity.PUBLIC, Integrity.DERIVED),
     "thesis_show": _envelope("thesis", SourceType.TOOL_RESULT, Sensitivity.PUBLIC, Integrity.DERIVED),

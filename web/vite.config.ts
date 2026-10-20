@@ -23,6 +23,8 @@ export default defineConfig({
       "/api/news": proxy(market),
       "/api/filings": proxy(market),
       "/api/viewer-context": proxy(market),
+      "/api/theses": proxy(market),
+      "/api/portfolio": proxy(market),
     },
   },
 });
