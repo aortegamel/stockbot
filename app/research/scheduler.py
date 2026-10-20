@@ -1739,6 +1739,11 @@ _OBJECTIVE_COMPANY_RE = re.compile(
     r"\b(?:for|with)\s+([A-Z][a-zA-Z&.'\- ]{2,40}?)(?:\s+this\s+week|\s+last\s+|\s+daily|\s+now|\s*$)",
     flags=re.IGNORECASE,
 )
+# ponytail: role/market acronyms that must never win as an explicit stock subject;
+# both _objective_ticker and _objective_chart_candidates honor this one set.
+_ACRONYM_NON_SUBJECTS = frozenset(
+    {"ceo", "cfo", "cto", "ai", "etf", "etfs", "ipo", "cpi", "gdp", "fed", "fomc", "eps", "pe", "usa", "us"}
+)
 
 
 def _candidate_sort_key(item: tuple[int, str]) -> int:
@@ -1791,21 +1796,7 @@ def _objective_chart_candidates(objective: str) -> list[str]:
         "et",
         "am",
         "pm",
-        "ceo",
-        "cfo",
-        "cto",
-        "ai",
-        "etf",
-        "etfs",
-        "ipo",
-        "cpi",
-        "gdp",
-        "fed",
-        "fomc",
-        "eps",
-        "pe",
-        "usa",
-        "us",
+        *_ACRONYM_NON_SUBJECTS,
     }
     labels.extend(
         (position, label)
@@ -1836,7 +1827,7 @@ def _objective_ticker(objective: object) -> str | None:
     from app.tools import _resolve_company_to_ticker as _resolve
 
     for _tok in _OBJECTIVE_TICKER_RE.findall(objective):
-        if _tok.upper() in _ORG or _tok.upper() in ("SHO", "REG"):
+        if _tok.upper() in _ORG or _tok.upper() in ("SHO", "REG") or _tok.lower() in _ACRONYM_NON_SUBJECTS:
             continue
         _rt = _resolve(_tok)
         if _rt is not None:
@@ -1936,6 +1927,8 @@ def _objective_subject_ticker(objective: object, supplied_ticker: object = None)
 
         candidates = _objective_chart_candidates(objective)
         for candidate in candidates:
+            if candidate.lower() in _ACRONYM_NON_SUBJECTS:
+                continue
             resolved = _resolve_company_to_ticker(candidate)
             if resolved is not None:
                 return resolved

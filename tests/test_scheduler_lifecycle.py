@@ -8154,10 +8154,14 @@ def test_fallback_args_use_chart_context_for_unresolved_explicit_subject(
 def test_objective_subject_uses_chart_context_for_unresolved_acronyms(
     objective: str, supplied: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Role and topic acronyms that do not resolve leave the chart ticker in place."""
+    """Role and topic acronyms never win as the explicit subject, even when they resolve."""
     from app import tools
 
-    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_chart_test_subject)
+    def _resolve_acronym(label: str) -> str | None:
+        return {"AI": "AI", "CEO": "CEOO"}.get(label, _resolve_chart_test_subject(label))
+
+    monkeypatch.setattr(tools, "_resolve_company_to_ticker", _resolve_acronym)
+    assert sched._objective_ticker(objective) is None
     assert sched._objective_subject_ticker(objective, supplied) == supplied
 
 
