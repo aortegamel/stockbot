@@ -444,7 +444,7 @@ def test_run_emits_progress_before_terminal(monkeypatch: pytest.MonkeyPatch) -> 
     out = kw._run({"id": "r1", "prompt": "hello?"}, jev=JevClient(), progress=fake_progress)
     assert out["id"] == "r1"
     assert stages[:2] == ["session", "intake_done"]
-    assert stages[-2:] == ["tool_start", "tool_done"]
+    assert stages[-3:] == ["tool_start", "tool_done", "nodes_done"]
 
 
 def test_digest_strips_tags_keeps_text() -> None:
@@ -759,7 +759,9 @@ def test_reasoner_rate_limit_retries_once(monkeypatch: pytest.MonkeyPatch) -> No
     assert calls["n"] == 2 and [p["id"] for p in proposals] == ["rs:t-q1"]
     assert "fallback" not in hints
     assert ("reasoner_retry", {"attempt": 2, "reason": "rate_limited"}) in events
-    assert events[-1] == ("reasoner_done", {"proposals": 1})
+    stage, detail = events[-1]
+    assert stage == "reasoner_done" and detail is not None and set(detail) == {"proposals", "ms"}
+    assert detail["proposals"] == 1 and isinstance(detail["ms"], float) and detail["ms"] >= 0
 
 
 def test_reasoner_rate_limit_twice_fails_twice(monkeypatch: pytest.MonkeyPatch) -> None:

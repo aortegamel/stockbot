@@ -838,6 +838,26 @@ describe("runKernelAgent final personas", () => {
     expect(m.evidence.count).toBe(2);
   });
 
+  test("done timings sum worker progress phases, skip malformed values, and omit unmeasured phases", async () => {
+    const progress = (id: string, stage: string, detail: Record<string, unknown>): string => `${JSON.stringify({ type: "progress", id, stage, detail })}\n`;
+    const { events } = await runFinal({
+      reply: (_pass2, id) =>
+        progress(id, "intake_done", { wall_ms: 100, settle_ms: 10 }) +
+        progress(id, "reasoner_done", { proposals: 2, ms: 40 }) +
+        progress(id, "intake_done", { wall_ms: 20, settle_ms: 5 }) +
+        progress(id, "intake_done", { wall_ms: "7", settle_ms: null }) +
+        progress(id, "nodes_done", { ms: 300 }) +
+        graphReply(id),
+    });
+    expect(answers(events)).toEqual([trioAnswer(1)]);
+    // routeMs and firstTextMs belong to the route; no gap means no pass2Ms.
+    expect(doneMetrics(events).timings).toEqual({
+      intakeMs: 120, admitMs: 15, reasonerMs: 40, nodesMs: 300, personasMs: expect.any(Number), gatesMs: expect.any(Number),
+    });
+    const follow = await runFinal({ reply: sessionReply, decide: (p, pass) => (pass === 1 && p === "bearbot" ? { missingEvidence: "need doc X" } : {}) });
+    expect(Object.keys(doneMetrics(follow.events).timings ?? {}).sort()).toEqual(["gatesMs", "pass2Ms", "personasMs"]);
+  });
+
   test("a non-string or empty pass-1 sessionId uses the legacy follow-up and still merges new evidence", async () => {
     for (const sessionId of [7, ""]) {
       const { events, calls, bodies } = await runFinal({

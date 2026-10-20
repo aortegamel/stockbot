@@ -2,7 +2,7 @@ import { reason } from "@/lib/muse/client";
 import { asksWatchlist, kernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, type KernelResponse } from "@/lib/agent/kernel";
 import { tools } from "@/lib/tools";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
-import { FINAL_PERSONAS, redactArgs, sourceReferences, type AgentEvent, type Evidence, type FailureCategory, type Persona } from "@/lib/agent/types";
+import { FINAL_PERSONAS, redactArgs, sourceReferences, type AgentEvent, type Evidence, type FailureCategory, type Persona, type Timings } from "@/lib/agent/types";
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
@@ -66,12 +66,15 @@ function publicEvent(e: AgentEvent): AgentEvent | null {
   }
 }
 
-function streamSender(req: Request, controller: ReadableStreamDefaultController<Uint8Array>): (e: AgentEvent) => void {
+// Every done carries the request-owned timings: the route round and the first answer text.
+function streamSender(req: Request, controller: ReadableStreamDefaultController<Uint8Array>, requestAt: number, timings: Timings): (e: AgentEvent) => void {
   const enc = new TextEncoder();
   const debug = ["1", "true", "yes"].includes((process.env.STOCKBOT_DEBUG ?? "").trim().toLowerCase());
   let terminalSent = false;
   return (e) => {
     if (req.signal.aborted) return;
+    if (e.type === "answer_delta") timings.firstTextMs ??= performance.now() - requestAt;
+    if (e.type === "done") e = { ...e, metrics: { ...e.metrics, timings: { ...e.metrics.timings, ...timings } } };
     let out = debug ? e : publicEvent(e);
     if (!out) return;
     if (!debug && (e.type === "failed" || e.type === "error")) {
@@ -123,6 +126,7 @@ async function selectEntry(body: Record<string, unknown>, signal: AbortSignal): 
 
 export async function POST(req: Request): Promise<Response> {
   const deadlineAt = Date.now() + REQUEST_WALL_MS;
+  const requestAt = performance.now();
   const input = await readAgentRequest(req);
   if (input instanceof Response) return input;
   const { prompt, ticker, currentChartTicker: chartInput, parsedWatchlist } = input;
@@ -137,7 +141,8 @@ export async function POST(req: Request): Promise<Response> {
   console.log(`[web] [agent-api] POST prompt_chars=${prompt.length}${watchlist ? ` watchlist=${watchlist.length}` : ""}`);
   const stream = new ReadableStream({
     async start(controller) {
-      const send = streamSender(req, controller);
+      const timings: Timings = {};
+      const send = streamSender(req, controller, requestAt, timings);
       // JEV owns the original route independently from the optional chart action.
       const answerDirect = async (): Promise<boolean> => {
         const t0 = performance.now();
@@ -274,7 +279,9 @@ export async function POST(req: Request): Promise<Response> {
       };
       // ponytail: JEV-first entry — one route round selects the route and any explicit personas.
       // The watchlist rides as separate context; JEV's returned route governs dispatch here.
+      const routeAt = performance.now();
       const selected = await selectEntry({ op: "route", prompt, ...tickerField, ...watchlistField, ...(currentChartTicker ? { currentChartTicker } : {}) }, req.signal);
+      timings.routeMs = performance.now() - routeAt;
       if ("error" in selected) {
         const routeError = selected.error;
         // Selection is unknown. The route must not guess personas or a route.

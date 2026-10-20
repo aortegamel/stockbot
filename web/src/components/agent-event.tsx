@@ -42,7 +42,7 @@ function WorkEventView({ event }: { event: AgentEvent }) {
   }
 }
 
-export function AgentEventView({ event }: { event: AgentEvent }) {
+export function AgentEventView({ event, debug = false }: { event: AgentEvent; debug?: boolean }) {
   switch (event.type) {
     case "agent_start":
       return <div className="text-zinc-100">&gt; {event.prompt}</div>;
@@ -57,6 +57,8 @@ export function AgentEventView({ event }: { event: AgentEvent }) {
       return <span>{event.text}</span>;
     case "done": {
       const m = event.metrics;
+      // Phase timings are debug output (.env STOCKBOT_DEBUG=1); an absent phase never renders.
+      const timings = debug ? Object.entries(m.timings ?? {}).flatMap(([k, v]) => (v === undefined ? [] : [`${k} ${Math.round(v)}ms`])) : [];
       return (
         <div className="pt-2 text-xs text-zinc-500">
           <div>── metrics ──</div>
@@ -69,6 +71,7 @@ export function AgentEventView({ event }: { event: AgentEvent }) {
             Needle: {Math.round(m.needle.totalMs)}ms · Tools: {Math.round(m.tools.totalMs)}ms · Stockbot:{" "}
             {Math.round(m.muse.totalMs)}ms · Total: {Math.round(m.totalMs)}ms
           </div>
+          {timings.length > 0 && <div>Timings: {timings.join(" · ")}</div>}
         </div>
       );
     }

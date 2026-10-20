@@ -866,6 +866,7 @@ def _reasoner_decompose_with_retry(
     )
     base_prompt = _intake_reasoner_prompt(objective_id, objective, as_of, digest)
     _notify(progress, "reasoner_start")
+    started = time.perf_counter()
     call_timeout = timeout_s if timeout_s is not None else _INTAKE_REASONER_TIMEOUT_S
     feedback: str | None = None  # validator error from attempt 1; only model-output failures set it
     for attempt in (1, 2):
@@ -887,7 +888,7 @@ def _reasoner_decompose_with_retry(
         if norm is None:
             _notify(progress, "reasoner_retry", {"attempt": 2})
             continue
-        _notify(progress, "reasoner_done", {"proposals": len(norm)})
+        _notify(progress, "reasoner_done", {"proposals": len(norm), "ms": (time.perf_counter() - started) * 1000.0})
         return norm, _harvest_hints(out) if isinstance(out, dict) else {}
     raise RuntimeError("reasoner decompose failed twice without proposals")
 
@@ -2502,6 +2503,7 @@ def _run(
     )
     if denied is not None:
         return denied
+    nodes_t0 = time.perf_counter()
     try:
         run_result: dict[str, JSONValue] = asyncio.run(
             scheduler.run(sid, **_run_kwargs(client, progress, select_round, run_deadline))
@@ -2512,6 +2514,7 @@ def _run(
     finally:
         _close_bootstrap_job(sid)
         logger.info("run wall_timing rid=%s elapsed_s=%.1f", rid, time.perf_counter() - _t0)
+    _notify(progress, "nodes_done", {"ms": (time.perf_counter() - nodes_t0) * 1000.0})
     failed = _run_failure(rid, run_result)
     if failed is not None:
         return failed

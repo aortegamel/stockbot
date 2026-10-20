@@ -147,7 +147,11 @@ export type Metrics = {
   };
   evidence: { count: number; characters: number };
   failures: Partial<Record<FailureCategory, number>>;
+  // Phase milliseconds; a phase with no measurement stays absent, never 0.
+  timings?: Timings;
 };
+
+export type Timings = Partial<Record<"routeMs" | "intakeMs" | "reasonerMs" | "admitMs" | "nodesMs" | "personasMs" | "gatesMs" | "pass2Ms" | "firstTextMs", number>>;
 
 const SENSITIVE_KEY_NORMS: Record<string, true> = {
   accesstoken: true,

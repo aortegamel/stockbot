@@ -1601,7 +1601,11 @@ def test_run_bootstrap_cleanup_failure_preserves_outcome(
         kw.main()
 
     responses: list[object] = [json.loads(line) for line in stdout.getvalue().splitlines()]
-    assert responses == [{"type": "ready"}, out]
+    assert responses[0] == {"type": "ready"} and responses[-1] == out
+    if scheduler_error:
+        assert responses[1:-1] == []
+    else:
+        assert responses[1:-1] == [{"type": "progress", "id": "rc", "stage": "nodes_done", "detail": {"ms": mock.ANY}}]
     assert out["evidence"] == []
 
 

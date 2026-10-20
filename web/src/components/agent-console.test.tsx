@@ -189,6 +189,7 @@ describe("AgentConsole event presentation", () => {
       muse: { calls: 4, totalMs: 77.8, inputTokens: 42, outputTokens: 0 },
       evidence: { count: 5, characters: 600 },
       failures: {},
+      timings: { routeMs: 10.4, nodesMs: 300 },
     };
     for (const debug of [false, true]) {
       const provided = rows([{ type: "done", metrics: measured }], true, debug)[0];
@@ -196,8 +197,11 @@ describe("AgentConsole event presentation", () => {
       expect(provided).toContain("Needle calls: 2 · Tool calls: 3 · Stockbot calls: 4 · Evidence: 5 · Evidence chars: 600");
       expect(provided).toContain("Stockbot input: 42 · Stockbot output: 0");
       expect(provided).toContain("Needle: 13ms · Tools: 33ms · Stockbot: 78ms · Total: 124ms");
+      // Phase timings render only in debug; an absent phase never renders.
+      expect(provided.includes("Timings: routeMs 10ms · nodesMs 300ms")).toBe(debug);
       const omitted = rows([{ type: "done", metrics: metrics() }], true, debug)[0];
       expect(omitted).toContain("Stockbot input: n/a · Stockbot output: n/a");
+      expect(omitted).not.toContain("Timings:");
     }
   });
 

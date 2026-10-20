@@ -43,6 +43,8 @@ let sessionsCreated = 0;
 
 let emitProgress = false;
 let emitEvidence = false;
+// runKernelAgent ends with this done metrics object when non-null.
+let kernelDone: Record<string, unknown> | null = null;
 const capturedSource = { id: `capture:${"a".repeat(64)}`, title: "Captured filing", url: "https://www.sec.gov/filing" };
 const bridgeEvidence: Evidence = {
   id: "ev:bridge", source: "bridge", retrievedAt: "2026-01-01T00:00:00Z", content: "internal tool output",
@@ -90,6 +92,10 @@ mock.module("@/lib/agent/kernel", () => ({
       emit({ type: "evidence", evidence: [bridgeEvidence], sessionId: "rs:test" });
       emit({ type: "answer_delta", text: "A fact [ev:bridge]" });
     }
+    if (kernelDone !== null) {
+      const emit = args[1] as (e: Record<string, unknown>) => void;
+      emit({ type: "done", metrics: kernelDone });
+    }
   },
 }));
 
@@ -130,6 +136,7 @@ function reset(): void {
   reasonDown = false;
   emitProgress = false;
   emitEvidence = false;
+  kernelDone = null;
   verdicts = ["node_resolved"];
   personas = null;
   routeReply = null;
@@ -190,7 +197,8 @@ describe("agent entry route", () => {
       delete process.env.OPENCODE_MODEL;
       winner = "clarify_subject";
       const prompt = "can you give me buying advice";
-      const now = spyOn(performance, "now").mockReturnValueOnce(100).mockReturnValue(125);
+      // Calls: request start, route start, route end, clarify start, first text, done.
+      const now = spyOn(performance, "now").mockReturnValueOnce(80).mockReturnValueOnce(80).mockReturnValueOnce(90).mockReturnValueOnce(100).mockReturnValue(125);
       try {
         const events = await eventsFor(prompt, ticker);
         expect(events).toEqual([
@@ -205,6 +213,7 @@ describe("agent entry route", () => {
               muse: { calls: 0, totalMs: 0 },
               evidence: { count: 0, characters: 0 },
               failures: {},
+              timings: { routeMs: 10, firstTextMs: 45 },
             },
           },
         ]);
@@ -217,6 +226,24 @@ describe("agent entry route", () => {
       } finally {
         now.mockRestore();
       }
+    }
+  });
+
+  test("research done keeps kernel timings and adds the route and first-text timings", async () => {
+    reset();
+    winner = "research_required";
+    emitProgress = true;
+    emitEvidence = true;
+    const metrics = { totalMs: 1, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: 1 }, evidence: { count: 1, characters: 1 }, failures: {} };
+    kernelDone = { ...metrics, timings: { intakeMs: 120, nodesMs: 300 } };
+    const now = spyOn(performance, "now").mockReturnValueOnce(1000).mockReturnValueOnce(1000).mockReturnValueOnce(1015).mockReturnValue(1250);
+    try {
+      const events = await eventsFor("What drove NVDA revenue?");
+      expect(events.map((e) => e.type)).toEqual(["progress", "evidence", "answer_delta", "done"]);
+      // A phase the worker never reported (reasonerMs, admitMs, ...) stays absent.
+      expect(events.at(-1)?.metrics).toEqual({ ...metrics, timings: { intakeMs: 120, nodesMs: 300, routeMs: 15, firstTextMs: 250 } });
+    } finally {
+      now.mockRestore();
     }
   });
 

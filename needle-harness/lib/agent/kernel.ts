@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { reason, type MuseUsage } from "../muse/client";
 import { FINAL_PERSONAS, redactArgs, sourceReferences } from "./types";
-import type { AgentEvent, Evidence, FailureCategory, FinalClaim, FinalPersonaResult, Metrics, Persona } from "./types";
+import type { AgentEvent, Evidence, FailureCategory, FinalClaim, FinalPersonaResult, Metrics, Persona, Timings } from "./types";
 
 // ponytail: persistent worker bridge (spawn-once, ready-gated); spawn/exit/stderr handling mirrors lib/needle/client.ts.
 function requiredEnv(name: string): string {
@@ -669,6 +669,8 @@ type KernelRun = {
   museCalls: number;
   museMs: number;
   usage: MuseUsage;
+  timings: Timings;
+  pass2At: number | undefined;
 };
 
 // One answer pass: the reasoner stages plus the drafts and gaps that the gate and
@@ -705,15 +707,34 @@ function rowsOf<T>(v: T[] | undefined): T[] {
 
 // Every terminal event reports the same totals.
 function metricsOf(run: KernelRun, escalations: number): Metrics {
+  const now = performance.now();
   return {
-    totalMs: performance.now() - run.t0,
+    totalMs: now - run.t0,
     // ponytail: kernel reports no routing/execution split yet; worker wall time sits on tools, TS routing is 0.
     needle: { calls: run.decisionsCount, totalMs: 0, escalations },
     tools: { calls: run.callsCount, totalMs: run.workerMs },
     muse: { calls: run.museCalls, totalMs: run.museMs, ...run.usage },
     evidence: { count: run.evidence.length, characters: run.evidence.reduce((n, e) => n + e.content.length, 0) },
     failures: run.failures,
+    // Phases sum over both passes; pass2Ms is the pass-2 wall time and overlaps them.
+    timings: {
+      ...run.timings,
+      ...(run.museCalls > 0 ? { personasMs: run.museMs } : {}),
+      ...(run.pass2At !== undefined ? { pass2Ms: now - run.pass2At } : {}),
+    },
   };
+}
+
+// Worker progress stages that carry phase milliseconds: [detail field, timing key].
+const WORKER_TIMINGS: Record<string, readonly (readonly [string, keyof Timings])[]> = {
+  intake_done: [["wall_ms", "intakeMs"], ["settle_ms", "admitMs"]],
+  reasoner_done: [["ms", "reasonerMs"]],
+  nodes_done: [["ms", "nodesMs"]],
+};
+
+// Worker milliseconds are untrusted JSON: only finite numbers count.
+function addTiming(run: KernelRun, key: keyof Timings, ms: unknown): void {
+  if (typeof ms === "number" && Number.isFinite(ms)) run.timings[key] = (run.timings[key] ?? 0) + ms;
 }
 
 // One shared terminal path: count the failure, disclose it, then report totals.
@@ -790,6 +811,8 @@ function endTerminal(run: KernelRun): void {
 // and relays worker progress with a detail only when the worker sent one.
 function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSignal; timeoutMs: number; onProgress: (stage: string, detail?: Record<string, unknown>) => void } {
   const onProgress = (stage: string, detail?: Record<string, unknown>): void => {
+    const fields = Object.hasOwn(WORKER_TIMINGS, stage) ? WORKER_TIMINGS[stage] : [];
+    for (const [field, key] of fields) addTiming(run, key, detail?.[field]);
     if (stage === "chart_update") {
       const ticker = parseTicker(detail?.ticker);
       if (ticker !== undefined) {
@@ -989,6 +1012,7 @@ async function followPass(run: KernelRun, gap: string): Promise<boolean> {
   const sessionId = typeof run.sessionId === "string" && run.sessionId ? run.sessionId : undefined;
   const deadlineAt = Date.now() + REQUEST_WALL_MS;
   run.direct = false;
+  run.pass2At = performance.now();
   run.emit({ type: "progress", stage: "evidence_gap", detail: { missing: gap.slice(0, 300) } });
   const body: Record<string, unknown> = sessionId === undefined
     ? { op: "run", prompt: `${run.prompt}\nStill missing: ${gap}`, deadlineAt, ...run.scope }
@@ -1180,6 +1204,7 @@ async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
     return;
   }
   const order: Persona[] = run.isTrio ? ["bearbot", "bullbot", "stockbot"] : [...run.personas];
+  const gatesAt = performance.now();
   const gated = await applyFinalGates({
     results: order.flatMap((p) => results.filter((r) => r.persona === p)),
     evidence: run.evidence,
@@ -1189,6 +1214,7 @@ async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
     ...(typeof run.sessionId === "string" && run.sessionId ? { sessionId: run.sessionId } : {}),
     gate: (body, gateOpts) => run.router.call(body, { ...(run.signal ? { signal: run.signal } : {}), ...gateOpts }),
   });
+  addTiming(run, "gatesMs", performance.now() - gatesAt);
   if ("failure" in gated) endFailed(run, "muse", "provider_error", gated.failure);
   else endReport(run, gated.text);
 }
@@ -1284,6 +1310,8 @@ function openRun(prompt: string, emit: (e: AgentEvent) => void, opts: KernelRunO
     museCalls: 0,
     museMs: 0,
     usage: {},
+    timings: {},
+    pass2At: undefined,
   };
 }
 

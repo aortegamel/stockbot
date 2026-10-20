@@ -140,7 +140,7 @@ export function AgentConsole({ events, reasoning, debug }: { events: AgentEvent[
       </div>}
       <SelectedSource selected={selected} known={known} setSelected={setSelected} />
       {tail.map((e, i) => (
-        <AgentEventView key={`tail-${i}`} event={e} />
+        <AgentEventView key={`tail-${i}`} event={e} debug={debug} />
       ))}
     </div>
   );
