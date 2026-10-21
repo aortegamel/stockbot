@@ -440,6 +440,8 @@ def _decision_env(monkeypatch: pytest.MonkeyPatch, api_format: str = "chat_compl
     monkeypatch.setenv("DECISION_API_URL", _NATIVE_URL if native else _DECISION_URL)
     monkeypatch.setenv("DECISION_API_KEY", _DECISION_KEY)
     monkeypatch.setenv("DECISION_MODEL", _NATIVE_MODEL if native else _DECISION_MODEL)
+    # app.config loads the repository .env; each test sets REASONING_EFFORT itself.
+    monkeypatch.delenv("REASONING_EFFORT", raising=False)
 
 
 def _chat_body(content: object, **extra: object) -> bytes:
@@ -1015,6 +1017,38 @@ def test_http_decision_format_comes_only_from_setting(
     body = json.loads(req.data)
     expected = {"model", "state", "questions"} if api_format == "decisions" else {"model", "messages", "stream"}
     assert set(body) == expected and body["model"] == _NATIVE_MODEL
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
+def test_http_decision_reasoning_effort_field_per_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str
+) -> None:
+    """Chat Completions gets reasoning_effort unchanged; the Decisions API documents no reasoning field."""
+    import urllib.request
+
+    client, seen = _http_client(tmp_path, monkeypatch, _body(api_format, _HTTP_ANSWERS), api_format)
+    monkeypatch.setenv("REASONING_EFFORT", "xhigh")
+    _http_run(client)
+    req = seen["request"]
+    assert isinstance(req, urllib.request.Request) and isinstance(req.data, bytes)
+    body = json.loads(req.data)
+    if api_format == "decisions":
+        assert set(body) == {"model", "state", "questions"}
+    else:
+        assert set(body) == {"model", "messages", "stream", "reasoning_effort"}
+        assert body["reasoning_effort"] == "xhigh"
+
+
+@pytest.mark.parametrize("api_format", _FORMATS)
+@pytest.mark.parametrize("value", ["XHIGH", "x high", "1high", "a" * 33])
+def test_http_decision_rejects_bad_reasoning_effort_before_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str, value: str
+) -> None:
+    client, seen = _http_client(tmp_path, monkeypatch, _body(api_format, _HTTP_ANSWERS), api_format)
+    monkeypatch.setenv("REASONING_EFFORT", value)
+    with pytest.raises(RuntimeError, match=r"decide: decision_request_failed: REASONING_EFFORT must match"):
+        _http_run(client)
+    assert "request" not in seen and "persist" not in seen
 
 
 @pytest.mark.parametrize("api_format", _FORMATS)

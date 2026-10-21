@@ -6,11 +6,16 @@ edgartools identity configuration lives behind the edgar boundary in
 
 import logging
 import os
+import re
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 
 from dotenv import dotenv_values
 
 from .log_stream import LogStreamHandler
+
+if TYPE_CHECKING:
+    from .research.models import JSONValue
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -131,6 +136,30 @@ def _env_optional(name: str) -> str | None:
     """Optional env value: stripped string, or None when unset/blank."""
     value = (os.getenv(name) or "").strip()
     return value or None
+
+
+_REASONING_EFFORT_SHAPE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+
+
+def reasoning_fields(
+    protocol: Literal["responses", "chat_completions", "decisions"], error_prefix: str
+) -> dict[str, JSONValue]:
+    """REASONING_EFFORT in the protocol's own request field; TS twin: decision/reasoning.ts.
+
+    A set value passes through unchanged, so each provider's own levels work. Unset or
+    empty sends no field: the provider default applies. A bad shape raises before any request.
+    """
+    effort = _env_optional("REASONING_EFFORT")
+    if effort is None:
+        return {}
+    if not _REASONING_EFFORT_SHAPE.fullmatch(effort):
+        raise RuntimeError(f"{error_prefix}: REASONING_EFFORT must match ^[a-z][a-z0-9_-]{{0,31}}$")
+    if protocol == "responses":
+        return {"reasoning": {"effort": effort}}
+    if protocol == "chat_completions":
+        return {"reasoning_effort": effort}
+    # The Decisions API request schema (DecisionsRequest) documents no reasoning field: send none.
+    return {}
 
 
 def _env_int(name: str, default: int) -> int:

@@ -8,8 +8,9 @@ analyses / evidence requests). JEV admission (choice/noul/score) happens
 elsewhere; the candidates returned here are non-authoritative until admitted.
 
 Thin transport: reuses the decision/run.ts postOpenCode contract
-(POST {model, input} -> Responses payload with output/message/output_text
-parts -> exact-keys JSON object). No new protocol, no new auth flow.
+(POST {model, input, optional REASONING_EFFORT reasoning} -> Responses payload
+with output/message/output_text parts -> exact-keys JSON object). No new
+protocol, no new auth flow.
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ from dataclasses import dataclass
 from typing import Literal, NotRequired, TypedDict
 from urllib import error as _urlerror
 from urllib import request as _urlrequest
+
+from app.config import reasoning_fields
 
 
 class Proposal(TypedDict):
@@ -358,7 +361,9 @@ PostFn = Callable[[str, str], dict[str, object]]
 
 
 def _default_post(url: str, api_key: str, model: str, prompt: str, timeout_s: float = 120.0) -> dict[str, object]:
-    body = json.dumps({"model": model, "input": prompt}).encode()
+    body = json.dumps(
+        {"model": model, "input": prompt, **reasoning_fields("responses", "opencode_unavailable")}
+    ).encode()
     req = _urlrequest.Request(
         url,
         data=body,

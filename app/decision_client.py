@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, NoReturn, Protocol, TypeGuard, override, runtime_checkable
 
 from app.child_spawn import registering_child
-from app.config import get_data_root
+from app.config import get_data_root, reasoning_fields
 from app.research.models import (
     DecisionRecord,
     JSONValue,
@@ -1677,19 +1677,21 @@ class JevClient:
         url = _decision_setting("DECISION_API_URL")
         key = _decision_setting("DECISION_API_KEY")
         model = _decision_setting("DECISION_MODEL")
+        reasoning = reasoning_fields(api_format, "decide: decision_request_failed")
         decision_input: dict[str, JSONValue] = {
             "state": validate_json_value(state, "<state>"),
             "questions": dict(questions),
         }
         body: dict[str, JSONValue]
         if api_format == "decisions":
-            body = {"model": model, **decision_input}
+            body = {"model": model, **decision_input, **reasoning}
         else:
             user = json.dumps(decision_input, separators=(",", ":"))
             body = {
                 "model": model,
                 "messages": [{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": user}],
                 "stream": False,
+                **reasoning,
             }
         req = urllib.request.Request(
             url,

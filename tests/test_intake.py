@@ -1951,9 +1951,9 @@ def test_reasoner_real_transport_sends_exact_prompt(monkeypatch: pytest.MonkeyPa
         return io.BytesIO(json.dumps(_reasoner_response('{"proposals":[]}')).encode())
 
     monkeypatch.setattr(rc._urlrequest, "urlopen", urlopen)
-    assert ReasonerClient(model="m", url="http://opencode.invalid", api_key="secret", timeout_s=7).decompose(
-        "raw\nprompt", "s"
-    ) == {"proposals": []}
+    monkeypatch.delenv("REASONING_EFFORT", raising=False)
+    client = ReasonerClient(model="m", url="http://opencode.invalid", api_key="secret", timeout_s=7)
+    assert client.decompose("raw\nprompt", "s") == {"proposals": []}
     request, timeout = requests[0]
     assert request.full_url == "http://opencode.invalid"
     data = request.data
@@ -1961,6 +1961,17 @@ def test_reasoner_real_transport_sends_exact_prompt(monkeypatch: pytest.MonkeyPa
     assert json.loads(data) == {"model": "m", "input": "raw\nprompt"}
     assert request.get_header("Authorization") == "Bearer secret"
     assert timeout == 7
+    # REASONING_EFFORT passes through unchanged as Responses reasoning.effort.
+    monkeypatch.setenv("REASONING_EFFORT", "xhigh")
+    client.decompose("raw\nprompt", "s")
+    data = requests[1][0].data
+    assert isinstance(data, bytes)
+    assert json.loads(data) == {"model": "m", "input": "raw\nprompt", "reasoning": {"effort": "xhigh"}}
+    # A bad shape is a config failure (terminal for the retry loop) before any request.
+    monkeypatch.setenv("REASONING_EFFORT", "X High")
+    with pytest.raises(RuntimeError, match=r"^opencode_unavailable: REASONING_EFFORT must match"):
+        client.decompose("raw\nprompt", "s")
+    assert len(requests) == 2
 
 
 @pytest.mark.parametrize(
