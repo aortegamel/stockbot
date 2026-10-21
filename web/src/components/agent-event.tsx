@@ -53,11 +53,11 @@ const TOOL_PHRASES: Record<string, string> = {
   search_company_patents: "Searched company patents", get_current_time: "Checked the current time",
   set_chart_symbol: "Changed the chart", update_watchlist: "Updated the watchlist",
 };
-// Worker progress stages (app/research/kernel_worker.py) plus the kernel's evidence_gap.
+// Worker progress stages (app/research/kernel_worker.py).
 const STAGE_PHRASES: Record<string, string> = {
   session: "Opened a research session", intake_start: "Started gathering sources", intake_done: "Gathered first sources",
   intake_evidence: "Reviewed first evidence", reasoner_start: "Planned the research", reasoner_retry: "Re-planned the research",
-  reasoner_done: "Finished the plan", nodes_done: "Finished the research steps", evidence_gap: "Looked for missing evidence",
+  reasoner_done: "Finished the plan", nodes_done: "Finished the research steps",
 };
 
 type Step = Extract<AgentEvent, { type: "tool_start" | "progress" }>;

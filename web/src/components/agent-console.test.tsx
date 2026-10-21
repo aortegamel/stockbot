@@ -282,6 +282,49 @@ describe("AgentConsole trio offer", () => {
   });
 });
 
+describe("AgentConsole status lines", () => {
+  const working: AgentEvent[] = [
+    { type: "agent_start", prompt: "NVDA insider sales?" },
+    { type: "status", text: "Looking up Form 4 insider filings…" },
+    { type: "tool_start", tool: "get_insider_activity" },
+    { type: "status", text: "Reading <b>Form 4</b> filings for NVDA" },
+  ];
+  const answered: AgentEvent[] = [...working, { type: "answer_delta", text: "Insiders sold." }, { type: "done", metrics: metrics() }];
+
+  function statusView(events: AgentEvent[], debug = false): { live: string[]; details: HTMLDetailsElement | null; text: string } {
+    const page = new JSDOM(html(events, true, debug));
+    try {
+      const doc = page.window.document;
+      const live = [...(doc.querySelector('[role="status"]')?.children ?? [])].map((line) => line.textContent ?? "");
+      return { live, details: doc.querySelector<HTMLDetailsElement>("details.text-xs"), text: doc.body.textContent ?? "" };
+    } finally {
+      page.window.close();
+    }
+  }
+
+  test("prod shows each status line as plain text while the run works", () => {
+    const view = statusView(working);
+    expect(view.live).toEqual(["Looking up Form 4 insider filings…", "Reading <b>Form 4</b> filings for NVDA"]);
+    expect(view.details).toBeNull();
+    // Raw work rows stay hidden in prod.
+    expect(view.text).not.toContain("get_insider_activity");
+  });
+
+  test("the lines collapse under one summary once the answer arrives", () => {
+    const view = statusView(answered);
+    expect(view.live).toEqual([]);
+    expect(view.details?.open).toBe(false);
+    expect(view.details?.querySelector("summary")?.textContent).toBe("Progress · 2 steps");
+    expect([...(view.details?.children ?? [])].slice(1).map((line) => line.textContent)).toEqual(["Looking up Form 4 insider filings…", "Reading <b>Form 4</b> filings for NVDA"]);
+  });
+
+  test("debug keeps the raw work rows and shows each status line once", () => {
+    const view = statusView(working, true);
+    expect(view.text).toContain("├─ get_insider_activity…");
+    expect(view.text.split("Looking up Form 4 insider filings…").length).toBe(2);
+  });
+});
+
 describe("AgentConsole show-work row", () => {
   const work: AgentEvent[] = [
     { type: "agent_start", prompt: "NVDA risks?" },

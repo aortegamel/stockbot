@@ -142,19 +142,18 @@ An empty graph retains the direct prompt without evidence.
 Exactly one failed or empty draft retries once.
 A second draft failure or a failed or empty synthesis fails the report without prose.
 
-If a first-pass draft or synthesis reports `Missing-Evidence`, the kernel combines unique gaps into one follow-up pass.
-The follow-up uses the same session.
-The kernel merges the evidence and repeats persona generation with the same synthesis rules.
-The follow-up still runs after persona generation exceeds the first research wall.
-The kernel never runs a third research pass.
-The second pass is final even when a gap remains.
+The kernel runs exactly one worker research run and one persona round.
+An unresolved node, a tripped guard, or an escalation never starts more research.
+The persona prompts never ask for a missing-evidence line.
+The graph projection carries no open-items list or partial-coverage line, and no persona stance mentions gaps.
+An answer never announces missing evidence: what the run did not find is left out.
 
 Final gates check the claim inventory and the whole response.
 The gate requests carry the research session id of the run they judge.
 A gate error rejects its claim or response; it never keeps ungraded prose.
 If the whole response fails, the gates check each claim.
 The kernel removes each rejected claim substring.
-Other prose stays unchanged, including uncertainty and `Missing-Evidence`.
+Other prose stays unchanged, including uncertainty.
 Node IDs and decision records never count as evidence IDs.
 
 An inventory with an unknown evidence ID retries once for each affected persona on the same evidence snapshot.
@@ -166,12 +165,16 @@ A still-invalid, empty, or failed correction fails without prose or another retr
 Other inventory defects do not retry.
 Direct answers carry no inventory and never retry.
 A gate failure, an empty persona, or rejection of all claims fails the report without prose.
+The claim inventory is the last `json` fenced block of a response.
+The kernel drops any text after its closing fence.
+An unclosed (cut-off) block never shows raw JSON: the prose ends at the fence.
 
-A remaining gap does not emit `failed` when the final gates pass.
+An unresolved node does not emit `failed` when the final gates pass.
+A research answer with no cited claim ships its gated prose with no warning banner.
 The kernel emits one `answer_delta` with labeled persona sections.
 The trio emits Bearbot and Bullbot drafts before the Stockbot response.
 Partial selections emit sections in canonical order.
-Metrics count all attempted calls and token usage across retries and passes.
+Metrics count all attempted calls and token usage across retries.
 Metrics also report the final stage duration.
 Runtime model prompts retain persona tasks, required response formats, and untrusted-data protections.
 They no longer impose advice bans, authority bans, evidence-only reasoning, word targets, or a prose outline.
@@ -180,15 +183,22 @@ Existing code validation, risk checks, authorization, and execution limits remai
 The configured provider can still add a disclaimer.
 Muse receives all projected evidence without an aggregate character cap.
 
-Research wall: the 120-second `REQUEST_WALL_MS` deadline applies to each worker research pass.
-The first pass starts its wall at route entry, or at the caller `deadlineAt`.
-The follow-up pass gets a fresh wall: `deadlineAt` is the follow-up start plus 120 seconds.
-Its worker call timeout is also 120 seconds.
-Worst-case research latency is therefore 240 seconds plus unbounded persona time.
-One gap adds one follow-up research pass and one more persona generation round.
+Research wall: the 120-second `REQUEST_WALL_MS` deadline applies to the worker research run.
+The run starts its wall at route entry, or at the caller `deadlineAt`.
+Its worker call timeout is the time left on that wall.
+Worst-case research latency is therefore 120 seconds plus unbounded persona time.
 Persona generation, the draft retry, and Stockbot synthesis have no application time limit.
 The kernel waits for them without a deadline, even after the wall passes.
 The caller cancellation signal still reaches every persona call and aborts it.
+
+Output caps (experiment): two optional env knobs cap Muse output tokens.
+`MUSE_MAX_OUTPUT_TOKENS` caps each call. `MUSE_ANSWER_TOKEN_BUDGET` caps all Muse calls of one request (brief, personas, retries).
+Each call sends `max_output_tokens = min(per-call cap, remaining budget)`.
+The remaining budget drops by each response's reported output tokens.
+Concurrent trio drafts read the same remaining budget, so together they can exceed it.
+Under 16 tokens left, the next call fails before any request: the provider rejects `max_output_tokens` below 16.
+Unset knobs send no cap. The chat-completions fallback sends no cap.
+The provider counts reasoning tokens inside `max_output_tokens`, so a low cap can return little or no prose.
 
 Startup prewarm: the Bun host waits up to 120 seconds for the kernel worker `ready` message.
 At 120 seconds, prewarm kills the silent worker and logs the failure. The API host keeps serving.

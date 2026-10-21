@@ -106,7 +106,6 @@ export type FinalPersonaResult = {
   text: string;
   claims: FinalClaim[];
   confidence?: number;
-  missingEvidence?: string;
 };
 
 // Final-answer personas in fixed output order; each runs as its own Muse call.
@@ -166,7 +165,9 @@ export type AgentEvent =
   // A stockbot-only research answer offers the trio over the same session evidence.
   | { type: "offer_trio"; sessionId: string }
   | { type: "tool_failed"; tool: string; category: FailureCategory; preview: string }
-  | { type: "failed"; category: FailureCategory; message: string };
+  | { type: "failed"; category: FailureCategory; message: string }
+  // A readable progress line for the user, never answer text. Build it with statusEvent.
+  | { type: "status"; text: string };
 
 export type Metrics = {
   totalMs: number;
@@ -185,7 +186,7 @@ export type Metrics = {
   timings?: Timings;
 };
 
-export type Timings = Partial<Record<"routeMs" | "intakeMs" | "reasonerMs" | "admitMs" | "nodesMs" | "personasMs" | "gatesMs" | "pass2Ms" | "firstTextMs", number>>;
+export type Timings = Partial<Record<"routeMs" | "intakeMs" | "reasonerMs" | "admitMs" | "nodesMs" | "personasMs" | "gatesMs" | "firstTextMs", number>>;
 
 const SENSITIVE_KEY_NORMS: Record<string, true> = {
   accesstoken: true,
@@ -220,4 +221,38 @@ function redactValue(value: unknown): unknown {
 // TS key-based redaction is a UI safeguard only; the authoritative recorder boundary is app/redact.py (key norms PLUS free-text Bearer/sk/JWT patterns — a secret smuggled inside a query value is invisible to key matching).
 export function redactArgs(a: Record<string, unknown>): Record<string, unknown> {
   return redactValue(a) as Record<string, unknown>;
+}
+
+// One collapsed line bounded to 120 chars: a status can quote the prompt, a search query,
+// or model-chosen arguments. Clients render it as plain text.
+export function statusEvent(text: string): AgentEvent {
+  const line = text.replace(/\s+/g, " ").trim();
+  return { type: "status", text: line.length > 120 ? `${line.slice(0, 119)}…` : line };
+}
+
+// Present-tense [verb, object] for common tools; any other tool reads "Running <tool name>".
+const TOOL_STATUS: Record<string, readonly [string, string]> = {
+  get_insider_activity: ["Reading", "Form 4 insider filings"], get_planned_insider_sales: ["Reading", "Form 144 planned sales"],
+  get_beneficial_ownership: ["Reading", "major shareholder stakes"], get_short_interest: ["Checking", "FINRA short interest"],
+  get_reg_sho_volume: ["Checking", "FINRA short-sale volume"], get_short_pressure_profile: ["Checking", "short pressure"],
+  get_fundamentals: ["Reading", "reported fundamentals"], get_financial_statements: ["Reading", "financial statements"],
+  get_xbrl_facts: ["Reading", "reported financial facts"], get_valuation_metrics: ["Calculating", "valuation multiples"],
+  get_analyst_estimates: ["Reading", "analyst estimates"], get_material_events: ["Reading", "recent material events"],
+  search_sec_filings: ["Searching", "SEC filings"], search_sec_filings_bounded: ["Searching", "SEC filings"],
+  list_sec_filings: ["Listing", "SEC filings"], get_sec_document: ["Reading", "the SEC filing"],
+  find_sec_entities: ["Finding", "the company at the SEC"], find_sec_entities_bounded: ["Finding", "the company at the SEC"],
+  search_web: ["Searching", "the web"], get_current_time: ["Checking", "the current time"],
+  query_finra: ["Analyzing", "FINRA data"], get_finra_datapoints: ["Reading", "FINRA data"],
+};
+
+// "Reading Form 4 insider filings for NVDA"; search_web names its query ("Searching the web: <query>").
+// verb replaces the tool verb, e.g. "Looking up" before the arguments exist.
+export function toolStatus(tool: string, subject?: string, verb?: string): string {
+  const [toolVerb, what] = Object.hasOwn(TOOL_STATUS, tool) ? TOOL_STATUS[tool] : ["Running", tool.replaceAll("_", " ")];
+  const suffix = subject ? (tool === "search_web" ? `: ${subject}` : ` for ${subject}`) : "";
+  return `${verb ?? toolVerb} ${what}${suffix}`;
+}
+
+export function foundStatus(count: number): string {
+  return count > 0 ? `Found ${count} ${count === 1 ? "source" : "sources"}` : "Found nothing new";
 }

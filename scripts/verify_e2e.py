@@ -49,6 +49,7 @@ class Case(TypedDict):
 class Run:
     events: list[str] = field(default_factory=list)
     first_text_ms: float | None = None
+    first_progress_ms: float | None = None  # First readable status line, before any answer text.
     total_ms: float | None = None
     route: str | None = None
     citation_count: int = 0
@@ -93,7 +94,9 @@ def parse_stream(lines: Iterable[tuple[float, bytes]]) -> Run:
             continue
         kind = str(event.get("type")) if isinstance(event, dict) else "non-object"
         run.events.append(kind)
-        if kind == "answer_delta":
+        if kind == "status":
+            run.first_progress_ms = ms if run.first_progress_ms is None else run.first_progress_ms
+        elif kind == "answer_delta":
             run.first_text_ms = ms if run.first_text_ms is None else run.first_text_ms
             answer.append(str(event.get("text", "")))
         elif kind == "evidence":
@@ -217,12 +220,14 @@ def main(argv: list[str] | None = None) -> int:
             results.append((case, n, run, evaluate(case, run)))
     research = [run for case, _, run, _ in results if "research_required" in _routes(case)]
     first = [r.first_text_ms for r in research if r.first_text_ms is not None]
+    progress = [r.first_progress_ms for r in research if r.first_progress_ms is not None]
     total = [r.total_ms for r in research if r.total_ms is not None]
     passed = sum(not fails for *_, fails in results)
     summary = {
         "runs": len(results),
         "passed": passed,
         "research": {
+            "first_progress_ms": {"p50": _pct(progress, 0.5), "p90": _pct(progress, 0.9)},
             "first_text_ms": {"p50": _pct(first, 0.5), "p90": _pct(first, 0.9)},
             "total_ms": {"p50": _pct(total, 0.5), "p90": _pct(total, 0.9)},
         },
@@ -233,13 +238,13 @@ def main(argv: list[str] | None = None) -> int:
     out.write_text(
         json.dumps({"base_url": args.base_url, "runs": rows, "summary": summary}, indent=2) + "\n", encoding="utf-8"
     )
-    print("| id | route | first_text_ms | total_ms | citations | pass |")
-    print("|---|---|---|---|---|---|")
+    print("| id | route | first_progress_ms | first_text_ms | total_ms | citations | pass |")
+    print("|---|---|---|---|---|---|---|")
     for case, n, run, fails in results:
         label = f"{case['id']}#{n}" if args.runs > 1 else case["id"]
         verdict = "PASS" if not fails else f"FAIL {','.join(fails)}"
         print(
-            f"| {label} | {run.route} | {_ms(run.first_text_ms)} | {_ms(run.total_ms)} | {run.citation_count} | {verdict} |"
+            f"| {label} | {run.route} | {_ms(run.first_progress_ms)} | {_ms(run.first_text_ms)} | {_ms(run.total_ms)} | {run.citation_count} | {verdict} |"
         )
     print(f"\n{passed}/{len(results)} passed; research p50/p90 ms: {json.dumps(summary['research'])}")
     print(f"wrote {out}")

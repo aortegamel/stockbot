@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import { categorizeFailure, closeBridge, endSession, invoke, newSessionId } from "./stockbot";
 import { harvest, reason, splitInventory } from "../muse/client";
 import fc from "fast-check";
-import { FINAL_PERSONAS, sourceReferences, type Evidence, type Persona } from "../agent/types";
+import { FINAL_PERSONAS, sourceReferences, type Evidence, type FinalClaim, type Persona } from "../agent/types";
 
 const ROOT = process.cwd().endsWith("needle-harness")
   ? process.cwd().replace(/\/needle-harness$/, "")
@@ -376,6 +376,18 @@ describe("muse inventory fence", () => {
       expect(inv.confidence).toBeUndefined();
     }
   });
+
+  test("the claims block is found whether it ends the text, has text after it, or is cut off", () => {
+    const block = `\`\`\`json ${JSON.stringify({ claims: [{ text: "A fact [E1].", claim_type: "observed_fact", evidence_ids: ["E1"] }] })}`;
+    const claims: FinalClaim[] = [{ text: "A fact [E1].", claimType: "observed_fact", evidenceIds: ["E1"] }];
+    // Fence last, then trailing whitespace or text after the fence: the claims parse, and the trailing text is dropped.
+    for (const tail of ["```", "```  \n\n", "```\nThanks for reading.\n"]) {
+      expect(splitInventory(`A fact [E1].\n${block}${tail}`)).toEqual({ prose: "A fact [E1].\n", claims });
+    }
+    // Unclosed fence: complete JSON still parses; truncated JSON gives no claims. Raw JSON never reaches the prose.
+    expect(splitInventory(`A fact [E1].\n${block}`)).toEqual({ prose: "A fact [E1].\n", claims });
+    expect(splitInventory(`A fact [E1].\n${block.slice(0, 30)}`)).toEqual({ prose: "A fact [E1].\n", claims: [] });
+  });
 });
 
 describe("server source metadata", () => {
@@ -417,12 +429,12 @@ describe("server source metadata", () => {
 
 describe("muse reason personas (fake provider)", () => {
   type Msg = { role: string; content: string };
-  type Body = { model: string; input?: Msg[]; messages?: Msg[] };
+  type Body = { model: string; input?: Msg[]; messages?: Msg[]; max_output_tokens?: number };
   type Seen = { path: string; session: string | null; body: Body };
   const seen: Seen[] = [];
   let respond: (path: string, body: Body) => Response = () => sse("ok");
   let stopServer = (): void => { };
-  const KEYS = ["OPENCODE_API_KEY", "OPENCODE_MODEL", "OPENCODE_URL"] as const;
+  const KEYS = ["OPENCODE_API_KEY", "OPENCODE_MODEL", "OPENCODE_URL", "MUSE_MAX_OUTPUT_TOKENS", "MUSE_ANSWER_TOKEN_BUDGET"] as const;
   const prevEnv = Object.fromEntries(KEYS.map((k) => [k, process.env[k]]));
 
   function sse(...deltas: string[]): Response {
@@ -433,11 +445,8 @@ describe("muse reason personas (fake provider)", () => {
   }
   const systemOf = (b: Body): string => (b.input ?? b.messages ?? [])[0].content;
   const userOf = (b: Body): string => (b.input ?? b.messages ?? [])[1].content;
-  // Fake provider plays whichever persona the system message names; only the bear asks for more evidence.
-  const personaReply = (_path: string, b: Body): Response => {
-    const who = /^You are (\w+)\./.exec(systemOf(b))?.[1] ?? "nobody";
-    return who === "Bearbot" ? sse("Bearbot read [E1].\n", "Missing-Evidence: revolver covenant terms") : sse(`${who} read [E1].`);
-  };
+  // Fake provider plays whichever persona the system message names.
+  const personaReply = (_path: string, b: Body): Response => sse(`${/^You are (\w+)\./.exec(systemOf(b))?.[1] ?? "nobody"} read [E1].`);
   // One draft delta, then the stream never ends.
   const hanging = (): Response =>
     new Response(
@@ -456,8 +465,6 @@ describe("muse reason personas (fake provider)", () => {
   const input = {
     prompt: "Is ACME exposed to its lender?\n\nOBJECTIVE (verbatim user intent; never restate or change it): ACME lender exposure",
     evidence,
-    escalated: false,
-    unresolved: ["n2"],
     onDelta: () => { },
   };
 
@@ -488,16 +495,13 @@ describe("muse reason personas (fake provider)", () => {
   beforeEach(() => {
     seen.length = 0;
     respond = personaReply;
+    delete process.env.MUSE_MAX_OUTPUT_TOKENS;
+    delete process.env.MUSE_ANSWER_TOKEN_BUDGET;
   });
 
-  test("personas see the same request and evidence on separate sessions; gaps stay per persona", async () => {
+  test("personas see the same request and evidence on separate sessions", async () => {
     const results = await Promise.all(FINAL_PERSONAS.map((persona) => reason({ ...input, ticker: "NVDA", persona })));
-    expect(results.map((r) => r.text)).toEqual([
-      "Stockbot read [E1].",
-      "Bearbot read [E1].\nMissing-Evidence: revolver covenant terms",
-      "Bullbot read [E1].",
-    ]);
-    expect(results.map((r) => r.missingEvidence)).toEqual([undefined, "revolver covenant terms", undefined]);
+    expect(results.map((r) => r.text)).toEqual(["Stockbot read [E1].", "Bearbot read [E1].", "Bullbot read [E1]."]);
     expect(results[0].usage).toEqual({ inputTokens: 7, outputTokens: 3 });
     expect(seen.map((s) => s.path)).toEqual(["/v1/responses", "/v1/responses", "/v1/responses"]);
     expect(new Set(seen.map((s) => s.session)).size).toBe(3);
@@ -507,11 +511,11 @@ describe("muse reason personas (fake provider)", () => {
     const user = [...users][0];
     for (const fact of ["OBJECTIVE", "[E1]", "[E2]", "Revolver matures 2027", "Top customer is 38%"]) expect(user).toContain(fact);
     expect(user).toStartWith(`USER REQUEST\n${input.prompt}\n\nEVIDENCE\n`);
-    // Roles differ, and each keeps the open-node gap instruction and the inline citation instruction.
+    // Roles differ; none asks for a gap line, and each keeps the inline citation instruction.
     const systems = seen.map((s) => systemOf(s.body));
     expect(new Set(systems).size).toBe(3);
     for (const s of systems) {
-      expect(s).toContain("Missing-Evidence:");
+      expect(s).not.toContain("Missing-Evidence");
       expect(s).toContain("CURRENT STOCK CONTEXT\nThe current chart stock is NVDA.");
       expect(s).toContain("Use this stock only if the user request does not name a stock.");
       expect(s).toContain("An explicit stock in the user request takes precedence.");
@@ -615,7 +619,7 @@ describe("muse reason personas (fake provider)", () => {
   });
 
   test.each([undefined, "NVDA"])("a direct call sends the direct system prompt without evidence (ticker %s)", async (ticker) => {
-    const r = await reason({ prompt: "What is ACME?", ticker, evidence: [], escalated: false, direct: true, onDelta: () => { } });
+    const r = await reason({ prompt: "What is ACME?", ticker, evidence: [], direct: true, onDelta: () => { } });
     expect(r.text).toBe("Stockbot read [E1].");
     expect(seen.length).toBe(1);
     const [call] = seen;
@@ -630,7 +634,7 @@ describe("muse reason personas (fake provider)", () => {
   });
 
   test("a single-tool call without a persona keeps the evidence prompt", async () => {
-    const r = await reason({ ...input, persona: undefined, escalated: false, onDelta: () => { } });
+    const r = await reason({ ...input, persona: undefined, onDelta: () => { } });
     expect(r.text).toBe("Stockbot read [E1].");
     const [call] = seen;
     if (!call) throw new Error("expected one provider call");
@@ -652,7 +656,6 @@ describe("muse reason personas (fake provider)", () => {
     expect(r.text).toBe("Bearbot read [E1].\n");
     expect(r.claims).toEqual([{ text: "Bearbot read [E1].", claimType: "observed_fact", evidenceIds: ["E1"], confidence: 0.8 }]);
     expect(r.confidence).toBe(0.6);
-    expect(r.missingEvidence).toBeUndefined();
     // Streamed deltas keep the raw block; only the returned prose is display text.
     expect(deltas.join("")).toContain("```json");
     expect(r.text).not.toContain("```json");
@@ -670,6 +673,54 @@ describe("muse reason personas (fake provider)", () => {
     expect(seen.map((s) => s.path)).toEqual(["/v1/responses", "/v1/chat/completions"]);
     expect(seen[1].session).toBe(seen[0].session);
     expect(seen[1].body.messages).toEqual(seen[0].body.input);
+  });
+
+  test("no cap env sends no max_output_tokens; MUSE_MAX_OUTPUT_TOKENS caps each call", async () => {
+    await reason({ ...input, persona: "bearbot" });
+    expect(seen[0]?.body).not.toHaveProperty("max_output_tokens");
+    process.env.MUSE_MAX_OUTPUT_TOKENS = "1200";
+    await reason({ ...input, persona: "bearbot" });
+    expect(seen[1]?.body.max_output_tokens).toBe(1200);
+  });
+
+  test("MUSE_ANSWER_TOKEN_BUDGET caps each call at the remaining budget and charges actual output tokens", async () => {
+    process.env.MUSE_MAX_OUTPUT_TOKENS = "60";
+    process.env.MUSE_ANSWER_TOKEN_BUDGET = "100";
+    const spent = { outputTokens: 0 };
+    await reason({ ...input, persona: "stockbot", spent });
+    // The fake provider reports 3 output tokens per call.
+    expect(spent.outputTokens).toBe(3);
+    spent.outputTokens = 50;
+    await reason({ ...input, persona: "stockbot", spent });
+    expect(seen.map((s) => s.body.max_output_tokens)).toEqual([60, 50]);
+    expect(spent.outputTokens).toBe(53);
+    // A single call without a request tally still gets min(per-call cap, budget).
+    process.env.MUSE_MAX_OUTPUT_TOKENS = "";
+    await reason({ ...input, persona: "stockbot" });
+    expect(seen[2]?.body.max_output_tokens).toBe(100);
+    // Under the provider minimum of 16 left: no request.
+    spent.outputTokens = 90;
+    await expect(reason({ ...input, persona: "stockbot", spent })).rejects.toThrow("muse answer token budget exhausted");
+    expect(seen.length).toBe(3);
+  });
+
+  test("an invalid cap value fails before any request", async () => {
+    for (const raw of ["8", "12.5", "lots"]) {
+      process.env.MUSE_MAX_OUTPUT_TOKENS = raw;
+      await expect(reason({ ...input, persona: "bearbot" })).rejects.toThrow("MUSE_MAX_OUTPUT_TOKENS must be an integer >= 16");
+    }
+    expect(seen.length).toBe(0);
+  });
+
+  test("a capped stream cut off inside the claims block yields prose and no raw JSON", async () => {
+    process.env.MUSE_MAX_OUTPUT_TOKENS = "600";
+    respond = () => sse("Bearbot read [E1].\n", '```json {"claims": [{"text": "Bearbot re');
+    const r = await reason({ ...input, persona: "bearbot" });
+    expect(seen[0]?.body.max_output_tokens).toBe(600);
+    expect(r.text).toBe("Bearbot read [E1].\n");
+    expect(r.text).not.toContain("```");
+    expect(r.text).not.toContain("{");
+    expect(r.claims).toEqual([]);
   });
 
   describe("controlled clock past 120s", () => {

@@ -23,7 +23,7 @@ const PERSONAS: Record<Persona, { name: string; stance: string }> = {
   stockbot: {
     name: "Stockbot",
     stance:
-      "You give the balanced base case. Weigh the evidence and its gaps with equal rigor. State the most probable outcome. Open your answer with a 2–3 sentence conclusion before any details.",
+      "You give the balanced base case. Weigh the evidence with rigor. State the most probable outcome. Open your answer with a 2–3 sentence conclusion before any details.",
   },
   bearbot: {
     name: "Bearbot",
@@ -83,15 +83,19 @@ function parseInventoryClaim(item: unknown): FinalClaim | undefined {
   if (isConf(rec.confidence)) claim.confidence = rec.confidence;
   return claim;
 }
-const INVENTORY_FENCE = /```json\s*([\s\S]*?)\s*```\s*$/;
-// Exported for tests/kernel: trailing inventory block stripped from prose, claims
-// coerced from snake_case wire to camelCase, confidence carried when 0..1.
+const FENCE_OPEN = "```json";
+// Exported for tests/kernel: the last ```json block is the inventory. Prose is
+// the text before it. Text after its closing fence is dropped. An unclosed
+// (cut-off) block never leaks its JSON into the prose. Claims are coerced from
+// snake_case wire to camelCase; confidence is carried when 0..1.
 export function splitInventory(raw: string): { prose: string; claims: FinalClaim[]; confidence?: number } {
-  const m = INVENTORY_FENCE.exec(raw);
-  if (!m) return { prose: raw, claims: [] };
-  const prose = raw.slice(0, m.index);
+  const start = raw.lastIndexOf(FENCE_OPEN);
+  if (start < 0) return { prose: raw, claims: [] };
+  const prose = raw.slice(0, start);
+  const block = raw.slice(start + FENCE_OPEN.length);
+  const end = block.indexOf("```");
   try {
-    const doc: unknown = JSON.parse(m[1] ?? "");
+    const doc: unknown = JSON.parse(end < 0 ? block : block.slice(0, end));
     const rec = doc && typeof doc === "object" && !Array.isArray(doc) ? (doc as Record<string, unknown>) : undefined;
     const list = rec?.claims;
     const claims = Array.isArray(list)
@@ -109,17 +113,14 @@ export function splitInventory(raw: string): { prose: string; claims: FinalClaim
 function withInventory(r: { text: string; usage: MuseUsage }): {
   text: string;
   usage: MuseUsage;
-  missingEvidence?: string;
   claims: FinalClaim[];
   confidence?: number;
 } {
   const inv = splitInventory(r.text);
-  const gap = /^Missing-Evidence:\s*(.+)$/m.exec(inv.prose)?.[1];
   return {
     text: inv.prose,
     usage: r.usage,
     claims: inv.claims,
-    ...(gap !== undefined ? { missingEvidence: gap } : {}),
     ...(inv.confidence !== undefined ? { confidence: inv.confidence } : {}),
   };
 }
@@ -250,15 +251,11 @@ type ReasonOptions = {
   // A user-picked feed item: rendered in the user message as untrusted data, never in system text.
   context?: AskContext;
   evidence: Evidence[];
-  escalated: boolean;
   direct?: boolean;
   // Optional graph state (kernel.ts always sends these; direct callers omit them).
-  // escalated/incompleteGuard/unresolved add the gap instruction; it states partial coverage when evidence rows exist.
   objective?: string;
   nodes?: unknown[];
   decisions?: unknown[];
-  unresolved?: string[];
-  incompleteGuard?: boolean;
   // Final-answer persona; omitted = Stockbot (direct and single-tool callers).
   persona?: Persona;
   // Synthesis only: sibling drafts for the Stockbot judge (trio only). Bear/Bull and direct callers never use this.
@@ -267,6 +264,9 @@ type ReasonOptions = {
   signal?: AbortSignal;
   deadlineAt?: number;
   onDelta: (text: string) => void;
+  // Output tokens already spent by earlier Muse calls of the same request; the
+  // answer budget subtracts them. reason() adds its own usage to it.
+  spent?: { outputTokens: number };
   // reason() strips the inventory fence: the returned text is display prose plus
   // parsed claims (external prose unchanged; streamed deltas keep the raw block).
 };
@@ -290,22 +290,12 @@ function reasonSignal(opts: ReasonOptions): AbortSignal {
   return signal;
 }
 
-function gapInstruction(opts: ReasonOptions): string {
-  const needsGapLine =
-    opts.escalated || opts.incompleteGuard === true || (opts.unresolved !== undefined && opts.unresolved.length > 0);
-  if (!needsGapLine) return "";
-  return (opts.evidence.length > 0
-    ? "\nEvidence coverage is partial: some evidence rows are present, but retrieval did not resolve every gap."
-    : "\nRetrieval found no usable evidence.") +
-    " If evidence necessary to answer the original user request is still missing, end your answer with a line: Missing-Evidence: <only the evidence necessary to answer the original user request>.";
-}
-
 function reasonInput(opts: ReasonOptions): { role: string; content: string }[] {
   const persona = opts.persona ?? "stockbot";
   // An omitted persona retains the original prompt for direct and single-tool callers.
   const system = opts.direct
     ? directSystem(persona)
-    : (opts.persona ? researchSystem(opts.persona) : SYSTEM + CITE_IDS) + gapInstruction(opts);
+    : opts.persona ? researchSystem(opts.persona) : SYSTEM + CITE_IDS;
   const stockContext = opts.ticker
     ? `\n\nCURRENT STOCK CONTEXT\nThe current chart stock is ${opts.ticker}. Use this stock only if the user request does not name a stock. An explicit stock in the user request takes precedence.`
     : "";
@@ -326,32 +316,58 @@ function reasonInput(opts: ReasonOptions): { role: string; content: string }[] {
     { role: "user", content: user },
   ];
 }
+// The provider rejects max_output_tokens below 16 (live 400: "The number must be `>= 16`").
+const MIN_OUTPUT_TOKENS = 16;
+function envTokens(name: string): number | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < MIN_OUTPUT_TOKENS) throw new Error(`opencode_unavailable: ${name} must be an integer >= ${MIN_OUTPUT_TOKENS}`);
+  return n;
+}
 
-export async function reason(opts: ReasonOptions): Promise<{ text: string; usage: MuseUsage; missingEvidence?: string; claims: FinalClaim[]; confidence?: number }> {
+// ponytail: MUSE_MAX_OUTPUT_TOKENS (per call) and MUSE_ANSWER_TOKEN_BUDGET (all
+// Muse calls of one request) exist only for the output-cap experiment. Replace
+// both with one fixed constant once a value is chosen. Concurrent calls (trio
+// drafts) each read the same remaining budget, so they can overshoot it together.
+// Unset = no cap. max_output_tokens counts reasoning tokens too (live usage).
+function outputCap(spent: { outputTokens: number } | undefined): number | undefined {
+  const perCall = envTokens("MUSE_MAX_OUTPUT_TOKENS");
+  const total = envTokens("MUSE_ANSWER_TOKEN_BUDGET");
+  if (total === undefined) return perCall;
+  const left = total - (spent?.outputTokens ?? 0);
+  if (left < MIN_OUTPUT_TOKENS) throw new Error("muse answer token budget exhausted");
+  return Math.min(perCall ?? left, left);
+}
+
+export async function reason(opts: ReasonOptions): Promise<{ text: string; usage: MuseUsage; claims: FinalClaim[]; confidence?: number }> {
   const { apiKey, model, base } = reasonEndpoint();
   const signal = reasonSignal(opts);
+  const cap = outputCap(opts.spent);
   // Each call uses a separate provider session, including concurrent personas.
   const session = crypto.randomUUID();
   const input = reasonInput(opts);
-  const body = { model, input, stream: true };
+  const body = { model, input, stream: true, ...(cap !== undefined ? { max_output_tokens: cap } : {}) };
   // Explicit personas have no per-fetch limit. The caller deadline still applies.
   const fetchSignal = (): AbortSignal =>
     opts.persona ? signal : AbortSignal.any([AbortSignal.timeout(FETCH_TIMEOUT_MS), signal]);
-  try {
-    return withInventory(await post(base, apiKey, session, "/responses", body, opts.onDelta, fetchSignal()));
-  } catch (err) {
-    // Cancelled or past deadline: no retry, no fallback.
-    if (signal.aborted) throw err;
-    const msg = err instanceof Error ? err.message : String(err);
-    // ponytail: 429 is a usage window, not a wrong route — retry the same endpoint
-    // once after a short wait; only 404/405 (unsupported path) falls over.
-    if (/(429|GoUsageLimit)/.test(msg)) {
-      await sleep(5000, undefined, { signal });
-      return withInventory(await post(base, apiKey, session, "/responses", body, opts.onDelta, fetchSignal()));
-    }
-    if (!/(404|405|500|502|503|504)/.test(msg)) throw err;
-    return withInventory(
-      await post(
+  const send = async (): Promise<{ text: string; usage: MuseUsage }> => {
+    try {
+      return await post(base, apiKey, session, "/responses", body, opts.onDelta, fetchSignal());
+    } catch (err) {
+      // Cancelled or past deadline: no retry, no fallback.
+      if (signal.aborted) throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      // ponytail: 429 is a usage window, not a wrong route — retry the same endpoint
+      // once after a short wait; only 404/405 (unsupported path) falls over.
+      if (/(429|GoUsageLimit)/.test(msg)) {
+        await sleep(5000, undefined, { signal });
+        return post(base, apiKey, session, "/responses", body, opts.onDelta, fetchSignal());
+      }
+      if (!/(404|405|500|502|503|504)/.test(msg)) throw err;
+      // The chat fallback carries no cap: the cap name there is unverified (the
+      // live endpoint answers ModelProtocolUnsupported for chat on this model).
+      return post(
         base,
         apiKey,
         session,
@@ -359,7 +375,11 @@ export async function reason(opts: ReasonOptions): Promise<{ text: string; usage
         { model, messages: input.map((m) => ({ role: m.role, content: m.content })), stream: true },
         opts.onDelta,
         fetchSignal(),
-      ),
-    );
-  }
+      );
+    }
+  };
+  const raw = await send();
+  // A response without a usage count is charged the full cap.
+  if (opts.spent) opts.spent.outputTokens += raw.usage.outputTokens ?? cap ?? 0;
+  return withInventory(raw);
 }

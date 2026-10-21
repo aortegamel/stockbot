@@ -5171,7 +5171,7 @@ async def _drive_rounds(
             _log_round_timing(sid, nid, round_no, None, attempts, ev_before, evidence, select_ms)
             continue
         select_failures = 0
-        _progress(progress, "tool_start", {"node_id": nid, "action": action})
+        _progress(progress, "tool_start", {"node_id": nid, "action": action, "tools": _selection_tools(decision)})
         step = await _run_round(
             action,
             decision,

@@ -3314,7 +3314,9 @@ def test_e2e_parse_research_stream_times_text_and_counts_known_citations() -> No
         _sse(
             (5, {"type": "agent_start", "prompt": "p"}),
             (6, b": keepalive\n"),
+            (8, {"type": "status", "text": "Researching: p"}),
             (50, {"type": "progress", "stage": "working"}),
+            (55, {"type": "status", "text": "Planned 3 questions"}),
             (60, {"type": "chart_update", "ticker": "NVDA"}),
             (70, {"type": "evidence", "evidence": [{"id": "ev:a"}, {"id": "ev:b"}]}),
             (900, {"type": "answer_delta", "text": "Risk [ev:a] and [ev:a] "}),
@@ -3322,8 +3324,18 @@ def test_e2e_parse_research_stream_times_text_and_counts_known_citations() -> No
             (1200, _done(tools=2)),
         )
     )
-    assert run.events == ["agent_start", "progress", "chart_update", "evidence", "answer_delta", "answer_delta", "done"]
-    assert (run.first_text_ms, run.total_ms, run.route) == (900, 1200, "research_required")
+    assert run.events == [
+        "agent_start",
+        "status",
+        "progress",
+        "status",
+        "chart_update",
+        "evidence",
+        "answer_delta",
+        "answer_delta",
+        "done",
+    ]
+    assert (run.first_progress_ms, run.first_text_ms, run.total_ms, run.route) == (8, 900, 1200, "research_required")
     assert run.citation_count == 1  # ev:a once; ev:zz is not a streamed evidence id.
     assert run.timings == _done(tools=2)["metrics"] and run.errors == []
     case: e2e.Case = {**_case(), "expected_route": "research_required"}

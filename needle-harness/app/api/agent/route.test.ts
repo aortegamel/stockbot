@@ -301,7 +301,7 @@ describe("agent entry route", () => {
   test("reasoning_required answers direct without tools or research", async () => {
     reset();
     const types = (await eventsFor("hello")).map((e) => e.type);
-    expect(types).toEqual(["agent_start", "reasoning_start", "answer_delta", "done"]);
+    expect(types).toEqual(["agent_start", "status", "reasoning_start", "answer_delta", "done"]);
     expect(runCalls.length).toBe(0);
     expect(kernelCalls.filter((c) => c.op === "arguments").length).toBe(0);
     expect(reasonCalls[0].evidence).toEqual([]);
@@ -314,7 +314,7 @@ describe("agent entry route", () => {
     try {
       winner = "no_session";
       const types = (await eventsFor("hello")).map((e) => e.type);
-      expect(types).toEqual(["agent_start", "reasoning_start", "answer_delta", "done"]);
+      expect(types).toEqual(["agent_start", "status", "reasoning_start", "answer_delta", "done"]);
       expect(runCalls.length).toBe(0);
       expect(reasonCalls[0].evidence).toEqual([]);
     } finally {
@@ -331,7 +331,7 @@ describe("agent entry route", () => {
     ]) {
       reset();
       const types = (await eventsFor(prompt)).map((e) => e.type);
-      expect(types).toEqual(["agent_start", "reasoning_start", "answer_delta", "done"]);
+      expect(types).toEqual(["agent_start", "status", "reasoning_start", "answer_delta", "done"]);
       expect(runCalls.length).toBe(0);
       expect(kernelCalls.filter((c) => c.op === "arguments").length).toBe(0);
       expect(reasonCalls[0].evidence).toEqual([]);
@@ -343,13 +343,37 @@ describe("agent entry route", () => {
     winner = "get_current_time";
     const events = await eventsFor("what time is it?");
     const types = events.map((e) => e.type);
-    expect(types).toEqual(["agent_start", "needle_decision", "tool_start", "tool_result", "evidence", "reasoning_start", "answer_delta", "done"]);
+    expect(types).toEqual(["agent_start", "status", "needle_decision", "tool_start", "status", "tool_result", "status", "evidence", "reasoning_start", "answer_delta", "done"]);
+    // Readable progress precedes the tool result: the route line first, then the tool phrase, then the count.
+    expect(events.flatMap((e) => (e.type === "status" ? [e.text] : []))).toEqual(["Looking up the current time…", "Checking the current time", "Found 1 source"]);
     expect(events.filter((e) => e.type === "tool_start").length).toBe(1);
     expect(runCalls.length).toBe(0);
     expect(kernelCalls.filter((c) => c.op === "arguments").map((c) => c.tool)).toEqual(["get_current_time"]);
     expect(reasonCalls[0].evidence.length).toBe(1);
     expect(ended).toEqual(["sess-test"]);
     expect(metricCalls(events, "tools")).toBe(1);
+  });
+
+  test("status lines name the tool subject in prod, bound untrusted queries, and open the direct route", async () => {
+    reset();
+    delete process.env.STOCKBOT_DEBUG;
+    const direct = await eventsFor("hello");
+    expect(direct[1]).toEqual({ type: "status", text: "Thinking…" });
+    reset();
+    delete process.env.STOCKBOT_DEBUG;
+    winner = "get_insider_activity";
+    argsReply = { tool: "get_insider_activity", arguments: { ticker: "nvda" }, confidence: 1 };
+    const insider = await eventsFor("NVDA insider sales?");
+    expect(insider.flatMap((e) => (e.type === "status" ? [e.text] : []))).toEqual([
+      "Looking up Form 4 insider filings…", "Reading Form 4 insider filings for NVDA", "Found 1 source",
+    ]);
+    reset();
+    winner = "search_web";
+    argsReply = { tool: "search_web", arguments: { query: `chip\n  demand ${"x".repeat(200)}` }, confidence: 1 };
+    const web = (await eventsFor("chip news?")).flatMap((e) => (e.type === "status" ? [String(e.text)] : []));
+    // The model-chosen query is one collapsed line, cut to 120 characters with an ellipsis.
+    expect(web[1]).toBe(`Searching the web: chip demand ${"x".repeat(88)}…`);
+    expect(web[1]).toHaveLength(120);
   });
 
   test("tool missing from TS registry executes via bridge invoke", async () => {
@@ -484,7 +508,7 @@ describe("agent entry route", () => {
     process.env.STOCKBOT_DEBUG = "1";
     reasonDown = true;
     const events = await eventsFor("hello");
-    expect(events.map((e) => e.type)).toEqual(["agent_start", "reasoning_start", "failed", "error"]);
+    expect(events.map((e) => e.type)).toEqual(["agent_start", "status", "reasoning_start", "failed", "error"]);
     expect(runCalls.length).toBe(0);
   });
 
@@ -493,7 +517,7 @@ describe("agent entry route", () => {
     delete process.env.STOCKBOT_DEBUG;
     reasonDown = true;
     const events = await eventsFor("hello");
-    expect(events.map((e) => e.type)).toEqual(["agent_start", "reasoning_start", "error"]);
+    expect(events.map((e) => e.type)).toEqual(["agent_start", "status", "reasoning_start", "error"]);
     const working = events.find((e) => e.type === "reasoning_start");
     expect(working?.model).toBe("stockbot");
     const terminal = events.find((e) => e.type === "error");
@@ -505,15 +529,18 @@ describe("agent entry route", () => {
     delete process.env.STOCKBOT_DEBUG;
     winner = "get_current_time";
     const prod = await eventsFor("what time is it?");
-    expect(prod.map((e) => e.type)).toEqual(["agent_start", "evidence", "reasoning_start", "answer_delta", "done"]);
+    expect(prod.map((e) => e.type)).toEqual(["agent_start", "status", "status", "status", "evidence", "reasoning_start", "answer_delta", "done"]);
     reset();
     winner = "get_current_time";
     const debug = await eventsFor("what time is it?");
     expect(debug.map((e) => e.type)).toEqual([
       "agent_start",
+      "status",
       "needle_decision",
       "tool_start",
+      "status",
       "tool_result",
+      "status",
       "evidence",
       "reasoning_start",
       "answer_delta",
@@ -858,7 +885,7 @@ describe("agent entry route", () => {
     toolFailure = { category: "provider_error", error: message };
     const events = await eventsFor("short interest?");
     expect(events.map((event) => event.type)).toEqual([
-      "agent_start", "needle_decision", "tool_start", "tool_result", "tool_failed", "reasoning_start", "answer_delta", "done",
+      "agent_start", "status", "needle_decision", "tool_start", "status", "tool_result", "status", "tool_failed", "reasoning_start", "answer_delta", "done",
     ]);
     expect(events.find((event) => event.type === "tool_result")?.preview).toBe(message.slice(0, 160));
     expect(events.find((event) => event.type === "tool_failed")).toMatchObject({ category: "provider_error", preview: message.slice(0, 160) });
@@ -878,7 +905,7 @@ describe("agent entry route", () => {
       toolThrows = thrown;
       const events = await eventsFor("short interest?");
       expect(events.map((event) => event.type)).toEqual([
-        "agent_start", "needle_decision", "tool_start", "tool_failed", "reasoning_start", "answer_delta", "done",
+        "agent_start", "status", "needle_decision", "tool_start", "status", "tool_failed", "status", "reasoning_start", "answer_delta", "done",
       ]);
       expect(events.find((event) => event.type === "tool_failed")).toEqual({
         type: "tool_failed", tool: "query_finra", category: "tool_error", preview: "tool exploded",
@@ -894,7 +921,7 @@ describe("agent entry route", () => {
     winner = "query_finra";
     assessDown = true;
     const events = await eventsFor("short interest?");
-    expect(events.map((event) => event.type)).toEqual(["agent_start", "needle_decision", "tool_start", "tool_result", "evidence"]);
+    expect(events.map((event) => event.type)).toEqual(["agent_start", "status", "needle_decision", "tool_start", "status", "tool_result", "status", "evidence"]);
     expect(runCalls[0]?.[2]).toMatchObject({ seedEvidence: [expect.objectContaining({ id: "ev:bridge" })] });
     expect(reasonCalls).toEqual([]);
     expect(ended).toEqual(["sess-test"]);
@@ -986,7 +1013,7 @@ describe("agent entry route", () => {
     reset();
     delete process.env.OPENCODE_MODEL;
     const events = await eventsFor("hello");
-    expect(events.map((event) => event.type)).toEqual(["agent_start"]);
+    expect(events.map((event) => event.type)).toEqual(["agent_start", "status"]);
     expect(reasonCalls).toEqual([]);
     expect(runCalls).toHaveLength(1);
   });
@@ -1292,8 +1319,9 @@ describe("watchlist chat action", () => {
       argsReply = { tool: "update_watchlist", arguments: { action, ticker: "amd" }, confidence: 1 };
       const prompt = `${action} AMD to my watchlist`;
       const events = await eventsFor(prompt, "NVDA", ["NVDA", "AAPL"]);
-      expect(events.slice(0, 3)).toEqual([
+      expect(events.slice(0, 4)).toEqual([
         { type: "agent_start", prompt },
+        { type: "status", text: "Updating your watchlist…" },
         { type: "watchlist_update", action, ticker: "AMD" },
         { type: "answer_delta", text },
       ]);
@@ -1345,8 +1373,9 @@ describe("workspace widget chat action", () => {
     argsReply = { tool: "add_widget", arguments: { type: "short-volume", ticker: "aapl" }, confidence: 1 };
     const prompt = "add a short volume widget";
     const events = await eventsFor(prompt, undefined, undefined, "AAPL");
-    expect(events.slice(0, 3)).toEqual([
+    expect(events.slice(0, 4)).toEqual([
       { type: "agent_start", prompt },
+      { type: "status", text: "Adding the widget…" },
       { type: "widget_update", ticker: "AAPL", widgetType: "short-volume" },
       { type: "answer_delta", text: "Added the short-volume widget to the AAPL workspace." },
     ]);

@@ -2,7 +2,7 @@ import { reason } from "@/lib/muse/client";
 import { asksWatchlist, kernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type KernelResponse } from "@/lib/agent/kernel";
 import { tools } from "@/lib/tools";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
-import { ASK_CONTEXT_KINDS, FINAL_PERSONAS, redactArgs, safeSourceUrl, sourceReferences, WIDGET_TYPES, type AgentEvent, type AskContext, type Evidence, type FailureCategory, type Persona, type Timings } from "@/lib/agent/types";
+import { ASK_CONTEXT_KINDS, FINAL_PERSONAS, foundStatus, redactArgs, safeSourceUrl, sourceReferences, statusEvent, toolStatus, WIDGET_TYPES, type AgentEvent, type AskContext, type Evidence, type FailureCategory, type Persona, type Timings } from "@/lib/agent/types";
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
@@ -205,9 +205,10 @@ export async function POST(req: Request): Promise<Response> {
       const answerDirect = async (): Promise<boolean> => {
         const t0 = performance.now();
         send({ type: "agent_start", prompt });
+        send(statusEvent("Thinking…"));
         send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
         try {
-          const r = await reason({ prompt, evidence: [], escalated: false, direct: true, ...reasonContext(), onDelta: (text) => send({ type: "answer_delta", text }) });
+          const r = await reason({ prompt, evidence: [], direct: true, ...reasonContext(), onDelta: (text) => send({ type: "answer_delta", text }) });
           send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: performance.now() - t0, ...r.usage }, evidence: { count: 0, characters: 0 }, failures: {} } });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -250,6 +251,8 @@ export async function POST(req: Request): Promise<Response> {
         const t0 = performance.now();
         const toolT0 = performance.now();
         send({ type: "agent_start", prompt });
+        // No subject yet: the arguments name it at tool start.
+        send(statusEvent(`${toolStatus(toolName, undefined, "Looking up")}…`));
         const evidence: Evidence[] = [];
         const failures: Partial<Record<FailureCategory, number>> = {};
         let needleCalls = 0;
@@ -263,16 +266,19 @@ export async function POST(req: Request): Promise<Response> {
             toolCalls += 1;
             if (res.ok) {
               // A repeated call with the same name+args returns the same evidence id: keep one copy.
-              if (!evidence.some((e) => e.id === res.evidence.id)) {
+              const fresh = !evidence.some((e) => e.id === res.evidence.id);
+              if (fresh) {
                 evidence.push(res.evidence);
                 singleShotEvidence.push(res.evidence);
               }
               send({ type: "tool_result", tool, evidenceId: res.evidence.id, preview: res.evidence.content.slice(0, 160) });
+              send(statusEvent(foundStatus(fresh ? 1 : 0)));
               send({ type: "evidence", evidence: [...evidence] });
               outcome = { ok: true, content: res.evidence.content.slice(0, 1500) };
             } else {
               failures[res.category] = (failures[res.category] ?? 0) + 1;
               send({ type: "tool_result", tool, preview: res.error.slice(0, 160) });
+              send(statusEvent("That source had no usable data"));
               send({ type: "tool_failed", tool, category: res.category, preview: res.error.slice(0, 160) });
               outcome = { ok: false, error: res.error.slice(0, 500), category: res.category };
             }
@@ -280,6 +286,7 @@ export async function POST(req: Request): Promise<Response> {
             const msg = err instanceof Error ? err.message : String(err);
             failures.tool_error = (failures.tool_error ?? 0) + 1;
             send({ type: "tool_failed", tool, category: "tool_error", preview: msg.slice(0, 160) });
+            send(statusEvent("That source had no usable data"));
             outcome = { ok: false, error: msg.slice(0, 500), category: "tool_error" };
           } finally {
             await endSession(sessionId);
@@ -290,7 +297,7 @@ export async function POST(req: Request): Promise<Response> {
           send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
           try {
             const m0 = performance.now();
-            const r = await reason({ prompt, evidence, escalated: false, direct: evidence.length === 0, ...reasonContext(), onDelta: (text) => send({ type: "answer_delta", text }) });
+            const r = await reason({ prompt, evidence, direct: evidence.length === 0, ...reasonContext(), onDelta: (text) => send({ type: "answer_delta", text }) });
             send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures } });
           } catch (err) {
             send({ type: "error", message: err instanceof Error ? err.message : String(err) });
@@ -306,6 +313,7 @@ export async function POST(req: Request): Promise<Response> {
           needleCalls += 1;
           send({ type: "needle_decision", step, tool, arguments: redactArgs(args), confidence });
           send({ type: "tool_start", tool });
+          send(statusEvent(toolStatus(tool, tool === "search_web" ? (typeof args.query === "string" ? args.query : undefined) : parseTicker(args.ticker))));
           const outcome = await executeTool(tool, args);
           const verdict = await assessTool(tool, args, outcome);
           if (verdict === null) return false;
@@ -328,6 +336,7 @@ export async function POST(req: Request): Promise<Response> {
       const applyWatchlist = async (): Promise<boolean> => {
         const t0 = performance.now();
         send({ type: "agent_start", prompt });
+        send(statusEvent("Updating your watchlist…"));
         const generated = await generateArguments("update_watchlist");
         let text = "Watchlist update failed: no valid stock and action.";
         if (generated) {
@@ -362,6 +371,7 @@ export async function POST(req: Request): Promise<Response> {
       const applyWidget = async (): Promise<boolean> => {
         const t0 = performance.now();
         send({ type: "agent_start", prompt });
+        send(statusEvent("Adding the widget…"));
         const generated = await generateArguments("add_widget");
         let text = "Widget update failed: no valid widget and stock.";
         if (generated) {
