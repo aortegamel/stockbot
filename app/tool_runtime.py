@@ -863,7 +863,7 @@ def _can_persist_staged_result(name: str, staged: _StagedContext) -> bool:
 
 
 def _persist_staged_tool_result(
-    name: str, result: dict[str, object], staged: _StagedContext, tool_call_id: str
+    name: str, result: dict[str, object], staged: _StagedContext, tool_call_id: str, arguments: dict[str, object]
 ) -> str | None:
     """Persist one staged FINRA/WEB result; returns its id for the citation path.
 
@@ -881,7 +881,13 @@ def _persist_staged_tool_result(
         from app.research import service as _svc
 
         out = _svc.persist_tool_result(
-            staged.session_id, staged.job_id, name, tool_result_id, result, repo=staged.store
+            staged.session_id,
+            staged.job_id,
+            name,
+            tool_result_id,
+            result,
+            arguments=arguments,
+            repo=staged.store,
         )
         rid = out.get("tool_result_id")
         if isinstance(rid, str) and rid and isinstance(result, dict):
@@ -1624,6 +1630,7 @@ def _handler_error_response(
 def _finish_tool_result(
     name: str,
     result: object,
+    arguments: dict[str, object],
     session: RuntimeToolSession,
     staged: _StagedContext,
     *,
@@ -1641,7 +1648,7 @@ def _finish_tool_result(
     if error is not None:
         return error
     assert isinstance(result, dict)
-    rid = _persist_staged_tool_result(name, result, staged, resolved_tc_id)
+    rid = _persist_staged_tool_result(name, result, staged, resolved_tc_id, arguments)
 
     # Gate 5: ingress scan on the rendered evidence; quarantined or blocked
     # results are withheld from the agent with a fixed placeholder.
@@ -1765,6 +1772,7 @@ def _execute_agent_tool(
     return _finish_tool_result(
         name,
         result,
+        arguments,
         session,
         staged,
         t0=t0,

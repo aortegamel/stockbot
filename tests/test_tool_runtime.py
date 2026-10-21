@@ -336,11 +336,15 @@ def test_persistable_staged_result_requires_replayable_tool_and_ids(
     assert rt._can_persist_staged_result("search_web", _StagedContext(sid, "", False, repo)) is False
     assert rt._can_persist_staged_result("search_web", _StagedContext(sid, jid, False, repo)) is True
     assert (
-        rt._persist_staged_tool_result("search_web", {"content": "x"}, _StagedContext(sid, jid, False, None), "tc-0")
+        rt._persist_staged_tool_result(
+            "search_web", {"content": "x"}, _StagedContext(sid, jid, False, None), "tc-0", {}
+        )
         is None
     )
     assert (
-        rt._persist_staged_tool_result("search_tools", {"content": "x"}, _StagedContext(sid, jid, False, repo), "tc-0")
+        rt._persist_staged_tool_result(
+            "search_tools", {"content": "x"}, _StagedContext(sid, jid, False, repo), "tc-0", {}
+        )
         is None
     )
 
@@ -359,31 +363,35 @@ def test_persist_staged_result_records_id_and_absorbs_failures(tmp_path: Path, m
         tool_name: str,
         tool_result_id: str | None,
         result: object,
-        **_kwargs: object,
+        **kwargs: object,
     ) -> dict[str, object]:
-        calls.append((session_id, job_id, tool_name, tool_result_id, result))
+        calls.append((session_id, job_id, tool_name, tool_result_id, result, kwargs.get("arguments")))
         return {"tool_result_id": f"{session_id}:tr:fixed"}
 
     monkeypatch.setattr(service, "persist_tool_result", _persist)
     stored: dict[str, object] = {"content": "x"}
-    assert rt._persist_staged_tool_result("search_web", stored, staged, "tc-1") == f"{sid}:tr:fixed"
+    args: dict[str, object] = {"query": "NVDA demand"}
+    assert rt._persist_staged_tool_result("search_web", stored, staged, "tc-1", args) == f"{sid}:tr:fixed"
     assert stored["tool_result_id"] == f"{sid}:tr:fixed"
     # The persisted argument is the caller's dict, and the stored id lands in it after the call.
-    assert calls == [(sid, jid, "search_web", f"{sid}:tr:tc-1", {"content": "x", "tool_result_id": f"{sid}:tr:fixed"})]
+    # The call arguments ride along so the source page can show how the result was fetched.
+    assert calls == [
+        (sid, jid, "search_web", f"{sid}:tr:tc-1", {"content": "x", "tool_result_id": f"{sid}:tr:fixed"}, args)
+    ]
 
     def _empty_persist(*args: object, **kwargs: object) -> dict[str, object]:
         return {}
 
     monkeypatch.setattr(service, "persist_tool_result", _empty_persist)
     unlabeled: dict[str, object] = {"content": "x"}
-    assert rt._persist_staged_tool_result("search_web", unlabeled, staged, "") is None
+    assert rt._persist_staged_tool_result("search_web", unlabeled, staged, "", {}) is None
     assert "tool_result_id" not in unlabeled
 
     def _boom(*args: object, **kwargs: object) -> dict[str, object]:
         raise RuntimeError("store down")
 
     monkeypatch.setattr(service, "persist_tool_result", _boom)
-    assert rt._persist_staged_tool_result("search_web", {"content": "x"}, staged, "tc-2") is None
+    assert rt._persist_staged_tool_result("search_web", {"content": "x"}, staged, "tc-2", {}) is None
 
 
 # -- gateway result handling -------------------------------------------------

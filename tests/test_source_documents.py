@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import warnings
 from collections.abc import Mapping
@@ -344,6 +345,13 @@ def test_sec_evidence_resolves_through_pinned_metadata(tmp_path: Path, monkeypat
     assert document["captureKind"] == "original"
     assert location["prefix"] == "before "
     assert location["suffix"] == " after"
+    assert {key: document.get(key) for key in ("toolName", "toolArgs", "upstreamUrl", "publicUrl")} == {
+        "toolName": "get_sec_document",
+        "toolArgs": {"accession_no": ACC, "document_name": DOC},
+        "upstreamUrl": "https://www.sec.gov/z",
+        "publicUrl": "https://www.sec.gov/z",
+    }
+    assert "sec" not in document and "toolResultId" not in document
 
 
 def test_sec_evidence_without_metadata_hash_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -432,7 +440,12 @@ def test_sec_raw_basis_offsets_address_original_bytes(tmp_path: Path, monkeypatc
 
 def test_finra_web_evidence_replays_persisted_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
-    payload = {"evidence": [{"url": "https://example.com/a", "highlight": "the quoted excerpt here"}]}
+    # A row persisted before call arguments: the Exa payload echo stands in for them.
+    payload = {
+        "query": "acme news",
+        "search_type": "auto",
+        "evidence": [{"url": "https://example.com/a", "highlight": "the quoted excerpt here"}],
+    }
 
     class _WebRepo:
         def get_evidence(self, evidence_id: str) -> dict[str, object]:
@@ -465,6 +478,13 @@ def test_finra_web_evidence_replays_persisted_result(tmp_path: Path, monkeypatch
     document = read_source_document("evidence:ev-web", data_root=tmp_path, repo=_WebRepo())
     assert document["captureKind"] == "search_excerpt"
     assert document["quote"] == "quoted excerpt"
+    assert {key: document.get(key) for key in ("toolName", "toolResultId", "toolArgs", "publicUrl")} == {
+        "toolName": "search_web",
+        "toolResultId": "tr-1",
+        "toolArgs": {"query": "acme news", "search_type": "auto"},
+        "publicUrl": "https://example.com/a",
+    }
+    assert "upstreamUrl" not in document
 
 
 def test_sec_capture_rejects_archived_bytes_changed_after_retrieval(
@@ -634,6 +654,8 @@ def test_sec_scope_archives_retained_bytes_as_original_capture(tmp_path: Path, m
         "id": sources[0]["id"],
         "title": DOC,
         "url": "https://www.sec.gov/live",
+        "upstreamUrl": "https://www.sec.gov/live",
+        "publicUrl": "https://www.sec.gov/live",
         "publisher": "SEC",
         "publishedAt": "2026-01-03",
         "capturedAt": record.retrieved_at,
@@ -817,10 +839,15 @@ def test_web_evidence_reads_pinned_provider_content(tmp_path: Path) -> None:
         "source_content": content,
         "source_representation": "html",
     }
-    drifted = {"evidence": [{"url": "https://example.com/a", "highlight": "quoted excerpt", "source_content": "drift"}]}
+    drifted = {
+        "query": "echoed query",
+        "evidence": [{"url": "https://example.com/a", "highlight": "quoted excerpt", "source_content": "drift"}],
+    }
+    # Persisted call arguments win over the payload echo.
+    arguments = {"query": "acme news", "num_results": 5}
     repo = _Repo(
         {"ev-pin": {"evidence_id": "ev-pin", "session_id": "s", "source_name": "Exa", "provenance": provenance}},
-        {"tr-1": {"tool_name": "search_web", "session_id": "s", "result": drifted}},
+        {"tr-1": {"tool_name": "search_web", "session_id": "s", "result": drifted, "arguments": arguments}},
     )
     document = read_source_document("evidence:ev-pin", data_root=tmp_path, repo=repo)
     assert document == {
@@ -835,7 +862,212 @@ def test_web_evidence_reads_pinned_provider_content(tmp_path: Path) -> None:
         "content": content,
         "contentHash": raw_archive.content_hash(content.encode()),
         "quote": "quoted excerpt",
+        "toolName": "search_web",
+        "toolResultId": "tr-1",
+        "toolArgs": arguments,
+        "publicUrl": "https://example.com/a",
     }
+
+
+def _record_evidence(kind: str, tool: str, row: Mapping[str, object], **extra: object) -> dict[str, object]:
+    return {
+        "evidence_id": "ev-rec",
+        "session_id": "s",
+        "source_name": "FINRA" if kind == "finra_record" else "SEC",
+        "provenance": {
+            "kind": kind,
+            "tool_name": tool,
+            "tool_result_id": "tr-rec",
+            "record_identity": json.dumps(row, sort_keys=True),
+            **extra,
+        },
+    }
+
+
+def test_finra_record_reports_how_it_was_fetched(tmp_path: Path) -> None:
+    """FINRA: dataset API endpoint, echoed query as arguments, no public page."""
+    row = {"symbolCode": "ACME", "settlementDate": "2026-01-02", "currentShortPositionQuantity": 5}
+    payload = {
+        "dataset_id": "otcMarket/consolidatedShortInterest",
+        "query": {"ticker": "ACME", "start_date": "2026-01-01", "limit": 100},
+        "records": [row],
+    }
+    repo = _Repo(
+        {
+            "ev-rec": _record_evidence(
+                "finra_record",
+                "get_short_interest",
+                row,
+                dataset="otcMarket/consolidatedShortInterest",
+                known_at="2026-01-02",
+            )
+        },
+        {"tr-rec": {"tool_name": "get_short_interest", "session_id": "s", "result": payload}},
+    )
+    document = read_source_document("evidence:ev-rec", data_root=tmp_path, repo=repo)
+    how = ("toolName", "toolResultId", "dataset", "knownAt", "toolArgs", "upstreamUrl")
+    assert {key: document[key] for key in how} == {
+        "toolName": "get_short_interest",
+        "toolResultId": "tr-rec",
+        "dataset": "otcMarket/consolidatedShortInterest",
+        "knownAt": "2026-01-02",
+        "toolArgs": {"ticker": "ACME", "start_date": "2026-01-01", "limit": 100},
+        "upstreamUrl": "https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest",
+    }
+    assert "publicUrl" not in document
+    assert json.loads(str(document["quote"])) == row
+
+
+_SUBMISSIONS_42 = "https://data.sec.gov/submissions/CIK0000000042.json"
+
+
+@pytest.mark.parametrize(
+    ("row", "public", "upstream"),
+    [
+        (
+            {"accession_no": ACC, "form": "10-Q", "filer_cik": 42, "source": "https://www.sec.gov/home"},
+            "https://www.sec.gov/home",
+            _SUBMISSIONS_42,
+        ),
+        (
+            {"accession_no": ACC, "form": "10-Q", "filer_cik": 42},
+            "https://www.sec.gov/Archives/edgar/data/42/000000000026000042/",
+            _SUBMISSIONS_42,
+        ),
+        ({"form": "10-Q", "filer_cik": "../x"}, "https://www.sec.gov/declared", None),
+    ],
+)
+def test_sec_record_reports_how_it_was_fetched(
+    row: dict[str, object], public: str, upstream: str | None, tmp_path: Path
+) -> None:
+    """SEC: persisted arguments; the row's own sec.gov page, else the built filing index, else the declared URI.
+
+    The upstream API is the submissions JSON the listing came from, never the filing's web page.
+    """
+    payload = {"subject": "ACME", "filings": [row]}
+    tool_result: dict[str, object] = {
+        "tool_name": "list_sec_filings",
+        "session_id": "s",
+        "result": payload,
+        "arguments": {"identifier": "ACME", "form": "10-Q"},
+    }
+    evidence = _record_evidence(
+        "sec_record", "list_sec_filings", row, dataset="ACME", source_uri="https://www.sec.gov/declared"
+    )
+    repo = _Repo({"ev-rec": evidence}, {"tr-rec": tool_result})
+    document = read_source_document("evidence:ev-rec", data_root=tmp_path, repo=repo)
+    assert document["toolArgs"] == {"identifier": "ACME", "form": "10-Q"}
+    assert document["publicUrl"] == public
+    assert document.get("upstreamUrl") == upstream
+    del tool_result["arguments"]  # A row persisted before call arguments: the subject echo stands in.
+    assert read_source_document("evidence:ev-rec", data_root=tmp_path, repo=repo)["toolArgs"] == {"subject": "ACME"}
+
+
+def _sec_upstream(tmp_path: Path, tool: str, row: Mapping[str, object], payload: Mapping[str, object]) -> object:
+    evidence = _record_evidence("sec_record", tool, row, source_uri="https://www.sec.gov/declared")
+    repo = _Repo({"ev-rec": evidence}, {"tr-rec": {"tool_name": tool, "session_id": "s", "result": payload}})
+    return read_source_document("evidence:ev-rec", data_root=tmp_path, repo=repo).get("upstreamUrl")
+
+
+_EFTS_HIT = {"attempt_id": "s1-p2", "query": "going concern", "accession_no": ACC, "filer_cik": 7}
+_EFTS_ATTEMPTS = [
+    {"attempt_id": "s1-p1", "backend": "efts", "query": "other", "filters": {"page": 1}},
+    {
+        "attempt_id": "s1-p2",
+        "backend": "efts",
+        "query": "going concern",
+        "filters": {"forms": ["10-K", "10-Q"], "start_date": "2025-01-01", "end_date": "2025-12-31", "cik": "42"},
+    },
+]
+
+
+@pytest.mark.parametrize(
+    ("tool", "row", "payload", "upstream"),
+    [
+        pytest.param(
+            "get_xbrl_facts",
+            {"concept": "Revenues", "value": 5, "accession": ACC},
+            {"cik": 42, "matching_concepts": [{"concept": "Revenues", "value": 5, "accession": ACC}]},
+            "https://data.sec.gov/api/xbrl/companyfacts/CIK0000000042.json",
+            id="companyfacts",
+        ),
+        pytest.param(
+            "get_fundamentals",
+            {"metric": "shares_outstanding", "shares_outstanding": 9},
+            # The store path persists no `cik`; its companyfacts source_url names the company.
+            {
+                "metric": "shares_outstanding",
+                "shares_outstanding": 9,
+                "source_url": "https://data.sec.gov/api/xbrl/companyfacts/CIK0000000042.json",
+            },
+            "https://data.sec.gov/api/xbrl/companyfacts/CIK0000000042.json",
+            id="companyfacts-from-source-url",
+        ),
+        pytest.param(
+            "get_fundamentals",
+            {"name": "Acme", "cik": 42},
+            {"metric": "overview", "name": "Acme", "cik": 42},
+            _SUBMISSIONS_42,
+            id="submissions-overview",
+        ),
+        pytest.param(
+            "search_sec_filings",
+            _EFTS_HIT,
+            {"hits": [_EFTS_HIT], "attempts": _EFTS_ATTEMPTS},
+            "https://efts.sec.gov/LATEST/search-index?q=going+concern&forms=10-K%2C10-Q"
+            "&dateRange=custom&startdt=2025-01-01&enddt=2025-12-31&ciks=0000000042",
+            id="efts",
+        ),
+        pytest.param(
+            "get_insider_activity",
+            {"accession_no": ACC, "issuer_cik": 42, "insider_cik": 7, "source": "https://www.sec.gov/home"},
+            {"transactions": []},
+            f"https://www.sec.gov/Archives/edgar/data/42/000000000026000042/{ACC}.txt",
+            id="archive",
+        ),
+    ],
+)
+def test_sec_record_upstream_is_the_api_the_tool_called(
+    tool: str, row: dict[str, object], payload: dict[str, object], upstream: str, tmp_path: Path
+) -> None:
+    """Each SEC endpoint family builds its API URL from the row or payload CIK, never the filing web page."""
+    assert _sec_upstream(tmp_path, tool, row, {"subject": "ACME", **payload}) == upstream
+
+
+@pytest.mark.parametrize(
+    ("tool", "row", "payload"),
+    [
+        # 8-K event rows carry no CIK and no accession_no.
+        pytest.param("get_material_events", {"source_accessions": [ACC], "issuer": "Acme"}, {}, id="no-cik"),
+        # Rows mix SEC filings with Yahoo prices: no single endpoint.
+        pytest.param("get_valuation_metrics", {"ticker": "ACME", "cik": 42}, {"cik": 42}, id="mixed-endpoints"),
+        # The balance sheet comes from an unnamed 10-K's XBRL, not the companyfacts URL it reports.
+        pytest.param(
+            "get_fundamentals",
+            {"metric": "balance_sheet"},
+            {"metric": "balance_sheet", "cik": 42, "source_url": "https://www.sec.gov/home"},
+            id="unverified-metric",
+        ),
+        pytest.param("get_insider_activity", {"accession_no": "bad", "issuer_cik": 42}, {}, id="bad-accession"),
+        pytest.param(
+            "search_sec_filings",
+            {**_EFTS_HIT, "attempt_id": "s1-p9"},
+            {"attempts": _EFTS_ATTEMPTS},
+            id="unknown-attempt",
+        ),
+        pytest.param(
+            "search_sec_filings",
+            _EFTS_HIT,
+            {"attempts": [{**_EFTS_ATTEMPTS[1], "filters": {"ticker": "ACME"}}]},
+            id="ticker-scoped-attempt",
+        ),
+    ],
+)
+def test_sec_record_upstream_omitted_when_unverified(
+    tool: str, row: dict[str, object], payload: dict[str, object], tmp_path: Path
+) -> None:
+    """No verified endpoint or no CIK leaves the upstream API unrecorded; the filing page never stands in."""
+    assert _sec_upstream(tmp_path, tool, row, {"subject": "ACME", **payload}) is None
 
 
 @pytest.mark.parametrize(

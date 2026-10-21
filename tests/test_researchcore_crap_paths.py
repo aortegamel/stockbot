@@ -6834,10 +6834,14 @@ def test_persist_tool_result_preserves_first_payload(
     repo = _repo(tmp_path, monkeypatch)
     sid, jid = _svc_sid(repo)
     repo.save_job(dataclasses.replace(repo.get_job(jid), source_domain=domain, status="running"))
-    first = svc.persist_tool_result(sid, jid, tool, " result-id ", {"rows": [1]}, repo=repo)
-    again = svc.persist_tool_result(sid, jid, tool, "result-id", {"rows": [2]}, repo=repo)
+    first = svc.persist_tool_result(sid, jid, tool, " result-id ", {"rows": [1]}, arguments={"q": "NVDA"}, repo=repo)
+    again = svc.persist_tool_result(sid, jid, tool, "result-id", {"rows": [2]}, arguments={"q": "AMD"}, repo=repo)
     assert again == first
     assert repo.get_tool_result("result-id")["result"] == {"rows": [1]}
+    # The call arguments persist beside the first bytes; a caller without them stores none.
+    assert repo.get_tool_result("result-id")["arguments"] == {"q": "NVDA"}
+    svc.persist_tool_result(sid, jid, tool, "no-args", {"rows": [3]}, repo=repo)
+    assert "arguments" not in repo.get_tool_result("no-args")
 
 
 @pytest.mark.parametrize(

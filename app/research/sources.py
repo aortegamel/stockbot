@@ -16,7 +16,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, TypeGuard
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from app.config import get_data_root
 from app.research.repository import ResearchRepository
@@ -371,13 +371,34 @@ def _evidence_provenance(evidence: Mapping[str, object]) -> tuple[str, dict[str,
     provenance = evidence.get("provenance")
     if not isinstance(provenance, Mapping):
         raise FileNotFoundError("Source provenance is missing")
+    how = {
+        "toolName": _text(provenance, "tool_name"),
+        "toolResultId": _text(provenance, "tool_result_id"),
+        "dataset": _text(provenance, "dataset"),
+        "knownAt": _text(provenance, "known_at") or _text(evidence, "known_at"),
+    }
     return str(provenance.get("kind") or ""), {
         "title": _text(provenance, "title") or _text(provenance, "document_name") or _text(evidence, "source_name"),
         "url": _url(_text(provenance, "url") or _text(evidence, "source_uri")),
         "publisher": _text(evidence, "source_name"),
         "publishedAt": _text(evidence, "published_at"),
         "capturedAt": _text(evidence, "retrieved_at"),
+        **{key: value for key, value in how.items() if value},
     }
+
+
+def _tool_args(tool_result: Mapping[str, object], *echo_keys: str) -> dict[str, object]:
+    """Persisted call arguments, else the request the payload echoes (rows persisted before arguments)."""
+    args = tool_result.get("arguments")
+    if isinstance(args, Mapping):
+        return {"toolArgs": dict(args)}
+    payload = tool_result.get("result")
+    payload = payload if isinstance(payload, Mapping) else {}
+    echo = {key: payload[key] for key in echo_keys if payload.get(key) is not None}
+    query = echo.get("query")
+    if len(echo) == 1 and isinstance(query, Mapping):
+        echo = dict(query)
+    return {"toolArgs": echo} if echo else {}
 
 
 def _pinned_sec_digest(evidence: Mapping[str, object], provenance: Mapping[str, object], root: Path) -> str:
@@ -403,6 +424,9 @@ def _resolve_sec_source(
         **common,
         "quote": _text(provenance, "passage"),
         "location": {key: provenance[key] for key in ("offset", "end", "basis") if key in provenance},
+        # The kernel persists no tool result for document reads; the archived identity names the call.
+        "toolName": "get_sec_document",
+        "toolArgs": {key: _text(provenance, key) for key in ("accession_no", "document_name")},
         "sec": {
             "accession_no": provenance.get("accession_no"),
             "document_name": provenance.get("document_name"),
@@ -496,23 +520,162 @@ def _resolve_web_source(
 ) -> dict[str, object]:
     if tool_result.get("tool_name") != "search_web":
         raise ValueError("Source provenance mismatch")
-    pinned = _pinned_web_document(common, provenance)
-    if pinned is not None:
-        return pinned
-    return _replayed_web_document(common, provenance, tool_result)
+    document = _pinned_web_document(common, provenance) or _replayed_web_document(common, provenance, tool_result)
+    return {
+        **document,
+        "toolName": "search_web",
+        **_tool_args(tool_result, "query", "search_type"),
+        **({"publicUrl": document["url"]} if document.get("url") else {}),
+    }
+
+
+def _record_row(provenance: Mapping[str, object]) -> Mapping[str, object]:
+    """The cited row: record_identity holds the row as JSON when the kernel cited one row."""
+    try:
+        row = json.loads(_text(provenance, "record_identity"))
+    except ValueError:
+        return {}
+    return row if isinstance(row, Mapping) else {}
+
+
+def _finra_urls(common: Mapping[str, object], payload: Mapping[str, object]) -> dict[str, object]:
+    from app.config import FINRA_API_BASE
+
+    group, _, name = (_text(common, "dataset") or _text(payload, "dataset_id")).partition("/")
+    if not (group and name):
+        return {}
+    return {"upstreamUrl": f"{FINRA_API_BASE}/data/group/{quote(group, safe='')}/name/{quote(name, safe='')}"}
+
+
+_ACCESSION_RE = re.compile(r"[0-9]{10}-[0-9]{2}-[0-9]{6}")
+
+
+def _filing_index_url(row: Mapping[str, object]) -> str:
+    cik = row.get("filer_cik") or row.get("subject_cik")
+    accession = _text(row, "accession_no")
+    if not isinstance(cik, (int, str)) or not str(cik).isdigit():
+        return ""
+    if not _ACCESSION_RE.fullmatch(accession):
+        return ""
+    from edgar.urls import build_archive_url
+
+    return _url(build_archive_url(f"data/{int(cik)}/{accession.replace('-', '')}/"))
+
+
+# Endpoint whose response holds a cited row's values; tools whose rows mix endpoints stay out.
+# get_fundamentals keys on the metric its envelope reports.
+_SEC_API_FAMILIES: dict[str, str] = {
+    "list_sec_filings": "submissions",
+    "get_governance_events": "submissions",  # rows are listing metadata; the proxy text goes unused
+    "get_fundamentals:overview": "submissions",
+    "get_fundamentals:eps": "companyfacts",
+    "get_fundamentals:shares_outstanding": "companyfacts",
+    "get_xbrl_facts": "companyfacts",
+    "search_sec_filings": "efts",
+    # Parsed from the filing's full-submission .txt (edgartools Filing.sgml()).
+    "get_insider_activity": "archive",
+    "get_planned_insider_sales": "archive",
+    "get_beneficial_ownership": "archive",
+    "get_offering_history": "archive",
+    "get_transaction_status": "archive",
+    "get_recent_ownership_filings": "archive",
+}
+_CIK_KEYS = ("subject_cik", "issuer_cik", "filer_cik", "cik")
+_FACTS_URL_RE = re.compile(r".*/api/xbrl/companyfacts/CIK([0-9]{10})\.json")
+
+
+def _cik(*records: Mapping[str, object]) -> int | None:
+    """First CIK a record names directly or inside its persisted companyfacts URL."""
+    for record in records:
+        for key in _CIK_KEYS:
+            value = record.get(key)
+            if type(value) is int or (isinstance(value, str) and value.isascii() and value.isdigit()):
+                return int(value)
+        match = _FACTS_URL_RE.fullmatch(_text(record, "source_url"))
+        if match:
+            return int(match[1])
+    return None
+
+
+def _efts_url(row: Mapping[str, object], payload: Mapping[str, object]) -> str:
+    """The EFTS request behind one text hit, from its attempt's query and filters (page offset unrecorded)."""
+    attempt_id, attempts = _text(row, "attempt_id"), payload.get("attempts")
+    attempt = next(
+        (
+            a
+            for a in (attempts if attempt_id and isinstance(attempts, list) else [])
+            if isinstance(a, Mapping) and a.get("backend") == "efts" and a.get("attempt_id") == attempt_id
+        ),
+        None,
+    )
+    filters = attempt.get("filters") if attempt is not None else None
+    # A ticker scope makes edgartools resolve the CIK itself, so the sent `ciks` is unknown.
+    if attempt is None or not isinstance(filters, Mapping) or filters.get("ticker") is not None:
+        return ""
+    from edgar.search.efts import EFTS_BASE_URL
+
+    # Same parameters, same order as edgar.search.efts.search_filings.
+    forms, start, end, cik = (filters.get(key) for key in ("forms", "start_date", "end_date", "cik"))
+    params = [("q", _text(attempt, "query"))]
+    params += [("forms", ",".join(map(str, forms)))] if isinstance(forms, list) and forms else []
+    params += [("dateRange", "custom")] if start or end else []
+    params += [(name, str(value)) for name, value in (("startdt", start), ("enddt", end)) if value]
+    params += [("ciks", str(cik).strip().zfill(10))] if cik is not None else []
+    return f"{EFTS_BASE_URL}?{urlencode(params)}"
+
+
+def _sec_api_url(tool: str, row: Mapping[str, object], payload: Mapping[str, object]) -> str:
+    """The SEC API URL the tool called for this row; blank when unverified or the CIK is unknown."""
+    from edgar.urls import build_archive_url, build_company_facts_url, build_submissions_url
+
+    family = _SEC_API_FAMILIES.get(tool) or _SEC_API_FAMILIES.get(f"{tool}:{_text(payload, 'metric')}")
+    if family == "efts":
+        return _url(_efts_url(row, payload))
+    cik = _cik(row, payload)
+    if cik is None:
+        return ""
+    accession = _text(row, "accession_no")
+    if family == "submissions":
+        return _url(build_submissions_url(cik))
+    if family == "companyfacts":
+        return _url(build_company_facts_url(cik))
+    if family == "archive" and _ACCESSION_RE.fullmatch(accession):
+        return _url(build_archive_url(f"data/{cik}/{accession.replace('-', '')}/{accession}.txt"))
+    return ""
+
+
+def _sec_record_urls(provenance: Mapping[str, object], payload: Mapping[str, object]) -> dict[str, object]:
+    row = _record_row(provenance)
+    candidates = (
+        _text(row, "source_url"),
+        _text(row, "source"),
+        _text(provenance, "source_uri"),
+        _text(payload, "source_url"),
+        _text(payload, "source"),
+    )
+    declared = next(filter(None, map(_url, candidates)), "")
+    # A filing row's `source` is its sec.gov filing homepage; else build the filing index.
+    public = _url(_text(row, "source")) or _filing_index_url(row) or declared
+    upstream = _sec_api_url(_text(provenance, "tool_name"), row, payload)
+    return {
+        **({"upstreamUrl": upstream} if upstream else {}),
+        **({"publicUrl": public} if public else {}),
+    }
 
 
 def _resolve_structured_record(
-    common: dict[str, object], provenance: Mapping[str, object], tool_result: Mapping[str, object]
+    kind: str, common: dict[str, object], provenance: Mapping[str, object], tool_result: Mapping[str, object]
 ) -> dict[str, object]:
     if tool_result.get("tool_name") != provenance.get("tool_name"):
         raise ValueError("Source provenance mismatch")
-    payload = tool_result.get("result")
+    raw = tool_result.get("result")
+    payload: Mapping[str, object] = raw if isinstance(raw, Mapping) else {}
     content = (
         _bounded(json.dumps(dict(payload), sort_keys=True, ensure_ascii=False, indent=2))
-        if isinstance(payload, Mapping)
+        if isinstance(raw, Mapping)
         else ""
     )
+    finra = kind == "finra_record"
     return {
         **common,
         "content": content,
@@ -520,6 +683,8 @@ def _resolve_structured_record(
         "representation": "json",
         "captureKind": "structured_record",
         "quote": _text(provenance, "record_identity"),
+        **_tool_args(tool_result, "query" if finra else "subject"),
+        **(_finra_urls(common, payload) if finra else _sec_record_urls(provenance, payload)),
     }
 
 
@@ -539,7 +704,7 @@ def _resolve(source_id: str, root: Path, repo: object = None) -> dict[str, objec
     if kind == "web_source":
         return _resolve_web_source(common, provenance, tool_result)
     if kind in ("finra_record", "sec_record"):
-        return _resolve_structured_record(common, provenance, tool_result)
+        return _resolve_structured_record(kind, common, provenance, tool_result)
     raise FileNotFoundError("Source capture is missing")
 
 
@@ -588,7 +753,11 @@ def _render_sec_document(
 ) -> None:
     record = _sec_record(identity, root)
     payload = _checked_bytes(record, root, _text(identity, "sha256"))
-    document.update({"contentHash": record.sha256, "captureKind": "original", "url": _url(record.url)})
+    url = _url(record.url)
+    document.update({"contentHash": record.sha256, "captureKind": "original", "url": url})
+    if url:
+        # The archived sec.gov document URL is both the fetched address and its public page.
+        document.update({"upstreamUrl": url, "publicUrl": url})
     if payload.startswith(b"%PDF"):
         document.update({"representation": "pdf", "pdfUrl": f"/api/research/sources/{quote(source_id, safe='')}/pdf"})
     else:

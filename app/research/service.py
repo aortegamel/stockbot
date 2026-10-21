@@ -1834,6 +1834,7 @@ def persist_tool_result(
     tool_result_id: str | None,
     result: Mapping[str, object],
     *,
+    arguments: Mapping[str, object] | None = None,
     repo: ResearchRepository | Path | str | None = None,
 ) -> dict[str, JSONValue]:
     """Persist one staged tool result for FINRA/WEB/SEC-replay evidence; returns its id.
@@ -1842,7 +1843,9 @@ def persist_tool_result(
     domain owns (FINRA tools on FINRA jobs, search_web on WEB jobs, SEC replay
     tools on SEC jobs). Document reads never persist: their evidence replays
     the archive instead. Resume is idempotent: a repeated persist of the same
-    id keeps the first bytes and returns the same id.
+    id keeps the first bytes and returns the same id. ``arguments`` (the call's
+    arguments, when the caller has them) ride in the record so the source page
+    can show how the result was fetched.
     """
     store = _repo(repo)
     _found, job = _live_evidence_job(store, session_id, job_id)
@@ -1860,6 +1863,8 @@ def persist_tool_result(
         "created_at": utcnow().isoformat(),
         "result": validate_json_mapping(dict(result), "<persist_tool_result>: 'result'"),
     }
+    if arguments is not None:
+        record["arguments"] = validate_json_mapping(dict(arguments), "<persist_tool_result>: 'arguments'")
     try:
         store.save_tool_result(record)
     except ValueError as exc:
