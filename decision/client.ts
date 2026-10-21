@@ -2,10 +2,12 @@
 //
 // Reads DECISION_API_FORMAT (chat_completions or decisions; never inferred),
 // DECISION_API_URL (full endpoint, used verbatim), DECISION_API_KEY and
-// DECISION_MODEL per call; no defaults, no retries. Returns the normalized raw
+// DECISION_MODEL per call, plus optional REASONING_EFFORT (./reasoning.ts);
+// no defaults, no retries. Returns the normalized raw
 // {answers, model, usage?} that jev.ts/runtime.ts parse strictly. Errors never
 // carry the API key.
 import type { SystemOneFn } from "./jev.ts";
+import { reasoningFields } from "./reasoning.ts";
 
 // The Python and TypeScript transports share these instructions.
 // Live-model evaluations must check decision quality.
@@ -72,6 +74,7 @@ export function createSystemOne(fetchImpl: typeof fetch = fetch): SystemOneFn {
       if (q.criteria.length < 2)
         throw new Error(`Score question "${name}" has ${q.criteria.length} criteria; at least two scores are required.`);
     }
+    const reasoning = reasoningFields(native ? "decisions" : "chat_completions");
     let res: Response;
     let text: string;
     try {
@@ -81,7 +84,7 @@ export function createSystemOne(fetchImpl: typeof fetch = fetch): SystemOneFn {
       let method = "POST";
       let headers: Record<string, string> = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
       let body: string | undefined = JSON.stringify(native
-        ? { model, state: req.state, questions: req.questions }
+        ? { model, state: req.state, questions: req.questions, ...reasoning }
         : {
           model,
           messages: [
@@ -89,6 +92,7 @@ export function createSystemOne(fetchImpl: typeof fetch = fetch): SystemOneFn {
             { role: "user", content: JSON.stringify({ state: req.state, questions: req.questions }) },
           ],
           stream: false,
+          ...reasoning,
         });
       const signal = AbortSignal.timeout(TIMEOUT_MS);
       for (let redirects = 0; ; redirects++) {

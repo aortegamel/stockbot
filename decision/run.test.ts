@@ -15,6 +15,9 @@ import type { DecideOk, DecideResponse } from "./runtime.ts";
 import { MATERIALITY_LEVELS } from "./jev.ts";
 import { scenarios } from "./scenarios.ts";
 
+// Bun loads the repository .env into this process. Tests that need REASONING_EFFORT set it themselves.
+delete process.env.REASONING_EFFORT;
+
 const OBJ = scenarios[0].objective.id;
 const P = (suffix: string) => `${OBJ}-${suffix}`;
 // Longer than any filename allows, so decide artifacts must use a bounded slug.
@@ -589,6 +592,21 @@ test("unknown scenarios and blank OpenCode configuration fail before any request
     }
   }
   expect(calls).toHaveLength(0);
+});
+
+test("REASONING_EFFORT reaches OpenCode as reasoning.effort; a bad shape fails before any request", async () => {
+  const calls: FetchCall[] = [];
+  const fetchFn = recordingFetch(calls, () => chat({ error: { message: "stop" } }, 401));
+  try {
+    process.env.REASONING_EFFORT = "xhigh";
+    await expectRunError("sk-test-effort", fetchFn, "opencode_request_failed");
+    expect(JSON.parse(String(calls[0].init.body)).reasoning).toEqual({ effort: "xhigh" });
+    process.env.REASONING_EFFORT = "X-HIGH";
+    await expectRunError("sk-test-effort", fetchFn, "REASONING_EFFORT must match");
+    expect(calls).toHaveLength(1);
+  } finally {
+    delete process.env.REASONING_EFFORT;
+  }
 });
 
 test("a loopback Responses server accepts every OpenCode request and the run completes", async () => {
@@ -1256,6 +1274,33 @@ test("missing or unsupported DECISION_API_FORMAT fails before any request", asyn
   expect(await attempt(undefined)).toEqual({ id: "r1", error: "decide: decision_request_failed: missing DECISION_API_FORMAT" });
   for (const format of ["DECISIONS", "Chat_Completions", "chat", "responses", "auto", "decisions,chat_completions"])
     expect(await attempt(format)).toEqual({ id: "r1", error: "decide: decision_request_failed: unsupported DECISION_API_FORMAT" });
+});
+
+test("REASONING_EFFORT maps per decision format; a bad shape fails before any request", async () => {
+  const reply = (format: string) => () => chat(format === "decisions" ? { answers: GOOD } : completion(JSON.stringify({ answers: GOOD })));
+  try {
+    process.env.REASONING_EFFORT = "xhigh";
+    for (const format of ["chat_completions", "decisions"]) {
+      setDecisionEnv({ DECISION_API_FORMAT: format });
+      const calls: FetchCall[] = [];
+      await decide(recordingFetch(calls, reply(format)));
+      const body = JSON.parse(String(calls[0].init.body));
+      if (format === "chat_completions") expect(body.reasoning_effort).toBe("xhigh");
+      // The Decisions API documents no reasoning field, so the native body stays exact.
+      else expect(Object.keys(body).sort()).toEqual(["model", "questions", "state"]);
+    }
+    process.env.REASONING_EFFORT = "x high";
+    for (const format of ["chat_completions", "decisions"]) {
+      setDecisionEnv({ DECISION_API_FORMAT: format });
+      const calls: FetchCall[] = [];
+      expect(await decide(recordingFetch(calls, reply(format)))).toEqual({
+        id: "r1", error: "decide: decision_request_failed: REASONING_EFFORT must match ^[a-z][a-z0-9_-]{0,31}$",
+      });
+      expect(calls).toHaveLength(0);
+    }
+  } finally {
+    delete process.env.REASONING_EFFORT;
+  }
 });
 
 test("malformed native Decisions envelopes are rejected", async () => {

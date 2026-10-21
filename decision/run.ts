@@ -11,6 +11,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createSystemOne } from "./client.ts";
+import { reasoningFields } from "./reasoning.ts";
 import { scenarios } from "./scenarios.ts";
 import { analyzePrompt, decomposePrompt, expandPrompt } from "./prompts.ts";
 import type { Analysis, EvidenceRequest, Proposal } from "./prompts.ts";
@@ -230,7 +231,7 @@ async function postOpenCode(
   fetchFn: typeof fetch,
   url: string,
 ): Promise<unknown> {
-  const body = { model, input };
+  const body = { model, input, ...reasoningFields("responses") };
   await writeFile(join(dir, `request-${name}.json`), JSON.stringify(body, null, 2) + "\n");
   let res: Response;
   try {
