@@ -8922,3 +8922,90 @@ def test_create_node_rejects_null_nonstring_question(tmp_path: Path, monkeypatch
         with pytest.raises(ValueError, match="'question' must be a non-empty string"):
             create_untyped(sid, bad_question, "why it matters", repo=repo)
     assert repo.list_nodes(sid) == []
+
+
+def test_intake_newest_4a_digest_carries_insider_transactions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Newest 4/A: intake opens insider activity, so the digest carries parsed transaction rows.
+
+    Live defect: the chain opened only 8-Ks, so a 4/A-led listing left the answer with
+    filing metadata (form, filed date) and no transaction code, kind, shares or price.
+    """
+    import asyncio
+
+    from app.research import kernel_worker as kw
+    from app.research import scheduler as sched
+    from app.research import service as _svc
+    from app.tool_runtime import outcome_from_result
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid = _svc.create_research("Did NVDA insiders sell?", "o", as_of=None, repo=repo)
+    payloads: dict[str, dict[str, object]] = {
+        "list_sec_filings": {
+            "subject": "1045810",
+            "filings": [
+                {"form": "4/A", "accession_no": "0001045810-26-000002", "filed_at": "2026-09-09"},
+                {"form": "8-K", "accession_no": "0001045810-26-000001", "filed_at": "2026-09-01"},
+            ],
+            "source": "SEC EDGAR",
+        },
+        "get_insider_activity": {
+            "subject": "NVDA",
+            "count": 1,
+            "transactions": [
+                {
+                    "insider_name": "Huang Jen-Hsun",
+                    "transaction_code": "S",
+                    "transaction_kind": "open_market_sale",
+                    "transaction_date": "2026-09-05",
+                    "acquired_disposed": "D",
+                    "shares": 2605,
+                    "price": 360.13,
+                    "filed_at": "2026-09-09",
+                    "accession_no": "0001045810-26-000002",
+                }
+            ],
+            "source": "SEC EDGAR",
+        },
+    }
+    calls: list[str] = []
+
+    async def _attempt(
+        tool: str,
+        args: dict[str, object],
+        sid: str,
+        session: object,
+        registry: object,
+        jev: object,
+        kernel: sched._Kernel,
+        as_of: str | None,
+    ) -> dict[str, object]:
+        calls.append(tool)
+        job_id = sched._attempt_job(kernel, sid, "SEC")
+        result = dict(payloads[tool])
+        ref = f"{sid}:tr:{tool}"
+        _svc.persist_tool_result(sid, job_id, tool, ref, result)
+        result["tool_result_id"] = ref
+        return sched._success_attempt(tool, args, outcome_from_result(tool, result), result, "SEC", "intake", job_id)
+
+    def _cik(ticker: str) -> str:
+        return "1045810"
+
+    monkeypatch.setattr(kw, "_intake_attempt", _attempt)
+    monkeypatch.setattr(kw, "_intake_cik", _cik)
+    admitted, _raw, stats = asyncio.run(
+        kw._intake_round(None, ["NVDA"], sid, repo.get_session(sid).to_dict(), [], None, sched._Kernel(), None)
+    )
+    assert calls == ["list_sec_filings", "get_insider_activity"]
+    assert stats["outcomes"] == {"admitted": 2, "duplicate": 0, "not_citable": 0, "error": 0, "timeout": 0}
+    row = (
+        "  - insider_name Huang Jen-Hsun, transaction_code S, transaction_kind open_market_sale, "
+        "transaction_date 2026-09-05, acquired_disposed D, shares 2605, price 360.13, "
+        "filed_at 2026-09-09, accession_no 0001045810-26-000002"
+    )
+    contents = [str(ev.get("content", "")) for ev in admitted]
+    # Metadata alone (the listing) names the form and filed date but no transaction.
+    listing = [c for c in contents if "4/A" in c and row not in c]
+    assert listing and all("transaction_code" not in c and "shares" not in c for c in listing)
+    assert [c for c in contents if row in c]
+    assert row in kw._build_digest(admitted, ("NVIDIA", "NVDA"))

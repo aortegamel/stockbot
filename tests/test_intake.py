@@ -725,16 +725,19 @@ def test_multipart_objective_still_calls_reasoner(monkeypatch: pytest.MonkeyPatc
     assert calls == [objective] and questions == ["Q?", "Q?"]
 
 
-def test_intake_never_searches_filings_and_chains_8k(
+def test_intake_never_searches_filings_and_chains_newest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Intake calls list by CIK + chained doc + exact-text web; no search_sec_filings, no Needle (C)."""
     from app.research import kernel_worker as kw3
 
     calls: list[tuple[str, dict[str, object]]] = []
+    passed: list[tuple[object, ...]] = []
 
     async def _fake_attempt(tool: str, args: dict[str, object], *a: object, **k: object) -> dict[str, object]:
         calls.append((tool, dict(args)))
+        passed.append(a)
+        await asyncio.sleep(0.02)  # measurable per-source latency
         if tool == "list_sec_filings":
             # real _wrap_list shape: tool result carries filings directly (accession_no key).
             return {
@@ -743,8 +746,10 @@ def test_intake_never_searches_filings_and_chains_8k(
                 "job_id": "j-list",
                 "result": {
                     "subject": "320193",
-                    "count": 1,
-                    "filings": [{"form": "8-K", "accession_no": "0001-26-000001"}],
+                    "filings": [
+                        {"form": "4/A", "accession_no": "0001-26-000002"},
+                        {"form": "8-K", "accession_no": "0001-26-000001"},
+                    ],
                     "source": "SEC EDGAR",
                 },
                 "outcome": _outcome(),
@@ -766,24 +771,138 @@ def test_intake_never_searches_filings_and_chains_8k(
 
     monkeypatch.setattr(kw3, "_intake_attempt", _fake_attempt)
     monkeypatch.setattr(kw3, "_intake_cik", _cik)
-    asyncio.run(
+    session: dict[str, JSONValue] = {}
+    registry: list[dict[str, JSONValue]] = [{"name": "list_sec_filings"}]
+    jev = object()
+    kernel = _IntakeKernel()
+    _admitted, raw, stats = asyncio.run(
         kw3._intake_round(
             "how will orcl's manjure affect AAPL?",
             ["ORCL"],
             "s1",
-            {},
-            [],
-            None,
-            _IntakeKernel(),
-            None,
+            session,
+            registry,
+            jev,
+            kernel,
+            "2026-10-01",
         )
     )
     tools = [t for t, _ in calls]
     assert "search_sec_filings" not in tools
-    assert tools.count("list_sec_filings") == 1 and "get_sec_document" in tools
+    assert tools.count("list_sec_filings") == 1 and "get_insider_activity" in tools
+    assert "get_sec_document" not in tools
+    activity = [a for t, a in calls if t == "get_insider_activity"]
+    assert activity == [{"ticker": "ORCL", "limit": 10}]
     web = [a for t, a in calls if t == "search_web"]
     assert web and web[0].get("query") == "how will orcl's manjure affect AAPL?"
-    assert calls[0][0] == "list_sec_filings" and calls[0][1].get("identifier") == "320193"
+    assert calls[0] == (
+        "list_sec_filings",
+        {"identifier": "320193", "forms": list(kw3._INTAKE_SEC_FORMS), "limit": 5},
+    )
+    assert kw3._INTAKE_SEC_FORMS == (
+        "8-K",
+        "8-K/A",
+        "10-Q",
+        "10-Q/A",
+        "10-K",
+        "10-K/A",
+        "3",
+        "3/A",
+        "4",
+        "4/A",
+        "5",
+        "5/A",
+    )
+    assert passed and all(a == ("s1", session, registry, jev, kernel, "2026-10-01") for a in passed)
+    assert [(r["tool"], r["arguments"]) for r in raw] == [
+        ("list_sec_filings", {"identifier": "320193"}),
+        ("get_insider_activity", {"ticker": "ORCL"}),
+        ("search_web", {"query": "how will orcl's manjure affect AAPL?"}),
+    ]
+    per_source = stats["per_source"]
+    assert isinstance(per_source, dict)
+    assert all(10.0 <= per_source[t]["ms"] < 10_000.0 for t in ("list_sec_filings", "get_insider_activity"))
+
+
+def test_intake_chains_newest_non_insider_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Newest non-insider row still chains get_sec_document with its accession."""
+    from app.research import kernel_worker as kw3
+
+    calls: list[tuple[str, dict[str, object]]] = []
+    passed: list[tuple[object, ...]] = []
+
+    async def _fake_attempt(tool: str, args: dict[str, object], *a: object, **k: object) -> dict[str, object]:
+        calls.append((tool, dict(args)))
+        passed.append(a)
+        await asyncio.sleep(0.02)  # measurable per-source latency
+        if tool == "list_sec_filings":
+            return {
+                "tool": tool,
+                "arguments": args,
+                "job_id": "j-list",
+                "result": {
+                    "subject": "320193",
+                    "filings": [
+                        {"form": "8-K/A", "accession_no": "0001-26-000003"},
+                        {"form": "4", "accession_no": "0001-26-000002"},
+                    ],
+                    "source": "SEC EDGAR",
+                },
+                "outcome": _outcome(),
+                "outcome_summary": "x",
+                "error": None,
+            }
+        return {
+            "tool": tool,
+            "arguments": args,
+            "job_id": f"j-{tool}",
+            "result": {"tool_result_id": "s1:tr:x", "evidence": []},
+            "outcome": _outcome(),
+            "outcome_summary": "x",
+            "error": None,
+        }
+
+    def _cik(t: str) -> str:
+        return "320193"
+
+    monkeypatch.setattr(kw3, "_intake_attempt", _fake_attempt)
+    monkeypatch.setattr(kw3, "_intake_cik", _cik)
+    session: dict[str, JSONValue] = {}
+    registry: list[dict[str, JSONValue]] = [{"name": "get_sec_document"}]
+    jev = object()
+    kernel = _IntakeKernel()
+    _admitted, raw, stats = asyncio.run(
+        kw3._intake_round(
+            "how will orcl's manjure affect AAPL?",
+            ["ORCL"],
+            "s1",
+            session,
+            registry,
+            jev,
+            kernel,
+            "2026-10-01",
+        )
+    )
+    tools = [t for t, _ in calls]
+    assert tools.count("list_sec_filings") == 1 and "get_sec_document" in tools
+    assert "get_insider_activity" not in tools
+    doc = [a for t, a in calls if t == "get_sec_document"]
+    assert doc == [{"accession_no": "0001-26-000003", "max_chars": 3000}]
+    assert passed and all(a == ("s1", session, registry, jev, kernel, "2026-10-01") for a in passed)
+    assert [(r["tool"], r["arguments"]) for r in raw] == [
+        ("list_sec_filings", {"identifier": "320193"}),
+        ("get_sec_document", {"accession_no": "0001-26-000003"}),
+        ("search_web", {"query": "how will orcl's manjure affect AAPL?"}),
+    ]
+    per_source = stats["per_source"]
+    assert isinstance(per_source, dict)
+    assert all(10.0 <= per_source[t]["ms"] < 10_000.0 for t in ("list_sec_filings", "get_sec_document"))
+
+
+def test_newest_filing_skips_bad_rows_and_reads_accession_number() -> None:
+    """Junk and accession-less rows are skipped; accession_number counts; a non-string form is None."""
+    rows: list[object] = ["junk", {"form": "4"}, {"form": 4, "accession_number": " 0001-26-000009 "}]
+    assert kw._intake_newest_filing({"filings": rows}) == ("0001-26-000009", None)
 
 
 def _intake_web_queries_by_round(
@@ -1017,7 +1136,7 @@ def test_no_related_context_leaves_plan_unchanged(monkeypatch: pytest.MonkeyPatc
 
 
 def test_chain_keeps_list_result_when_doc_times_out(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Real chain+attempt path, slow get_sec_document executor: budget keeps the list."""
     import asyncio
@@ -1042,11 +1161,54 @@ def test_chain_keeps_list_result_when_doc_times_out(
     async def _round() -> tuple[list[dict[str, JSONValue]], list[dict[str, object]], dict[str, object]]:
         return await kwc._intake_round(None, ["ORCL"], "s1", {}, [], None, _IntakeKernel(), None)
 
-    _admitted, raw, _stats = asyncio.run(_round())
+    with caplog.at_level("WARNING", logger=kwc.logger.name):
+        _admitted, raw, _stats = asyncio.run(_round())
     assert len(raw) == 1 and raw[0]["tool"] == "list_sec_filings"
     record = raw[0]["record"]
     assert isinstance(record, dict)
     assert record.get("error") is None and record.get("job_id")  # real list, not synthetic timeout
+    assert any(r.getMessage() == "intake chain doc timeout ticker=ORCL acc=0001-26-000001" for r in caplog.records)
+
+
+def test_chain_keeps_list_result_when_insider_activity_times_out(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Newest row 4/A, insider fetch hangs: the chain stops at the doc deadline, list kept, 8s budget unused."""
+    import time as _t
+
+    from app import tool_runtime as rt
+
+    started: list[str] = []
+    finished: list[str] = []
+
+    async def _invoke(tool: str, args: dict[str, object], *a: object, **k: object) -> dict[str, object]:
+        started.append(tool)
+        if tool == "list_sec_filings":
+            return {"filings": [{"form": "4/A", "accession_no": "0001-26-000004"}]}
+        await asyncio.sleep(60)  # hangs far past the insider deadline
+        finished.append(tool)
+        return {}
+
+    def _cik(t: str) -> str:
+        return "320193"
+
+    monkeypatch.setattr(rt, "execute_agent_tool", _invoke)
+    monkeypatch.setattr(kw, "_intake_cik", _cik)
+    monkeypatch.setattr(kw, "_INTAKE_DOC_TIMEOUT_S", 0.05)
+    assert kw._INTAKE_BUDGET_S == 8.0  # budget untouched: the doc deadline alone ends the chain
+    t0 = _t.perf_counter()
+    with caplog.at_level("WARNING", logger=kw.logger.name):
+        _admitted, raw, stats = asyncio.run(kw._intake_round(None, ["ORCL"], "s1", {}, [], None, _IntakeKernel(), None))
+    elapsed = _t.perf_counter() - t0
+    assert started == ["list_sec_filings", "get_insider_activity"] and finished == []
+    assert [r["tool"] for r in raw] == ["list_sec_filings"]
+    record = raw[0]["record"]
+    assert isinstance(record, dict)
+    assert record.get("error") is None and record.get("job_id")  # real list, not synthetic timeout
+    outcomes = stats["outcomes"]
+    assert isinstance(outcomes, dict) and outcomes["timeout"] == 0  # chain finished; no budget straggler
+    assert any(r.getMessage() == "intake chain insider timeout ticker=ORCL" for r in caplog.records)
+    assert elapsed < 2.0
 
 
 def test_timeout_record_without_job_id_skips_settle(

@@ -3351,14 +3351,18 @@ def test_graph_intake_persists_citable_sources_dedupes_and_settles_jobs(
     assert isinstance(last_selected, dict)
     last_stats = last_selected["stats"]
     assert isinstance(last_stats, dict)
-    assert last_stats["outcomes"] == {"admitted": 1, "duplicate": 0, "not_citable": 0, "error": 0, "timeout": 0}
+    # Mock provides no doc backend, so the newest-filing chain errors on its
+    # get_sec_document follow-up and returns the list result itself.
+    assert last_stats["outcomes"] == {"admitted": 1, "duplicate": 0, "not_citable": 0, "error": 1, "timeout": 0}
     assert {str(row["provenance"]["kind"]) for row in evidence if isinstance(row.get("provenance"), dict)} == {
         "sec_record",
         "finra_record",
         "web_source",
     }
     for job_id, tool in attempts.items():
-        assert repo.get_job(job_id).status == ("failed" if tool == "get_threshold_securities" else "completed")
+        assert repo.get_job(job_id).status == (
+            "failed" if tool in ("get_threshold_securities", "get_sec_document") else "completed"
+        )
 
     admitted, raw, repeated = asyncio.run(
         kw._intake_round(
@@ -3386,7 +3390,9 @@ def test_graph_intake_persists_citable_sources_dedupes_and_settles_jobs(
     assert by_tool["get_threshold_securities"]["status"] == "error"
     assert "evidence_id" not in by_tool["get_threshold_securities"]
     for job_id, tool in attempts.items():
-        assert repo.get_job(job_id).status == ("failed" if tool == "get_threshold_securities" else "completed")
+        assert repo.get_job(job_id).status == (
+            "failed" if tool in ("get_threshold_securities", "get_sec_document") else "completed"
+        )
 
 
 @pytest.mark.parametrize(("call_timeout", "round_timeout"), [(60.0, 120.0), (120.0, 60.0)])

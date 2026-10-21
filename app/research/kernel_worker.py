@@ -237,7 +237,9 @@ def _evidence_id(rec: Mapping[str, JSONValue], fallback: str) -> str:
     return fallback
 
 
-_INTAKE_SEC_FORMS = ("8-K", "10-Q", "10-K", "4")
+_INTAKE_SEC_FORMS = ("8-K", "8-K/A", "10-Q", "10-Q/A", "10-K", "10-K/A", "3", "3/A", "4", "4/A", "5", "5/A")
+_INTAKE_INSIDER_FORMS = ("3", "3/A", "4", "4/A", "5", "5/A")
+_INTAKE_INSIDER_LIMIT = 10
 _INTAKE_SEC_LIMIT = 5
 _INTAKE_DIGEST_CHARS = 6000
 _INTAKE_MAX_ROUNDS = 2
@@ -466,19 +468,19 @@ def _intake_cik(ticker: str) -> str:
     return str(cik) if cik is not None else ticker
 
 
-def _intake_newest_8k(result: object) -> str | None:
-    """Newest 8-K accession from a list_sec_filings result; None when absent."""
+def _intake_newest_filing(result: object) -> tuple[str | None, str | None]:
+    """Newest accession and form from a list_sec_filings result; Nones when absent."""
     filings: object = result.get("filings") if isinstance(result, dict) else None
     if not isinstance(filings, list):
-        return None
+        return None, None
     for row in filings:
         if not isinstance(row, dict):
             continue
-        if str(row.get("form", "")).upper().startswith("8-K"):
-            acc = row.get("accession_no") or row.get("accession_number")
-            if isinstance(acc, str) and acc.strip():
-                return acc.strip()
-    return None
+        acc = row.get("accession_no") or row.get("accession_number")
+        if isinstance(acc, str) and acc.strip():
+            form = row.get("form")
+            return acc.strip(), form if isinstance(form, str) else None
+    return None, None
 
 
 async def _intake_ticker_chain(
@@ -490,7 +492,7 @@ async def _intake_ticker_chain(
     kernel: _Kernel,
     as_of: str | None,
 ) -> list[tuple[str, dict[str, object], dict[str, object], float]]:
-    """List one ticker, then open its newest 8-K; a slow ticker never holds the others."""
+    """List one ticker, then open its newest filing; a slow ticker never holds the others."""
     import time as _time
 
     out: list[tuple[str, dict[str, object], dict[str, object], float]] = []
@@ -507,8 +509,29 @@ async def _intake_ticker_chain(
         as_of,
     )
     out.append(("list_sec_filings", {"identifier": ident}, listing, (_time.perf_counter() - start) * 1000.0))
-    acc = _intake_newest_8k(listing.get("result"))
+    acc, form = _intake_newest_filing(listing.get("result"))
     if acc is None:
+        return out
+    if (form or "").strip().upper() in _INTAKE_INSIDER_FORMS:
+        start = _time.perf_counter()
+        try:
+            activity = await asyncio.wait_for(
+                _intake_attempt(
+                    "get_insider_activity",
+                    {"ticker": ticker, "limit": _INTAKE_INSIDER_LIMIT},
+                    sid,
+                    session,
+                    registry,
+                    jev,
+                    kernel,
+                    as_of,
+                ),
+                timeout=_INTAKE_DOC_TIMEOUT_S,
+            )
+        except TimeoutError:
+            logger.warning("intake chain insider timeout ticker=%s", ticker)
+            return out
+        out.append(("get_insider_activity", {"ticker": ticker}, activity, (_time.perf_counter() - start) * 1000.0))
         return out
     start = _time.perf_counter()
     # ponytail: 5s doc deadline sits inside the 8s intake budget, so the
