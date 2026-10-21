@@ -19,9 +19,10 @@ function evidence(id: string, sources?: Evidence["sources"]): Evidence {
 }
 
 const SEC_SOURCE = { id: "capture:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", title: "10-K" };
+const SEC_HREF = `#/source/${encodeURIComponent(SEC_SOURCE.id)}`;
 
 describe("AgentConsole source citations", () => {
-  test("known ids in answer text become citation buttons in prod", () => {
+  test("known ids in answer text become numbered links to the provenance page in prod", () => {
     const events: AgentEvent[] = [
       { type: "agent_start", prompt: "risk?" },
       { type: "evidence", evidence: [evidence("ev:abc123", [SEC_SOURCE])] },
@@ -29,8 +30,9 @@ describe("AgentConsole source citations", () => {
       { type: "done", metrics: metrics() },
     ];
     const out = renderToStaticMarkup(<AgentConsole events={events} reasoning={true} debug={false} />);
-    expect(out).toContain('aria-label="Open source for ev:abc123"');
-    expect(out).toContain("[ev:abc123]");
+    expect(out).toContain(`<a href="${SEC_HREF}" target="_blank" rel="noopener noreferrer" title="10-K" aria-label="Open source: 10-K"`);
+    expect(out).toContain(">[1]</a>");
+    expect(out).not.toContain("ev:abc123");
   });
 
   test("unknown markers stay plain text", () => {
@@ -42,10 +44,10 @@ describe("AgentConsole source citations", () => {
     ];
     const out = renderToStaticMarkup(<AgentConsole events={events} reasoning={true} debug={false} />);
     expect(out).toContain("See [ev:unknown] too.");
-    expect(out).not.toContain("Open source for ev:unknown");
+    expect(out).not.toContain("Open source:");
   });
 
-  test("known ids without sources still provide source controls", () => {
+  test("known ids without sources show a plain number; only sourced evidence is listed", () => {
     const events: AgentEvent[] = [
       { type: "agent_start", prompt: "risk?" },
       { type: "evidence", evidence: [evidence("ev:abc123", [SEC_SOURCE]), evidence("ev:abc124")] },
@@ -53,10 +55,11 @@ describe("AgentConsole source citations", () => {
       { type: "done", metrics: metrics() },
     ];
     const out = renderToStaticMarkup(<AgentConsole events={events} reasoning={true} debug={false} />);
-    expect(out).toContain("Sources: ev:abc123");
-    expect(out).not.toContain("Sources: ev:abc124");
-    expect(out).toContain("[ev:abc124]");
-    expect(out).not.toContain("Open source for ev:abc124");
+    expect(out).toContain(`<span class="text-xs text-zinc-500">Sources:</span><a href="${SEC_HREF}" target="_blank" rel="noopener noreferrer"`);
+    expect(out.match(/aria-label="Captured sources"[\s\S]*?<\/div>/)?.[0].match(/<a /g)).toHaveLength(1);
+    expect(out).toContain("<span>[2]</span>");
+    expect(out.match(/aria-label="Open source:/g)).toHaveLength(1);
+    expect(out).not.toContain("ev:abc12");
   });
 
   test("evidence event never renders as a prod row", () => {
@@ -81,8 +84,8 @@ describe("AgentConsole source citations", () => {
       { type: "done", metrics: metrics() },
     ];
     const out = renderToStaticMarkup(<AgentConsole events={events} reasoning={true} debug={false} />);
-    expect(out).toContain("Open source for ev:abc124");
-    expect(out).not.toContain("Open source for ev:abc123");
+    expect(out.match(/aria-label="Open source:/g)).toHaveLength(1);
+    expect(out).toContain(">[1]</a><span>, stale [ev:abc123].</span>");
   });
 
   // A gated research answer: prose, then the claim inventory, then done.
@@ -96,12 +99,12 @@ describe("AgentConsole source citations", () => {
     ];
     return renderToStaticMarkup(<AgentConsole events={events} reasoning={true} debug={false} />);
   }
-  const chip = (n: number, id: string): string => `aria-label="Open source for ${id}" class="rounded border border-blue-800 px-1 text-blue-300 underline decoration-dotted hover:bg-blue-950">[${n}]</button>`;
+  const chip = (n: number): string => `<a href="${SEC_HREF}" target="_blank" rel="noopener noreferrer" title="10-K" aria-label="Open source: 10-K" class="rounded border border-blue-800 px-1 text-blue-300 underline decoration-dotted hover:bg-blue-950">[${n}]</a>`;
 
   test("a claim with evidence ids gets a numbered chip after its first exact occurrence", () => {
     const out = claimed("Risk grew this year. Risk grew again.", [{ text: "Risk grew", claimType: "observed_fact", evidenceIds: ["ev:abc123"] }]);
-    expect(out).toContain(`<span>Risk grew</span><button type="button" ${chip(1, "ev:abc123")}<span> this year. Risk grew again.</span>`);
-    expect(out.match(/\[1\]<\/button>/g)).toHaveLength(1);
+    expect(out).toContain(`<span>Risk grew</span>${chip(1)}<span> this year. Risk grew again.</span>`);
+    expect(out.match(/\[1\]<\/a>/g)).toHaveLength(1);
   });
 
   test("unmatched claim text, empty evidence ids, and unknown ids add no chip", () => {
@@ -112,7 +115,7 @@ describe("AgentConsole source citations", () => {
     ] satisfies FinalClaim[]) {
       const out = claimed("Risk grew this year.", [claim]);
       expect(out).toContain("Risk grew this year.");
-      expect(out).not.toContain("Open source for");
+      expect(out).not.toContain("Open source:");
     }
   });
 
@@ -121,8 +124,7 @@ describe("AgentConsole source citations", () => {
       { text: "Risk grew", claimType: "observed_fact", evidenceIds: ["ev:abc123"] },
       { text: "Revenue fell", claimType: "observed_fact", evidenceIds: ["ev:abc124"] },
     ]);
-    expect(out.match(/Open source for ev:abc123/g)).toHaveLength(1);
-    expect(out).toContain(">[ev:abc123]</button>");
-    expect(out).toContain(`<span>. Revenue fell</span><button type="button" ${chip(2, "ev:abc124")}<span>.</span>`);
+    expect(out.match(/>\[1\]<\/a>/g)).toHaveLength(1);
+    expect(out).toContain(`${chip(1)}<span>. Revenue fell</span>${chip(2)}<span>.</span>`);
   });
 });

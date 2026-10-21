@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { fetchFeed, type FeedItem } from "../lib/market-data";
 import { toastAlert } from "../components/toasts";
 import { routeHash } from "../lib/route";
+import { safeSourceUrl } from "../../../needle-harness/lib/agent/types";
 import { ago } from "../lib/time";
 import type { ShellState } from "../layout/Shell";
 
@@ -14,7 +15,7 @@ function newestFirst(list: FeedItem[]): FeedItem[] {
   return [...list].sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
 }
 
-type Props = Pick<ShellState, "selected" | "watchlist" | "setInput"> & { openDrawer?: () => void };
+type Props = Pick<ShellState, "selected" | "watchlist" | "setInput" | "setAskContext"> & { openDrawer?: () => void };
 
 const FeedRow = memo(function FeedRow({ item, now, onAsk }: { item: FeedItem; now: number; onAsk: (item: FeedItem) => void }) {
   // Alerts open the workspace that holds the thesis panel.
@@ -34,7 +35,7 @@ const FeedRow = memo(function FeedRow({ item, now, onAsk }: { item: FeedItem; no
   );
 });
 
-export default function Feed({ selected, watchlist, setInput, openDrawer }: Props) {
+export default function Feed({ selected, watchlist, setInput, setAskContext, openDrawer }: Props) {
   // null: the first page is loading.
   const [items, setItems] = useState<FeedItem[] | null>(null);
   // Polled items that arrived while the list was scrolled away from the top.
@@ -103,11 +104,14 @@ export default function Feed({ selected, watchlist, setInput, openDrawer }: Prop
     };
   }, [symsKey, retry]);
 
+  // The item rides as a chip beside an empty input; the server rejects an unsafe url or a title over 300 chars, so both drop here.
   const ask = useCallback((item: FeedItem) => {
-    setInput(`About ${item.kind}${item.sym ? ` ${item.sym}` : ""}: ${item.title}${item.link ? ` (${item.link})` : ""} — `);
+    const url = safeSourceUrl(item.link);
+    setAskContext({ kind: item.kind, title: item.title.slice(0, 300), source: item.source, at: item.at, ...(url && url.length <= 2000 ? { url } : {}), ...(item.sym ? { sym: item.sym } : {}) });
+    setInput("");
     openDrawerRef.current?.();
     requestAnimationFrame(() => document.querySelector<HTMLInputElement>('[aria-label="Ask the research agent"]')?.focus());
-  }, [setInput]);
+  }, [setInput, setAskContext]);
 
   function showPending() {
     setItems((prev) => newestFirst([...pending, ...(prev ?? [])]));

@@ -78,6 +78,24 @@ describe("fetchSourceDocument", () => {
     }
   });
 
+  test("keeps how-we-got-it fields and plain-object tool arguments; old sessions omit them", async () => {
+    const how = {
+      toolName: "get_short_interest",
+      toolResultId: "rs:1:tr:7",
+      dataset: "otcMarket/consolidatedShortInterest",
+      knownAt: "2026-01-02",
+      upstreamUrl: "https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest",
+      publicUrl: "https://www.finra.org/x",
+      toolArgs: { ticker: "ACME", filters: { limit: 5 } },
+    };
+    const body = document({ representation: "json", captureKind: "structured_record", ...how });
+    respond(body);
+    expect(await fetchSourceDocument(id)).toStrictEqual(body);
+    respond(document());
+    const old = await fetchSourceDocument(id);
+    for (const key of Object.keys(how)) expect(key in old).toBe(false);
+  });
+
   test("preserves zero offsets, empty context, and partial locations", async () => {
     for (const location of [
       { offset: 0, end: 0, basis: "content", prefix: "", suffix: "" },
@@ -125,10 +143,11 @@ describe("fetchSourceDocument", () => {
       { ...document(), captureKind: "summary" },
       { ...document(), representation: "pdf", captureKind: "structured_record" },
       { ...document(), representation: "pdf", captureKind: "search_excerpt" },
-      ...["url", "publisher", "publishedAt", "capturedAt", "contentHash", "content", "matchingText", "pdfUrl"].map((key) => ({
+      ...["url", "publisher", "publishedAt", "capturedAt", "contentHash", "content", "matchingText", "pdfUrl", "toolName", "toolResultId", "dataset", "knownAt", "upstreamUrl", "publicUrl"].map((key) => ({
         ...document(),
         [key]: 42,
       })),
+      ...[null, [], "query=ACME", 5].map((toolArgs) => ({ ...document(), toolArgs })),
     ]) {
       respond(body);
       await expect(fetchSourceDocument(id)).rejects.toThrow();

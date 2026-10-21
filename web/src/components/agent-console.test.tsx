@@ -406,6 +406,27 @@ describe("AgentConsole toasts", () => {
       await act(async () => root.unmount());
     }
   });
+
+  test("a widget toast says Added only after the workspace confirmed it, the limit message when blocked, and stays neutral otherwise", async () => {
+    const container = dom.window.document.getElementById("root");
+    if (!container) throw new Error("missing test root");
+    const root = createRoot(container);
+    const added: AgentEvent = { type: "widget_update", ticker: "NVDA", widgetType: "news" };
+    const blocked: AgentEvent = { type: "widget_update", ticker: "NVDA", widgetType: "insider" };
+    const events: AgentEvent[] = [{ type: "agent_start", prompt: "q" }, added, blocked];
+    const toasts = () => [...(dom.window.document.body.querySelector('[aria-label="Notifications"]')?.children ?? [])].map((t) => t.textContent);
+    try {
+      await act(async () => root.render(<AgentConsole events={events} reasoning={false} debug={false} />));
+      expect(toasts()).toEqual(["Widget requested: news for NVDAOpen workspace", "Widget requested: insider for NVDAOpen workspace"]);
+      await act(async () => root.render(<AgentConsole events={events} reasoning={false} debug={false} widgetOutcomes={new Map([[added, "added"], [blocked, "blocked"]])} />));
+      expect(toasts()).toEqual([
+        "Added the news widget to NVDAOpen workspace",
+        "Workspace limit reached: the insider widget was not added to NVDA (24 widgets max)Open workspace",
+      ]);
+    } finally {
+      await act(async () => root.unmount());
+    }
+  });
 });
 
 describe("toastAlert", () => {

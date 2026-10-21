@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
-import { originalSourceUrl, resolveQuote, safeSourceUrl } from "./source-viewer";
+import { originalSourceUrl, resolveQuote } from "./source-viewer";
+import { safeSourceUrl } from "../../../needle-harness/lib/agent/types";
 import type { SourceDocument } from "./research-client";
 
 function document(overrides: Partial<SourceDocument> = {}): SourceDocument {

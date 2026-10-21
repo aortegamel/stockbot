@@ -6,7 +6,7 @@ import type { ReactNode } from "react";
 import type { Root } from "react-dom/client";
 import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
 import Workspace from "./Workspace";
-import { ActionCards } from "../components/action-cards";
+import { ActionCards, type WidgetOutcomes } from "../components/action-cards";
 import { monthlyReturns } from "../components/widgets";
 import type { Candle, WorkspaceDoc } from "../lib/market-data";
 import { useHashRoute } from "../lib/route";
@@ -63,12 +63,12 @@ function serve() {
   return { docs, requests };
 }
 
-function Page({ events = [] }: { events?: AgentEvent[] }) {
+function Page({ events = [], onWidgetOutcomes }: { events?: AgentEvent[]; onWidgetOutcomes?: (outcomes: WidgetOutcomes) => void }) {
   const [route, navigate] = useHashRoute();
   const selected = route?.page === "workspace" ? route.sym : "NVDA";
   const [watchlist, setWatchlist] = useState(["NVDA", "GME"]);
   return <Workspace selected={selected} pick={(sym) => navigate({ page: "workspace", sym })} watchlist={watchlist} onWatchlist={setWatchlist}
-    events={events} input="" setInput={() => { }} onSend={() => { }} openDrawer={() => { }} busy={false} debug={false}
+    events={events} input="" setInput={() => { }} setAskContext={() => { }} onSend={() => { }} openDrawer={() => { }} busy={false} debug={false} onWidgetOutcomes={onWidgetOutcomes}
     sessions={[{ session_id: "s1", status: "done", query: "NVDA research" }]} sessionId={null} setSessionId={() => { }} snapshot={null} journal={null} seq={0} />;
 }
 
@@ -101,6 +101,13 @@ function button(label: string): HTMLButtonElement {
   const el = [...container().querySelectorAll("button")].find((b) => b.textContent === label);
   if (!el) throw new Error(`missing ${label}`);
   return el;
+}
+async function typeUrl(url: string) {
+  await act(async () => {
+    const input = find<HTMLInputElement>('input[aria-label="TradingView URL"]');
+    Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set?.call(input, url);
+    input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+  });
 }
 // A real keydown starts at the focused element (the body when nothing has focus), bubbles, and is cancelable.
 async function escape(target: Element = dom.window.document.body) {
@@ -270,19 +277,68 @@ describe("Workspace", () => {
     expect(opened()).toBe(false);
   });
 
+  test("in focus mode Esc closes the open Indicators menu first, then exits focus mode", async () => {
+    serve();
+    await render(<Page />);
+    const focusing = () => find(".ws-grid").classList.contains("ws-grid-focus");
+    // jsdom's selector engine rejects "&" inside an attribute value, so match the label prefix.
+    await click(find('[aria-label^="Expand Price"]'));
+    const menu = find<HTMLDetailsElement>(".ws-widget-focus details");
+    menu.open = true;
+    await escape(find(".ws-widget-focus summary"));
+    expect([menu.open, focusing()]).toEqual([false, true]);
+    await escape(find(".ws-widget-focus summary"));
+    expect(focusing()).toBe(false);
+  });
+
+  test("at 24 widgets the Add widget menu is disabled with a limit hint", async () => {
+    const { docs } = serve();
+    docs.NVDA = { sym: "NVDA", widgets: Array.from({ length: 24 }, (_, i) => ({ id: `news-${i}`, type: "news", ticker: "NVDA" })), updated_at: "2026-10-20T10:00:00Z" };
+    await render(<Page />);
+    const select = () => find<HTMLSelectElement>('select[aria-label="Add widget"]');
+    expect(select().disabled).toBe(true);
+    expect(text()).toContain("Workspace limit: 24 widgets");
+    await click(container().querySelector('[aria-label="Remove News · NVDA"]')!);
+    expect(select().disabled).toBe(false);
+    expect(text()).not.toContain("Workspace limit");
+  });
+
   test("adding a TradingView link saves the workspace without Save", async () => {
     const { docs, requests } = serve();
     await render(<Page />);
     await add("tv-link");
-    await act(async () => {
-      const input = find<HTMLInputElement>('input[aria-label="TradingView URL"]');
-      Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set?.call(input, "https://www.tradingview.com/x/8ot166mV/");
-      input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
-    });
+    await typeUrl("https://www.tradingview.com/x/8ot166mV/");
     await click(button("Add link"));
     expect(requests.filter((r) => r.method === "PUT").map((r) => r.path)).toEqual(["/api/workspaces/NVDA"]);
     expect(docs.NVDA.widgets.at(-1)).toEqual({ id: "tv-link-1", type: "tv-link", ticker: "NVDA", params: { url: "https://www.tradingview.com/x/8ot166mV/", label: "TradingView snapshot" } });
     expect(text()).toContain("saved 12:00:00");
+  });
+
+  test("an open TradingView link form and an agent widget_update add nothing at 24 widgets", async () => {
+    const { docs, requests } = serve();
+    docs.NVDA = { sym: "NVDA", widgets: Array.from({ length: 23 }, (_, i) => ({ id: `news-${i}`, type: "news", ticker: "NVDA" })), updated_at: "2026-10-20T10:00:00Z" };
+    const puts = () => requests.filter((r) => r.method === "PUT").length;
+    const widgets = () => container().querySelectorAll(".ws-widget").length;
+    await render(<Page />);
+    await add("tv-link");
+    await typeUrl("https://www.tradingview.com/x/8ot166mV/");
+    // Below the cap a receipt still adds: 23 -> 24.
+    const outcomes: WidgetOutcomes[] = [];
+    const onWidgetOutcomes = (o: WidgetOutcomes) => void outcomes.push(o);
+    const events: AgentEvent[] = [{ type: "widget_update", ticker: "NVDA", widgetType: "short-volume" }];
+    await render(<Page events={events} onWidgetOutcomes={onWidgetOutcomes} />);
+    expect([widgets(), puts()]).toEqual([24, 1]);
+    expect(text()).toContain("Workspace limit: 24 widgets");
+    await click(button("Add link"));
+    expect([widgets(), puts()]).toEqual([24, 1]);
+    expect(docs.NVDA.widgets.some((w) => w.type === "tv-link")).toBe(false);
+    const blocked: AgentEvent = { type: "widget_update", ticker: "NVDA", widgetType: "insider" };
+    await render(<Page events={[...events, blocked]} onWidgetOutcomes={onWidgetOutcomes} />);
+    expect([widgets(), puts()]).toEqual([24, 1]);
+    expect(container().querySelector('[aria-label="Insider · NVDA"]')).toBeNull();
+    expect(text()).toContain("Workspace limit: 24 widgets");
+    // The console learns the first receipt was added and the second was blocked by the cap.
+    expect(outcomes.map((o) => [...o])).toEqual([[[events[0], "added"]], [[blocked, "blocked"]]]);
   });
 
   test("renders one summary card per ticker with the workspace link", async () => {

@@ -4,6 +4,7 @@ import { afterAll, afterEach, describe, expect, jest, mock, test } from "bun:tes
 import { act } from "react";
 import type { Root } from "react-dom/client";
 import type { FeedItem } from "../lib/market-data";
+import type { AskContext } from "../../../needle-harness/lib/agent/types";
 import Feed from "./Feed";
 
 // react-dom reads canUseDOM at module load, so it must load after the jsdom globals (see App.test.tsx).
@@ -48,11 +49,11 @@ function serve(...answers: (() => Response | Promise<Response>)[]): string[] {
   return urls;
 }
 
-async function mount(props: { setInput?: (value: string) => void; openDrawer?: () => void } = {}): Promise<HTMLElement> {
+async function mount(props: { setInput?: (value: string) => void; setAskContext?: (context: AskContext | null) => void; openDrawer?: () => void } = {}): Promise<HTMLElement> {
   const container = dom.window.document.getElementById("root");
   if (!container) throw new Error("missing test root");
   mounted = createRoot(container);
-  await act(async () => mounted?.render(<Feed selected="NVDA" watchlist={["NVDA", "AAPL"]} setInput={props.setInput ?? (() => { })} openDrawer={props.openDrawer} />));
+  await act(async () => mounted?.render(<Feed selected="NVDA" watchlist={["NVDA", "AAPL"]} setInput={props.setInput ?? (() => { })} setAskContext={props.setAskContext ?? (() => { })} openDrawer={props.openDrawer} />));
   return container;
 }
 
@@ -168,19 +169,27 @@ describe("Feed page", () => {
     expect(root.textContent).toContain("No items for this filter — try Ask Stockbot: what's new with NVDA?");
   });
 
-  test("Ask about this fills the agent input, opens the drawer, and focuses the prompt", async () => {
-    serve(() => page([item("n", "2026-10-20T11:00:00Z", { kind: "filing", title: "8-K current report" })]));
+  test("Ask about this attaches the item as context, empties the input, opens the drawer, and focuses the prompt", async () => {
+    serve(() => page([
+      item("n", "2026-10-20T11:00:00Z", { kind: "filing", title: "8-K current report" }),
+      item("x", "2026-10-20T10:00:00Z", { title: "y".repeat(400), link: "javascript:alert(1)", sym: undefined }),
+    ]));
     const setInput = mock((_value: string) => { });
+    const setAskContext = mock((_context: AskContext | null) => { });
     const openDrawer = mock(() => { });
     const prompt = dom.window.document.createElement("input");
     prompt.setAttribute("aria-label", "Ask the research agent");
     dom.window.document.body.append(prompt);
     try {
-      const root = await mount({ setInput, openDrawer });
-      await until(() => titles(root).length === 1);
-      await click(button(root, "Ask about this"));
-      expect(setInput).toHaveBeenCalledWith("About filing NVDA: 8-K current report (https://news.example/n) — ");
+      const root = await mount({ setInput, setAskContext, openDrawer });
+      await until(() => titles(root).length === 2);
+      await click(root.querySelectorAll<HTMLButtonElement>(".feed-row button")[0]!);
+      expect(setAskContext).toHaveBeenCalledWith({ kind: "filing", title: "8-K current report", url: "https://news.example/n", source: "wire", sym: "NVDA", at: "2026-10-20T11:00:00Z" });
+      expect(setInput).toHaveBeenCalledWith("");
       expect(openDrawer).toHaveBeenCalledTimes(1);
+      // An unsafe link drops and a long title is cut to the server's 300-char limit.
+      await click(root.querySelectorAll<HTMLButtonElement>(".feed-row button")[1]!);
+      expect(setAskContext).toHaveBeenLastCalledWith({ kind: "news", title: "y".repeat(300), source: "wire", at: "2026-10-20T10:00:00Z" });
       await until(() => dom.window.document.activeElement === prompt);
     } finally {
       prompt.remove();

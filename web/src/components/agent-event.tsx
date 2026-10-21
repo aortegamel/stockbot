@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { redactArgs, type AgentEvent, type FailureCategory } from "../../../needle-harness/lib/agent/types";
+import { redactArgs, type AgentEvent, type AskContext, type FailureCategory } from "../../../needle-harness/lib/agent/types";
 
 const LIMIT = "The research reached its work limit before it finished.";
 const MODEL = "The model could not produce a checked answer.";
@@ -158,10 +158,23 @@ function WorkEventView({ event }: { event: AgentEvent }) {
   }
 }
 
+// A readable feed-item chip: "News · Stocktwits · NVDA — title". CSS cuts a long title; title= holds it whole.
+export function AskContextChip({ context, onRemove }: { context: AskContext; onRemove?: () => void }) {
+  const kind = context.kind[0].toUpperCase() + context.kind.slice(1);
+  return (
+    <div className="pill" aria-label="Attached feed item" title={context.title} style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, maxWidth: "100%" }}>
+      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+        {[kind, context.source, context.sym].filter(Boolean).join(" · ")} — {context.title}
+      </span>
+      {onRemove && <button type="button" className="ghost" aria-label="Remove context" onClick={onRemove}>×</button>}
+    </div>
+  );
+}
+
 export function AgentEventView({ event, debug = false, onRetry }: { event: AgentEvent; debug?: boolean; onRetry?: () => void }) {
   switch (event.type) {
     case "agent_start":
-      return <div className="text-zinc-100">&gt; {event.prompt}</div>;
+      return <div className="text-zinc-100">&gt; {event.prompt}{event.context && <AskContextChip context={event.context} />}</div>;
     case "reasoning_start":
       return (
         <div>

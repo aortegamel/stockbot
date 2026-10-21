@@ -6,7 +6,7 @@ import { fetchMarkets, fetchSparklines, type MarketSort, type ScanDef } from "..
 
 const MAX_ROWS = 200;
 
-export default function Home(s: Pick<ShellState, "watchlist" | "onWatchlist" | "pick" | "setInput" | "openDrawer">) {
+export default function Home(s: Pick<ShellState, "watchlist" | "onWatchlist" | "pick" | "setInput" | "setAskContext" | "openDrawer">) {
   const [scan, setScan] = useState<ScanDef | null>(null);
   const [sort, setSort] = useState<MarketSort>("chg_pct");
   const [picked, setPicked] = useState<string | null>(null);
@@ -36,6 +36,7 @@ export default function Home(s: Pick<ShellState, "watchlist" | "onWatchlist" | "
           }}
           onCreate={() => {
             s.setInput("scan for ");
+            s.setAskContext(null);
             s.openDrawer();
           }}
         />

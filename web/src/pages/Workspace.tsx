@@ -7,7 +7,7 @@ import { PortfolioPanel } from "../components/portfolio-panel";
 import { EnableNotifications } from "../components/action-cards";
 import { freeEscape, isWidgetType, WidgetGrid, widgetLabel } from "../components/widgets";
 import { TvLinkForm } from "../components/tv-link";
-import { fetchQuote, fetchWorkspace, saveWorkspace, type WorkspaceWidget } from "../lib/market-data";
+import { fetchQuote, fetchWorkspace, MAX_WIDGETS, saveWorkspace, type WorkspaceWidget } from "../lib/market-data";
 import { routeHash, TICKER_RE } from "../lib/route";
 import type { ShellState } from "../layout/Shell";
 
@@ -250,8 +250,16 @@ export default function Workspace(s: ShellState) {
     setDoc((d) => (d?.sym === target ? { ...d, status } : d));
   }
 
-  function edit(next: WorkspaceWidget[]) {
-    setDoc({ sym, widgets: next, status: "unsaved" });
+  // Every add goes through here: the widgets past MAX_WIDGETS are dropped, so a full workspace changes nothing and saves nothing.
+  // Returns how many of `added` fit.
+  function add(added: WorkspaceWidget[], persist: boolean): number {
+    if (!loaded) return 0;
+    const fits = added.slice(0, Math.max(0, MAX_WIDGETS - loaded.widgets.length));
+    if (fits.length === 0) return 0;
+    const next = [...loaded.widgets, ...fits];
+    setDoc({ sym, widgets: next, status: persist ? "" : "unsaved" });
+    if (persist) void save(next);
+    return fits.length;
   }
 
   const removeWidget = useCallback((id: string) => {
@@ -266,19 +274,22 @@ export default function Workspace(s: ShellState) {
     void save(next);
   }, [loaded, sym]);
 
-  // A validated agent receipt adds its widget to this workspace and saves it.
+  // A validated agent receipt adds its widget to this workspace and saves it. The Shell learns which receipts were added or blocked by the cap.
   useEffect(() => {
     if (!loaded) return;
+    const receipts: AgentEvent[] = [];
     const added: string[] = [];
     for (const event of s.events) {
       if (event.type !== "widget_update" || event.ticker !== sym || applied.has(event)) continue;
       applied.add(event);
-      if (isWidgetType(event.widgetType) && event.widgetType !== "tv-link" && !loaded.widgets.some((w) => w.type === event.widgetType) && !added.includes(event.widgetType)) added.push(event.widgetType);
+      if (isWidgetType(event.widgetType) && event.widgetType !== "tv-link" && !loaded.widgets.some((w) => w.type === event.widgetType) && !added.includes(event.widgetType)) {
+        added.push(event.widgetType);
+        receipts.push(event);
+      }
     }
     if (added.length === 0) return;
-    const next = [...loaded.widgets, ...added.map((type) => widgetOf(type, sym))];
-    setDoc({ sym, widgets: next, status: "" });
-    void save(next);
+    const fit = add(added.map((type) => widgetOf(type, sym)), true);
+    s.onWidgetOutcomes?.(new Map(receipts.map((event, i) => [event, i < fit ? "added" : "blocked"] as const)));
   }, [s.events, loaded, sym]);
 
   function close(tab: string) {
@@ -291,6 +302,7 @@ export default function Workspace(s: ShellState) {
   // tv-link stays in the menu: a workspace holds any number of TradingView links.
   const missing = WIDGET_TYPES.filter((type) => type === "tv-link" || !widgets.some((w) => w.type === type));
   const status = loaded?.status ?? "";
+  const full = widgets.length >= MAX_WIDGETS;
 
   return (
     <div className="workspace">
@@ -309,16 +321,17 @@ export default function Workspace(s: ShellState) {
             <select
               aria-label="Add widget"
               value=""
-              disabled={!loaded}
+              disabled={!loaded || full}
               onChange={(e) => {
                 if (e.target.value === "tv-link") setLinking(true);
-                else if (isWidgetType(e.target.value)) edit([...widgets, widgetOf(e.target.value, sym)]);
+                else if (isWidgetType(e.target.value)) add([widgetOf(e.target.value, sym)], false);
               }}
               className="pill"
             >
               <option value="">Add widget</option>
               {missing.map((type) => <option key={type} value={type}>{widgetLabel(type)}</option>)}
             </select>
+            {full && <span className="feed-muted">Workspace limit: {MAX_WIDGETS} widgets</span>}
             <button type="button" disabled={!loaded} onClick={() => void save(widgets)} className="pill">Save</button>
             {status && <span className="feed-muted num">{status}</span>}
             {status === "workspace unavailable" && <button type="button" className="pill" onClick={() => setAttempt((n) => n + 1)}>Retry</button>}
@@ -330,9 +343,7 @@ export default function Workspace(s: ShellState) {
             <TvLinkForm
               onSubmit={(params) => {
                 setLinking(false);
-                const next = [...widgets, { id: nextTvLinkId(widgets), type: "tv-link", ticker: sym, params }];
-                setDoc({ sym, widgets: next, status: "" });
-                void save(next);
+                add([{ id: nextTvLinkId(widgets), type: "tv-link", ticker: sym, params }], true);
               }}
               onCancel={() => setLinking(false)}
             />

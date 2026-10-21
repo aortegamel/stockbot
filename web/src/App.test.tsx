@@ -371,6 +371,7 @@ describe("App agent send", () => {
     await until(() => root.querySelector("footer")?.lastElementChild?.textContent === selected);
     expect(text(root)).toContain(`AGENT · viewing ${selected}`);
     expect(text(root)).toContain(`Financials · ${selected}`);
+    expect(text(root)).toContain(`News · ${selected}`);
     expect(root.querySelector(`[role="region"][aria-label="${selected} price chart"]`)).not.toBeNull();
     const chart = find<HTMLIFrameElement>(root, `iframe[title="${selected} TradingView chart"]`);
     expect(new URL(chart.src).searchParams.get("symbol")).toBe(selected);
@@ -700,20 +701,42 @@ describe("App view switch", () => {
     await until(() => text(root).includes("NVDA100DELAYEDSEC none"));
   });
 
-  test("Feed Ask about this opens the closed drawer with the prompt prefilled", async () => {
+  test("Feed Ask about this attaches a readable chip, sends the default question with context, and × removes it", async () => {
     dom.window.localStorage.setItem("stockbot.drawer", "closed");
     dom.window.history.replaceState(null, "", "/#/feed");
-    serve((url) =>
-      url.includes("/api/feed")
-        ? json({ items: [{ id: "a", kind: "news", sym: "AAPL", title: "Apple ships", link: "https://n.example/a", at: "2026-10-20T09:00:00Z", source: "wire" }], as_of: "2026-10-20T09:00:00Z", errors: [] })
-        : undefined,
-    );
+    const { bodies } = serve((url) => {
+      if (url.includes("/api/feed")) return json({ items: [{ id: "a", kind: "news", sym: "AAPL", title: "Apple ships", link: "https://n.example/a", at: "2026-10-20T09:00:00Z", source: "wire" }], as_of: "2026-10-20T09:00:00Z", errors: [] });
+      if (url.includes("/api/agent")) return new Response("", { status: 200 });
+      return undefined;
+    });
     const root = await mount(<App />, false);
     await until(() => findButton(root, "Ask about this") !== null);
     expect(root.querySelector(AGENT_PROMPT)).toBeNull();
     await click(button(root, "Ask about this"));
     await until(() => root.querySelector(AGENT_PROMPT) !== null);
-    expect(find<HTMLInputElement>(root, AGENT_PROMPT).value).toBe("About news AAPL: Apple ships (https://n.example/a) — ");
+    const chip = () => root.querySelector<HTMLElement>('[aria-label="Attached feed item"]');
+    const remove = () => root.querySelector<HTMLButtonElement>('[aria-label="Remove context"]');
+    expect(find<HTMLInputElement>(root, AGENT_PROMPT).value).toBe("");
+    expect(chip()?.textContent).toBe("News · wire · AAPL — Apple ships×");
+    expect(chip()?.getAttribute("title")).toBe("Apple ships");
+    expect(button(root, "Send").disabled).toBe(false);
+
+    await click(remove()!);
+    expect(chip()).toBeNull();
+    expect(button(root, "Send").disabled).toBe(true);
+
+    await click(button(root, "Ask about this"));
+    await click(button(root, "Send"));
+    await until(() => bodies.some((body) => body.includes("What does this mean")));
+    expect(JSON.parse(bodies.find((body) => body.includes("What does this mean")) ?? "{}")).toEqual({
+      prompt: "What does this mean for AAPL?", ticker: "NVDA", currentChartTicker: "NVDA", watchlist: WATCHLIST,
+      context: { kind: "news", title: "Apple ships", url: "https://n.example/a", source: "wire", sym: "AAPL", at: "2026-10-20T09:00:00Z" },
+    });
+    // Sending clears the prompt chip; the transcript shows the message with the same chip, never a raw blob.
+    expect(remove()).toBeNull();
+    expect(text(root)).toContain("> What does this mean for AAPL?");
+    expect(chip()?.textContent).toBe("News · wire · AAPL — Apple ships");
+    expect(text(root)).not.toContain("https://n.example/a");
   });
 });
 

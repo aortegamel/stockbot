@@ -2,8 +2,10 @@ import { useEffect, useState } from "react";
 import { fetchFilings, fetchNews, fetchQuote, fetchWatchlistSources, type SourceRow } from "../lib/market-data";
 
 import { AgentConsole } from "./agent-console";
+import type { WidgetOutcomes } from "./action-cards";
+import { AskContextChip } from "./agent-event";
 import { useLoad } from "./home-panels";
-import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
+import type { AgentEvent, AskContext } from "../../../needle-harness/lib/agent/types";
 import type { JournalPage, ResearchSnapshot } from "../lib/research-client";
 import { sessionTitle } from "../lib/session-title";
 import { ago } from "../lib/time";
@@ -228,24 +230,32 @@ export function AIPanel({
   events,
   input,
   setInput,
+  context,
+  onClearContext,
   onSend,
   sym,
   busy,
   debug,
+  widgetOutcomes,
 }: {
   events: AgentEvent[];
   input: string;
   setInput: (v: string) => void;
+  // A feed item attached to the next Send; Send works with an empty input while it is set.
+  context?: AskContext | null;
+  onClearContext?: () => void;
   onSend: () => void;
   sym: string;
   busy: boolean;
   debug: boolean;
+  widgetOutcomes?: WidgetOutcomes;
 }) {
   return (
     <div style={{ ...panel, padding: 0, display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
       {/* Mixed case on purpose: the ticker context reads "viewing NVDA", not "VIEWING". */}
       <div className="card-head" style={{ textTransform: "none" }}>AGENT · viewing {sym}{debug ? " · DEBUG" : ""}</div>
-      <AgentConsole events={events} reasoning={events.some((event) => event.type === "reasoning_start")} debug={debug} />
+      <AgentConsole events={events} reasoning={events.some((event) => event.type === "reasoning_start")} debug={debug} widgetOutcomes={widgetOutcomes} />
+      {context && <div style={{ padding: "0 12px 6px" }}><AskContextChip context={context} onRemove={onClearContext} /></div>}
       <form onSubmit={(event) => { event.preventDefault(); onSend(); }} style={{ display: "flex", gap: 6, padding: "0 12px 12px" }}>
         <input
           aria-label="Ask the research agent"
@@ -256,7 +266,7 @@ export function AIPanel({
           className="input"
           style={{ flex: 1, minWidth: 0 }}
         />
-        <button type="submit" disabled={busy || !input.trim()} className="btn-primary" style={{ cursor: busy ? "wait" : "pointer" }}>
+        <button type="submit" disabled={busy || (!input.trim() && !context)} className="btn-primary" style={{ cursor: busy ? "wait" : "pointer" }}>
           {busy ? "Thinking…" : "Send"}
         </button>
       </form>

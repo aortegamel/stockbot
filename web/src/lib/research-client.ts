@@ -40,11 +40,19 @@ export type SourceDocument = {
   pdfUrl?: string;
   quote: string;
   location?: { offset?: number; end?: number; basis?: string; prefix?: string; suffix?: string };
+  // How the source was fetched. Sessions recorded before these fields omit them.
+  toolName?: string;
+  toolResultId?: string;
+  dataset?: string;
+  knownAt?: string;
+  upstreamUrl?: string;
+  publicUrl?: string;
+  toolArgs?: Record<string, unknown>;
 };
 
 const SOURCE_REPRESENTATIONS: SourceDocument["representation"][] = ["html", "text", "json", "pdf"];
 const CAPTURE_KINDS: SourceDocument["captureKind"][] = ["original", "provider_extraction", "structured_record", "search_excerpt"];
-const OPTIONAL_TEXT_KEYS = ["url", "publisher", "publishedAt", "capturedAt", "contentHash", "content", "matchingText", "pdfUrl"] as const;
+const OPTIONAL_TEXT_KEYS = ["url", "publisher", "publishedAt", "capturedAt", "contentHash", "content", "matchingText", "pdfUrl", "toolName", "toolResultId", "dataset", "knownAt", "upstreamUrl", "publicUrl"] as const;
 const LOCATION_TEXT_KEYS = ["basis", "prefix", "suffix"] as const;
 
 function fieldOf(record: object, key: string): unknown {
@@ -153,6 +161,11 @@ function copySourceMetadata(source: object, document: SourceDocument): void {
       if (typeof value !== "string") throw new Error("The source metadata is invalid.");
       document[key] = value;
     }
+  }
+  const args = fieldOf(source, "toolArgs");
+  if (args !== undefined) {
+    if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("The source metadata is invalid.");
+    document.toolArgs = { ...args };
   }
 }
 

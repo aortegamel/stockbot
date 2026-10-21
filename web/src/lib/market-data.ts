@@ -96,7 +96,7 @@ export function fetchMarkets(scan: string, syms: string[] = [], sort: MarketSort
   );
 }
 
-export type ScanFilter = {
+type ScanFilter = {
   symbols?: string[];
   forms?: string[];
   min_short_pct?: number;
@@ -191,6 +191,9 @@ export function fetchCandles(sym: string, range: string, interval: string, signa
   const q = `sym=${encodeURIComponent(sym)}&range=${encodeURIComponent(range)}&interval=${encodeURIComponent(interval)}`;
   return getJSON<{ candles?: Candle[]; error?: string }>(`/api/candles?${q}`, signal);
 }
+
+// Mirrors Workspace.widgets max_length in api/workspaces.py; the server rejects a save above it.
+export const MAX_WIDGETS = 24;
 
 // One saved widget in a per-ticker workspace. updated_at null: the workspace was never saved.
 export type WorkspaceWidget = { id: string; type: string; ticker: string; params?: Record<string, unknown> };

@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { FINAL_PERSONAS, type AgentEvent, type Evidence, type FinalClaim, type SourceReference } from "../../../needle-harness/lib/agent/types";
 import { fetchSourceDocument } from "../lib/research-client";
-import { originalSourceUrl, safeSourceUrl } from "../lib/source-viewer";
-import { ActionCards, TrioCard } from "./action-cards";
+import { routeHash } from "../lib/route";
+import { sourceLabel } from "../lib/source-viewer";
+import { ActionCards, TrioCard, type WidgetOutcomes } from "./action-cards";
 import { AgentEventView, WorkRow } from "./agent-event";
-import { SourcePanel } from "./source-panel";
 import { Toasts } from "./toasts";
 
-type AnswerPart = { text: string; citation?: Evidence };
+type AnswerPart = { text: string; citation?: Evidence; number?: number };
 
 // The sentence around [start, end): a newline or a terminator before the next sentence bounds it.
 // A terminator followed by a bracket marker does not end the sentence, so trailing markers stay inside.
@@ -21,6 +21,7 @@ function sentenceAround(answer: string, start: number, end: number): string {
 // ponytail: citations are exact Evidence.ids in brackets, never a parsed link scheme.
 // A gated claim adds a numbered chip after the first exact occurrence of its text, one per known
 // evidence id, unless its sentence already cites that id inline. Distinct ids number in answer order.
+// An inline marker shows its number too, so a raw evidence id never reaches the reader.
 function splitAnswer(answer: string, known: Map<string, Evidence>, claims: FinalClaim[]): AnswerPart[] {
   const entries = [...known.keys()];
   if (entries.length === 0) return [{ text: answer }];
@@ -43,8 +44,9 @@ function splitAnswer(answer: string, known: Map<string, Evidence>, claims: Final
   for (const mark of marks) {
     const at = Math.max(mark.at, last);
     if (at > last) parts.push({ text: answer.slice(last, at) });
-    if (!numbers.has(mark.id)) numbers.set(mark.id, numbers.size + 1);
-    parts.push({ text: mark.marker ?? `[${numbers.get(mark.id)}]`, citation: known.get(mark.id) });
+    const number = numbers.get(mark.id) ?? numbers.size + 1;
+    numbers.set(mark.id, number);
+    parts.push({ text: `[${number}]`, citation: known.get(mark.id), number });
     last = Math.max(last, mark.end);
   }
   if (last < answer.length) parts.push({ text: answer.slice(last) });
@@ -57,36 +59,38 @@ function evidenceById(events: AgentEvent[]): Map<string, Evidence> {
   return new Map(evidence.map((entry) => [entry.id, entry]));
 }
 
-function useCitationUrls(parts: AnswerPart[]): Map<string, string | undefined> {
+// Readable labels read once from each captured document. A failed read keeps the caller's fallback label.
+function useSourceLabels(references: SourceReference[]): Map<string, string> {
   const requested = useRef(new Set<string>());
   const mounted = useRef(false);
-  const [urls, setUrls] = useState(new Map<string, string | undefined>());
-  const references = new Map<string, SourceReference>();
-  for (const part of parts) {
-    const reference = part.citation?.sources?.[0];
-    if (reference && !references.has(reference.id)) references.set(reference.id, { id: reference.id, url: reference.url });
-  }
-  const sources = JSON.stringify([...references.values()]);
+  const [labels, setLabels] = useState(new Map<string, string>());
+  const ids = JSON.stringify([...new Set(references.map((reference) => reference.id))]);
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; };
   }, []);
   useEffect(() => {
-    for (const reference of JSON.parse(sources) as SourceReference[]) {
-      if (requested.current.has(reference.id)) continue;
-      requested.current.add(reference.id);
-      void fetchSourceDocument(reference.id)
-        .then((source) => originalSourceUrl(source, true))
-        .catch(() => safeSourceUrl(reference.url))
-        .then((url) => {
-          if (mounted.current) setUrls((current) => new Map(current).set(reference.id, url));
-        });
+    for (const id of JSON.parse(ids) as string[]) {
+      if (requested.current.has(id)) continue;
+      requested.current.add(id);
+      void fetchSourceDocument(id).then((source) => {
+        const label = sourceLabel(source);
+        if (label && mounted.current) setLabels((current) => new Map(current).set(id, label));
+      }, () => undefined);
     }
-  }, [sources]);
-  return urls;
+  }, [ids]);
+  return labels;
 }
 
-type SourceSelection = { evidenceId: string; position: number } | null;
+// Each listed source once, in evidence order, with the evidence row that cites it.
+function sourceLinks(known: Map<string, Evidence>): { reference: SourceReference; evidence: Evidence }[] {
+  const links = new Map<string, { reference: SourceReference; evidence: Evidence }>();
+  for (const evidence of known.values()) {
+    for (const reference of evidence.sources ?? []) if (!links.has(reference.id)) links.set(reference.id, { reference, evidence });
+  }
+  return [...links.values()];
+}
+
 // One trio follow-up per offered session; null events means the user declined.
 type TrioState = { sessionId: string; events: AgentEvent[] | null } | null;
 
@@ -115,32 +119,19 @@ async function fetchTrio(sessionId: string): Promise<AgentEvent[]> {
   }
 }
 
-function SelectedSource({
-  selected,
-  known,
-  setSelected,
-}: {
-  selected: SourceSelection;
-  known: Map<string, Evidence>;
-  setSelected: React.Dispatch<React.SetStateAction<SourceSelection>>;
-}) {
-  if (!selected) return null;
-  const sources = known.get(selected.evidenceId)?.sources || [];
-  if (sources.length === 0) return null;
-  const position = selected.position % sources.length;
-  return <SourcePanel key={sources[position].id} reference={sources[position]} position={position} count={sources.length} onNavigate={(direction) => setSelected((current) => current && { evidenceId: current.evidenceId, position: (current.position + direction + sources.length) % sources.length })} onClose={() => setSelected(null)} />;
-}
-
-// ponytail: selection keeps evidence id + index so follow-up merges refresh the panel instead of a stale snapshot.
+// A citation opens the provenance page for its first source in a new tab.
 // onRetry reruns the request behind these events; without it failures offer no Try again.
-export function AgentConsole({ events, reasoning, debug, onRetry }: { events: AgentEvent[]; reasoning: boolean; debug: boolean; onRetry?: () => void }) {
-  const [selected, setSelected] = useState<SourceSelection>(null);
+// widgetOutcomes: what the workspace did with each widget receipt, for the toast text.
+export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes }: { events: AgentEvent[]; reasoning: boolean; debug: boolean; onRetry?: () => void; widgetOutcomes?: WidgetOutcomes }) {
   const [trio, setTrio] = useState<TrioState>(null);
   const known = evidenceById(events);
-  const sourceControls = [...known.values()].filter((entry) => entry.sources?.length);
+  const links = sourceLinks(known);
   const answer = events.filter((e) => e.type === "answer_delta").map((e) => e.text).join("");
   const parts = splitAnswer(answer, known, events.findLast((e) => e.type === "claims")?.claims ?? []);
-  const citationUrls = useCitationUrls(parts);
+  const cited = parts.flatMap((part) => part.citation?.sources?.slice(0, 1) ?? []);
+  const labels = useSourceLabels([...cited, ...links.map((link) => link.reference)]);
+  const labelOf = (reference: SourceReference, evidence: Evidence, index: number): string =>
+    labels.get(reference.id) ?? evidence.title ?? reference.title ?? `${evidence.source.toUpperCase() || "Source"} ${index}`;
   if (events.length === 0) {
     return (
       <div className="flex-1 space-y-3 overflow-y-auto p-3 text-sm">
@@ -188,28 +179,25 @@ export function AgentConsole({ events, reasoning, debug, onRetry }: { events: Ag
         const citation = part.citation;
         const reference = citation?.sources?.[0];
         if (!citation || !reference) return <span key={i}>{part.text}</span>;
-        const url = citationUrls.has(reference.id) ? citationUrls.get(reference.id) : safeSourceUrl(reference.url);
-        const className = "rounded border border-blue-800 px-1 text-blue-300 underline decoration-dotted hover:bg-blue-950";
-        return url
-          ? <a key={i} href={url} target="_blank" rel="noopener noreferrer" aria-label={`Open source for ${citation.id}`} className={className}>{part.text}</a>
-          : <button key={i} type="button" onClick={() => setSelected({ evidenceId: citation.id, position: 0 })} aria-label={`Open source for ${citation.id}`} className={className}>{part.text}</button>;
+        const label = labelOf(reference, citation, part.number ?? 0);
+        return <a key={i} href={routeHash({ page: "source", id: reference.id })} target="_blank" rel="noopener noreferrer" title={label} aria-label={`Open source: ${label}`} className="rounded border border-blue-800 px-1 text-blue-300 underline decoration-dotted hover:bg-blue-950">{part.text}</a>;
       })}</div>}
       <WorkRow events={events} debug={debug} />
       <ActionCards events={events} />
-      {sourceControls.length > 0 && <div className="flex flex-wrap gap-2 pt-2" role="group" aria-label="Captured sources">
-        {sourceControls.map((entry) => (
-          <button key={entry.id} type="button" onClick={() => setSelected({ evidenceId: entry.id, position: 0 })} className="rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:border-zinc-400" aria-label={`Open captured sources for ${entry.id}`}>
-            Sources: {entry.id}
-          </button>
+      {links.length > 0 && <div className="flex flex-wrap items-center gap-2 pt-2" role="group" aria-label="Captured sources">
+        <span className="text-xs text-zinc-500">Sources:</span>
+        {links.map(({ reference, evidence }, index) => (
+          <a key={reference.id} href={routeHash({ page: "source", id: reference.id })} target="_blank" rel="noopener noreferrer" className="rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:border-zinc-400">
+            {labelOf(reference, evidence, index + 1)}
+          </a>
         ))}
       </div>}
-      <SelectedSource selected={selected} known={known} setSelected={setSelected} />
       {tail.map((e, i) => (
         <AgentEventView key={`tail-${i}`} event={e} debug={debug} onRetry={onRetry} />
       ))}
       {offer && !current && <TrioCard onYes={() => askTrio(offer.sessionId)} onNo={() => setTrio({ sessionId: offer.sessionId, events: null })} />}
       {current?.events && <AgentConsole events={current.events} reasoning={current.events.some((e) => e.type === "reasoning_start")} debug={debug} onRetry={() => askTrio(current.sessionId)} />}
-      <Toasts events={events} onRetry={onRetry} />
+      <Toasts events={events} onRetry={onRetry} widgetOutcomes={widgetOutcomes} />
     </div>
   );
 }

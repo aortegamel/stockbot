@@ -1,3 +1,4 @@
+import { SourcePage } from "./components/source-panel";
 import Shell from "./layout/Shell";
 import Home from "./pages/Home";
 import Workspace from "./pages/Workspace";
@@ -11,6 +12,7 @@ export default function App() {
         if (route.page === "home") return <Home {...state} />;
         if (route.page === "feed") return <Feed {...state} />;
         if (route.page === "harness") return <Harness sessionId={state.sessionId} />;
+        if (route.page === "source") return <SourcePage key={route.id} id={route.id} />;
         return <Workspace {...state} />;
       }}
     </Shell>

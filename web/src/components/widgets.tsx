@@ -207,10 +207,10 @@ const WidgetFrame = memo(function WidgetFrame({ widget, focused, onFocus, onRemo
   );
 });
 
-// A window Esc belongs to the innermost owner: a field, a form, or the palette handles its own Esc first.
+// A window Esc belongs to the innermost owner: a field, a form, an open menu, or the palette handles its own Esc first.
 export function freeEscape(e: KeyboardEvent): boolean {
   return e.key === "Escape" && !e.defaultPrevented
-    && !(e.target instanceof window.Element && e.target.closest("input,textarea,select,form,[role=combobox]"));
+    && !(e.target instanceof window.Element && e.target.closest("input,textarea,select,form,[role=combobox],details[open]"));
 }
 
 // Refresh remounts one widget. Expand focuses one widget over the whole grid; Esc restores the grid.

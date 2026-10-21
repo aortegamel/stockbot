@@ -28,6 +28,7 @@
 import createDOMPurify from "dompurify";
 import type { WindowLike } from "dompurify";
 import type { SourceDocument } from "./research-client";
+import { safeSourceUrl } from "../../../needle-harness/lib/agent/types";
 
 export type QuoteResolution =
   | { status: "resolved"; start: number; end: number }
@@ -104,23 +105,6 @@ export function sanitizeSourceHtml(sourceWindow: WindowLike, html: string): Docu
     ALLOW_ARIA_ATTR: false,
     ALLOWED_URI_REGEXP: /^https?:/i,
   });
-}
-
-// A link is safe only when the viewer could fetch it directly: web scheme, host present, no credentials.
-function fetchableHttpUrl(parsed: URL): boolean {
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
-  return parsed.hostname !== "" && !parsed.username && !parsed.password;
-}
-
-export function safeSourceUrl(value: string | undefined): string | undefined {
-  if (!value) return undefined;
-  try {
-    const parsed = new URL(value);
-    if (fetchableHttpUrl(parsed)) return parsed.href;
-  } catch {
-    return undefined;
-  }
-  return undefined;
 }
 
 export function originalSourceUrl(source: SourceDocument, resolved: boolean): string | undefined {
@@ -418,4 +402,62 @@ export function activateQuote(root: HTMLElement, marks: HTMLElement[]): void {
   root.querySelectorAll(".mgl-active-element-highlight").forEach((element) => element.classList.remove("mgl-active-element-highlight"));
   for (const mark of marks) mark.classList.add("mgl-cited-element-highlight", "mgl-active-element-highlight");
   marks[0]?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+// A structured record's quote is the cited row as JSON; anything else is not a row.
+function quotedRow(source: SourceDocument): Record<string, unknown> | undefined {
+  try {
+    const row: unknown = JSON.parse(source.quote);
+    return isRecord(row) ? row : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// ponytail: fixed SEC/FINRA row keys, extend the lists when a new tool names its fields differently.
+const ROW_LABEL_KEYS = [
+  ["form", "dataset"],
+  ["filer_name", "subject_name", "symbol", "symbolCode", "issueSymbolIdentifier"],
+  ["filed_at", "date", "settlementDate", "tradeReportDate"],
+];
+
+// Readable "publisher · title · date" label. Structured records name the cited row instead of a title.
+// Returns "" when the document names nothing; callers pick their own fallback.
+export function sourceLabel(source: SourceDocument): string {
+  const row = source.captureKind === "structured_record" ? quotedRow(source) : undefined;
+  const parts = row
+    ? ROW_LABEL_KEYS.map((keys, index) => keys.map((key) => row[key]).find((value) => typeof value === "string" || typeof value === "number") ?? (index === 0 ? source.dataset : undefined))
+    : [source.title, (source.publishedAt || source.knownAt)?.slice(0, 10)];
+  return [...new Set([source.publisher, ...parts].filter((part) => part !== undefined && part !== "").map(String))].join(" · ");
+}
+
+export type RecordTable = { columns: string[]; rows: Record<string, unknown>[]; cited: number };
+
+// Whitespace-free JSON with sorted keys: the kernel may collapse whitespace inside the cited row.
+function canonicalRow(row: Record<string, unknown>): string {
+  const sorted = (_key: string, value: unknown) => isRecord(value) ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : value;
+  return JSON.stringify(row, sorted).replace(/\s/gu, "");
+}
+
+// ponytail: only top-level arrays of objects count as rows; nested row lists render as cell JSON.
+// The table holds the list that contains the cited row, else the first list. cited is -1 when no row matches.
+export function recordTable(source: SourceDocument): RecordTable | null {
+  if (source.representation !== "json") return null;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(source.content ?? "");
+  } catch {
+    return null;
+  }
+  if (!isRecord(payload)) return null;
+  const quoted = quotedRow(source);
+  const key = quoted ? canonicalRow(quoted) : undefined;
+  const lists = Object.values(payload).filter((value): value is Record<string, unknown>[] => Array.isArray(value) && value.length > 0 && value.every(isRecord));
+  const rows = lists.find((list) => list.some((row) => canonicalRow(row) === key)) ?? lists[0];
+  if (!rows) return null;
+  return { columns: [...new Set(rows.flatMap((row) => Object.keys(row)))], rows, cited: key ? rows.findIndex((row) => canonicalRow(row) === key) : -1 };
 }

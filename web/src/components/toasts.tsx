@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
 import type { FeedItem } from "../lib/market-data";
-import { actionSummary, OpenWorkspace } from "./action-cards";
+import { actionSummary, OpenWorkspace, type WidgetOutcomes } from "./action-cards";
 import { failureText } from "./agent-event";
 
 const TOAST_MS = 5000;
@@ -58,21 +58,21 @@ export function toastAlert(item: FeedItem): void {
 }
 
 // One event gives at most one toast: an applied action or a terminal failure.
-function toastFor(event: AgentEvent): { text: string; sym?: string; failed: boolean } | undefined {
+function toastFor(event: AgentEvent, widgetOutcomes?: WidgetOutcomes): { text: string; sym?: string; failed: boolean } | undefined {
   if (event.type === "error") return { text: "The request failed. Please retry.", failed: true };
   if (event.type === "failed") return { text: failureText(event.category), failed: true };
-  const summary = actionSummary(event);
+  const summary = actionSummary(event, widgetOutcomes);
   return summary && { ...summary, failed: false };
 }
 
 // ponytail: one timer drops the oldest toast at a time; per-toast timers if stacks grow long.
-export function Toasts({ events, onRetry }: { events: AgentEvent[]; onRetry?: () => void }) {
+export function Toasts({ events, onRetry, widgetOutcomes }: { events: AgentEvent[]; onRetry?: () => void; widgetOutcomes?: WidgetOutcomes }) {
   // The stack portals to the shared corner host: a backdrop-filter ancestor would otherwise pin "fixed" to the panel.
   const [host, setHost] = useState<HTMLElement | null>(null);
   const [gone, setGone] = useState<ReadonlySet<AgentEvent>>(new Set());
   useEffect(() => setHost(toastHost()), []);
   const shown = events.flatMap((event, i) => {
-    const toast = gone.has(event) ? undefined : toastFor(event);
+    const toast = gone.has(event) ? undefined : toastFor(event, widgetOutcomes);
     return toast ? [{ event, i, ...toast }] : [];
   });
   const oldest = shown[0]?.event;

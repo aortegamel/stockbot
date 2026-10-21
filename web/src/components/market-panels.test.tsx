@@ -15,7 +15,7 @@ import {
 } from "./market-panels";
 import type { JournalPage } from "../lib/research-client";
 import { WatchlistChatPanel } from "./watchlist-chat-panel";
-import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
+import type { AgentEvent, AskContext } from "../../../needle-harness/lib/agent/types";
 
 // react-dom reads canUseDOM once at module load, so it must load after the jsdom globals
 // exist. A static import runs before this module body, so this one import stays dynamic.
@@ -244,6 +244,8 @@ describe("FinancialsPanel and NewsPanel", () => {
     await until(() => (root.textContent ?? "").includes("Filing 2"));
     expect(asked).toEqual(["/api/filings?sym=NVDA"]);
     expect(root.textContent).not.toContain("FILINGS · NVDA");
+    expect(root.textContent).toContain("filed 2026-10-12");
+    expect(root.textContent).not.toContain("filed 2026-10-13");
     expect(root.querySelector('[title="updated 2026-10-13T01:23:45-04:00"]')).not.toBeNull();
     const link = root.querySelector("a");
     expect(link?.textContent).toBe("Filing 0");
@@ -271,6 +273,7 @@ describe("FinancialsPanel and NewsPanel", () => {
     const root = await mount(<NewsPanel sym="AAPL" />);
     await until(() => (root.textContent ?? "").includes("Headline 7"));
     expect(root.textContent).not.toContain("NEWS · AAPL");
+    expect(root.textContent).toContain("2026-10-14T12:34 · Example Wire");
     expect(root.textContent).not.toContain("12:34:56");
     expect(root.textContent).not.toContain("null · Example Wire");
     expect(root.textContent).not.toContain("Headline 8");
@@ -426,6 +429,28 @@ describe("AIPanel", () => {
     expect(root.textContent).toContain("AGENT · viewing AAPL");
     expect(root.textContent).toContain("The filing reports revenue growth.");
     expect(root.textContent).not.toContain("DEBUG");
+  });
+
+  test("a feed chip enables an empty Send, cuts its title with CSS, keeps the full title, and × removes it", async () => {
+    const title = "CRWV, NBIS, NVDA Jump Overnight: Musk Says the next build-out is bigger than expected";
+    let sends = 0;
+    function Prompt() {
+      const [context, setContext] = useState<AskContext | null>({ kind: "news", title, url: "https://stocktwits.com/a", source: "Stocktwits", sym: "NVDA", at: "2026-10-20T09:00:00Z" });
+      return <AIPanel events={[]} input="" setInput={() => { }} context={context} onClearContext={() => setContext(null)} onSend={() => { sends += 1; }} sym="NVDA" busy={false} debug={false} />;
+    }
+    const root = await mount(<Prompt />);
+    const chip = root.querySelector<HTMLElement>('[aria-label="Attached feed item"]')!;
+    const send = root.querySelector('button[type="submit"]') as HTMLButtonElement;
+    expect(chip.textContent).toBe(`News · Stocktwits · NVDA — ${title}×`);
+    expect(chip.title).toBe(title);
+    expect(chip.querySelector("span")!.style.textOverflow).toBe("ellipsis");
+    expect(root.textContent).not.toContain("https://stocktwits.com/a");
+    expect(send.disabled).toBe(false);
+    await click(send);
+    expect(sends).toBe(1);
+    await click(root.querySelector('[aria-label="Remove context"]')!);
+    expect(root.querySelector('[aria-label="Attached feed item"]')).toBeNull();
+    expect(send.disabled).toBe(true);
   });
 });
 

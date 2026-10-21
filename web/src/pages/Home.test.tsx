@@ -64,7 +64,7 @@ function serve(over: Record<string, Handler> = {}): URL[] {
 type Props = Parameters<typeof Home>[0];
 
 function state(over: Partial<Props> = {}): Props {
-  return { pick: () => { }, watchlist: ["NVDA", "AAPL"], onWatchlist: () => { }, setInput: () => { }, openDrawer: () => { }, ...over };
+  return { pick: () => { }, watchlist: ["NVDA", "AAPL"], onWatchlist: () => { }, setInput: () => { }, setAskContext: () => { }, openDrawer: () => { }, ...over };
 }
 
 async function mount(s: Props): Promise<HTMLElement> {
@@ -134,11 +134,12 @@ describe("Home", () => {
     expect(calls).toEqual([["NVDA", "AAPL", "GME"], ["AAPL"]]);
   });
 
-  test("a scan click loads its table and Create your own prefills the agent input", async () => {
+  test("a scan click loads its table and Create your own prefills the agent input and clears a feed item", async () => {
     const inputs: string[] = [];
+    const contexts: unknown[] = [];
     let opened = 0;
     const urls = serve();
-    const root = await mount(state({ setInput: (v) => inputs.push(v), openDrawer: () => opened++ }));
+    const root = await mount(state({ setInput: (v) => inputs.push(v), setAskContext: (c) => contexts.push(c), openDrawer: () => opened++ }));
     await until(() => text(root).includes("Most shorted"));
     expect(text(root)).toContain("No saved scans.");
     await click(button(root, "Most shorted"));
@@ -146,6 +147,7 @@ describe("Home", () => {
     await until(() => text(root).includes("Markets · Most shorted") && text(root).includes("GME"));
     await click(button(root, "Create your own"));
     expect(inputs).toEqual(["scan for "]);
+    expect(contexts).toEqual([null]);
     expect(opened).toBe(1);
   });
 

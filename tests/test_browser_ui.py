@@ -35,7 +35,8 @@ PALETTE = (By.CSS_SELECTOR, 'input[role="combobox"]')
 FIRST_HIT = (By.XPATH, "//*[@id='cmd-list']//*[@role='option'][b='ORCL']")
 AGENT_INPUT = (By.CSS_SELECTOR, 'input[aria-label="Ask the research agent"]')
 SEND = (By.CSS_SELECTOR, 'button[type="submit"]')
-SOURCE_ID = "capture:fixture-long"
+# Real capture ids are sha256 hex; the #/source/<id> route rejects any other shape.
+SOURCE_ID = "capture:" + "a" * 64
 SOURCE: dict[str, object] = {
     "id": SOURCE_ID,
     "title": "10-K",
@@ -597,32 +598,41 @@ def test_agent_transcript_scrolls_inside_panel(
     }
     WebDriverWait(browser, 10).until(EC.presence_of_element_located((By.XPATH, "//div[text()='── metrics ──']")))
     assert_prompt_reachable(browser)
-    sources = browser.find_element(By.CSS_SELECTOR, 'button[aria-label="Open captured sources for ev:fixture"]')
+    sources = browser.find_element(By.CSS_SELECTOR, '[aria-label="Captured sources"] a')
+    assert "ev:fixture" not in sources.text
     assert not visible(browser, sources), "The long answer must overflow the transcript for this check."
     wheel_until(browser, transcript_point(browser), lambda: visible(browser, sources))
     assert_prompt_reachable(browser)
 
-    # Captured source: the content scrolls on its own until the final line.
+    # Captured source opens in its own tab; its content scrolls on its own until the final line.
+    original = browser.current_window_handle
+    tabs_before = set(browser.window_handles)
     sources.click()
-    WebDriverWait(browser, 10).until(
-        EC.presence_of_element_located((By.XPATH, "//aside//p[@role='status'][contains(., 'quote matches')]"))
-    )
-    content = browser.find_element(By.CSS_SELECTOR, '[aria-label="Captured source content"]')
-    mark = content.find_element(By.TAG_NAME, "mark")
-    settle(browser, content)
-    # activateQuote scrolls smoothly; a loaded machine can delay the animation past settle's window.
-    WebDriverWait(browser, 10).until(lambda _: visible(browser, mark), "The cited passage is not visible.")
-    assert browser.execute_script("return arguments[0].scrollHeight > arguments[0].clientHeight + 1", content)
-    box = mark.rect
-    wheel_until(
-        browser,
-        (int(box["x"] + box["width"] / 2), int(box["y"] + box["height"] / 2)),
-        lambda: browser.execute_script(
-            "const c = arguments[0]; return c.scrollTop > 0 && c.scrollTop + c.clientHeight >= c.scrollHeight - 1;",
-            content,
-        ),
-    )
-    assert_prompt_reachable(browser)
+    WebDriverWait(browser, 10).until(lambda _: len(set(browser.window_handles) - tabs_before) == 1)
+    browser.switch_to.window((set(browser.window_handles) - tabs_before).pop())
+    try:
+        WebDriverWait(browser, 10).until(
+            EC.presence_of_element_located((By.XPATH, "//article//p[@role='status'][contains(., 'quote matches')]"))
+        )
+        content = browser.find_element(By.CSS_SELECTOR, '[aria-label="Captured source content"]')
+        mark = content.find_element(By.TAG_NAME, "mark")
+        settle(browser, content)
+        # activateQuote scrolls smoothly; a loaded machine can delay the animation past settle's window.
+        WebDriverWait(browser, 10).until(lambda _: visible(browser, mark), "The cited passage is not visible.")
+        assert browser.execute_script("return arguments[0].scrollHeight > arguments[0].clientHeight + 1", content)
+        box = mark.rect
+        wheel_until(
+            browser,
+            (int(box["x"] + box["width"] / 2), int(box["y"] + box["height"] / 2)),
+            lambda: browser.execute_script(
+                "const c = arguments[0]; return c.scrollTop > 0 && c.scrollTop + c.clientHeight >= c.scrollHeight - 1;",
+                content,
+            ),
+        )
+        assert_prompt_reachable(browser)
+    finally:
+        browser.close()
+        browser.switch_to.window(original)
 
 
 def test_filings_panel_shows_fund_filing_date_and_provider_error(browser: webdriver.Chrome) -> None:
@@ -662,27 +672,36 @@ def test_chat_chart_update_moves_chart_to_amd(browser: webdriver.Chrome, local_u
     assert "AGENT · viewing AMD" in browser.find_element(By.CSS_SELECTOR, "main").text
 
 
-def test_chat_citation_opens_fixture_source_in_new_tab(browser: webdriver.Chrome, local_ui: UI) -> None:
+def test_chat_citation_opens_source_page_in_new_tab(browser: webdriver.Chrome, local_ui: UI) -> None:
     wait = WebDriverWait(browser, 10)
     send_chat(browser, local_ui, CITATION_PROMPT)
-    citation = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'a[aria-label="Open source for ev:fixture"]')))
-    assert citation.text == "[ev:fixture]"
-    href = citation.get_attribute("href") or ""
-    assert FIXTURE_SOURCE_PATH in href and href.startswith("http://127.0.0.1:")
+    citation = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'a[aria-label^="Open source: "]')))
+    assert citation.text == "[1]"
+    assert "ev:fixture" not in (citation.get_attribute("aria-label") or "")
+    assert (citation.get_attribute("href") or "").endswith(f"#/source/{quote(SOURCE_ID, safe='')}")
     original = browser.current_window_handle
     tabs_before = set(browser.window_handles)
     citation.click()
     wait.until(lambda _: len(set(browser.window_handles) - tabs_before) == 1)
-    new_tab = (set(browser.window_handles) - tabs_before).pop()
-    browser.switch_to.window(new_tab)
+    browser.switch_to.window((set(browser.window_handles) - tabs_before).pop())
     try:
+        wait.until(EC.text_to_be_present_in_element((By.CSS_SELECTOR, "article"), "How we got this"))
+        open_original = browser.find_element(By.LINK_TEXT, "Open original")
+        assert FIXTURE_SOURCE_PATH in (open_original.get_attribute("href") or "")
+        page_tab = browser.current_window_handle
+        before_original = set(browser.window_handles)
+        open_original.click()
+        wait.until(lambda _: len(set(browser.window_handles) - before_original) == 1)
+        browser.switch_to.window((set(browser.window_handles) - before_original).pop())
         wait.until(EC.url_contains(FIXTURE_SOURCE_PATH))
         assert "Fixture source document" in browser.page_source
+        browser.close()
+        browser.switch_to.window(page_tab)
     finally:
         browser.close()
         browser.switch_to.window(original)
     assert browser.current_window_handle == original
-    assert FIXTURE_SOURCE_PATH not in browser.current_url
+    assert "#/source/" not in browser.current_url
 
 
 def test_chat_watchlist_update_shows_amd_without_moving_chart(browser: webdriver.Chrome, local_ui: UI) -> None:

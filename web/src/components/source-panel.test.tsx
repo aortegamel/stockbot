@@ -1,14 +1,16 @@
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { dom } from "../test-dom";
+import { afterEach, describe, expect, test } from "bun:test";
 import { act } from "react";
 import type { ReactNode } from "react";
-import { createRoot } from "react-dom/client";
 import fc from "fast-check";
 import type { Root } from "react-dom/client";
-import { JSDOM } from "jsdom";
 import { AgentConsole } from "./agent-console";
-import { SourcePanel } from "./source-panel";
+import { SourcePage } from "./source-panel";
 import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
 import type { SourceDocument } from "../lib/research-client";
+
+// Static import cannot work: react-dom reads canUseDOM once at module load, so it loads after the jsdom globals exist.
+const { createRoot } = await import("react-dom/client");
 
 const TEXT: SourceDocument = {
   id: "evidence:panel:text",
@@ -26,35 +28,13 @@ const TEXT: SourceDocument = {
 
 const TEXT_URL = "/api/research/sources/evidence%3Apanel%3Atext";
 
-const dom = new JSDOM(`<body><div id="root"></div></body>`, { url: "https://example.com/" });
-const registry = globalThis as Record<string, unknown>;
-const DOM_GLOBALS = ["IS_REACT_ACT_ENVIRONMENT", "window", "document", "navigator", "requestAnimationFrame", "cancelAnimationFrame"];
-const savedGlobals = new Map<string, PropertyDescriptor | undefined>();
 const realFetch = globalThis.fetch;
 let mounted: Root | null = null;
-
-beforeAll(() => {
-  for (const key of DOM_GLOBALS) savedGlobals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
-  registry.IS_REACT_ACT_ENVIRONMENT = true;
-  registry.window = dom.window;
-  registry.document = dom.window.document;
-  registry.navigator = dom.window.navigator;
-  registry.requestAnimationFrame = (callback: FrameRequestCallback) => setTimeout(() => callback(0), 0) as unknown as number;
-  registry.cancelAnimationFrame = (frame: number) => clearTimeout(frame);
-});
 
 afterEach(async () => {
   await act(async () => mounted?.unmount());
   mounted = null;
   globalThis.fetch = realFetch;
-});
-
-afterAll(() => {
-  for (const [key, descriptor] of savedGlobals) {
-    if (descriptor) Object.defineProperty(globalThis, key, descriptor);
-    else Reflect.deleteProperty(globalThis, key);
-  }
-  dom.window.close();
 });
 
 // Each reply serves one source request in order. A gate holds a reply until the test releases it.
@@ -71,8 +51,8 @@ function serve(...replies: { body: unknown; status?: number; gate?: Promise<void
   return requests;
 }
 
-function panel(id: string, count = 1, events: string[] = []): ReactNode {
-  return <SourcePanel reference={{ id }} position={0} count={count} onNavigate={(direction) => events.push(`navigate:${direction}`)} onClose={() => events.push("close")} />;
+function panel(id: string): ReactNode {
+  return <SourcePage id={id} />;
 }
 
 async function mount(element: ReactNode): Promise<HTMLElement> {
@@ -136,17 +116,20 @@ const EXA: SourceDocument = {
   quote: `Nvidia&#39;s <strong>sales <em>soared</em></strong> &amp; margins held.</p><figure><p>Getty Images</p></figure><p>Revenue dou`,
 };
 
-describe("SourcePanel", () => {
+// Each "How we got this" term with its shown value.
+function how(root: HTMLElement): Record<string, string | null | undefined> {
+  return Object.fromEntries([...root.querySelectorAll("dl dt")].map((term) => [term.textContent, term.nextElementSibling?.textContent]));
+}
+
+describe("SourcePage", () => {
   test("renders text captures with metadata and marks the exact quote", async () => {
     const requests = serve({ body: TEXT });
     const root = await mount(panel(TEXT.id));
     await until(resolved(root));
     expect(requests).toEqual([TEXT_URL]);
-    expect(root.querySelector("h3")?.textContent).toBe("10-K");
+    expect(root.querySelector("h1")?.textContent).toBe("SEC · 10-K · 2026-01-01");
     expect(root.textContent).toContain("Original document");
-    for (const value of ["SEC", "2026-01-01", "2026-01-02", "abc", "1 of 1"]) expect(root.textContent).toContain(value);
-    expect(button(root, "Previous source").disabled).toBe(true);
-    expect(button(root, "Next source").disabled).toBe(true);
+    expect(how(root)).toMatchObject({ Source: "SEC", Published: "2026-01-01", Retrieved: "2026-01-02", "Content hash": "abc" });
     expect(root.querySelector('a[href="https://www.sec.gov/filing"]')?.textContent).toBe("Open original");
     expect(root.querySelectorAll("mark").length).toBe(1);
     expect(root.querySelector("mark")?.textContent).toBe("Revenue   grew");
@@ -226,7 +209,7 @@ describe("SourcePanel", () => {
       quote: "",
     };
     const root = await open(sparse);
-    expect([...root.querySelectorAll("dl dd")].map((cell) => cell.textContent)).toEqual(["Not recorded", "Not recorded", "Not recorded", "Not recorded", "text"]);
+    expect([...root.querySelectorAll("dl dd")].map((cell) => cell.textContent)).toEqual(Array(9).fill("Not recorded"));
     expect(root.textContent).toContain("Structured record");
     expect(root.querySelector("blockquote")).toBeNull();
     expect(root.querySelector("mark")).toBeNull();
@@ -369,167 +352,167 @@ describe("SourcePanel", () => {
     const root = await mount(panel(TEXT.id));
     await until(() => root.querySelector('[role="alert"]') !== null);
     expect(root.querySelector('[role="alert"]')?.textContent).toContain("source capture not found");
-    expect(root.querySelector("h3")).toBeNull();
+    expect(root.querySelector("h1")).toBeNull();
     expect(root.querySelectorAll("mark").length).toBe(0);
     await click(root, "Retry source");
     await until(resolved(root));
     expect(requests).toEqual([TEXT_URL, TEXT_URL]);
     expect(root.querySelector('[role="alert"]')).toBeNull();
-    expect(root.querySelector("h3")?.textContent).toBe("10-K");
+    expect(root.querySelector("h1")?.textContent).toBe("SEC · 10-K · 2026-01-01");
     expect(root.querySelector("mark")?.textContent).toBe("Revenue   grew");
-    expect(dom.window.document.activeElement).toBe(root.querySelector("aside"));
   });
 
-  test("navigates sources, returns to the quote, and closes through panel controls", async () => {
+  test("Go to quote returns to the marked passage", async () => {
     serve({ body: TEXT });
-    const events: string[] = [];
-    const root = await mount(panel(TEXT.id, 2, events));
+    const root = await mount(panel(TEXT.id));
     await until(resolved(root));
-    expect(root.textContent).toContain("1 of 2");
     const mark = root.querySelector("mark");
     mark?.classList.remove("mgl-active-element-highlight");
     await click(root, "Go to quote");
     expect(mark?.classList.contains("mgl-active-element-highlight")).toBe(true);
-    for (const label of ["Previous source", "Next source", "Close source"]) await click(root, label);
-    await act(async () => {
-      root.querySelector("aside")?.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-    });
-    expect(events).toEqual(["navigate:-1", "navigate:1", "close", "close"]);
   });
 
-  test("console citations keep stable links while text streams and resolve new sources once", async () => {
-    const source: SourceDocument = { ...TEXT, representation: "html", content: "<p>Revenue grew.</p><p>Margins held.</p>", quote: "Revenue grew.\nMargins held." };
-    const next: SourceDocument = { ...TEXT, id: "evidence:panel:next-citation", url: "https://www.sec.gov/next", representation: "html", content: "<p>Margins held.</p>", quote: "Margins held." };
-    const nextUrl = "/api/research/sources/evidence%3Apanel%3Anext-citation";
+  test("a structured record reads as a table with the cited row highlighted and shows how it was fetched", async () => {
+    const api = "https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest";
+    const record: SourceDocument = {
+      id: "evidence:panel:finra",
+      title: "FINRA",
+      url: api,
+      publisher: "FINRA",
+      capturedAt: "2026-01-03",
+      contentHash: "hash",
+      representation: "json",
+      captureKind: "structured_record",
+      content: JSON.stringify({
+        dataset_id: "otcMarket/consolidatedShortInterest",
+        records: [{ symbolCode: "ACME", settlementDate: "2026-01-01", qty: 1 }, { symbolCode: "ACME", settlementDate: "2026-01-02", qty: 5, extra: { lot: 2 } }],
+      }, null, 2),
+      // The kernel cites the row as sorted, whitespace-collapsed JSON.
+      quote: '{"extra": {"lot": 2}, "qty": 5, "settlementDate": "2026-01-02", "symbolCode": "ACME"}',
+      toolName: "get_short_interest",
+      toolResultId: "rs:1:tr:7",
+      dataset: "otcMarket/consolidatedShortInterest",
+      knownAt: "2026-01-02",
+      upstreamUrl: api,
+      toolArgs: { ticker: "ACME", limit: 100 },
+    };
+    const root = await open(record);
+    expect(root.querySelector("h1")?.textContent).toBe("FINRA · otcMarket/consolidatedShortInterest · ACME · 2026-01-02");
+    expect(root.textContent).toContain("The quote matches the captured source.");
+    const table = root.querySelector('[aria-label="Captured source content"] table');
+    expect([...table?.querySelectorAll("th") ?? []].map((cell) => cell.textContent)).toEqual(["symbolCode", "settlementDate", "qty", "extra"]);
+    const cited = table?.querySelectorAll('tr[aria-current="true"]') ?? [];
+    expect(cited).toHaveLength(1);
+    expect([...cited[0].querySelectorAll("td")].map((cell) => cell.textContent)).toEqual(["ACME", "2026-01-02", "5", '{"lot":2}']);
+    expect(cited[0].classList.contains("mgl-cited-element-highlight")).toBe(true);
+    expect(root.querySelector("blockquote")).toBeNull();
+    expect(root.textContent).not.toContain('{"extra"');
+    expect(how(root)).toMatchObject({
+      Source: "FINRA",
+      Tool: "get_short_interest",
+      Arguments: JSON.stringify({ ticker: "ACME", limit: 100 }, null, 2),
+      "Upstream API": api,
+      // FINRA records have no public page, even though the url names the API.
+      "Public page": "Not recorded",
+      "Known at": "2026-01-02",
+      Retrieved: "2026-01-03",
+    });
+    const upstream = [...root.querySelectorAll("dd a")].find((anchor) => anchor.textContent === api);
+    expect([upstream?.getAttribute("href"), upstream?.getAttribute("target"), upstream?.getAttribute("rel")]).toEqual([api, "_blank", "noopener noreferrer"]);
+    cited[0].classList.remove("mgl-active-element-highlight");
+    await click(root, "Go to quote");
+    expect(cited[0].classList.contains("mgl-active-element-highlight")).toBe(true);
+  });
+
+  test("a structured record without a matching row selects no row", async () => {
+    const root = await open({ ...TEXT, id: "evidence:panel:nomatch", representation: "json", captureKind: "structured_record", content: JSON.stringify({ filings: [{ form: "10-Q" }] }), quote: "ACME 2026-01-02" });
+    expect(root.textContent).toContain("The quote does not resolve in the rendered source. No passage is selected.");
+    expect(root.querySelectorAll("tbody tr")).toHaveLength(1);
+    expect(root.querySelector('tr[aria-current="true"]')).toBeNull();
+    expect(root.querySelector("blockquote")).toBeNull();
+  });
+
+  test("a cited SEC row links its filing page with the accession number highlighted", async () => {
+    const index = "https://www.sec.gov/Archives/edgar/data/1045810/0002152188-26-000007-index.html";
+    const row = { accession_no: "0002152188-26-000007", form: "4/A", source: index };
+    const root = await open({ ...TEXT, id: "evidence:panel:secrow", publisher: "SEC", representation: "json", captureKind: "structured_record", content: JSON.stringify({ filings: [{ accession_no: "0001197647-26-000011", form: "4" }, row] }), quote: JSON.stringify(row), publicUrl: index });
+    expect(root.querySelectorAll('tr[aria-current="true"]')).toHaveLength(1);
+    expect(originalHref(root)).toBe(`${index}#:~:text=0002152188%2D26%2D000007`);
+    await close();
+    const unmatched = await open({ ...TEXT, id: "evidence:panel:secnomatch", publisher: "SEC", representation: "json", captureKind: "structured_record", content: JSON.stringify({ filings: [{ accession_no: "0001197647-26-000011" }] }), quote: JSON.stringify(row), publicUrl: index });
+    expect(originalHref(unmatched)).toBe(index);
+  });
+
+  test("the public page link prefers publicUrl and unsafe URLs never become links", async () => {
+    const root = await open({ ...TEXT, id: "evidence:panel:public", publicUrl: "https://www.sec.gov/public", upstreamUrl: "javascript:alert(1)", toolName: "get_sec_document", toolArgs: { accession_no: "0000000000-26-000042", document_name: "primary.htm" } });
+    expect(originalHref(root)).toBe("https://www.sec.gov/public");
+    expect(how(root)["Upstream API"]).toBe("Not recorded");
+    expect(how(root).Tool).toBe("get_sec_document");
+    expect(root.querySelector('a[href^="javascript:"]')).toBeNull();
+    await close();
+    const unsafe = await open({ ...TEXT, id: "evidence:panel:unsafe", url: "https://user:secret@example.com/filing" });
+    expect(originalHref(unsafe)).toBeUndefined();
+    expect(how(unsafe)["Public page"]).toBe("Not recorded");
+  });
+
+  test("console citations open the provenance page in a new tab with labels from the loaded sources", async () => {
+    const source: SourceDocument = { ...TEXT, title: "10-K annual report" };
+    const record: SourceDocument = {
+      ...TEXT,
+      id: "evidence:panel:record",
+      title: "FINRA",
+      publisher: "FINRA",
+      representation: "json",
+      captureKind: "structured_record",
+      content: "{}",
+      dataset: "otcMarket/consolidatedShortInterest",
+      quote: JSON.stringify({ symbolCode: "ACME", settlementDate: "2026-01-02" }),
+    };
     const { promise: loaded, resolve: release } = Promise.withResolvers<void>();
-    const { promise: nextLoaded, resolve: releaseNext } = Promise.withResolvers<void>();
-    const requests = serve({ body: source, gate: loaded }, { body: next, gate: nextLoaded }, { body: source });
+    const requests = serve({ body: source, gate: loaded }, { body: record });
     const events: AgentEvent[] = [
-      {
-        type: "evidence", evidence: [
-          { id: "ev:cited", source: "sec", retrievedAt: "", content: "", sources: [{ id: source.id, url: "https://www.sec.gov/before-load" }, { id: "evidence:unused" }] },
-          { id: "ev:uncited", source: "sec", retrievedAt: "", content: "", sources: [{ id: next.id, url: "https://www.sec.gov/next-before-load" }] },
-        ]
-      },
+      { type: "evidence", evidence: [{ id: "ev:cited", source: "sec", title: "Evidence title", retrievedAt: "", content: "", sources: [{ id: source.id, title: "Reference title" }, { id: record.id }] }] },
       { type: "answer_delta", text: "Revenue rose [ev:cited]. Margins held [ev:cited]." },
     ];
     const root = await mount(<AgentConsole events={events} reasoning={false} debug={false} />);
-    const anchors = () => [...root.querySelectorAll('a[aria-label="Open source for ev:cited"]')];
-    expect(anchors()).toHaveLength(2);
-    for (const anchor of anchors()) {
-      expect(anchor.getAttribute("href")).toBe("https://www.sec.gov/before-load");
-      expect(anchor.getAttribute("target")).toBe("_blank");
-      expect(anchor.getAttribute("rel")).toBe("noopener noreferrer");
-    }
-    expect(requests).toEqual([TEXT_URL]);
-    const textOnly: AgentEvent[] = [...events, { type: "answer_delta", text: " More streamed text." }];
-    await act(async () => mounted?.render(<AgentConsole events={textOnly} reasoning={false} debug={false} />));
-    expect(anchors().map((anchor) => anchor.getAttribute("href"))).toEqual(["https://www.sec.gov/before-load", "https://www.sec.gov/before-load"]);
-    expect(requests).toEqual([TEXT_URL]);
-    const withNext: AgentEvent[] = [...textOnly, { type: "answer_delta", text: " More [ev:cited]. Next [ev:uncited] and [ev:uncited]." }];
-    await act(async () => mounted?.render(<AgentConsole events={withNext} reasoning={false} debug={false} />));
-    const nextAnchors = () => [...root.querySelectorAll('a[aria-label="Open source for ev:uncited"]')];
-    expect(anchors()).toHaveLength(3);
-    expect(nextAnchors().map((anchor) => anchor.getAttribute("href"))).toEqual(["https://www.sec.gov/next-before-load", "https://www.sec.gov/next-before-load"]);
-    expect(requests).toEqual([TEXT_URL, nextUrl]);
+    const inline = () => [...root.querySelectorAll('a[aria-label^="Open source:"]')];
+    const listed = () => [...root.querySelectorAll('[aria-label="Captured sources"] a')];
+    expect(inline().map((anchor) => [anchor.textContent, anchor.getAttribute("href"), anchor.getAttribute("target"), anchor.getAttribute("rel"), anchor.getAttribute("title")])).toEqual(
+      Array(2).fill(["[1]", "#/source/evidence%3Apanel%3Atext", "_blank", "noopener noreferrer", "Evidence title"]),
+    );
+    await until(() => listed()[1]?.textContent === "FINRA · otcMarket/consolidatedShortInterest · ACME · 2026-01-02");
+    expect(listed().map((anchor) => [anchor.textContent, anchor.getAttribute("href"), anchor.getAttribute("target"), anchor.getAttribute("rel")])).toEqual([
+      ["Evidence title", "#/source/evidence%3Apanel%3Atext", "_blank", "noopener noreferrer"],
+      ["FINRA · otcMarket/consolidatedShortInterest · ACME · 2026-01-02", "#/source/evidence%3Apanel%3Arecord", "_blank", "noopener noreferrer"],
+    ]);
     await act(async () => release());
-    await until(() => anchors().every((anchor) => anchor.getAttribute("href") === `${source.url}#:~:text=Revenue%20grew.,Margins%20held.`));
-    await act(async () => mounted?.render(<AgentConsole events={[...withNext, { type: "answer_delta", text: " Text without another citation." }]} reasoning={false} debug={false} />));
-    expect(anchors()).toHaveLength(3);
-    for (const anchor of anchors()) {
-      expect(anchor.getAttribute("href")).toBe(`${source.url}#:~:text=Revenue%20grew.,Margins%20held.`);
-      expect(anchor.getAttribute("target")).toBe("_blank");
-      expect(anchor.getAttribute("rel")).toBe("noopener noreferrer");
-    }
-    expect(nextAnchors().map((anchor) => anchor.getAttribute("href"))).toEqual(["https://www.sec.gov/next-before-load", "https://www.sec.gov/next-before-load"]);
-    await act(async () => releaseNext());
-    await until(() => nextAnchors().every((anchor) => anchor.getAttribute("href") === fragment(next.url ?? "", next.quote ?? "")));
-    expect(nextAnchors()).toHaveLength(2);
-    expect(requests).toEqual([TEXT_URL, nextUrl]);
+    await until(() => listed()[0]?.textContent === "SEC · 10-K annual report · 2026-01-01");
+    expect(inline().map((anchor) => anchor.getAttribute("aria-label"))).toEqual(Array(2).fill("Open source: SEC · 10-K annual report · 2026-01-01"));
+    await act(async () => mounted?.render(<AgentConsole events={[...events, { type: "answer_delta", text: " More text." }]} reasoning={false} debug={false} />));
+    expect(requests).toEqual([TEXT_URL, "/api/research/sources/evidence%3Apanel%3Arecord"]);
+    // Raw evidence ids never reach the reader, and no in-drawer panel opens.
+    expect(root.textContent).not.toContain("ev:cited");
+    expect(root.textContent).not.toContain("evidence:panel");
     expect(root.querySelector("aside")).toBeNull();
-    await click(root, "Sources: ev:cited");
-    await until(resolved(root));
-    expect(root.querySelector("aside h3")?.textContent).toBe("10-K");
-    expect(root.textContent).toContain("1 of 2");
-    expect(requests).toEqual([TEXT_URL, nextUrl, TEXT_URL]);
   });
 
-  test("console citations without an original URL still open the captured source panel", async () => {
-    const source: SourceDocument = { ...TEXT, url: undefined };
-    const requests = serve({ body: source }, { body: source });
+  test("console source labels fall back to the reference title, then the publisher and index", async () => {
+    const requests = serve({ body: { error: "source capture not found" }, status: 404 }, { body: { error: "source capture not found" }, status: 404 });
     const events: AgentEvent[] = [
-      { type: "evidence", evidence: [{ id: "ev:no-url", source: "sec", retrievedAt: "", content: "", sources: [{ id: source.id }] }] },
-      { type: "answer_delta", text: "Revenue rose [ev:no-url]." },
+      {
+        type: "evidence", evidence: [
+          { id: "ev:a", source: "sec", retrievedAt: "", content: "", sources: [{ id: "evidence:a", title: "Reference title" }] },
+          { id: "ev:b", source: "finra", retrievedAt: "", content: "", sources: [{ id: "evidence:b" }] },
+        ]
+      },
+      { type: "answer_delta", text: "A [ev:a]. B [ev:b]." },
     ];
     const root = await mount(<AgentConsole events={events} reasoning={false} debug={false} />);
-    expect(requests).toEqual([TEXT_URL]);
-    expect(root.querySelector('a[aria-label="Open source for ev:no-url"]')).toBeNull();
-    expect(root.querySelector('button[aria-label="Open source for ev:no-url"]')).not.toBeNull();
-    await click(root, "[ev:no-url]");
-    await until(resolved(root));
-    expect(root.querySelector("aside h3")?.textContent).toBe("10-K");
-    expect(requests).toEqual([TEXT_URL, TEXT_URL]);
-  });
-
-  test("console citations reject unsafe reference and loaded URLs", async () => {
-    for (const { url, referenceUrl } of [
-      { url: "javascript:alert(1)", referenceUrl: "javascript:alert(1)" },
-      { url: "https://user:secret@example.com/filing", referenceUrl: "https://user:secret@example.com/filing" },
-      { url: "javascript:alert(1)", referenceUrl: "https://www.sec.gov/filing" },
-    ]) {
-      const source: SourceDocument = { ...TEXT, url };
-      const { promise: loaded, resolve: release } = Promise.withResolvers<void>();
-      const requests = serve({ body: source, gate: loaded }, { body: source });
-      const events: AgentEvent[] = [
-        { type: "evidence", evidence: [{ id: "ev:unsafe", source: "sec", retrievedAt: "", content: "", sources: [{ id: source.id, url: referenceUrl }] }] },
-        { type: "answer_delta", text: "Revenue rose [ev:unsafe]." },
-      ];
-      const root = await mount(<AgentConsole events={events} reasoning={false} debug={false} />);
-      expect(root.querySelector('a[aria-label="Open source for ev:unsafe"]')?.getAttribute("href")).toBe(referenceUrl === "https://www.sec.gov/filing" ? referenceUrl : undefined);
-      await act(async () => release());
-      expect(root.querySelector('a[aria-label="Open source for ev:unsafe"]')).toBeNull();
-      await click(root, "[ev:unsafe]");
-      await until(resolved(root));
-      expect(originalHref(root)).toBeUndefined();
-      expect(requests).toEqual([TEXT_URL, TEXT_URL]);
-      await close();
-    }
-  });
-
-  test("console navigation shows only the selected capture while loading and after failure", async () => {
-    const next: SourceDocument = { ...TEXT, id: "evidence:panel:next", title: "8-K", content: "Margins fell sharply.", quote: "Margins fell" };
-    const { promise: nextLoaded, resolve: releaseNext } = Promise.withResolvers<void>();
-    const requests = serve({ body: { ...TEXT, url: undefined } }, { body: TEXT }, { body: next, gate: nextLoaded }, { body: { error: "source capture not found" }, status: 404 });
-    const events: AgentEvent[] = [
-      { type: "agent_start", prompt: "risk?" },
-      { type: "evidence", evidence: [{ id: "ev:abc123", source: "sec", retrievedAt: "2026-10-10T00:00:00Z", content: "", sources: [{ id: TEXT.id }, { id: next.id }, { id: "evidence:panel:missing" }] }] },
-      { type: "answer_delta", text: "Risk grew [ev:abc123]." },
-    ];
-    const root = await mount(<AgentConsole events={events} reasoning={false} debug={false} />);
-    await click(root, "[ev:abc123]");
-    await until(resolved(root));
-    expect(root.querySelector("aside h3")?.textContent).toBe("10-K");
-
-    await click(root, "Next source");
-    const loading = root.querySelector("aside")?.textContent ?? "";
-    expect(loading).toContain("2 of 3");
-    expect(loading).toContain("Loading captured source…");
-    expect(loading).not.toContain("10-K");
-    expect(root.querySelector("aside h3")).toBeNull();
-    expect(root.querySelector("aside mark")).toBeNull();
-    await act(async () => releaseNext());
-    await until(() => root.querySelector("aside mark")?.textContent === "Margins fell");
-    expect(root.querySelector("aside h3")?.textContent).toBe("8-K");
-
-    await click(root, "Next source");
-    await until(() => root.querySelector('aside [role="alert"]') !== null);
-    const failed = root.querySelector("aside")?.textContent ?? "";
-    expect(failed).toContain("3 of 3");
-    expect(failed).toContain("source capture not found");
-    expect(failed).not.toContain("8-K");
-    expect(root.querySelector("aside h3")).toBeNull();
-    expect(root.querySelector("aside mark")).toBeNull();
-    expect(requests).toEqual([TEXT_URL, TEXT_URL, "/api/research/sources/evidence%3Apanel%3Anext", "/api/research/sources/evidence%3Apanel%3Amissing"]);
+    await until(() => requests.length === 2);
+    await act(async () => { });
+    expect([...root.querySelectorAll('[aria-label="Captured sources"] a')].map((anchor) => anchor.textContent)).toEqual(["Reference title", "FINRA 2"]);
+    expect([...root.querySelectorAll('a[aria-label^="Open source:"]')].map((anchor) => [anchor.textContent, anchor.getAttribute("title")])).toEqual([["[1]", "Reference title"], ["[2]", "FINRA 2"]]);
+    expect(root.textContent).not.toContain("ev:a");
   });
 
   test("rejects a provider-extracted PDF before it reaches the PDF renderer", async () => {
@@ -546,7 +529,7 @@ describe("SourcePanel", () => {
     const root = await mount(panel(extracted.id));
     await until(() => root.querySelector('[role="alert"]') !== null);
     expect(requests).toEqual(["/api/research/sources/evidence%3Apanel%3Apdf"]);
-    expect(root.querySelector("h3")).toBeNull();
+    expect(root.querySelector("h1")).toBeNull();
     expect(root.querySelector('[aria-label="Captured PDF pages"]')).toBeNull();
     expect(root.querySelector('[aria-label="Captured source content"]')).toBeNull();
     expect([...root.querySelectorAll("button")].some((entry) => entry.textContent === "Go to quote")).toBe(false);
