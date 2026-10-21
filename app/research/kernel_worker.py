@@ -1,6 +1,6 @@
 """Kernel worker: stdin-JSONL bridge from the TS route to the Python scheduler.
 
-Request:  {"id", "op": "run", "prompt", "asOf"?, "deadlineAt"? (epoch ms), "sessionId"?, "gap"?,
+Request:  {"id", "op": "run", "prompt", "asOf"?, "deadlineAt"? (epoch ms),
            "ticker"?, "watchlist"? ([tickers]: the user's watchlist request; replaces ticker scope),
            "context"? (a user-attached feed item {kind, title, source, at, url?, sym?}: untrusted data)}
           {"id", "op": "watchlist", "watchlist": [tickers], "deadlineAt"?} -> {"id", "watchlist": [rows]}
@@ -241,6 +241,7 @@ _INTAKE_SEC_FORMS = ("8-K", "10-Q", "10-K", "4")
 _INTAKE_SEC_LIMIT = 5
 _INTAKE_DIGEST_CHARS = 6000
 _INTAKE_MAX_ROUNDS = 2
+_INTAKE_MAX_QUESTIONS = 4
 _INTAKE_CALL_TIMEOUT_S = 8.0
 _INTAKE_BUDGET_S = 8.0
 _INTAKE_REASONER_TIMEOUT_S = 20.0
@@ -755,7 +756,13 @@ def _intake_reasoner_prompt(
         '   the user did not write them) and "corrected_query" (what you think the user\n'
         "   meant). Reason in any form you need; these are hints, not a template, and\n"
         "   nothing you write is filtered or rewritten by code.\n"
-        "5. Cite only evidence_ids present in the digest.\n"
+        "5. Related companies and organizations named in the raw query, the feed item or the\n"
+        "   digest (customers, suppliers, partners, competitors) are useful context, even\n"
+        "   private ones with no ticker (OpenAI, SpaceX, Anthropic, xAI). For a private one,\n"
+        "   write a web-search question about its relationship to the subject, for example\n"
+        "   'OpenAI compute purchases from NVIDIA', and add its name to \"tickers\".\n"
+        "   Write at most 2 such related-company questions.\n"
+        "6. Cite only evidence_ids present in the digest.\n"
         "\n"
         "Output exactly one JSON object and nothing else: no prose, no markdown fences.\n"
         'Valid example ("tickers": string[] and "corrected_query": string are optional top-level keys):\n'
@@ -1377,8 +1384,15 @@ def _intake_decompose_timeout(setup_deadline: float | None) -> float | None:
     return max(setup_deadline - time.perf_counter() - 5.0, 1.0)
 
 
+# ponytail: shape, not lookup: US symbols are 1-5 letters plus an optional share class
+# (BRK.B, BF-B). A short private name (XAI) still reads as a ticker; add a lookup if that matters.
+_LISTED_SYMBOL_RE = re.compile(r"[A-Z]{1,5}(?:[.-][A-Z])?")
+_INTAKE_RELATED_MAX = 2
+_INTAKE_RELATED_CHARS = 40
+
+
 def _intake_hint_tickers(hints: Mapping[str, object], tickers: Sequence[str]) -> list[str]:
-    """New tickers named by the Reasoner hints, in first-seen order."""
+    """New ticker-shaped symbols named by the Reasoner hints, in first-seen order."""
     raw_hints = hints.get("tickers")
     if not isinstance(raw_hints, list):
         return []
@@ -1387,9 +1401,50 @@ def _intake_hint_tickers(hints: Mapping[str, object], tickers: Sequence[str]) ->
         if not isinstance(t, str):
             continue
         up = t.strip().upper()
-        if up and up not in tickers and up not in out:
+        if _LISTED_SYMBOL_RE.fullmatch(up) and up not in tickers and up not in out:
             out.append(up)
     return out
+
+
+def _intake_related_names(hints: Mapping[str, object], related: Sequence[str], known_text: str) -> list[str]:
+    """Related names with no ticker shape (OpenAI, SpaceX): search-only context, at most _INTAKE_RELATED_MAX.
+
+    A name counts only when the request, feed item or evidence names it; that text gives its spelling.
+    """
+    raw_hints = hints.get("tickers")
+    out = list(related)
+    for t in raw_hints if isinstance(raw_hints, list) else []:
+        name = t.strip() if isinstance(t, str) else ""
+        if len(out) >= _INTAKE_RELATED_MAX or not name or len(name) > _INTAKE_RELATED_CHARS:
+            continue
+        if _LISTED_SYMBOL_RE.fullmatch(name.upper()):
+            continue
+        found = re.search(rf"(?<!\w){re.escape(name)}(?!\w)", known_text, re.IGNORECASE)
+        if found is not None and found.group().lower() not in (n.lower() for n in out):
+            out.append(found.group())
+    return out
+
+
+def _intake_related_proposals(
+    related: Sequence[str], subject: Sequence[str], proposals: Sequence[Mapping[str, object]], objective_id: str
+) -> list[dict[str, object]]:
+    """One web-search question per related name the planner did not already ask about; needs a subject."""
+    if not subject:
+        return []
+    label = f"{subject[0]} ({subject[-1]})" if len(subject) > 1 else subject[0]
+    asked = "\n".join(str(p.get("question")) for p in proposals).lower()
+    return [
+        {
+            "id": f"{objective_id}-related{i}",
+            "objectiveId": objective_id,
+            "question": f"Web search: {name} relationship with {label} "
+            "(customer, supplier, partner or competitor) and recent deals",
+            "dependsOn": [],
+            "whyItMatters": f"{name} has no ticker to research; its ties to {label} give context.",
+        }
+        for i, name in enumerate(related, 1)
+        if name.lower() not in asked
+    ]
 
 
 def _intake_corrected_query(hints: Mapping[str, object], fetched_queries: Sequence[str]) -> str | None:
@@ -1440,13 +1495,20 @@ async def _graph_intake(
     rounds = 0
     fetched_tickers: list[str] = []
     fetched_queries: list[str] = []
-    tickers = _intake_start_tickers(objective, None if watchlist else supplied_ticker)
+    # The feed item's validated sym is the subject when the prompt names none; it outranks the chart.
+    feed_sym = context.get("sym") if context is not None else None
+    tickers = _intake_start_tickers(
+        objective, feed_sym if isinstance(feed_sym, str) else None if watchlist else supplied_ticker
+    )
     # A feed item always plans through the Reasoner, so the questions target the item.
     single_subject = context is None and _intake_single_subject(objective, tickers, watchlist)
     subject = _intake_subject(tickers)
     query_text: str | None = " ".join((*subject, objective))
     # A feed item's title runs once, in round 1, as its own exact-text web search: citable coverage of the item.
     title_query = str(context["title"]) if context is not None else None
+    # Related names (no ticker) the planner found in the request, feed item or evidence: search-only context.
+    related: list[str] = []
+    context_text = " ".join(str(v) for v in context.values()) if context is not None else ""
     while True:
         if _intake_round2_spent(setup_deadline, rounds):
             break
@@ -1478,17 +1540,29 @@ async def _graph_intake(
             proposals = _objective_or_admitted(objective, sid, [])
             _log_intake_round(sid, objective, raw, digest, {"proposals": proposals, "hints": hints}, stats, kernel)
             break
-        proposals, hints = _reasoner_decompose_with_retry(
-            objective,
-            as_of,
-            sid,
-            digest,
-            progress,
-            _intake_decompose_timeout(setup_deadline),
-            setup_deadline,
-            context,
-        )
+        try:
+            proposals, hints = _reasoner_decompose_with_retry(
+                objective,
+                as_of,
+                sid,
+                digest,
+                progress,
+                _intake_decompose_timeout(setup_deadline),
+                setup_deadline,
+                context,
+            )
+        except Exception as exc:
+            if rounds == 0:
+                raise
+            # Round 2 never discards round 1: keep its plan and evidence, record the failure.
+            error = f"{type(exc).__name__}: {exc}"[:300]
+            logger.warning("intake round2_planner_failed sid=%s err=%s", sid, error)
+            stats["planner_error"] = error
+            reasoner_out: dict[str, object] = {"proposals": proposals, "hints": hints, "error": error}
+            _log_intake_round(sid, objective, raw, digest, reasoner_out, stats, kernel)
+            break
         rounds += 1
+        related = _intake_related_names(hints, related, f"{objective}\n{context_text}\n{digest}")
         _log_intake_round(sid, objective, raw, digest, {"proposals": proposals, "hints": hints}, stats, kernel)
         if rounds >= _INTAKE_MAX_ROUNDS:
             break
@@ -1499,7 +1573,10 @@ async def _graph_intake(
             break
         query_text = _intake_corrected_query(hints, fetched_queries)
         tickers = [*tickers, *next_tickers]
-    return proposals
+    # ponytail: 4 planner questions max, cut BEFORE JEV so disposition never judges proposals that
+    # can't become nodes; related-company questions ride after the cut and never lose their place.
+    planned = proposals[:_INTAKE_MAX_QUESTIONS]
+    return [*planned, *_intake_related_proposals(related, subject, planned, sid)]
 
 
 def _log_intake_round(
@@ -1758,11 +1835,8 @@ def run_graph_prompt(
                 context=context,
             )
         )
-        # ponytail: 4 concrete questions max; cap BEFORE JEV so disposition never judges
-        # proposals that can't become nodes, and dropped deps never silently vanish.
-        capped: list[dict[str, object]] = proposals[:4] if proposals else []
         admitted: list[dict[str, object]] = (
-            _jev_admit(sid, objective, capped, jev=client, setup_deadline=setup_deadline) if capped else []
+            _jev_admit(sid, objective, proposals, jev=client, setup_deadline=setup_deadline) if proposals else []
         )
         _create_nodes_topological(sid, stamped, admitted if admitted else [])
         return sid
@@ -1792,26 +1866,6 @@ def _create_nodes_topological(sid: str, objective: str, admitted: list[dict[str,
         node_id = node.node_id
         if node_id:
             id_to_node[pid] = node_id
-
-
-def _followup_gap_nodes(sid: str, gap: str) -> tuple[str, list[str]]:
-    """Pass-2 entry: one gap node in the pass-1 session, no intake. Returns (sid, [new node ids])."""
-    from app.research import service
-    from app.research.repository import ResearchRepository
-
-    store = ResearchRepository()
-    store.get_session(sid)  # KeyError on unknown session; caller reports invalid_params
-    leftover = [n.node_id for n in service.ready_nodes(sid)]
-    node = service.create_node(sid, query_with_today_utc(gap), "Missing evidence named by the writer.")
-    for nid in leftover:
-        try:
-            current = store.get_node(nid)
-        except KeyError:
-            continue
-        if current.status not in ("proposed", "gathering"):
-            continue
-        service.block_node(sid, nid, "pass-2 superseded by gap node")
-    return sid, [node.node_id] if node.node_id else []
 
 
 def _request_ticker(req: Mapping[str, JSONValue], where: str = "<worker>") -> str | None:
@@ -2332,27 +2386,6 @@ def _run_deadlines(req: Mapping[str, JSONValue]) -> tuple[float, float, float]:
     )
 
 
-def _run_gap_request(req: Mapping[str, JSONValue]) -> tuple[str, str] | None:
-    """(sessionId, gap) for a pass-2 request; None when the request starts a new session."""
-    raw_session = req.get("sessionId")
-    raw_gap = req.get("gap")
-    if isinstance(raw_session, str) and raw_session.strip() and isinstance(raw_gap, str) and raw_gap.strip():
-        return raw_session.strip(), raw_gap.strip()
-    return None
-
-
-def _run_followup(rid: str, session_id: str, gap: str) -> tuple[str, list[str], dict[str, JSONValue] | None]:
-    """Pass-2 setup: (session id, new node ids, terminal response); the id is empty when denied."""
-    try:
-        sid, followup_nodes = _followup_gap_nodes(session_id, gap)
-    except KeyError as exc:
-        return "", [], _terminal(rid, "invalid_params", f"unknown session: {exc}")
-    except Exception as exc:
-        logger.exception("kernel session followup setup failed rid=%s", rid)
-        return "", [], _terminal(rid, "provider_error", f"session setup failed: {exc}")
-    return sid, followup_nodes, None
-
-
 def _run_graph_session(
     rid: str,
     objective: str,
@@ -2386,28 +2419,6 @@ def _run_graph_session(
         logger.exception("kernel session setup failed rid=%s", rid)
         return "", _terminal(rid, "provider_error", f"session setup failed: {exc}")
     return sid, None
-
-
-def _run_session(
-    rid: str,
-    req: Mapping[str, JSONValue],
-    objective: str,
-    as_of: str | None,
-    client: JevClient,
-    progress: ProgressFn | None,
-    setup_deadline: float,
-    run_ticker: str | None,
-    watchlist: list[str] | None,
-    context: dict[str, JSONValue] | None = None,
-) -> tuple[str, list[str], dict[str, JSONValue] | None]:
-    """Pass-2 or graph session setup: (session id, new node ids, terminal response)."""
-    gap = _run_gap_request(req)
-    if gap is None:
-        sid, denied = _run_graph_session(
-            rid, objective, as_of, client, progress, setup_deadline, run_ticker, watchlist, context
-        )
-        return sid, [], denied
-    return _run_followup(rid, *gap)
 
 
 def _run_failure(rid: str, run_result: object) -> dict[str, JSONValue] | None:
@@ -2560,16 +2571,9 @@ def _run_decision_rows(decision_rows: Sequence[DecisionRecord]) -> tuple[list[JS
     return decisions_payload, watchlist_rows
 
 
-def _run_unresolved(nodes_payload: Sequence[JSONValue], followup_nodes: Sequence[str]) -> list[JSONValue]:
-    """Unresolved node ids; a follow-up gates only its own new gap node."""
-    unresolved: list[JSONValue] = [
-        str(n["node_id"]) for n in nodes_payload if isinstance(n, dict) and n.get("status") != "resolved"
-    ]
-    if followup_nodes:
-        # ponytail: follow-up gates only the new gap node; pass-1 nodes keep
-        # their own states in nodes_payload but never gate the writer again.
-        unresolved = [nid for nid in unresolved if nid in followup_nodes]
-    return unresolved
+def _run_unresolved(nodes_payload: Sequence[JSONValue]) -> list[JSONValue]:
+    """Unresolved node ids: every node not resolved."""
+    return [str(n["node_id"]) for n in nodes_payload if isinstance(n, dict) and n.get("status") != "resolved"]
 
 
 def _run_escalation(
@@ -2582,9 +2586,7 @@ def _run_escalation(
     return {k: v for k, v in failures.items()}, 1 if escalated else 0, escalated
 
 
-def _run_result(
-    rid: str, objective: str, sid: str, run_result: Mapping[str, JSONValue], followup_nodes: list[str]
-) -> dict[str, JSONValue]:
+def _run_result(rid: str, objective: str, sid: str, run_result: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
     """Whole worker response: persisted evidence, nodes, decisions, calls, and escalation state."""
     from app.research.repository import ResearchRepository
 
@@ -2599,7 +2601,7 @@ def _run_result(
     tool_executions, tool_calls, failures = _run_call_rows(attempts, known_ids)
     nodes_payload = _run_node_rows(node_rows)
     decisions_payload, watchlist_rows = _run_decision_rows(decision_rows)
-    unresolved = _run_unresolved(nodes_payload, followup_nodes)
+    unresolved = _run_unresolved(nodes_payload)
     failures_json, escalations, escalated = _run_escalation(failures, unresolved, incomplete_guard, stalled)
     out: dict[str, JSONValue] = {
         "id": rid,
@@ -2671,8 +2673,8 @@ def _run(
     objective = prompt.strip()
     client = _jev_client(jev)
     _t0, setup_deadline, run_deadline = _run_deadlines(req)
-    sid, followup_nodes, denied = _run_session(
-        rid, req, objective, as_of, client, progress, setup_deadline, run_ticker, watchlist, context
+    sid, denied = _run_graph_session(
+        rid, objective, as_of, client, progress, setup_deadline, run_ticker, watchlist, context
     )
     if denied is not None:
         return denied
@@ -2691,7 +2693,7 @@ def _run(
     failed = _run_failure(rid, run_result)
     if failed is not None:
         return failed
-    return _run_result(rid, objective, sid, run_result, followup_nodes)
+    return _run_result(rid, objective, sid, run_result)
 
 
 _KERNEL_OPS = (

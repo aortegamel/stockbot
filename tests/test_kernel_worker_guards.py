@@ -1855,119 +1855,10 @@ def test_graph_intake_round_failure_propagates(monkeypatch: pytest.MonkeyPatch) 
         )
 
 
-def test_followup_reuses_session_skips_setup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """sessionId+gap creates one node in the live session; no new session, no intake."""
-    import asyncio
-    import tempfile
-
-    from app.research import service
-
-    monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
-    sid = service.create_research("q?", "q?")
-    node = service.create_node(sid, "q1?", "w")
-    service.block_node(sid, node.node_id, "incomplete: pass 1 gap")
-
-    created: list[str] = []
-    orig_graph = kw.run_graph_prompt
-
-    def _boom_graph(*a: object, **k: object) -> str:
-        raise AssertionError("follow-up must not run setup")
-
-    async def _fake_sched(run_sid: str, **hooks: object) -> dict[str, object]:
-        assert run_sid == sid
-        nodes = service.ready_nodes(sid)
-        assert [n.node_id for n in nodes] == created
-        service.resolve_node(sid, nodes[0].node_id)
-        return {"status": "complete", "nodes": [], "incomplete_guard": False}
-
-    orig_create = service.create_node
-
-    def _count(
-        run_sid: str,
-        question: str,
-        why_it_matters: str,
-        depends_on: Sequence[str] | None = None,
-        *,
-        repo: ResearchRepository | Path | str | None = None,
-    ) -> ResearchNode:
-        out = orig_create(run_sid, question, why_it_matters, depends_on, repo=repo)
-        created.append(out.node_id)
-        return out
-
-    monkeypatch.setattr(kw, "run_graph_prompt", _boom_graph)
-    monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
-    monkeypatch.setattr("app.research.service.create_node", _count)
-    monkeypatch.setattr(kw, "_close_bootstrap_job", _no_bootstrap)
-    out = asyncio.run(asyncio.to_thread(kw._run, {"id": "r2", "prompt": "q?", "sessionId": sid, "gap": "need doc X"}))
-    assert out["sessionId"] == sid
-    assert out["unresolved"] == []
-    assert len(created) == 1
-    nodes = out["nodes"]
-    assert isinstance(nodes, list) and len(nodes) == 2
-    kw.run_graph_prompt = orig_graph
-
-
-def test_followup_unknown_session_is_invalid_params(
+def test_run_links_only_explicit_known_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unknown sessionId returns invalid_params, never a new session."""
-    import tempfile
-
-    monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
-    out = kw._run({"id": "r9", "prompt": "q?", "sessionId": "rs:nope", "gap": "need doc X"})
-    terminal = out.get("terminal")
-    assert isinstance(terminal, dict) and terminal.get("category") == "invalid_params"
-
-
-def test_followup_blocks_leftover_proposed_node(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A leftover pass-1 proposed node is blocked; the scheduler sees only the gap node."""
-    import asyncio
-    import tempfile
-
-    from app.research import service
-
-    monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
-    sid = service.create_research("q?", "q?")
-    leftover = service.create_node(sid, "pass-1 leftover?", "w")
-
-    gap_ids: list[str] = []
-
-    async def _fake_sched(run_sid: str, **hooks: object) -> dict[str, object]:
-        assert run_sid == sid
-        assert [n.node_id for n in service.ready_nodes(run_sid)] == gap_ids
-        service.resolve_node(run_sid, gap_ids[0])
-        return {"status": "complete", "nodes": [], "incomplete_guard": False}
-
-    orig_create = service.create_node
-
-    def _count(
-        run_sid: str,
-        question: str,
-        why_it_matters: str,
-        depends_on: Sequence[str] | None = None,
-        *,
-        repo: ResearchRepository | Path | str | None = None,
-    ) -> ResearchNode:
-        out = orig_create(run_sid, question, why_it_matters, depends_on, repo=repo)
-        if out.node_id:
-            gap_ids.append(out.node_id)
-        return out
-
-    monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
-    monkeypatch.setattr("app.research.service.create_node", _count)
-    monkeypatch.setattr(kw, "_close_bootstrap_job", _no_bootstrap)
-    out = asyncio.run(asyncio.to_thread(kw._run, {"id": "r3", "prompt": "q?", "sessionId": sid, "gap": "need doc X"}))
-    assert out["sessionId"] == sid
-    assert len(gap_ids) == 1
-    assert ResearchRepository().get_node(leftover.node_id).status == "blocked"
-
-
-def test_followup_links_only_explicit_known_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Pass-2 calls cite their own known ids (pass-1 duplicate winner, repeats); others get no evidenceId."""
+    """Run calls cite only known ids (a prior duplicate winner, repeats); others get no evidenceId."""
     import asyncio
     import tempfile
 
@@ -2029,9 +1920,13 @@ def test_followup_links_only_explicit_known_evidence(
             "incomplete_guard": False,
         }
 
+    def _graph(*a: object, **k: object) -> str:
+        return sid
+
+    monkeypatch.setattr(kw, "run_graph_prompt", _graph)
     monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
     monkeypatch.setattr(kw, "_close_bootstrap_job", _no_bootstrap)
-    out = asyncio.run(asyncio.to_thread(kw._run, {"id": "r4", "prompt": "q?", "sessionId": sid, "gap": "need doc Y"}))
+    out = asyncio.run(asyncio.to_thread(kw._run, {"id": "r4", "prompt": "q?"}))
     calls = out["toolCalls"]
     assert isinstance(calls, list)
     assert [c.get("evidenceId") for c in calls if isinstance(c, dict)] == [
@@ -2120,9 +2015,13 @@ def test_wire_evidence_sends_full_sec_document_observation(
             service.resolve_node(run_sid, n.node_id)
         return {"status": "complete", "nodes": [], "incomplete_guard": False}
 
+    def _graph(*a: object, **k: object) -> str:
+        return sid
+
+    monkeypatch.setattr(kw, "run_graph_prompt", _graph)
     monkeypatch.setattr("app.research.scheduler.run", _fake_sched)
     monkeypatch.setattr(kw, "_close_bootstrap_job", _no_bootstrap)
-    out = asyncio.run(asyncio.to_thread(kw._run, {"id": "r6", "prompt": "q?", "sessionId": sid, "gap": "revenue"}))
+    out = asyncio.run(asyncio.to_thread(kw._run, {"id": "r6", "prompt": "q?"}))
     evidence = out["evidence"]
     assert isinstance(evidence, list)
     rows = {e["id"]: e["content"] for e in evidence if isinstance(e, dict)}
@@ -2408,8 +2307,8 @@ def test_run_requires_a_prompt_before_any_setup(monkeypatch: pytest.MonkeyPatch,
     assert out["terminal"] == {"category": "invalid_params", "message": "prompt required"}
 
 
-def test_run_sessionid_without_gap_starts_a_new_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A sessionId without a gap is not a pass-2 request: setup still runs and no node is created."""
+def test_run_ignores_a_caller_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run never reuses a caller sessionId: setup still runs and creates a fresh session."""
     seen: list[str] = []
 
     def _graph(prompt: str, as_of: object = None, **rest: object) -> str:
@@ -3086,18 +2985,6 @@ def test_graph_intake_uses_current_context_only_without_resolved_stock(
     assert [node.question for node in ResearchRepository().list_nodes(sid)] == [objective]
 
 
-def test_run_followup_setup_failure_is_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A raising pass-2 setup reports provider_error with the session-setup text."""
-
-    def _boom(session_id: str, gap: str) -> tuple[str, list[str]]:
-        raise RuntimeError("setup blew up")
-
-    monkeypatch.setattr(kw, "_followup_gap_nodes", _boom)
-    out = kw._run({"id": "rf", "prompt": "q?", "sessionId": "rs:1", "gap": "need doc X"}, jev=JevClient())
-    assert out["error"] == "session setup failed: setup blew up"
-    assert out["terminal"] == {"category": "provider_error", "message": out["error"]}
-
-
 def test_decompose_empty_proposals_twice_is_type_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """Two empty proposal sets exhaust the retry budget and surface the empty-proposals rejection."""
     calls = {"n": 0}
@@ -3168,18 +3055,6 @@ def test_run_stall_adds_to_the_tool_failure_count(monkeypatch: pytest.MonkeyPatc
     assert out["stalled"] is True and out["escalated"] is True
 
 
-def test_pass2_denial_keeps_request_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An unknown pass-2 session answers invalid_params under the caller's own id."""
-    import tempfile
-
-    monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
-    out = kw._run({"id": "r9", "prompt": "q?", "sessionId": "rs:nope", "gap": "need doc X"}, jev=JevClient())
-    assert out["id"] == "r9"
-    terminal = out["terminal"]
-    assert isinstance(terminal, dict) and terminal["category"] == "invalid_params"
-    assert "unknown session" in str(out["error"])
-
-
 def test_scope_denial_keeps_request_id(monkeypatch: pytest.MonkeyPatch) -> None:
     """A malformed scope answers invalid_params under the caller's own id before any setup."""
 
@@ -3192,20 +3067,6 @@ def test_scope_denial_keeps_request_id(monkeypatch: pytest.MonkeyPatch) -> None:
     terminal = out.get("terminal")
     assert isinstance(terminal, dict) and terminal["category"] == "invalid_params"
     assert "ticker" in str(out.get("error"))
-
-
-def test_setup_failure_keeps_request_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A raising pass-2 setup reports provider_error under the caller's own id."""
-
-    def _boom(session_id: str, gap: str) -> tuple[str, list[str]]:
-        raise RuntimeError("setup blew up")
-
-    monkeypatch.setattr(kw, "_followup_gap_nodes", _boom)
-    out = kw._run({"id": "rf", "prompt": "q?", "sessionId": "rs:1", "gap": "need doc X"}, jev=JevClient())
-    assert out["id"] == "rf"
-    terminal = out.get("terminal")
-    assert isinstance(terminal, dict) and terminal["category"] == "provider_error"
-    assert terminal["message"] == out.get("error")
 
 
 def test_registry_guard_error_keeps_exact_message(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3252,38 +3113,6 @@ def test_run_reports_bounded_stall_reason(
     assert out["stalled"] is (status == "stalled")
     assert out.get("stalled_reason") == expected
     assert out["escalated"] is (status == "stalled")
-
-
-def test_pass2_response_gates_only_gap_node(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A follow-up escalates only on its own gap node; pass-1 states never gate the writer again."""
-
-    async def _sched(sid: str, **hooks: object) -> dict[str, object]:
-        return {"status": "complete", "nodes": [], "incomplete_guard": False}
-
-    def _ev(self: ResearchRepository, sid: str) -> list[dict[str, JSONValue]]:
-        return []
-
-    def _nodes(self: ResearchRepository, sid: str) -> list[ResearchNode]:
-        return [
-            ResearchNode(node_id="n1", session_id="s1", question="q1?", why_it_matters="w", status="gathering"),
-            ResearchNode(node_id="gap1", session_id="s1", question="q2?", why_it_matters="w", status="gathering"),
-        ]
-
-    def _dec(self: ResearchRepository, sid: str) -> list[DecisionRecord]:
-        return []
-
-    monkeypatch.setattr("app.research.scheduler.run", _sched)
-    monkeypatch.setattr(kw, "_close_bootstrap_job", _no_bootstrap)
-
-    def _session(*a: object) -> tuple[str, list[str], None]:
-        return ("s1", ["gap1"], None)
-
-    monkeypatch.setattr(kw, "_run_session", _session)
-    monkeypatch.setattr(ResearchRepository, "list_evidence", _ev)
-    monkeypatch.setattr(ResearchRepository, "list_nodes", _nodes)
-    monkeypatch.setattr(ResearchRepository, "list_decisions", _dec)
-    out = kw._run({"id": "rg", "prompt": "q?", "sessionId": "s1", "gap": "x"}, jev=JevClient())
-    assert out["unresolved"] == ["gap1"] and out["escalated"] is True and out["escalations"] == 1
 
 
 def test_run_response_cannot_include_another_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
