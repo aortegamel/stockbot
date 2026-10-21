@@ -25,8 +25,11 @@ const muted = "var(--muted, #7A8599)";
 const down = "var(--down, #EF5350)";
 const small = { fontSize: 12 } as const;
 
+// POSTs carry no body, but the CSRF guard (web/lan-token.ts) requires a JSON content type on every non-GET /api call.
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, { ...init, headers: { Accept: "application/json" } });
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (init?.method === "POST") headers["Content-Type"] = "application/json";
+  const res = await fetch(path, { ...init, headers });
   const body = (await res.json().catch(() => ({}))) as T & { detail?: unknown };
   if (!res.ok) throw new Error(typeof body.detail === "string" ? body.detail : `request failed: ${res.status}`);
   return body;

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-export type Holding = {
+type Holding = {
   ticker: string;
   quantity: string;
   average_cost: string | null;
@@ -51,7 +51,7 @@ export function PortfolioPanel({ onSelectTicker }: { onSelectTicker: (ticker: st
   const sync = () => {
     setBusy(true);
     setError(null);
-    load("/api/portfolio/sync", { method: "POST" })
+    load("/api/portfolio/sync", { method: "POST", headers: { "Content-Type": "application/json" } })
       .then(setView)
       .catch((e: unknown) => setError(`sync failed: ${e instanceof Error ? e.message : String(e)}`))
       .finally(() => setBusy(false));

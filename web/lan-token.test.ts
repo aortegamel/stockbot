@@ -107,6 +107,15 @@ describe("LAN token gate", () => {
         });
         expect(res.status).toBe(403);
       });
+      test(`body-less same-host POST needs a JSON content type (token ${env.STOCKBOT_LAN_TOKEN ? "set" : "unset"})`, async () => {
+        const base = await serve(env);
+        const host = new URL(base).host;
+        const headers = { Origin: `http://${host}`, host, ...(env.STOCKBOT_LAN_TOKEN ? { "x-stockbot-token": TOKEN } : {}) };
+        const bare = await fetch(`${base}/api/theses/x/check`, { method: "POST", headers });
+        expect(bare.status).toBe(403);
+        const json = await fetch(`${base}/api/theses/x/check`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" } });
+        expect(json.status).toBe(200);
+      });
     }
     test("GET with a foreign Origin still passes", async () => {
       const base = await serve({});
