@@ -526,6 +526,55 @@ def test_get_xbrl_facts_always_live_enveloped(monkeypatch: pytest.MonkeyPatch) -
     assert "source" not in first_concept
 
 
+def test_get_xbrl_facts_resolves_labels_and_rejects_unknown_offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def _fake_facts(ticker: str, concept: str) -> dict[str, object]:
+        calls.append(concept)
+        if concept == "RevenueFromContractWithCustomerExcludingAssessedTax" and ticker == "OLD":
+            return {"error": f"No data found for {ticker}: no XBRL facts found for concept '{concept}'"}
+        return {
+            "ticker": ticker,
+            "concept_searched": concept,
+            "matching_concepts": [{"concept": f"us-gaap:{concept}", "value": 1.0, "period_end": "2026-06-30"}],
+            "count": 1,
+            "source": "SEC EDGAR XBRL facts",
+        }
+
+    monkeypatch.setattr(sec_facts.edgar_client, "get_xbrl_facts", _fake_facts)
+    result = sec_facts.get_xbrl_facts("MSFT", "quarterly revenue")
+    assert calls == ["RevenueFromContractWithCustomerExcludingAssessedTax"]
+    assert result["concept_requested"] == "quarterly revenue"
+    assert result["concept_searched"] == "RevenueFromContractWithCustomerExcludingAssessedTax"
+    calls.clear()
+    assert sec_facts.get_xbrl_facts("OLD", "Total  Revenue")["concept_searched"] == "Revenues"
+    assert calls == ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues"]
+    calls.clear()
+    assert sec_facts.get_xbrl_facts("MSFT", "us-gaap:InventoryNet")["concept_searched"] == "us-gaap:InventoryNet"
+    calls.clear()
+    for label in ("vibes", "gross profit", "", "2026-06-30"):
+        rejected = sec_facts.get_xbrl_facts("MSFT", label)
+        assert "unknown concept" in str(rejected["error"]) and "XBRL tag" in str(rejected["error"])
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("label", "tags"),
+    [
+        ("net income", ("NetIncomeLoss",)),
+        ("EPS", ("EarningsPerShareDiluted",)),
+        ("diluted eps", ("EarningsPerShareDiluted",)),
+        ("basic EPS", ("EarningsPerShareBasic",)),
+        ("operating income", ("OperatingIncomeLoss",)),
+        ("total assets", ("Assets",)),
+        ("Cash", ("CashAndCashEquivalentsAtCarryingValue",)),
+        ("NetIncomeLoss", ("NetIncomeLoss",)),
+    ],
+)
+def test_xbrl_concept_tags_maps_common_labels(label: str, tags: tuple[str, ...]) -> None:
+    assert sec_facts.xbrl_concept_tags(label) == tags
+
+
 # ---------------------------------------------------------------------------
 # Tool schema + dispatch + render
 # ---------------------------------------------------------------------------

@@ -2519,10 +2519,16 @@ def _validate_xbrl_concept(
     attempts: Sequence[Mapping[str, JSONValue]],
     kernel: _Kernel,
 ) -> None:
-    """Reject a get_xbrl_facts concept that no request or source record names; JEV re-selects, no fallback concept."""
+    """Reject an unknown-label or ungrounded get_xbrl_facts concept; JEV re-selects, no fallback concept."""
     if tool_name != "get_xbrl_facts":
         return
+    from app.services.sec_facts import xbrl_concept_tags
+
     concept = filled.get("concept")
+    if isinstance(concept, str) and xbrl_concept_tags(concept) is None:
+        raise _ReselectRequest(
+            f"get_xbrl_facts unknown concept {concept!r}; re-selecting - use an exact XBRL tag or a common metric label"
+        )
     tag = concept.strip().split(":")[-1].strip() if isinstance(concept, str) else ""
     text = "\n".join([*_xbrl_request_texts(session, node), *_xbrl_source_texts(evidence, attempts, kernel)])
     if _xbrl_concept_grounded(tag, text):

@@ -15,6 +15,7 @@ All other payload keys stay byte-identical.
 from __future__ import annotations
 
 import datetime as _dt
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TypedDict
@@ -35,6 +36,7 @@ from ..edgar_client import (
     _has_contiguous_quarters,
     _is_recent_dividend_period,
 )
+from ..normalization import CANONICAL_CONCEPTS
 from .dividend_analysis import analyze_dividends
 
 DEFAULT_DATA_ROOT = None
@@ -1507,16 +1509,55 @@ def _xbrl_counts(payload: Mapping[str, object]) -> tuple[list[object], int]:
     return matching, count
 
 
+# Common, unambiguous metric labels -> exact SEC tags, tried in order.
+_REVENUE_TAGS = CANONICAL_CONCEPTS["Revenue"]
+_XBRL_LABEL_TAGS: dict[str, tuple[str, ...]] = {
+    "revenue": _REVENUE_TAGS,
+    "quarterly revenue": _REVENUE_TAGS,
+    "total revenue": _REVENUE_TAGS,
+    "net income": ("NetIncomeLoss",),
+    "eps": (DILUTED_EPS_CONCEPT,),
+    "diluted eps": (DILUTED_EPS_CONCEPT,),
+    "basic eps": (BASIC_EPS_CONCEPT,),
+    "operating income": ("OperatingIncomeLoss",),
+    "total assets": ("Assets",),
+    "cash": ("CashAndCashEquivalentsAtCarryingValue",),
+}
+_XBRL_TAG_RE = re.compile(r"(?:[a-z][a-z0-9-]*:)?[A-Z][A-Za-z0-9]*")
+
+
+def xbrl_concept_tags(concept: str) -> tuple[str, ...] | None:
+    """Tags to search: a mapped label's tags, an exact tag as given, or None for an unknown label."""
+    tags = _XBRL_LABEL_TAGS.get(" ".join(concept.lower().split()))
+    if tags is not None:
+        return tags
+    tag = concept.strip()
+    return (tag,) if _XBRL_TAG_RE.fullmatch(tag) else None
+
+
 def get_xbrl_facts(ticker: str, concept: str) -> dict[str, object]:
-    """Always-live XBRL fact search, enveloped (label key source_label)."""
-    payload = edgar_client.get_xbrl_facts(ticker, concept)
+    """Always-live XBRL fact search, enveloped (label key source_label).
+
+    A mapped label tries its tags in order; an unknown label fails before any network call.
+    """
+    tags = xbrl_concept_tags(concept)
+    if tags is None:
+        return {
+            "error": f"unknown concept {concept!r}: use an exact XBRL tag such as NetIncomeLoss, "
+            "or a common label such as revenue, net income, operating income, total assets, or cash"
+        }
+    payload: dict[str, object] = {}
+    for tag in tags:
+        payload = edgar_client.get_xbrl_facts(ticker, tag)
+        if "error" not in payload:
+            break
     if "error" in payload:
         return payload
     matching, count = _xbrl_counts(payload)
     return _envelope_for_live(
         ticker,
         "concept",
-        payload,
+        {**payload, "concept_requested": concept},
         None,
         count,
         returned_count=len(matching),

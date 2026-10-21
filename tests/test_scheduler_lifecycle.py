@@ -4310,6 +4310,16 @@ def test_xbrl_unrequested_concept_reselects_before_invoke(concept: str) -> None:
     assert out["error_type"] == "reselect" and "duplicate" not in str(out["error"])
 
 
+def test_xbrl_unknown_label_reselects_even_when_requested() -> None:
+    """A label the request names but the shared check cannot map never reaches the runtime."""
+    out, invoked = _xbrl_attempt("What were NVDA vibes last quarter?", "vibes")
+    assert invoked == []
+    assert out["error_type"] == "reselect" and "unknown concept" in str(out["error"])
+    out, invoked = _xbrl_attempt("What was MSFT quarterly revenue?", "quarterly revenue")
+    assert out["error"] is None
+    assert invoked == [{"ticker": "NVDA", "concept": "quarterly revenue"}]
+
+
 @pytest.mark.parametrize(
     "concept",
     ["Revenue", "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax"],

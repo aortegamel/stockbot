@@ -84,6 +84,20 @@ def test_ambiguous_concepts_return_no_data_without_mixing(monkeypatch: pytest.Mo
     assert "matching_concepts" not in result
 
 
+def test_exact_tag_wins_over_substring_matches(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        _FakeCompany,
+        "rows",
+        [_row("us-gaap:Assets"), _row("us-gaap:AssetsCurrent"), _row("us-gaap:OtherAssetsNoncurrent")],
+    )
+    for concept in ("Assets", "us-gaap:Assets"):
+        result = edgar_client.get_xbrl_facts("FAKE", concept)
+        matching = result["matching_concepts"]
+        assert isinstance(matching, list)
+        assert [r["concept"] for r in matching] == ["us-gaap:Assets"]
+    assert "ambiguous" in str(edgar_client.get_xbrl_facts("FAKE", "Asset")["error"])
+
+
 def test_ownership_limit_clamps_and_rejects() -> None:
     assert edgar_client._ownership_limit(None) == 10
     assert edgar_client._ownership_limit(5) == 5

@@ -1170,8 +1170,13 @@ def _xbrl_token_match(df: pd.DataFrame, concept: str):
 
 
 def _xbrl_candidates(df: pd.DataFrame, concept: str):
-    """Concept matches: substring, then spaceless, then all-tokens fallback."""
+    """Concept matches: exact tag, then substring, then spaceless, then all-tokens fallback."""
     concept_lower = concept.lower()
+    # An exact tag ("Assets") wins over the substring rows it also names (AssetsCurrent).
+    tags = df["concept"].str.lower().str.rsplit(":", n=1).str[-1]
+    matching = df[tags == concept_lower.rsplit(":", 1)[-1].strip()]
+    if not matching.empty:
+        return matching
     matching = df[df["concept"].str.lower().str.contains(concept_lower, na=False)]
     if not matching.empty:
         return matching

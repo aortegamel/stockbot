@@ -891,7 +891,7 @@ TOOLS: list[dict[str, object]] = [
         "function": {
             "name": "get_xbrl_facts",
             "description": "Single XBRL-tagged fact by concept name for one ticker: XBRL financial metrics (Revenue, Net Income, "
-            'Cash, Debt, Equity, etc.) for any company. Do not use this for EPS; for EPS use get_fundamentals(metric="eps"). Use exact XBRL tag names (e.g. NetIncomeLoss for net income), never friendly labels. Do NOT use for full statements (get_financial_statements). Takes a ticker and concept.',
+            'Cash, Debt, Equity, etc.) for any company. Do not use this for EPS; for EPS use get_fundamentals(metric="eps"). Use an exact XBRL tag (e.g. NetIncomeLoss for net income) or one of these labels: revenue, quarterly revenue, total revenue, net income, operating income, total assets, cash. Any other friendly label is rejected. Do NOT use for full statements (get_financial_statements). Takes a ticker and concept.',
             "parameters": {
                 "type": "object",
                 "properties": {

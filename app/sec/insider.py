@@ -4,6 +4,7 @@ Seam: live reads via SourceGateway + normalization + raw_archive (write-once) + 
 """
 
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
 
@@ -459,9 +460,13 @@ def get_insider_activity(
     forms: tuple[str, ...] | list[str] = _DEFAULT_FORMS,
 ) -> list[InsiderTransaction]:
     filings = list_sec_filings(ticker_or_cik, forms=list(forms), as_of=as_of, limit=limit)
-    out: list[InsiderTransaction] = []
-    for filing in filings:
-        out.extend(_activity_records_of(filing, ticker_or_cik))
+    # ponytail: per-call pool, never scheduler._SEC_POOL: this tool already runs on a SEC worker,
+    # so nested submits there can starve it. edgar's process-wide limiter (HTTP_MGR, 9 req/s)
+    # still paces every request. `with` joins all fetches: one failure cancels none, and the
+    # in-order .result() re-raises the same first-in-order error the serial loop raised.
+    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="insider") as pool:
+        futures = [pool.submit(_activity_records_of, filing, ticker_or_cik) for filing in filings]
+    out = [txn for future in futures for txn in future.result()]
     if limit is not None:
         out = out[:limit]
     return out

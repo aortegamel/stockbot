@@ -1,5 +1,6 @@
 """Offline tests for app/sec/insider.py (no network)."""
 
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -361,6 +362,86 @@ def test_get_insider_activity_propagates_failed_loads(monkeypatch: pytest.Monkey
     assert txns[0].shares == 10
     filings.clear()
     assert insider.get_insider_activity("ACME") == []
+
+
+def _parallel_filings(monkeypatch: pytest.MonkeyPatch, accessions: list[str]) -> None:
+    filings = [SimpleNamespace(accession_no=a, form="4", filed_at="2024-01-15", company="ACME") for a in accessions]
+
+    def fake_list(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        return filings
+
+    monkeypatch.setattr(insider, "list_sec_filings", fake_list)
+
+
+def test_get_insider_activity_keeps_serial_order_when_fetches_finish_out_of_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _parallel_filings(monkeypatch, ["a", "b", "c"])
+    last_done = threading.Event()
+
+    def fake_load(accession_no: str) -> _Obj:
+        # "a" finishes only after "c": a serial loop never reaches "c" and the wait fails.
+        if accession_no == "a" and not last_done.wait(timeout=5):
+            raise AssertionError("fetches did not overlap")
+        if accession_no == "c":
+            last_done.set()
+        return _Obj([_Activity(code="P", shares=1)], name=accession_no)
+
+    monkeypatch.setattr(insider, "load_ownership", fake_load)
+    txns = insider.get_insider_activity("ACME")
+    assert [(t.accession_no, t.insider_name) for t in txns] == [("a", "a"), ("b", "b"), ("c", "c")]
+
+
+def test_get_insider_activity_failure_cancels_no_fetch_and_raises_first_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _parallel_filings(monkeypatch, ["bad1", "g1", "bad2", "g2"])
+    later_failed = threading.Event()
+    finished: list[str] = []
+    lock = threading.Lock()
+
+    def fake_load(accession_no: str) -> _Obj:
+        try:
+            if accession_no == "bad2":
+                raise RuntimeError("bad2")
+            if accession_no == "bad1":
+                # The later item fails first; the serial-order error still wins.
+                assert later_failed.wait(timeout=5)
+                raise RuntimeError("bad1")
+            return _Obj([_Activity(code="P", shares=1)])
+        finally:
+            with lock:
+                finished.append(accession_no)
+            if accession_no == "bad2":
+                later_failed.set()
+
+    monkeypatch.setattr(insider, "load_ownership", fake_load)
+    with pytest.raises(RuntimeError, match="^bad1$"):
+        insider.get_insider_activity("ACME")
+    assert sorted(finished) == ["bad1", "bad2", "g1", "g2"]
+
+
+def test_get_insider_activity_fetches_overlap(monkeypatch: pytest.MonkeyPatch) -> None:
+    _parallel_filings(monkeypatch, [f"acc{i}" for i in range(6)])
+    barrier = threading.Barrier(3, timeout=5)
+    lock = threading.Lock()
+    state = {"in_flight": 0, "max": 0}
+
+    def fake_load(accession_no: str) -> _Obj:
+        with lock:
+            state["in_flight"] += 1
+            state["max"] = max(state["max"], state["in_flight"])
+        try:
+            if accession_no in ("acc0", "acc1", "acc2"):
+                barrier.wait()  # breaks (and the test fails) unless three fetches run at once
+            return _Obj([_Activity(code="P", shares=1)])
+        finally:
+            with lock:
+                state["in_flight"] -= 1
+
+    monkeypatch.setattr(insider, "load_ownership", fake_load)
+    assert len(insider.get_insider_activity("ACME")) == 6
+    assert state["max"] >= 3
 
 
 def test_store_no_persist_and_live_insider_per_accession(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
