@@ -140,6 +140,9 @@ const MESSAGE_RULES: readonly {
   category: FailureCategory;
   retryable: boolean;
 }[] = [
+    // Same rule as the kernel worker's _source_failure (app/research/kernel_worker.py): a source's
+    // "No data found for ..." answer is no_records, whatever else the message names.
+    { traps: ["no data found for "], category: "no_records", retryable: false },
     { traps: ["deadline"], category: "deadline_exceeded", retryable: false },
     { traps: ["timeout", "timed out", "timed_out", "expired"], category: "timeout", retryable: true },
     { traps: ["research_loop_detected", "repeats an action", "already ran"], category: "research_loop_detected", retryable: false },

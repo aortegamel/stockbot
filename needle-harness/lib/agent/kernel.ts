@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { reason, type MuseUsage } from "../muse/client";
 import { FINAL_PERSONAS, redactArgs, sourceReferences, WIDGET_TYPES } from "./types";
-import type { AgentEvent, Evidence, FailureCategory, FinalClaim, FinalPersonaResult, Metrics, Persona, Timings } from "./types";
+import type { AgentEvent, AskContext, Evidence, FailureCategory, FinalClaim, FinalPersonaResult, Metrics, Persona, Timings } from "./types";
 
 // ponytail: persistent worker bridge (spawn-once, ready-gated); spawn/exit/stderr handling mirrors lib/needle/client.ts.
 function requiredEnv(name: string): string {
@@ -105,6 +105,7 @@ type KernelGraphNode = {
 export type KernelReasonInput = {
   prompt: string;
   ticker?: string;
+  context?: AskContext;
   evidence: Evidence[];
   escalated: boolean;
   direct?: boolean;
@@ -639,6 +640,8 @@ type KernelRunOptions = {
   ticker?: string;
   currentChartTicker?: string;
   watchlist?: readonly string[];
+  // A user-picked feed item: labeled untrusted data for the reasoner and the worker's intake planner.
+  context?: AskContext;
 };
 
 // One research run's mutable state: the request scope, the merged worker graph,
@@ -653,6 +656,7 @@ type KernelRun = {
   deadlineAt: number;
   scope: Record<string, unknown>;
   currentChartTicker: string | undefined;
+  context: AskContext | undefined;
   personas: readonly Persona[];
   isTrio: boolean;
   seed: Evidence[];
@@ -1102,6 +1106,7 @@ function reasonInput(run: KernelRun): ReasonInput {
   return {
     prompt,
     ...(run.scope.watchlist === undefined && run.currentChartTicker !== undefined ? { ticker: run.currentChartTicker } : {}),
+    ...(run.context ? { context: run.context } : {}),
     evidence: run.evidence,
     escalated: run.direct ? false : run.escalated,
     direct: run.direct || (run.escalated && run.evidence.length === 0),
@@ -1322,7 +1327,7 @@ async function finishAnswer(run: KernelRun, pass: Pass, note = ""): Promise<void
 }
 
 // The research snapshot a trio follow-up answers over: evidence plus the graph projection.
-type TrioSnapshot = Pick<KernelRun, "prompt" | "objective" | "evidence" | "nodes" | "records" | "unresolved" | "guard" | "escalated" | "watchlist" | "scope" | "currentChartTicker">;
+type TrioSnapshot = Pick<KernelRun, "prompt" | "objective" | "evidence" | "nodes" | "records" | "unresolved" | "guard" | "escalated" | "watchlist" | "scope" | "currentChartTicker" | "context">;
 // ponytail: process-local, newest 20 sessions, lost on restart; read evidence from the research store if follow-ups must survive restarts.
 const TRIO_SNAPSHOTS = new Map<string, TrioSnapshot>();
 const TRIO_SNAPSHOT_LIMIT = 20;
@@ -1334,7 +1339,7 @@ function offerTrio(run: KernelRun): void {
   TRIO_SNAPSHOTS.delete(sessionId);
   TRIO_SNAPSHOTS.set(sessionId, {
     prompt: run.prompt, objective: run.objective, evidence: [...run.evidence], nodes: run.nodes, records: run.records,
-    unresolved: run.unresolved, guard: run.guard, escalated: run.escalated, watchlist: run.watchlist, scope: run.scope, currentChartTicker: run.currentChartTicker,
+    unresolved: run.unresolved, guard: run.guard, escalated: run.escalated, watchlist: run.watchlist, scope: run.scope, currentChartTicker: run.currentChartTicker, context: run.context,
   });
   const oldest = TRIO_SNAPSHOTS.keys().next().value;
   if (TRIO_SNAPSHOTS.size > TRIO_SNAPSHOT_LIMIT && oldest !== undefined) TRIO_SNAPSHOTS.delete(oldest);
@@ -1374,10 +1379,13 @@ async function answerPass(run: KernelRun, pass: number): Promise<PassOutcome> {
   run.museMs += performance.now() - started;
   if (endStageFailure(run, stage)) return { ended: true };
   // Final accuracy gates on the research path only, and pass 2 is final even when
-  // gaps remain: the gates check the prose and drop unsupported claims. Under
-  // PASS2_MIN_WALL_MS of request wall left, pass 1 is final and states the gap.
-  const skipped = stage.gaps.length > 0 && pass < 2 && run.deadlineAt - Date.now() < PASS2_MIN_WALL_MS;
-  const last = stage.gaps.length === 0 || pass >= 2 || skipped;
+  // gaps remain: the gates check the prose and drop unsupported claims. Pass 2
+  // runs only for a real gap: a Missing-Evidence line while a planned node is
+  // still unresolved. A hedge over fully resolved nodes ships with its line.
+  // Under PASS2_MIN_WALL_MS of request wall left, pass 1 is final and states the gap.
+  const gap = stage.gaps.length > 0 && pass < 2 && run.unresolved.length > 0;
+  const skipped = gap && run.deadlineAt - Date.now() < PASS2_MIN_WALL_MS;
+  const last = !gap || skipped;
   if (last && !run.direct && stage.results !== undefined) await correctInventory(stage, input);
   if (endStageFailure(run, stage)) return { ended: true };
   if (last) {
@@ -1390,9 +1398,9 @@ async function answerPass(run: KernelRun, pass: number): Promise<PassOutcome> {
 // Fail-closed evidence loop: partial selections reason concurrently over one
 // shared snapshot; the full trio synthesizes (bear+bull draft concurrently,
 // then stockbot judges both drafts against the same snapshot). Drafts stay
-// buffered. Any Missing-Evidence line on pass 1 runs exactly one shared
-// same-session follow-up with a fresh research wall, merges, and regenerates,
-// unless under PASS2_MIN_WALL_MS of the request wall remains.
+// buffered. A Missing-Evidence line on pass 1 with an unresolved planned node
+// runs exactly one shared same-session follow-up with a fresh research wall,
+// merges, and regenerates, unless under PASS2_MIN_WALL_MS of the request wall remains.
 // Pass 2 is final even with gaps: the final gates check the prose and drop
 // unsupported claims. Any failure after the trio's one draft retry fails.
 export async function runKernelAgent(
@@ -1429,8 +1437,9 @@ function openRun(prompt: string, emit: (e: AgentEvent) => void, opts: KernelRunO
     reasonFn: deps.reason ?? reason,
     router: runRouter(deps),
     deadlineAt: opts?.deadlineAt ?? Date.now() + REQUEST_WALL_MS,
-    scope: runScope(ticker, requested),
+    scope: { ...runScope(ticker, requested), ...(opts?.context ? { context: opts.context } : {}) },
     currentChartTicker: requested ? undefined : parseTicker(opts?.currentChartTicker) ?? ticker,
+    context: opts?.context,
     personas,
     isTrio: isTrioPersonas(personas),
     seed: Array.isArray(opts?.seedEvidence) ? opts.seedEvidence : [],

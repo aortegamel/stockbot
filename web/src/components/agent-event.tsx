@@ -13,7 +13,7 @@ const FAILURE_TEXT: Record<FailureCategory, string> = {
   policy_denied: "This request is not allowed.", policy_rejection: "This request is not allowed.",
   tool_error: SOURCE, storage_error: SOURCE, freeze_mismatch: SOURCE,
   model_error: MODEL, model_output_failure: MODEL, provider_error: MODEL, synthesis_failed: MODEL, committee_deadlock: MODEL,
-  no_evidence: "No evidence was found for this question.",
+  no_evidence: "No evidence was found for this question.", no_records: "A data source had no records for this request.",
 };
 
 export function failureText(category: FailureCategory): string {

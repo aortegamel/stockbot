@@ -2,7 +2,7 @@ import { reason } from "@/lib/muse/client";
 import { asksWatchlist, kernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type KernelResponse } from "@/lib/agent/kernel";
 import { tools } from "@/lib/tools";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
-import { FINAL_PERSONAS, redactArgs, sourceReferences, WIDGET_TYPES, type AgentEvent, type Evidence, type FailureCategory, type Persona, type Timings } from "@/lib/agent/types";
+import { ASK_CONTEXT_KINDS, FINAL_PERSONAS, redactArgs, safeSourceUrl, sourceReferences, WIDGET_TYPES, type AgentEvent, type AskContext, type Evidence, type FailureCategory, type Persona, type Timings } from "@/lib/agent/types";
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
@@ -16,9 +16,23 @@ function parsePersonas(v: unknown): Persona[] | null | undefined {
   const canonical = FINAL_PERSONAS.filter((p) => v.includes(p));
   return v.length > 0 && v.length === canonical.length && canonical.every((p, i) => v[i] === p) ? canonical : undefined;
 }
+const ASK_CONTEXT_KEYS = ["kind", "title", "url", "source", "sym", "at"];
+// Feed-item context beside the verbatim prompt: undefined when absent, null when
+// malformed (callers reject; unknown keys reject too). The values stay untrusted data.
+function parseAskContext(v: unknown): AskContext | null | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "object" || Array.isArray(v) || Object.keys(v).some((k) => !ASK_CONTEXT_KEYS.includes(k))) return null;
+  const { kind, title, url, source, sym, at } = v as Record<string, unknown>;
+  const text = (s: unknown): s is string => typeof s === "string" && s.trim() !== "" && s.length <= 300;
+  if (!ASK_CONTEXT_KINDS.some((k) => k === kind) || !text(title) || !text(source) || typeof at !== "string" || at.length > 40) return null;
+  if (url !== undefined && (typeof url !== "string" || url.length > 2000 || safeSourceUrl(url) === undefined)) return null;
+  const ticker = parseTicker(sym);
+  if (sym !== undefined && ticker === undefined) return null;
+  return { kind: kind as AskContext["kind"], title, source, at, ...(url !== undefined ? { url } : {}), ...(ticker !== undefined ? { sym: ticker } : {}) };
+}
 // Trio follow-up request: persona and gate stages over an offered session (same id shape as /api/research).
 type PersonasRequest = { op: "personas"; sessionId: string; personas: Persona[] };
-async function readAgentRequest(req: Request): Promise<Response | PersonasRequest | { prompt: string; ticker: unknown; currentChartTicker: unknown; parsedWatchlist: string[] | undefined }> {
+async function readAgentRequest(req: Request): Promise<Response | PersonasRequest | { prompt: string; ticker: unknown; currentChartTicker: unknown; parsedWatchlist: string[] | undefined; context: AskContext | undefined }> {
   let prompt: unknown;
   let ticker: unknown;
   let currentChartTicker: unknown;
@@ -26,8 +40,9 @@ async function readAgentRequest(req: Request): Promise<Response | PersonasReques
   let op: unknown;
   let sessionId: unknown;
   let personasRaw: unknown;
+  let contextRaw: unknown;
   try {
-    ({ prompt, ticker, currentChartTicker, watchlist: watchlistRaw, op, sessionId, personas: personasRaw } = await req.json());
+    ({ prompt, ticker, currentChartTicker, watchlist: watchlistRaw, op, sessionId, personas: personasRaw, context: contextRaw } = await req.json());
   } catch {
     console.error("[web] [agent-api] invalid JSON");
     return Response.json({ error: "invalid JSON" }, { status: 400 });
@@ -50,7 +65,13 @@ async function readAgentRequest(req: Request): Promise<Response | PersonasReques
     console.error("[web] [agent-api] invalid watchlist");
     return Response.json({ error: "watchlist must list 1-25 valid tickers" }, { status: 400 });
   }
-  return { prompt, ticker, currentChartTicker, parsedWatchlist };
+  // Feed-item context rides beside the verbatim prompt the same way; a malformed item fails loudly.
+  const context = parseAskContext(contextRaw);
+  if (context === null) {
+    console.error("[web] [agent-api] invalid context");
+    return Response.json({ error: "context must be a feed item: kind news|filing|insider|alert, title and source (1-300 chars), at (max 40 chars), optional http(s) url and ticker sym" }, { status: 400 });
+  }
+  return { prompt, ticker, currentChartTicker, parsedWatchlist, context };
 }
 
 function publicEvent(e: AgentEvent): AgentEvent | null {
@@ -163,7 +184,10 @@ export async function POST(req: Request): Promise<Response> {
   const input = await readAgentRequest(req);
   if (input instanceof Response) return input;
   if ("op" in input) return personasResponse(req, input, requestAt);
-  const { prompt, ticker, currentChartTicker: chartInput, parsedWatchlist } = input;
+  const { prompt, ticker, currentChartTicker: chartInput, parsedWatchlist, context } = input;
+  // The feed item rides beside the verbatim prompt as labeled untrusted data: the router, the
+  // research planner, and the reasoner see it. The prompt itself never changes.
+  const contextField = context ? { context } : {};
   // Only a prompt that names the watchlist uses its symbols instead of the selected ticker.
   const watchlist = parsedWatchlist !== undefined && asksWatchlist(prompt) ? parsedWatchlist : undefined;
   const watchlistField = watchlist ? { watchlist } : {};
@@ -171,7 +195,7 @@ export async function POST(req: Request): Promise<Response> {
   const parsedTicker = watchlist ? undefined : parseTicker(ticker);
   let tickerField = parsedTicker !== undefined ? { ticker: parsedTicker } : {};
   let currentChartTicker = parseTicker(chartInput) ?? parseTicker(ticker);
-  const reasonContext = (): { ticker?: string } => !watchlist && currentChartTicker ? { ticker: currentChartTicker } : {};
+  const reasonContext = (): { ticker?: string; context?: AskContext } => ({ ...(!watchlist && currentChartTicker ? { ticker: currentChartTicker } : {}), ...contextField });
   console.log(`[web] [agent-api] POST prompt_chars=${prompt.length}${watchlist ? ` watchlist=${watchlist.length}` : ""}`);
   const stream = new ReadableStream({
     async start(controller) {
@@ -238,8 +262,11 @@ export async function POST(req: Request): Promise<Response> {
             const res = entry?.execute ? await entry.execute(args, { sessionId }) : await invoke(tool, args, sessionId);
             toolCalls += 1;
             if (res.ok) {
-              evidence.push(res.evidence);
-              singleShotEvidence.push(res.evidence);
+              // A repeated call with the same name+args returns the same evidence id: keep one copy.
+              if (!evidence.some((e) => e.id === res.evidence.id)) {
+                evidence.push(res.evidence);
+                singleShotEvidence.push(res.evidence);
+              }
               send({ type: "tool_result", tool, evidenceId: res.evidence.id, preview: res.evidence.content.slice(0, 160) });
               send({ type: "evidence", evidence: [...evidence] });
               outcome = { ok: true, content: res.evidence.content.slice(0, 1500) };
@@ -291,8 +318,10 @@ export async function POST(req: Request): Promise<Response> {
           if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(verdict)) return false;
           current = verdict;
         }
-        // Cap reached with another tool pending — research owns the longer chain.
-        return false;
+        // Cap reached with another tool pending: admitted evidence answers now; none left researches.
+        if (evidence.length === 0) return false;
+        await answerFromEvidence();
+        return true;
       };
       // The watchlist action is a UI receipt, never evidence: Needle fills its arguments and only
       // a validated canonical receipt emits watchlist_update. A failure answers visibly, never researches.
@@ -385,7 +414,7 @@ export async function POST(req: Request): Promise<Response> {
       // ponytail: JEV-first entry — one route round selects the route and any explicit personas.
       // The watchlist rides as separate context; JEV's returned route governs dispatch here.
       const routeAt = performance.now();
-      const selected = await selectEntry({ op: "route", prompt, ...tickerField, ...watchlistField, ...(currentChartTicker ? { currentChartTicker } : {}) }, req.signal);
+      const selected = await selectEntry({ op: "route", prompt, ...tickerField, ...watchlistField, ...(currentChartTicker ? { currentChartTicker } : {}), ...contextField }, req.signal);
       timings.routeMs = performance.now() - routeAt;
       if ("error" in selected) {
         const routeError = selected.error;
@@ -436,7 +465,7 @@ export async function POST(req: Request): Promise<Response> {
         return;
       }
       try {
-        await runKernelAgent(prompt, send, { signal: req.signal, seedEvidence: singleShotEvidence, deadlineAt, ...(personas ? { personas } : {}), ...tickerField, ...(currentChartTicker ? { currentChartTicker } : {}), ...(watchlist ? { watchlist } : {}) });
+        await runKernelAgent(prompt, send, { signal: req.signal, seedEvidence: singleShotEvidence, deadlineAt, ...(personas ? { personas } : {}), ...tickerField, ...(currentChartTicker ? { currentChartTicker } : {}), ...(watchlist ? { watchlist } : {}), ...contextField });
       } catch (err) {
         console.error(`[web] [agent-api] runKernelAgent error: ${err instanceof Error ? err.message : String(err)}`);
         send({ type: "error", message: err instanceof Error ? err.message : String(err) });

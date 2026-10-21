@@ -27,6 +27,8 @@ let assessReply: Record<string, unknown> | null = null;
 let toolFailure: { category: string; error: string } | null = null;
 let toolThrows: unknown = null;
 let endThrows = false;
+// Ids the next generic bridge results carry, in call order; empty means ev:bridge.
+let bridgeIds: string[] = [];
 let chartReceipt: unknown = { result_type: "chart_selection", ticker: "MSFT" };
 let watchlistReceipt: unknown = { result_type: "watchlist_update", action: "add", ticker: "AMD" };
 let widgetReceipt: unknown = { result_type: "widget_selection", widget_type: "short-volume", ticker: "AAPL" };
@@ -36,9 +38,9 @@ const runCalls: unknown[][] = [];
 const personaCalls: unknown[][] = [];
 // runKernelAgent offers the trio for rs:test when true.
 let emitOffer = false;
-type ReasonCall = { prompt: string; ticker?: string; evidence: Evidence[]; onDelta?: (t: string) => void };
+type ReasonCall = { prompt: string; ticker?: string; context?: unknown; evidence: Evidence[]; onDelta?: (t: string) => void };
 const reasonCalls: ReasonCall[] = [];
-type KernelCall = { op?: unknown; tool?: unknown; prompt?: unknown; objective?: unknown; ticker?: unknown; currentChartTicker?: unknown; watchlist?: unknown };
+type KernelCall = { op?: unknown; tool?: unknown; prompt?: unknown; objective?: unknown; ticker?: unknown; currentChartTicker?: unknown; watchlist?: unknown; context?: unknown };
 const kernelCalls: KernelCall[] = [];
 const kernelOpts: unknown[] = [];
 const invokeTimeouts: unknown[] = [];
@@ -135,7 +137,7 @@ mock.module("@/lib/tools/stockbot", () => ({
     if (name === "set_chart_symbol") return { ok: true, chartSelection: chartReceipt, evidence: { ...bridgeEvidence, content: "ticker: MSFT\nresult_type: chart_selection" } };
     if (name === "update_watchlist") return { ok: true, watchlistUpdate: watchlistReceipt, evidence: { ...bridgeEvidence, content: "action: add\nticker: AMD" } };
     if (name === "add_widget") return { ok: true, widgetSelection: widgetReceipt, evidence: { ...bridgeEvidence, content: "widget_type: short-volume\nticker: AAPL" } };
-    return { ok: true, evidence: { ...bridgeEvidence, source: name } };
+    return { ok: true, evidence: { ...bridgeEvidence, id: bridgeIds.shift() ?? bridgeEvidence.id, source: name } };
   },
   newSessionId: () => {
     sessionsCreated += 1;
@@ -165,6 +167,7 @@ function reset(): void {
   toolFailure = null;
   toolThrows = null;
   endThrows = false;
+  bridgeIds = [];
   chartReceipt = { result_type: "chart_selection", ticker: "MSFT" };
   watchlistReceipt = { result_type: "watchlist_update", action: "add", ticker: "AMD" };
   widgetReceipt = { result_type: "widget_selection", widget_type: "short-volume", ticker: "AAPL" };
@@ -384,6 +387,7 @@ describe("agent entry route", () => {
     reset();
     winner = "search_sec_filings";
     verdicts = ["get_sec_document", "node_resolved"];
+    bridgeIds = ["ev:search", "ev:document"];
     const events = await eventsFor("NVDA risk factors?");
     expect(events.filter((e) => e.type === "tool_start").length).toBe(2);
     expect(invoked.map((c) => c[0])).toEqual(["search_sec_filings", "get_sec_document"]);
@@ -767,6 +771,69 @@ describe("agent entry route", () => {
     }
   });
 
+  const feedContext = { kind: "news", title: "NVDA jumps overnight", url: "https://news.example/a?x=1", source: "Stocktwits", sym: "NVDA", at: "2026-10-20T09:00:00Z" };
+  async function postContext(context: unknown): Promise<Response> {
+    const { POST } = await import("./route");
+    return POST(new Request("http://localhost/api/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: "What does this mean for NVDA?", ticker: "NVDA", context }),
+    }));
+  }
+
+  test("a valid feed context reaches the routing call, the kernel, and the reasoner as data beside the verbatim prompt", async () => {
+    reset();
+    winner = "research_required";
+    await (await postContext({ ...feedContext, sym: "nvda" })).text();
+    expect(kernelCalls.map((c) => c.op)).toEqual(["route"]);
+    expect(kernelCalls[0]?.prompt).toBe("What does this mean for NVDA?");
+    expect(kernelCalls[0]?.context).toEqual(feedContext);
+    expect(runCalls[0]?.[0]).toBe("What does this mean for NVDA?");
+    const runOpts = runCalls[0]?.[2] as Record<string, unknown>;
+    expect(runOpts.context).toEqual(feedContext);
+
+    reset();
+    const { url: _url, sym: _sym, ...bare } = feedContext;
+    await (await postContext(bare)).text();
+    expect(reasonCalls[0]?.prompt).toBe("What does this mean for NVDA?");
+    expect(reasonCalls[0]?.context).toEqual(bare);
+  });
+
+  test("each invalid context field is rejected with 400 before any worker call", async () => {
+    for (const bad of [
+      "news", [], { ...feedContext, extra: 1 },
+      { ...feedContext, kind: "tweet" }, { ...feedContext, kind: undefined },
+      { ...feedContext, title: "" }, { ...feedContext, title: "  " }, { ...feedContext, title: "x".repeat(301) }, { ...feedContext, title: 7 },
+      { ...feedContext, source: "" }, { ...feedContext, source: "x".repeat(301) },
+      { ...feedContext, url: "javascript:alert(1)" }, { ...feedContext, url: "ftp://news.example/a" }, { ...feedContext, url: "https://user:pw@news.example/a" },
+      { ...feedContext, url: "not a url" }, { ...feedContext, url: `https://news.example/${"a".repeat(2000)}` }, { ...feedContext, url: 7 },
+      { ...feedContext, sym: "SEC" }, { ...feedContext, sym: "nvda!" }, { ...feedContext, sym: 7 },
+      { ...feedContext, at: 7 }, { ...feedContext, at: "x".repeat(41) },
+    ]) {
+      reset();
+      const res = await postContext(bad);
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: "context must be a feed item: kind news|filing|insider|alert, title and source (1-300 chars), at (max 40 chars), optional http(s) url and ticker sym" });
+      expect(kernelCalls.length).toBe(0);
+      expect(runCalls.length).toBe(0);
+      expect(reasonCalls.length).toBe(0);
+    }
+  });
+
+  test("a request without context sends none", async () => {
+    for (const context of [undefined, null]) {
+      reset();
+      winner = "research_required";
+      await (await postContext(context)).text();
+      expect("context" in (kernelCalls[0] ?? {})).toBe(false);
+      const runOpts = runCalls[0]?.[2] as Record<string, unknown>;
+      expect("context" in runOpts).toBe(false);
+      reset();
+      await (await postContext(context)).text();
+      expect(reasonCalls[0] && "context" in reasonCalls[0]).toBe(false);
+    }
+  });
+
   test("invalid JSON and missing prompts stop before routing", async () => {
     const { POST } = await import("./route");
     for (const [body, error] of [
@@ -833,19 +900,66 @@ describe("agent entry route", () => {
     expect(ended).toEqual(["sess-test"]);
   });
 
-  test("invalid assessment verdicts and a three-tool cap defer to research", async () => {
-    for (const verdict of [undefined, "", 42, "invalid tool", "query_finra"]) {
+  test("invalid assessment verdicts defer to research", async () => {
+    for (const verdict of [undefined, "", 42, "invalid tool"]) {
       reset();
       winner = "query_finra";
       assessReply = { verdict };
       await eventsFor("short interest?");
-      const expectedCalls = verdict === "query_finra" ? 3 : 1;
-      expect(invoked).toHaveLength(expectedCalls);
-      expect(ended).toHaveLength(expectedCalls);
+      expect(invoked).toHaveLength(1);
+      expect(ended).toHaveLength(1);
       expect(runCalls).toHaveLength(1);
       expect(runCalls[0]?.[2]).toMatchObject({ seedEvidence: expect.arrayContaining([expect.objectContaining({ id: "ev:bridge" })]) });
       expect(reasonCalls).toEqual([]);
     }
+  });
+
+  test("three-tool cap with admitted evidence answers without research", async () => {
+    reset();
+    winner = "query_finra";
+    assessReply = { verdict: "query_finra" };
+    bridgeIds = ["ev:1", "ev:2", "ev:3"];
+    const events = await eventsFor("short interest?");
+    expect(invoked).toHaveLength(3);
+    expect(ended).toHaveLength(3);
+    expect(events.filter((e) => e.type === "agent_start")).toHaveLength(1);
+    expect(runCalls).toEqual([]);
+    expect(reasonCalls).toHaveLength(1);
+    expect(reasonCalls[0].evidence).toHaveLength(3);
+    expect(events.slice(-3).map((e) => e.type)).toEqual(["reasoning_start", "answer_delta", "done"]);
+    expect(metricCalls(events, "tools")).toBe(3);
+  });
+
+  test("a repeated identical tool call keeps one evidence item", async () => {
+    reset();
+    winner = "list_sec_filings";
+    verdicts = ["list_sec_filings", "node_resolved"];
+    const events = await eventsFor("NVDA filings?");
+    expect(invoked.map((c) => c[0])).toEqual(["list_sec_filings", "list_sec_filings"]);
+    expect(reasonCalls[0].evidence.map((e) => e.id)).toEqual(["ev:bridge"]);
+    expect(events.filter((e) => e.type === "evidence").at(-1)?.evidence).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ metrics: { tools: { calls: 2 }, evidence: { count: 1 } } });
+    expect(runCalls).toEqual([]);
+  });
+
+  test("a no-data tool result counts as no_records, not tool_error", async () => {
+    reset();
+    winner = "get_xbrl_facts";
+    toolFailure = { category: "no_records", error: "No data found for MSFT: no XBRL facts found for concept 'Assets'" };
+    const events = await eventsFor("MSFT total assets?");
+    expect(events.find((e) => e.type === "tool_failed")).toMatchObject({ category: "no_records" });
+    expect(events.at(-1)).toMatchObject({ metrics: { failures: { no_records: 1 } } });
+  });
+
+  test("three-tool cap without admitted evidence still defers to research", async () => {
+    reset();
+    winner = "query_finra";
+    assessReply = { verdict: "query_finra" };
+    toolFailure = { category: "tool_error", error: "bad args" };
+    await eventsFor("short interest?");
+    expect(invoked).toHaveLength(3);
+    expect(runCalls).toHaveLength(1);
+    expect(reasonCalls).toEqual([]);
   });
 
   test("cleanup failure retains completed evidence without assessing the tool", async () => {

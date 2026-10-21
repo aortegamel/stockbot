@@ -24,7 +24,9 @@ export type FailureCategory =
   | "storage_error"
   | "policy_rejection"
   | "duplicate_research_action"
-  | "research_loop_detected";
+  | "research_loop_detected"
+  // The source answered but holds no matching records ("No data found for ..."), as the kernel worker reports it.
+  | "no_records";
 
 // ponytail: research caps live in the kernel (None=null=unlimited); no TS budget mirror (DISPLAY_CHAR_LIMIT in loop.ts is a model-view bound, never termination).
 
@@ -52,7 +54,7 @@ export type Evidence = {
 };
 
 // Match the source endpoint. References never contain paths or live URLs.
-const SOURCE_ID_RE = /^(?:capture:[a-f0-9]{64}|evidence:[A-Za-z0-9:_-]{1,256})$/;
+export const SOURCE_ID_RE = /^(?:capture:[a-f0-9]{64}|evidence:[A-Za-z0-9:_-]{1,256})$/;
 
 // One candidate reference: only a well-formed id plus public title/url fields
 // survive; every other shape drops the row instead of repairing it.
@@ -115,6 +117,28 @@ export type Persona = (typeof FINAL_PERSONAS)[number];
 // The add_widget tool accepts every kind except tv-link (it needs a user-pasted URL).
 export const WIDGET_TYPES: readonly string[] = ["price-volume", "financials", "news", "monthly-returns", "short-interest", "short-volume", "insider", "filings", "multiples", "tv-link"];
 
+// Feed item kinds. An Ask-about-this context names one item of these kinds.
+export const ASK_CONTEXT_KINDS = ["news", "filing", "insider", "alert"] as const;
+// A user-picked feed item beside the verbatim prompt. It is untrusted data, never instructions.
+export type AskContext = { kind: (typeof ASK_CONTEXT_KINDS)[number]; title: string; url?: string; source: string; sym?: string; at: string };
+// A link is safe only when the viewer could fetch it directly: web scheme, host present, no credentials.
+// Shared by the web viewer and the agent route's feed-context check; no DOM dependency.
+function fetchableHttpUrl(parsed: URL): boolean {
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+  return parsed.hostname !== "" && !parsed.username && !parsed.password;
+}
+
+export function safeSourceUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = new URL(value);
+    if (fetchableHttpUrl(parsed)) return parsed.href;
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
 export type ToolResult = { ok: true; evidence: Evidence; chartSelection?: unknown; watchlistUpdate?: unknown; widgetSelection?: unknown } | { ok: false; error: string; category: FailureCategory; retryable: boolean };
 
 export type Tool = {
@@ -124,7 +148,7 @@ export type Tool = {
 };
 
 export type AgentEvent =
-  | { type: "agent_start"; prompt: string }
+  | { type: "agent_start"; prompt: string; context?: AskContext }
   | { type: "chart_update"; ticker: string }
   | { type: "watchlist_update"; action: "add" | "remove"; ticker: string }
   | { type: "widget_update"; ticker: string; widgetType: string }

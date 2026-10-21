@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
 import { applyFinalGates, asksWatchlist, citedOrThin, inventoryDefect, KernelRouter, parseTicker, parseWatchlist, PASS2_MIN_WALL_MS, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type FinalGateCaller, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
-import { FINAL_PERSONAS, type AgentEvent, type Evidence, type FinalClaim, type Metrics, type Persona } from "./types";
+import { FINAL_PERSONAS, type AgentEvent, type AskContext, type Evidence, type FinalClaim, type Metrics, type Persona } from "./types";
 
 class FakeChild implements KernelChild {
   exitCode: number | null = null;
@@ -413,8 +413,9 @@ describe("runKernelAgent final personas", () => {
   const graphReply = (id: string): string =>
     `${JSON.stringify({ id, objective: "q", evidence: [{ id: "ev:1", content: "fact" }], nodes: [{ node_id: "n1", question: "q", status: "blocked", depends_on: [] }], decisions: [], unresolved: ["n1"], incomplete_guard: true, toolExecutions: [], toolCalls: [], failures: {}, escalations: 1, escalated: true })}\n`;
   // Same shape with the session id a current worker reports: the gates need it.
-  const sessionGraphReply = (id: string): string =>
-    `${JSON.stringify({ id, objective: "q", sessionId: "rs:live", evidence: [{ id: "ev:1", content: "fact" }], nodes: [], decisions: [], unresolved: [], incomplete_guard: false, toolExecutions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false })}\n`;
+  // A listed unresolved node makes a pass-1 Missing-Evidence line a real gap.
+  const sessionGraphReply = (id: string, unresolved: string[] = []): string =>
+    `${JSON.stringify({ id, objective: "q", sessionId: "rs:live", evidence: [{ id: "ev:1", content: "fact" }], nodes: [], decisions: [], unresolved, incomplete_guard: false, toolExecutions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false })}\n`;
   test("seed and follow-up evidence retain captures before the gated answer without changing model content", async () => {
     process.env.OPENCODE_MODEL = "test-model";
     const events: AgentEvent[] = [];
@@ -436,7 +437,7 @@ describe("runKernelAgent final personas", () => {
           evidence: replies === 1
             ? [{ id: "ev:1", content: "kernel fact", sources: [kernelSource] }, { id: "ev:bad", content: "uncaptured", sources: [{ id: "/raw/path" }] }]
             : [{ id: "ev:1", content: "changed duplicate", sources: [kernelSource, followSource] }, { id: "ev:2", content: "second fact", title: "Follow-up filing", url: "https://www.sec.gov/filing", sources: [followSource] }, { id: "ev:2", content: "duplicate", sources: [] }],
-          nodes: [], decisions: [], unresolved: [], needleDecisions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false,
+          nodes: [], decisions: [], unresolved: replies === 1 ? ["n1"] : [], needleDecisions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false,
         })}\n`;
       };
       queueMicrotask(() => child.emitStdout('{"type":"ready"}\n'));
@@ -557,6 +558,7 @@ describe("runKernelAgent final personas", () => {
     ticker?: string;
     currentChartTicker?: string;
     watchlist?: readonly string[];
+    context?: AskContext;
     // Injects only spawnFn+reason so the router falls back to its default python/worker path.
     spawnOnly?: boolean;
   }): Promise<{ events: AgentEvent[]; calls: Call[]; bodies: Record<string, unknown>[]; gates: Record<string, unknown>[]; maxInFlight: number; runTimeouts: (number | undefined)[]; spawns: { cmd: string; args: string[] }[] }> {
@@ -616,6 +618,7 @@ describe("runKernelAgent final personas", () => {
           ...(opts.ticker !== undefined ? { ticker: opts.ticker } : {}),
           ...(opts.currentChartTicker !== undefined ? { currentChartTicker: opts.currentChartTicker } : {}),
           ...(opts.watchlist !== undefined ? { watchlist: opts.watchlist } : {}),
+          ...(opts.context !== undefined ? { context: opts.context } : {}),
           deps: {
             ...(opts.spawnOnly ? {} : { python: "py", workerPath: "w" }),
             spawnFn: spawn,
@@ -811,6 +814,27 @@ describe("runKernelAgent final personas", () => {
       const finalPass = gapping.length > 0 ? 2 : 1;
       expect(calls.filter((c) => c.pass === finalPass).map((c) => c.input.persona)).toEqual(subset);
       expect(answers(events)).toEqual([subset.map((p) => `${label(p)}\n${p} p${finalPass}`).join("\n\n")]);
+    }
+  });
+
+  test("pass 2 runs only when a Missing-Evidence line meets an unresolved planned node", async () => {
+    for (const unresolved of [[], ["n1"]]) {
+      const real = unresolved.length > 0;
+      const { events, bodies } = await runFinal({
+        personas: ["stockbot"],
+        reply: (pass2, id) => pass2
+          ? sessionReply(true, id)
+          : `${JSON.stringify({ id, objective: "q", sessionId: "s1", evidence: [{ id: "ev:1", content: "fact" }], nodes: [{ node_id: "n1", question: "q", status: real ? "blocked" : "resolved", depends_on: [] }], decisions: [], unresolved, incomplete_guard: false, toolExecutions: [], toolCalls: [], failures: {}, escalations: real ? 1 : 0, escalated: real })}\n`,
+        decide: (_p, pass) => (pass === 1 ? { text: "stockbot p1\nMissing-Evidence: need doc X", missingEvidence: "need doc X" } : {}),
+      });
+      const runs = runBodies(bodies);
+      expect(runs.length).toBe(real ? 2 : 1);
+      if (real) expect(runs[1]?.gap).toBe("need doc X");
+      expect(events.filter((e) => e.type === "progress" && e.stage === "evidence_gap").length).toBe(real ? 1 : 0);
+      expect(events.filter((e) => e.type === "reasoning_start").length).toBe(real ? 2 : 1);
+      // A hedge over resolved nodes ships pass 1 with its own gap line and no skip note.
+      expect(answers(events)).toEqual([`${label("stockbot")}\n${real ? "stockbot p2" : "stockbot p1\nMissing-Evidence: need doc X"}`]);
+      expect(events.some((e) => e.type === "failed")).toBe(false);
     }
   });
 
@@ -1678,11 +1702,23 @@ describe("runKernelAgent final personas", () => {
     }
   });
 
+  test("a feed context reaches every reasoner call and every worker run body", async () => {
+    const context: AskContext = { kind: "news", title: "NVDA jumps", source: "Stocktwits", sym: "NVDA", at: "2026-10-20T09:00:00Z" };
+    const { calls, bodies } = await runFinal({ ticker: "nvda", context, reply: (_p, id) => sessionGraphReply(id, ["n1"]) });
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) expect(call.input.context).toEqual(context);
+    expect(runBodies(bodies).length).toBeGreaterThan(0);
+    for (const body of runBodies(bodies)) expect(body).toMatchObject({ prompt: expect.not.stringContaining("NVDA jumps"), ticker: "NVDA", context });
+    const { calls: bare, bodies: bareBodies } = await runFinal({ ticker: "nvda", personas: ["stockbot"], reply: (_p, id) => emptyReply(id) });
+    expect(bare[0]?.input).not.toHaveProperty("context");
+    for (const body of runBodies(bareBodies)) expect(body).not.toHaveProperty("context");
+  });
+
   test("chart progress updates every trio call after each research pass without changing research scope", async () => {
     const { events, calls, bodies } = await runFinal({
       ticker: "nvda",
       currentChartTicker: "aapl",
-      reply: (pass2, id) => `${JSON.stringify({ type: "progress", id, stage: "chart_update", detail: { ticker: pass2 ? " brk.b " : " msft " } })}\n${sessionGraphReply(id)}`,
+      reply: (pass2, id) => `${JSON.stringify({ type: "progress", id, stage: "chart_update", detail: { ticker: pass2 ? " brk.b " : " msft " } })}\n${sessionGraphReply(id, ["n1"])}`,
       decide: (persona, pass) => pass === 1 && persona === "bullbot" ? { missingEvidence: "need doc X" } : {},
     });
     expect(events.filter((e) => e.type === "chart_update")).toEqual([
@@ -1754,7 +1790,7 @@ describe("runKernelAgent final personas", () => {
       ticker: "nvda",
       currentChartTicker: "aapl",
       watchlist: ["NVDA", "QQQ"],
-      reply: (_p, id) => `${JSON.stringify({ type: "progress", id, stage: "chart_update", detail: { ticker: "msft" } })}\n${sessionGraphReply(id)}`,
+      reply: (_p, id) => `${JSON.stringify({ type: "progress", id, stage: "chart_update", detail: { ticker: "msft" } })}\n${sessionGraphReply(id, ["n1"])}`,
       decide: (persona, pass, attempt) => {
         if (persona === "bearbot" && attempt === 1) return new Error("retry draft");
         return pass === 1 && persona === "bullbot" ? { missingEvidence: "need doc X" } : {};
