@@ -32,7 +32,7 @@ function Snapshot({ id, label }: { id: string; label: string }) {
 }
 
 // Every URL below comes from parsed fields, never from the pasted link.
-export function TvLinkView({ link, label }: { link: TradingViewLink; label: string }) {
+function TvLinkView({ link, label }: { link: TradingViewLink; label: string }) {
   if (link.kind === "snapshot") return <Snapshot id={link.id} label={label} />;
   if (link.kind === "symbol") return <Frame src={chartSrc(link.symbol)} title={`${label} TradingView embed`} />;
   if (link.kind === "chart-params") return <Frame src={chartSrc(link.symbol, link.interval ? { interval: link.interval } : undefined)} title={`${label} TradingView embed`} />;

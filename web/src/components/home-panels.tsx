@@ -55,7 +55,7 @@ const signed = (v: number | null | undefined) => (v === null || v === undefined 
 const tone = (v: number | null | undefined) => (v === null || v === undefined ? "" : v >= 0 ? "up" : "down");
 const change = (closes: number[]) => (closes.length > 1 && closes[0] ? ((closes[closes.length - 1] - closes[0]) / closes[0]) * 100 : null);
 
-export function Sparkline({ closes, w = 120, h = 32, mark = false }: { closes: number[]; w?: number; h?: number; mark?: boolean }) {
+function Sparkline({ closes, w = 120, h = 32, mark = false }: { closes: number[]; w?: number; h?: number; mark?: boolean }) {
   if (closes.length < 2) return <span className="home-empty">no data</span>;
   const lo = Math.min(...closes);
   const span = Math.max(...closes) - lo || 1;

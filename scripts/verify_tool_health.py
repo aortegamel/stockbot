@@ -362,6 +362,10 @@ _LOCAL_HANDLER_TOOLS = frozenset(
         "get_macro_context",
         "get_trend_evidence",
         "search_company_patents",
+        # Pure UI receipts: validate args and return a dict; the frontend applies them.
+        "set_chart_symbol",
+        "update_watchlist",
+        "add_widget",
     }
 ) | frozenset(_RESEARCH_HANDLERS)
 
