@@ -200,6 +200,13 @@ Under 16 tokens left, the next call fails before any request: the provider rejec
 Unset knobs send no cap. The chat-completions fallback sends no cap.
 The provider counts reasoning tokens inside `max_output_tokens`, so a low cap can return little or no prose.
 
+Reasoning effort: `REASONING_EFFORT` sets the model's reasoning effort on every remote model call: Muse, the Reasoner, and JEV.
+Stockbot sends the value unchanged, so each provider's own levels work. The value must match `^[a-z][a-z0-9_-]{0,31}$`.
+A bad value fails the call before any request. Unset or empty sends no field, so the provider default applies.
+Responses calls send `reasoning: {effort}`. Chat Completions calls, including the Muse fallback, send `reasoning_effort`.
+The Decisions API documents no reasoning field, so the `decisions` format sends none.
+`decision/reasoning.ts` and `app/config.py` `reasoning_fields` own this mapping.
+
 Startup prewarm: the Bun host waits up to 120 seconds for the kernel worker `ready` message.
 At 120 seconds, prewarm kills the silent worker and logs the failure. The API host keeps serving.
 
@@ -421,7 +428,7 @@ Tests inject fake values.
 ### `chat_completions` format
 
 Use this value for an OpenAI-compatible Chat Completions endpoint, such as `https://<provider-host>/v1/chat/completions`.
-The request body contains `model`, `messages`, and `stream: false`.
+The request body contains `model`, `messages`, and `stream: false`, plus `reasoning_effort` when `REASONING_EFFORT` is set.
 One fixed system message carries the answer instructions.
 One user message carries the JSON text of `{state, questions}`.
 The request uses no tools, `response_format`, JSON Schema, or logprobs.

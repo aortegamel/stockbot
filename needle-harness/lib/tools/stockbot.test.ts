@@ -429,12 +429,12 @@ describe("server source metadata", () => {
 
 describe("muse reason personas (fake provider)", () => {
   type Msg = { role: string; content: string };
-  type Body = { model: string; input?: Msg[]; messages?: Msg[]; max_output_tokens?: number };
+  type Body = { model: string; input?: Msg[]; messages?: Msg[]; max_output_tokens?: number; reasoning?: { effort: string }; reasoning_effort?: string };
   type Seen = { path: string; session: string | null; body: Body };
   const seen: Seen[] = [];
   let respond: (path: string, body: Body) => Response = () => sse("ok");
   let stopServer = (): void => { };
-  const KEYS = ["OPENCODE_API_KEY", "OPENCODE_MODEL", "OPENCODE_URL", "MUSE_MAX_OUTPUT_TOKENS", "MUSE_ANSWER_TOKEN_BUDGET"] as const;
+  const KEYS = ["OPENCODE_API_KEY", "OPENCODE_MODEL", "OPENCODE_URL", "MUSE_MAX_OUTPUT_TOKENS", "MUSE_ANSWER_TOKEN_BUDGET", "REASONING_EFFORT"] as const;
   const prevEnv = Object.fromEntries(KEYS.map((k) => [k, process.env[k]]));
 
   function sse(...deltas: string[]): Response {
@@ -497,6 +497,7 @@ describe("muse reason personas (fake provider)", () => {
     respond = personaReply;
     delete process.env.MUSE_MAX_OUTPUT_TOKENS;
     delete process.env.MUSE_ANSWER_TOKEN_BUDGET;
+    delete process.env.REASONING_EFFORT;
   });
 
   test("personas see the same request and evidence on separate sessions", async () => {
@@ -673,6 +674,7 @@ describe("muse reason personas (fake provider)", () => {
     expect(seen.map((s) => s.path)).toEqual(["/v1/responses", "/v1/chat/completions"]);
     expect(seen[1].session).toBe(seen[0].session);
     expect(seen[1].body.messages).toEqual(seen[0].body.input);
+    expect(seen[1].body).not.toHaveProperty("reasoning_effort");
   });
 
   test("no cap env sends no max_output_tokens; MUSE_MAX_OUTPUT_TOKENS caps each call", async () => {
@@ -710,6 +712,26 @@ describe("muse reason personas (fake provider)", () => {
       await expect(reason({ ...input, persona: "bearbot" })).rejects.toThrow("MUSE_MAX_OUTPUT_TOKENS must be an integer >= 16");
     }
     expect(seen.length).toBe(0);
+  });
+
+  test("REASONING_EFFORT passes through in each protocol field; unset sends none; a bad shape fails before any request", async () => {
+    await reason({ ...input, persona: "bearbot" });
+    expect(seen[0]?.body).not.toHaveProperty("reasoning");
+    // Any provider level passes unchanged, not only the OpenAI names.
+    process.env.REASONING_EFFORT = "max";
+    await reason({ ...input, persona: "bearbot" });
+    expect(seen[1]?.body.reasoning).toEqual({ effort: "max" });
+    process.env.REASONING_EFFORT = "xhigh";
+    respond = (path) => path === "/v1/responses" ? new Response("not found", { status: 404 }) : sse("via chat");
+    await reason({ ...input, persona: "bearbot" });
+    expect(seen.slice(2).map((s) => s.path)).toEqual(["/v1/responses", "/v1/chat/completions"]);
+    expect(seen[3]?.body.reasoning_effort).toBe("xhigh");
+    expect(seen[3]?.body).not.toHaveProperty("reasoning");
+    for (const bad of ["XHIGH", "x high", "1high", "a".repeat(33)]) {
+      process.env.REASONING_EFFORT = bad;
+      await expect(reason({ ...input, persona: "bearbot" })).rejects.toThrow("REASONING_EFFORT must match");
+    }
+    expect(seen.length).toBe(4);
   });
 
   test("a capped stream cut off inside the claims block yields prose and no raw JSON", async () => {

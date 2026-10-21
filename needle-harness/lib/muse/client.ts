@@ -1,5 +1,6 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { FINAL_CLAIM_TYPES, type AskContext, type Evidence, type FinalClaim, type FinalClaimType, type Persona } from "../agent/types";
+import { reasoningFields } from "../../../decision/reasoning";
 
 export type MuseUsage = {
   inputTokens?: number;
@@ -347,7 +348,7 @@ export async function reason(opts: ReasonOptions): Promise<{ text: string; usage
   // Each call uses a separate provider session, including concurrent personas.
   const session = crypto.randomUUID();
   const input = reasonInput(opts);
-  const body = { model, input, stream: true, ...(cap !== undefined ? { max_output_tokens: cap } : {}) };
+  const body = { model, input, stream: true, ...reasoningFields("responses"), ...(cap !== undefined ? { max_output_tokens: cap } : {}) };
   // Explicit personas have no per-fetch limit. The caller deadline still applies.
   const fetchSignal = (): AbortSignal =>
     opts.persona ? signal : AbortSignal.any([AbortSignal.timeout(FETCH_TIMEOUT_MS), signal]);
@@ -372,7 +373,7 @@ export async function reason(opts: ReasonOptions): Promise<{ text: string; usage
         apiKey,
         session,
         "/chat/completions",
-        { model, messages: input.map((m) => ({ role: m.role, content: m.content })), stream: true },
+        { model, messages: input.map((m) => ({ role: m.role, content: m.content })), stream: true, ...reasoningFields("chat_completions") },
         opts.onDelta,
         fetchSignal(),
       );
