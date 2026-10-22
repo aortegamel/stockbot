@@ -1614,3 +1614,134 @@ def test_reg_sho_no_date_on_monday_queries_single_day(
     compare = body["compareFilters"]
     assert isinstance(compare, list)
     assert {"compareType": "EQUAL", "fieldName": "tradeReportDate", "fieldValue": "2026-09-21"} in compare
+
+
+# --- Official public files (citation pages) -----------------------------------
+
+# Trimmed copies of the 2026-10-15 cdn.finra.org files (same header, line shapes).
+_FNQC_FILE = (
+    b"Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market\n"
+    b"20261015|NVDA|274457.043010|1022|934921.209763|B\n"
+    b"20261015|NVDL|1000|0|2000|B\n"
+    b"2\n"
+)
+_CNMS_FILE = (
+    b"Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market\n"
+    b"20261015|NVDA|18013290.539633|100349|51176540.043723|B,Q,N\n"
+    b"1\n"
+)
+_SHRT_FILE = (
+    b'"accountingYearMonthNumber"|"symbolCode"|"issueName"|"currentShortPositionQuantity"|"stockSplitFlag"'
+    b'|"daysToCoverQuantity"|"changePercent"|"settlementDate"\n'
+    b'"20260930"|"NV"|"Envision Inc"|"5"||"1.00"|"0.00"|"2026-09-30"\n'
+    b'"20260930"|"NVDA"|"NVIDIA Corporation Common Stoc"|"311389688"||"2.82"|"5.83"|"2026-09-30"\n'
+)
+_NVDA_FNQC_ROW = {
+    "reportingFacilityCode": "NCTRF",
+    "totalParQuantity": 934921.209763,
+    "shortParQuantity": 274457.04301,
+    "marketCode": "B",
+    "tradeReportDate": "2026-10-15",
+    "securitiesInformationProcessorSymbolIdentifier": "NVDA",
+    "shortExemptParQuantity": 1022,
+}
+
+
+@pytest.fixture
+def official_get(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    files = {
+        "https://cdn.finra.org/equity/regsho/daily/FNQCshvol20261015.txt": _FNQC_FILE,
+        "https://cdn.finra.org/equity/regsho/daily/CNMSshvol20261015.txt": _CNMS_FILE,
+        "https://cdn.finra.org/equity/otcmarket/biweekly/shrt20260930.csv": _SHRT_FILE,
+    }
+
+    def fake_get(url: str, timeout: int) -> MagicMock:
+        assert timeout == 60
+        resp = MagicMock()
+        resp.content = files[url]
+        return resp
+
+    get_mock = MagicMock(side_effect=fake_get)
+    monkeypatch.setattr("app.finra_client.requests.get", get_mock)
+    return get_mock
+
+
+def test_official_reg_sho_row_cites_its_facility_file_line(official_get: MagicMock, tmp_path: Path) -> None:
+    """marketCode B (NCTRF) maps to FNQC; file 274457.043010 equals API 274457.04301."""
+    page = finra_client.resolve_finra_official("otcMarket/regShoDaily", _NVDA_FNQC_ROW, {}, root=tmp_path)
+    assert page is not None
+    assert page["url"] == "https://cdn.finra.org/equity/regsho/daily/FNQCshvol20261015.txt"
+    assert page["quote"] == "20261015|NVDA|274457.043010|1022|934921.209763|B"
+    assert page["payload"] == _FNQC_FILE
+    assert page["media"] == "text"
+    assert page["anchor"] == ""
+    assert page["sha256"] == finra_client.raw_archive.content_hash(_FNQC_FILE)
+
+
+def test_official_reg_sho_facility_code_alone_selects_file(official_get: MagicMock, tmp_path: Path) -> None:
+    row = {k: v for k, v in _NVDA_FNQC_ROW.items() if k != "marketCode"}
+    page = finra_client.resolve_finra_official("otcMarket/regShoDaily", row, {}, root=tmp_path)
+    assert page is not None
+    assert page["url"] == "https://cdn.finra.org/equity/regsho/daily/FNQCshvol20261015.txt"
+
+
+def test_official_reg_sho_envelope_cites_consolidated_line(official_get: MagicMock, tmp_path: Path) -> None:
+    """Analysis envelopes cite their query JSON: ticker + as_of_date -> CNMS; Mock suffix stripped."""
+    query = {"ticker": "NVDA", "start_date": None, "end_date": None, "limit": 100, "offset": 0, "filters": None}
+    payload = {"dataset_id": "otcMarket/regShoDaily", "query": query, "as_of_date": "2026-10-15"}
+    page = finra_client.resolve_finra_official("otcMarket/regShoDailyMock", query, payload, root=tmp_path)
+    assert page is not None
+    assert page["url"] == "https://cdn.finra.org/equity/regsho/daily/CNMSshvol20261015.txt"
+    assert page["quote"] == "20261015|NVDA|18013290.539633|100349|51176540.043723|B,Q,N"
+
+
+def test_official_reg_sho_disagreeing_or_missing_line_raises(official_get: MagicMock, tmp_path: Path) -> None:
+    wrong = {**_NVDA_FNQC_ROW, "totalParQuantity": 934921.2}
+    with pytest.raises(ValueError, match="TotalVolume"):
+        finra_client.resolve_finra_official("otcMarket/regShoDaily", wrong, {}, root=tmp_path)
+    absent = {**_NVDA_FNQC_ROW, "securitiesInformationProcessorSymbolIdentifier": "AMD"}
+    with pytest.raises(ValueError, match="no line for AMD"):
+        finra_client.resolve_finra_official("otcMarket/regShoDaily", absent, {}, root=tmp_path)
+
+
+def test_official_short_interest_cites_quoted_symbol_line_once(official_get: MagicMock, tmp_path: Path) -> None:
+    """Exact "NVDA" cell (not the "NV" prefix); the second read comes from the archive."""
+    row = {
+        "symbolCode": "NVDA",
+        "settlementDate": "2026-09-30",
+        "accountingYearMonthNumber": 20260930,
+        "currentShortPositionQuantity": 311389688,
+        "stockSplitFlag": None,
+        "changePercent": 5.83,
+    }
+    first = finra_client.resolve_finra_official("otcMarket/consolidatedShortInterest", row, {}, root=tmp_path)
+    second = finra_client.resolve_finra_official("otcMarket/consolidatedShortInterest", row, {}, root=tmp_path)
+    assert first is not None
+    assert first == second
+    assert first["url"] == "https://cdn.finra.org/equity/otcmarket/biweekly/shrt20260930.csv"
+    assert (
+        first["quote"] == '"20260930"|"NVDA"|"NVIDIA Corporation Common Stoc"|"311389688"||"2.82"|"5.83"|"2026-09-30"'
+    )
+    assert first["media"] == "text"
+    assert official_get.call_count == 1
+    with pytest.raises(ValueError, match="currentShortPositionQuantity"):
+        finra_client.resolve_finra_official(
+            "otcMarket/consolidatedShortInterest", {**row, "currentShortPositionQuantity": 1}, {}, root=tmp_path
+        )
+
+
+def test_official_empty_row_cites_first_payload_record(official_get: MagicMock, tmp_path: Path) -> None:
+    payload = {"records": [{"symbolCode": "NVDA", "settlementDate": "2026-09-30"}]}
+    page = finra_client.resolve_finra_official("otcMarket/consolidatedShortInterest", {}, payload, root=tmp_path)
+    assert page is not None
+    assert '"NVDA"' in str(page["quote"])
+
+
+def test_official_file_absent_for_other_datasets_or_unknown_subject(official_get: MagicMock, tmp_path: Path) -> None:
+    """thresholdList/weeklySummary have no static FINRA file; no symbol/day means no page."""
+    row = {"issueSymbolIdentifier": "NVDA", "tradeDate": "2026-10-15"}
+    assert finra_client.resolve_finra_official("otcMarket/thresholdList", row, {}, root=tmp_path) is None
+    assert finra_client.resolve_finra_official("otcMarket/weeklySummary", row, {}, root=tmp_path) is None
+    assert finra_client.resolve_finra_official("", row, {}, root=tmp_path) is None
+    assert finra_client.resolve_finra_official("otcMarket/regShoDaily", {"ticker": "NVDA"}, {}, root=tmp_path) is None
+    official_get.assert_not_called()

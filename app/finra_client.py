@@ -13,7 +13,9 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from operator import itemgetter
+from pathlib import Path
 from typing import TypeGuard
 
 import requests
@@ -27,6 +29,7 @@ from .config import (
     get_finra_client_secret,
 )
 from .finra_analysis import analyze_and_brief
+from .storage import raw_archive
 
 logger = logging.getLogger(__name__)
 
@@ -524,6 +527,133 @@ def get_threshold_securities(ticker: str | None = None, trade_date: str | None =
         end_date=trade_date,
         limit=200 if not ticker else 50,
     )
+
+
+# Official public files behind API rows: the human citation page of a FINRA
+# record. Only the datasets below publish a static cdn.finra.org file; the
+# thresholdList/weeklySummary/... pages are SPAs fed by api.finra.org itself.
+_OFFICIAL_FILE_KIND = "official_file"
+# marketCode or reportingFacilityCode -> daily short-sale volume file prefix.
+# API rows for 2026-10-15 (B/NCTRF, Q/NQTRF, N/NYTRF, O/ORF) equal the
+# FNQC/FNSQ/FNYX/FORF file lines; "D = ADF" per FINRA regShoDaily metadata.
+_REG_SHO_FILE_PREFIXES = {
+    "B": "FNQC",
+    "NCTRF": "FNQC",
+    "Q": "FNSQ",
+    "NQTRF": "FNSQ",
+    "N": "FNYX",
+    "NYTRF": "FNYX",
+    "O": "FORF",
+    "ORF": "FORF",
+    "D": "FNRA",
+}
+# regShoDaily API field -> facility file column.
+_REG_SHO_FILE_COLUMNS = {
+    "shortParQuantity": "ShortVolume",
+    "shortExemptParQuantity": "ShortExemptVolume",
+    "totalParQuantity": "TotalVolume",
+    "marketCode": "Market",
+}
+
+
+def resolve_finra_official(
+    dataset: str, row: Mapping[str, object], payload: Mapping[str, object], *, root: Path
+) -> dict[str, object] | None:
+    """Official cdn.finra.org file and the exact cited line for one FINRA row.
+
+    ``row`` is the cited row ({} = the payload's first record); analysis
+    envelopes cite their query JSON, so the symbol may be ``ticker`` and the day
+    the payload's ``as_of_date``. None when FINRA publishes no static file for
+    the dataset or no symbol/day is known. Fetch failures raise; a missing or
+    disagreeing line raises ValueError.
+    """
+    name = dataset.rpartition("/")[2].casefold().removesuffix("mock")
+    if name == "regshodaily":
+        symbol_field, date_field = "securitiesInformationProcessorSymbolIdentifier", "tradeReportDate"
+    elif name.endswith("shortinterest"):
+        symbol_field, date_field = "symbolCode", "settlementDate"
+    else:
+        return None
+    records = payload.get("records")
+    first = records[0] if isinstance(records, list) and records else None
+    cited: Mapping[str, object] = row or (first if isinstance(first, Mapping) else {})
+    query = payload.get("query")
+    symbol = (
+        cited.get(symbol_field) or cited.get("ticker") or (query.get("ticker") if isinstance(query, Mapping) else None)
+    )
+    day = _norm_date(cited.get(date_field) or payload.get("as_of_date"))
+    if not (isinstance(symbol, str) and symbol.strip() and day):
+        return None
+    stamp = day.replace("-", "")
+    columns: Mapping[str, str] | None = None
+    if name == "regshodaily":
+        facility = _REG_SHO_FILE_PREFIXES.get(str(cited.get("marketCode"))) or _REG_SHO_FILE_PREFIXES.get(
+            str(cited.get("reportingFacilityCode"))
+        )
+        # ponytail: no facility (analysis envelope, trimmed fields) cites the consolidated line unchecked.
+        url = f"https://cdn.finra.org/equity/regsho/daily/{facility or 'CNMS'}shvol{stamp}.txt"
+        symbol_column = "Symbol"
+        columns = _REG_SHO_FILE_COLUMNS if facility else {}
+    else:
+        url = f"https://cdn.finra.org/equity/otcmarket/biweekly/shrt{stamp}.csv"
+        symbol_column = "symbolCode"
+    data = _official_file(url, root)
+    quote = _official_line(data.decode("utf-8", "replace"), url, symbol_column, symbol.strip(), cited, columns)
+    return {
+        "url": url,
+        "payload": data,
+        "sha256": raw_archive.content_hash(data),
+        "media": "text",
+        "quote": quote,
+        "anchor": "",
+    }
+
+
+def _official_file(url: str, root: Path) -> bytes:
+    """Archived bytes of one official file; fetched and archived once."""
+    record = raw_archive.find("finra", _OFFICIAL_FILE_KIND, url, root=root / "raw")
+    if record is not None:
+        return record.payload_path.read_bytes()
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    raw_archive.archive("finra", _OFFICIAL_FILE_KIND, url, resp.content, url=url, root=root / "raw")
+    return resp.content
+
+
+def _official_line(
+    text: str,
+    url: str,
+    symbol_column: str,
+    symbol: str,
+    cited: Mapping[str, object],
+    columns: Mapping[str, str] | None,
+) -> str:
+    """The pipe-delimited line for ``symbol``; its cells must equal the cited
+    values (``columns``: API field -> file column, None = same names)."""
+    lines = text.splitlines()
+    header = [cell.strip('"') for cell in lines[0].split("|")] if lines else []
+    if symbol_column not in header:
+        raise ValueError(f"{url}: no {symbol_column} column")
+    at = header.index(symbol_column)
+    for line in lines[1:]:
+        cells = [cell.strip('"') for cell in line.split("|")]
+        if len(cells) != len(header) or cells[at] != symbol:
+            continue
+        values = dict(zip(header, cells, strict=True))
+        for api_field, column in (columns if columns is not None else {h: h for h in header}).items():
+            value = cited.get(api_field)
+            if value is not None and column in values and not _same_value(value, values[column]):
+                raise ValueError(f"{url}: {symbol} {column}={values[column]!r} disagrees with {api_field}={value!r}")
+        return line
+    raise ValueError(f"{url}: no line for {symbol}")
+
+
+def _same_value(value: object, cell: str) -> bool:
+    """Numbers compare by value (file 274457.043010 == API 274457.04301)."""
+    try:
+        return Decimal(str(value)) == Decimal(cell)
+    except InvalidOperation:
+        return str(value).strip() == cell.strip()
 
 
 def _filter_list(filters: object) -> list[dict[str, object]] | None:
