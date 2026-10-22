@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import warnings
 from collections.abc import Mapping
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 from hypothesis import given, settings
@@ -54,6 +56,36 @@ class _Repo:
 
     def get_tool_result(self, tool_result_id: str) -> object:
         return self._results[tool_result_id]
+
+
+_Calls = list[tuple[str, dict[str, object], dict[str, object]]]
+
+
+def _official(monkeypatch: pytest.MonkeyPatch, page: Mapping[str, object] | None, *, finra: bool) -> _Calls:
+    """Fake the SEC or FINRA official-page resolver: record each call, return one fixed page (or None)."""
+    from app import finra_client
+    from app.sec import documents
+
+    calls: _Calls = []
+
+    def resolve(name: str, row: Mapping[str, object], payload: Mapping[str, object], *, root: Path) -> object:
+        calls.append((name, dict(row), dict(payload)))
+        return None if page is None else dict(page)
+
+    target = (finra_client, "resolve_finra_official") if finra else (documents, "resolve_sec_official")
+    monkeypatch.setattr(*target, resolve, raising=False)
+    return calls
+
+
+def _page(url: str, body: bytes, media: str, quoted: str, anchor: str = "") -> dict[str, object]:
+    return {
+        "url": url,
+        "payload": body,
+        "sha256": raw_archive.content_hash(body),
+        "media": media,
+        "quote": quoted,
+        "anchor": anchor,
+    }
 
 
 def test_capture_web_result_archives_only_success_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -161,16 +193,29 @@ def test_capture_search_excerpt_preserved_when_no_content(tmp_path: Path, monkey
     assert plain["representation"] == "text"
 
 
-def test_capture_structured_record_archives_finra_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_capture_structured_record_without_official_page_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A bridge record capture cites no row: the resolver reads the whole payload, and None is case 3."""
     monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    calls = _official(monkeypatch, None, finra=True)
+    result = {"dataset_id": "otcMarket/thresholdList", "content": "short interest rows", "row": 1}
     with capture_scope() as sources:
         capture_result("browse_tools", {"content": "ignored navigation"})
-        capture_result("query_finra", {"content": "short interest rows", "row": 1})
+        capture_result("query_finra", result)
     assert len(sources) == 1
-    document = read_source_document(sources[0]["id"], data_root=tmp_path)
+    with caplog.at_level("ERROR", logger="app.research.sources"):
+        document = read_source_document(sources[0]["id"], data_root=tmp_path)
+    assert calls == [("otcMarket/thresholdList", {}, result)]
     assert document["captureKind"] == "structured_record"
-    assert document["representation"] == "json"
+    assert document["representation"] == "text"
+    assert json.loads(str(document["content"])) == result
     assert document["publisher"] == "FINRA"
+    assert document["linkStatus"] == "missing"
+    assert "originalUrl" not in document and "highlightUrl" not in document
+    assert [record.levelname for record in caplog.records] == ["ERROR"]
+    assert f"source_id={sources[0]['id']}" in caplog.records[0].getMessage()
+    assert "kind=finra_record tool=query_finra" in caplog.records[0].getMessage()
 
 
 def test_capture_sec_result_archives_live_bytes_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -345,12 +390,16 @@ def test_sec_evidence_resolves_through_pinned_metadata(tmp_path: Path, monkeypat
     assert document["captureKind"] == "original"
     assert location["prefix"] == "before "
     assert location["suffix"] == " after"
-    assert {key: document.get(key) for key in ("toolName", "toolArgs", "upstreamUrl", "publicUrl")} == {
+    # Case 1: exact HTML bytes and a directive that matches the cited passage once.
+    keys = ("toolName", "toolArgs", "originalUrl", "highlightUrl", "linkStatus")
+    assert {key: document.get(key) for key in keys} == {
         "toolName": "get_sec_document",
         "toolArgs": {"accession_no": ACC, "document_name": DOC},
-        "upstreamUrl": "https://www.sec.gov/z",
-        "publicUrl": "https://www.sec.gov/z",
+        "originalUrl": "https://www.sec.gov/z",
+        "highlightUrl": "https://www.sec.gov/z#:~:text=quoted%20passage",
+        "linkStatus": "highlighted_original",
     }
+    assert "upstreamUrl" not in document and "publicUrl" not in document
     assert "sec" not in document and "toolResultId" not in document
 
 
@@ -478,13 +527,16 @@ def test_finra_web_evidence_replays_persisted_result(tmp_path: Path, monkeypatch
     document = read_source_document("evidence:ev-web", data_root=tmp_path, repo=_WebRepo())
     assert document["captureKind"] == "search_excerpt"
     assert document["quote"] == "quoted excerpt"
-    assert {key: document.get(key) for key in ("toolName", "toolResultId", "toolArgs", "publicUrl")} == {
+    # Case 2: a web source holds the provider extraction, not the page bytes.
+    keys = ("toolName", "toolResultId", "toolArgs", "originalUrl", "linkStatus")
+    assert {key: document.get(key) for key in keys} == {
         "toolName": "search_web",
         "toolResultId": "tr-1",
         "toolArgs": {"query": "acme news", "search_type": "auto"},
-        "publicUrl": "https://example.com/a",
+        "originalUrl": "https://example.com/a",
+        "linkStatus": "stockbot_render",
     }
-    assert "upstreamUrl" not in document
+    assert "highlightUrl" not in document and "upstreamUrl" not in document and "publicUrl" not in document
 
 
 def test_sec_capture_rejects_archived_bytes_changed_after_retrieval(
@@ -654,8 +706,8 @@ def test_sec_scope_archives_retained_bytes_as_original_capture(tmp_path: Path, m
         "id": sources[0]["id"],
         "title": DOC,
         "url": "https://www.sec.gov/live",
-        "upstreamUrl": "https://www.sec.gov/live",
-        "publicUrl": "https://www.sec.gov/live",
+        "originalUrl": "https://www.sec.gov/live",
+        "linkStatus": "stockbot_render",
         "publisher": "SEC",
         "publishedAt": "2026-01-03",
         "capturedAt": record.retrieved_at,
@@ -767,15 +819,26 @@ def test_evidence_reader_uses_requested_data_root(tmp_path: Path, monkeypatch: p
     assert read_source_document("evidence:ev-root", data_root=data_root)["contentHash"] == digest
 
 
+_OFFICIAL_HTML = (
+    b"<html><body><p>Intro</p><table><tr><td>ACME</td><td>2026-01-02</td><td>5</td></tr></table></body></html>"
+)
+
+
 @pytest.mark.parametrize(
-    ("tool", "kind", "publisher"),
-    [("query_finra", "finra_record", "FINRA"), ("get_fundamentals", "sec_record", "SEC")],
+    ("tool", "kind", "publisher", "url"),
+    [
+        ("query_finra", "finra_record", "FINRA", "https://cdn.finra.org/equity/otcmarket/biweekly/shrt20260102.csv"),
+        ("get_fundamentals", "sec_record", "SEC", "https://www.sec.gov/Archives/edgar/data/42/x.htm"),
+    ],
 )
 def test_structured_capture_matches_persisted_record_evidence(
-    tool: str, kind: str, publisher: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tool: str, kind: str, publisher: str, url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A single-shot record capture and its persisted evidence replay show the same exact content."""
+    """A single-shot record capture and its persisted evidence replay render the same official page."""
     monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    calls = _official(
+        monkeypatch, _page(url, _OFFICIAL_HTML, "html", "ACME | 2026-01-02 | 5"), finra=kind == "finra_record"
+    )
     result = {"symbol": "ACME", "text": "row summary", "rows": [{"name": "Société", "value": 5}], "as_of": "2026-01-02"}
     with capture_scope() as sources:
         capture_result(tool, {**result, "error": "upstream"})
@@ -808,17 +871,26 @@ def test_structured_capture_matches_persisted_record_evidence(
         },
     )
     persisted = read_source_document("evidence:ev-rec", data_root=tmp_path, repo=repo)
-    keys = ("content", "contentHash", "captureKind", "representation")
+    # Neither cites a JSON row, so the resolver reads both pages from the same whole payload.
+    name = "" if kind == "finra_record" else tool
+    assert calls == [(name, {}, result), (name, {}, result)]
+    keys = ("url", "content", "contentHash", "captureKind", "representation", "quote", "location", "linkStatus")
     assert {key: persisted[key] for key in keys} == {key: captured[key] for key in keys}
-    assert captured["contentHash"] == raw_archive.content_hash(str(captured["content"]).encode())
-    assert (captured["title"], captured["publisher"], captured["quote"]) == (tool, publisher, "")
-    assert {key: persisted[key] for key in ("title", "url", "publisher", "publishedAt", "capturedAt", "quote")} == {
+    assert {key: captured[key] for key in ("url", "captureKind", "representation", "quote", "originalUrl")} == {
+        "url": url,
+        "captureKind": "original",
+        "representation": "html",
+        "quote": "ACME | 2026-01-02 | 5",
+        "originalUrl": url,
+    }
+    assert captured["contentHash"] == raw_archive.content_hash(_OFFICIAL_HTML)
+    assert captured["highlightUrl"] == f"{url}#:~:text=ACME,5"
+    assert (captured["title"], captured["publisher"]) == (tool, publisher)
+    assert {key: persisted[key] for key in ("title", "publisher", "publishedAt", "capturedAt")} == {
         "title": "Record",
-        "url": "https://example.com/record",
         "publisher": publisher,
         "publishedAt": "2026-01-01",
         "capturedAt": "2026-01-02",
-        "quote": "ACME 2026-01-02",
     }
     with pytest.raises(ValueError):
         read_source_document("evidence:ev-swap", data_root=tmp_path, repo=repo)
@@ -865,7 +937,8 @@ def test_web_evidence_reads_pinned_provider_content(tmp_path: Path) -> None:
         "toolName": "search_web",
         "toolResultId": "tr-1",
         "toolArgs": arguments,
-        "publicUrl": "https://example.com/a",
+        "originalUrl": "https://example.com/a",
+        "linkStatus": "stockbot_render",
     }
 
 
@@ -884,190 +957,216 @@ def _record_evidence(kind: str, tool: str, row: Mapping[str, object], **extra: o
     }
 
 
-def test_finra_record_reports_how_it_was_fetched(tmp_path: Path) -> None:
-    """FINRA: dataset API endpoint, echoed query as arguments, no public page."""
-    row = {"symbolCode": "ACME", "settlementDate": "2026-01-02", "currentShortPositionQuantity": 5}
+def _record_repo(kind: str, tool: str, row: Mapping[str, object], payload: object, **extra: object) -> _Repo:
+    return _Repo(
+        {"ev-rec": _record_evidence(kind, tool, row, **extra)},
+        {"tr-rec": {"tool_name": tool, "session_id": "s", "result": payload}},
+    )
+
+
+_SHVOL_URL = "https://cdn.finra.org/equity/regsho/daily/CNMSshvol20260102.txt"
+_SHVOL = b"Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market\n20260102|ACME|5|0|9|B,Q,N\n"
+
+
+def test_finra_record_reports_how_it_was_fetched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """FINRA: the cited row's daily file is the original. Plain text never highlights (case 2)."""
+    line = "20260102|ACME|5|0|9|B,Q,N"
+    calls = _official(monkeypatch, _page(_SHVOL_URL, _SHVOL, "text", line), finra=True)
+    row = {"securitiesInformationProcessorSymbolIdentifier": "ACME", "tradeReportDate": "2026-01-02"}
     payload = {
-        "dataset_id": "otcMarket/consolidatedShortInterest",
+        "dataset_id": "otcMarket/regShoDaily",
         "query": {"ticker": "ACME", "start_date": "2026-01-01", "limit": 100},
         "records": [row],
     }
-    repo = _Repo(
-        {
-            "ev-rec": _record_evidence(
-                "finra_record",
-                "get_short_interest",
-                row,
-                dataset="otcMarket/consolidatedShortInterest",
-                known_at="2026-01-02",
-            )
-        },
-        {"tr-rec": {"tool_name": "get_short_interest", "session_id": "s", "result": payload}},
+    repo = _record_repo(
+        "finra_record", "get_reg_sho_volume", row, payload, dataset="otcMarket/regShoDaily", known_at="2026-01-02"
     )
     document = read_source_document("evidence:ev-rec", data_root=tmp_path, repo=repo)
-    how = ("toolName", "toolResultId", "dataset", "knownAt", "toolArgs", "upstreamUrl")
+    assert calls == [("otcMarket/regShoDaily", row, payload)]
+    how = ("toolName", "toolResultId", "dataset", "knownAt", "toolArgs")
     assert {key: document[key] for key in how} == {
-        "toolName": "get_short_interest",
+        "toolName": "get_reg_sho_volume",
         "toolResultId": "tr-rec",
-        "dataset": "otcMarket/consolidatedShortInterest",
+        "dataset": "otcMarket/regShoDaily",
         "knownAt": "2026-01-02",
         "toolArgs": {"ticker": "ACME", "start_date": "2026-01-01", "limit": 100},
-        "upstreamUrl": "https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest",
     }
-    assert "publicUrl" not in document
-    assert json.loads(str(document["quote"])) == row
+    start = _SHVOL.decode().index(line)
+    assert {key: document[key] for key in ("url", "captureKind", "representation", "content", "quote")} == {
+        "url": _SHVOL_URL,
+        "captureKind": "original",
+        "representation": "text",
+        "content": _SHVOL.decode(),
+        "quote": line,
+    }
+    assert document["location"] == {
+        "basis": "rendered",
+        "offset": start,
+        "end": start + len(line),
+        "prefix": _SHVOL.decode()[:start],
+        "suffix": "\n",
+    }
+    assert (document["originalUrl"], document["linkStatus"]) == (_SHVOL_URL, "stockbot_render")
+    assert not {"highlightUrl", "upstreamUrl", "publicUrl", "matchingText"} & set(document)
 
 
-_SUBMISSIONS_42 = "https://data.sec.gov/submissions/CIK0000000042.json"
+_TEN_Q = "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000042/nvda-20260426.htm"
 
 
 @pytest.mark.parametrize(
-    ("row", "public", "upstream"),
+    ("body", "quoted", "anchor", "fragment"),
     [
-        (
-            {"accession_no": ACC, "form": "10-Q", "filer_cik": 42, "source": "https://www.sec.gov/home"},
-            "https://www.sec.gov/home",
-            _SUBMISSIONS_42,
+        pytest.param(
+            "<table><tr><td>Revenue</td><td>81,615</td><td>60,922</td></tr>"
+            "<tr><td>Cost of revenue</td><td>81,615</td><td>17,394</td></tr></table>",
+            "Revenue | 81,615",
+            "f-30",
+            # "Revenue" also starts "revenue" in the next row, so the next cell becomes the suffix.
+            "#f-30:~:text=Revenue,81%2C615,-60%2C922",
+            id="table-row-cells-with-suffix",
         ),
-        (
-            {"accession_no": ACC, "form": "10-Q", "filer_cik": 42},
-            "https://www.sec.gov/Archives/edgar/data/42/000000000026000042/",
-            _SUBMISSIONS_42,
+        pytest.param(
+            "<p>Item 1</p><p>Net income</p><p>Item 2</p><p>Net income</p>",
+            "Net income",
+            "",
+            "#:~:text=Item%201-,Net%20income",
+            id="prefix-block",
         ),
-        ({"form": "10-Q", "filer_cik": "../x"}, "https://www.sec.gov/declared", None),
+        pytest.param("<p>Total</p><p>Total</p><p>Total</p>", "Total", "", None, id="ambiguous"),
+        pytest.param("<p>Revenues grew</p>", "Revenue", "", None, id="mid-word"),
+        pytest.param("<p>Revenue</p>", "Absent quote", "", None, id="quote-not-found"),
     ],
 )
-def test_sec_record_reports_how_it_was_fetched(
-    row: dict[str, object], public: str, upstream: str | None, tmp_path: Path
+def test_sec_record_link_status_follows_verified_directive(
+    body: str, quoted: str, anchor: str, fragment: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """SEC: persisted arguments; the row's own sec.gov page, else the built filing index, else the declared URI.
+    """Case 1 only when the directive matches the quote exactly once in our rendering; else case 2."""
+    page = f"<html><body>{body}</body></html>".encode()
+    calls = _official(monkeypatch, _page(_TEN_Q, page, "html", quoted, anchor), finra=False)
+    row = {"concept": "Revenues", "value": 81615, "accession": ACC}
+    payload = {"cik": 1045810, "matching_concepts": [row]}
+    document = read_source_document(
+        "evidence:ev-rec", data_root=tmp_path, repo=_record_repo("sec_record", "get_xbrl_facts", row, payload)
+    )
+    assert calls == [("get_xbrl_facts", row, payload)]
+    assert (document["captureKind"], document["representation"], document["content"]) == (
+        "original",
+        "html",
+        page.decode(),
+    )
+    assert document["originalUrl"] == _TEN_Q
+    if fragment is None:
+        assert document["linkStatus"] == "stockbot_render"
+        assert "highlightUrl" not in document
+    else:
+        assert document["linkStatus"] == "highlighted_original"
+        assert document["highlightUrl"] == _TEN_Q + fragment
+        matching = str(document["matchingText"])
+        assert _sources._fragment_ranges(matching, fragment) == [
+            (matching.index(quoted), matching.index(quoted) + len(quoted))
+        ]
 
-    The upstream API is the submissions JSON the listing came from, never the filing's web page.
-    """
-    payload = {"subject": "ACME", "filings": [row]}
+
+def test_sec_record_reports_how_it_was_fetched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SEC: persisted arguments, else the subject echo. A PDF original never highlights (case 2)."""
+    pdf = b"%PDF-1.4\nofficial filing\n%%EOF\n"
+    url = f"https://www.sec.gov/Archives/edgar/data/42/000000000026000042/{ACC}.pdf"
+    _official(monkeypatch, _page(url, pdf, "pdf", "official filing"), finra=False)
+    row = {"accession_no": ACC, "form": "10-Q", "filer_cik": 42}
     tool_result: dict[str, object] = {
         "tool_name": "list_sec_filings",
         "session_id": "s",
-        "result": payload,
+        "result": {"subject": "ACME", "filings": [row]},
         "arguments": {"identifier": "ACME", "form": "10-Q"},
     }
-    evidence = _record_evidence(
-        "sec_record", "list_sec_filings", row, dataset="ACME", source_uri="https://www.sec.gov/declared"
-    )
+    evidence = _record_evidence("sec_record", "list_sec_filings", row, source_uri="https://data.sec.gov/x.json")
     repo = _Repo({"ev-rec": evidence}, {"tr-rec": tool_result})
     document = read_source_document("evidence:ev-rec", data_root=tmp_path, repo=repo)
     assert document["toolArgs"] == {"identifier": "ACME", "form": "10-Q"}
-    assert document["publicUrl"] == public
-    assert document.get("upstreamUrl") == upstream
+    assert {key: document.get(key) for key in ("url", "representation", "pdfUrl", "originalUrl", "linkStatus")} == {
+        "url": url,
+        "representation": "pdf",
+        "pdfUrl": "/api/research/sources/evidence%3Aev-rec/pdf",
+        "originalUrl": url,
+        "linkStatus": "stockbot_render",
+    }
+    assert read_source_pdf("evidence:ev-rec", data_root=tmp_path, repo=repo) == pdf
     del tool_result["arguments"]  # A row persisted before call arguments: the subject echo stands in.
     assert read_source_document("evidence:ev-rec", data_root=tmp_path, repo=repo)["toolArgs"] == {"subject": "ACME"}
 
 
-def _sec_upstream(tmp_path: Path, tool: str, row: Mapping[str, object], payload: Mapping[str, object]) -> object:
-    evidence = _record_evidence("sec_record", tool, row, source_uri="https://www.sec.gov/declared")
-    repo = _Repo({"ev-rec": evidence}, {"tr-rec": {"tool_name": tool, "session_id": "s", "result": payload}})
-    return read_source_document("evidence:ev-rec", data_root=tmp_path, repo=repo).get("upstreamUrl")
-
-
-_EFTS_HIT = {"attempt_id": "s1-p2", "query": "going concern", "accession_no": ACC, "filer_cik": 7}
-_EFTS_ATTEMPTS = [
-    {"attempt_id": "s1-p1", "backend": "efts", "query": "other", "filters": {"page": 1}},
-    {
-        "attempt_id": "s1-p2",
-        "backend": "efts",
-        "query": "going concern",
-        "filters": {"forms": ["10-K", "10-Q"], "start_date": "2025-01-01", "end_date": "2025-12-31", "cik": "42"},
-    },
-]
+def test_record_without_official_page_logs_full_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Case 3: no official page. Only the Stockbot view remains, and an ERROR names every input."""
+    calls = _official(monkeypatch, None, finra=False)
+    row = {"source_accessions": [ACC], "issuer": "Acme"}
+    payload = {"subject": "ACME", "events": [row]}
+    tool_result = {"tool_name": "get_material_events", "session_id": "s", "result": payload, "arguments": {"x": 1}}
+    repo = _Repo(
+        {"ev-rec": _record_evidence("sec_record", "get_material_events", row, source_uri="https://data.sec.gov/a")},
+        {"tr-rec": tool_result},
+    )
+    with caplog.at_level("ERROR", logger="app.research.sources"):
+        document = read_source_document("evidence:ev-rec", data_root=tmp_path, repo=repo)
+    assert calls == [("get_material_events", row, payload)]
+    assert document["linkStatus"] == "missing"
+    assert not {"originalUrl", "highlightUrl"} & set(document)
+    assert (document["captureKind"], document["representation"], document["quote"]) == ("structured_record", "text", "")
+    assert json.loads(str(document["content"])) == row
+    with pytest.raises(FileNotFoundError):
+        read_source_pdf("evidence:ev-rec", data_root=tmp_path, repo=repo)
+    [record] = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert record.getMessage() == (
+        "source official page missing: source_id=evidence:ev-rec evidence_id=ev-rec kind=sec_record "
+        f'tool=get_material_events tool_args={{"x": 1}} row={json.dumps(row, sort_keys=True)} '
+        "reason=resolver found no official page for the cited record"
+    )
 
 
 @pytest.mark.parametrize(
-    ("tool", "row", "payload", "upstream"),
+    "change",
     [
-        pytest.param(
-            "get_xbrl_facts",
-            {"concept": "Revenues", "value": 5, "accession": ACC},
-            {"cik": 42, "matching_concepts": [{"concept": "Revenues", "value": 5, "accession": ACC}]},
-            "https://data.sec.gov/api/xbrl/companyfacts/CIK0000000042.json",
-            id="companyfacts",
-        ),
-        pytest.param(
-            "get_fundamentals",
-            {"metric": "shares_outstanding", "shares_outstanding": 9},
-            # The store path persists no `cik`; its companyfacts source_url names the company.
-            {
-                "metric": "shares_outstanding",
-                "shares_outstanding": 9,
-                "source_url": "https://data.sec.gov/api/xbrl/companyfacts/CIK0000000042.json",
-            },
-            "https://data.sec.gov/api/xbrl/companyfacts/CIK0000000042.json",
-            id="companyfacts-from-source-url",
-        ),
-        pytest.param(
-            "get_fundamentals",
-            {"name": "Acme", "cik": 42},
-            {"metric": "overview", "name": "Acme", "cik": 42},
-            _SUBMISSIONS_42,
-            id="submissions-overview",
-        ),
-        pytest.param(
-            "search_sec_filings",
-            _EFTS_HIT,
-            {"hits": [_EFTS_HIT], "attempts": _EFTS_ATTEMPTS},
-            "https://efts.sec.gov/LATEST/search-index?q=going+concern&forms=10-K%2C10-Q"
-            "&dateRange=custom&startdt=2025-01-01&enddt=2025-12-31&ciks=0000000042",
-            id="efts",
-        ),
-        pytest.param(
-            "get_insider_activity",
-            {"accession_no": ACC, "issuer_cik": 42, "insider_cik": 7, "source": "https://www.sec.gov/home"},
-            {"transactions": []},
-            f"https://www.sec.gov/Archives/edgar/data/42/000000000026000042/{ACC}.txt",
-            id="archive",
-        ),
+        {"url": "https://data.sec.gov/submissions/CIK0000000042.json"},
+        {"url": "https://efts.sec.gov/LATEST/search-index?q=x"},
+        {"url": "https://api.finra.org/data/group/otcMarket/name/regShoDaily"},
+        {"url": "http://www.sec.gov/x.htm"},
+        {"url": "https://www.sec.gov/x.htm#:~:text=x"},
+        {"url": ""},
+        {"sha256": "0" * 64},
+        {"media": "json"},
+        {"payload": "not bytes"},
+        {"quote": None},
     ],
 )
-def test_sec_record_upstream_is_the_api_the_tool_called(
-    tool: str, row: dict[str, object], payload: dict[str, object], upstream: str, tmp_path: Path
+def test_resolver_page_outside_contract_is_rejected(
+    change: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each SEC endpoint family builds its API URL from the row or payload CIK, never the filing web page."""
-    assert _sec_upstream(tmp_path, tool, row, {"subject": "ACME", **payload}) == upstream
+    """No API host, plain-http, fragment, or unhashed page ever becomes an original link."""
+    _official(monkeypatch, {**_page(_TEN_Q, b"<p>x</p>", "html", "x"), **change}, finra=False)
+    repo = _record_repo("sec_record", "get_xbrl_facts", {"concept": "x"}, {"cik": 42})
+    with pytest.raises(ValueError, match="Official source page is invalid"):
+        read_source_document("evidence:ev-rec", data_root=tmp_path, repo=repo)
 
 
-@pytest.mark.parametrize(
-    ("tool", "row", "payload"),
-    [
-        # 8-K event rows carry no CIK and no accession_no.
-        pytest.param("get_material_events", {"source_accessions": [ACC], "issuer": "Acme"}, {}, id="no-cik"),
-        # Rows mix SEC filings with Yahoo prices: no single endpoint.
-        pytest.param("get_valuation_metrics", {"ticker": "ACME", "cik": 42}, {"cik": 42}, id="mixed-endpoints"),
-        # The balance sheet comes from an unnamed 10-K's XBRL, not the companyfacts URL it reports.
-        pytest.param(
-            "get_fundamentals",
-            {"metric": "balance_sheet"},
-            {"metric": "balance_sheet", "cik": 42, "source_url": "https://www.sec.gov/home"},
-            id="unverified-metric",
-        ),
-        pytest.param("get_insider_activity", {"accession_no": "bad", "issuer_cik": 42}, {}, id="bad-accession"),
-        pytest.param(
-            "search_sec_filings",
-            {**_EFTS_HIT, "attempt_id": "s1-p9"},
-            {"attempts": _EFTS_ATTEMPTS},
-            id="unknown-attempt",
-        ),
-        pytest.param(
-            "search_sec_filings",
-            _EFTS_HIT,
-            {"attempts": [{**_EFTS_ATTEMPTS[1], "filters": {"ticker": "ACME"}}]},
-            id="ticker-scoped-attempt",
-        ),
-    ],
-)
-def test_sec_record_upstream_omitted_when_unverified(
-    tool: str, row: dict[str, object], payload: dict[str, object], tmp_path: Path
-) -> None:
-    """No verified endpoint or no CIK leaves the upstream API unrecorded; the filing page never stands in."""
-    assert _sec_upstream(tmp_path, tool, row, {"subject": "ACME", **payload}) is None
+def test_finra_official_page_is_fetched_once_on_first_view(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The first view fetches the official file and archives it. Later views read the archive only."""
+    from unittest.mock import MagicMock
+
+    url = "https://cdn.finra.org/equity/regsho/daily/FNQCshvol20261015.txt"
+    body = b"Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market\n20261015|NVDA|274457.043010|1022|934921.209763|B\n2\n"
+    get = MagicMock(return_value=MagicMock(content=body))
+    monkeypatch.setattr("app.finra_client.requests.get", get)
+    row = {"securitiesInformationProcessorSymbolIdentifier": "NVDA", "tradeReportDate": "2026-10-15", "marketCode": "B"}
+    repo = _record_repo("finra_record", "get_reg_sho_volume", row, {}, dataset="otcMarket/regShoDaily")
+    first = read_source_document("evidence:ev-rec", data_root=tmp_path, repo=repo)
+    second = read_source_document("evidence:ev-rec", data_root=tmp_path, repo=repo)
+    assert get.call_count == 1
+    assert get.call_args.args[0] == url
+    assert first == second
+    assert (first["originalUrl"], first["linkStatus"], first["content"]) == (url, "stockbot_render", body.decode())
+    assert first["quote"] == "20261015|NVDA|274457.043010|1022|934921.209763|B"
+    assert first["contentHash"] == raw_archive.content_hash(body)
 
 
 @pytest.mark.parametrize(
@@ -1196,3 +1295,25 @@ def test_reader_rejects_store_missing_tool_result_read(tmp_path: Path, monkeypat
 
     with pytest.raises(KeyError):
         read_source_document("evidence:ev-half", data_root=tmp_path, repo=_OnlyEvidence())
+
+
+_CELLS = st.sampled_from(["Revenue", "revenue", "81,615", "Net income", "a-b", "x&y", "Item 1", "Total", "5"])
+
+
+@settings(max_examples=200, derandomize=True, deadline=None)
+@given(st.lists(st.lists(_CELLS, min_size=1, max_size=3), min_size=1, max_size=6), st.data())
+def test_prop_text_directive_matches_exactly_once(lines: list[list[str]], data: st.DataObject) -> None:
+    """Any directive the builder returns matches exactly the quoted blocks once, with one block per term."""
+    rendered = "\n".join(" | ".join(cells) for cells in lines)
+    spans = [(match.start(), match.end()) for match in re.finditer(r"[^\n|]+", rendered)]
+    spans = [(start + (rendered[start] == " "), end - (rendered[end - 1] == " ")) for start, end in spans]
+    first = data.draw(st.integers(0, len(spans) - 1))
+    last = data.draw(st.integers(first, len(spans) - 1))
+    start, end = spans[first][0], spans[last][1]
+    fragment = _sources._text_fragment(rendered, start, end, data.draw(st.sampled_from(["", "f-30"])))
+    if fragment is None:
+        return
+    assert _sources._fragment_ranges(rendered, fragment) == [(start, end)]
+    terms = fragment.partition(":~:text=")[2].split(",")
+    assert len(terms) <= 4
+    assert all("\n" not in unquote(term) and " | " not in unquote(term) for term in terms)
