@@ -2109,7 +2109,9 @@ class _LiveRun:
         return fid
 
     def _freeze_evidence_text(self, session_id: str, ev_ids: Sequence[str]) -> str:
-        """One shared serialization of the exact freeze records for all committee members."""
+        """One shared serialization of the exact freeze records (canonical datapoint included) for all members."""
+        from app.research.evidence import datapoint_descriptor
+
         by_id = {e.evidence_id: e for e in self.ledger.list_session(session_id)}
         lines: list[str] = []
         for eid in ev_ids:
@@ -2124,6 +2126,9 @@ class _LiveRun:
             lines.append(f"claim_kind: {rec.claim_kind}")
             lines.append(f"claim: {rec.claim_text}")
             lines.append(f"content: {content}")
+            point = datapoint_descriptor(rec)
+            if point is not None:
+                lines.append(f"datapoint: {json.dumps(point, sort_keys=True)}")
         return "\n".join(lines).replace("\x00", "")  # never hand NUL bytes to a prompt
 
     def _create_freeze(self, session_id: str) -> str:
@@ -2385,7 +2390,6 @@ class _LiveRun:
     def _store_final(self, session_id: str, freeze_id: str, answer: str, claims: Sequence[object]) -> None:
         """Require verified ledger proof for every claim, persist the synthesis answer, close as completed."""
         from app.research import service as _svc
-        from app.research.agents import DATAPOINT_FIELDS
         from app.research.agents import GroundedClaim as _GC
 
         grounded = [claim for claim in claims if isinstance(claim, _GC)]
@@ -2395,7 +2399,7 @@ class _LiveRun:
                 "text": claim.text,
                 "claim_type": claim.claim_type,
                 "evidence_ids": list(claim.evidence_ids),
-                **{key: getattr(claim, key) for key in DATAPOINT_FIELDS if getattr(claim, key) is not None},
+                "datapoint_ids": list(claim.datapoint_ids),
             }
             for claim in grounded
         ]

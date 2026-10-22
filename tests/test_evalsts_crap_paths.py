@@ -856,11 +856,11 @@ def test_model_guards():
 
 def test_committee_branches():
     stock, bull, bear = _trio()
-    stock.claims.append(GroundedClaim(text="shared", evidence_ids=["EV-1"]))
-    bull.claims.append(GroundedClaim(text="shared", evidence_ids=["EV-1"]))
-    bear.claims.append(GroundedClaim(text="shared", evidence_ids=["EV-1"]))
-    bull.claims.append(GroundedClaim(text="bull-only", evidence_ids=["EV-2"]))
-    bear.claims.append(GroundedClaim(text="bear-only", evidence_ids=["EV-3"]))
+    stock.claims.append(GroundedClaim(text="shared evidence suggests exposure", evidence_ids=["EV-1"]))
+    bull.claims.append(GroundedClaim(text="shared evidence suggests exposure", evidence_ids=["EV-1"]))
+    bear.claims.append(GroundedClaim(text="shared evidence suggests exposure", evidence_ids=["EV-1"]))
+    bull.claims.append(GroundedClaim(text="bull-only finding suggests growth", evidence_ids=["EV-2"]))
+    bear.claims.append(GroundedClaim(text="bear-only finding suggests risk", evidence_ids=["EV-3"]))
     bull.research_requests.append(
         ResearchRequest(
             question="q1",
@@ -900,12 +900,16 @@ def test_committee_branches():
 
 def test_final_branches():
     stock, bull, bear = _trio()
-    stock.claims.append(GroundedClaim(text="same", evidence_ids=["EV-1"]))
-    bull.claims.append(GroundedClaim(text="same", evidence_ids=["EV-2"]))
+    stock.claims.append(GroundedClaim(text="same evidence suggests growth", evidence_ids=["EV-1"]))
+    bull.claims.append(GroundedClaim(text="same evidence suggests growth", evidence_ids=["EV-2"]))
     stock.unknowns.append("terms undisclosed")
     bull.unknowns.append("terms undisclosed")
     bull.what_would_change.append("a new filing")
     bear.what_would_change.append("a new filing")
+    stock.claims.append(GroundedClaim(text="terms undisclosed", claim_type="unknown", evidence_ids=[]))
+    bull.claims.append(GroundedClaim(text="terms undisclosed", claim_type="unknown", evidence_ids=[]))
+    bull.claims.append(GroundedClaim(text="a new filing", claim_type="unknown", evidence_ids=[]))
+    bear.claims.append(GroundedClaim(text="a new filing", claim_type="unknown", evidence_ids=[]))
     disagreement = compute_disagreement(stock, bull, bear)
     final = synthesize_final(
         "q",
@@ -919,7 +923,8 @@ def test_final_branches():
         disagreement=disagreement,
     )
     assert final.claims[0].evidence_ids == ["EV-1", "EV-2"]
-    assert final.unknowns == ["terms undisclosed"] and final.what_would_change == ["a new filing"]
+    assert final.unknowns[:2] == ["terms undisclosed", "a new filing"] and final.what_would_change == ["a new filing"]
+    assert final.claims[-1].claim_type == "unknown" and not final.claims[-1].evidence_ids
     override = synthesize_final(
         "q",
         session_id="rs:t",
@@ -930,10 +935,10 @@ def test_final_branches():
         bull=bull,
         bear=bear,
         disagreement=disagreement,
-        model="same. Unsupported draft.",
+        model="same evidence suggests growth. same evidence suggests growth with no downside. Unsupported draft.",
     )
-    # The caller's answer passes the prose gate: only the claim-covered sentence survives.
-    assert override.answer == "same."
+    # The gate removes uncovered sentences, including an unsupported clause beside a claim.
+    assert override.answer == "same evidence suggests growth."
 
 
 def test_opt_telemetry_rejects_bad_int_type() -> None:

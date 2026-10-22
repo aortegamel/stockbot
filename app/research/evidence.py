@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -28,7 +29,11 @@ __all__ = [
     "EvidenceRejectedError",
     "ProofVerdict",
     "assumption_proof",
+    "calculation_datapoint",
     "calculation_proof",
+    "canonical_datapoint",
+    "cited_record",
+    "datapoint_descriptor",
     "discovery_only",
     "edgartools_version",
     "evidence_bundle_entry",
@@ -457,6 +462,9 @@ _PROOF_FIELDS: dict[str, tuple[str, ...]] = {
 }
 """Exact keys per proof kind (besides ``kind``); anything else fails closed."""
 
+_PROOF_OPTIONAL: dict[str, tuple[str, ...]] = {"calculation": ("datapoint",)}
+"""Optional keys per proof kind: a calculation row persisted before canonical datapoints lacks one."""
+
 
 def value_hash(value: str) -> str:
     """Canonical datapoint value hash (sha256 hex over the exact utf-8 text)."""
@@ -465,9 +473,9 @@ def value_hash(value: str) -> str:
 
 def _proof_field(key: str, raw: object, where: str) -> JSONValue:
     """One validated proof field; the shape is fixed per key."""
-    if key == "locator":
+    if key in ("locator", "datapoint"):
         if not isinstance(raw, Mapping) or not raw:
-            raise EvidenceIntegrityError(f"{where}: 'locator' must be a non-empty object")
+            raise EvidenceIntegrityError(f"{where}: {key!r} must be a non-empty object")
         return validate_json_mapping(dict(raw), where)
     if key == "inputProofIds":
         if not isinstance(raw, (list, tuple)) or not raw or any(not isinstance(i, str) or not i.strip() for i in raw):
@@ -492,10 +500,13 @@ def validate_proof(value: object, where: str = "<evidence>: 'proof'") -> dict[st
     fields = _PROOF_FIELDS.get(kind) if isinstance(kind, str) else None
     if fields is None:
         raise EvidenceIntegrityError(f"{where}: 'kind' must be one of {list(PROOF_KINDS)}, got {kind!r}")
-    if set(value) != {"kind", *fields}:
-        raise EvidenceIntegrityError(f"{where}: {kind} proof keys must be exactly {['kind', *fields]}")
+    optional = _PROOF_OPTIONAL.get(str(kind), ())
+    if not {"kind", *fields} <= set(value) <= {"kind", *fields, *optional}:
+        raise EvidenceIntegrityError(
+            f"{where}: {kind} proof keys must be exactly {['kind', *fields]} (+{list(optional)})"
+        )
     proof: dict[str, JSONValue] = {"kind": kind}
-    for key in fields:
+    for key in (*fields, *(key for key in optional if key in value)):
         proof[key] = _proof_field(key, value[key], where)
     return proof
 
@@ -518,39 +529,56 @@ def _proof_locator(provenance: Mapping[str, object]) -> dict[str, JSONValue] | N
     return validate_json_mapping({key: provenance.get(key) for key in keys}, "<proof>: 'locator'")
 
 
-def _value_in_passage(provenance: Mapping[str, object], source_bytes: bytes, value: str) -> bool:
-    """Value occurs verbatim in the kernel-located passage and only that passage.
+_RECORD_LISTS = (
+    "filings",
+    "transactions",
+    "quarterly_eps",
+    "facts",
+    "matching_concepts",
+    "rows",
+    "records",
+    "documents",
+    "events",
+)
+"""Row lists of a persisted structured tool result (the same keys the replay gate cites)."""
 
-    SEC rows check their exact passage, web rows their excerpt, FINRA/SEC-record
-    rows their cited record JSON. Falling back to the whole archived payload
-    would let one row in a multi-row result prove another row's value, so the
-    fallback is gone: a value outside the cited record fails as conflicted.
-    """
-    kind = provenance.get("kind")
-    if kind == "sec_source":
-        texts: tuple[object, ...] = (provenance.get("passage"),)
-    elif kind == "web_source":
-        texts = (provenance.get("excerpt"),)
-    elif kind in ("finra_record", "sec_record"):
-        texts = (_canonical_record_text(provenance.get("record_identity")),)
-    else:
-        texts = (source_bytes.decode("utf-8", "replace"),)
-    return any(isinstance(text, str) and value in text for text in texts)
-
-
-def _canonical_record_text(identity: object) -> str | None:
-    """Canonical JSON of the cited record identity (sorted keys), or None when not a record mapping."""
-    import json as _json
-
-    if not isinstance(identity, str):
-        return None
-    try:
-        parsed = _json.loads(identity)
-    except ValueError:
-        return identity
-    if not isinstance(parsed, Mapping):
-        return None
-    return _json.dumps(dict(parsed), sort_keys=True, default=str)
+_ENTITY_KEYS = (
+    "symbol",
+    "symbolCode",
+    "securitiesInformationProcessorSymbolIdentifier",
+    "ticker",
+    "issueSymbolIdentifier",
+    "issuerSymbol",
+    "entity",
+    "entity_id",
+    "entity_name",
+    "issuer",
+    "issuer_cik",
+    "subject_cik",
+    "cik",
+    "company",
+    "subject",
+)
+_PERIOD_KEYS = (
+    "period",
+    "fiscal_period",
+    "frame",
+    "period_end",
+    "end",
+    "settlementDate",
+    "settlement_date",
+    "tradeReportDate",
+    "trade_date",
+    "weekStartDate",
+    "date",
+    "as_of_date",
+    "report_date",
+    "period_of_report",
+)
+_UNIT_KEYS = ("unit", "units", "uom", "currency")
+_CONCEPT_KEYS = ("concept", "tag")
+_VALUE_KEYS = ("value", "val")
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?;])\s+|\n")
 
 
 def _datapoint_text(value: object, key: str) -> str:
@@ -560,43 +588,360 @@ def _datapoint_text(value: object, key: str) -> str:
     return text
 
 
-def observation_proof(*, provenance: Mapping[str, object], source_bytes: bytes, value: object) -> dict[str, JSONValue]:
-    """Observation proof: the archived source bytes, the provenance locator, and the value hash.
+def _scalar_text(value: object) -> str | None:
+    """Exact text of one JSON scalar field: a string as stored, a number as JSON; bool/null state no value."""
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return json.dumps(value)
+    return None
 
-    Refuses an ambiguous source identity, absent bytes, and a value that is not
-    verbatim in the located passage. Store the stripped ``value`` on the row.
+
+def _record_payload(result: Mapping[str, object]) -> Mapping[str, object]:
+    payload = result.get("result")
+    return payload if isinstance(payload, Mapping) else result
+
+
+def _record_text(row: Mapping[str, object]) -> str:
+    return json.dumps(dict(row), sort_keys=True, default=str)
+
+
+def cited_record(result: Mapping[str, object], locator: object) -> Mapping[str, object] | None:
+    """Find the persisted row with exactly the cited canonical JSON, else return None.
+
+    A locator must contain the complete row or the complete flat payload.
+    JSON key order and formatting do not affect equality.
+    String content remains exact.
     """
-    prov = validate_provenance(provenance, "<proof>: 'provenance'")
-    text = _datapoint_text(value, "value")
-    locator = _proof_locator(prov)
-    if locator is None:
-        raise ValueError("observation_proof: provenance does not identify one exact source revision")
-    if not isinstance(source_bytes, bytes) or not source_bytes:
-        raise ValueError("observation_proof: source_bytes must be the non-empty archived bytes")
-    if not _value_in_passage(prov, source_bytes, text):
-        raise ValueError(f"observation_proof: value {text!r} is not verbatim in the located source passage")
+    text = locator.strip() if isinstance(locator, str) else ""
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    text = _record_text(parsed)
+    payload = _record_payload(result)
+    rows: list[Mapping[str, object]] = []
+    for key in _RECORD_LISTS:
+        listed = payload.get(key)
+        rows.extend(row for row in (listed if isinstance(listed, list) else []) if isinstance(row, Mapping))
+    metrics = payload.get("metrics")
+    if isinstance(metrics, Mapping):
+        rows.append(metrics)
+    hits = [row for row in rows if text == _record_text(row)]
+    if hits:
+        return hits[0]
+    return payload if text == _record_text(payload) else None
+
+
+def _norm_key(text: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", text.casefold())
+
+
+def _record_field(row: Mapping[str, object], metric: str) -> tuple[str, str]:
+    """(field key, source metric spelling) the metric names in the row; none or several fail closed."""
+    want = _norm_key(metric)
+    if not want:
+        raise ValueError(f"metric {metric!r} names no field")
+    reserved = {_norm_key(key) for key in (*_ENTITY_KEYS, *_PERIOD_KEYS, *_UNIT_KEYS, *_CONCEPT_KEYS, *_VALUE_KEYS)}
+    hits = [
+        (key, key)
+        for key, value in row.items()
+        if _norm_key(key) == want and _norm_key(key) not in reserved and _scalar_text(value) is not None
+    ]
+    for concept_key in _CONCEPT_KEYS:
+        concept = row.get(concept_key)
+        if isinstance(concept, str) and want in (_norm_key(concept), _norm_key(concept.rsplit(":", 1)[-1])):
+            hits.extend((value_key, concept) for value_key in _VALUE_KEYS if value_key in row)
+    if len(hits) != 1:
+        reason = "is ambiguous in" if hits else "names no field of"
+        raise ValueError(f"metric {metric!r} {reason} the cited record")
+    return hits[0]
+
+
+def _record_label(
+    row: Mapping[str, object], payload: Mapping[str, object], keys: tuple[str, ...], claimed: str | None, label: str
+) -> str | None:
+    """Source spelling of one identity field (row first, else payload); a disagreeing claim fails closed.
+
+    Entity and period are required. A unit absent from the source stays None,
+    and a claimed unit the source never states fails closed.
+    """
+    for source in (row, payload):
+        values = [text for key in keys if (text := _scalar_text(source.get(key))) is not None]
+        if not values:
+            continue
+        if claimed is None:
+            if label != "unit" or len(set(values)) > 1:
+                raise ValueError(f"datapoint {label} is required")
+            return values[0]
+        for text in values:
+            if text.casefold() == claimed.casefold():
+                return text
+        raise ValueError(f"{label} {claimed!r} is not the cited record's {label}")
+    if label == "unit" and claimed is None:
+        return None
+    raise ValueError(f"the cited record states no {label}")
+
+
+def _record_datapoint(
+    provenance: Mapping[str, object], source_bytes: bytes, claimed: Mapping[str, str | None]
+) -> dict[str, JSONValue]:
+    """Descriptor body of one structured-record datapoint: the exact field of the one cited row."""
+    try:
+        result = json.loads(source_bytes)
+    except ValueError:
+        raise ValueError("archived tool result is not JSON") from None
+    if not isinstance(result, Mapping):
+        raise ValueError("archived tool result is not a JSON object")  # noqa: TRY004 - proof builders raise ValueError
+    payload = _record_payload(result)
+    row = cited_record(result, provenance.get("record_identity"))
+    if row is None:
+        raise ValueError("the cited record is absent or ambiguous in the persisted result")
+    field_key, metric = _record_field(row, str(claimed["metric"]))
+    value = _scalar_text(row.get(field_key))
+    if value is None or value != claimed["value"]:
+        raise ValueError(f"value {claimed['value']!r} is not the exact {field_key!r} field value")
     return {
-        "kind": "observation",
-        "sourceId": f"sha256:{sha256(source_bytes).hexdigest()}",
-        "locator": locator,
-        "valueHash": value_hash(text),
+        "metric": metric,
+        "field": field_key,
+        "value": value,
+        "entity": _record_label(row, payload, _ENTITY_KEYS, claimed["entity"], "entity"),
+        "period": _record_label(row, payload, _PERIOD_KEYS, claimed["period"], "period"),
+        "unit": _record_label(row, payload, _UNIT_KEYS, claimed["unit"], "unit"),
+        "statement": json.dumps(dict(row), sort_keys=True, default=str),
     }
 
 
-def calculation_proof(
-    *, formula_id: object, formula_version: object, input_proof_ids: object, value: object
+def _phrase(text: str) -> re.Pattern[str]:
+    """Case-insensitive whole-phrase pattern; whitespace runs match any whitespace.
+
+    A word boundary applies only at an alphanumeric edge, so ``%`` still matches in ``4.2%``.
+    """
+    body = r"\s+".join(re.escape(part) for part in text.split())
+    head = r"(?<![0-9A-Za-z])" if text.strip()[:1].isalnum() else ""
+    tail = r"(?![0-9A-Za-z])" if text.strip()[-1:].isalnum() else ""
+    return re.compile(f"{head}{body}{tail}", re.IGNORECASE)
+
+
+def _passage_label(passage: str, claimed: str | None, label: str) -> str | None:
+    """Source spelling of an entity/period/unit the labeled passage states; absent fails closed."""
+    if claimed is None:
+        if label == "unit":
+            return None
+        raise ValueError(f"datapoint {label} is required")
+    found = _phrase(claimed).search(passage)
+    if found is None:
+        raise ValueError(f"{label} {claimed!r} is not stated in the located passage")
+    return found.group(0)
+
+
+def _passage_datapoint(provenance: Mapping[str, object], claimed: Mapping[str, str | None]) -> dict[str, JSONValue]:
+    """Bind one metric, value and identity within one sentence of a located passage.
+
+    Reject additional metrics, values and identity from other sentences.
+    """
+    field_key = "passage" if provenance.get("kind") == "sec_source" else "excerpt"
+    passage = provenance.get(field_key)
+    if not isinstance(passage, str) or not passage.strip():
+        raise ValueError(f"the located {field_key} is empty")
+    value = str(claimed["value"])
+    hits = list(re.finditer(rf"(?<![0-9A-Za-z.,]){re.escape(value)}(?![0-9A-Za-z]|[.,][0-9])", passage))
+    if len(hits) != 1:
+        reason = "appears more than once in" if hits else "is not a whole token of"
+        raise ValueError(f"value {value!r} {reason} the located {field_key}")
+    start, end = hits[0].span()
+    sentence_start = max((m.end() for m in _SENTENCE_BREAK.finditer(passage, 0, start)), default=0)
+    after = _SENTENCE_BREAK.search(passage, end)
+    statement = passage[sentence_start : after.start() if after else len(passage)].strip()
+    entity = _passage_label(statement, claimed["entity"], "entity")
+    period = _passage_label(statement, claimed["period"], "period")
+    unit = _passage_label(statement, claimed["unit"], "unit")
+    labels = list(_phrase(str(claimed["metric"])).finditer(passage, sentence_start, start))
+    if not labels:
+        raise ValueError(f"metric {claimed['metric']!r} does not label the value's source statement")
+    between = passage[labels[-1].end() : start]
+    for stated in (entity, period, unit):
+        between = _phrase(stated).sub(" ", between) if stated else between
+    if re.search(r"[0-9]", between):
+        raise ValueError(f"metric {claimed['metric']!r} labels another number before value {value!r}")
+    remainder = statement
+    for selected in (str(claimed["metric"]), value, entity, period, unit):
+        remainder = _phrase(selected).sub(" ", remainder) if selected else remainder
+    connectors = {"a", "an", "the", "of", "in", "for", "at", "on", "as", "is", "are", "was", "were", "s"}
+    if set(re.findall(r"[0-9A-Za-z]+", remainder.casefold())) - connectors:
+        raise ValueError("the source statement contains an unrelated metric or value")
+    return {
+        "metric": labels[-1].group(0),
+        "field": field_key,
+        "value": value,
+        "entity": entity,
+        "period": period,
+        "unit": unit,
+        "statement": statement,
+    }
+
+
+def _datapoint_id(anchor: Mapping[str, object]) -> str:
+    """Deterministic datapoint id: sha256 over the canonical JSON of its source anchor (never model prose)."""
+    body = json.dumps(anchor, sort_keys=True, separators=(",", ":"), default=str)
+    return f"dp:{sha256(body.encode('utf-8')).hexdigest()}"
+
+
+def canonical_datapoint(
+    *,
+    provenance: Mapping[str, object],
+    source_bytes: bytes,
+    metric: object,
+    value: object,
+    entity: object,
+    period: object,
+    unit: object = None,
 ) -> dict[str, JSONValue]:
-    """Calculation proof: formula id + version over input evidence ids (formula argument order)."""
-    return validate_proof(
-        {
-            "kind": "calculation",
-            "formulaId": _datapoint_text(formula_id, "formula_id"),
-            "formulaVersion": _datapoint_text(formula_version, "formula_version"),
-            "inputProofIds": list(input_proof_ids) if isinstance(input_proof_ids, (list, tuple)) else input_proof_ids,
-            "valueHash": value_hash(_datapoint_text(value, "value")),
-        },
-        "<proof>",
+    """Kernel-built canonical datapoint descriptor of one observation; ValueError when the source refuses it.
+
+    The caller's metric/value/entity/period/unit only select. Every descriptor
+    field is read off the source: a structured record's exact field (record rows),
+    or a labeled passage sentence (SEC passages, web excerpts). The ``id`` hashes
+    the source revision, the locator, and the descriptor body.
+    """
+    prov = validate_provenance(provenance, "<proof>: 'provenance'")
+    locator = _proof_locator(prov)
+    if locator is None:
+        raise ValueError("provenance does not identify one exact source revision")
+    if not isinstance(source_bytes, bytes) or not source_bytes:
+        raise ValueError("source_bytes must be the non-empty archived bytes")
+    claimed: dict[str, str | None] = {
+        "metric": _datapoint_text(metric, "metric"),
+        "value": _datapoint_text(value, "value"),
+        "entity": _datapoint_text(entity, "entity") if entity is not None else None,
+        "period": _datapoint_text(period, "period") if period is not None else None,
+        "unit": _datapoint_text(unit, "unit") if unit is not None else None,
+    }
+    kind = prov.get("kind")
+    if kind in ("sec_record", "finra_record"):
+        body = _record_datapoint(prov, source_bytes, claimed)
+    elif kind in ("sec_source", "web_source"):
+        body = _passage_datapoint(prov, claimed)
+    else:
+        raise ValueError(f"{kind!r} provenance carries no datapoint")
+    anchor = {"source": f"sha256:{sha256(source_bytes).hexdigest()}", "locator": locator, "datapoint": body}
+    return {"id": _datapoint_id(anchor), **body}
+
+
+def observation_proof(
+    *,
+    provenance: Mapping[str, object],
+    source_bytes: bytes,
+    value: object,
+    metric: object,
+    entity: object,
+    period: object,
+    unit: object = None,
+) -> dict[str, JSONValue]:
+    """Observation proof: archived source bytes, the locator with its canonical datapoint, and the value hash.
+
+    Refuses an ambiguous source identity, absent bytes, and any datapoint the
+    source does not state (``canonical_datapoint``). Store the descriptor's
+    value/entity/period/unit on the row: they are the source spelling.
+    """
+    prov = validate_provenance(provenance, "<proof>: 'provenance'")
+    datapoint = canonical_datapoint(
+        provenance=prov, source_bytes=source_bytes, metric=metric, value=value, entity=entity, period=period, unit=unit
     )
+    locator = _proof_locator(prov)
+    assert locator is not None  # canonical_datapoint refuses an unlocated provenance
+    return {
+        "kind": "observation",
+        "sourceId": f"sha256:{sha256(source_bytes).hexdigest()}",
+        "locator": {**locator, "datapoint": datapoint},
+        "valueHash": value_hash(str(datapoint["value"])),
+    }
+
+
+def datapoint_descriptor(evidence: Evidence) -> dict[str, JSONValue] | None:
+    """Stored canonical datapoint of one row; None for legacy rows and proof-less kinds.
+
+    It is authentic only when the row's proof verifies (``verify_observation`` /
+    ``verify_calculation`` rebuild it from the source and compare).
+    """
+    kind = evidence.proof.get("kind")
+    if kind == "observation":
+        locator = evidence.proof.get("locator")
+        raw = locator.get("datapoint") if isinstance(locator, Mapping) else None
+    elif kind == "calculation":
+        raw = evidence.proof.get("datapoint")
+    else:
+        raw = None
+    return dict(raw) if isinstance(raw, Mapping) else None
+
+
+def calculation_datapoint(
+    *,
+    formula_id: object,
+    formula_version: object,
+    inputs: Sequence[Evidence],
+    metric: object,
+    value: object,
+    entity: object,
+    period: object,
+    unit: object,
+) -> dict[str, JSONValue]:
+    """Canonical datapoint of one calculation: formula over its inputs' canonical datapoints (argument order).
+
+    ``metric`` is the declared label of the derived quantity (no source states
+    it). Entity/period/unit are the calculation row's own fields;
+    ``verify_calculation`` checks them against the inputs. Formula, input ids,
+    and value are verified. Any input without a canonical datapoint fails.
+    """
+    formula = f"{_datapoint_text(formula_id, 'formula_id')}@{_datapoint_text(formula_version, 'formula_version')}"
+    points = [datapoint_descriptor(row) for row in inputs]
+    if not points or any(point is None for point in points):
+        raise ValueError("every calculation input needs a canonical datapoint")
+    named = [point for point in points if point is not None]
+    label = _datapoint_text(metric, "metric")
+    text = _datapoint_text(value, "value")
+    operands = ", ".join(f"{point['metric']}={point['value']}" for point in named)
+    body: dict[str, JSONValue] = {
+        "metric": label,
+        "field": "formula",
+        "formula": formula,
+        "value": text,
+        "entity": _datapoint_text(entity, "entity"),
+        "period": _datapoint_text(period, "period"),
+        "unit": _datapoint_text(unit, "unit") if unit is not None else None,
+        "statement": f"{label} = {formula}({operands}) = {text}",
+        "inputs": [point["id"] for point in named],
+    }
+    return {"id": _datapoint_id({"formula": formula, "datapoint": body}), **body}
+
+
+def calculation_proof(
+    *,
+    formula_id: object,
+    formula_version: object,
+    input_proof_ids: object,
+    value: object,
+    datapoint: Mapping[str, object] | None = None,
+) -> dict[str, JSONValue]:
+    """Calculation proof: formula id + version over input evidence ids (formula argument order).
+
+    ``datapoint`` is the ``calculation_datapoint`` descriptor; the admission path
+    adds it once the input rows are loaded.
+    """
+    proof: dict[str, object] = {
+        "kind": "calculation",
+        "formulaId": _datapoint_text(formula_id, "formula_id"),
+        "formulaVersion": _datapoint_text(formula_version, "formula_version"),
+        "inputProofIds": list(input_proof_ids) if isinstance(input_proof_ids, (list, tuple)) else input_proof_ids,
+        "valueHash": value_hash(_datapoint_text(value, "value")),
+    }
+    if datapoint is not None:
+        proof["datapoint"] = dict(datapoint)
+    return validate_proof(proof, "<proof>")
 
 
 def assumption_proof(*, origin: object, description: object) -> dict[str, JSONValue]:
@@ -747,10 +1092,12 @@ def _datapoint_verdict(evidence: Evidence, kind: str, value: object) -> ProofVer
 
 
 def verify_observation(evidence: Evidence, *, value: object, source_bytes: bytes | None) -> ProofVerdict:
-    """Check one claimed value against an observation row: value hash, locator, archived bytes, passage.
+    """Check one claimed value against an observation row: value hash, locator, archived bytes, datapoint.
 
     ``source_bytes`` are the raw_archive bytes the caller loaded for ``proof.sourceId``;
-    None (bytes absent) fails closed as unverified. Never raises.
+    None (bytes absent) fails closed as unverified. The stored canonical datapoint
+    must rebuild from those bytes exactly; a legacy proof without one stays
+    unverified. Never raises.
     """
     early = _datapoint_verdict(evidence, "observation", value)
     if early is not None:
@@ -758,14 +1105,30 @@ def verify_observation(evidence: Evidence, *, value: object, source_bytes: bytes
     locator = _proof_locator(evidence.provenance)
     if locator is None:
         return ProofVerdict("unverified", "provenance does not identify one exact source revision")
-    if evidence.proof["locator"] != locator:
+    stored = dict(evidence.proof["locator"]) if isinstance(evidence.proof["locator"], Mapping) else {}
+    datapoint = stored.pop("datapoint", None)
+    if stored != locator:
         return ProofVerdict("conflicted", "proof locator differs from the row provenance")
+    if not isinstance(datapoint, Mapping):
+        return ProofVerdict("unverified", "legacy observation proof carries no canonical datapoint")
     if source_bytes is None:
         return ProofVerdict("unverified", "archived source bytes absent")
     if f"sha256:{sha256(source_bytes).hexdigest()}" != evidence.proof["sourceId"]:
         return ProofVerdict("conflicted", "archived source bytes do not match proof sourceId")
-    if not _value_in_passage(evidence.provenance, source_bytes, evidence.value or ""):
-        return ProofVerdict("conflicted", "value is not verbatim in the located source passage")
+    try:
+        rebuilt = canonical_datapoint(
+            provenance=evidence.provenance,
+            source_bytes=source_bytes,
+            metric=datapoint.get("metric"),
+            value=evidence.value,
+            entity=evidence.entity,
+            period=evidence.period,
+            unit=evidence.unit,
+        )
+    except ValueError as exc:
+        return ProofVerdict("conflicted", f"canonical datapoint does not rebuild from the source: {exc}")
+    if rebuilt != dict(datapoint):
+        return ProofVerdict("conflicted", "stored canonical datapoint differs from the source rebuild")
     return _VERIFIED
 
 
@@ -837,6 +1200,8 @@ def _calculation_input_defect(evidence: Evidence, rows: Sequence[Evidence]) -> s
         period_ok = same_period and len(rows) == 2
     elif semantics == "multiple":
         period_ok = len(rows) == 2 and (same_period or (len(set(row_periods)) == 2 and output_period in row_periods))
+    elif semantics in ("quarter", "ttm"):
+        period_ok = True  # source periods differ per input; _temporal_input_defect checks the intervals
     else:
         period_ok = same_period
     if not period_ok:
@@ -911,6 +1276,29 @@ def verify_calculation(
         return ProofVerdict("unverified", f"formula {formula_id}@{version} is unknown")
     if recomputed.strip() != evidence.value:
         return ProofVerdict("conflicted", f"formula recomputes {recomputed.strip()!r}, row states {evidence.value!r}")
+    return _calculation_datapoint_verdict(evidence, [row for row, _ in inputs])
+
+
+def _calculation_datapoint_verdict(evidence: Evidence, rows: Sequence[Evidence]) -> ProofVerdict:
+    """The stored calculation datapoint must rebuild from the verified inputs; a legacy row lacks one."""
+    stored = evidence.proof.get("datapoint")
+    if not isinstance(stored, Mapping):
+        return ProofVerdict("unverified", "legacy calculation proof carries no canonical datapoint")
+    try:
+        rebuilt = calculation_datapoint(
+            formula_id=evidence.proof["formulaId"],
+            formula_version=evidence.proof["formulaVersion"],
+            inputs=rows,
+            metric=stored.get("metric"),
+            value=evidence.value,
+            entity=evidence.entity,
+            period=evidence.period,
+            unit=evidence.unit,
+        )
+    except ValueError as exc:
+        return ProofVerdict("unverified", f"canonical datapoint does not rebuild: {exc}")
+    if rebuilt != dict(stored):
+        return ProofVerdict("conflicted", "stored canonical datapoint differs from the input rebuild")
     return _VERIFIED
 
 

@@ -486,6 +486,135 @@ describe("SourcePage", () => {
     },
   };
 
+  test("public source mismatches and ambiguity preserve the verified API record", async () => {
+    for (const failure of ["SOURCE_MISMATCH", "SOURCE_AMBIGUOUS"]) {
+      const content = JSON.stringify({ symbolCode: "ACME", shortVolume: 100 }, null, 2);
+      const reason = `The public file conflicts with the API record: <img src="https://example.test/conflict"> & ${failure}.`;
+      const root = await open({
+        ...TEXT,
+        id: "evidence:panel:api-conflict",
+        title: "Reg SHO daily short volume",
+        publisher: "FINRA",
+        url: "https://api.finra.org/data/group/otcMarket/name/regShoDaily",
+        captureKind: "structured_record",
+        content,
+        quote: '"shortVolume": 100',
+        linkStatus: "missing",
+        originalUrl: undefined,
+        sourceConflict: { failure, reason },
+        audit: auditInput("panel:api-conflict", "100", {
+          entity: "ACME", period: "2026-01-02", unit: "shares",
+          source: { name: "FINRA", hash: "sha256:api-record" },
+        }),
+      });
+      const notice = root.querySelector('[aria-label="Source conflict"]');
+      expect(notice?.textContent).toContain("The public link is unavailable. The captured API record remains visible.");
+      expect([...notice?.querySelectorAll("p") ?? []].map((paragraph) => paragraph.textContent)).toEqual([
+        "The public link is unavailable. The captured API record remains visible.", failure, reason,
+      ]);
+      expect(notice?.querySelector("img")).toBeNull();
+      expect(auditFields(root.querySelector('[aria-label="Source audit"] > dl'))).toMatchObject({
+        Verification: "Verified", Value: "100", Entity: "ACME", Period: "2026-01-02", Unit: "shares",
+        Source: "FINRA", "Evidence hash": "sha256:api-record",
+      });
+      expect(root.querySelector('[aria-label="Captured source content"]')?.textContent).toBe(content);
+      expect(markTexts(root)).toEqual(['"shortVolume": 100']);
+      expect(official(root)).toBeUndefined();
+      expect(hrefs(root)).toEqual([]);
+      expect(root.querySelector('[role="alert"]')).toBeNull();
+      await close();
+    }
+  });
+
+  test("a verified observation shows its canonical descriptor without changing the audit value rows", async () => {
+    const root = await open({
+      ...TEXT,
+      audit: auditInput("panel:text", "26,044", {
+        datapoint: {
+          id: "dp:revenue", metric: "revenue", field: "total_revenue", value: "26044",
+          entity: "NVDA", period: "Q1 FY2025", unit: "USD millions",
+          statement: "NVDA reported revenue of <26,044> USD millions.",
+        },
+      }),
+    });
+    const audit = root.querySelector('[aria-label="Source audit"] > dl');
+    expect(auditFields(audit)).toMatchObject({
+      Verification: "Verified", Value: "26,044", Entity: "NVDA", Period: "Q1 FY2025", Unit: "USD millions",
+      "Datapoint ID": "dp:revenue", Metric: "revenue", Field: "total_revenue",
+      Statement: "NVDA reported revenue of <26,044> USD millions.",
+    });
+    expect(Object.keys(auditFields(audit))).not.toContain("Formula");
+    expect(Object.keys(auditFields(audit))).not.toContain("Input datapoint IDs");
+  });
+
+  test("a verified calculation shows its canonical formula, input IDs, and verified input descriptors", async () => {
+    const input = {
+      id: "dp:revenue", metric: "revenue", value: "26044", entity: "NVDA", period: "Q1 FY2025",
+      statement: "NVDA reported total revenue of 26044 USD millions.",
+    };
+    const root = await open({
+      ...CALCULATION,
+      audit: {
+        ...CALCULATION.audit!, formula: undefined, formulaId: undefined, formulaVersion: undefined,
+        datapoint: {
+          id: "dp:non-data-center", metric: "non_data_center_revenue", value: "3481",
+          entity: "NVDA", period: "Q1 FY2025", statement: "Total revenue minus Data Center revenue.",
+          formula: "total - data center", inputs: ["dp:revenue", "dp:data-center"],
+        },
+        inputs: [
+          auditInput("EV-TOT", "26,044", { datapoint: input }),
+          auditInput("EV-DC", "22,563", {
+            datapoint: { ...input, id: "dp:data-center", metric: "data_center_revenue", value: "22563", statement: "NVDA reported Data Center revenue of 22563 USD millions." },
+          }),
+        ],
+      },
+    });
+    const audit = root.querySelector('[aria-label="Source audit"] > dl');
+    expect(auditFields(audit)).toMatchObject({
+      Verification: "Verified", Value: "3481", Entity: "NVDA", Period: "Q1 FY2025", Unit: "USD millions",
+      "Datapoint ID": "dp:non-data-center", Metric: "non_data_center_revenue",
+      Statement: "Total revenue minus Data Center revenue.", Formula: "total - data center",
+      "Input datapoint IDs": "dp:revenue, dp:data-center",
+    });
+    expect(Object.keys(auditFields(audit))).not.toContain("Field");
+    expect(auditFields(root.querySelector('[aria-label="Calculation inputs"] > li dl'))).toMatchObject({
+      Verification: "Verified", Value: "26,044", "Datapoint ID": "dp:revenue", Metric: "revenue",
+      Statement: input.statement,
+    });
+    expect([...root.querySelectorAll('[aria-label="Calculation inputs"] > li dl')].map((list) => auditFields(list)["Datapoint ID"])).toEqual(["dp:revenue", "dp:data-center"]);
+  });
+
+  test("nonverified audit nodes hide canonical descriptors without hiding verified input descriptors", async () => {
+    const datapoint = {
+      id: "dp:held", metric: "held_metric", field: "held_field", value: "12", entity: "NVDA", period: "Q1 FY2025",
+      statement: "A canonical statement.", formula: "canonical-only formula", inputs: ["dp:input"],
+    };
+    for (const verification of ["unverified", "conflicted"] as const) {
+      const root = await open({
+        ...CALCULATION,
+        audit: {
+          ...CALCULATION.audit!, verification, verificationReason: "The proof did not verify.", datapoint,
+          inputs: [
+            auditInput("EV-VERIFIED", "12", { datapoint }),
+            auditInput("EV-NOT-VERIFIED", "12", { verification, verificationReason: "The proof did not verify.", datapoint }),
+          ],
+        },
+      });
+      const audit = auditFields(root.querySelector('[aria-label="Source audit"] > dl'));
+      const inputs = [...root.querySelectorAll('[aria-label="Calculation inputs"] > li dl')].map(auditFields);
+      for (const fields of [audit, inputs[1]!]) {
+        for (const name of ["Datapoint ID", "Metric", "Field", "Statement", "Input datapoint IDs"]) {
+          expect(Object.keys(fields)).not.toContain(name);
+        }
+        expect(fields.Formula).not.toBe(datapoint.formula);
+        expect(fields.Verification).toBe(`${verification === "unverified" ? "Not verified" : "Conflicted"} — The proof did not verify.`);
+      }
+      expect(audit.Formula).toBe("total - data center");
+      expect(inputs[0]).toMatchObject({ Verification: "Verified", "Datapoint ID": "dp:held", Formula: datapoint.formula });
+      await close();
+    }
+  });
+
   test("a calculation view shows the formula and opens each input record, never one arbitrary original", async () => {
     const root = await open(CALCULATION);
     const audit = root.querySelector('[aria-label="Source audit"]');

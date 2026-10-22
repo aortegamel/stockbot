@@ -1214,9 +1214,15 @@ def _intake_evidence_preview(
         eid = row.get("evidence_id")
         content = row.get("content")
         text = content if isinstance(content, str) else ""
-        preview.append(
-            {"id": eid if isinstance(eid, str) else "", "content": text[: chars - used], "sources": row.get("sources")}
-        )
+        item: dict[str, object] = {
+            "id": eid if isinstance(eid, str) else "",
+            "content": text[: chars - used],
+            "sources": row.get("sources"),
+        }
+        datapoints = _row_datapoints(row)
+        if datapoints:
+            item["datapoints"] = datapoints
+        preview.append(item)
         used += len(text)
     return preview
 
@@ -2285,15 +2291,15 @@ def _final_proof_defect(req: Mapping[str, JSONValue], raw_claims: object) -> str
     """Deterministic ledger proof for wire claims before any JEV call; None when every claim verifies.
 
     Claims resolve against the research session's persisted ledger (content hash,
-    archive bytes / persisted tool result, observation/calculation proof, numbers
-    in kernel-held text). No session id, an unknown session, or any unproven
-    non-unknown claim fails closed.
+    archive bytes / persisted tool result, observation/calculation proof, canonical
+    datapoint references bound to the wording, exact source statements, explicit
+    qualifiers). No session id, an unknown session, or any unproven claim fails closed.
     """
     from app.research import service
-    from app.research.agents import DATAPOINT_FIELDS, parse_grounded_claims
+    from app.research.agents import parse_grounded_claims
     from app.research.repository import ResearchRepository
 
-    keys = ("text", "claim_type", "evidence_ids", *DATAPOINT_FIELDS)
+    keys = ("text", "claim_type", "evidence_ids", "datapoint_ids")
     rows = [
         {key: item[key] for key in keys if item.get(key) is not None}
         for item in (raw_claims if isinstance(raw_claims, list) else [])
@@ -2387,7 +2393,13 @@ def _final_claim_evidence(req: Mapping[str, JSONValue], holder: Mapping[str, JSO
 
 
 def _assess_final_response(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
-    """Whole-response gate (runs even with empty claims): ledger proof first, then JEV judges the wording as written."""
+    """Whole-response gate (runs even with empty claims): ledger proof, sentence coverage, then JEV on the wording.
+
+    Every sentence must sit inside inventory claim texts, qualitative sentences included,
+    so a response passes whole only when no prose escapes the deterministic claim gate.
+    """
+    from app.research.synthesis.final import uncovered_sentences
+
     rid = _request_id(req)
     text = req.get("text")
     if not isinstance(text, str) or not text.strip():
@@ -2397,6 +2409,16 @@ def _assess_final_response(req: Mapping[str, JSONValue], jev: JevClient | None =
     if defect is not None:
         logger.info("toolflow assess_final_response rid=%s reason=proof %.300s", rid, defect)
         return _final_fail(rid, defect)
+    raw_claims = req.get("claims")
+    claim_texts = [
+        str(item["text"])
+        for item in (raw_claims if isinstance(raw_claims, list) else [])
+        if isinstance(item, Mapping) and isinstance(item.get("text"), str)
+    ]
+    uncovered = uncovered_sentences(text.strip(), claim_texts)
+    if uncovered:
+        logger.info("toolflow assess_final_response rid=%s reason=coverage", rid)
+        return _final_fail(rid, f"coverage: sentence {uncovered[0][:120]!r} has no inventory claim")
     try:
         client = _jev_client(jev)
         out = asyncio.run(
@@ -2577,8 +2599,22 @@ def _run_attempts(
     return attempts, incomplete_guard
 
 
+def _row_datapoints(rec: Mapping[str, object]) -> list[JSONValue]:
+    """The stored canonical datapoint of one ledger row, for model context only.
+
+    The publication gate re-verifies it against the source before any claim may reference it.
+    """
+    from app.research.evidence import datapoint_descriptor, evidence_from_dict
+
+    try:
+        point = datapoint_descriptor(evidence_from_dict(rec))
+    except ValueError:
+        return []
+    return [point] if point is not None else []
+
+
 def _run_evidence(records: Sequence[Mapping[str, JSONValue]]) -> tuple[list[JSONValue], set[str]]:
-    """(wire evidence rows, known ids): stored text per row, its refs, never a guessed id."""
+    """(wire evidence rows, known ids): stored text per row, its refs and datapoint, never a guessed id."""
     from app.research.sources import source_references
 
     evidence: list[JSONValue] = []
@@ -2592,6 +2628,9 @@ def _run_evidence(records: Sequence[Mapping[str, JSONValue]]) -> tuple[list[JSON
         refs: list[JSONValue] = [{**ref} for ref in source_references(rec)]
         if refs:
             row["sources"] = refs
+        datapoints = _row_datapoints(rec)
+        if datapoints:
+            row["datapoints"] = datapoints
         evidence.append(row)
         known_ids.add(row_id)
     return evidence, known_ids

@@ -51,7 +51,40 @@ export type Evidence = {
   sourceHandle?: Record<string, unknown>;
   sourceRefs?: Record<string, unknown>;
   sources?: SourceReference[];
+  datapoints?: Datapoint[];
 };
+
+// Kernel-built canonical datapoint of one ledger row (Python evidence.canonical_datapoint /
+// calculation_datapoint). Model context only: the worker gate re-verifies it before a claim may cite it.
+export type Datapoint = {
+  id: string;
+  metric: string;
+  value: string;
+  entity: string;
+  period: string;
+  unit?: string;
+  statement: string;
+  inputs?: string[];
+};
+
+function text(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+// Trust boundary: keep only well-formed kernel descriptors (dp: id, every identity field a string); never repair.
+export function readDatapoints(raw: unknown): Datapoint[] {
+  if (!Array.isArray(raw)) return [];
+  const out: Datapoint[] = [];
+  for (const item of raw) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+    const { id, metric, value, entity, period, unit, statement, inputs } = item as Record<string, unknown>;
+    if (!text(id) || !id.startsWith("dp:") || !text(metric) || !text(value) || !text(entity) || !text(period) || !text(statement)) continue;
+    const point: Datapoint = { id, metric, value, entity, period, statement };
+    if (text(unit)) point.unit = unit;
+    if (Array.isArray(inputs)) point.inputs = inputs.filter(text);
+    out.push(point);
+  }
+  return out;
+}
 
 // Match the source endpoint. References never contain paths or live URLs.
 export const SOURCE_ID_RE = /^(?:capture:[a-f0-9]{64}|evidence:[A-Za-z0-9:_-]{1,256})$/;
@@ -96,17 +129,15 @@ export const FINAL_CLAIM_TYPES = [
 ] as const;
 export type FinalClaimType = (typeof FINAL_CLAIM_TYPES)[number];
 
-// The typed datapoint keys (value/entity/period/unit) use the Python ledger
-// names. Each is a non-empty string when present. `value` is verbatim in `text`.
+// Claims never state value/entity/period/unit themselves: every number they state
+// resolves through datapointIds (snake_case datapoint_ids on the wire) to a kernel
+// descriptor of a cited row, and the Python gate binds the wording to it.
 export type FinalClaim = {
   text: string;
   claimType: FinalClaimType;
   evidenceIds: string[];
+  datapointIds?: string[];
   confidence?: number;
-  value?: string;
-  entity?: string;
-  period?: string;
-  unit?: string;
 };
 
 export type FinalPersonaResult = {

@@ -424,7 +424,7 @@ def _sufficient_coverage(**kw: object) -> dict[str, object]:
 def _ana(eid: str, follow_ups: Sequence[object] = ()) -> dict[str, object]:
     return {
         "executive_view": "view",
-        "claims": [{"text": "finding", "evidence_ids": [eid]}],
+        "claims": [{"text": "finding suggests exposure", "evidence_ids": [eid]}],
         "impact_channels": [{"text": "channel", "direction": "up", "evidence_ids": [eid]}],
         "materiality": {"overall": "medium", "reasoning": "material"},
         "uncertainties": ["scope remains SEC-only"],
@@ -1479,10 +1479,12 @@ def test_finalize_terminal_on_repeat(tmp_path: Path, monkeypatch: pytest.MonkeyP
     eid = f"{sid}:ev:1"
     _full_trio(repo, sid, src, eid)
     svc.decide_next_wave(sid, repo=repo)
-    out = svc.finalize_session(sid, "finding", [{"text": "finding", "evidence_ids": [eid]}], repo=repo)
+    out = svc.finalize_session(
+        sid, "finding suggests exposure", [{"text": "finding suggests exposure", "evidence_ids": [eid]}], repo=repo
+    )
     assert out["status"] == "completed"
     with pytest.raises(ValueError, match="terminal"):
-        svc.finalize_session(sid, "answer", [{"text": "finding", "evidence_ids": [eid]}], repo=repo)
+        svc.finalize_session(sid, "answer", [{"text": "finding suggests exposure", "evidence_ids": [eid]}], repo=repo)
 
 
 def test_finalize_missing_trio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1496,7 +1498,7 @@ def test_finalize_missing_trio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert isinstance(first_trio, str)
     svc.record_committee_analysis(sid, first_trio, "stockbot", _ana(eid), repo=repo)
     with pytest.raises(ValueError, match="missing committee"):
-        svc.finalize_session(sid, "answer", [{"text": "finding", "evidence_ids": [eid]}], repo=repo)
+        svc.finalize_session(sid, "answer", [{"text": "finding suggests exposure", "evidence_ids": [eid]}], repo=repo)
 
 
 def test_finalize_missing_disagreement(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1510,7 +1512,7 @@ def test_finalize_missing_disagreement(tmp_path: Path, monkeypatch: pytest.Monke
 
     monkeypatch.setattr("app.research.synthesis.committee.compute_disagreement", _dis_none)
     with pytest.raises(ValueError, match="missing disagreement"):
-        svc.finalize_session(sid, "answer", [{"text": "finding", "evidence_ids": [eid]}], repo=repo)
+        svc.finalize_session(sid, "answer", [{"text": "finding suggests exposure", "evidence_ids": [eid]}], repo=repo)
 
 
 def test_finalize_bad_claims_and_answer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1518,7 +1520,7 @@ def test_finalize_bad_claims_and_answer(tmp_path: Path, monkeypatch: pytest.Monk
     sid, src = _sid(repo)
     eid = f"{sid}:ev:1"
     _full_trio(repo, sid, src, eid)
-    good: list[object] = [{"text": "finding", "evidence_ids": [eid]}]
+    good: list[object] = [{"text": "finding suggests exposure", "evidence_ids": [eid]}]
     bad_claims: list[object] = json.loads('"nope"')
     with pytest.raises(ValueError, match="must be a list"):
         svc.finalize_session(sid, "answer", bad_claims, repo=repo)
@@ -1537,7 +1539,7 @@ def test_finalize_rejects_open_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert isinstance(extra_raw, str)
     extra = extra_raw
     with pytest.raises(ValueError, match="still open") as exc:
-        svc.finalize_session(sid, "answer", [{"text": "finding", "evidence_ids": [eid]}], repo=repo)
+        svc.finalize_session(sid, "answer", [{"text": "finding suggests exposure", "evidence_ids": [eid]}], repo=repo)
     assert isinstance(extra, str) and extra in str(exc.value)
 
 
@@ -1566,14 +1568,14 @@ def test_finalize_rejects_empty_synthesis(tmp_path: Path, monkeypatch: pytest.Mo
 
     monkeypatch.setattr("app.research.synthesis.final.synthesize_final", _synth_blank)
     with pytest.raises(ValueError, match="empty answer"):
-        svc.finalize_session(sid, "answer", [{"text": "finding", "evidence_ids": [eid]}], repo=repo)
+        svc.finalize_session(sid, "answer", [{"text": "finding suggests exposure", "evidence_ids": [eid]}], repo=repo)
 
 
 # -- finalize publication proof: typed datapoints replay from ledger + archive bytes --
 
-_DP_DC = "Data Center revenue was $22,563 million for the first quarter."
-_DP_TOT = "Total revenue was $26,044 million for the first quarter."
-_DP_TYPED: dict[str, object] = {"entity": "NVDA", "period": "Q1 FY2025", "unit": "USD millions"}
+_DP_DC = "NVDA Q1 FY2025 Data Center revenue was $22,563 million."
+_DP_TOT = "NVDA Q1 FY2025 Total revenue was $26,044 million."
+_DP_TYPED: dict[str, object] = {"entity": "NVDA", "period": "Q1 FY2025", "unit": "million"}
 
 
 def _dp_item(eid: str, passage: str, value: str, *, typed: bool = True) -> dict[str, object]:
@@ -1581,7 +1583,7 @@ def _dp_item(eid: str, passage: str, value: str, *, typed: bool = True) -> dict[
     item = _item(eid, matching_passage=passage, content=passage, source_handle=seam.handle_for_registered(passage))
     item["value"] = value
     if typed:
-        item.update(_DP_TYPED)
+        item.update(_DP_TYPED, metric=passage.removeprefix("NVDA Q1 FY2025 ").split(" was ")[0])
     return item
 
 
@@ -1601,6 +1603,7 @@ def _dp_frozen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Researc
         "formula_version": "1",
         "input_evidence_ids": [ids["tot"], ids["dc"]],
         "value": "3481",
+        "metric": "non-Data Center revenue",
         "claim_text": "non-data-center revenue",
         "subject": "NVDA",
         "known_at": KNOWN,
@@ -1626,43 +1629,71 @@ def test_committee_analysis_rejects_fabricated_number(tmp_path: Path, monkeypatc
     jobs = svc.create_committee_jobs(sid, 1, repo=repo)["jobs"]
     assert isinstance(jobs, list) and isinstance(jobs[0], str)
     bad = _ana(ids["dc"])
-    bad["claims"] = [{"text": "Data Center revenue was $99,999 million.", "evidence_ids": [ids["dc"]]}]
-    with pytest.raises(ValueError, match="record_committee_analysis: ERR_DATAPOINT_UNVERIFIED"):
+    point = _dp_id(repo, ids["dc"])
+    bad["claims"] = [_dp_claim(_DP_DC.replace("22,563", "99,999"), "observed_fact", [ids["dc"]], point)]
+    with pytest.raises(ValueError, match="record_committee_analysis: ERR_DATAPOINT_UNBOUND"):
         svc.record_committee_analysis(sid, jobs[0], "stockbot", bad, repo=repo)
     assert repo.get_job(jobs[0]).status != "completed"
     good = _ana(ids["dc"])
-    good["claims"] = [{"text": "Data Center revenue was $22,563 million.", "evidence_ids": [ids["dc"]]}]
+    good["claims"] = [_dp_claim(_DP_DC, "observed_fact", [ids["dc"]], point)]
     svc.record_committee_analysis(sid, jobs[0], "stockbot", good, repo=repo)
     assert repo.get_job(jobs[0]).status == "completed"
 
 
-def _dp_claim(
-    text: str, claim_type: str, eids: list[str], value: str | None = None, **typed: object
-) -> dict[str, object]:
-    claim: dict[str, object] = {"text": text, "claim_type": claim_type, "evidence_ids": eids}
-    if value is not None:
-        claim.update({"value": value, **_DP_TYPED, **typed})
-    return claim
+def _dp_id(repo: ResearchRepository, eid: str) -> str:
+    from app.research.evidence import datapoint_descriptor, evidence_from_dict
+
+    point = datapoint_descriptor(evidence_from_dict(repo.get_evidence(eid)))
+    assert point is not None, eid
+    return str(point["id"])
+
+
+def _dp_claim(text: str, claim_type: str, eids: list[str], *datapoint_ids: str) -> dict[str, object]:
+    return {
+        "text": text,
+        "claim_type": claim_type,
+        "evidence_ids": eids,
+        "datapoint_ids": list(datapoint_ids),
+    }
 
 
 def test_finalize_rejects_fabricated_and_unrelated_datapoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A number the ledger cannot replay never publishes: fail closed, nothing persisted."""
     repo, sid, ids = _dp_session(tmp_path, monkeypatch)
-    dc_text = "Data Center revenue was $22,563 million."
+    dc_text = _DP_DC
+    dc_point = _dp_id(repo, ids["dc"])
+    calc_point = _dp_id(repo, ids["calc"])
     fabricated = [
-        # Fabricated typed value against a real row.
-        _dp_claim("Data Center revenue was $22,564 million.", "observed_fact", [ids["dc"]], "22,564"),
+        # Fabricated value against a real datapoint.
+        (
+            _dp_claim(dc_text.replace("22,563", "22,564"), "observed_fact", [ids["dc"]], dc_point),
+            "ERR_DATAPOINT_UNBOUND",
+        ),
         # Real value, but the cited evidence id proves a different datapoint.
-        _dp_claim(dc_text, "observed_fact", [ids["tot"]], "22,563"),
+        (_dp_claim(dc_text, "observed_fact", [ids["tot"]], dc_point), "ERR_DATAPOINT_UNVERIFIED"),
         # Real value and row, wrong entity.
-        _dp_claim(dc_text, "observed_fact", [ids["dc"]], "22,563", entity="AMD"),
-        # Untyped number in prose that no cited source text holds.
-        _dp_claim("Data Center revenue was $99,999 million.", "observed_fact", [ids["dc"]]),
-        # Calculation claim whose value the formula does not recompute.
-        _dp_claim("Other revenue was $3480 million.", "calculation", [ids["calc"]], "3480"),
+        (
+            _dp_claim(dc_text.replace("NVDA", "AMD"), "observed_fact", [ids["dc"]], dc_point),
+            "ERR_DATAPOINT_UNBOUND",
+        ),
+        # A number without a datapoint reference never publishes.
+        (
+            _dp_claim(dc_text.replace("22,563", "99,999"), "observed_fact", [ids["dc"]]),
+            "ERR_DATAPOINT_UNVERIFIED",
+        ),
+        # Calculation wording states a value the formula does not recompute.
+        (
+            _dp_claim(
+                "NVDA Q1 FY2025 non-Data Center revenue was $3480 million.",
+                "calculation",
+                [ids["calc"]],
+                calc_point,
+            ),
+            "ERR_DATAPOINT_UNBOUND",
+        ),
     ]
-    for claim in fabricated:
-        with pytest.raises(ValueError, match="finalize_session: ERR_DATAPOINT_UNVERIFIED"):
+    for claim, error in fabricated:
+        with pytest.raises(ValueError, match=f"finalize_session: {error}"):
             svc.finalize_session(sid, str(claim["text"]), [claim], repo=repo)
     session = repo.get_session(sid)
     assert session.status != "completed" and not session.final_result
@@ -1673,12 +1704,12 @@ def test_finalize_publishes_valid_observation_calculation_and_qualified_inferenc
 ) -> None:
     """Valid chains replay; uncovered factual answer prose is deleted before publication."""
     repo, sid, ids = _dp_session(tmp_path, monkeypatch)
-    dc_text = "Data Center revenue was $22,563 million."
-    calc_text = "Non-data-center revenue was $3481 million."
+    dc_text = _DP_DC
+    calc_text = "NVDA Q1 FY2025 non-Data Center revenue was $3481 million."
     inference = "Demand may stay supply-constrained."
     claims: list[object] = [
-        _dp_claim(dc_text, "observed_fact", [ids["dc"]], "22,563"),
-        _dp_claim(calc_text, "calculation", [ids["calc"]], "3481"),
+        _dp_claim(dc_text, "observed_fact", [ids["dc"]], _dp_id(repo, ids["dc"])),
+        _dp_claim(calc_text, "calculation", [ids["calc"]], _dp_id(repo, ids["calc"])),
         _dp_claim(inference, "inference", [ids["dc"]]),
     ]
     answer = f"{dc_text} {calc_text} {inference} Revenue will triple to $90,000 million next year."
@@ -1692,12 +1723,11 @@ def test_finalize_publishes_valid_observation_calculation_and_qualified_inferenc
     assert "90,000" not in published  # uncovered factual sentence deleted surgically
     rows = final["claims"]
     assert isinstance(rows, list)
-    typed = {
-        (r.get("claim_type"), r.get("value"), r.get("entity"), r.get("period")) for r in rows if isinstance(r, dict)
-    }
-    assert ("observed_fact", "22,563", "NVDA", "Q1 FY2025") in typed
-    assert ("calculation", "3481", "NVDA", "Q1 FY2025") in typed
-    assert ("inference", None, None, None) in typed  # an inference stays qualified, never a datapoint
+    typed = {str(r.get("claim_type")): r.get("datapoint_ids", []) for r in rows if isinstance(r, dict)}
+    assert typed["observed_fact"] == [_dp_id(repo, ids["dc"])]
+    assert typed["calculation"] == [_dp_id(repo, ids["calc"])]
+    assert typed["inference"] == []  # An inference stays qualified without a datapoint reference.
+    assert all(not {"value", "entity", "period", "unit"}.intersection(row) for row in rows if isinstance(row, dict))
 
 
 def test_finalize_fails_closed_when_archived_source_bytes_are_absent(
@@ -1712,7 +1742,7 @@ def test_finalize_fails_closed_when_archived_source_bytes_are_absent(
     assert revisions
     for record in revisions:
         record.payload_path.unlink()
-    claim = _dp_claim("Data Center revenue was $22,563 million.", "observed_fact", [ids["dc"]], "22,563")
+    claim = _dp_claim(_DP_DC, "observed_fact", [ids["dc"]], _dp_id(repo, ids["dc"]))
     with pytest.raises(ValueError, match="finalize_session: ERR_PROOF_UNVERIFIED"):
         svc.finalize_session(sid, str(claim["text"]), [claim], repo=repo)
     assert repo.get_session(sid).status != "completed"
@@ -1738,6 +1768,7 @@ def test_record_evidence_refuses_unprovable_datapoints_before_commit(
         "formula_version": "1",
         "input_evidence_ids": [dc, dc],
         "value": "45126",
+        "metric": "doubled Data Center revenue",
         "claim_text": "doubled",
         "subject": "NVDA",
         "known_at": KNOWN,
@@ -1762,8 +1793,8 @@ def test_finalize_published_calculation_carries_replayable_audit_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo, sid, ids = _dp_session(tmp_path, monkeypatch)
-    calc_text = "Non-data-center revenue was $3481 million."
-    claim = _dp_claim(calc_text, "calculation", [ids["calc"]], "3481")
+    calc_text = "NVDA Q1 FY2025 non-Data Center revenue was $3481 million."
+    claim = _dp_claim(calc_text, "calculation", [ids["calc"]], _dp_id(repo, ids["calc"]))
     assert svc.finalize_session(sid, calc_text, [claim], repo=repo)["status"] == "completed"
     final = repo.get_session(sid).final_result
     assert isinstance(final, dict)
@@ -1800,7 +1831,7 @@ def _sess(**kw: object) -> ResearchSession:
 
 
 def _ok_claim(eid: str = "EV-1") -> str:
-    return json.dumps([{"text": "finding one", "evidence_ids": [eid]}])
+    return json.dumps([{"text": "finding suggests exposure", "evidence_ids": [eid]}])
 
 
 def _committee_env(claims: object, follows: object, **kw: object) -> str:
@@ -1874,17 +1905,21 @@ def test_pgc_blank_text() -> None:
 
 def test_pgc_uncited() -> None:
     with pytest.raises(ModelOutputFailure):
-        parse_grounded_claims(json.dumps([{"text": "t", "evidence_ids": []}]), frozen=["EV-1"])
+        parse_grounded_claims(json.dumps([{"text": "finding suggests exposure", "evidence_ids": []}]), frozen=["EV-1"])
 
 
 def test_pgc_unknown_id() -> None:
     with pytest.raises(ModelOutputFailure):
-        parse_grounded_claims(json.dumps([{"text": "t", "evidence_ids": ["EV-999"]}]), frozen=["EV-1"])
+        parse_grounded_claims(
+            json.dumps([{"text": "finding suggests exposure", "evidence_ids": ["EV-999"]}]), frozen=["EV-1"]
+        )
 
 
 def test_pgc_ok_dedups_and_strips() -> None:
-    out = parse_grounded_claims(json.dumps([{"text": "  hi  ", "evidence_ids": ["EV-1", "EV-1"]}]), frozen=["EV-1"])
-    assert out[0].text == "hi" and out[0].evidence_ids == ["EV-1"]
+    out = parse_grounded_claims(
+        json.dumps([{"text": "  finding suggests exposure  ", "evidence_ids": ["EV-1", "EV-1"]}]), frozen=["EV-1"]
+    )
+    assert out[0].text == "finding suggests exposure" and out[0].evidence_ids == ["EV-1"]
 
 
 # ---- parse_committee_output arms ----
@@ -1922,7 +1957,7 @@ def test_pco_rich_envelope_required() -> None:
         )
     env = parse_committee_envelope(
         _committee_env(
-            [{"text": "finding one", "evidence_ids": ["EV-1"]}],
+            [{"text": "finding suggests exposure", "evidence_ids": ["EV-1"]}],
             [],
             impact_channels=[{"text": "channel", "direction": "up", "evidence_ids": ["EV-1"]}],
             uncertainties=["scope remains SEC-only"],
@@ -1949,7 +1984,9 @@ def test_pco_malformed_followup() -> None:
 
 def test_pco_ok_tags_agent() -> None:
     c, f = parse_committee_output(
-        _committee_env([{"text": "finding one", "evidence_ids": ["EV-1"]}], ["What drove Q2 revenue growth?"]),
+        _committee_env(
+            [{"text": "finding suggests exposure", "evidence_ids": ["EV-1"]}], ["What drove Q2 revenue growth?"]
+        ),
         frozen=["EV-1"],
         agent="stockbot",
     )
@@ -1971,7 +2008,7 @@ def test_coerce_wave_all_copies(mod: str) -> None:
 
 
 def _model_ev999(p: str) -> str:
-    return _committee_env([{"text": "t", "evidence_ids": ["EV-999"]}], [])
+    return _committee_env([{"text": "finding suggests exposure", "evidence_ids": ["EV-999"]}], [])
 
 
 def _model_raw(p: str) -> str:
@@ -1983,7 +2020,7 @@ def _model_empty(p: str) -> str:
 
 
 def _model_ev1(p: str) -> str:
-    return _committee_env([{"text": "t", "evidence_ids": ["EV-1"]}], [])
+    return _committee_env([{"text": "finding suggests exposure", "evidence_ids": ["EV-1"]}], [])
 
 
 # ---- run_* committee arms x3 ----
@@ -2073,7 +2110,7 @@ def test_dossier_uncited() -> None:
             session_id="rs:t",
             wave_id=1,
             as_of="x",
-            results=[_kern_res(findings=[GroundedClaim(text="t", evidence_ids=[])])],
+            results=[_kern_res(findings=[GroundedClaim(text="finding suggests exposure", evidence_ids=[])])],
             known_evidence_ids=["EV-1"],
         )
 
@@ -2093,7 +2130,7 @@ def test_dossier_unknown_id_journals() -> None:
             session_id="rs:t",
             wave_id=1,
             as_of="x",
-            results=[_kern_res(findings=[GroundedClaim(text="t", evidence_ids=["EV-9"])])],
+            results=[_kern_res(findings=[GroundedClaim(text="finding suggests exposure", evidence_ids=["EV-9"])])],
             known_evidence_ids=["EV-1"],
             journal=_journal_seen(seen),
         )
@@ -2107,8 +2144,8 @@ def test_dossier_dedup_merge() -> None:
         wave_id=1,
         as_of="x",
         results=[
-            _kern_res(findings=[GroundedClaim(text="same", evidence_ids=["EV-1"])]),
-            _kern_res(findings=[GroundedClaim(text="same", evidence_ids=["EV-2"])]),
+            _kern_res(findings=[GroundedClaim(text="finding suggests exposure", evidence_ids=["EV-1"])]),
+            _kern_res(findings=[GroundedClaim(text="finding suggests exposure", evidence_ids=["EV-2"])]),
         ],
         known_evidence_ids=["EV-1", "EV-2"],
     )
@@ -2180,7 +2217,7 @@ def test_collect_non_dict_candidate_skipped() -> None:
             return {}
         return {"evidence_ids": ["EV-1", {"evidence_id": "EV-2", "known_at": "2025-05-01"}]}
 
-    out = _scout_with(_d, model_text=json.dumps([{"text": "t", "evidence_ids": ["EV-2"]}]))
+    out = _scout_with(_d, model_text=json.dumps([{"text": "finding suggests exposure", "evidence_ids": ["EV-2"]}]))
     assert [c.evidence_ids for c in out.findings] == [["EV-2"]]
 
 
@@ -2190,7 +2227,7 @@ def test_collect_blank_id_skipped_and_coverage_path() -> None:
             return {}
         return {"evidence_ids": [{"evidence_id": ""}, {"evidence_id": "EV-2", "known_at": "2025-05-01"}]}
 
-    out = _scout_with(_d, model_text=json.dumps([{"text": "t", "evidence_ids": ["EV-2"]}]))
+    out = _scout_with(_d, model_text=json.dumps([{"text": "finding suggests exposure", "evidence_ids": ["EV-2"]}]))
     assert [c.evidence_ids for c in out.findings] == [["EV-2"]]
 
 
@@ -2204,7 +2241,11 @@ def test_collect_pit_reject_journals(cap_calls: object = None) -> None:
 
     # The PIT-ineligible id is rejected + journalled; the claim citing it is dropped,
     # never accepted (scout boundary tolerates the bad record instead of aborting).
-    out = _scout_with(_d, model_text=json.dumps([{"text": "t", "evidence_ids": ["EV-1"]}]), journal=_journal_seen(seen))
+    out = _scout_with(
+        _d,
+        model_text=json.dumps([{"text": "finding suggests exposure", "evidence_ids": ["EV-1"]}]),
+        journal=_journal_seen(seen),
+    )
     assert seen and seen[0] == ("evidence.rejected", {"session_id": "rs:t", "evidence_id": "EV-9"})
     assert out.findings == []
     assert any("dropped" in line for line in out.limitations)
@@ -2234,7 +2275,7 @@ def _fallback():
         session_id="rs:t",
         wave_id=1,
         as_of="unbounded",
-        findings=[GroundedClaim(text="t", evidence_ids=["EV-1"])],
+        findings=[GroundedClaim(text="finding suggests exposure", evidence_ids=["EV-1"])],
     )
 
 
@@ -5301,7 +5342,7 @@ def test_research_read_freeze_scope_dossier(tmp_path: Path, monkeypatch: pytest.
                     session_id=sid,
                     wave_id=1,
                     subject="NVDA",
-                    findings=[{"text": "finding", "evidence_ids": [evidence_id]}],
+                    findings=[{"text": "finding suggests exposure", "evidence_ids": [evidence_id]}],
                 )
             )
         )
@@ -5380,7 +5421,7 @@ def test_research_analysis_and_finalize_arms(tmp_path: Path, monkeypatch: pytest
     assert tools_mod._analysis_payload({"analysis": {"a": 1}}) == {"a": 1}
     assert execute_tool(
         "research_finalize",
-        {"session_id": sid, "answer": " ", "claims": [{"text": "t", "evidence_ids": ["e"]}]},
+        {"session_id": sid, "answer": " ", "claims": [{"text": "finding suggests exposure", "evidence_ids": ["e"]}]},
         "m",
         context=ctx,
     )["error"]
@@ -5389,20 +5430,20 @@ def test_research_analysis_and_finalize_arms(tmp_path: Path, monkeypatch: pytest
     ]
     assert execute_tool(
         "research_finalize",
-        {"session_id": sid, "answer": "a", "claims": [{"text": "t", "evidence_ids": ["e"]}]},
+        {"session_id": sid, "answer": "a", "claims": [{"text": "finding suggests exposure", "evidence_ids": ["e"]}]},
         "m",
         context=RequestContext("t", frozenset({Capability.RESEARCH})),
     )["error"]
     assert execute_tool(
         "research_finalize",
-        {"session_id": sid, "answer": "a", "claims": [{"text": "t", "evidence_ids": []}]},
+        {"session_id": sid, "answer": "a", "claims": [{"text": "finding suggests exposure", "evidence_ids": []}]},
         "m",
         context=ctx,
     )["error"]
     assert tools_mod._finalize_answer({"answer": "a"}) == "a"
-    assert tools_mod._finalize_claim_ids(["e"]) == ["e"]
+    assert tools_mod._finalize_claim_ids({"claim_type": "inference"}, ["e"]) == ["e"]
     with pytest.raises(ValueError):
-        tools_mod._finalize_claim_ids([])
+        tools_mod._finalize_claim_ids({"claim_type": "inference"}, [])
     with pytest.raises(ValueError):
         tools_mod._finalize_claim_text({"text": " "})
 
@@ -5438,7 +5479,10 @@ def _grounded(prompt: str) -> str:
     claims: list[dict[str, object]] = (
         []
         if not seen
-        else [{"text": f"grounded finding {chr(97 + i)}", "evidence_ids": [eid]} for i, eid in enumerate(seen[:6])]
+        else [
+            {"text": f"grounded finding {chr(97 + i)} suggests exposure", "evidence_ids": [eid]}
+            for i, eid in enumerate(seen[:6])
+        ]
     )
     if "Temporary assignment" in prompt:
         return json.dumps(claims)
@@ -5547,9 +5591,9 @@ def test_coerce_reused_findings_arms() -> None:
     mixed: list[object] = [
         "str",
         {"text": "", "evidence_ids": ["E1"]},
-        {"text": "t", "evidence_ids": []},
-        {"text": "t", "evidence_ids": ["", 42]},
-        {"text": " good ", "evidence_ids": ["E1", "E2"]},
+        {"text": "finding suggests exposure", "evidence_ids": []},
+        {"text": "finding suggests exposure", "evidence_ids": ["", 42]},
+        {"text": " finding suggests exposure ", "evidence_ids": ["E1", "E2"]},
     ]
     out = _LiveRun._coerce_reused_findings(mixed)
     first = out[0]
@@ -6453,7 +6497,7 @@ def _prompt_wave(prompt: str) -> int:
 def _scripted_claims(prompt: str) -> list[dict[str, object]]:
     """Grounded claims citing up to six ids the prompt actually acquired."""
     return [
-        {"text": f"finding {chr(97 + i)}", "evidence_ids": [eid]}
+        {"text": f"finding {chr(97 + i)} suggests exposure", "evidence_ids": [eid]}
         for i, eid in enumerate(_prompt_evidence_ids(prompt)[:6])
     ]
 
@@ -6891,11 +6935,28 @@ def test_replayed_provenance_rejection_precedence(
         "session_id": "other-session" if defect == "session" else sid,
         "job_id": "other-job" if defect in {"tool", "lane"} else jid,
         "tool_name": "wrong-tool" if defect in {"session", "tool"} else tool,
-        "result": {},
+        "result": {"records": [{"metric": "revenue grew"}]} if domain in ("FINRA", "SEC") else {},
     }
     if defect not in {"locator", "unknown"}:
         repo.save_tool_result(record)
-    data = {"tool_result_id": "replay", "matching_passage": "" if defect == "locator" else "missing passage"}
+    exact = (
+        {"tool_result_id": "replay", "matching_passage": json.dumps({"metric": "revenue grew"}, sort_keys=True)}
+        if domain in ("FINRA", "SEC")
+        else {"tool_result_id": "replay", "matching_passage": "missing passage"}
+    )
+    absent = (
+        {"tool_result_id": "replay", "matching_passage": json.dumps({"metric": "unrelated row"}, sort_keys=True)}
+        if domain in ("FINRA", "SEC")
+        else {"tool_result_id": "replay", "matching_passage": "missing passage"}
+    )
+    if defect == "locator":
+        data = {"tool_result_id": "replay", "matching_passage": ""}
+    elif defect == "passage":
+        data = absent
+    elif defect == "unknown" and domain == "WEB":
+        data = {"tool_result_id": "replay", "matching_passage": "missing passage"}
+    else:
+        data = exact
     expected = {
         "locator": "ERR_RAW_SOURCE_REQUIRED",
         "unknown": f"unknown persisted {'web' if domain == 'WEB' else domain} tool result",
@@ -6916,8 +6977,10 @@ def test_structured_provenance_replays_dataset_uri_and_timing(
 ) -> None:
     repo = _repo(tmp_path, monkeypatch)
     sid, jid = _sid(repo)
+    import json as _json
+
     payload = {
-        "records": [{"metric": "revenue grew"}],
+        "records": [{"metric": "revenue grew", "filed_at": KNOWN}],
         "dataset_id": "finra-data",
         "subject": "NVDA",
         "source_url": " https://sec.gov/persisted ",
@@ -6935,8 +6998,9 @@ def test_structured_provenance_replays_dataset_uri_and_timing(
         record.update(payload)
     repo.save_tool_result(record)
     provenance = svc._finra_provenance if domain == "FINRA" else svc._sec_record_provenance
-    out = provenance({"tool_result_id": "structured", "matching_passage": "revenue   grew"}, repo.get_job(jid))
-    assert out["record_identity"] == "revenue grew"
+    identity = _json.dumps(payload["records"][0], sort_keys=True)
+    out = provenance({"tool_result_id": "structured", "matching_passage": identity}, repo.get_job(jid))
+    assert out["record_identity"] == identity
     assert out["tool_result_id"] == "structured"
     assert out["dataset"] == ("finra-data" if domain == "FINRA" else "NVDA")
     assert out["known_at"] == KNOWN
@@ -6945,13 +7009,23 @@ def test_structured_provenance_replays_dataset_uri_and_timing(
         declared = provenance(
             {
                 "tool_result_id": "structured",
-                "matching_passage": "revenue grew",
-                "source_uri": "https://sec.gov/declared",
+                "matching_passage": identity,
+                "source_uri": "https://sec.gov/persisted",
             },
             store=repo,
             session_id=sid,
         )
-        assert declared["source_uri"] == "https://sec.gov/declared"
+        assert declared["source_uri"] == "https://sec.gov/persisted"
+        with pytest.raises(ValueError, match="ERR_PROVENANCE_MISMATCH"):
+            provenance(
+                {
+                    "tool_result_id": "structured",
+                    "matching_passage": identity,
+                    "source_uri": "https://sec.gov/declared",
+                },
+                store=repo,
+                session_id=sid,
+            )
 
 
 def test_web_provenance_skips_uncitable_rows_and_rejects_ambiguous_match(
@@ -7450,6 +7524,7 @@ def test_regweb_web_datapoint_value_must_be_excerpt_verbatim(tmp_path: Path, mon
                 "matching_passage": "NVDA demand rises",
                 "known_at": KNOWN,
                 "value": "Quarter body",
+                "metric": "NVDA demand",
                 "entity": "NVDA",
                 "period": "2025-Q2",
             },
@@ -7555,9 +7630,14 @@ def test_reg4_finra_replay_selects_cited_not_first_row(tmp_path: Path, monkeypat
         }
     )
     out = svc._finra_provenance(
-        {"tool_result_id": "board", "matching_passage": '"pct": 20.0'}, store=repo, session_id=sid
+        {
+            "tool_result_id": "board",
+            "matching_passage": json.dumps({"pct": 20.0, "ticker": "BBB"}, sort_keys=True),
+        },
+        store=repo,
+        session_id=sid,
     )
-    assert '"pct": 20.0' in str(out["record_identity"]) and '"pct": 30.0' not in str(out["record_identity"])
+    assert str(out["record_identity"]) == json.dumps({"pct": 20.0, "ticker": "BBB"}, sort_keys=True)
 
 
 def test_reg4_finra_conflict_preserved_not_silently_preferred(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -7574,7 +7654,11 @@ def test_reg4_finra_conflict_preserved_not_silently_preferred(tmp_path: Path, mo
         }
     )
     with pytest.raises(ValueError, match="ERR_PASSAGE_NOT_IN_SOURCE"):
-        svc._finra_provenance({"tool_result_id": "one", "matching_passage": '"pct": 99.9'}, store=repo, session_id=sid)
+        svc._finra_provenance(
+            {"tool_result_id": "one", "matching_passage": json.dumps({"pct": 99.9, "ticker": "AAA"})},
+            store=repo,
+            session_id=sid,
+        )
 
 
 def test_reg4_finra_absence_stays_coverage_never_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -7647,13 +7731,10 @@ def test_e2e_archived_bytes_removed_after_freeze_never_publish(tmp_path: Path, m
     # Ledger hashes stay stable. The publication check must still replay the missing archive.
     verify_freeze(frozen, list(rows.values()))
     claim = GroundedClaim(
-        text="NVDA revenue was 26,044 million",
+        text="NVDA Q1 FY2025 total revenue was $26,044 million.",
         claim_type="observed_fact",
         evidence_ids=[evidence.evidence_id],
-        value="26,044",
-        entity=evidence.entity,
-        period=evidence.period,
-        unit=evidence.unit,
+        datapoint_ids=[_dp_id(e2e.repo, evidence.evidence_id)],
     )
     with pytest.raises(ValueError, match="ERR_PROOF_UNVERIFIED"):
         svc.require_verified_claims(e2e.repo, e2e.sid, [claim], "acceptance")

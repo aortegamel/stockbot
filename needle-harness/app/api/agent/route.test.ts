@@ -3,12 +3,13 @@ import fc from "fast-check";
 import { FINAL_PERSONAS, type Evidence } from "@/lib/agent/types";
 // Real validator captured before mock.module replaces the kernel exports; route.ts must see the production rule.
 // The final gates run for real too; only the worker call behind them is scripted.
-import { asksWatchlist, dropUncovered, gateAnswer, parseTicker, parseWatchlist } from "@/lib/agent/kernel";
+import { asksWatchlist, dropUncovered, gateAnswer, parseTicker, parseWatchlist, qualifiedEvidenceFree } from "@/lib/agent/kernel";
 const realParseTicker = parseTicker;
 const realParseWatchlist = parseWatchlist;
 const realAsksWatchlist = asksWatchlist;
 const realGateAnswer = gateAnswer;
 const realDropUncovered = dropUncovered;
+const realQualifiedEvidenceFree = qualifiedEvidenceFree;
 
 // Mutable stubs reconfigured per test; route.ts is imported dynamically after
 // mock.module setup because static imports would bind the real kernel/muse
@@ -31,8 +32,8 @@ let assessReply: Record<string, unknown> | null = null;
 let gateReply: Record<string, unknown> = { support_answer: "yes" };
 const gateBodies: Record<string, unknown>[] = [];
 // The reasoner's answer text and claims inventory.
-let reasonText = "hi";
-let reasonClaims: unknown[] = [];
+let reasonText = "The answer is unknown.";
+let reasonClaims: unknown[] = [{ text: reasonText, claimType: "unknown", evidenceIds: [] }];
 let toolFailure: { category: string; error: string } | null = null;
 let toolThrows: unknown = null;
 let endThrows = false;
@@ -76,6 +77,7 @@ mock.module("@/lib/agent/kernel", () => ({
   asksWatchlist: realAsksWatchlist,
   gateAnswer: realGateAnswer,
   dropUncovered: realDropUncovered,
+  qualifiedEvidenceFree: realQualifiedEvidenceFree,
   kernelRouter: {
     call: async (body: KernelCall, opts?: { signal?: AbortSignal; timeoutMs?: number }) => {
       kernelOpts.push(opts);
@@ -195,8 +197,8 @@ function reset(): void {
   assessReply = null;
   gateReply = { support_answer: "yes" };
   gateBodies.length = 0;
-  reasonText = "hi";
-  reasonClaims = [];
+  reasonText = "The answer is unknown.";
+  reasonClaims = [{ text: reasonText, claimType: "unknown", evidenceIds: [] }];
   toolFailure = null;
   toolThrows = null;
   endThrows = false;
@@ -361,6 +363,8 @@ describe("agent entry route", () => {
     process.env.OPENCODE_MODEL = "test-model";
     try {
       winner = "no_session";
+      reasonText = "Assume the discount rate is 10%.";
+      reasonClaims = [{ text: reasonText, claimType: "assumption", evidenceIds: [] }];
       const types = (await eventsFor("hello")).map((e) => e.type);
       expect(types).toEqual(["agent_start", "status", "reasoning_start", "answer_delta", "done"]);
       expect(runCalls.length).toBe(0);
@@ -391,7 +395,7 @@ describe("agent entry route", () => {
     winner = "get_current_time";
     const events = await eventsFor("what time is it?");
     const types = events.map((e) => e.type);
-    expect(types).toEqual(["agent_start", "status", "needle_decision", "tool_start", "status", "tool_result", "status", "evidence", "reasoning_start", "answer_delta", "done"]);
+    expect(types).toEqual(["agent_start", "status", "needle_decision", "tool_start", "status", "tool_result", "status", "evidence", "reasoning_start", "answer_delta", "claims", "done"]);
     // Readable progress precedes the tool result: the route line first, then the tool phrase, then the count.
     expect(events.flatMap((e) => (e.type === "status" ? [e.text] : []))).toEqual(["Looking up the current time…", "Checking the current time", "Found 1 source"]);
     expect(events.filter((e) => e.type === "tool_start").length).toBe(1);
@@ -408,20 +412,21 @@ describe("agent entry route", () => {
   test("a single-tool answer is buffered, gated with its session, and never shows an unproven number", async () => {
     reset();
     winner = "query_finra";
-    const fact = { text: "Short interest was 12.5% [ev:bridge].", claimType: "observed_fact", evidenceIds: ["ev:bridge"], value: "12.5%", entity: "NVDA", period: "2026-10-15", unit: "percent" };
+    const fact = { text: "NVDA short interest for 2026-10-15 was 12.5% [ev:bridge].", claimType: "observed_fact", evidenceIds: ["ev:bridge"], datapointIds: ["dp:short-interest"] };
+    const datapoint = { id: "dp:short-interest", metric: "shortInterest", value: "12.5", entity: "NVDA", period: "2026-10-15", unit: "%", statement: fact.text };
     reasonText = `${fact.text} Volume hit 99 million. More filings may follow.`;
     reasonClaims = [fact];
-    entryReplies = [{ sessionId: "rs:entry", evidence: [{ ...bridgeEvidence, source: "FINRA", content: fact.text }], content: fact.text }];
+    entryReplies = [{ sessionId: "rs:entry", evidence: [{ ...bridgeEvidence, source: "FINRA", content: fact.text, datapoints: [datapoint] }], content: fact.text }];
     const events = await eventsFor("short interest?");
     // The streamed reasoner delta never reaches the client: one gated answer only.
-    expect(events.filter((e) => e.type === "answer_delta")).toEqual([{ type: "answer_delta", text: `${fact.text} More filings may follow.` }]);
+    expect(events.filter((e) => e.type === "answer_delta")).toEqual([{ type: "answer_delta", text: fact.text }]);
     expect(events.slice(-3).map((e) => e.type)).toEqual(["answer_delta", "claims", "done"]);
     expect(events.find((e) => e.type === "claims")?.claims).toEqual([fact]);
     expect(gateBodies).toHaveLength(1);
     expect(gateBodies[0]).toMatchObject({
       op: "assess_final_response",
       sessionId: "rs:entry",
-      claims: [{ text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:bridge"], value: "12.5%", entity: "NVDA", period: "2026-10-15", unit: "percent" }],
+      claims: [{ text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:bridge"], datapoint_ids: ["dp:short-interest"] }],
     });
     expect(runCalls).toEqual([]);
   });
@@ -429,9 +434,11 @@ describe("agent entry route", () => {
   test("a rejected single-tool number is withheld with an explicit refusal, never retried in research", async () => {
     reset();
     winner = "query_finra";
-    reasonText = "Short interest was 12.5% [ev:bridge].";
-    reasonClaims = [{ text: reasonText, claimType: "observed_fact", evidenceIds: ["ev:bridge"], value: "12.5%" }];
-    gateReply = { error: "proof: value does not match the archived row" };
+    reasonText = "NVDA short interest for 2026-10-15 was 12.5% [ev:bridge].";
+    reasonClaims = [{ text: reasonText, claimType: "observed_fact", evidenceIds: ["ev:bridge"], datapointIds: ["dp:short-interest"] }];
+    const datapoint = { id: "dp:short-interest", metric: "shortInterest", value: "12.5", entity: "NVDA", period: "2026-10-15", unit: "%", statement: reasonText };
+    entryReplies = [{ sessionId: "rs:entry", evidence: [{ ...bridgeEvidence, datapoints: [datapoint] }], content: reasonText }];
+    gateReply = { error: "proof: datapoint does not match the archived row" };
     const events = await eventsFor("short interest?");
     expectVerificationRefusal(events);
     expect(gateBodies.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_claim"]);
@@ -476,18 +483,39 @@ describe("agent entry route", () => {
     }
   });
 
-  test("a direct answer is buffered and drops every datapoint sentence; nothing left researches", async () => {
+  test("a direct answer is buffered and keeps only qualified evidence-free inventory; nothing left researches", async () => {
     reset();
-    reasonText = "NVDA rose 12% today. Ask me for sources.";
+    const unknown = { text: "The source is unavailable.", claimType: "unknown", evidenceIds: [] };
+    reasonText = `NVDA rose 12% today. ${unknown.text}`;
+    reasonClaims = [unknown];
     const events = await eventsFor("hello");
-    expect(events.filter((e) => e.type === "answer_delta")).toEqual([{ type: "answer_delta", text: "Ask me for sources." }]);
+    expect(events.filter((e) => e.type === "answer_delta")).toEqual([{ type: "answer_delta", text: unknown.text }]);
     expect(gateBodies).toEqual([]);
     expect(runCalls).toEqual([]);
     reset();
     reasonText = "NVDA rose 12% today.";
+    reasonClaims = [];
     const empty = await eventsFor("hello");
     expect(empty.some((e) => e.type === "answer_delta")).toBe(false);
     expect(runCalls).toHaveLength(1);
+  });
+
+  test("unqualified direct prose falls back to research without publishing an answer", async () => {
+    for (const route of ["reasoning_required", "no_session"]) {
+      for (const claimType of [undefined, "unknown", "assumption"]) {
+        reset();
+        winner = route;
+        reasonText = "NVDA dominates its market.";
+        reasonClaims = claimType ? [{ text: reasonText, claimType, evidenceIds: [] }] : [];
+        const events = await eventsFor("NVDA outlook?");
+        expect(events.map((event) => event.type)).toEqual(["agent_start", "status", "reasoning_start"]);
+        expect(reasonCalls).toHaveLength(1);
+        expect(reasonCalls[0].evidence).toEqual([]);
+        expect(gateBodies).toEqual([]);
+        expect(runCalls).toHaveLength(1);
+        expect(runCalls[0]?.[0]).toBe("NVDA outlook?");
+      }
+    }
   });
 
   test("status lines name the tool subject in prod, bound untrusted queries, and open the direct route", async () => {
@@ -669,7 +697,7 @@ describe("agent entry route", () => {
     delete process.env.STOCKBOT_DEBUG;
     winner = "get_current_time";
     const prod = await eventsFor("what time is it?");
-    expect(prod.map((e) => e.type)).toEqual(["agent_start", "status", "status", "status", "evidence", "reasoning_start", "answer_delta", "done"]);
+    expect(prod.map((e) => e.type)).toEqual(["agent_start", "status", "status", "status", "evidence", "reasoning_start", "answer_delta", "claims", "done"]);
     reset();
     winner = "get_current_time";
     const debug = await eventsFor("what time is it?");
@@ -684,6 +712,7 @@ describe("agent entry route", () => {
       "evidence",
       "reasoning_start",
       "answer_delta",
+      "claims",
       "done",
     ]);
   });
@@ -1091,7 +1120,7 @@ describe("agent entry route", () => {
     expect(runCalls).toEqual([]);
     expect(reasonCalls).toHaveLength(1);
     expect(reasonCalls[0].evidence).toHaveLength(3);
-    expect(events.slice(-3).map((e) => e.type)).toEqual(["reasoning_start", "answer_delta", "done"]);
+    expect(events.slice(-4).map((e) => e.type)).toEqual(["reasoning_start", "answer_delta", "claims", "done"]);
     expect(metricCalls(events, "tools")).toBe(3);
   });
 
@@ -1138,7 +1167,7 @@ describe("agent entry route", () => {
     expect(ended).toEqual([]);
     expect(sessionsCreated).toBe(0);
     expect(runCalls).toEqual([]);
-    expect(events.slice(-2).map((e) => e.type)).toEqual(["answer_delta", "done"]);
+    expect(events.slice(-3).map((e) => e.type)).toEqual(["answer_delta", "claims", "done"]);
   });
 
   test("single-shot reasoning failure emits the original error without research", async () => {
@@ -1245,7 +1274,7 @@ describe("agent entry route", () => {
         expect(kernelCalls.map((call) => call.op)).toEqual(["route"]);
         if (selection === null) {
           expect(reasonCalls[0]).toMatchObject({ ticker: "AAPL", evidence: [] });
-          expect(events.at(-2)).toEqual({ type: "answer_delta", text: "hi" });
+          expect(events.at(-2)).toEqual({ type: "answer_delta", text: reasonText });
         } else {
           expect(runCalls[0]?.[2]).toMatchObject({ personas: selection, ticker: "AAPL", currentChartTicker: "AAPL" });
         }
@@ -1285,7 +1314,7 @@ describe("agent entry route", () => {
       expect(events.some((event) => event.type === "chart_update")).toBe(false);
       expect(events.some((event) => event.type === "error" || event.type === "failed")).toBe(false);
       expect(String(events[0]?.text)).toContain("Chart update failed:");
-      expect(events.at(-2)).toEqual({ type: "answer_delta", text: "hi" });
+      expect(events.at(-2)).toEqual({ type: "answer_delta", text: reasonText });
       expect(reasonCalls[0]).toMatchObject({ ticker: "AAPL", evidence: [] });
       expect(ended).toEqual(["sess-test"]);
       expect(runCalls).toEqual([]);

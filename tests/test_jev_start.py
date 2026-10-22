@@ -1858,8 +1858,9 @@ def test_assess_final_claim_conditional_and_missing(tmp_path: Path) -> None:
         asyncio.run(client.assess_final_claim("x", "  ", [], session_id="s1"))
 
 
-def test_assess_final_ops_fail_closed() -> None:
+def test_assess_final_ops_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import app.research.kernel_worker as kw
+    import tests.research_source_seam as seam
 
     blank = kw._assess_final_response({"id": "r1", "op": "assess_final_response", "text": "  "})
     assert blank["support"] is None and blank["support_answer"] is None and blank["evidence_state"] == "insufficient"
@@ -1894,17 +1895,28 @@ def test_assess_final_ops_fail_closed() -> None:
         ) -> dict[str, JSONValue]:
             raise RuntimeError("jev down")
 
-    down_r = kw._assess_final_response({"id": "r2", "text": "x", "evidence": []}, jev=_Boom())
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "The filing discusses exposure."})
+    inventory: dict[str, JSONValue] = {
+        "text": "The filing may suggest exposure.",
+        "claim_type": "inference",
+        "evidence_ids": ["ev-1"],
+    }
+    down_r = kw._assess_final_response(
+        {"id": "r2", "sessionId": sid, "text": inventory["text"], "claims": [inventory], "evidence": []}, jev=_Boom()
+    )
     assert down_r["support"] is None and down_r["support_answer"] is None and down_r["evidence_state"] == "insufficient"
+    assert down_r["error"] == "jev down"
     down_c = kw._assess_final_claim(
         {
             "id": "c2",
-            "claim": {"text": "x", "claim_type": "inference", "evidence_ids": []},
+            "sessionId": sid,
+            "claim": inventory,
             "evidence": [],
         },
         jev=_Boom(),
     )
     assert down_c["support"] is None and down_c["evidence_state"] == "insufficient"
+    assert down_c["error"] == "jev down"
 
 
 def test_assess_final_ops_shape_and_alias(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1918,7 +1930,7 @@ def test_assess_final_ops_shape_and_alias(tmp_path: Path, monkeypatch: pytest.Mo
         {
             "id": "r3",
             "op": "assess_final_response",
-            "text": "WSJ reported X; if Y then Z.",
+            "text": "WSJ reported X. If Y then Z.",
             "claims": [
                 {
                     "text": "WSJ reported X.",

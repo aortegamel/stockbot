@@ -6,7 +6,7 @@ opt-in via tests/test_finra_smoke.py (pytest -m finra_smoke).
 """
 
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Self, override
@@ -1861,6 +1861,81 @@ def test_reg4_file_vs_api_conflict_preserved(reg4_get: MagicMock, tmp_path: Path
         finra_client.resolve_finra_official("otcMarket/regShoDaily", absent, {}, root=tmp_path)
 
 
+_FNQC_HEADER = "Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market"
+_FNQC_NVDA = "20261015|NVDA|274457.043010|1022|934921.209763|B"
+
+
+def _resolve_fnqc(
+    monkeypatch: pytest.MonkeyPatch, root: Path, lines: list[str], row: Mapping[str, object] = _NVDA_FNQC_ROW
+) -> dict[str, object] | None:
+    """Resolve ``row`` against an FNQC file made of ``lines`` under a fresh archive root."""
+    body = "\n".join([_FNQC_HEADER, *lines, str(len(lines))]).encode() + b"\n"
+    monkeypatch.setattr("app.finra_client.requests.get", MagicMock(return_value=MagicMock(content=body)))
+    return finra_client.resolve_finra_official("otcMarket/regShoDaily", row, {}, root=root)
+
+
+def test_official_line_skips_earlier_disagreeing_duplicate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Earlier NVDA lines with another value, day, or venue never hide the later line that agrees."""
+    earlier = [
+        "20261015|NVDA|1|1022|934921.209763|B",
+        "20261014|NVDA|274457.043010|1022|934921.209763|B",
+        "20261015|NVDA|274457.043010|1022|934921.209763|Q",
+    ]
+    page = _resolve_fnqc(monkeypatch, tmp_path, [*earlier, _FNQC_NVDA])
+    assert page is not None and page["quote"] == _FNQC_NVDA
+
+
+def test_official_line_rejects_wrong_day_and_venue(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The Date and Market cells are identity fields: a lone line for another day or venue is a conflict."""
+    with pytest.raises(finra_client.OfficialFileConflict, match="Date='20261014' disagrees"):
+        _resolve_fnqc(monkeypatch, tmp_path / "day", ["20261014|NVDA|274457.043010|1022|934921.209763|B"])
+    # A facility-only row (no marketCode) still needs a Market cell that maps to its facility file.
+    facility_only = {k: v for k, v in _NVDA_FNQC_ROW.items() if k != "marketCode"}
+    with pytest.raises(finra_client.OfficialFileConflict, match="Market='Q' disagrees"):
+        _resolve_fnqc(
+            monkeypatch, tmp_path / "venue", ["20261015|NVDA|274457.043010|1022|934921.209763|Q"], facility_only
+        )
+
+
+def test_official_line_rejects_ambiguous_agreeing_duplicates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Two lines agree with every cited value but differ in an uncited cell: neither is chosen by position."""
+    row = {k: v for k, v in _NVDA_FNQC_ROW.items() if k != "shortExemptParQuantity"}
+    other = "20261015|NVDA|274457.043010|9|934921.209763|B"
+    for name, lines in (("ab", [_FNQC_NVDA, other]), ("ba", [other, _FNQC_NVDA])):
+        with pytest.raises(finra_client.OfficialFileConflict, match="2 ambiguous lines for NVDA"):
+            _resolve_fnqc(monkeypatch, tmp_path / name, lines, row)
+
+
+def test_official_line_equivalent_duplicates_cite_one_line_in_any_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Equal-valued duplicates (274457.043010 == 274457.04301) pass and cite the same line in either order."""
+    twin = "20261015|NVDA|274457.04301|1022.0|934921.209763|B"
+    first = _resolve_fnqc(monkeypatch, tmp_path / "ab", [_FNQC_NVDA, twin])
+    second = _resolve_fnqc(monkeypatch, tmp_path / "ba", [twin, _FNQC_NVDA])
+    assert first is not None and second is not None
+    assert first["quote"] == second["quote"] == min(_FNQC_NVDA, twin)
+
+
+def test_official_line_conflicts_are_typed_but_archive_corruption_is_not(reg4_get: MagicMock, tmp_path: Path) -> None:
+    """Missing and disagreeing lines raise OfficialFileConflict. A bad archive stays a plain ValueError."""
+    with pytest.raises(finra_client.OfficialFileConflict, match="no line for ZZZ"):
+        finra_client.resolve_finra_official(
+            "otcMarket/regShoDaily",
+            {**_NVDA_FNQC_ROW, "securitiesInformationProcessorSymbolIdentifier": "ZZZ"},
+            {},
+            root=tmp_path,
+        )
+    page = finra_client.resolve_finra_official("otcMarket/regShoDaily", _NVDA_FNQC_ROW, {}, root=tmp_path)
+    assert page is not None and isinstance(page["url"], str)
+    record = finra_client.raw_archive.find("finra", "official_file", page["url"], root=tmp_path / "raw")
+    assert record is not None
+    record.payload_path.write_bytes(b"edited")
+    with pytest.raises(ValueError, match="content hash") as info:
+        finra_client.resolve_finra_official("otcMarket/regShoDaily", _NVDA_FNQC_ROW, {}, root=tmp_path)
+    assert not isinstance(info.value, finra_client.OfficialFileConflict)
+
+
 def test_reg4_archive_hash_mismatch_fails_closed(reg4_get: MagicMock, tmp_path: Path) -> None:
     """Edited archived bytes never verify: the archive read re-checks the content hash and never refetches."""
     from app.storage import raw_archive as _archive
@@ -1936,7 +2011,14 @@ def test_reg4_weekly_threshold_records_cite_payload_json(
         dataset="otcMarket/weeklySummary",
         tool_result_id="tr-weekly",
     )
-    proof = observation_proof(provenance=prov, source_bytes=payload_bytes, value="12345")
+    proof = observation_proof(
+        provenance=prov,
+        source_bytes=payload_bytes,
+        value="12345",
+        metric="totalShareQuantity",
+        entity="NVDA",
+        period="2026-10-13",
+    )
     assert proof["sourceId"] == f"sha256:{digest}"
     row_proof = {
         "kind": "observation",

@@ -886,12 +886,21 @@ def _render_record(
 
     Return (official page URL, text fragment, (failure, reason) for a missing page). A failed
     official fetch drops only the public link: the held record still renders, nothing persisted changes.
+    A published FINRA file that disagrees with the cited row or holds ambiguous lines also drops the
+    public link. The held record renders, and ``sourceConflict`` reports the file conflict apart from
+    the API proof verdict in ``audit``. Archive corruption and other errors still raise.
     """
+    from app.finra_client import OfficialFileConflict
+
     try:
         official = _official_page(document, record, root)
         missing = ("PUBLIC_PAGE_UNAVAILABLE", "resolver found no official page for the cited record")
     except OSError as exc:
         official, missing = None, ("SOURCE_UNAVAILABLE", f"official page fetch failed: {exc}")
+    except OfficialFileConflict as exc:
+        failure = failure_reason(exc)
+        official, missing = None, (failure, f"published file conflicts with the cited record: {exc}")
+        document["sourceConflict"] = {"failure": failure, "reason": str(exc)}
     if official is None:
         # No official page: the Stockbot view shows the cited row (the whole payload when none was cited).
         row, payload = record.get("row"), record.get("payload")
@@ -956,8 +965,12 @@ _AUDIT_TEXT_KEYS = (
 )
 
 
-def _audit_node(view: Mapping[str, object]) -> dict[str, object]:
-    """Viewer shape of one audit view: typed value, verification, source identity, inputs. No API URLs."""
+def _audit_node(view: Mapping[str, object], rows: Mapping[str, Mapping[str, object]]) -> dict[str, object]:
+    """Viewer shape of one audit view: typed value, verification, source identity, inputs. No API URLs.
+
+    A verified node also carries its kernel-built canonical ``datapoint`` descriptor (with its id).
+    The replay verdict rebuilds and compares that descriptor, so an unverified node never shows one.
+    """
     evidence_id = _text(view, "evidence_id")
     node: dict[str, object] = {
         "evidenceId": evidence_id,
@@ -974,9 +987,16 @@ def _audit_node(view: Mapping[str, object]) -> dict[str, object]:
     identity = {name: _text(source, key) for name, key in fields if _text(source, key)}
     if identity:
         node["source"] = identity
+    proof = rows.get(evidence_id, {}).get("proof")
+    if node["verification"] == "verified" and isinstance(proof, Mapping):
+        locator = proof.get("locator")
+        # Observations hold the descriptor in their locator; calculations hold it on the proof.
+        datapoint = proof.get("datapoint") or (locator.get("datapoint") if isinstance(locator, Mapping) else None)
+        if isinstance(datapoint, Mapping):
+            node["datapoint"] = dict(datapoint)
     inputs = view.get("inputs")
     if isinstance(inputs, list):
-        node["inputs"] = [_audit_node(item) for item in inputs if isinstance(item, Mapping)]
+        node["inputs"] = [_audit_node(item, rows) for item in inputs if isinstance(item, Mapping)]
     return node
 
 
@@ -1015,7 +1035,7 @@ def _audit(store: object, evidence: Mapping[str, object], source_id: str) -> dic
     if isinstance(store, ResearchRepository) and isinstance(session_id, str):
         rows.update(_session_rows(store, session_id))
     rows.setdefault(_text(evidence, "evidence_id"), evidence)
-    audit = _audit_node(_calculation_view(evidence, rows, ""))
+    audit = _audit_node(_calculation_view(evidence, rows, ""), rows)
     repairs = _repair_summary(
         store, _text(evidence, "evidence_id"), session_id if isinstance(session_id, str) else None
     )

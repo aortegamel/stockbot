@@ -29,20 +29,31 @@ CLAIM_TYPES = (
 
 ``observed_fact``/``calculation``/``contradicted``/``inference``/``conditional_risk``/
 ``attributed_report`` need at least one freeze id; ``unknown`` (nothing located
-within the searched scope) may cite none, and so may an ``assumption`` without a
-``value`` (a labeled hypothetical, never a verified fact). ``calculation`` cites
-the calculation ledger row whose proof recomputes its ``value``.
+within the searched scope) and ``assumption`` (a labeled hypothetical, never a
+verified fact) may cite none. ``calculation`` references the canonical
+calculation datapoint whose proof recomputes its value.
 ``conditional_risk`` is a risk disclosure: the cited passage supports the risk as
 stated, not that the risk materialized. ``attributed_report`` is a reporting
 claim: the cited passage supports that the report was made, not the underlying
-reported event.
+reported event. The publication gate (``service.require_verified_claims``)
+checks the explicit qualifier each non-observation type needs.
 """
 
-DATAPOINT_FIELDS = ("value", "entity", "period", "unit")
-"""Typed datapoint carrier on one claim (same wire names in Python and TS)."""
+DATAPOINT_ID_PREFIX = "dp:"
+"""Kernel-created canonical datapoint ids (``evidence.canonical_datapoint``); claims reference them via ``datapoint_ids``."""
 
-_VALUELESS_TYPES = frozenset({"inference", "unknown"})
-"""Claim types that never carry a datapoint value (an inference stays qualified)."""
+CLAIM_WORDING_RULE = (
+    " A claim that states a number lists datapoint_ids: the exact dp: ids of the evidence datapoints it states,"
+    " and cites their rows in evidence_ids."
+    " Write each datapoint's metric label, then its value, in one sentence, and name its entity, period, and unit"
+    " as the datapoint spells them. State no other number. Add no wording beyond the datapoint fields and statement."
+    " An observed_fact without a number copies one source sentence verbatim."
+    " An observed number stays observed_fact and a calculated one stays calculation."
+    " inference wording hedges (suggests, likely, may); an assumption opens with Assuming or If;"
+    " unknown wording says what was not found or is unknown; conditional_risk states the condition (if, could, may, risk);"
+    " attributed_report names who reported or stated it; contradicted says what conflicts."
+)
+"""Producer contract for the publication gate (``service._claim_proof_defect``); shared by every claim prompt."""
 
 MATERIALITY_LEVELS = ("critical", "high", "medium", "low")
 
@@ -98,15 +109,16 @@ class CommitteeMateriality:
 
 @dataclass
 class GroundedClaim:
-    """One claim with its declared type, freeze-contained evidence links, and optional typed datapoint."""
+    """One claim: declared type, freeze-contained evidence links, canonical datapoint references.
+
+    A claim never asserts metric/value/entity/period/unit itself: each number it
+    states resolves through ``datapoint_ids`` to a kernel-created descriptor.
+    """
 
     text: str
     claim_type: str = "inference"
     evidence_ids: list[str] = field(default_factory=list)
-    value: str | None = None
-    entity: str | None = None
-    period: str | None = None
-    unit: str | None = None
+    datapoint_ids: list[str] = field(default_factory=list)
 
 
 def _frozen_set(frozen: Sequence[str]) -> set[str]:
@@ -159,46 +171,40 @@ def _grounded_ids(raw_ids: object, frozen_set: set[str]) -> list[str] | None:
 def _claim_ids(item: dict[object, object], raw_text: str, frozen_set: set[str], claim_type: str) -> list[str]:
     """Validated deduped evidence ids, all contained in the freeze.
 
-    ``unknown`` and a value-less ``assumption`` may cite nothing; every other claim needs at least one id.
+    ``unknown`` and ``assumption`` without datapoint references may cite nothing; every other claim needs an id.
     """
     seen = _grounded_ids(item.get("evidence_ids"), frozen_set)
     if seen is None:
         raise ModelOutputFailure("each claim needs an evidence_ids list of ids")
-    citeless = claim_type == "unknown" or (claim_type == "assumption" and item.get("value") is None)
+    citeless = claim_type in ("unknown", "assumption") and not item.get("datapoint_ids")
     if not seen and not citeless:
         raise ModelOutputFailure(f"uncited {claim_type} claim: {raw_text[:120]!r}")
     return seen
 
 
-def _datapoint(item: dict[object, object], raw_text: str, claim_type: str) -> dict[str, str | None]:
-    """Typed datapoint fields: each absent/None or a non-blank string; the value sits verbatim in the text."""
-    out: dict[str, str | None] = {}
-    for key in DATAPOINT_FIELDS:
-        raw = item.get(key)
-        if raw is not None and (not isinstance(raw, str) or not raw.strip()):
-            raise ModelOutputFailure(f"claim {key} must be a non-empty string when present, got {raw!r}")
-        out[key] = raw.strip()[:500] if isinstance(raw, str) else None
-    value = out["value"]
-    if value is not None and claim_type in _VALUELESS_TYPES:
-        raise ModelOutputFailure(f"{claim_type} claim cannot carry a datapoint value: {raw_text[:120]!r}")
-    if value is None and claim_type == "calculation":
-        raise ModelOutputFailure(f"calculation claim needs a value: {raw_text[:120]!r}")
-    if value is not None and value not in raw_text:
-        raise ModelOutputFailure(f"claim value {value!r} is not verbatim in its text: {raw_text[:120]!r}")
-    return out
+def _datapoint_ids(item: dict[object, object], raw_text: str, claim_type: str) -> list[str]:
+    """Deduped canonical datapoint ids (absent means none); a calculation needs at least one."""
+    raw = item.get("datapoint_ids", [])
+    if not isinstance(raw, list) or any(
+        not isinstance(dp, str) or not dp.startswith(DATAPOINT_ID_PREFIX) for dp in raw
+    ):
+        raise ModelOutputFailure(f"claim datapoint_ids must be a list of {DATAPOINT_ID_PREFIX!r} ids, got {raw!r}")
+    if not raw and claim_type == "calculation":
+        raise ModelOutputFailure(f"calculation claim needs datapoint_ids: {raw_text[:120]!r}")
+    return list(dict.fromkeys(raw))
 
 
-_CLAIM_KEYS = frozenset({"text", "claim_type", "evidence_ids", *DATAPOINT_FIELDS})
+_CLAIM_KEYS = frozenset({"text", "claim_type", "evidence_ids", "datapoint_ids"})
 
 
 def _build_claim(item: object, frozen_set: set[str]) -> GroundedClaim:
-    """Validate one {text, claim_type, evidence_ids, value?, entity?, period?, unit?} record against the freeze."""
+    """Validate one {text, claim_type, evidence_ids, datapoint_ids?} record against the freeze."""
     if not isinstance(item, dict):
         raise ModelOutputFailure("each claim must be {text, claim_type, evidence_ids}")
     keys = set(item)
     if keys - _CLAIM_KEYS or "evidence_ids" not in keys or "text" not in keys:
         raise ModelOutputFailure(
-            "each claim must contain {text, claim_type, evidence_ids} plus only optional value/entity/period/unit"
+            "each claim must contain {text, claim_type, evidence_ids} plus only optional datapoint_ids"
         )
     raw_text = _claim_text(item)
     claim_type = _claim_type(item)
@@ -206,7 +212,7 @@ def _build_claim(item: object, frozen_set: set[str]) -> GroundedClaim:
         text=raw_text.strip()[:500],
         claim_type=claim_type,
         evidence_ids=_claim_ids(item, raw_text, frozen_set, claim_type),
-        **_datapoint(item, raw_text.strip()[:500], claim_type),
+        datapoint_ids=_datapoint_ids(item, raw_text, claim_type),
     )
 
 
@@ -214,12 +220,12 @@ def parse_grounded_claims(text: str, *, frozen: Sequence[str]) -> list[GroundedC
     """Parse model JSON records; each claim must cite only freeze ids.
 
     Expected shape: [{"text": "...", "claim_type": "...", "evidence_ids": [...]}, ...]
-    plus optional typed ``value``/``entity``/``period``/``unit`` strings. A missing
-    ``claim_type`` is ``inference``; ``unknown`` (and a value-less ``assumption``)
-    may leave ``evidence_ids`` empty. Unknown IDs (e.g. EV-999), uncited claims,
-    a value on an inference/unknown, a value missing from the text, or
-    blank/non-JSON output raise ``ModelOutputFailure``. Represent nothing found
-    explicitly as [].
+    plus optional ``datapoint_ids`` (kernel ``dp:`` ids). A missing ``claim_type``
+    is ``inference``; ``unknown`` and ``assumption`` may leave ``evidence_ids``
+    empty when they reference no datapoint. Unknown IDs (e.g. EV-999), uncited
+    claims, a calculation without datapoint_ids, claim-level value/entity/period/unit
+    keys, or blank/non-JSON output raise ``ModelOutputFailure``. Represent nothing
+    found explicitly as [].
     """
     frozen_set = _frozen_set(frozen)
     return [_build_claim(item, frozen_set) for item in _decode_claims_list(text)]
@@ -508,6 +514,7 @@ def parse_committee_output(
 
 __all__ = [
     "CLAIM_TYPES",
+    "CLAIM_WORDING_RULE",
     "COMMITTEE_ENVELOPE_ERROR",
     "COMMITTEE_REQUIRED_KEYS",
     "MATERIALITY_LEVELS",

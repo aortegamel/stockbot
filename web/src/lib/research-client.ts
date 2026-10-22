@@ -1,7 +1,8 @@
 // Backend-state reads: research snapshot + journal tail for the terminal.
 // Snapshot restores state on reload; journal polls for logs; live work streams
 // over POST /api/agent SSE. No mock chat or positions here.
-import { safeSourceUrl, SOURCE_ID_RE } from "../../../needle-harness/lib/agent/types";
+import { readDatapoints, safeSourceUrl, SOURCE_ID_RE } from "../../../needle-harness/lib/agent/types";
+import type { Datapoint } from "../../../needle-harness/lib/agent/types";
 
 export type ResearchSnapshot = {
   session?: { session_id?: string; status?: string; query?: string; objective?: string; updated_at?: string };
@@ -56,6 +57,8 @@ export type SourceDocument = {
   highlightUrl?: string;
   // The backend's replay of the observation or calculation proof at viewer open. Evidence sources only.
   audit?: SourceAudit;
+  // A published-file conflict does not change the captured API record's proof verdict.
+  sourceConflict?: { failure: string; reason: string };
 };
 
 // One verified observation or calculation, read-only. sourceId opens that record's own Stockbot view.
@@ -74,6 +77,7 @@ export type SourceAudit = {
   formulaId?: string;
   formulaVersion?: string;
   recomputedValue?: string;
+  datapoint?: Datapoint & { field?: string; formula?: string };
   source?: { name?: string; document?: string; accession?: string; hash?: string };
   inputs?: SourceAudit[];
   repairs?: SourceRepair[];
@@ -131,6 +135,17 @@ function auditSource(raw: unknown): NonNullable<SourceAudit["source"]> {
   return source;
 }
 
+function auditDatapoint(raw: unknown): NonNullable<SourceAudit["datapoint"]> {
+  const record = plainObject(raw, "The source audit is invalid.");
+  const datapoint: NonNullable<SourceAudit["datapoint"]> | undefined = readDatapoints([record])[0];
+  if (!datapoint) throw new Error("The source audit is invalid.");
+  for (const key of ["field", "formula"] as const) {
+    const value = optionalText(record, key, "The source audit is invalid.");
+    if (value !== undefined) datapoint[key] = value;
+  }
+  return datapoint;
+}
+
 // Trust boundary: every audit node is typed, bounded in depth, and links only a server source id.
 function auditOf(raw: unknown, depth: number): SourceAudit {
   const record = plainObject(raw, "The source audit is invalid.");
@@ -146,6 +161,8 @@ function auditOf(raw: unknown, depth: number): SourceAudit {
     if (value !== undefined) audit[key] = value;
   }
   if (fieldOf(record, "source") !== undefined) audit.source = auditSource(fieldOf(record, "source"));
+  const datapoint = fieldOf(record, "datapoint");
+  if (datapoint !== undefined && audit.verification === "verified") audit.datapoint = auditDatapoint(datapoint);
   const inputs = fieldOf(record, "inputs");
   if (inputs !== undefined) {
     if (!Array.isArray(inputs)) throw new Error("The source audit is invalid.");
@@ -283,6 +300,14 @@ function copySourceMetadata(source: object, document: SourceDocument): void {
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("The source metadata is invalid.");
     document.toolArgs = { ...args };
   }
+  const conflict = fieldOf(source, "sourceConflict");
+  if (conflict !== undefined) {
+    const record = plainObject(conflict, "The source conflict is invalid.");
+    const failure = optionalText(record, "failure", "The source conflict is invalid.");
+    const reason = optionalText(record, "reason", "The source conflict is invalid.");
+    if (!failure || !reason) throw new Error("The source conflict is invalid.");
+    document.sourceConflict = { failure, reason };
+  }
 }
 
 // Each link status names exactly the links it carries. Links are safe web URLs; the plain original has no text fragment.
@@ -293,7 +318,7 @@ function validateLinks(document: SourceDocument): void {
     ? originalUrl === undefined && highlightUrl === undefined
     : originalUrl !== undefined && (linkStatus === "highlighted_original") === (highlightUrl !== undefined) && document.captureKind !== "structured_record" && document.captureKind !== "calculation";
   const safe = [originalUrl, highlightUrl].every((url) => url === undefined || safeSourceUrl(url) !== undefined);
-  if (!shaped || !safe || originalUrl?.includes(":~:")) throw new Error("The source links are invalid.");
+  if (!shaped || !safe || originalUrl?.includes(":~:") || (document.sourceConflict && linkStatus !== "missing")) throw new Error("The source links are invalid.");
 }
 
 function validateCapturedContent(document: SourceDocument): void {

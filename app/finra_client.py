@@ -10,7 +10,7 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -568,8 +568,8 @@ def resolve_finra_official(
     ``row`` is the cited row (empty = no official page; the first record is never
     substituted). Analysis envelopes cite their query JSON, so the symbol may be
     ``ticker`` and the day the payload's ``as_of_date``. None when FINRA publishes
-    no static file for the dataset or no symbol/day is known. Fetch failures raise;
-    a missing or disagreeing line raises ValueError.
+    no static file for the dataset or no symbol/day is known. Fetch failures raise.
+    A missing, disagreeing, or ambiguous line raises :class:`OfficialFileConflict`.
     """
     name = dataset.rpartition("/")[2].casefold().removesuffix("mock")
     if name == "regshodaily":
@@ -588,6 +588,7 @@ def resolve_finra_official(
         return None
     stamp = day.replace("-", "")
     columns: Mapping[str, str] | None = None
+    identity: dict[str, tuple[Callable[[str], object], object]]
     if name == "regshodaily":
         facility = _REG_SHO_FILE_PREFIXES.get(str(cited.get("marketCode"))) or _REG_SHO_FILE_PREFIXES.get(
             str(cited.get("reportingFacilityCode"))
@@ -598,11 +599,16 @@ def resolve_finra_official(
         url = f"https://cdn.finra.org/equity/regsho/daily/{facility}shvol{stamp}.txt"
         symbol_column = "Symbol"
         columns = _REG_SHO_FILE_COLUMNS
+        # The line's day and venue must be the cited day and the selected facility file.
+        identity = {"Date": (_norm_date, day), "Market": (_REG_SHO_FILE_PREFIXES.get, facility)}
     else:
         url = f"https://cdn.finra.org/equity/otcmarket/biweekly/shrt{stamp}.csv"
         symbol_column = "symbolCode"
+        identity = {"settlementDate": (_norm_date, day)}
     data = _official_file(url, root)
-    quote = _official_line(data.decode("utf-8", "replace"), url, symbol_column, symbol.strip(), cited, columns)
+    quote = _official_line(
+        data.decode("utf-8", "replace"), url, symbol_column, symbol.strip(), cited, columns, identity
+    )
     return {
         "url": url,
         "payload": data,
@@ -633,6 +639,13 @@ def _official_file(url: str, root: Path) -> bytes:
     return resp.content
 
 
+class OfficialFileConflict(ValueError):
+    """The published file disagrees with the cited API row: no line, only disagreeing lines, or ambiguous lines.
+
+    The viewer keeps the captured API record and reports this conflict apart from the API proof verdict.
+    """
+
+
 def _official_line(
     text: str,
     url: str,
@@ -640,25 +653,56 @@ def _official_line(
     symbol: str,
     cited: Mapping[str, object],
     columns: Mapping[str, str] | None,
+    identity: Mapping[str, tuple[Callable[[str], object], object]],
 ) -> str:
-    """The pipe-delimited line for ``symbol``; its cells must equal the cited
-    values (``columns``: API field -> file column, None = same names)."""
+    """The one pipe-delimited line for ``symbol`` that agrees with every cited value.
+
+    ``columns`` maps API field -> file column (None = same names). ``identity`` maps a file
+    column -> (normalizer, expected value) for the day and venue cells. The scan reads every
+    symbol line, so a disagreeing earlier line never hides a later match. Several agreeing
+    lines pass only when every cell has an equal value. The lexically first line is then
+    quoted, so file order never changes the result. Other agreeing duplicates are ambiguous.
+    """
     lines = text.splitlines()
-    header = [cell.strip('"') for cell in lines[0].split("|")] if lines else []
-    if symbol_column not in header:
-        raise ValueError(f"{url}: no {symbol_column} column")
-    at = header.index(symbol_column)
+    header: list[str] = [cell.strip('"') for cell in lines[0].split("|")] if lines else []
+    for column in (symbol_column, *identity):
+        if column not in header:
+            raise ValueError(f"{url}: no {column} column")
+    fields = columns if columns is not None else {h: h for h in header}
+    agreeing: list[tuple[str, dict[str, str]]] = []
+    conflicts: list[str] = []
     for line in lines[1:]:
         cells = [cell.strip('"') for cell in line.split("|")]
-        if len(cells) != len(header) or cells[at] != symbol:
+        if len(cells) != len(header) or cells[header.index(symbol_column)] != symbol:
             continue
         values = dict(zip(header, cells, strict=True))
-        for api_field, column in (columns if columns is not None else {h: h for h in header}).items():
-            value = cited.get(api_field)
-            if value is not None and column in values and not _same_value(value, values[column]):
-                raise ValueError(f"{url}: {symbol} {column}={values[column]!r} disagrees with {api_field}={value!r}")
-        return line
-    raise ValueError(f"{url}: no line for {symbol}")
+        conflict = next(
+            (
+                f"{column}={values[column]!r} disagrees with {field}={cited[field]!r}"
+                for field, column in fields.items()
+                if cited.get(field) is not None and column in values and not _same_value(cited[field], values[column])
+            ),
+            None,
+        ) or next(
+            (
+                f"{column}={values[column]!r} disagrees with the cited {expected!r}"
+                for column, (normalize, expected) in identity.items()
+                if normalize(values[column]) != expected
+            ),
+            None,
+        )
+        if conflict is None:
+            agreeing.append((line, values))
+        else:
+            conflicts.append(conflict)
+    if not agreeing:
+        if not conflicts:
+            raise OfficialFileConflict(f"{url}: no line for {symbol}")
+        raise OfficialFileConflict(f"{url}: {symbol} {conflicts[0]} ({len(conflicts)} {symbol} line(s), none agree)")
+    first = agreeing[0][1]
+    if any(not _same_value(first[h], values[h]) for _, values in agreeing[1:] for h in header):
+        raise OfficialFileConflict(f"{url}: {len(agreeing)} ambiguous lines for {symbol} agree with the cited row")
+    return min(line for line, _ in agreeing)
 
 
 def _same_value(value: object, cell: str) -> bool:

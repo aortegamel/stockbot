@@ -4150,7 +4150,7 @@ def test_synthesize_final_falls_back_to_per_claim_channels() -> None:
     from app.research.synthesis.final import synthesize_final
 
     stock, bull, bear = _shapes_trio([], [], [])
-    stock.claims[:] = [GroundedClaim(text="Azure demand raises revenue", evidence_ids=["ev:1"])]
+    stock.claims[:] = [GroundedClaim(text="Azure demand may raise revenue", evidence_ids=["ev:1"])]
     disagreement = CommitteeDisagreement(session_id="s:1", wave_id=1, freeze_id="F1", agreement=["shared read"])
     final = synthesize_final(
         "q",
@@ -4163,5 +4163,5 @@ def test_synthesize_final_falls_back_to_per_claim_channels() -> None:
         bear=bear,
         disagreement=disagreement,
     )
-    assert [c["name"] for c in final.impact_channels] == ["Azure demand raises revenue"]
+    assert [c["name"] for c in final.impact_channels] == ["Azure demand may raise revenue"]
     assert final.impact_channels[0]["evidence_ids"] == ["ev:1"]

@@ -268,6 +268,7 @@ def _run_node(kernel: _Kernel, jev: JevClient) -> dict[str, JSONValue]:
 def test_admit_before_complete_with_finra_domain() -> None:
     import json
 
+    from app.research.evidence import cited_record
     from app.research.service import _finra_record_texts
 
     kernel = _Kernel()
@@ -288,18 +289,17 @@ def test_admit_before_complete_with_finra_domain() -> None:
         _Kernel({"s1:tr:abc": finra_result}),
     )
     assert candidate is not None
-    row_text = " ".join(
-        json.dumps(
-            {
-                "settlementDate": "2024-01-01",
-                "symbolCode": "XYZ",
-                "currentShortPositionQuantity": 123,
-            },
-            sort_keys=True,
-            default=str,
-        ).split()
+    row_text = json.dumps(
+        {
+            "settlementDate": "2024-01-01",
+            "symbolCode": "XYZ",
+            "currentShortPositionQuantity": 123,
+        },
+        sort_keys=True,
+        default=str,
     )
     assert candidate["record_identity"] == row_text
+    assert cited_record({"result": {"records": [_FINRA_ROW]}}, str(candidate["record_identity"])) == _FINRA_ROW
     replay = _finra_record_texts(
         {
             "result": {
@@ -314,12 +314,12 @@ def test_admit_before_complete_with_finra_domain() -> None:
             "tool_name": "query_finra",
         }
     )
-    assert any(str(candidate["record_identity"]) in t for t in replay)
+    assert row_text in replay
 
 
 def test_finra_envelope_identity_is_symbol_distinct_and_replay_valid() -> None:
-    """Envelope identity comes from its own scope: replay-valid, stable across repeats, distinct per symbol."""
-    from app.research.service import _finra_record_texts
+    """Envelope identity is the whole payload: replay-valid via cited_record, distinct per symbol."""
+    from app.research.evidence import cited_record
 
     def envelope(symbol: str, metrics_sum: int) -> dict[str, JSONValue]:
         return {
@@ -340,7 +340,7 @@ def test_finra_envelope_identity_is_symbol_distinct_and_replay_valid() -> None:
         locator = str(candidate["record_identity"])
         assert locator
         # A model citing this identity must still replay against the persisted result.
-        assert any(locator in text for text in _finra_record_texts(persisted))
+        assert cited_record(persisted, locator) == payload
         return locator
 
     first = identity(envelope("NVDA", 100))
@@ -5527,21 +5527,31 @@ def test_prop_generated_forms_are_never_substituted(form: str) -> None:
 
 
 def test_finra_locator_reads_rows_then_envelope_then_nothing() -> None:
-    """Row JSON wins; a rows-less envelope cites its own scope; a payload with neither stays uncitable."""
+    """Row JSON wins; a rows-less envelope cites its full JSON; a payload with neither stays uncitable."""
     row_text = sched._finra_locator({"records": [_FINRA_ROW]})
-    assert row_text is not None and "XYZ" in row_text
-    assert sched._finra_locator({"briefing": "  short   interest  "}) == "short interest"
-    assert sched._finra_locator({"briefing_source": "deterministic_only"}) == "deterministic_only"
+    assert row_text == sched._compact_json(_FINRA_ROW)
+    envelope = {"briefing": "  short   interest  ", "query": {"ticker": "NVDA"}}
+    assert sched._finra_locator(envelope) == sched._compact_json(envelope)
     assert sched._finra_locator({}) is None
-    assert sched._finra_locator({"briefing": "   ", "query": {}}) is None
+    assert sched._finra_locator({"briefing": "   ", "records": []}) == sched._compact_json(
+        {"briefing": "   ", "records": []}
+    )
 
 
 def test_sec_replay_locator_reads_scalar_rows_and_envelope() -> None:
-    """Scalar rows cite verbatim; a payload with no citable row cites its own JSON."""
-    assert sched._sec_replay_locator({"filings": ["10-K 0000320193-25-000079"]}) == "10-K 0000320193-25-000079"
-    assert sched._sec_replay_locator({"rows": [42]}) == "42"
+    """A payload with no mapping row cites its own JSON; bare scalars are never citable fragments."""
+    from app.research.evidence import cited_record
+
+    assert (
+        sched._sec_replay_locator({"filings": ["10-K 0000320193-25-000079"]})
+        == '{"filings": ["10-K 0000320193-25-000079"]}'
+    )
+    assert sched._sec_replay_locator({"rows": [42]}) == '{"rows": [42]}'
     assert sched._sec_replay_locator({"filings": [None]}) == '{"filings": [null]}'
     assert sched._sec_replay_locator({}) == "{}"
+    assert cited_record({"filings": ["10-K 0000320193-25-000079"]}, '{"filings": ["10-K 0000320193-25-000079"]}') == {
+        "filings": ["10-K 0000320193-25-000079"]
+    }
 
 
 def test_tool_result_ref_reads_handle_and_result_ids() -> None:
@@ -7192,9 +7202,10 @@ def test_scrub_keeps_timestamp_against_scope_day() -> None:
     assert filled == {"as_of": "2026-09-01T12:00:00"}
 
 
-def test_sec_replay_dict_row_truncates_2000() -> None:
-    """A long dict row cites exactly 2000 chars."""
-    assert len(sched._sec_replay_locator({"filings": [{"k": "x" * 2500}]}) or "") == 2000
+def test_sec_replay_dict_row_keeps_full_json() -> None:
+    """A long dict row cites its full canonical JSON, never a truncation."""
+    row = {"k": "x" * 2500}
+    assert sched._sec_replay_locator({"filings": [row]}) == sched._compact_json(row)
 
 
 def test_sec_replay_documents_row() -> None:
@@ -7202,11 +7213,10 @@ def test_sec_replay_documents_row() -> None:
     assert sched._sec_replay_locator({"documents": [{"a": 5}]}) == '{"a": 5}'
 
 
-def test_sec_replay_envelope_truncates_2000() -> None:
-    """A payload with no citable row cites its own JSON truncated to 2000 chars."""
-    locator = sched._sec_replay_locator({"note": "x" * 2500})
-    assert isinstance(locator, str) and len(locator) == 2000
-    assert locator == sched._compact_json({"note": "x" * 2500})[:2000]
+def test_sec_replay_envelope_keeps_full_json() -> None:
+    """A payload with no citable row cites its own full JSON."""
+    payload = {"note": "x" * 2500}
+    assert sched._sec_replay_locator(payload) == sched._compact_json(payload)
 
 
 def test_sec_replay_events_row() -> None:
@@ -7229,9 +7239,9 @@ def test_sec_replay_records_row() -> None:
     assert sched._sec_replay_locator({"records": [{"a": 4}]}) == '{"a": 4}'
 
 
-def test_sec_replay_scalar_row_truncates_2000() -> None:
-    """A long scalar row cites exactly 2000 chars."""
-    assert sched._sec_replay_locator({"rows": ["x" * 2500]}) == "x" * 2000
+def test_sec_replay_scalar_row_cites_full_payload() -> None:
+    """Scalar list rows are not citable fragments: the locator names the complete payload JSON."""
+    assert sched._sec_replay_locator({"rows": ["x" * 2500]}) == '{"rows": ["' + "x" * 2500 + '"]}'
 
 
 def test_sec_replay_transactions_row() -> None:

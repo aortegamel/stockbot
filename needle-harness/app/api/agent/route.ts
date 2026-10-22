@@ -1,7 +1,7 @@
 import { reason } from "@/lib/muse/client";
-import { asksWatchlist, dropUncovered, gateAnswer, kernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type KernelResponse } from "@/lib/agent/kernel";
+import { asksWatchlist, dropUncovered, gateAnswer, kernelRouter, parseTicker, parseWatchlist, qualifiedEvidenceFree, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type KernelResponse } from "@/lib/agent/kernel";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
-import { ASK_CONTEXT_KINDS, FINAL_PERSONAS, foundStatus, redactArgs, safeSourceUrl, sourceReferences, statusEvent, toolStatus, WIDGET_TYPES, type AgentEvent, type AskContext, type Evidence, type FailureCategory, type Persona, type Timings } from "@/lib/agent/types";
+import { ASK_CONTEXT_KINDS, FINAL_PERSONAS, foundStatus, readDatapoints, redactArgs, safeSourceUrl, sourceReferences, statusEvent, toolStatus, WIDGET_TYPES, type AgentEvent, type AskContext, type Evidence, type FailureCategory, type Persona, type Timings } from "@/lib/agent/types";
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
@@ -201,8 +201,8 @@ export async function POST(req: Request): Promise<Response> {
       const timings: Timings = {};
       const send = streamSender(req, controller, requestAt, timings);
       // JEV owns the original route independently from the optional chart action.
-      // A direct answer has no evidence, so it is buffered and shown minus every
-      // datapoint sentence; nothing left means research answers instead.
+      // A direct answer has no evidence, so it is buffered and shows only its explicitly
+      // qualified unknown/assumption claims; nothing left means research answers instead.
       const answerDirect = async (): Promise<boolean> => {
         const t0 = performance.now();
         send({ type: "agent_start", prompt });
@@ -210,7 +210,7 @@ export async function POST(req: Request): Promise<Response> {
         send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
         try {
           const r = await reason({ prompt, evidence: [], direct: true, ...reasonContext(), onDelta: () => { } });
-          const text = dropUncovered(r.text, [], false);
+          const text = dropUncovered(r.text, qualifiedEvidenceFree(r.claims));
           if (!text) return false;
           send({ type: "answer_delta", text });
           send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: performance.now() - t0, ...r.usage }, evidence: { count: 0, characters: 0 }, failures: {} } });
@@ -278,12 +278,14 @@ export async function POST(req: Request): Promise<Response> {
             let fresh = 0;
             for (const row of res.evidence ?? []) {
               if (evidence.some((e) => e.id === row.id)) continue;
+              const datapoints = readDatapoints(row.datapoints);
               const ev: Evidence = {
                 id: row.id, source: row.source ?? tool, content: row.content,
                 retrievedAt: row.retrievedAt ?? new Date().toISOString(),
                 ...(row.title !== undefined ? { title: row.title } : {}),
                 ...(row.url !== undefined ? { url: row.url } : {}),
                 sources: sourceReferences(row.sources),
+                ...(datapoints.length > 0 ? { datapoints } : {}),
               };
               evidence.push(ev);
               singleShotEvidence.push(ev);

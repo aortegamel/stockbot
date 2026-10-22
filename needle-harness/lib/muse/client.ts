@@ -40,11 +40,13 @@ const PERSONAS: Record<Persona, { name: string; stance: string }> = {
 
 // Final-answer claim inventory: trailing fenced block, stripped before display.
 // Verbatim qualified wording, model-declared types mirroring Python CLAIM_TYPES
-// exactly, EVIDENCE row ids only, model-declared confidence (carried, never a threshold).
+// exactly, EVIDENCE row ids and their dp: datapoint ids only, model-declared
+// confidence (carried, never a threshold). The wording rules mirror Python
+// agents.CLAIM_WORDING_RULE, which the worker publication gate enforces.
 const INVENTORY_RULE =
   " End your answer with a fenced inventory block and nothing after it:" +
-  " ```json {\"claims\": [{\"text\": \"<verbatim prose substring>\", \"claim_type\": \"<observed_fact|calculation|inference|assumption|unknown|contradicted|conditional_risk|attributed_report>\", \"evidence_ids\": [\"<EVIDENCE row ids>\"], \"value\": \"<datapoint as written>\", \"entity\": \"<who>\", \"period\": \"<when>\", \"unit\": \"<unit>\", \"confidence\": 0.9}], \"confidence\": 0.9}```" +
-  " Every factual sentence needs a claims row. Prose not covered by the inventory is deleted, and a number outside it never shows." +
+  " ```json {\"claims\": [{\"text\": \"<verbatim prose substring>\", \"claim_type\": \"<observed_fact|calculation|inference|assumption|unknown|contradicted|conditional_risk|attributed_report>\", \"evidence_ids\": [\"<EVIDENCE row ids>\"], \"datapoint_ids\": [\"<dp: ids of those rows>\"], \"confidence\": 0.9}], \"confidence\": 0.9}```" +
+  " Every sentence needs claims rows that cover all of it. Prose not covered by the inventory is deleted." +
   " Each claims[].text copies your prose above verbatim, qualified wording as written including attribution/qualification" +
   " (conditional_risk states the condition and consequence as qualified, not that it will occur;" +
   " attributed_report states who reported it, not that the event happened)." +
@@ -52,9 +54,16 @@ const INVENTORY_RULE =
   " calculation computed from the cited rows; inference reasoned from cited evidence;" +
   " assumption a premise you state, not evidence; contradicted cited evidence conflicts with it;" +
   " unknown the evidence does not establish it." +
-  " A claim with a number sets value to that number exactly as written in its text, plus entity, period, and unit when known." +
+  " A claim that states a number lists datapoint_ids: the exact dp: ids from the datapoint lines of the rows it cites." +
+  " Write each datapoint's metric label, then its value, in one sentence, and name its entity, period, and unit as the datapoint spells them." +
+  " State no other number. Add no wording beyond the datapoint fields and statement." +
+  " An observed_fact without a number copies one source sentence verbatim." +
+  " An observed number stays observed_fact and a calculated one stays calculation." +
+  " inference wording hedges (suggests, likely, may); an assumption opens with Assuming or If;" +
+  " unknown wording says what was not found or is unknown; conditional_risk states the condition (if, could, may, risk);" +
+  " attributed_report names who reported or stated it; contradicted says what conflicts." +
   " evidence_ids lists only exact ids of rows in the EVIDENCE section, never node ids or decision records." +
-  " Unknown and assumption claims may cite none and carry no value. All other types need at least one." +
+  " Unknown and assumption claims may cite none. All other types need at least one." +
   " confidence is your own 0..1, carried through, never a threshold." +
   " Nothing found means {\"claims\": []}." +
   " The block is stripped before display; prose claims missing from it fail the accuracy gate.";
@@ -63,23 +72,28 @@ function researchSystem(persona: Persona): string {
   return `You are ${name}. ${stance} Answer in prose. After a fact from EVIDENCE, put its row id in brackets, e.g. [ev:abc123].` + INVENTORY_RULE;
 }
 
+// A direct answer has no evidence, so only explicitly qualified unknown/assumption sentences can show.
+const DIRECT_INVENTORY_RULE =
+  " You have no sourced evidence for this request, so you cannot state facts." +
+  " Write only qualified sentences: an assumption opens with Assuming or If; an unknown says what is unknown or was not found." +
+  " State no number except a year." +
+  " End your answer with a fenced inventory block and nothing after it:" +
+  " ```json {\"claims\": [{\"text\": \"<verbatim prose substring>\", \"claim_type\": \"<unknown|assumption>\", \"evidence_ids\": []}]}```" +
+  " Every sentence needs a claims row. Prose not covered by the inventory is deleted.";
 function directSystem(persona: Persona): string {
   const { name } = PERSONAS[persona];
-  return `You are ${name}.`;
+  return `You are ${name}.` + DIRECT_INVENTORY_RULE;
 }
 function isConf(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1;
 }
-// Model-declared evidence ids: only exact non-empty strings survive; anything
-// else is dropped, never repaired.
+// Model-declared evidence/datapoint ids: only exact non-empty strings survive;
+// anything else is dropped, never repaired.
 function declaredEvidenceIds(value: unknown): string[] {
   const raw = Array.isArray(value) ? value : [];
   return raw.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
 }
 
-// Datapoint keys are optional; a present key that is not a non-empty string
-// makes the row malformed, so it drops instead of losing its datapoint.
-const DATAPOINT_KEYS = ["value", "entity", "period", "unit"] as const;
 function parseInventoryClaim(item: unknown): FinalClaim | undefined {
   if (!item || typeof item !== "object" || Array.isArray(item)) return undefined;
   const rec = item as Record<string, unknown>;
@@ -87,13 +101,9 @@ function parseInventoryClaim(item: unknown): FinalClaim | undefined {
   const rawType = typeof rec.claim_type === "string" ? rec.claim_type.trim().toLowerCase() : "";
   if (!(FINAL_CLAIM_TYPES as readonly string[]).includes(rawType)) return undefined;
   const claim: FinalClaim = { text: rec.text, claimType: rawType as FinalClaimType, evidenceIds: declaredEvidenceIds(rec.evidence_ids) };
+  const points = declaredEvidenceIds(rec.datapoint_ids);
+  if (points.length > 0) claim.datapointIds = points;
   if (isConf(rec.confidence)) claim.confidence = rec.confidence;
-  for (const key of DATAPOINT_KEYS) {
-    const v = rec[key];
-    if (v === undefined || v === null) continue;
-    if (typeof v !== "string" || !v.trim()) return undefined;
-    claim[key] = v;
-  }
   return claim;
 }
 const FENCE_OPEN = "```json";
@@ -138,12 +148,14 @@ function withInventory(r: { text: string; usage: MuseUsage }): {
   };
 }
 
-// All admitted evidence reaches personas; no character budget.
+// All admitted evidence reaches personas; no character budget. Each kernel
+// datapoint shows as one JSON line so claims can cite its dp: id and copy its fields.
 function formatEvidence(evidence: Evidence[]): string {
   return evidence
     .map(
       (e) =>
-        `[${e.id}]\nsource: ${e.source}\n${e.title ? `title: ${e.title}\n` : ""}${e.url ? `url: ${e.url}\n` : ""}content: ${e.content}`,
+        `[${e.id}]\nsource: ${e.source}\n${e.title ? `title: ${e.title}\n` : ""}${e.url ? `url: ${e.url}\n` : ""}content: ${e.content}` +
+        (e.datapoints ?? []).map((p) => `\ndatapoint: ${JSON.stringify(p)}`).join(""),
     )
     .join("\n\n");
 }

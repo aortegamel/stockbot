@@ -33,7 +33,6 @@ from dataclasses import dataclass, field, replace
 
 from app.research.agents import (
     CLAIM_TYPES,
-    DATAPOINT_FIELDS,
     GroundedClaim,
     claims_refs,
     conservative_claim_type,
@@ -42,7 +41,6 @@ from app.research.agents.bearbot import BearAnalysis
 from app.research.agents.bullbot import BullAnalysis
 from app.research.agents.stockbot import StockbotAnalysis
 from app.research.evidence import evidence_domain, evidence_integrity
-from app.research.grounding import numeric_tokens
 
 from .committee import CommitteeDisagreement, _coerce_wave_id
 
@@ -51,11 +49,19 @@ SCOPE_ABSENCE = "No disclosure located within the searched scope"
 SEC_SCOPE_ABSENCE = "No disclosure located within the searched SEC scope"
 """Legacy SEC-scoped alias (kept for pinned readers); prefer SCOPE_ABSENCE."""
 
-SCOPE_LIMITATION = "Searched-source scope: only the allowed sources were searched; unsearched sources carry no finding."
-SEC_ONLY_LIMITATION = (
-    "SEC-only scope: no non-SEC source (news, transcripts, private documents, market data) was searched."
+SCOPE_LIMITATION = (
+    "Searched-source scope is unknown beyond the searched sources:"
+    " only the allowed sources were searched; unsearched sources carry no finding."
 )
-"""Legacy SEC-only limitation (kept for pinned readers); prefer SCOPE_LIMITATION."""
+SEC_ONLY_LIMITATION = (
+    "SEC-only scope is unknown beyond SEC filings:"
+    " no non-SEC source (news, transcripts, private documents, market data) was searched."
+)
+"""Legacy SEC-only limitation (kept for pinned readers); prefer SCOPE_LIMITATION.
+
+Both disclose an explicit unknown: what lies beyond the searched sources is
+unknown, so a generator-created ``unknown`` claim may inventory the sentence.
+"""
 
 _CLAIM_SEVERITY = {
     "observed_fact": "direct",
@@ -291,16 +297,14 @@ def _channels_from_claims(claims: list[GroundedClaim]) -> list[dict[str, object]
 
 
 def _effect_row(claim: GroundedClaim) -> dict[str, object]:
-    """One effect row: claim text with its declared type, freeze refs, and any typed datapoint fields."""
+    """One effect row: claim text with its declared type, freeze refs, and canonical datapoint references."""
     row: dict[str, object] = {
         "text": claim.text,
         "claim_type": claim.claim_type,
         "evidence_ids": list(claim.evidence_ids),
     }
-    for key in DATAPOINT_FIELDS:
-        value = getattr(claim, key)
-        if value is not None:
-            row[key] = value
+    if claim.datapoint_ids:
+        row["datapoint_ids"] = list(claim.datapoint_ids)
     return row
 
 
@@ -549,36 +553,26 @@ def _split_effects(claims: Sequence[GroundedClaim]) -> tuple[list[dict[str, obje
     return first, second
 
 
-def _datapoint_fields(item: object) -> dict[str, str | None]:
-    """Typed datapoint fields of one caller claim (non-blank strings only; everything else None)."""
-    out: dict[str, str | None] = {}
-    for key in DATAPOINT_FIELDS:
-        raw = _channel_field(item, key)
-        out[key] = raw.strip() if isinstance(raw, str) and raw.strip() else None
-    return out
-
-
 def _coerce_extra_claim(item: object) -> GroundedClaim | None:
-    """One caller claim in grounded shape (typed datapoint kept); None when blank, ungrounded, or mistyped."""
+    """One caller claim in grounded shape (datapoint references kept); None when blank, ungrounded, or mistyped."""
     if isinstance(item, GroundedClaim):
-        raw_text, raw_type, raw_ids = item.text, item.claim_type, item.evidence_ids
+        raw_text, raw_type, raw_ids, raw_points = item.text, item.claim_type, item.evidence_ids, item.datapoint_ids
     elif isinstance(item, Mapping):
         raw_text = _channel_field(item, "text", "claim_text", "claim")
         raw_type = _channel_field(item, "claim_type")
         raw_ids = _channel_field(item, "evidence_ids", "refs")
+        raw_points = _channel_field(item, "datapoint_ids")
     else:
         return None
     text = raw_text.strip() if isinstance(raw_text, str) else ""
     declared = raw_type.strip().lower() if isinstance(raw_type, str) else ""
     claim_type = declared if declared in CLAIM_TYPES else "inference"
     ids = _cited_channel_ids(raw_ids)
-    datapoint = _datapoint_fields(item)
-    citeless = claim_type == "unknown" or (claim_type == "assumption" and datapoint["value"] is None)
+    points = _cited_channel_ids(raw_points)
+    citeless = claim_type in ("unknown", "assumption") and not points
     if not text or not (ids or citeless):
         return None
-    if claim_type in ("inference", "unknown"):
-        datapoint["value"] = None  # an inference stays qualified: no datapoint value rides it
-    return GroundedClaim(text=text[:500], claim_type=claim_type, evidence_ids=ids, **datapoint)
+    return GroundedClaim(text=text[:500], claim_type=claim_type, evidence_ids=ids, datapoint_ids=points)
 
 
 def _normalize_extra(extra: Sequence[GroundedClaim | dict[str, object]] | None) -> list[GroundedClaim]:
@@ -587,16 +581,12 @@ def _normalize_extra(extra: Sequence[GroundedClaim | dict[str, object]] | None) 
 
 
 def _merged_claim(prior: GroundedClaim, claim: GroundedClaim) -> GroundedClaim:
-    """Two same-text claims as one: union refs, least assertive type, first datapoint unless the type drops values."""
-    claim_type = conservative_claim_type([prior.claim_type, claim.claim_type])
-    datapoint = {key: getattr(prior, key) or getattr(claim, key) for key in DATAPOINT_FIELDS}
-    if claim_type in ("inference", "unknown"):
-        datapoint["value"] = None
+    """Two same-text claims as one: union refs and datapoint references, least assertive declared type."""
     return GroundedClaim(
         text=prior.text,
-        claim_type=claim_type,
+        claim_type=conservative_claim_type([prior.claim_type, claim.claim_type]),
         evidence_ids=list(dict.fromkeys([*prior.evidence_ids, *claim.evidence_ids])),
-        **datapoint,
+        datapoint_ids=list(dict.fromkeys([*prior.datapoint_ids, *claim.datapoint_ids])),
     )
 
 
@@ -625,6 +615,11 @@ def _normalize_scope(scope: Mapping[str, object] | None) -> dict[str, object]:
     sec_only = upper == ["SEC"]
     limitation = SEC_ONLY_LIMITATION if sec_only else SCOPE_LIMITATION
     return {"allowed_sources": sources, "sec_only": sec_only, "limitation": limitation}
+
+
+def _scope_limitation(scope: Mapping[str, object]) -> str:
+    """Explicit searched-source disclosure the generator inventories as unknown."""
+    return str(scope["limitation"])
 
 
 def _synth_unknowns(
@@ -656,6 +651,13 @@ def _synth_changes(stock: StockbotAnalysis, bull: BullAnalysis, bear: BearAnalys
             list(getattr(bear, "what_would_change", []) or []),
         )
     )
+
+
+def _limitation_claim(limitation: str) -> GroundedClaim:
+    """Generator-created unknown inventorying one deterministic scope/coverage disclosure."""
+    from app.research.agents import GroundedClaim
+
+    return GroundedClaim(text=limitation, claim_type="unknown")
 
 
 def _synth_limitations(evidence_limitations: Sequence[str] | None, scope: Mapping[str, object]) -> list[str]:
@@ -996,6 +998,7 @@ def synthesize_final(
     """
     claims = _synthesis_claims(stock, bull, bear, extra_claims)
     scope = _normalize_scope(research_scope)
+    claims = [*claims, _limitation_claim(_scope_limitation(scope))]
     first_order, second_order = _split_effects(claims)
     observations_list = [row for row in (observations or []) if isinstance(row, Mapping)]
     coverage_norm = _normalize_coverage(coverage)
@@ -1028,7 +1031,7 @@ def synthesize_final(
         bull_evidence_ids=claims_refs(bull.claims),
         bear_evidence_ids=claims_refs(bear.claims),
         critical_disagreements=_critical_disagreements(disagreement),
-        evidence_limitations=_synth_limitations(evidence_limitations, scope),
+        evidence_limitations=[*_synth_limitations(evidence_limitations, scope)],
         research_scope=scope,
         direct_evidence=_observation_rows(observations_list),
         calculations=_calculation_views(observations_list, as_of),
@@ -1040,79 +1043,86 @@ def synthesize_final(
         sources=_normalize_sources(sources, claims, observations_list),
     )
     gate_uncovered_prose(synth)
-    synth.answer = _deep_answer(synth) if model is None else _gate_text(str(model), _claim_texts(synth), True)
+    synth.answer = _deep_answer(synth) if model is None else _gate_text(str(model), _claim_texts(synth))
     return synth
 
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
-_DIGIT = re.compile(r"\d")
+_CITATION = re.compile(r"\[[^\]]*\]")
+_WORD = re.compile(r"[a-z0-9]+")
+_CONNECTIVES = frozenset({"and", "but", "while", "whereas", "also", "however", "or"})
+"""Words that may join covered claim texts inside one sentence without asserting anything."""
 
 
-def _claim_texts(synth: FinalSynthesis) -> list[tuple[str, frozenset[str]]]:
-    """(whitespace-normalized text, numbers it states in text or typed fields) per inventory row, unknowns included."""
-    rows: list[tuple[str, frozenset[str]]] = []
-    for claim in synth.claims:
-        text = " ".join(claim.text.split())
-        if text:
-            stated = " ".join(v for v in (claim.text, claim.value, claim.entity, claim.period, claim.unit) if v)
-            rows.append((text, frozenset(numeric_tokens(stated))))
-    return rows
+def _plain(text: str) -> str:
+    """Citation brackets dropped and whitespace collapsed (no space left before punctuation)."""
+    return re.sub(r"\s+([.,;:!?])", r"\1", " ".join(_CITATION.sub(" ", text).split()))
 
 
-def _covered(sentence: str, inventory: Sequence[tuple[str, frozenset[str]]]) -> bool:
-    """Covered when a claim row's text sits verbatim in the sentence (or the sentence inside it) and every
-    number the sentence states belongs to that row, so no number rides along on a covered sentence."""
-    norm = " ".join(sentence.split())
-    numbers = numeric_tokens(norm)
-    return any((text in norm or norm in text) and numbers <= stated for text, stated in inventory)
+def _claim_texts(synth: FinalSynthesis) -> list[str]:
+    """Plain text per inventory row, unknowns included; the publication gate proves each row."""
+    return [text for text in (_plain(claim.text) for claim in synth.claims) if text]
 
 
-def _gate_text(text: str, inventory: Sequence[tuple[str, frozenset[str]]], assertive: bool) -> str:
-    """Surgically delete uncovered factual sentences, line by line; covered and non-factual ones stay.
+def _covered(sentence: str, inventory: Sequence[str]) -> bool:
+    """A sentence is covered when claim text states exactly it or combines to fill it with connectives."""
+    rest = _plain(sentence)
+    if any(text.casefold() == rest.casefold() for text in inventory):
+        return True
+    for text in sorted(inventory, key=len, reverse=True):
+        rest = rest.replace(text, " ")
+    return set(_WORD.findall(rest.casefold())) <= _CONNECTIVES
 
-    Assertive prose treats every sentence as factual. Hedge prose (unknowns,
-    changes, limitations, coverage detail) treats a sentence as factual when it
-    carries a number. ponytail: the digit rule is the deterministic datapoint
-    signal; a qualitative fact inside hedge prose needs a judge to catch it.
+
+def _gate_text(text: str, inventory: Sequence[str]) -> str:
+    """Surgically delete every sentence no claim covers, line by line.
+
+    Every section is gated, hedge prose included: assumption/unknown claim texts
+    live in the inventory, so their wording stays while unclaimed wording deletes.
     """
     lines: list[str] = []
     for line in text.splitlines():
-        kept = [
-            s
-            for s in _SENTENCE_END.split(line.strip())
-            if s and (_covered(s, inventory) or not (assertive or _DIGIT.search(s)))
-        ]
+        kept = [s for s in _SENTENCE_END.split(line.strip()) if s and _covered(s, inventory)]
         if kept:
             lines.append(" ".join(kept))
     return "\n".join(lines)
 
 
-def _gate_list(items: Sequence[str], inventory: Sequence[tuple[str, frozenset[str]]], assertive: bool) -> list[str]:
+def _gate_list(items: Sequence[str], inventory: Sequence[str]) -> list[str]:
     """Gate every entry of one prose list; entries left empty drop out."""
-    return [kept for kept in (_gate_text(item, inventory, assertive) for item in items) if kept]
+    return [kept for kept in (_gate_text(item, inventory) for item in items) if kept]
+
+
+def uncovered_sentences(text: str, claim_texts: Sequence[str]) -> list[str]:
+    """Sentences of assertive prose (an answer) that no claim text covers, in order."""
+    inventory = [plain for plain in (_plain(claim) for claim in claim_texts) if plain]
+    return [
+        s for line in text.splitlines() for s in _SENTENCE_END.split(line.strip()) if s and not _covered(s, inventory)
+    ]
 
 
 def gate_uncovered_prose(synth: FinalSynthesis) -> FinalSynthesis:
-    """Exhaustive prose inventory: every factual sentence needs a claim row, else it is deleted in place.
+    """Exhaustive prose inventory: every sentence needs a claim row, else it is deleted in place.
 
-    Covers base/bull/bear, executive summary, positioning, catalysts (assertive)
-    and unknowns, what-would-change, limitations, coverage detail (hedge).
-    Absence observations are coverage artifacts: never citable, never gated.
+    Covers base/bull/bear, executive summary, positioning, catalysts, unknowns,
+    what-would-change, limitations, and coverage detail. Assumption and unknown
+    claims are inventory rows like any other, so their wording stays. Absence
+    observations are coverage artifacts: never citable, never gated.
     """
     texts = _claim_texts(synth)
-    synth.base_case = _gate_text(synth.base_case, texts, True)
-    synth.bull_case = _gate_text(synth.bull_case, texts, True)
-    synth.bear_case = _gate_text(synth.bear_case, texts, True)
-    synth.executive_summary = _gate_text(synth.executive_summary, texts, True) or "No grounded findings."
-    synth.positioning = _gate_list(synth.positioning, texts, True)
-    synth.catalysts = _gate_list(synth.catalysts, texts, True)
-    synth.unknowns = _gate_list(synth.unknowns, texts, False)
-    synth.what_would_change = _gate_list(synth.what_would_change, texts, False)
-    synth.evidence_limitations = _gate_list(synth.evidence_limitations, texts, False)
+    synth.base_case = _gate_text(synth.base_case, texts)
+    synth.bull_case = _gate_text(synth.bull_case, texts)
+    synth.bear_case = _gate_text(synth.bear_case, texts)
+    synth.executive_summary = _gate_text(synth.executive_summary, texts) or "No grounded findings."
+    synth.positioning = _gate_list(synth.positioning, texts)
+    synth.catalysts = _gate_list(synth.catalysts, texts)
+    synth.unknowns = _gate_list(synth.unknowns, texts)
+    synth.what_would_change = _gate_list(synth.what_would_change, texts)
+    synth.evidence_limitations = _gate_list(synth.evidence_limitations, texts)
     for section in synth.coverage.values():
         raw = section.get("detail") if isinstance(section, dict) else None
         if isinstance(section, dict) and isinstance(raw, str):
-            detail = _gate_text(raw, texts, False)
+            detail = _gate_text(raw, texts)
             if detail:
                 section["detail"] = detail
             else:
@@ -1129,4 +1139,5 @@ __all__ = [
     "gate_uncovered_prose",
     "scoped_absence",
     "synthesize_final",
+    "uncovered_sentences",
 ]

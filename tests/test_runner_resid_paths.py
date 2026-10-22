@@ -55,7 +55,10 @@ def _grounded(prompt: str) -> str:
     claims: list[dict[str, object]] = (
         []
         if not seen
-        else [{"text": f"grounded finding {chr(97 + i)}", "evidence_ids": [eid]} for i, eid in enumerate(seen[:6])]
+        else [
+            {"text": f"grounded finding {chr(97 + i)} suggests exposure", "evidence_ids": [eid]}
+            for i, eid in enumerate(seen[:6])
+        ]
     )
     if "Temporary assignment" in prompt:
         return json.dumps(claims)
@@ -163,7 +166,7 @@ def _trio(sid: str, wave: int, fid: str) -> tuple[StockbotAnalysis, BullAnalysis
     from app.research.agents.bullbot import BullAnalysis
     from app.research.agents.stockbot import StockbotAnalysis
 
-    claim = [GroundedClaim(text="holds share", evidence_ids=["E1"])]
+    claim = [GroundedClaim(text="likely holds share", evidence_ids=["E1"])]
     stock = StockbotAnalysis(
         session_id=sid,
         wave_id=wave,
@@ -569,6 +572,12 @@ def test_complete_wave_tail_synth_and_none(tmp_path: Path, monkeypatch: pytest.M
     done = repo.get_session(sid)
     assert done.status == "completed" and done.final_result is not None
     assert done.final_result["freeze_id"] == w2["freeze_id"]
+    final_claims = done.final_result["claims"]
+    assert isinstance(final_claims, list) and final_claims
+    for claim in final_claims:
+        assert isinstance(claim, dict)
+        assert set(claim) == {"text", "claim_type", "evidence_ids", "datapoint_ids"}
+        assert claim["datapoint_ids"] == []
     none_result = Wave1Result(
         session_id=sid,
         wave_id=2,

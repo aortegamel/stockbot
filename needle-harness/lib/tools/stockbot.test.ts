@@ -389,11 +389,11 @@ describe("muse inventory fence", () => {
     expect(splitInventory(`A fact [E1].\n${block.slice(0, 30)}`)).toEqual({ prose: "A fact [E1].\n", claims: [] });
   });
 
-  test("datapoint keys survive on new claim types, and a malformed datapoint drops its row", () => {
+  test("datapoint ids survive on new claim types, and removed value keys do not reject rows", () => {
     const payload = {
       claims: [
-        { text: "Revenue was $35.1B.", claim_type: "observed_fact", evidence_ids: ["E1"], value: "$35.1B", entity: "NVDA", period: "Q3 FY2025", unit: "USD", stray: "x" },
-        { text: "Margin is 75%.", claim_type: "calculation", evidence_ids: ["E1", "E2"], value: "75%", period: null },
+        { text: "Revenue was $35.1B.", claim_type: "observed_fact", evidence_ids: ["E1"], datapoint_ids: ["dp:revenue"], value: "$35.1B", entity: "NVDA", period: "Q3 FY2025", unit: "USD", stray: "x" },
+        { text: "Margin is 75%.", claim_type: "calculation", evidence_ids: ["E1", "E2"], datapoint_ids: ["dp:margin"], value: "75%", period: null },
         { text: "Assume flat demand.", claim_type: "assumption" },
         { text: "Bad value.", claim_type: "observed_fact", evidence_ids: ["E1"], value: 35.1 },
         { text: "Blank unit.", claim_type: "observed_fact", evidence_ids: ["E1"], value: "1", unit: " " },
@@ -403,9 +403,27 @@ describe("muse inventory fence", () => {
     const inv = splitInventory(`Old \`\`\`json {"claims": []}\`\`\` text.\n\`\`\`json ${JSON.stringify(payload)}\`\`\``);
     expect(inv.prose).toBe('Old ```json {"claims": []}``` text.\n');
     expect(inv.claims).toEqual([
-      { text: "Revenue was $35.1B.", claimType: "observed_fact", evidenceIds: ["E1"], value: "$35.1B", entity: "NVDA", period: "Q3 FY2025", unit: "USD" },
-      { text: "Margin is 75%.", claimType: "calculation", evidenceIds: ["E1", "E2"], value: "75%" },
+      { text: "Revenue was $35.1B.", claimType: "observed_fact", evidenceIds: ["E1"], datapointIds: ["dp:revenue"] },
+      { text: "Margin is 75%.", claimType: "calculation", evidenceIds: ["E1", "E2"], datapointIds: ["dp:margin"] },
       { text: "Assume flat demand.", claimType: "assumption", evidenceIds: [] },
+      { text: "Bad value.", claimType: "observed_fact", evidenceIds: ["E1"] },
+      { text: "Blank unit.", claimType: "observed_fact", evidenceIds: ["E1"] },
+    ]);
+  });
+
+  test("datapoint_ids drops malformed entries and ignores removed value keys", () => {
+    const payload = {
+      claims: [
+        { text: "Revenue was reported.", claim_type: "observed_fact", evidence_ids: ["E1"], datapoint_ids: ["dp:revenue", "", null, 3, {}, ["dp:nested"], "dp:margin"], value: 35.1, entity: {}, period: false, unit: " " },
+        { text: "Margin may change.", claim_type: "inference", evidence_ids: ["E1"], datapoint_ids: "dp:margin", value: null },
+        { text: "Demand may change.", claim_type: "inference", evidence_ids: ["E1"], datapoint_ids: ["", null, false] },
+      ],
+    };
+    const inv = splitInventory(`Revenue was reported.\n\`\`\`json ${JSON.stringify(payload)}\`\`\``);
+    expect(inv.claims).toEqual([
+      { text: "Revenue was reported.", claimType: "observed_fact", evidenceIds: ["E1"], datapointIds: ["dp:revenue", "dp:margin"] },
+      { text: "Margin may change.", claimType: "inference", evidenceIds: ["E1"] },
+      { text: "Demand may change.", claimType: "inference", evidenceIds: ["E1"] },
     ]);
   });
 });
@@ -478,8 +496,17 @@ describe("muse reason personas (fake provider)", () => {
       { headers: { "Content-Type": "text/event-stream" } },
     );
 
+  const datapoint = {
+    id: "dp:drawn",
+    metric: "drawn",
+    value: "$2.1B",
+    entity: "ACME",
+    period: "2026",
+    unit: "USD",
+    statement: "ACME drawn was $2.1B in 2026.",
+  };
   const evidence: Evidence[] = [
-    { id: "E1", source: "sec", retrievedAt: "2026-01-01T00:00:00Z", content: "Revolver matures 2027; $2.1B drawn." },
+    { id: "E1", source: "sec", retrievedAt: "2026-01-01T00:00:00Z", content: "Revolver matures 2027; $2.1B drawn.", datapoints: [datapoint] },
     { id: "E2", source: "sec", retrievedAt: "2026-01-01T00:00:00Z", content: "Top customer is 38% of revenue." },
   ];
   const input = {
@@ -532,6 +559,7 @@ describe("muse reason personas (fake provider)", () => {
     const user = [...users][0];
     for (const fact of ["OBJECTIVE", "[E1]", "[E2]", "Revolver matures 2027", "Top customer is 38%"]) expect(user).toContain(fact);
     expect(user).toStartWith(`USER REQUEST\n${input.prompt}\n\nEVIDENCE\n`);
+    expect(user).toContain(`[E1]\nsource: sec\ncontent: ${evidence[0].content}\ndatapoint: ${JSON.stringify(datapoint)}\n\n[E2]`);
     // Roles differ; none asks for a gap line, and each keeps the inline citation instruction.
     const systems = seen.map((s) => systemOf(s.body));
     expect(new Set(systems).size).toBe(3);
@@ -647,9 +675,15 @@ describe("muse reason personas (fake provider)", () => {
     if (!call) throw new Error("expected one provider call");
     expect(call.path).toBe("/v1/responses");
     expect(systemOf(call.body)).not.toContain("Missing-Evidence:");
-    expect(systemOf(call.body)).toBe("You are Stockbot." + (ticker
-      ? "\n\nCURRENT STOCK CONTEXT\nThe current chart stock is NVDA. Use this stock only if the user request does not name a stock. An explicit stock in the user request takes precedence."
-      : ""));
+    expect(systemOf(call.body)).toBe("You are Stockbot." +
+      " You have no sourced evidence for this request, so you cannot state facts." +
+      " Write only qualified sentences: an assumption opens with Assuming or If; an unknown says what is unknown or was not found." +
+      " State no number except a year." +
+      " End your answer with a fenced inventory block and nothing after it:" +
+      " ```json {\"claims\": [{\"text\": \"<verbatim prose substring>\", \"claim_type\": \"<unknown|assumption>\", \"evidence_ids\": []}]}```" +
+      " Every sentence needs a claims row. Prose not covered by the inventory is deleted." + (ticker
+        ? "\n\nCURRENT STOCK CONTEXT\nThe current chart stock is NVDA. Use this stock only if the user request does not name a stock. An explicit stock in the user request takes precedence."
+        : ""));
     expect(userOf(call.body)).toBe("USER REQUEST\nWhat is ACME?");
     expect(userOf(call.body)).not.toContain("EVIDENCE");
   });
@@ -663,9 +697,10 @@ describe("muse reason personas (fake provider)", () => {
     expect(systemOf(call.body)).not.toContain("CURRENT STOCK CONTEXT");
     expect(userOf(call.body)).toContain("EVIDENCE\n[E1]\nsource: sec");
     expect(systemOf(call.body)).toContain("After a fact from EVIDENCE, put its row id in brackets, e.g. [ev:abc123].");
-    // The single-tool answer is gated, so the prompt asks for the claims inventory with datapoint keys.
+    // The single-tool answer needs an inventory that references datapoint ids.
     expect(systemOf(call.body)).toContain("End your answer with a fenced inventory block");
-    expect(systemOf(call.body)).toContain("\"value\"");
+    expect(systemOf(call.body)).toContain("\"datapoint_ids\"");
+    expect(systemOf(call.body)).not.toContain("\"value\"");
     expect(userOf(call.body)).not.toContain("SIBLING DRAFTS");
   });
 

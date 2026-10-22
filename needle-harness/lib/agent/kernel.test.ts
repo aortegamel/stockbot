@@ -3,8 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
-import { applyFinalGates, asksWatchlist, dropUncovered, inventoryDefect, KernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type FinalGateCaller, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
-import { FINAL_PERSONAS, type AgentEvent, type AskContext, type Evidence, type FinalClaim, type Metrics, type Persona } from "./types";
+import { applyFinalGates, asksWatchlist, datapointRows, dropUncovered, inventoryDefect, KernelRouter, parseTicker, parseWatchlist, qualifiedEvidenceFree, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type FinalGateCaller, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
+import { FINAL_PERSONAS, readDatapoints, type AgentEvent, type AskContext, type Datapoint, type Evidence, type FinalClaim, type Metrics, type Persona } from "./types";
 
 class FakeChild implements KernelChild {
   exitCode: number | null = null;
@@ -485,8 +485,8 @@ describe("runKernelAgent final personas", () => {
         python: "py", workerPath: "w", spawnFn, reason: async (o) => {
           expect(o.evidence).toEqual([]);
           expect(o.direct).toBe(true);
-          o.onDelta("hello");
-          return { text: "hello", usage: {} };
+          o.onDelta("The requested information is unknown.");
+          return { text: "The requested information is unknown.", usage: {}, claims: [{ text: "The requested information is unknown.", claimType: "unknown", evidenceIds: [] }] };
         },
       }
     });
@@ -879,15 +879,24 @@ describe("runKernelAgent final personas", () => {
   });
 
   test("the source gates keep supported facts and drop unsupported claims", async () => {
-    const supported = "Revenue was $10M.";
-    const unsupported = "Q3 margin was 40%.";
+    const supported = "NVDA Q3 FY2025 revenue was $10M USD.";
+    const unsupported = "NVDA Q3 FY2025 margin was 40%.";
     const { events, bodies, gates } = await runFinal({
       personas: ["bearbot"],
+      reply: (id) => `${JSON.stringify({
+        ...JSON.parse(graphReply(id)),
+        evidence: [{
+          id: "ev:1", content: "fact", datapoints: [
+            { id: "dp:revenue", metric: "revenue", value: "$10M", entity: "NVDA", period: "Q3 FY2025", unit: "USD", statement: supported },
+            { id: "dp:margin", metric: "margin", value: "40%", entity: "NVDA", period: "Q3 FY2025", unit: "%", statement: unsupported },
+          ],
+        }],
+      })}\n`,
       decide: () => ({
         text: `${supported} ${unsupported}`,
         claims: [
-          { text: supported, claimType: "observed_fact", evidenceIds: ["ev:1"] },
-          { text: unsupported, claimType: "observed_fact", evidenceIds: ["ev:1"] },
+          { text: supported, claimType: "observed_fact", evidenceIds: ["ev:1"], datapointIds: ["dp:revenue"] },
+          { text: unsupported, claimType: "observed_fact", evidenceIds: ["ev:1"], datapointIds: ["dp:margin"] },
         ],
       }),
       gate: (body) => {
@@ -947,25 +956,28 @@ describe("runKernelAgent final personas", () => {
   });
 
   test("empty graph answers direct through every selected persona", async () => {
-    const { events, calls } = await runFinal({ reply: emptyReply, personas: ["stockbot", "bullbot"] });
+    const { events, calls } = await runFinal({
+      reply: emptyReply, personas: ["stockbot", "bullbot"],
+      decide: (p) => ({ text: `${p} results are unknown.`, claims: [{ text: `${p} results are unknown.`, claimType: "unknown", evidenceIds: [] }] }),
+    });
     expect(calls.map((c) => c.input.persona)).toEqual(["stockbot", "bullbot"]);
     for (const c of calls) {
       expect(c.input.direct).toBe(true);
       expect(c.input.prompt).toBe("q");
       expect(c.input.evidence).toEqual([]);
     }
-    expect(answers(events)).toEqual([`${label("stockbot")}\nstockbot p1\n\n${label("bullbot")}\nbullbot p1`]);
+    expect(answers(events)).toEqual([`${label("stockbot")}\nstockbot results are unknown.\n\n${label("bullbot")}\nbullbot results are unknown.`]);
     expect(doneMetrics(events).muse.calls).toBe(2);
   });
   test("an empty-graph direct answer skips the source gates even when the gate service rejects", async () => {
     const { events, gates } = await runFinal({
       reply: emptyReply,
       personas: ["stockbot", "bullbot"],
-      decide: (p) => ({ claims: [{ text: `${p} p1`, claimType: "unknown", evidenceIds: [] }] }),
+      decide: (p) => ({ text: `${p} results are unknown.`, claims: [{ text: `${p} results are unknown.`, claimType: "unknown", evidenceIds: [] }] }),
       gate: () => ({ error: "gate down" }),
     });
     expect(gates).toEqual([]);
-    expect(answers(events)).toEqual([`${label("stockbot")}\nstockbot p1\n\n${label("bullbot")}\nbullbot p1`]);
+    expect(answers(events)).toEqual([`${label("stockbot")}\nstockbot results are unknown.\n\n${label("bullbot")}\nbullbot results are unknown.`]);
     expect(events.some((e) => e.type === "failed")).toBe(false);
   });
   test("whole-response pass gates every persona with one op per persona", async () => {
@@ -1033,8 +1045,8 @@ describe("runKernelAgent final personas", () => {
   });
 
   test("whole-response reject runs per-claim gates and deletes only rejected substrings", async () => {
-    const kept = "bearbot keeps this";
-    const cut = "bearbot loses this";
+    const kept = "bearbot may keep this.";
+    const cut = "bearbot reported this.";
     const { events, gates } = await runFinal({
       decide: (p) =>
         p === "bearbot"
@@ -1157,8 +1169,8 @@ describe("runKernelAgent final personas", () => {
   });
 
   test("a corrected answer still passes the source gates before display", async () => {
-    const kept = "bearbot corrected fact";
-    const cut = "bearbot corrected guess";
+    const kept = "bearbot corrected fact.";
+    const cut = "bearbot corrected guess.";
     const { events, calls, gates } = await runFinal({
       personas: ["bearbot"],
       decide: (_p, _pass, attempt) =>
@@ -1197,8 +1209,8 @@ describe("runKernelAgent final personas", () => {
     });
     expect(calls.map((c) => c.input.persona)).toEqual(["stockbot"]);
     expect(gates).toEqual([]);
-    expect(answers(events)).toEqual([`${label("stockbot")}\nstockbot p1`]);
-    expect(events.some((e) => e.type === "failed")).toBe(false);
+    expect(answers(events)).toEqual([]);
+    expect(events.some((e) => e.type === "failed" && e.message === "stockbot: all claims rejected")).toBe(true);
   });
 
   test("property: a correction attempt cites only known ids or fails closed", async () => {
@@ -1223,82 +1235,155 @@ describe("runKernelAgent final personas", () => {
     );
   });
 
+  const revenuePoint: Datapoint = {
+    id: "dp:revenue", metric: "revenue", value: "$35.1B", entity: "NVDA", period: "Q3 FY2025", unit: "USD",
+    statement: "NVDA Q3 FY2025 revenue was $35.1B USD.",
+  };
+
   test("inventoryDefect rejects non-substrings, unknown ids, and uncited non-unknown claims", () => {
     const known = new Set(["ev:1"]);
-    expect(inventoryDefect("prose", [{ text: "missing", claimType: "inference", evidenceIds: ["ev:1"] }], known)).toMatch(/substring/);
-    expect(inventoryDefect("prose has it", [{ text: "has it", claimType: "inference", evidenceIds: ["ev:9"] }], known)).toMatch(/unknown evidence id/);
-    expect(inventoryDefect("prose has it", [{ text: "has it", claimType: "observed_fact", evidenceIds: [] }], known)).toMatch(/uncited/);
-    expect(inventoryDefect("prose has it", [{ text: "has it", claimType: "unknown", evidenceIds: [] }], known)).toBeUndefined();
+    const points = datapointRows([]);
+    expect(inventoryDefect("prose", [{ text: "missing", claimType: "inference", evidenceIds: ["ev:1"] }], known, points)).toMatch(/substring/);
+    expect(inventoryDefect("prose has it", [{ text: "has it", claimType: "inference", evidenceIds: ["ev:9"] }], known, points)).toMatch(/unknown evidence id/);
+    expect(inventoryDefect("prose has it", [{ text: "has it", claimType: "observed_fact", evidenceIds: [] }], known, points)).toMatch(/uncited/);
+    expect(inventoryDefect("prose has it", [{ text: "has it", claimType: "unknown", evidenceIds: [] }], known, points)).toBeUndefined();
   });
 
-  test("inventoryDefect checks typed datapoints: cited, verbatim value, calculations carry a value", () => {
-    const known = new Set(["ev:1"]);
-    const prose = "Revenue was $35.1B. Margin is 75%. Assume flat demand.";
-    const fact: FinalClaim = { text: "Revenue was $35.1B.", claimType: "observed_fact", evidenceIds: ["ev:1"], value: "$35.1B", entity: "NVDA", period: "Q3", unit: "USD" };
-    expect(inventoryDefect(prose, [fact], known)).toBeUndefined();
-    expect(inventoryDefect(prose, [{ text: "Assume flat demand.", claimType: "assumption", evidenceIds: [] }], known)).toBeUndefined();
-    expect(inventoryDefect(prose, [{ ...fact, value: "$36B" }], known)).toMatch(/datapoint value/);
-    expect(inventoryDefect(prose, [{ text: "Revenue was $35.1B.", claimType: "unknown", evidenceIds: [], value: "$35.1B" }], known)).toMatch(/datapoint value/);
-    expect(inventoryDefect(prose, [{ text: "Margin is 75%.", claimType: "calculation", evidenceIds: ["ev:1"] }], known)).toMatch(/calculation without value/);
-    expect(inventoryDefect(prose, [{ text: "Margin is 75%.", claimType: "calculation", evidenceIds: ["ev:1"], value: "75%" }], known)).toBeUndefined();
+  test("inventoryDefect requires datapoints carried by cited rows and calculations to reference datapoints", () => {
+    const margin: Datapoint = { ...revenuePoint, id: "dp:margin", metric: "margin", value: "75%", unit: "%", inputs: ["dp:revenue"], statement: "NVDA Q3 FY2025 margin was 75%." };
+    const evidence: Evidence[] = [
+      { id: "ev:1", source: "kernel", retrievedAt: "t", content: "fact", datapoints: [revenuePoint, margin] },
+      { id: "ev:2", source: "kernel", retrievedAt: "t", content: "other fact" },
+    ];
+    const known = new Set(evidence.map((e) => e.id));
+    const points = datapointRows(evidence);
+    const prose = `${revenuePoint.statement} ${margin.statement} Assume flat demand.`;
+    const fact: FinalClaim = { text: revenuePoint.statement, claimType: "observed_fact", evidenceIds: ["ev:1"], datapointIds: [revenuePoint.id] };
+    expect(points).toEqual(new Map([[revenuePoint.id, "ev:1"], [margin.id, "ev:1"]]));
+    expect(inventoryDefect(prose, [fact], known, points)).toBeUndefined();
+    expect(inventoryDefect(prose, [{ text: "Assume flat demand.", claimType: "assumption", evidenceIds: [] }], known, points)).toBeUndefined();
+    expect(inventoryDefect(prose, [{ ...fact, datapointIds: ["dp:missing"] }], known, points)).toBe("inventory cites unknown datapoint id: dp:missing");
+    expect(inventoryDefect(prose, [{ ...fact, evidenceIds: ["ev:2"] }], known, points)).toBe("inventory cites unknown datapoint id: dp:revenue");
+    expect(inventoryDefect(prose, [{ ...fact, claimType: "unknown", evidenceIds: [] }], known, points)).toMatch(/unknown datapoint id/);
+    expect(inventoryDefect(prose, [{ text: margin.statement, claimType: "calculation", evidenceIds: ["ev:1"] }], known, points)).toMatch(/calculation without datapoint_ids/);
+    expect(inventoryDefect(prose, [{ text: margin.statement, claimType: "calculation", evidenceIds: ["ev:1"], datapointIds: [margin.id] }], known, points)).toBeUndefined();
   });
 
-  test("dropUncovered keeps a number only inside a kept claim; `all` also drops uncovered sentences", () => {
+  test("dropUncovered requires full sentence coverage for qualitative clauses and numbers", () => {
     const claim: FinalClaim = { text: "Revenue was $35.1B", claimType: "observed_fact", evidenceIds: ["ev:1"] };
     const text = "Revenue was $35.1B [ev:12]. Q3 looks firm. Margin hit 99%.\nGrowth was 12% too.";
-    expect(dropUncovered(text, [claim], false)).toBe("Revenue was $35.1B [ev:12]. Q3 looks firm.");
-    expect(dropUncovered(text, [claim], true)).toBe("Revenue was $35.1B [ev:12].");
-    // A covered sentence still drops a number outside the claim text.
-    expect(dropUncovered("Revenue was $35.1B, up 40%.", [claim], false)).toBe("");
-    expect(dropUncovered("No numbers here. Filed a 10-K.", [], false)).toBe("No numbers here.");
+    expect(dropUncovered(text, [claim])).toBe("Revenue was $35.1B [ev:12].");
+    expect(dropUncovered("Revenue was $35.1B, up 40%.", [claim])).toBe("");
+    expect(dropUncovered("Revenue was $35.1B and demand is strong.", [claim])).toBe("");
+    expect(dropUncovered("No numbers here. Filed a 10-K.", [])).toBe("");
+    const demand: FinalClaim = { text: "demand may hold", claimType: "inference", evidenceIds: ["ev:1"] };
+    expect(dropUncovered("Revenue was $35.1B and demand may hold [ev:1].", [claim, demand])).toBe("Revenue was $35.1B and demand may hold [ev:1].");
   });
 
-  test("a fabricated or unproven number never shows; typed datapoints ride the gate wire", async () => {
-    const fact: FinalClaim = { text: "Revenue was $35.1B [ev:1].", claimType: "observed_fact", evidenceIds: ["ev:1"], value: "$35.1B", entity: "NVDA", period: "Q3 FY2025", unit: "USD" };
+  test("qualifiedEvidenceFree keeps only qualified unknowns and opening assumptions without citations", () => {
+    const unknown: FinalClaim = { text: "No 2026 guidance was found.", claimType: "unknown", evidenceIds: [] };
+    const assumption: FinalClaim = { text: "Assuming flat demand, margins hold at 70%.", claimType: "assumption", evidenceIds: [] };
+    const rejected: FinalClaim[] = [
+      { text: "Revenue was $99B but margins are unknown.", claimType: "unknown", evidenceIds: [] },
+      { text: "Demand remains firm.", claimType: "unknown", evidenceIds: [] },
+      { text: "Margins hold at 70%, assuming flat demand.", claimType: "assumption", evidenceIds: [] },
+      { ...unknown, evidenceIds: ["ev:1"] },
+      { ...assumption, evidenceIds: ["ev:1"] },
+      { ...unknown, datapointIds: ["dp:guidance"] },
+      { ...assumption, datapointIds: ["dp:margin"] },
+      { text: "Demand may hold.", claimType: "inference", evidenceIds: [] },
+    ];
+    expect(qualifiedEvidenceFree([unknown, ...rejected, assumption])).toEqual([unknown, assumption]);
+  });
+
+  test("readDatapoints drops malformed descriptors and sanitizes optional fields", () => {
+    for (const raw of [undefined, null, {}, "dp:revenue", 7]) expect(readDatapoints(raw)).toEqual([]);
+    const malformed: unknown[] = [null, [], "dp:revenue", 7, { ...revenuePoint, id: "ev:1" }];
+    for (const key of ["id", "metric", "value", "entity", "period", "statement"] as const) {
+      malformed.push({ ...revenuePoint, [key]: "" }, { ...revenuePoint, [key]: 7 }, { ...revenuePoint, [key]: null });
+      const missing: Record<string, unknown> = { ...revenuePoint };
+      delete missing[key];
+      malformed.push(missing);
+    }
+    expect(readDatapoints(malformed)).toEqual([]);
+    expect(readDatapoints([
+      ...malformed,
+      { ...revenuePoint, extra: "ignored", inputs: ["dp:input", "", 7, null] },
+      { ...revenuePoint, unit: 7, inputs: "dp:input" },
+    ])).toEqual([
+      { ...revenuePoint, inputs: ["dp:input"] },
+      { id: revenuePoint.id, metric: revenuePoint.metric, value: revenuePoint.value, entity: revenuePoint.entity, period: revenuePoint.period, statement: revenuePoint.statement },
+    ]);
+  });
+
+  test("a fabricated or unproven number never shows and datapoint ids enter the gate wire", async () => {
+    const fact: FinalClaim = { text: "NVDA Q3 FY2025 revenue was $35.1B USD [ev:1].", claimType: "observed_fact", evidenceIds: ["ev:1"], datapointIds: [revenuePoint.id] };
     const hedge: FinalClaim = { text: "Margins may compress if demand slows.", claimType: "inference", evidenceIds: ["ev:1"] };
     const text = `${fact.text} ${hedge.text} Margin hit 99%.`;
-    // Whole-response pass: the uninventoried 99% sentence drops; both claims replay as shown.
-    const passed = await runFinal({ personas: ["stockbot"], reply: sessionGraphReply, decide: () => ({ text, claims: [fact, hedge] }) });
+    const reply = (id: string): string => `${JSON.stringify({
+      ...JSON.parse(sessionGraphReply(id)),
+      evidence: [{ id: "ev:1", content: "fact", datapoints: [revenuePoint, null, { ...revenuePoint, id: "ev:bad" }] }],
+    })}\n`;
+    // The whole-response pass still drops the sentence that has no inventory claim.
+    const passed = await runFinal({ personas: ["stockbot"], reply, decide: () => ({ text, claims: [fact, hedge] }) });
+    expect(passed.calls[0]?.input.evidence[0]?.datapoints).toEqual([revenuePoint]);
+    expect(passed.events.find((e) => e.type === "evidence")).toMatchObject({ evidence: [{ datapoints: [revenuePoint] }] });
     expect(passed.gates[0]?.claims).toEqual([
-      { text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:1"], value: "$35.1B", entity: "NVDA", period: "Q3 FY2025", unit: "USD" },
+      { text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:1"], datapoint_ids: [revenuePoint.id] },
       { text: hedge.text, claim_type: "inference", evidence_ids: ["ev:1"] },
     ]);
     expect(answers(passed.events)).toEqual([`${label("stockbot")}\n${fact.text} ${hedge.text}`]);
     expect(passed.events.find((e) => e.type === "claims")).toEqual({ type: "claims", claims: [fact, hedge] });
-    // A ledger proof failure on the datapoint deletes it; the qualified inference stays.
+    // A ledger proof failure removes the datapoint claim but keeps the qualified inference.
     const proofFailed = await runFinal({
       personas: ["stockbot"],
-      reply: sessionGraphReply,
+      reply,
       decide: () => ({ text, claims: [fact, hedge] }),
       gate: (body) => {
-        if (body.op === "assess_final_response") return { error: "proof: value conflicts with ledger" };
-        return (body.claim as Record<string, unknown>).value === undefined ? { support_answer: "yes" } : { error: "proof: value conflicts with ledger" };
+        if (body.op === "assess_final_response") return { error: "proof: datapoint conflicts with ledger" };
+        return (body.claim as Record<string, unknown>).datapoint_ids === undefined ? { support_answer: "yes" } : { error: "proof: datapoint conflicts with ledger" };
       },
     });
-    expect(proofFailed.gates.find((g) => g.op === "assess_final_claim")?.claim).toMatchObject({ value: "$35.1B", period: "Q3 FY2025" });
+    expect(proofFailed.gates.find((g) => g.op === "assess_final_claim")?.claim).toEqual({
+      text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:1"], datapoint_ids: [revenuePoint.id],
+    });
+    for (const body of [...passed.gates, ...proofFailed.gates]) {
+      const claims = body.op === "assess_final_response" ? body.claims as Record<string, unknown>[] : [body.claim as Record<string, unknown>];
+      for (const claim of claims) {
+        for (const key of ["value", "entity", "period", "unit"]) expect(claim).not.toHaveProperty(key);
+      }
+    }
     expect(answers(proofFailed.events)).toEqual([`${label("stockbot")}\n${hedge.text}`]);
   });
 
-  test("an empty-graph direct answer drops every datapoint sentence, and fails closed when nothing is left", async () => {
-    const kept = await runFinal({ reply: emptyReply, personas: ["stockbot"], decide: () => ({ text: "NVDA rose 12% today. Ask me for sources.", claims: [] }) });
-    expect(answers(kept.events)).toEqual([`${label("stockbot")}\nAsk me for sources.`]);
-    const empty = await runFinal({ reply: emptyReply, personas: ["stockbot"], decide: () => ({ text: "NVDA rose 12% today.", claims: [] }) });
-    expect(answers(empty.events)).toEqual([]);
-    expect(failedCategory(empty.events)).toBe("provider_error");
+  test("an empty-graph direct answer keeps qualified unknown prose and rejects unqualified prose", async () => {
+    const unknown: FinalClaim = { text: "No 2026 guidance was found.", claimType: "unknown", evidenceIds: [] };
+    const kept = await runFinal({
+      reply: emptyReply, personas: ["stockbot"],
+      decide: () => ({ text: `NVDA rose 12% today. ${unknown.text} Ask me for sources.`, claims: [unknown] }),
+    });
+    expect(answers(kept.events)).toEqual([`${label("stockbot")}\n${unknown.text}`]);
+    expect(kept.gates).toEqual([]);
+    for (const claims of [[], [{ text: "Ask me for sources.", claimType: "unknown" as const, evidenceIds: [] }]]) {
+      const empty = await runFinal({ reply: emptyReply, personas: ["stockbot"], decide: () => ({ text: "NVDA rose 12% today. Ask me for sources.", claims }) });
+      expect(answers(empty.events)).toEqual([]);
+      expect(failedCategory(empty.events)).toBe("provider_error");
+      expect(empty.events.find((e) => e.type === "failed")).toMatchObject({ message: "stockbot: all claims rejected" });
+    }
   });
 
   test("a research answer with no cited claim ships the gated prose with no banner", async () => {
     const { events } = await runFinal({
       personas: ["bearbot"],
-      decide: () => ({ text: "bearbot guess", claims: [{ text: "bearbot guess", claimType: "unknown", evidenceIds: [] }] }),
+      decide: () => ({ text: "The bearbot outlook is unknown.", claims: [{ text: "The bearbot outlook is unknown.", claimType: "unknown", evidenceIds: [] }] }),
     });
-    expect(answers(events)).toEqual([`${label("bearbot")}\nbearbot guess`]);
+    expect(answers(events)).toEqual([`${label("bearbot")}\nThe bearbot outlook is unknown.`]);
     expect(events.some((e) => e.type === "failed")).toBe(false);
   });
 
   test("a cited claim the gates delete leaves only the kept prose, with no banner", async () => {
-    const kept = "bearbot uncited opinion";
-    const cut = "bearbot cited fact";
+    const kept = "The bearbot outlook is unknown.";
+    const cut = "bearbot cited fact.";
     const { events } = await runFinal({
       personas: ["bearbot"],
       decide: () => ({
@@ -1553,7 +1638,7 @@ describe("runKernelAgent final personas", () => {
   test("applyFinalGates treats worker error as reject and deletes surgically", async () => {
     const ev = [{ id: "ev:1", source: "kernel", retrievedAt: "t", content: "fact" }];
     const gated = await applyFinalGates({
-      results: [{ persona: "bearbot", text: "aaa KEEP bbb CUT ccc", claims: [{ text: "KEEP", claimType: "inference", evidenceIds: ["ev:1"] }, { text: "CUT", claimType: "inference", evidenceIds: ["ev:1"] }] }],
+      results: [{ persona: "bearbot", text: "KEEP. CUT. Uncovered.", claims: [{ text: "KEEP", claimType: "inference", evidenceIds: ["ev:1"] }, { text: "CUT", claimType: "inference", evidenceIds: ["ev:1"] }] }],
       evidence: ev,
       personaOrder: ["bearbot"],
       gate: async (body) => {
@@ -1585,7 +1670,7 @@ describe("runKernelAgent final personas", () => {
       const claims: FinalClaim[] = Array.from({ length: claimCounts[i] ?? 0 }, (_, j) => ({
         text: `${p}-c${j}`, claimType: "inference", evidenceIds: [defectAt === i && j === 0 ? "ev:9" : "ev:1"],
       }));
-      return { persona: p, text: `${p} lead. ${claims.map((c) => c.text).join(" ")}`, claims };
+      return { persona: p, text: `${p} lead.\n${claims.map((c) => c.text).join("\n")}`, claims };
     });
 
   test("applyFinalGates checks every persona and every rejected claim concurrently", async () => {
@@ -1663,7 +1748,7 @@ describe("runKernelAgent worker replies", () => {
         python: "py",
         workerPath: "w",
         spawnFn,
-        reason: async (o: KernelReasonInput) => ({ text: `${o.persona} answer`, usage: {} }),
+        reason: async (o: KernelReasonInput): Promise<KernelReasonResult> => ({ text: `${o.persona} answer`, usage: {}, claims: [{ text: `${o.persona} answer`, claimType: "inference", evidenceIds: o.evidence.map((e) => e.id) }] }),
       },
     });
   }
@@ -1869,7 +1954,7 @@ describe("trio offer and persona follow-up", () => {
       python: "py", workerPath: "w", spawnFn,
       reason: async (o: KernelReasonInput): Promise<KernelReasonResult> => {
         calls.push(o);
-        return { text: `${o.persona} view`, usage: {}, claims: [] };
+        return { text: `${o.persona} view`, usage: {}, claims: [{ text: `${o.persona} view`, claimType: "inference", evidenceIds: ["ev:1"] }] };
       },
     };
   }
@@ -1885,7 +1970,7 @@ describe("trio offer and persona follow-up", () => {
     const calls: KernelReasonInput[] = [];
     await runKernelAgent("q", (e) => { events.push(e); }, { deps: trioDeps([], calls) });
     expect(calls.map((c) => c.persona)).toEqual(["stockbot"]);
-    expect(events.slice(-3).map((e) => e.type)).toEqual(["answer_delta", "offer_trio", "done"]);
+    expect(events.slice(-4).map((e) => e.type)).toEqual(["answer_delta", "offer_trio", "claims", "done"]);
     expect(events.find((e) => e.type === "offer_trio")).toEqual({ type: "offer_trio", sessionId: "rs:trio" });
     expect(doneOf(events).muse.calls).toBe(1);
   });

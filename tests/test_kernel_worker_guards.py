@@ -2650,6 +2650,125 @@ def test_entry_gates_use_dated_context_and_valid_tool_results(monkeypatch: pytes
     }
 
 
+def test_final_response_rejects_uncovered_qualitative_sentence_before_jev(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import tests.research_source_seam as seam
+
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "The filing discusses exposure."})
+
+    async def _unexpected_jev(*args: object, **kwargs: object) -> dict[str, JSONValue]:
+        pytest.fail("JEV must not assess prose with an uncovered sentence")
+
+    jev = JevClient()
+    monkeypatch.setattr(jev, "assess_final_response", _unexpected_jev)
+    out = kw._assess_final_response(
+        {
+            "id": "uncovered",
+            "sessionId": sid,
+            "text": "The filing may suggest exposure. Demand collapsed.",
+            "claims": [
+                {
+                    "text": "The filing may suggest exposure.",
+                    "claim_type": "inference",
+                    "evidence_ids": ["ev-1"],
+                }
+            ],
+        },
+        jev=jev,
+    )
+    assert out == {
+        "id": "uncovered",
+        "error": "coverage: sentence 'Demand collapsed.' has no inventory claim",
+        "support": None,
+        "support_answer": None,
+        "evidence_state": "insufficient",
+    }
+    assert ResearchRepository().list_decisions(sid) == []
+
+
+def _final_datapoint_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
+    import tests.research_source_seam as seam
+    from app.research import service
+
+    passage = "NVDA FY2025 revenue was 123 USD."
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-legacy": passage})
+    store = ResearchRepository()
+    service.record_evidence(
+        sid,
+        store.list_jobs(sid)[0].job_id,
+        {
+            "evidence_id": "ev-point",
+            "content": passage,
+            "claim_text": passage,
+            "subject": "NVDA",
+            "source_name": "SEC",
+            "source_record_id": seam.DEFAULT_ACCESSION,
+            "document_name": seam.DEFAULT_DOCUMENT,
+            "matching_passage": passage,
+            "source_handle": seam.handle_for_registered(passage),
+            "known_at": "2025-05-01T00:00:00+00:00",
+            "metric": "revenue",
+            "value": "123",
+            "entity": "NVDA",
+            "period": "FY2025",
+            "unit": "USD",
+        },
+        repo=store,
+    )
+    return sid
+
+
+def test_final_proof_defect_forwards_datapoints_and_filters_removed_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from app.research.evidence import datapoint_descriptor, evidence_from_dict
+
+    sid = _final_datapoint_session(monkeypatch, tmp_path)
+    record = next(row for row in ResearchRepository().list_evidence(sid) if row["evidence_id"] == "ev-point")
+    point = datapoint_descriptor(evidence_from_dict(record))
+    assert point is not None
+    claim: dict[str, JSONValue] = {
+        "text": "NVDA FY2025 revenue was 123 USD.",
+        "claim_type": "observed_fact",
+        "evidence_ids": ["ev-point"],
+        "datapoint_ids": [point["id"]],
+        "value": "999",
+        "entity": "untrusted entity",
+        "period": "untrusted period",
+        "unit": "untrusted unit",
+    }
+    assert kw._final_proof_defect({"sessionId": sid}, [claim]) is None
+    id_cases: list[list[JSONValue]] = [[], ["dp:missing"]]
+    for ids in id_cases:
+        defect = kw._final_proof_defect({"sessionId": sid}, [{**claim, "datapoint_ids": ids}])
+        assert "ERR_DATAPOINT_UNVERIFIED" in str(defect)
+    unhedged: dict[str, JSONValue] = {
+        "text": "The filing establishes exposure.",
+        "claim_type": "inference",
+        "evidence_ids": ["ev-legacy"],
+    }
+    defect = kw._final_proof_defect({"sessionId": sid}, [unhedged])
+    assert "ERR_CLAIM_UNQUALIFIED" in str(defect)
+
+
+def test_run_evidence_adds_only_canonical_datapoints(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from app.research.evidence import datapoint_descriptor, evidence_from_dict
+
+    sid = _final_datapoint_session(monkeypatch, tmp_path)
+    records = ResearchRepository().list_evidence(sid)
+    record = next(row for row in records if row["evidence_id"] == "ev-point")
+    point = datapoint_descriptor(evidence_from_dict(record))
+    assert point is not None
+    legacy: dict[str, JSONValue] = {"evidence_id": "ev-untyped", "content": "A legacy row without a proof."}
+    rows, known_ids = kw._run_evidence([*records, legacy])
+    by_id = {row["id"]: row for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)}
+    assert known_ids == set(by_id) == {"ev-point", "ev-legacy", "ev-untyped"}
+    assert by_id["ev-point"]["datapoints"] == [point]
+    assert "datapoints" not in by_id["ev-legacy"]
+    assert "datapoints" not in by_id["ev-untyped"]
+
+
 async def _list_result(*a: object, **k: object) -> object:
     return ["not", "a", "mapping"]
 
@@ -2662,10 +2781,19 @@ def test_assess_final_malformed_results_fail_closed(monkeypatch: pytest.MonkeyPa
     """A non-mapping JEV result is a fail-closed verdict carrying the malformed-result text."""
     import tests.research_source_seam as seam
 
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "claim text from the filing."})
+    inventory: dict[str, JSONValue] = {
+        "text": "The filing may suggest exposure.",
+        "claim_type": "inference",
+        "evidence_ids": ["ev-1"],
+    }
+
     jev = JevClient()
     monkeypatch.setattr(jev, "assess_final_response", _list_result)
     monkeypatch.setattr(jev, "assess_final_claim", _text_result)
-    response = kw._assess_final_response({"id": "f1", "text": "claim text"}, jev=jev)
+    response = kw._assess_final_response(
+        {"id": "f1", "sessionId": sid, "text": inventory["text"], "claims": [inventory]}, jev=jev
+    )
     assert response == {
         "id": "f1",
         "error": "assess_final_response: malformed result",
@@ -2677,12 +2805,11 @@ def test_assess_final_malformed_results_fail_closed(monkeypatch: pytest.MonkeyPa
     unproven = kw._assess_final_claim({"id": "c0", "claim": {"text": "claim text", "claim_type": "inference"}}, jev=jev)
     assert str(unproven["error"]).startswith("proof: sessionId required")
     assert unproven["support"] is None and unproven["evidence_state"] == "insufficient"
-    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "claim text from the filing."})
     claim = kw._assess_final_claim(
         {
             "id": "c1",
             "sessionId": sid,
-            "claim": {"text": "claim text", "claim_type": "inference", "evidence_ids": ["ev-1"]},
+            "claim": inventory,
         },
         jev=jev,
     )
@@ -2732,11 +2859,12 @@ def test_final_response_gate_validates_inventory_before_model_assessment(
         {"text": "y", "claim_type": "fact", "confidence": True},
         {"text": "z", "claim_type": "fact", "evidence_ids": "ev-1"},
     ]
+    claim_text = "WSJ reported X, which suggests recovery"
     request: dict[str, JSONValue] = {
         "id": "f2",
         "op": "assess_final_response",
         "sessionId": sid,
-        "text": " WSJ reported X. ",
+        "text": f"  {claim_text}.  ",
         "confidence": confidence,
     }
     # A malformed inventory row fails the ledger proof gate before any model assessment.
@@ -2744,7 +2872,7 @@ def test_final_response_gate_validates_inventory_before_model_assessment(
     assert rejected is not None and str(rejected["error"]).startswith("proof:")
     assert rejected["support_answer"] is None and seen == []
     clean: list[JSONValue] = [
-        {"text": f"  {'c' * 2100}  ", "claim_type": " inference ", "confidence": 0.5, "evidence_ids": ["ev-1"]},
+        {"text": f"  {claim_text}  ", "claim_type": " inference ", "confidence": 0.5, "evidence_ids": ["ev-1"]},
     ]
     out = kw._direct_op({**request, "claims": clean}, jev)
     assert out is not None
@@ -2754,10 +2882,10 @@ def test_final_response_gate_validates_inventory_before_model_assessment(
     assert out["confidence"] == expected_confidence
     assert len(seen) == 1
     state = seen[0]
-    assert state["text"] == "WSJ reported X." and state["evidence"] == []
+    assert state["text"] == f"{claim_text}." and state["evidence"] == []
     assert state["confidence"] == expected_confidence
     assert state["claims"] == [
-        {"text": "c" * 2000, "claim_type": "inference", "evidence_ids": ["ev-1"], "confidence": 0.5},
+        {"text": claim_text[:2000], "claim_type": "inference", "evidence_ids": ["ev-1"], "confidence": 0.5},
     ]
     decisions = ResearchRepository().list_decisions(sid)
     assert len(decisions) == 1 and decisions[0].decision_type == "final_response_assessment"
@@ -2767,20 +2895,39 @@ def test_final_response_gate_validates_inventory_before_model_assessment(
     ("payload", "evidence", "confidence", "claim_type"),
     [
         (
-            {"claim": {"text": "X.", "claim_type": "inference", "evidence_ids": ["ev-1"], "confidence": 0.5}},
+            {
+                "claim": {
+                    "text": "The filing reports X may occur.",
+                    "claim_type": "inference",
+                    "evidence_ids": ["ev-1"],
+                    "confidence": 0.5,
+                }
+            },
             [{"id": "ev-1", "content": ""}],
             0.5,
             "inference",
         ),
         (
-            {"claim": {"text": "X.", "claim_type": "inference", "evidence_ids": ["ev-1"]}, "confidence": 0.6},
+            {
+                "claim": {
+                    "text": "The filing reports X may occur.",
+                    "claim_type": "inference",
+                    "evidence_ids": ["ev-1"],
+                },
+                "confidence": 0.6,
+            },
             [{"id": "ev-1", "content": ""}],
             0.6,
             "inference",
         ),
         (
             {
-                "claim": {"text": "X.", "claim_type": "inference", "evidence_ids": ["ev-1"], "confidence": 0.5},
+                "claim": {
+                    "text": "The filing reports X may occur.",
+                    "claim_type": "inference",
+                    "evidence_ids": ["ev-1"],
+                    "confidence": 0.5,
+                },
                 "evidence": [{"id": "ev-9", "content": "filing text", "other": 1}],
                 "confidence": 0.8,
             },
@@ -2789,7 +2936,11 @@ def test_final_response_gate_validates_inventory_before_model_assessment(
             "inference",
         ),
         (
-            {"text": "X.", "claim_type": "attributed_report", "evidence_ids": ["ev-1"]},
+            {
+                "text": "The filing reports X may occur.",
+                "claim_type": "attributed_report",
+                "evidence_ids": ["ev-1"],
+            },
             [{"id": "ev-1", "content": ""}],
             None,
             "attributed_report",
@@ -2806,7 +2957,7 @@ def test_final_claim_gate_assesses_available_evidence(
 ) -> None:
     import tests.research_source_seam as seam
 
-    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "X. The filing says so."})
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "The filing reports X may occur. The filing says so."})
     seen: list[object] = []
     supported = any(isinstance(row, dict) and row.get("content") for row in evidence)
 
@@ -2838,13 +2989,20 @@ def test_final_claim_gate_assesses_available_evidence(
     assert out["support_answer"] == ("yes" if supported else "no")
     assert out["evidence_state"] == ("sufficient_support" if supported else "insufficient")
     assert out["confidence"] == confidence
-    assert seen == [{"text": "X.", "claim_type": claim_type, "evidence": evidence, "confidence": confidence}]
+    assert seen == [
+        {
+            "text": "The filing reports X may occur.",
+            "claim_type": claim_type,
+            "evidence": evidence,
+            "confidence": confidence,
+        }
+    ]
     decisions = ResearchRepository().list_decisions(sid)
     assert len(decisions) == 1 and decisions[0].decision_type == "final_claim_assessment"
     # An uncited inference or an id the ledger never admitted fails the proof gate; JEV never runs.
     id_cases: list[list[JSONValue]] = [[], ["ev-404"]]
     for ids in id_cases:
-        claim: dict[str, JSONValue] = {"text": "X.", "claim_type": "inference", "evidence_ids": ids}
+        claim: dict[str, JSONValue] = {"text": "X may occur.", "claim_type": "inference", "evidence_ids": ids}
         unproven = kw._direct_op(
             {"id": "u", "op": "assess_final_claim", "sessionId": sid, "claim": claim},
             JevClient(transport=_transport, data_root=tmp_path),
@@ -4002,7 +4160,9 @@ def test_entry_tool_admits_into_its_gated_session_before_return(
     assert isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict)
     eid = rows[0]["id"]
     assert isinstance(eid, str)
-    claims: list[JSONValue] = [{"text": "The source reports 123.", "claim_type": "inference", "evidence_ids": [eid]}]
+    claims: list[JSONValue] = [
+        {"text": "The source may suggest exposure.", "claim_type": "inference", "evidence_ids": [eid]}
+    ]
     assert kw._final_proof_defect({"sessionId": sid}, claims) is None
     assert "not a substantive ledger row" in str(
         kw._final_proof_defect(

@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from . import (
+    CLAIM_WORDING_RULE,
     CommitteeMateriality,
     GroundedClaim,
     ImpactChannel,
@@ -102,7 +103,7 @@ def run_bullbot(
         f"contractual protection, or diversified revenue. Question: {question}\n"
         f"Freeze: {freeze_id} as of {as_of} evidence={len(frozen)}\n"
         'Respond with one JSON object only: {"role": "bullbot", "executive_view": "<bullish read>", '
-        '"claims": [{"text": "<finding>", "claim_type": "observed_fact|inference|unknown|contradicted|conditional_risk|attributed_report", "evidence_ids": ["<freeze-id>", ...]}], '
+        '"claims": [{"text": "<finding>", "claim_type": "observed_fact|calculation|inference|unknown|contradicted|conditional_risk|attributed_report", "evidence_ids": ["<freeze-id>", ...], "datapoint_ids": ["<dp:id>", ...]}], '
         '"impact_channels": [{"text": "<channel>", "direction": "<what it does to the question>", "evidence_ids": ["<freeze-id>"]}], '
         '"materiality": {"overall": "critical|high|medium|low", "reasoning": "<why>"}, '
         '"uncertainties": ["<what the freeze does not establish>"], '
@@ -115,7 +116,7 @@ def run_bullbot(
         "unknown when the frozen evidence does not establish it (for example no disclosure located within the searched scope). "
         "Cite both sides when evidence conflicts and declare contradicted. "
         "observed_fact/inference/contradicted/conditional_risk/attributed_report need at least one freeze id; unknown may cite none. "
-        "Cite only freeze ids."
+        "Cite only freeze ids." + CLAIM_WORDING_RULE
     )
     if evidence_text.strip():
         prompt += f"\nEvidence (cite ids):\n{evidence_text.strip()}"

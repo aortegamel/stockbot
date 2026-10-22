@@ -1868,11 +1868,31 @@ TOOLS: list[dict[str, object]] = [
                             },
                             "source_uri": {
                                 "type": "string",
-                                "description": "URL of the opened document, when known.",
+                                "description": "URL of the opened document, when known. For an SEC structured record it only selects: it must equal the cited record's persisted source.",
                             },
                             "known_at": {
                                 "type": "string",
-                                "description": "ISO-8601 public-knowledge timestamp (e.g. filing date); never a retrieval time.",
+                                "description": "Ignored for SEC/FINRA/WEB rows: the kernel reads public-knowledge time from the archive or the cited persisted record, never from the caller.",
+                            },
+                            "value": {
+                                "type": "string",
+                                "description": "Optional typed datapoint: the exact value text the source states (a record field's exact text, or one whole token of the passage). Needs metric, entity, and period.",
+                            },
+                            "metric": {
+                                "type": "string",
+                                "description": "What the value measures: the cited record's field name or concept (e.g. currentShortPositionQuantity, us-gaap:Revenues), or the passage label that precedes the value in its sentence (e.g. Total revenue).",
+                            },
+                            "entity": {
+                                "type": "string",
+                                "description": "Who the value describes, as the cited record field or passage states it.",
+                            },
+                            "period": {
+                                "type": "string",
+                                "description": "When the value applies, as the cited record field or passage states it.",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "description": "Unit as the cited record field or passage states it; omit when the source states none. The response returns the kernel-built datapoint and datapoint_id that final claims cite.",
                             },
                             "search_id": {
                                 "type": "string",
@@ -2097,7 +2117,7 @@ TOOLS: list[dict[str, object]] = [
                     "claims": {
                         "type": "array",
                         "minItems": 1,
-                        "description": "Grounded findings; each claim needs non-empty text and non-empty evidence IDs from the freeze.",
+                        "description": "Grounded findings; each claim needs non-empty text. observation/calculation/inference/contradicted/conditional_risk/attributed_report need freeze evidence IDs; unknown and value-less assumption may cite none. Every stated number references its kernel datapoint id; each claim passes the publication gate as written.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -2108,9 +2128,27 @@ TOOLS: list[dict[str, object]] = [
                                 },
                                 "evidence_ids": {
                                     "type": "array",
-                                    "minItems": 1,
                                     "items": {"type": "string", "minLength": 1},
-                                    "description": "Frozen evidence IDs grounding this claim.",
+                                    "description": "Frozen evidence IDs grounding this claim (may be empty only for unknown or value-less assumption).",
+                                },
+                                "claim_type": {
+                                    "type": "string",
+                                    "enum": [
+                                        "observed_fact",
+                                        "calculation",
+                                        "inference",
+                                        "assumption",
+                                        "unknown",
+                                        "contradicted",
+                                        "conditional_risk",
+                                        "attributed_report",
+                                    ],
+                                    "description": "Declared claim type (absent means inference). Non-observation types need explicit qualified wording: inference hedges, assumption opens with Assuming/If, unknown says what was not found.",
+                                },
+                                "datapoint_ids": {
+                                    "type": "array",
+                                    "items": {"type": "string", "pattern": "^dp:"},
+                                    "description": "Kernel datapoint ids (research_add_evidence datapoint_id) for every number the text states. The text names each datapoint's metric before its value, plus its entity, period, and unit. A claim never states value/entity/period/unit fields itself.",
                                 },
                             },
                             "required": ["text", "evidence_ids"],
@@ -8383,12 +8421,14 @@ def _research_read(arguments: dict[str, object], context: RequestContext) -> dic
     record: object = store[resource_id]
     if kind == "evidence" and isinstance(record, Mapping):
         from app.research.evidence import evidence_domain, evidence_integrity
+        from app.research.service import _datapoint_view
 
         prov = record.get("provenance")
         prov_map = prov if isinstance(prov, Mapping) else None
         filled = dict(record)
         filled["source_domain"] = evidence_domain(prov_map)
         filled["integrity_class"] = evidence_integrity(prov_map)
+        filled.update(_datapoint_view(record))
         record = filled
     return {"session_id": session_id, "kind": kind, "resource_id": resource_id, "record": record}
 
@@ -8544,15 +8584,15 @@ def _finalize_answer(arguments: dict[str, object]) -> str:
     return answer
 
 
-def _finalize_claim_ids(evidence_ids: object) -> list[str]:
-    """Validated claim evidence id list (non-empty strings)."""
-    if not isinstance(evidence_ids, list) or not evidence_ids:
+def _finalize_claim_ids(claim: object, evidence_ids: object) -> list[str]:
+    """Validated claim evidence id list; only unknown / value-less assumption may cite nothing."""
+    if not isinstance(evidence_ids, list) or any(not isinstance(item, str) or not item for item in evidence_ids):
+        raise ValueError("research_finalize: each claim 'evidence_ids' must be a list of non-empty strings")
+    claim_type = claim.get("claim_type") if isinstance(claim, dict) else None
+    datapoint_ids = claim.get("datapoint_ids") if isinstance(claim, dict) else None
+    citeless = claim_type in ("unknown", "assumption") and not datapoint_ids
+    if not evidence_ids and not citeless:
         raise ValueError("research_finalize: each claim 'evidence_ids' must be a non-empty list of non-empty strings")
-    for item in evidence_ids:
-        if not isinstance(item, str) or not item.strip():
-            raise ValueError(
-                "research_finalize: each claim 'evidence_ids' must be a non-empty list of non-empty strings"
-            )
     return evidence_ids
 
 
@@ -8570,7 +8610,7 @@ def _finalize_claims(arguments: dict[str, object]) -> list[object]:
         raise ValueError("research_finalize: 'claims' must be a non-empty list")
     for claim in claims:
         _finalize_claim_text(claim)
-        _finalize_claim_ids(claim.get("evidence_ids", []) if isinstance(claim, dict) else [])
+        _finalize_claim_ids(claim, claim.get("evidence_ids", []) if isinstance(claim, dict) else [])
     return claims
 
 

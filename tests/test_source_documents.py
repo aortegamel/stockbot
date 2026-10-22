@@ -1460,9 +1460,14 @@ def test_reg4_finra_duplicate_rows_replay_second_record(tmp_path: Path, monkeypa
         repo=repo,
     )
     prov = _svc._finra_provenance(
-        {"tool_result_id": "tr-dup", "matching_passage": '"v": 2'}, store=repo, session_id=sid
+        {
+            "tool_result_id": "tr-dup",
+            "matching_passage": json.dumps({"symbolCode": "ACME", "v": 2}, sort_keys=True),
+        },
+        store=repo,
+        session_id=sid,
     )
-    assert '"v": 2' in str(prov["record_identity"])
+    assert str(prov["record_identity"]) == json.dumps({"symbolCode": "ACME", "v": 2}, sort_keys=True)
 
 
 def test_reg4_web_snippet_vs_full_article_distinguished(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1790,6 +1795,78 @@ def test_later_official_fetch_failure_is_controlled_and_never_mutates_evidence(
     assert failed["audit"] == healthy["audit"]
 
 
+@pytest.mark.parametrize(
+    ("lines", "failure", "reason"),
+    [
+        pytest.param(["20261015|NVDA|1|0|2|Q"], "SOURCE_MISMATCH", "disagrees", id="file-disagrees"),
+        pytest.param(
+            ["20261015|NVDA|1|0|2|B", "20261015|NVDA|3|0|4|B"], "SOURCE_AMBIGUOUS", "ambiguous", id="ambiguous"
+        ),
+    ],
+)
+def test_published_file_conflict_keeps_api_record_and_reports_conflict_apart(
+    lines: list[str],
+    failure: str,
+    reason: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A conflicting or ambiguous FINRA file drops only the public link. The API record and its audit stay."""
+    import copy
+
+    body = ("Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market\n" + "\n".join(lines) + "\n").encode()
+
+    def healthy_get(url: str, timeout: int) -> _FinraResponse:
+        return _FinraResponse(url)
+
+    def conflicting_get(url: str, timeout: int) -> _FinraResponse:
+        response = _FinraResponse(url)
+        response.content = body
+        return response
+
+    monkeypatch.setattr("app.finra_client.requests.get", healthy_get)
+    healthy = read_source_document(
+        "evidence:ev-rec",
+        data_root=tmp_path / "healthy",
+        repo=_record_repo("finra_record", "get_reg_sho_volume", _FNQC_ROW, {}, dataset="otcMarket/regShoDaily"),
+    )
+    monkeypatch.setattr("app.finra_client.requests.get", conflicting_get)
+    repo = _record_repo("finra_record", "get_reg_sho_volume", _FNQC_ROW, {}, dataset="otcMarket/regShoDaily")
+    stored = copy.deepcopy(repo.get_evidence("ev-rec"))
+    with caplog.at_level("ERROR", logger="app.research.sources"):
+        document = _sources.read_source_view("evidence:ev-rec", data_root=tmp_path, repo=repo)
+    assert "error" not in document
+    assert (document["captureKind"], document["linkStatus"], document["quote"]) == ("structured_record", "missing", "")
+    assert not {"originalUrl", "highlightUrl"} & set(document)
+    assert json.loads(str(document["content"])) == _FNQC_ROW
+    conflict = document["sourceConflict"]
+    assert isinstance(conflict, dict) and conflict["failure"] == failure
+    assert reason in str(conflict["reason"]) and _FNQC_URL in str(conflict["reason"])
+    # The API proof verdict is unchanged by the file conflict; the conflict lives beside it.
+    assert document["audit"] == healthy["audit"] and "sourceConflict" not in healthy
+    [record] = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert record.getMessage().endswith(f" failure={failure}")
+    assert repo.get_evidence("ev-rec") == stored
+
+
+def test_corrupt_finra_archive_never_renders_as_conflict_view(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Edited archived file bytes stay a controlled 409 SOURCE_CORRUPT read error, never a structured fallback."""
+
+    def healthy_get(url: str, timeout: int) -> _FinraResponse:
+        return _FinraResponse(url)
+
+    monkeypatch.setattr("app.finra_client.requests.get", healthy_get)
+    repo = _record_repo("finra_record", "get_reg_sho_volume", _FNQC_ROW, {}, dataset="otcMarket/regShoDaily")
+    assert read_source_document("evidence:ev-rec", data_root=tmp_path, repo=repo)["captureKind"] == "original"
+    archived = raw_archive.find("finra", "official_file", _FNQC_URL, root=tmp_path / "raw")
+    assert archived is not None
+    archived.payload_path.write_bytes(_FNQC.replace(b"274457.043010", b"274457.043011"))
+    view = _sources.read_source_view("evidence:ev-rec", data_root=tmp_path, repo=repo)
+    assert (view["status"], view["failure"]) == (409, "SOURCE_CORRUPT")
+    assert "sourceConflict" not in view and "content" not in view
+
+
 def test_sec_official_fetch_rejects_off_host_redirects_and_transport_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     """The SEC page fetch keeps only a final https://www.sec.gov/ response; failures surface as OSError."""
     import httpx
@@ -1959,7 +2036,7 @@ def _proof_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Rese
     import dataclasses
 
     from app.research.evidence import evidence_to_dict
-    from tests.test_research_harness import _PROOF_DOC, _calculation_row, _observation_row
+    from tests.test_research_harness import _PROOF_DC, _PROOF_DOC, _PROOF_TOT, _calculation_row, _observation_row
 
     monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "research.sqlite"))
@@ -1968,12 +2045,12 @@ def _proof_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Rese
     ).sha256
     repo = ResearchRepository()
     pinned: dict[str, JSONValue] = {"source_content_hash": digest}
+    total = dataclasses.replace(_observation_row("EV-TOT", _PROOF_TOT, "26,044"), metadata=pinned)
+    dc = dataclasses.replace(_observation_row("EV-DC", _PROOF_DC, "22,563"), metadata=pinned)
     for row in (
-        dataclasses.replace(_observation_row("EV-TOT", "Total revenue was $26,044 million", "26,044"), metadata=pinned),
-        dataclasses.replace(
-            _observation_row("EV-DC", "Data Center revenue was $22,563 million", "22,563"), metadata=pinned
-        ),
-        _calculation_row("EV-NONDC", "3481", ["EV-TOT", "EV-DC"]),
+        total,
+        dc,
+        _calculation_row("EV-NONDC", "3481", ["EV-TOT", "EV-DC"], rows=[total, dc]),
         _calculation_row("EV-BAD", "3481", ["EV-TOT", "EV-GONE"]),
     ):
         repo.save_evidence(evidence_to_dict(row))
@@ -2027,7 +2104,7 @@ def test_calculation_view_audits_each_input_record_and_never_borrows_an_original
         _PROOF_PAGE,
         digest,
     )
-    assert observation["quote"] == "Data Center revenue was $22,563 million"
+    assert observation["quote"] == "NVDA Q1 FY2025 Data Center revenue was $22,563 million"
     observed = observation["audit"]
     assert isinstance(observed, dict)
     assert (observed["claimType"], observed["verification"], observed["value"]) == (
@@ -2074,6 +2151,7 @@ def test_viewer_audit_shows_repair_history_beside_unverified_legacy_verdict(
     document = read_source_document("evidence:EV-LEGACY", data_root=tmp_path, repo=repo)
     assert isinstance(document.get("audit"), dict)
     assert (document["audit"]["verification"], document["audit"].get("value")) == ("unverified", None)
+    assert "datapoint" not in document["audit"]
     [shown] = document["audit"].get("repairs", [])
     assert isinstance(shown, dict)
     assert (shown["repair_id"], shown["status"], shown["category"]) == (
@@ -2127,6 +2205,7 @@ def test_e2e_citations_open_verified_views_with_exact_replay(
     from tests.test_research_harness import (
         _E2E_FINRA_ROWS,
         _E2E_FULL,
+        _E2E_WEB,
         _e2e_finra_line,
         _e2e_publish,
         _e2e_rows,
@@ -2167,13 +2246,19 @@ def test_e2e_citations_open_verified_views_with_exact_replay(
         audit = view["audit"]
         assert isinstance(audit, dict)
         assert (audit["sourceId"], audit["verification"], audit["value"]) == (source_id, "verified", evidence.value)
+        proof = e2e.repo.get_evidence(evidence.evidence_id)["proof"]
+        assert isinstance(proof, dict)
+        locator = proof.get("locator")
+        descriptor = proof.get("datapoint") or (locator.get("datapoint") if isinstance(locator, dict) else None)
+        # A verified audit carries the kernel-built canonical datapoint, id included.
+        assert isinstance(descriptor, dict) and audit["datapoint"] == descriptor
         assert read_source_document(source_id, data_root=e2e.data, repo=ResearchRepository()) == view
         documents[key] = view
 
     assert documents["tot"]["content"] == _E2E_FULL
     assert documents["tot"]["contentHash"] == raw_archive.content_hash(_E2E_FULL.encode())
     assert documents["web"]["captureKind"] == "search_excerpt"
-    assert documents["web"]["content"] == "NVDA shares rose 4.2% on demand"
+    assert documents["web"]["content"] == _E2E_WEB
     finra = documents["finra"]
     assert finra["linkStatus"] == ("stockbot_render" if public_file else "missing")
     assert finra.get("originalUrl") == (url if public_file else None)
@@ -2200,11 +2285,18 @@ def test_e2e_sec_case_two_publishes_api_proof_and_replays_official_bytes(
     from dataclasses import replace
 
     from app.research import service
-    from app.research.evidence import evidence_from_dict
+    from app.research.evidence import datapoint_descriptor, evidence_from_dict
     from app.research.freeze import freeze_from_dict, verify_freeze
     from app.sec import documents
     from tests.test_research_harness import _committee_analysis
-    from tests.test_sec_documents_archive import OFF_INDEX, OFF_PRIMARY, OFF_PRIMARY_HTML, _FakeSec, _revenue_row
+    from tests.test_sec_documents_archive import (
+        OFF_CIK,
+        OFF_INDEX,
+        OFF_PRIMARY,
+        OFF_PRIMARY_HTML,
+        _FakeSec,
+        _revenue_row,
+    )
 
     monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "research.sqlite"))
@@ -2214,7 +2306,8 @@ def test_e2e_sec_case_two_publishes_api_proof_and_replays_official_bytes(
     sid = service.create_research("Revenue?", as_of="2026-08-01", repo=repo)
     job = repo.list_jobs(sid)[0].job_id
     repo.save_job(replace(repo.get_job(job), source_domain="SEC"))
-    fact = _revenue_row(**({"element_id": element_id} if element_id is not None else {}))
+    # SEC availability comes from the cited record's own filing metadata, never the caller.
+    fact = _revenue_row(filed_at="2026-07-20", **({"element_id": element_id} if element_id is not None else {}))
     service.persist_tool_result(sid, job, "get_xbrl_facts", "TR-CASE-TWO", fact, repo=repo)
     service.record_evidence(
         sid,
@@ -2225,8 +2318,9 @@ def test_e2e_sec_case_two_publishes_api_proof_and_replays_official_bytes(
             "matching_passage": json.dumps(fact, sort_keys=True),
             "known_at": "2026-07-20",
             "value": str(fact["value"]),
-            "entity": "AAPL",
-            "period": "2026-04-01..2026-06-30",
+            "metric": "us-gaap:Revenues",
+            "entity": str(OFF_CIK),
+            "period": "2026-06-30",
             "unit": "USD",
         },
         repo=repo,
@@ -2239,14 +2333,13 @@ def test_e2e_sec_case_two_publishes_api_proof_and_replays_official_bytes(
     service.complete_job(job, {}, repo=repo)
     service.freeze_session(sid, repo=repo)
     frozen = freeze_from_dict(repo.get_freeze(f"{sid}:1:freeze"))
+    point = datapoint_descriptor(evidence)
+    assert point is not None
     claim = {
-        "text": f"AAPL revenue was {evidence.value} USD",
+        "text": f"{evidence.entity} Revenues for {evidence.period} was {evidence.value} USD",
         "claim_type": "observed_fact",
         "evidence_ids": ["EV-CASE-TWO"],
-        "value": evidence.value,
-        "entity": evidence.entity,
-        "period": evidence.period,
-        "unit": evidence.unit,
+        "datapoint_ids": [point["id"]],
     }
     for role in ("stockbot", "bullbot", "bearbot"):
         role_id = str(service.start_job(sid, role, repo=repo)["job_id"])

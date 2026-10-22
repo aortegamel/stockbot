@@ -42,6 +42,30 @@ describe("fetchSourceDocument", () => {
     expect((await fetchSourceDocument(id)).matchingText).toBe("");
   });
 
+  test.each(["SOURCE_MISMATCH", "SOURCE_AMBIGUOUS"])("preserves %s separately from the API audit and existing source fields", async (failure) => {
+    const source = document({
+      captureKind: "structured_record", quote: "", content: '{"shortVolume":100}', publisher: "FINRA",
+      toolName: "get_reg_sho_volume", toolResultId: "result:1", toolArgs: { symbol: "NVDA" }, dataset: "regSho",
+      knownAt: "2026-10-21", contentHash: "sha256:api",
+      sourceConflict: { failure, reason: "The published file disagrees with the API record." },
+      audit: { evidenceId: "EV-1", claimType: "observed_fact", verification: "verified", verificationReason: "", value: "100" },
+    });
+    respond(source);
+    expect(await fetchSourceDocument(id)).toStrictEqual(source);
+  });
+
+  test("rejects malformed source conflicts and conflicts with an available public link", async () => {
+    for (const sourceConflict of [null, [], "conflict", {}, { failure: 1, reason: "mismatch" }, { failure: "SOURCE_MISMATCH", reason: null }]) {
+      respond({ ...document(), sourceConflict });
+      await expect(fetchSourceDocument(id)).rejects.toThrow("The source conflict is invalid.");
+    }
+    respond(document({
+      linkStatus: "stockbot_render", originalUrl: "https://www.finra.org/file.txt",
+      sourceConflict: { failure: "SOURCE_MISMATCH", reason: "The published file disagrees." },
+    }));
+    await expect(fetchSourceDocument(id)).rejects.toThrow("The source links are invalid.");
+  });
+
   test("rejects mismatched ids, wrong shapes, and non-original PDFs", async () => {
     for (const body of [
       document({ id: "other" }),
@@ -318,6 +342,42 @@ describe("fetchSourceDocument audit", () => {
     });
     respond(calculation(audit));
     expect((await fetchSourceDocument(id)).audit).toStrictEqual(audit);
+  });
+
+  test("preserves canonical descriptors on verified observations and calculations", async () => {
+    const observed = {
+      id: "dp:observation", metric: "revenue", field: "Revenue", value: "100", entity: "NVDA", period: "2026",
+      unit: "USD", statement: "NVDA revenue for 2026 was 100 USD.",
+    };
+    const derived = {
+      ...observed, id: "dp:calculation", metric: "revenue_change", field: "formula", formula: "difference@1",
+      statement: "revenue_change = difference@1(revenue=100, revenue=90) = 10", value: "10",
+      inputs: ["dp:observation", "dp:prior"],
+    };
+    const audit = node({
+      claimType: "calculation", formula: "a - b", value: "10", datapoint: derived,
+      inputs: [node({ value: "100", datapoint: observed })],
+    });
+    respond(calculation(audit));
+    expect((await fetchSourceDocument(id)).audit).toStrictEqual(audit);
+  });
+
+  test("does not expose canonical datapoints for unverified or conflicted audits", async () => {
+    for (const verification of ["unverified", "conflicted"] as const) {
+      const audit = node({ verification, value: "100" });
+      respond(calculation({ ...audit, datapoint: { id: "dp:untrusted" } }));
+      expect((await fetchSourceDocument(id)).audit).toStrictEqual(audit);
+    }
+  });
+
+  test("rejects malformed canonical descriptors on verified audits", async () => {
+    const datapoint = { id: "dp:observation", metric: "revenue", value: "100", entity: "NVDA", period: "2026", statement: "Revenue was 100." };
+    for (const invalid of [null, [], {}, { ...datapoint, id: "EV-1" }, { ...datapoint, metric: 1 }, { ...datapoint, field: 1 }, { ...datapoint, formula: 1 }]) {
+      respond(calculation({ ...node(), datapoint: invalid }));
+      await expect(fetchSourceDocument(id)).rejects.toThrow("The source audit is invalid.");
+    }
+    respond(calculation({ ...node(), datapoint: { ...datapoint, unit: null } }));
+    expect((await fetchSourceDocument(id)).audit?.datapoint).toStrictEqual(datapoint);
   });
 
   test("keeps repair history as typed display text, never a citation link", async () => {

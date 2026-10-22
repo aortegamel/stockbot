@@ -417,29 +417,19 @@ def _compact_json(value: object) -> str:
 
 
 def _finra_locator(payload: Mapping[str, object]) -> str | None:
-    """First citable FINRA text: canonical row JSON, then the envelope's own scope.
+    """First citable FINRA record: canonical row JSON, then the complete envelope.
 
-    FINRA cites canonical row JSON (matches replay). The analysis envelopes of
-    ``get_short_interest``/``get_reg_sho_volume`` carry no rows, so their identity must come
-    from the envelope itself: the query JSON names the requested symbol, while metrics alone
-    can coincide between two symbols and ``briefing_source`` is one constant for all of them
-    (that constant collapsed every watchlist symbol onto one evidence row). Every tier here is
-    a text of ``service._finra_record_texts``, so replayed citations still validate.
+    Analysis envelopes of ``get_short_interest``/``get_reg_sho_volume`` carry no
+    rows, so their identity is the whole payload (``cited_record`` only matches
+    full canonical JSON). Metrics alone can coincide between two symbols and the
+    query JSON is a filter, not the persisted result, so neither is citable.
     """
     records = payload.get("records")
     if isinstance(records, list):
         for row in records:
             if isinstance(row, dict):
-                return _compact_json(row)[:2000]
-    for key in ("query", "metrics"):
-        value = payload.get(key)
-        if isinstance(value, dict) and value:
-            return _compact_json(value)[:2000]
-    for key in ("briefing", "briefing_source"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return " ".join(value.split())[:2000]
-    return None
+                return _compact_json(row)
+    return _compact_json(dict(payload)) if payload else None
 
 
 def _web_locator(payload: Mapping[str, object]) -> tuple[str | None, str | None]:
@@ -549,12 +539,18 @@ def _sec_evidence_candidate(result: object, outcome: object, kernel: _Kernel) ->
 
 
 def _sec_replay_locator(payload: Mapping[str, object]) -> str | None:
-    """First citable SEC structured text: one row JSON, else the envelope JSON."""
+    """First citable SEC structured record: one mapping-row JSON, else the envelope JSON.
+
+    Non-mapping rows are not citable records (``cited_record`` only matches
+    full canonical JSON), so a list of bare scalars falls through to the
+    complete payload.
+    """
     for key in (
         "filings",
         "transactions",
         "quarterly_eps",
         "facts",
+        "matching_concepts",
         "rows",
         "records",
         "documents",
@@ -564,12 +560,8 @@ def _sec_replay_locator(payload: Mapping[str, object]) -> str | None:
         if isinstance(rows, list):
             for row in rows:
                 if isinstance(row, dict):
-                    return _compact_json(dict(row))[:2000]
-                elif isinstance(row, (str, int, float)):
-                    text = str(row).strip()
-                    if text:
-                        return text[:2000]
-    return _compact_json(dict(payload))[:2000]
+                    return _compact_json(dict(row))
+    return _compact_json(dict(payload))
 
 
 def _structured_evidence_candidate(

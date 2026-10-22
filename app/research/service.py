@@ -9,6 +9,7 @@ subprocess, or synthesizes outcomes. stdlib + kernel modules only.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -22,6 +23,7 @@ from . import jobs as _jobs
 from . import session as _session
 from .evidence import (
     Evidence,
+    datapoint_descriptor,
     evidence_content_hash,
     evidence_domain,
     evidence_to_dict,
@@ -928,13 +930,13 @@ def _check_replay_lane(repo: ResearchRepository, result: Mapping[str, object], r
 def _finra_replay_ref(
     data: Mapping[str, object], result: Mapping[str, object], tool_name: str, locator: str, ref_id: str
 ) -> dict[str, JSONValue]:
-    """Build a FINRA citation with the persisted dataset and availability."""
+    """Build a FINRA citation with the persisted dataset and availability (full cited record, never truncated)."""
     payload = result.get("result")
     payload = payload if isinstance(payload, Mapping) else result
     dataset = payload.get("dataset_id") or payload.get("dataset")
     return finra_record_ref(
         tool_name=tool_name,
-        record_identity=locator[:2000],
+        record_identity=locator,
         dataset=dataset if isinstance(dataset, str) else None,
         source_uri=_svc_opt_str(data, "source_uri"),
         known_at=_finra_known_at(result),
@@ -951,12 +953,7 @@ def _finra_provenance(
 ) -> dict[str, JSONValue]:
     """FinraRecordRef replayed against the persisted FINRA tool result."""
     ref_id = _tool_result_ref(data, "FINRA")
-    locator = _normalize_record_text(_first_text(data, (*_PASSAGE_KEYS, "record_identity")))
-    if not locator:
-        raise ValueError(
-            "record_evidence: ERR_RAW_SOURCE_REQUIRED (a FINRA citation names the persisted "
-            "tool result id plus the record values you are citing.)"
-        )
+    locator = _finra_record_locator(_first_text(data, (*_PASSAGE_KEYS, "record_identity")))
     repo, result = _replay_result(store, ref_id, "FINRA", session_id)
     tool_name = str(result.get("tool_name") or "")
     if tool_name not in _FINRA_EVIDENCE_TOOLS:
@@ -964,8 +961,9 @@ def _finra_provenance(
             f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} is {tool_name!r}, not FINRA records)"
         )
     _check_replay_lane(repo, result, ref_id, job)
-    texts = _finra_record_texts(result)
-    if not any(locator in text for text in texts):
+    from .evidence import cited_record
+
+    if cited_record(result, locator) is None:
         raise ValueError(
             "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE (the cited record values do not appear "
             "in the persisted FINRA tool result)"
@@ -990,41 +988,114 @@ def _sec_record_texts(result: Mapping[str, object]) -> list[str]:
     return [text for text in texts if text]
 
 
-def _sec_record_known_at(data: Mapping[str, object], payload: Mapping[str, object]) -> str | None:
-    """Caller-known_at wins (structured tools report their own filing dates); else payload scan."""
-    for key in ("known_at", "filed_at", "accepted_at", "published_at", "as_of_date"):
-        value = data.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    for key in ("known_at", "filed_at", "accepted_at", "published_at", "as_of_date"):
-        value = payload.get(key)
+_SEC_AVAILABILITY_KEYS = ("known_at", "accepted_at", "filed_at")
+"""Filing availability fields of one SEC record, in ``app.sec.models.pit_of`` precedence."""
+
+
+def _sec_record_known_at(result: Mapping[str, object], locator: str) -> str | None:
+    """Availability of the one cited SEC record, read from its persisted filing metadata; None when unknown.
+
+    Only the cited row's own known_at/accepted_at/filed_at count. A caller time,
+    another row, an envelope timestamp, or a financial as-of/period date never
+    stands in, so a historical session fails PIT_UNVERIFIED when it is missing.
+    """
+    from .evidence import cited_record
+
+    record = cited_record(result, locator)
+    for key in _SEC_AVAILABILITY_KEYS:
+        value = record.get(key) if record is not None else None
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
 
 
-def _sec_replay_source_uri(data: Mapping[str, object], payload: Mapping[str, object]) -> str | None:
-    """Use the declared URI first, then the persisted SEC source."""
-    source_uri = _svc_opt_str(data, "source_uri")
-    if source_uri is None:
-        raw_uri = payload.get("source") or payload.get("source_url")
-        if isinstance(raw_uri, str) and raw_uri.strip():
-            source_uri = raw_uri.strip()
+def _source_candidate(value: object) -> str | None:
+    """A persisted source field only when it is a URL; labels like 'SEC EDGAR' never count as URIs."""
+    if isinstance(value, str) and (cleaned := value.strip()) and cleaned.startswith(("http://", "https://")):
+        return cleaned
+    return None
+
+
+def _sec_replay_source_uri(data: Mapping[str, object], result: Mapping[str, object], locator: str) -> str | None:
+    """Persisted source of the cited SEC record (its own URL, else the result's URL source).
+
+    A declared ``source_uri`` only selects: it must equal that persisted source,
+    so it can never point the citation at another filing.
+    """
+    from .evidence import cited_record
+
+    payload = result.get("result")
+    payload = payload if isinstance(payload, Mapping) else result
+    record = cited_record(result, locator) or {}
+    candidates = [_source_candidate(record.get(key)) for key in ("source_url", "url", "filing_url")]
+    candidates += [_source_candidate(payload.get(key)) for key in ("source_url", "source")]
+    source_uri = next((uri for uri in candidates if uri is not None), None)
+    declared = _svc_opt_str(data, "source_uri")
+    if declared is not None and source_uri is not None and declared != source_uri:
+        raise ValueError(
+            "record_evidence: ERR_PROVENANCE_MISMATCH (declared source_uri differs from the cited SEC record's source)"
+        )
     return source_uri
+
+
+def _sec_record_locator(raw: object) -> str:
+    """The cited SEC record bytes: complete canonical JSON (key order/spacing free), never a fragment."""
+    from .evidence import _record_text
+
+    if isinstance(raw, str) and raw.strip():
+        stripped = raw.strip()
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            pass
+        else:
+            if isinstance(parsed, Mapping):
+                return _record_text(parsed)
+            raise ValueError(
+                "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE (an SEC citation names one complete "
+                "persisted record, not a fragment)"
+            )
+    raise ValueError(
+        "record_evidence: ERR_RAW_SOURCE_REQUIRED (an SEC citation names the complete persisted "
+        "record JSON of the response you read)"
+    )
+
+
+def _finra_record_locator(raw: object) -> str:
+    """The cited FINRA record bytes verbatim: exact JSON (key order/spacing free), never a fragment."""
+    from .evidence import _record_text
+
+    if isinstance(raw, str) and raw.strip():
+        stripped = raw.strip()
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            pass
+        else:
+            if isinstance(parsed, Mapping):
+                return _record_text(parsed)
+            raise ValueError(
+                "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE (a FINRA citation names one complete "
+                "persisted record, not a fragment)"
+            )
+    raise ValueError(
+        "record_evidence: ERR_RAW_SOURCE_REQUIRED (a FINRA citation names the persisted "
+        "tool result id plus the complete record JSON you are citing.)"
+    )
 
 
 def _sec_replay_ref(
     data: Mapping[str, object], result: Mapping[str, object], tool_name: str, locator: str, ref_id: str
 ) -> dict[str, JSONValue]:
-    """Build a structured SEC citation from the persisted response fields."""
+    """Build a structured SEC citation from the persisted response fields only (full cited record)."""
     payload = result.get("result")
     payload = payload if isinstance(payload, Mapping) else result
     return sec_record_ref(
         tool_name=tool_name,
-        record_identity=locator[:2000],
+        record_identity=locator,
         dataset=str(payload.get("subject") or payload.get("ticker") or "") or None,
-        source_uri=_sec_replay_source_uri(data, payload),
-        known_at=_sec_record_known_at(data, payload),
+        source_uri=_sec_replay_source_uri(data, result, locator),
+        known_at=_sec_record_known_at(result, locator),
         tool_result_id=ref_id,
     )
 
@@ -1038,12 +1109,7 @@ def _sec_record_provenance(
 ) -> dict[str, JSONValue]:
     """SecRecordRef replayed against the persisted SEC structured tool result."""
     ref_id = _tool_result_ref(data, "SEC")
-    locator = _normalize_record_text(_first_text(data, (*_PASSAGE_KEYS, "record_identity")))
-    if not locator:
-        raise ValueError(
-            "record_evidence: ERR_RAW_SOURCE_REQUIRED (an SEC citation names the persisted "
-            "tool result id plus the record values you are citing.)"
-        )
+    locator = _sec_record_locator(_first_text(data, (*_PASSAGE_KEYS, "record_identity")))
     repo, result = _replay_result(store, ref_id, "SEC", session_id)
     tool_name = str(result.get("tool_name") or "")
     if tool_name not in _SEC_REPLAY_TOOLS:
@@ -1051,8 +1117,9 @@ def _sec_record_provenance(
             f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} is {tool_name!r}, not SEC records)"
         )
     _check_replay_lane(repo, result, ref_id, job)
-    texts = _sec_record_texts(result)
-    if not any(locator in text for text in texts):
+    from .evidence import cited_record
+
+    if cited_record(result, locator) is None:
         raise ValueError(
             "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE (the cited record values do not appear "
             "in the persisted SEC tool result)"
@@ -1568,7 +1635,8 @@ def _provenance_uri(provenance: Mapping[str, object], data: Mapping[str, object]
         value = provenance.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
-    return _svc_opt_str(data, "source_uri")
+    # A sec_record URI is the cited record's persisted source only (_sec_replay_source_uri).
+    return None if provenance.get("kind") == "sec_record" else _svc_opt_str(data, "source_uri")
 
 
 def _provenance_record_id(provenance: Mapping[str, object], data: Mapping[str, object]) -> str | None:
@@ -1580,17 +1648,21 @@ def _provenance_record_id(provenance: Mapping[str, object], data: Mapping[str, o
     return _svc_opt_str(data, "source_record_id")
 
 
-def _provenance_time(caller: object, authoritative: object, *, kind: str = "") -> datetime | None:
-    """Source time: FINRA/WEB rows use the kernel-replayed result time only; SEC uses caller time.
+def _provenance_time(data: Mapping[str, object], provenance: Mapping[str, object], key: str) -> datetime | None:
+    """Source time (``known_at``/``published_at``) from kernel-held fields only; a caller time never stands in.
 
-    A model-asserted known_at must never backdate a persisted result past PIT:
-    FINRA known_at is the persisted publication/availability time, WEB known_at
-    is the persisted published_at (never retrieval time, never caller time).
-    Missing result time stays None so bounded sessions fail PIT_UNVERIFIED
+    sec_source reads the archive known_at/filed_at that ``_apply_materialized_fields``
+    wrote over the caller's fields. sec_record reads the cited record's persisted
+    filing availability, FINRA its persisted publication time, and WEB its
+    persisted published_at (never retrieval time). Missing time stays None, so
+    a bounded session fails PIT_UNVERIFIED.
     """
-    if kind in ("finra_record", "web_source"):
-        return _coerce_dt(authoritative)
-    return _coerce_dt(authoritative) if authoritative is not None else _coerce_dt(caller)
+    kind = provenance.get("kind")
+    if kind == "sec_source":
+        return _coerce_dt(data.get(key))
+    if kind == "web_source":
+        return _coerce_dt(provenance.get("published_at"))
+    return _coerce_dt(provenance.get(key))
 
 
 def _build_evidence_record(
@@ -1628,16 +1700,8 @@ def _build_evidence_record(
         retrieved_at=_coerce_dt(data.get("retrieved_at")) or utcnow(),
         source_uri=_provenance_uri(provenance, data),
         source_record_id=_provenance_record_id(provenance, data),
-        published_at=_provenance_time(
-            data.get("published_at"), provenance.get("published_at"), kind=str(provenance.get("kind") or "")
-        ),
-        known_at=_provenance_time(
-            data.get("known_at"),
-            provenance.get("published_at")
-            if str(provenance.get("kind") or "") == "web_source"
-            else provenance.get("known_at"),
-            kind=str(provenance.get("kind") or ""),
-        ),
+        published_at=_provenance_time(data, provenance, "published_at"),
+        known_at=_provenance_time(data, provenance, "known_at"),
         effective_at=_coerce_dt(data.get("effective_at")),
         job_id=job_id,
         agent_id=str(data.get("agent_id", "pi")),
@@ -2046,15 +2110,19 @@ def _apply_materialized_fields(data: dict[str, object], source: MaterializedEvid
 
 
 def _item_datapoint(data: Mapping[str, object]) -> dict[str, str | None]:
-    """Typed datapoint of one item: value/entity/period/unit strings; a value needs its entity and period."""
+    """Typed datapoint of one item: metric/value/entity/period/unit strings.
+
+    A value needs its metric, entity, and period. For an observation they only
+    select: the canonical datapoint reads every field off the source.
+    """
     out: dict[str, str | None] = {}
-    for key in ("value", "entity", "period", "unit"):
+    for key in ("metric", "value", "entity", "period", "unit"):
         raw = data.get(key)
         if raw is not None and (not isinstance(raw, str) or not raw.strip()):
             raise ValueError(f"record_evidence: ERR_DATAPOINT_INCOMPLETE ({key} must be a non-empty string)")
         out[key] = raw.strip() if isinstance(raw, str) else None
-    if out["value"] is not None and (out["entity"] is None or out["period"] is None):
-        raise ValueError("record_evidence: ERR_DATAPOINT_INCOMPLETE (a value needs its entity and period)")
+    if out["value"] is not None and (out["metric"] is None or out["entity"] is None or out["period"] is None):
+        raise ValueError("record_evidence: ERR_DATAPOINT_INCOMPLETE (a value needs its metric, entity and period)")
     return out
 
 
@@ -2069,17 +2137,34 @@ def _observation_source_bytes(
 
 
 def _admission_observation_proof(
-    store: ResearchRepository, observed: MaterializedEvidenceSource | Mapping[str, object], value: str
-) -> tuple[dict[str, JSONValue], bytes]:
-    """(observation proof, its source bytes); a value not verbatim in the located passage fails closed."""
+    store: ResearchRepository,
+    observed: MaterializedEvidenceSource | Mapping[str, object],
+    datapoint: Mapping[str, object],
+) -> tuple[dict[str, JSONValue], bytes, dict[str, JSONValue]]:
+    """(observation proof, its source bytes, canonical datapoint); a datapoint the source refuses fails closed.
+
+    ``datapoint`` holds the caller's metric/value/entity/period/unit selectors.
+    Store the returned descriptor's value/entity/period/unit on the row.
+    """
     from .evidence import observation_proof
 
     provenance = observed.provenance if isinstance(observed, MaterializedEvidenceSource) else observed
     try:
         source_bytes = _observation_source_bytes(store, observed)
-        return observation_proof(provenance=provenance, source_bytes=source_bytes, value=value), source_bytes
+        proof = observation_proof(
+            provenance=provenance,
+            source_bytes=source_bytes,
+            metric=datapoint.get("metric"),
+            value=datapoint.get("value"),
+            entity=datapoint.get("entity"),
+            period=datapoint.get("period"),
+            unit=datapoint.get("unit"),
+        )
     except (KeyError, ValueError) as exc:
         raise ValueError(f"record_evidence: ERR_DATAPOINT_UNVERIFIED ({exc})") from None
+    locator = proof["locator"]
+    assert isinstance(locator, dict) and isinstance(locator.get("datapoint"), dict)
+    return proof, source_bytes, locator["datapoint"]
 
 
 def _calculation_inputs(store: ResearchRepository, session_id: str, proof: Mapping[str, object]) -> list[Evidence]:
@@ -2101,6 +2186,18 @@ def _calculation_known_at(inputs: Sequence[Evidence]) -> datetime | None:
     return None if not known or any(k is None for k in known) else max(k for k in known if k is not None)
 
 
+def _datapoint_view(row: Mapping[str, object]) -> dict[str, JSONValue]:
+    """Canonical datapoint + id of one stored row; {} when the row carries none (legacy shape preserved)."""
+    raw_proof = row.get("proof")
+    proof: Mapping[str, object] = raw_proof if isinstance(raw_proof, Mapping) else {}
+    locator = proof.get("locator")
+    raw = locator.get("datapoint") if isinstance(locator, Mapping) else proof.get("datapoint")
+    if not isinstance(raw, Mapping):
+        return {}
+    datapoint = validate_json_mapping(dict(raw), "<datapoint>")
+    return {"datapoint": datapoint, "datapoint_id": datapoint.get("id")}
+
+
 def _record_calculation(
     store: ResearchRepository,
     session_id: str,
@@ -2109,8 +2206,12 @@ def _record_calculation(
     job: Job,
     data: dict[str, object],
 ) -> dict[str, JSONValue]:
-    """Admit one calculation row: formula id/version over input rows, recomputed and verified before commit."""
-    from .evidence import calculation_proof
+    """Admit one calculation row: formula id/version over input rows, recomputed and verified before commit.
+
+    Its canonical datapoint names the inputs' canonical datapoints, so every
+    input must carry one (a legacy observation cannot feed a new calculation).
+    """
+    from .evidence import calculation_datapoint, calculation_proof
 
     wave = _evidence_wave(data, job.wave_id)
     datapoint = _item_datapoint(data)
@@ -2124,13 +2225,31 @@ def _record_calculation(
     except ValueError as exc:
         raise ValueError(f"record_evidence: ERR_CALCULATION_INVALID ({exc})") from None
     inputs = _calculation_inputs(store, session_id, proof)
+    try:
+        proof["datapoint"] = calculation_datapoint(
+            formula_id=proof["formulaId"],
+            formula_version=proof["formulaVersion"],
+            inputs=inputs,
+            metric=datapoint["metric"],
+            value=datapoint["value"],
+            entity=datapoint["entity"],
+            period=datapoint["period"],
+            unit=datapoint["unit"],
+        )
+    except ValueError as exc:
+        raise ValueError(f"record_evidence: ERR_CALCULATION_INVALID ({exc})") from None
     formula = f"{proof['formulaId']}@{proof['formulaVersion']}"
     args = ", ".join(f"{row.evidence_id}={row.value}" for row in inputs)
     content = f"{formula}({args}) = {datapoint['value']}"
     identity_key = "|".join(("calculation", formula, ",".join(row.evidence_id for row in inputs), content))
     hit = store.find_evidence_by_identity(session_id, identity_key)
     if hit is not None:
-        return {"evidence_id": hit.get("evidence_id"), "accepted": False, "duplicate_of": hit.get("evidence_id")}
+        return {
+            "evidence_id": hit.get("evidence_id"),
+            "accepted": False,
+            "duplicate_of": hit.get("evidence_id"),
+            **_datapoint_view(hit),
+        }
     evidence_id, _source_name, supports, contradicts = _evidence_ids_names(data, job)
     metadata, subject = _evidence_typed(data, found)
     _content, claim = _evidence_content(data)
@@ -2159,7 +2278,8 @@ def _record_calculation(
         unit=datapoint["unit"],
         proof=proof,
     )
-    return _persist_finra_web_record(store, session_id, job_id, found, record, proof_bytes=None)
+    out = _persist_finra_web_record(store, session_id, job_id, found, record, proof_bytes=None)
+    return {**out, **_datapoint_view(out)}
 
 
 def record_evidence(
@@ -2174,9 +2294,11 @@ def record_evidence(
     An ``absence_observation`` item is a search-scope record: it is validated the
     same way and then persisted as a session coverage artifact (never a ledger
     row, never a citable evidence id). An observed fact carrying ``value`` (with
-    ``entity``/``period``, optional ``unit``) gets an observation proof over its
-    archived bytes. A ``calculation`` item names ``formula_id``/``formula_version``/
-    ``input_evidence_ids`` and is recomputed before commit.
+    ``metric``/``entity``/``period``, optional ``unit``) gets an observation proof
+    over its archived bytes whose kernel-built canonical datapoint binds those
+    fields to the source. A ``calculation`` item names ``formula_id``/``formula_version``/
+    ``input_evidence_ids`` plus a ``metric`` label and is recomputed before commit.
+    The response carries the row's ``datapoint`` and ``datapoint_id`` (None when value-less).
     """
     if not isinstance(item, Mapping):
         raise ValueError("record_evidence: 'item' must be a mapping")  # noqa: TRY004 - public error contract pins ValueError, tests are oracle
@@ -2200,14 +2322,23 @@ def record_evidence(
     provenance = observed.provenance if isinstance(observed, MaterializedEvidenceSource) else observed
     identity_key = _evidence_identity(data, claim, subject, provenance)
     if datapoint["value"] is not None:
-        identity_key = "|".join((identity_key, datapoint["value"], datapoint["period"] or ""))
+        identity_key = "|".join(
+            (identity_key, datapoint["value"], datapoint["period"] or "", datapoint["metric"] or "")
+        )
     hit = store.find_evidence_by_identity(session_id, identity_key)
     if hit is not None:
-        return {"evidence_id": hit.get("evidence_id"), "accepted": False, "duplicate_of": hit.get("evidence_id")}
+        return {
+            "evidence_id": hit.get("evidence_id"),
+            "accepted": False,
+            "duplicate_of": hit.get("evidence_id"),
+            **_datapoint_view(hit),
+        }
     proof: dict[str, JSONValue] = {}
     proof_bytes: bytes | None = None
     if datapoint["value"] is not None:
-        proof, proof_bytes = _admission_observation_proof(store, observed, datapoint["value"])
+        proof, proof_bytes, canonical = _admission_observation_proof(store, observed, datapoint)
+        # The row stores the source spelling, so replay rebuilds the same descriptor.
+        datapoint = {key: text if isinstance(text := canonical.get(key), str) else None for key in datapoint}
     if isinstance(observed, MaterializedEvidenceSource):
         _apply_materialized_fields(data, observed)
     record = _build_evidence_record(
@@ -2230,8 +2361,10 @@ def record_evidence(
         proof=proof,
     )
     if isinstance(observed, MaterializedEvidenceSource):
-        return _persist_evidence_record(store, session_id, job_id, found, record, source=observed)
-    return _persist_finra_web_record(store, session_id, job_id, found, record, proof_bytes=proof_bytes)
+        out = _persist_evidence_record(store, session_id, job_id, found, record, source=observed)
+    else:
+        out = _persist_finra_web_record(store, session_id, job_id, found, record, proof_bytes=proof_bytes)
+    return {**out, **_datapoint_view(out)}
 
 
 def _submit_str_list_field(cov: dict[str, object], key: str, *, required: bool = False) -> list[str]:
@@ -3857,9 +3990,7 @@ def _claim_mappings(claims: Sequence[object]) -> list[Mapping[str, object]]:
 
 
 def _shaped_claim(item: Mapping[str, object]) -> dict[str, object]:
-    """One caller claim narrowed to the grounded envelope: text + evidence_ids (+ explicit claim_type/datapoint)."""
-    from .agents import DATAPOINT_FIELDS
-
+    """One caller claim narrowed to the grounded envelope: text + evidence_ids (+ explicit claim_type/datapoint_ids)."""
     refs = item.get("evidence_ids", [])
     shaped: dict[str, object] = {
         "text": _first_present(item, "text", "claim_text", "claim"),
@@ -3867,7 +3998,7 @@ def _shaped_claim(item: Mapping[str, object]) -> dict[str, object]:
     }
     # Explicit keys survive verbatim (the strict parser types them); absent ones stay absent
     # (parsers default claim_type to inference).
-    for key in ("claim_type", *DATAPOINT_FIELDS):
+    for key in ("claim_type", "datapoint_ids"):
         if item.get(key) is not None:
             shaped[key] = item.get(key)
     return shaped
@@ -4050,28 +4181,319 @@ def _row_integrity_defect(store: ResearchRepository, session_id: str, evidence: 
     return f"{evidence.evidence_id}: no replayable source identity"
 
 
-def _kernel_text(rows: Mapping[str, Mapping[str, object]], evidence: Evidence, depth: int = 0) -> str:
-    """Kernel-held text of one row (passage/excerpt/record identity/value), calculation inputs included.
+_CITATION_RE = re.compile(r"\[[^\]]*\]")
+_TOKEN_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
+_YEAR_RE = re.compile(r"(?:19|20)\d\d")
+_QUALIFIERS: dict[str, re.Pattern[str]] = {
+    "inference": re.compile(
+        r"\b(?:suggest\w*|likely|may|might|could|would|appears?|impl(?:y|ies|ied)|indicat\w*|infer\w*"
+        r"|probabl[ey]|expect\w*|seems?|potential\w*|perhaps)\b",
+        re.IGNORECASE,
+    ),
+    "assumption": re.compile(
+        r"^\W*(?:assum\w*|hypothetical\w*|suppos\w*|if|in (?:a|the|this) [\w-]+ (?:scenario|case))\b", re.IGNORECASE
+    ),
+    "unknown": re.compile(
+        r"\b(?:unknown|unclear|undisclosed|unavailable"
+        r"|not (?:found|located|disclosed|available|reported|stated|established|identified|determined)"
+        r"|no (?:[\w-]+ ){0,4}(?:was|were|is|are) (?:found|located|disclosed|reported|identified|available)"
+        r"|(?:did|does|could|can) ?not (?:find|locate|establish|determine|identify|confirm))\b",
+        re.IGNORECASE,
+    ),
+    "conditional_risk": re.compile(r"\b(?:if|could|may|might|would|risks?|potential\w*|uncertain\w*)\b", re.IGNORECASE),
+    "attributed_report": re.compile(
+        r"\b(?:report\w*|according to|said|says|stat(?:ed|es)|announc\w*|disclos\w*|claim\w*)\b", re.IGNORECASE
+    ),
+    "contradicted": re.compile(r"\b(?:contradict\w*|conflict\w*|inconsistent|disput\w*|differ\w*)\b", re.IGNORECASE),
+}
+"""Explicit wording each non-observation claim type needs; the declared type alone never qualifies a claim.
 
-    Never the caller-supplied ``content``: only text the kernel materialized or recomputed.
-    """
-    prov = evidence.provenance
-    parts = [prov.get(key) for key in ("passage", "excerpt", "source_content", "record_identity")]
-    parts.append(evidence.value)
-    raw_ids = evidence.proof.get("inputProofIds")
-    for eid in raw_ids if isinstance(raw_ids, list) and depth < _MAX_PROOF_DEPTH else []:
-        row = _ledger_row(rows, str(eid))
-        parts.append(_kernel_text(rows, row, depth + 1) if isinstance(row, Evidence) else None)
-    return " ".join(part for part in parts if isinstance(part, str))
+An assumption must open with its qualifier, so a premise never trails a factual sentence.
+ponytail: lexical qualifiers; a qualified claim can still carry an unproven qualitative clause,
+which the worker's JEV gate judges as written. Numbers never ride along: they need datapoints.
+"""
+_GLUE_WORDS = frozenset(
+    {"a", "an", "the", "of", "in", "for", "to", "and", "or", "at", "on", "by", "as", "is", "are", "was", "were"}
+    | {"be", "been", "its", "it", "their", "this", "that", "with", "from", "than", "per", "s"}
+)
+"""Connective words a quantitative claim may add around its referenced datapoint wording."""
 
 
-def _datapoint_matches(claim: GroundedClaim, evidence: Evidence) -> bool:
-    """Claimed entity/period/unit agree with the row's (case-insensitive) wherever both state one."""
-    for key in ("entity", "period", "unit"):
-        mine, theirs = getattr(claim, key), getattr(evidence, key)
-        if mine is not None and theirs is not None and mine.casefold() != theirs.casefold():
+def _blank(match: re.Match[str]) -> str:
+    return " " * len(match.group())
+
+
+def _masked(text: str) -> str:
+    """Claim text with citation brackets and SEC form names blanked (positions kept)."""
+    from .grounding import _FORM_RE
+
+    return _FORM_RE.sub(_blank, _CITATION_RE.sub(_blank, text))
+
+
+def _numbers(masked: str) -> list[tuple[str, int, int]]:
+    """(number without thousands separators, start, end) per numeric token of masked text."""
+    from .grounding import _NUMBER_RE
+
+    return [(m.group().replace(",", ""), m.start(), m.end()) for m in _NUMBER_RE.finditer(masked)]
+
+
+def _words(text: str) -> list[tuple[str, int, int]]:
+    """Casefolded words with spans; camelCase and snake_case split, so source field names read as words."""
+    return [(m.group().casefold(), m.start(), m.end()) for m in _TOKEN_RE.finditer(text)]
+
+
+def _phrase_spans(masked: str, phrase: str) -> list[tuple[int, int]]:
+    """Spans where the phrase's words occur contiguously in the masked text."""
+    needle = [word for word, _, _ in _words(phrase)]
+    hay = _words(masked)
+    width = len(needle)
+    return [
+        (hay[i][1], hay[i + width - 1][2])
+        for i in range(len(hay) - width + 1)
+        if width and [word for word, _, _ in hay[i : i + width]] == needle
+    ]
+
+
+def _metric_label(metric: str) -> str:
+    """A concept tag reads without its namespace ("us-gaap:Revenues" -> "Revenues")."""
+    return metric.rsplit(":", 1)[-1] if ":" in metric and " " not in metric.strip() else metric
+
+
+_UNIT_ALIASES = {"usd": ("$", "usd", "dollar"), "%": ("%", "percent"), "percent": ("%", "percent")}
+"""Symbol spellings a claim may use for a source unit; any other unit is stated by its own words."""
+
+
+def _states_unit(masked: str, unit: str) -> bool:
+    """Every part of a unit ("USD/shares", "USD millions") is stated by word, singular/plural form, or symbol alias."""
+    words = [word for word, _, _ in _words(masked)]
+    for part in (p for p in re.split(r"[/*\s]+", unit.casefold()) if p):
+        names = _UNIT_ALIASES.get(part, (part,))
+        if not any(
+            name in masked
+            if not name.isalnum()
+            else any(w.startswith(name) or (len(w) >= 4 and name.startswith(w)) for w in words)
+            for name in names
+        ):
             return False
     return True
+
+
+def _point_text(point: Mapping[str, object], keys: Sequence[str]) -> str:
+    return " ".join(str(point.get(key)) for key in keys if isinstance(point.get(key), str))
+
+
+def _value_spans(masked: str, numbers: Sequence[tuple[str, int, int]], value: str) -> list[tuple[int, int]]:
+    """Where the claim states the value: matching number tokens, else the exact (casefold) value text."""
+    wanted = numeric_tokens(value)
+    if len(wanted) == 1:
+        return [(start, end) for norm, start, end in numbers if norm in wanted]
+    lowered, needle = masked.casefold(), value.casefold()
+    return [(at, at + len(needle)) for at in range(len(lowered)) if lowered.startswith(needle, at)]
+
+
+def _bound_value_spans(
+    masked: str, numbers: Sequence[tuple[str, int, int]], point: Mapping[str, object], *, strict: bool
+) -> list[tuple[int, int]]:
+    """Value occurrences the metric label directly precedes: same sentence, only identity between.
+
+    Strict (observed_fact/calculation) additionally admits only the datapoint's own
+    entity/period/unit/metric words and connectives between label and value: any
+    other word — e.g. a neighbouring metric label like ``net income`` — breaks
+    the binding, so a value cannot borrow a neighbouring metric's label. Other
+    claim types keep the original number/sentence checks plus their qualifier policy.
+    """
+    context = numeric_tokens(_point_text(point, ("entity", "period", "unit")))
+    identity = {word for word, _, _ in _words(_point_text(point, ("metric", "entity", "period", "unit")))} | _GLUE_WORDS
+    labels = _phrase_spans(masked, _metric_label(str(point["metric"])))
+    bound: list[tuple[int, int]] = []
+    for start, end in _value_spans(masked, numbers, str(point["value"])):
+        for _, label_end in labels:
+            between = [norm for norm, at, _ in numbers if label_end <= at < start]
+            gap = masked[label_end:start]
+            gap_words = [word for word, _, _ in _words(gap) if not word.isdigit()]
+            if (
+                label_end <= start
+                and not _SENTENCE_END_RE.search(gap)
+                and all(n in context for n in between)
+                and (not strict or all(word in identity for word in gap_words))
+            ):
+                bound.append((start, end))
+                break
+    return bound
+
+
+def _binding_defect(text: str, points: Sequence[Mapping[str, object]], claim_type: str) -> str | None:
+    """Bind the claim wording to each referenced datapoint's metric/value/entity/period/unit; no stray number.
+
+    Every referenced datapoint needs its metric label directly before its value,
+    its entity and period, and its unit when the source states one. Every other
+    number must be one of those identities; an ``unknown`` may also name a year,
+    and an explicitly opened ``assumption`` states premise numbers of its own.
+    Numeric-token overlap with a source never suffices.
+    """
+    masked = _masked(text)
+    strict = claim_type in ("observed_fact", "calculation")
+    bounds = (
+        [0, *[match.end() for match in _SENTENCE_END_RE.finditer(masked)], len(masked)] if strict else [0, len(masked)]
+    )
+    numbers = _numbers(masked)
+    bound: list[tuple[int, int]] = []
+    context: set[str] = set()
+    owner: dict[tuple[int, int], int] = {}
+    for index, point in enumerate(points):
+        pid = point.get("id")
+        missing = [key for key in ("metric", "value", "entity", "period") if not str(point.get(key) or "").strip()]
+        if missing:
+            return f"ERR_DATAPOINT_UNVERIFIED (datapoint {pid} lacks {', '.join(missing)})"
+        spans = _bound_value_spans(masked, numbers, point, strict=strict)
+        if strict:
+            kept: list[tuple[int, int]] = []
+            for start, end in spans:
+                at = next(i for i in range(len(bounds) - 1) if bounds[i] <= start < bounds[i + 1])
+                scope = masked[bounds[at] : bounds[at + 1]]
+                unit = point.get("unit")
+                if all(_phrase_spans(scope, str(point[key])) for key in ("entity", "period")) and (
+                    not isinstance(unit, str) or not unit.strip() or _states_unit(scope, unit)
+                ):
+                    kept.append((start, end))
+            spans = kept
+        else:
+            unit = None
+        if not spans:
+            return (
+                f"ERR_DATAPOINT_UNBOUND (claim does not state datapoint {pid} metric {point['metric']!r} "
+                f"directly before its value {point['value']!r})"
+            )
+        if not strict:
+            scope = masked
+            for key in ("entity", "period"):
+                if not _phrase_spans(scope, str(point[key])):
+                    return f"ERR_DATAPOINT_UNBOUND (claim does not state datapoint {pid} {key} {point[key]!r})"
+            unit = point.get("unit")
+            if isinstance(unit, str) and unit.strip() and not _states_unit(scope, unit):
+                return f"ERR_DATAPOINT_UNBOUND (claim does not state datapoint {pid} unit {unit!r})"
+        bound.extend(spans)
+        context |= numeric_tokens(_point_text(point, ("entity", "period", "unit", "metric")))
+        for start, end in spans:
+            owner[(start, end)] = index
+    if strict:
+        by_sentence: dict[tuple[int, int], set[int]] = {}
+        for (start, _), index in owner.items():
+            at = next(i for i in range(len(bounds) - 1) if bounds[i] <= start < bounds[i + 1])
+            by_sentence.setdefault((bounds[at], bounds[at + 1]), set()).add(index)
+        for span, members in by_sentence.items():
+            identities = {
+                (
+                    str(points[i].get("entity")).casefold(),
+                    str(points[i].get("period")).casefold(),
+                    str(points[i].get("unit")).casefold() if isinstance(points[i].get("unit"), str) else "",
+                )
+                for i in members
+            }
+            if len(identities) > 1:
+                window = masked[span[0] : span[1]] if span != (-1, -1) else masked
+                return (
+                    "ERR_DATAPOINT_UNBOUND (one sentence states several identities:"
+                    f" {window.strip()[:120]!r} names {len(members)} datapoints; identify each in its own sentence)"
+                )
+    seen: dict[str, int] = {}
+    for index, point in enumerate(points):
+        pid = str(point.get("id"))
+        if pid in seen:
+            return (
+                f"ERR_DATAPOINT_UNBOUND (datapoint {pid} is referenced twice; state each value beside its own metric)"
+            )
+        seen[pid] = index
+    by_span: dict[tuple[int, int], set[int]] = {}
+    for (start, end), members in sorted(by_span.items()):
+        if len(members) > 1:
+            disputed = sorted(str(points[i].get("id")) for i in members)
+            return (
+                "ERR_DATAPOINT_UNBOUND (one stated number binds to several datapoints:"
+                f" {masked[start:end]!r} matches {disputed}; state each value beside its own metric)"
+            )
+    if claim_type == "assumption":
+        return None
+    stray = sorted(
+        {
+            norm
+            for norm, start, end in numbers
+            if norm not in context
+            and not any(a <= start and end <= b for a, b in bound)
+            and not (claim_type == "unknown" and _YEAR_RE.fullmatch(norm))
+        }
+    )
+    if stray:
+        return f"ERR_DATAPOINT_UNVERIFIED (numbers {stray} need a referenced verified datapoint in datapoint_ids)"
+    return None
+
+
+def _wording_defect(text: str, points: Sequence[Mapping[str, object]]) -> str | None:
+    """A quantitative fact adds only connective words to its datapoints' own metric/entity/period/unit wording.
+
+    The full source statement (e.g. a record row's sorted-key JSON) is never
+    vocabulary: a dataset metric label without its own referenced datapoint —
+    like ``net income`` beside a lone revenue reference — fails here.
+    """
+    vocabulary = {
+        word for point in points for word, _, _ in _words(_point_text(point, ("metric", "entity", "period", "unit")))
+    }
+    extra = sorted(
+        {word for word, _, _ in _words(_masked(text)) if not word.isdigit() and word not in vocabulary | _GLUE_WORDS}
+    )
+    if extra:
+        return f"ERR_STATEMENT_UNVERIFIED (words {extra[:8]} are not in the referenced datapoint labels or identity fields)"
+    return None
+
+
+def _sentences(text: object) -> set[str]:
+    """Normalized sentences: brackets dropped, quotes straightened, casefolded, outer punctuation stripped."""
+    if not isinstance(text, str):
+        return set()
+    plain = _CITATION_RE.sub(" ", text).translate(str.maketrans("\u2018\u2019\u201c\u201d", "''\"\""))
+    out = {" ".join(part.split()).casefold().strip(" \"'()[].,;:!?") for part in _SENTENCE_SPLIT_RE.split(plain)}
+    return {sentence for sentence in out if sentence}
+
+
+def _statement_defect(
+    claim: GroundedClaim, points: Sequence[Mapping[str, object]], verified: Sequence[Evidence]
+) -> str | None:
+    """A qualitative observed fact equals, sentence by sentence, a located source statement.
+
+    Located statements are the referenced datapoint statements and the passages or
+    excerpts of cited rows whose canonical proof verifies; legacy rows locate nothing.
+    """
+    located: set[str] = set()
+    for point in points:
+        located |= _sentences(point.get("statement"))
+    for row in verified:
+        if datapoint_descriptor(row) is not None:
+            located |= _sentences(row.provenance.get("passage")) | _sentences(row.provenance.get("excerpt"))
+    unmatched = sorted(_sentences(claim.text) - located)
+    if unmatched:
+        return f"ERR_STATEMENT_UNVERIFIED (wording {unmatched[0][:120]!r} matches no located source statement)"
+    return None
+
+
+def _kind_defect(claim: GroundedClaim, points: Sequence[Mapping[str, object]]) -> str | None:
+    """Observed stays observed and calculated stays calculated: a claim type never relabels its datapoints."""
+    calculated = [str(point.get("id")) for point in points if "inputs" in point]
+    if claim.claim_type == "observed_fact" and calculated:
+        return f"ERR_CLAIM_KIND (observed_fact references calculated datapoints {calculated}; declare calculation)"
+    if claim.claim_type == "calculation" and not calculated:
+        return "ERR_CLAIM_KIND (calculation references no calculated datapoint)"
+    return None
+
+
+def _referenced_points(claim: GroundedClaim, verified: Sequence[Evidence]) -> list[Mapping[str, object]] | str:
+    """Descriptors the claim references, each from a cited row whose proof verified (so the descriptor is authentic)."""
+    by_id = {str(point.get("id")): point for row in verified if (point := datapoint_descriptor(row)) is not None}
+    missing = [dp for dp in claim.datapoint_ids if dp not in by_id]
+    if missing:
+        return f"ERR_DATAPOINT_UNVERIFIED (datapoints {missing} are not verified datapoints of cited rows {claim.evidence_ids})"
+    return [by_id[dp] for dp in claim.datapoint_ids]
 
 
 def _claim_proof_defect(
@@ -4079,19 +4501,20 @@ def _claim_proof_defect(
 ) -> str | None:
     """Why one claim may not publish, or None.
 
-    ``unknown`` and a value-less ``assumption`` stay qualified and need no proof.
-    Every cited row must decode (content hash), replay (archive bytes / persisted
-    tool result / calculation proof), and verify any proof it carries. A
-    claimed ``value`` needs one cited row whose observation or calculation proof
-    verifies that exact value with agreeing entity/period/unit. Every number in
-    the claim text must sit in the cited rows' kernel-held text, so a number with
-    no typed ``value`` is still never fabricated.
+    1. A non-observation type carries its explicit qualifier (``_QUALIFIERS``).
+    2. Every cited row decodes (content hash), replays (archive bytes / persisted
+       tool result / calculation proof), and verifies any proof it carries.
+    3. Every ``datapoint_ids`` entry is the kernel descriptor of a cited verified row;
+       observed vs calculated datapoints match the declared type.
+    4. The wording binds each datapoint (metric before value, entity, period, unit)
+       and states no other number; a quantitative observed fact or calculation adds
+       only connective words to its datapoint wording.
+    5. A qualitative observed fact equals a located source statement.
     """
-    if claim.claim_type == "unknown" or (claim.claim_type == "assumption" and claim.value is None):
-        return None
-    texts: list[str] = []
-    proven = False
-    proof_rows: list[Evidence] = []
+    qualifier = _QUALIFIERS.get(claim.claim_type)
+    if qualifier is not None and not qualifier.search(_masked(claim.text)):
+        return f"ERR_CLAIM_UNQUALIFIED ({claim.claim_type} wording carries no explicit {claim.claim_type} qualifier)"
+    verified: list[Evidence] = []
     for eid in claim.evidence_ids:
         row = _ledger_row(rows, eid)
         if isinstance(row, str):
@@ -4099,26 +4522,20 @@ def _claim_proof_defect(
         integrity = _row_integrity_defect(store, session_id, row)
         if integrity is not None:
             return f"ERR_PROOF_UNVERIFIED ({integrity})"
-        own = _proof_verdict(rows, row, row.value) if row.proof else None
-        if own is not None and own.status != "verified":
-            return f"ERR_PROOF_UNVERIFIED ({row.evidence_id} {own.status}: {own.reason})"
-        texts.append(_kernel_text(rows, row))
-        proof_rows.append(row)
-        if claim.value is not None and own is not None and _datapoint_matches(claim, row):
-            proven = proven or _proof_verdict(rows, row, claim.value).status == "verified"
-    if claim.value is not None and not proven:
-        return f"ERR_DATAPOINT_UNVERIFIED (value {claim.value!r} has no verified proof among {claim.evidence_ids})"
-    if claim.claim_type in ("observed_fact", "calculation") and claim.value is None and numeric_tokens(claim.text):
-        missing_proof = sorted(eid for eid, row in zip(claim.evidence_ids, proof_rows) if not row.proof)
-        if missing_proof:
-            return (
-                f"ERR_DATAPOINT_UNVERIFIED (proof-less evidence {missing_proof} cannot back "
-                "a verified observed_fact/calculation claim)"
-            )
-    missing = sorted(numeric_tokens(claim.text) - numeric_tokens(" ".join(texts)))
-    if missing:
-        return f"ERR_DATAPOINT_UNVERIFIED (numbers {missing} are not in the cited source text)"
-    return None
+        if row.proof:
+            own = _proof_verdict(rows, row, row.value)
+            if own.status != "verified":
+                return f"ERR_PROOF_UNVERIFIED ({row.evidence_id} {own.status}: {own.reason})"
+            verified.append(row)
+    points = _referenced_points(claim, verified)
+    if isinstance(points, str):
+        return points
+    defect = _kind_defect(claim, points) or _binding_defect(claim.text, points, claim.claim_type)
+    if defect is not None or claim.claim_type not in ("observed_fact", "calculation"):
+        return defect
+    if points:
+        return _wording_defect(claim.text, points)
+    return _statement_defect(claim, points, verified)
 
 
 def _session_rows(store: ResearchRepository, session_id: str) -> dict[str, Mapping[str, object]]:
@@ -4228,7 +4645,6 @@ def _finalize_persist(
     synth: FinalSynthesis,
 ) -> dict[str, object]:
     """Re-verify every published claim, persist the synthesis result, walk ANALYZING->SYNTHESIZING->COMPLETED."""
-    from .agents import DATAPOINT_FIELDS
     from .models import SessionStatus
 
     require_verified_claims(store, session_id, synth.claims, "finalize_session")
@@ -4245,7 +4661,7 @@ def _finalize_persist(
                 "text": claim.text,
                 "claim_type": claim.claim_type,
                 "evidence_ids": validate_json_value(list(claim.evidence_ids), "<service>"),
-                **{key: getattr(claim, key) for key in DATAPOINT_FIELDS if getattr(claim, key) is not None},
+                "datapoint_ids": validate_json_value(list(claim.datapoint_ids), "<service>"),
             }
             claims_json.append(row)
         final["claims"] = claims_json

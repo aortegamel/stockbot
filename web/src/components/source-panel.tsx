@@ -110,13 +110,19 @@ const NOT_RECORDED = "Not recorded";
 
 // This page is the Stockbot view. The one external link opens the official page; a missing official page shows none.
 function SourceHeader({ source }: { source: SourceDocument }) {
-  const original = originalLink(source);
+  const original = source.sourceConflict ? null : originalLink(source);
   return (<>
     <h1 className="mt-1 text-base font-semibold">{sourceLabel(source) || source.title}</h1>
     <p className="mt-1 text-amber-200">{CAPTURE_LABELS[source.captureKind]}</p>
     {original && <p className="mt-1"><a className="text-blue-300 underline" href={original.href} target="_blank" rel="noopener noreferrer">
       {original.highlighted ? `Open on ${original.host} (highlighted) ↗` : `Original on ${original.host} ↗`}
     </a></p>}
+    {source.sourceConflict && <section aria-label="Source conflict" className="mt-3 text-sm text-amber-200">
+      <h2 className="font-semibold">Source conflict</h2>
+      <p>The public link is unavailable. The captured API record remains visible.</p>
+      <p>{source.sourceConflict.failure}</p>
+      <p>{source.sourceConflict.reason}</p>
+    </section>}
     <h2 className="mt-3 text-sm font-semibold">How we got this</h2>
     <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs text-zinc-400">
       <dt>Source</dt><dd>{source.publisher || NOT_RECORDED}</dd>
@@ -134,10 +140,13 @@ const VERIFICATION_LABELS: Record<SourceAudit["verification"], string> = { verif
 
 function AuditFields({ audit }: { audit: SourceAudit }) {
   const source = [audit.source?.name, audit.source?.document, audit.source?.accession].filter(Boolean).join(" · ");
-  const formula = audit.formula || (audit.formulaId ? `${audit.formulaId}@${audit.formulaVersion ?? ""}` : undefined);
+  const datapoint = audit.verification === "verified" ? audit.datapoint : undefined;
+  const formula = audit.formula || (audit.formulaId ? `${audit.formulaId}@${audit.formulaVersion ?? ""}` : undefined) || datapoint?.formula;
   const rows: [string, string | undefined][] = [
     ["Value", audit.value], ["Entity", audit.entity], ["Period", audit.period], ["Unit", audit.unit], ["Known at", audit.knownAt],
     ["Source", source || undefined], ["Evidence hash", audit.source?.hash], ["Formula", formula], ["Recomputed", audit.recomputedValue],
+    ["Datapoint ID", datapoint?.id], ["Metric", datapoint?.metric], ["Field", datapoint?.field], ["Statement", datapoint?.statement],
+    ["Input datapoint IDs", datapoint?.inputs?.join(", ")],
   ];
   return (
     <dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs text-zinc-400">

@@ -1,21 +1,34 @@
 """Explicit repair of legacy evidence rows that carry no proof.
 
-A repair never writes the evidence row, a freeze, or a tool result. It reads the
-persisted row and tool result, recovers the source identity the row retained,
-resolves the historical SEC fact or persisted record under the original
-``as_of``, and records an immutable repair artifact that points at the old row.
+A repair never writes the legacy evidence row, a freeze, or an existing tool
+result. It reads the persisted row and tool result, recovers the source identity
+the row retained, resolves the historical SEC fact or persisted record under the
+original ``as_of``, and records an immutable repair artifact that points at the
+old row.
 
-Repair is artifact-only: no publication gate (``require_verified_claims``,
-``_claim_proof_defect``, ``_proof_verdict``) reads ``evidence_repairs``. A legacy
-row with no ledger proof stays unverified at publication; the source viewer
-shows repairs as read-only audit history beside that verdict. Wiring repair
-lookup into the gates would need an explicit decision on how repairs count as proof.
+Without a target session a repair is audit-only: no publication gate reads
+``evidence_repairs``, the legacy row stays unverified, and the source viewer
+shows repairs as read-only history beside that verdict.
+
+With an explicitly named open target session, each verified artifact of this
+call is promoted to one new evidence row in that session. The kernel persists the
+verified source row as a tool result of the target session (an SEC fact under
+``get_xbrl_facts``, a cited record as a copy of its original persisted result)
+and re-runs normal admission: replay, canonical datapoint, integrity, PIT
+against the target ``as_of``, and proof replay before commit. A repaired status
+alone never promotes. Calculation inputs promote first, and the calculation proof
+names their new evidence ids. A row carries ``metadata.repair_id`` and
+``metadata.repaired_evidence_id``, plus ``superseded_by`` when the legacy row is
+in the target session. The identity key ``repair|<repair_id>`` makes a rerun
+return the same row. Unresolved artifacts and failed admissions stay audit-only.
+Legacy ids and repair ids never become citable.
 
 Matching is deterministic. A retained accession or row pins one exact source.
 When the identity is incomplete, every point-in-time candidate must agree, so a
 first matching number never stands in for a source. A fact known only after
 ``as_of`` stays unresolved: a later restatement never substitutes for an older
-observation. Every unresolved datapoint logs its reason at ERROR level.
+observation. Every unresolved datapoint and every failed promotion logs its
+reason at ERROR level.
 """
 
 from __future__ import annotations
@@ -25,14 +38,15 @@ import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from urllib.parse import parse_qs, urlparse
 
 from app.storage import raw_archive
 
-from .evidence import Evidence, evidence_from_dict, validate_proof, value_hash
+from .evidence import Evidence, _scalar_text, evidence_from_dict, validate_proof, value_hash
+from .models import JSONValue, ResearchSession, validate_json_mapping
 from .repository import ResearchRepository
 
 logger = logging.getLogger(__name__)
@@ -454,7 +468,18 @@ def _archived_fact(fact: Mapping[str, object]) -> str:
 
 
 def _fact_source(fact: Mapping[str, object]) -> dict[str, object]:
-    keys = ("cik", "concept", "original_concept", "unit", "period_start", "period_end", "fiscal_year", "fiscal_period")
+    """The verified fact as a record: the row a promotion persists and its datapoint binds to."""
+    keys = (
+        "entity_id",
+        "cik",
+        "concept",
+        "original_concept",
+        "unit",
+        "period_start",
+        "period_end",
+        "fiscal_year",
+        "fiscal_period",
+    )
     return {
         **{key: fact.get(key) for key in keys},
         "accession": fact.get("accession"),
@@ -579,7 +604,9 @@ def _input_artifact(run: _Run, parent: _Point, index: int, spec: Mapping[str, ob
     try:
         if value is None:
             raise _Unresolved("SOURCE_IDENTITY_MISSING", "no value retained")
-        return _spec_artifact(run, point, spec, value)
+        artifact = _spec_artifact(run, point, spec, value)
+        # Nested write times are not source content: keep them out of the parent's hash and immutable body.
+        return {key: item for key, item in artifact.items() if key != "created_at"}
     except _Unresolved as exc:
         raise _Unresolved("CALCULATION_INVALID", f"input {index}: {exc.reason} ({exc.detail})") from None
 
@@ -766,22 +793,330 @@ def _repairs(store: ResearchRepository, raw: Mapping[str, object]) -> list[dict[
     return [_outcome(run, evidence, point, results) for point in points]
 
 
-def repair_evidence(store: ResearchRepository, evidence_id: str) -> list[dict[str, object]]:
+# --------------------------------------------------------------------------- promotion into a target session
+
+_REPAIR_LINEAGE = "repair"
+"""Job and agent id of promoted rows and their tool results: an explicit operator repair, never a model job."""
+
+_REPAIR_SEC_TOOL = "get_xbrl_facts"
+"""SEC replay tool a promoted companyfacts fact persists under."""
+
+
+def _open_session(store: ResearchRepository, session_id: str) -> ResearchSession:
+    """The target session as stored now; KeyError when absent, ValueError when terminal."""
+    from .session import TERMINAL_STATUSES
+
+    found = store.get_session(session_id)
+    if found.status in TERMINAL_STATUSES:
+        raise ValueError(f"target session {session_id!r} status is {found.status!r} (terminal)")
+    return found
+
+
+def _live_wave(found: ResearchSession) -> int:
+    """The wave new evidence joins (the service live-wave rule); a frozen wave fails closed."""
+    wave = max(found.current_wave, len(found.freeze_ids) + 1, 1)
+    if f"{found.session_id}:{wave}:freeze" in found.freeze_ids:
+        raise ValueError(f"target session {found.session_id!r} wave {wave} is frozen")
+    return wave
+
+
+def _source_record(
+    store: ResearchRepository, artifact: Mapping[str, object]
+) -> tuple[str, str, dict[str, object], Mapping[str, object], dict[str, str | None]]:
+    """(domain, tool, payload, row, datapoint) one verified observation replays in the target session.
+
+    An SEC fact persists as one XBRL fact row beside its companyfacts proof. A
+    cited record copies its original persisted result, which must still hash to
+    the verified source, and binds the one row field that holds the value.
+    """
+    source = artifact.get("source")
+    if not isinstance(source, Mapping):
+        raise ValueError("the repair artifact names no source")  # noqa: TRY004 - promotion failures are ValueError
+    if "tool_result_id" not in source:
+        row = dict(source)
+        datapoint = {
+            "metric": _text(row.get("concept")) or None,
+            "value": _scalar_text(row.get("value")),
+            "entity": _scalar_text(row.get("entity_id")),
+            "period": _scalar_text(row.get("period_end")),
+            "unit": _scalar_text(row.get("unit")),
+        }
+        return "SEC", _REPAIR_SEC_TOOL, {"facts": [row], "companyfacts": artifact.get("proof")}, row, datapoint
+    original = store.get_tool_result(str(source.get("tool_result_id")))
+    digest = raw_archive.content_hash(_canonical(original).encode("utf-8"))
+    row = source.get("row")
+    if _nested(artifact, "proof", "sourceId") != f"sha256:{digest}" or not isinstance(row, Mapping):
+        raise ValueError(f"tool result {source.get('tool_result_id')!r} no longer matches the verified source")
+    value = artifact.get("value")
+    fields = [key for key, item in row.items() if _same_number(item, value) or _text(item) == value]
+    if len(fields) != 1:
+        raise ValueError(f"the cited row holds the value in {len(fields)} fields, not exactly one")
+    datapoint = {
+        "metric": str(fields[0]),
+        "value": _scalar_text(row[fields[0]]),
+        "entity": _scalar_text(artifact.get("entity")),
+        "period": _scalar_text(artifact.get("period")),
+        "unit": _scalar_text(artifact.get("unit")),
+    }
+    domain = "FINRA" if artifact.get("category") == "finra_structured" else "SEC"
+    return domain, str(original.get("tool_name")), dict(_payload(original)), row, datapoint
+
+
+def _target_result(
+    store: ResearchRepository,
+    session_id: str,
+    result_id: str,
+    tool: str,
+    payload: Mapping[str, object],
+    artifact: Mapping[str, object],
+) -> None:
+    """Persist the verified source as a tool result of the target session once; a rerun reuses it."""
+    try:
+        store.get_tool_result(result_id)
+    except KeyError:
+        store.save_tool_result(
+            {
+                "tool_result_id": result_id,
+                "session_id": session_id,
+                "job_id": _REPAIR_LINEAGE,
+                "tool_name": tool,
+                "created_at": datetime.now(UTC).isoformat(),
+                "arguments": {"repair_id": str(artifact["repair_id"]), "evidence_id": str(artifact["evidence_id"])},
+                "result": validate_json_mapping(dict(payload), "<repair>: 'result'"),
+            }
+        )
+
+
+def _lineage(artifact: Mapping[str, object], interval: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+    """Promoted-row metadata: the repair and legacy row it came from, plus any period interval."""
+    return {
+        "repair_id": str(artifact["repair_id"]),
+        "repaired_evidence_id": str(artifact["evidence_id"]),
+        "repaired_session_id": str(artifact["session_id"]),
+        **interval,
+    }
+
+
+def _promotion_key(session_id: str, artifact: Mapping[str, object]) -> str:
+    return sha256(f"{session_id}|{artifact['repair_id']}".encode()).hexdigest()
+
+
+def _promote_observation(
+    store: ResearchRepository,
+    session_id: str,
+    raw: Mapping[str, object],
+    artifact: Mapping[str, object],
+    supersedes: str | None,
+) -> str:
+    """Admit one verified observation through the normal replay, datapoint, PIT, and proof path."""
+    from .service import (
+        _admission_observation_proof,
+        _build_evidence_record,
+        _finra_provenance,
+        _persist_finra_web_record,
+        _sec_record_provenance,
+    )
+
+    domain, tool, payload, row, datapoint = _source_record(store, artifact)
+    key = _promotion_key(session_id, artifact)
+    result_id = f"{session_id}:tr:repair:{key[:16]}"
+    _target_result(store, session_id, result_id, tool, payload, artifact)
+    data: dict[str, object] = {
+        "tool_result_id": result_id,
+        "record_identity": _canonical(row),
+        "known_at": row.get("known_at") if domain == "SEC" else None,
+        "source_type": domain.lower(),
+        "agent_id": _REPAIR_LINEAGE,
+        "superseded_by": supersedes,
+    }
+    replay = _finra_provenance if domain == "FINRA" else _sec_record_provenance
+    provenance = replay(data, None, store=store, session_id=session_id)
+    proof, source_bytes, descriptor = _admission_observation_proof(store, provenance, datapoint)
+    interval: dict[str, JSONValue] = {
+        name: _text(row.get(name)) for name in ("period_start", "period_end") if _text(row.get(name))
+    }
+    content = (
+        f"{datapoint['metric']} = {datapoint['value']} (repair {artifact['repair_id']} of {artifact['evidence_id']})"
+    )
+    found = _open_session(store, session_id)
+    record = _build_evidence_record(
+        data,
+        session_id=session_id,
+        job_id=_REPAIR_LINEAGE,
+        wave=_live_wave(found),
+        evidence_id=f"ev:{key[:12]}",
+        source_name=domain,
+        subject=_text(raw.get("subject")),
+        claim=content,
+        content=content,
+        supports=(),
+        contradicts=(),
+        metadata=_lineage(artifact, interval),
+        identity_key=f"repair|{artifact['repair_id']}",
+        claim_kind="observed_fact",
+        provenance=provenance,
+        datapoint={name: _scalar_text(descriptor.get(name)) for name in ("value", "entity", "period", "unit")},
+        proof=proof,
+    )
+    stored = _persist_finra_web_record(store, session_id, _REPAIR_LINEAGE, found, record, proof_bytes=source_bytes)
+    return str(stored["evidence_id"])
+
+
+def _interval(semantics: str, rows: Sequence[Evidence]) -> dict[str, JSONValue]:
+    """The calculation's own period interval for a temporal formula; the verifier checks it against its inputs."""
+    starts = [_text(row.metadata.get("period_start")) for row in rows]
+    ends = [_text(row.metadata.get("period_end")) for row in rows]
+    if semantics == "ttm":
+        return {"period_start": starts[0], "period_end": ends[-1]}
+    if semantics == "quarter" and len(ends) == 2:
+        return {"period_start": (date.fromisoformat(ends[1]) + timedelta(days=1)).isoformat(), "period_end": ends[0]}
+    return {}
+
+
+def _promote_calculation(
+    store: ResearchRepository,
+    session_id: str,
+    raw: Mapping[str, object],
+    artifact: Mapping[str, object],
+    supersedes: str | None,
+) -> str:
+    """Promote every input first, then admit the calculation over those new rows, recomputed before commit."""
+    from .evidence import calculation_datapoint, calculation_proof, evidence_content_hash
+    from .service import _FORMULAS, _calculation_known_at, _persist_finra_web_record
+
+    items = artifact.get("inputs")
+    if not isinstance(items, list) or not items:
+        raise ValueError("the calculation repair names no inputs")
+    ids = [_promote_point(store, session_id, raw, item, None) for item in items]
+    rows = [evidence_from_dict(store.get_evidence(eid)) for eid in ids]
+    formula_id, version = (
+        str(_nested(artifact, "proof", "formulaId")),
+        str(_nested(artifact, "proof", "formulaVersion")),
+    )
+    value, period = str(artifact["value"]), str(artifact["period"])
+    entity, unit = rows[0].entity, rows[0].unit
+    datapoint = calculation_datapoint(
+        formula_id=formula_id,
+        formula_version=version,
+        inputs=rows,
+        metric=str(artifact["datapoint"]),
+        value=value,
+        entity=entity,
+        period=period,
+        unit=unit,
+    )
+    proof = calculation_proof(
+        formula_id=formula_id, formula_version=version, input_proof_ids=ids, value=value, datapoint=datapoint
+    )
+    formula = f"{formula_id}@{version}"
+    content = f"{formula}({', '.join(f'{row.evidence_id}={row.value}' for row in rows)}) = {value}"
+    identity_key = f"repair|{artifact['repair_id']}"
+    found = _open_session(store, session_id)
+    record = Evidence(
+        evidence_id=f"ev:{_promotion_key(session_id, artifact)[:12]}",
+        session_id=session_id,
+        wave_id=_live_wave(found),
+        source_type="calculation",
+        source_name="calculation",
+        subject=_text(raw.get("subject")),
+        claim_text=content[:500],
+        content=content,
+        content_hash=evidence_content_hash(content),
+        retrieved_at=datetime.now(UTC),
+        source_record_id=f"calculation:{formula}",
+        known_at=_calculation_known_at(rows),
+        job_id=_REPAIR_LINEAGE,
+        agent_id=_REPAIR_LINEAGE,
+        metadata={
+            **_lineage(artifact, _interval(_FORMULAS[(formula_id, version)][1], rows)),
+            "identity_key": identity_key,
+            "claim_kind": "calculation",
+        },
+        superseded_by=supersedes,
+        claim_kind="calculation",
+        value=value,
+        entity=entity,
+        period=period,
+        unit=unit,
+        proof=proof,
+    )
+    stored = _persist_finra_web_record(store, session_id, _REPAIR_LINEAGE, found, record, proof_bytes=None)
+    return str(stored["evidence_id"])
+
+
+def _promote_point(
+    store: ResearchRepository,
+    session_id: str,
+    raw: Mapping[str, object],
+    artifact: object,
+    supersedes: str | None,
+) -> str:
+    """The target-session row of one verified artifact: the existing one on a rerun, else a newly admitted one."""
+    if not isinstance(artifact, Mapping) or artifact.get("status") != "verified":
+        raise ValueError("only a verified repair artifact promotes")
+    hit = store.find_evidence_by_identity(session_id, f"repair|{artifact['repair_id']}")
+    if hit is not None:
+        return str(hit["evidence_id"])
+    promote = _promote_calculation if _nested(artifact, "proof", "kind") == "calculation" else _promote_observation
+    return promote(store, session_id, raw, artifact, supersedes)
+
+
+def _promote(
+    store: ResearchRepository, session_id: str, raw: Mapping[str, object], artifact: Mapping[str, object]
+) -> str | None:
+    """Promoted evidence id of one artifact; an unresolved or refused artifact stays audit-only (None)."""
+    if artifact.get("status") != "verified":
+        return None
+    # The correction chain links only inside one ledger: the legacy row must sit in the target session.
+    supersedes = str(raw.get("evidence_id")) if raw.get("session_id") == session_id else None
+    try:
+        return _promote_point(store, session_id, raw, artifact, supersedes)
+    except (KeyError, ValueError) as exc:
+        logger.error(
+            "evidence repair not promoted target=%s evidence=%s repair=%s: %s",
+            session_id,
+            raw.get("evidence_id"),
+            artifact.get("repair_id"),
+            exc,
+        )
+        return None
+
+
+def repair_evidence(
+    store: ResearchRepository, evidence_id: str, target_session_id: str | None = None
+) -> list[dict[str, object]]:
     """Record one repair artifact per datapoint of one legacy row; the row itself is never written.
 
-    Raises KeyError for an unknown id and ValueError for a row a repair does not
-    cover: a discovery row, a row that already carries proof, or a passage/web row.
+    With ``target_session_id`` every verified artifact of this call is also
+    promoted into that open session (see the module docstring). Each returned
+    artifact then carries ``promoted_evidence_id``: the new row id, or None when
+    it stays audit-only. Persisted artifacts never carry that key.
+
+    Raises KeyError for an unknown id or target session. Raises ValueError for a
+    terminal or frozen target, or for a row a repair does not cover: a discovery
+    row, a row that already carries proof, or a passage/web row.
     """
     raw = store.get_evidence(evidence_id)
     if not _repairable(raw):
         raise ValueError(f"evidence {evidence_id!r} is not a repairable legacy row")
+    if target_session_id is not None:
+        _live_wave(_open_session(store, target_session_id))
     artifacts = _repairs(store, raw)
     for artifact in artifacts:
         store.save_evidence_repair(artifact)
-    return artifacts
+    if target_session_id is None:
+        return artifacts
+    return [
+        {**artifact, "promoted_evidence_id": _promote(store, target_session_id, raw, artifact)}
+        for artifact in artifacts
+    ]
 
 
-def repair_session(store: ResearchRepository, session_id: str) -> list[dict[str, object]]:
-    """Repair every repairable legacy row of one session."""
+def repair_session(
+    store: ResearchRepository, session_id: str, target_session_id: str | None = None
+) -> list[dict[str, object]]:
+    """Repair every repairable legacy row of one session, promoting into ``target_session_id`` when named."""
     rows = [row for row in store.list_evidence(session_id) if _repairable(row)]
-    return [artifact for row in rows for artifact in repair_evidence(store, str(row.get("evidence_id")))]
+    return [
+        artifact for row in rows for artifact in repair_evidence(store, str(row.get("evidence_id")), target_session_id)
+    ]

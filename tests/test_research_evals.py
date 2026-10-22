@@ -9,6 +9,7 @@ from hypothesis import strategies as st
 import tests.research_source_seam as seam
 from app.research.evals.evaluators import EvalInput, eval_input_from_fixture, evaluate
 from app.research.evals.regression import AgentFixture, FixtureTrace, load_fixture
+from app.research.synthesis.final import SEC_ONLY_LIMITATION
 
 
 def test_crashed_fails_scenario_crashed():
@@ -156,7 +157,7 @@ def _gs_sid(repo: object, q: str = _GS_Q) -> tuple[str, str]:
 
 def _gs_item(eid: str, **over: object) -> dict[str, object]:
     """Observed fact with the canonical handle for its cited passage."""
-    passage = "Investing and lending activities include OPENAI-linked positions (Note 3, p.88)."
+    passage = "GS 10-K discloses OpenAI-linked exposure. GS exposure for FY2024 was 1 USD."
     base: dict[str, object] = {
         "evidence_id": eid,
         "wave_id": 1,
@@ -170,6 +171,11 @@ def _gs_item(eid: str, **over: object) -> dict[str, object]:
         "matching_passage": passage,
         "source_handle": seam.handle_for(passage, accession=_GS_ACC, document=_GS_DOC),
         "known_at": "2025-06-29T00:00:00+00:00",
+        "metric": "exposure",
+        "value": "1",
+        "entity": "GS",
+        "period": "FY2024",
+        "unit": "USD",
     }
     base.update(over)
     return base
@@ -215,7 +221,7 @@ def _gs_envelope(eid: str) -> dict[str, object]:
         "executive_view": "GS carries OpenAI-linked exposure through its investing and credit marks.",
         "claims": [
             {"text": "GS 10-K discloses OpenAI-linked exposure", "claim_type": "observed_fact", "evidence_ids": [eid]},
-            {"text": "OpenAI private loan terms", "claim_type": "unknown", "evidence_ids": []},
+            {"text": "OpenAI private loan terms are unknown", "claim_type": "unknown", "evidence_ids": []},
         ],
         "impact_channels": [{"text": "Investing marks", "direction": "negative", "evidence_ids": [eid]}],
         "materiality": {"overall": "high", "reasoning": "filing-visible marks"},
@@ -437,7 +443,7 @@ def test_gs_arch_facts_inference_split() -> None:
     )
     assert declared[0].claim_type == "observed_fact"
     unknown = parse_grounded_claims(
-        _json.dumps([{"text": "OpenAI private loan terms", "claim_type": "unknown", "evidence_ids": []}]),
+        _json.dumps([{"text": "OpenAI private loan terms are unknown", "claim_type": "unknown", "evidence_ids": []}]),
         frozen=["EV-1"],
     )
     assert unknown[0].claim_type == "unknown"  # unknown may cite nothing
@@ -1348,8 +1354,15 @@ def test_promotion_derives_raw_declared_scoped_unknown_from_ledger(
         svc.record_committee_analysis(sid, jid, role, _gs_envelope(eid), repo=repo)
     svc.finalize_session(
         sid,
-        "GS 10-K discloses OpenAI-linked exposure.",
-        [{"text": "GS 10-K discloses OpenAI-linked exposure", "claim_type": "observed_fact", "evidence_ids": [eid]}],
+        "GS 10-K discloses OpenAI-linked exposure. Only SEC sources were searched is unknown.",
+        [
+            {"text": "GS 10-K discloses OpenAI-linked exposure", "claim_type": "observed_fact", "evidence_ids": [eid]},
+            {
+                "text": "Only SEC sources were searched is unknown",
+                "claim_type": "unknown",
+                "evidence_ids": [],
+            },
+        ],
         repo=repo,
     )
     fixtures = tmp_path / "fixtures"
@@ -1357,18 +1370,22 @@ def test_promotion_derives_raw_declared_scoped_unknown_from_ledger(
     promoted = load_fixture("gs-openai-sec-only", fixtures)
     assert promoted["question"] == _GS_Q
     assert promoted["evidence_ids"] == [eid] and promoted["known_ats"] == ["2025-05-01T00:00:00+00:00"]
-    assert promoted["answer_excerpt"] == "GS 10-K discloses OpenAI-linked exposure."
+    assert "GS 10-K discloses OpenAI-linked exposure." in promoted["answer_excerpt"]
     assert promoted["freeze_before"] == fid and promoted["freeze_after"] == fid
     assert promoted["trace"]["filings_opened"] == [_GS_ACC]
     assert promoted["trace"]["documents_opened"] == [f"{_GS_ACC}|{_GS_DOC}"]
     assert promoted["trace"]["raw_evidence_ids"] == [eid]
     assert promoted["trace"]["waves"] == [fid] and promoted["trace"]["committee_freeze_ids"] == [fid] * 3
     assert promoted["trace"]["roles_completed"] == ["stockbot", "bullbot", "bearbot"]
-    assert promoted["trace"]["navigation_evidence_ids"] == []
     assert promoted["trace"]["claims"][0]["claim_type"] == "observed_fact"
-    assert promoted["trace"]["claims_by_type"] == {"observed_fact": 1, "unknown": 1}
+    assert promoted["trace"]["claims_by_type"] == {"observed_fact": 1, "unknown": 3}
+    assert promoted["trace"]["limitations"] == [SEC_ONLY_LIMITATION]
     unknown = [claim for claim in promoted["trace"]["claims"] if claim["claim_type"] == "unknown"]
-    assert [claim["text"] for claim in unknown] == ["OpenAI private loan terms"]
+    assert [claim["text"] for claim in unknown] == [
+        "OpenAI private loan terms are unknown",
+        "Only SEC sources were searched is unknown",
+        SEC_ONLY_LIMITATION,
+    ]
     assert repo.get_freeze(fid)["evidence_ids"] == [eid]
     assert evaluate(eval_input_from_fixture(promoted)).passed
 
@@ -1511,7 +1528,7 @@ def test_final_synthesis_serialization_keeps_aliases_and_copies_rows() -> None:
     from app.research.synthesis.committee import CommitteeDisagreement
     from app.research.synthesis.final import synthesize_final
 
-    claim = GroundedClaim(text="growth", claim_type="inference", evidence_ids=["E1"])
+    claim = GroundedClaim(text="growth seems likely", claim_type="inference", evidence_ids=["E1"])
     stock = StockbotAnalysis(
         session_id="s",
         wave_id=1,
@@ -1563,7 +1580,15 @@ def test_final_synthesis_serialization_keeps_aliases_and_copies_rows() -> None:
     assert (
         payload["claims"]
         == payload["grounded_claims"]
-        == [{"text": "growth", "claim_type": "inference", "evidence_ids": ["E1"]}]
+        == [
+            {"text": "growth seems likely", "claim_type": "inference", "evidence_ids": ["E1"]},
+            {
+                "text": "SEC-only scope is unknown beyond SEC filings:"
+                " no non-SEC source (news, transcripts, private documents, market data) was searched.",
+                "claim_type": "unknown",
+                "evidence_ids": [],
+            },
+        ]
     )
     assert "SEC — forms: 10-K" in synthesis.answer
     assert "gaps: private" in synthesis.answer
