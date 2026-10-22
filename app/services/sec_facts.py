@@ -441,13 +441,17 @@ def _basic_match_for(period_end: str, recent_basic: Sequence[FinancialFactRow] |
     return next((b for b in recent_basic if b["period_end"] == period_end), None)
 
 
-def _eps_entry(diluted: FinancialFactRow, recent_basic: Sequence[FinancialFactRow] | None) -> dict[str, object]:
-    """One quarterly entry: diluted value plus basic when the period matches."""
+def _eps_entry(
+    diluted: FinancialFactRow, recent_basic: Sequence[FinancialFactRow] | None, cik: int | None
+) -> dict[str, object]:
+    """One quarterly entry: diluted value plus basic when the period matches, with its filing identity."""
     entry: dict[str, object] = {
         "fiscal_year": str(diluted["fiscal_year"]) if diluted.get("fiscal_year") is not None else "",
         "fiscal_period": (diluted.get("fiscal_period") or ""),
         "eps_diluted": round(diluted["value"], 2),
         "period_end": diluted["period_end"],
+        "accession": diluted["accession"],
+        "cik": cik,
     }
     matching = _basic_match_for(diluted["period_end"], recent_basic)
     if matching is not None:
@@ -462,14 +466,16 @@ def _eps_ttm(quarters: Sequence[FinancialFactRow] | None) -> float | None:
     return round(sum(r["value"] for r in quarters), 2)
 
 
-def _assemble_eps_payload(ticker: str, rows: Sequence[FinancialFactRow]) -> dict[str, object] | None:
+def _assemble_eps_payload(
+    ticker: str, rows: Sequence[FinancialFactRow], cik: int | None = None
+) -> dict[str, object] | None:
     """Deterministic live assembly over feed rows (pure; no storage)."""
     recent_diluted = _recent_concept_quarters(rows, DILUTED_EPS_CONCEPT)
     if not recent_diluted:
         return None
     basic_quarters = _duration_rows(rows, BASIC_EPS_CONCEPT, _QUARTER_DAYS)
     recent_basic = _recent_concept_quarters(rows, BASIC_EPS_CONCEPT) if basic_quarters else None
-    quarterly_eps = [_eps_entry(r, recent_basic) for r in recent_diluted]
+    quarterly_eps = [_eps_entry(r, recent_basic, cik) for r in recent_diluted]
     result: dict[str, object] = {
         "ticker": ticker,
         "quarterly_eps": quarterly_eps,
@@ -1369,7 +1375,11 @@ def _dividend_fundamental(ticker: str, requested: _dt.date, explicit_as_of: bool
 def _eps_fundamental(ticker: str, requested: _dt.date, explicit_as_of: bool = False) -> dict[str, object]:
     entity_id = _resolve_entity(ticker, requested, None)
     store_rows: list[FinancialFactRow] = _store_rows(entity_id, _EPS_CONCEPTS, requested, None) if entity_id else []
-    payload: dict[str, object] | None = _assemble_eps_payload(ticker, store_rows) if store_rows else None
+    payload: dict[str, object] | None = (
+        _assemble_eps_payload(ticker, store_rows, _resolve_cik(entity_id) if entity_id else None)
+        if store_rows
+        else None
+    )
     if payload is not None:
         quarters_count = payload.get("quarterly_eps")
         return _envelope(
@@ -1436,7 +1446,9 @@ def _latest_shares_row(
     return dict(latest), float(latest["value"])
 
 
-def _shares_store_payload(ticker: str, row: Mapping[str, object], shares_value: float | None) -> dict[str, object]:
+def _shares_store_payload(
+    ticker: str, row: Mapping[str, object], shares_value: float | None, cik: int | None
+) -> dict[str, object]:
     """Live-path shares-outstanding payload anchored on the latest row."""
     return {
         "ticker": ticker,
@@ -1446,6 +1458,7 @@ def _shares_store_payload(ticker: str, row: Mapping[str, object], shares_value: 
         "note": "SEC-reported shares outstanding, not public float",
         "filed_at": _stored_text(row.get("filed_at")),
         "accession": row.get("accession"),
+        "cik": cik,
         "source_url": row.get("source_url"),
         "known_at": _stored_text(row.get("known_at")),
     }
@@ -1465,7 +1478,7 @@ def _shares_outstanding_fundamental(
         return _envelope(
             ticker,
             "shares_outstanding",
-            _shares_store_payload(ticker, row, shares_value),
+            _shares_store_payload(ticker, row, shares_value, _resolve_cik(entity_id) if entity_id else None),
             data_source="live",
             as_of_date=requested.isoformat(),
             row_count=1,

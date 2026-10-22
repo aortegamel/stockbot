@@ -197,6 +197,14 @@ def test_eps_store_parity_with_live_algorithm(gateway: _Gateway) -> None:
     assert by_end["2026-04-26"]["eps_basic"] == 2.40
     assert result["ttm_eps_diluted"] == 6.53  # matches the live fixture exactly
     assert "ttm_eps_basic" not in result
+    # Each quarter names the filing behind it (derived Q4 cites the FY 10-K) and the issuer CIK.
+    assert {end: q["accession"] for end, q in by_end.items()} == {
+        "2025-07-27": "a4",
+        "2025-10-26": "a6",
+        "2026-01-25": "a7",
+        "2026-04-26": "a8",
+    }
+    assert all(q["cik"] == NVDA_CIK for q in quarterly_eps)
     assert result["source"] == "sec"
     assert result["source_label"] == "SEC EDGAR company facts (Basic & Diluted EPS)"
 
@@ -406,6 +414,7 @@ def test_shares_outstanding_store_latest_period_wins(gateway: _Gateway) -> None:
     assert result["shares_outstanding"] == 1100  # newest period_end; filed_at breaks restatement ties
     assert result["as_of"] == "2026-01-25"
     assert result["accession"] == "s3"
+    assert result["cik"] == NVDA_CIK
     assert result["filed_at"] == "2026-02-25"
     assert result["known_at"] == "2026-02-25"
     note = result["note"]

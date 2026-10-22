@@ -487,3 +487,218 @@ def test_accepted_2026_filing_rejected_at_2025_read(tmp_path: Path, monkeypatch:
     monkeypatch.setattr(documents, "get_by_accession_number", _fake_2026_filing)
     with pytest.raises(ValueError, match="not known as of"):
         documents.get_sec_document(ACC, DOC, as_of="2025-01-01", data_root=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# resolve_sec_official: official www.sec.gov page per cited row (fetch faked)
+# ---------------------------------------------------------------------------
+
+OFF_ACC = "0000320193-26-000010"
+OFF_CIK = 320193
+OFF_DIR = "https://www.sec.gov/Archives/edgar/data/320193/000032019326000010"
+OFF_INDEX = f"{OFF_DIR}/{OFF_ACC}-index.htm"
+OFF_PRIMARY = f"{OFF_DIR}/fake-10q.htm"
+OFF_INDEX_HTML = (
+    f"<html><body><div>SEC Accession No. {OFF_ACC}</div><table>"
+    '<tr><td>1</td><td><a href="/ix?doc=/Archives/edgar/data/320193/000032019326000010/fake-10q.htm">'
+    "fake-10q.htm</a></td></tr>"
+    f'<tr><td>2</td><td><a href="/Archives/edgar/data/320193/000032019326000010/{OFF_ACC}.txt">txt</a></td></tr>'
+    "</table></body></html>"
+)
+_Q2 = "<xbrli:startDate>2026-04-01</xbrli:startDate><xbrli:endDate>2026-06-30</xbrli:endDate>"
+_YTD = "<xbrli:startDate>2026-01-01</xbrli:startDate><xbrli:endDate>2026-06-30</xbrli:endDate>"
+_SEGMENT = "<xbrli:segment><xbrldi:explicitMember dimension='a:SegmentAxis'>a:DataCenter</xbrldi:explicitMember></xbrli:segment>"
+
+
+def _ix_context(context_id: str, period: str, segment: str = "") -> str:
+    return (
+        f'<xbrli:context id="{context_id}"><xbrli:entity><xbrli:identifier>320193</xbrli:identifier>{segment}'
+        f"</xbrli:entity><xbrli:period>{period}</xbrli:period></xbrli:context>"
+    )
+
+
+def _ix_fact(name: str, context: str, text: str, fact_id: str, scale: str = "6", extra: str = "") -> str:
+    return (
+        f'<ix:nonFraction name="{name}" contextRef="{context}" unitRef="usd" decimals="-6" scale="{scale}" '
+        f'format="ixt:num-dot-decimal" id="{fact_id}"{extra}>{text}</ix:nonFraction>'
+    )
+
+
+OFF_PRIMARY_HTML = (
+    '<html><body><div style="display:none"><ix:header><ix:hidden>'
+    + _ix_fact("us-gaap:Revenues", "c-1", "81,615", "f-hidden")
+    + "</ix:hidden><ix:resources>"
+    + _ix_context("c-1", _Q2)
+    + _ix_context("c-2", _Q2, _SEGMENT)
+    + _ix_context("c-3", _YTD)
+    + _ix_context("c-4", "<xbrli:instant>2026-07-20</xbrli:instant>")
+    + "</ix:resources></ix:header></div>"
+    + "<p>Shares outstanding as of July 20, 2026 was "
+    + _ix_fact("dei:EntityCommonStockSharesOutstanding", "c-4", "24.3", "f-5", scale="9")
+    + " billion.</p><table>"
+    + f"<tr><td>Data center</td><td>$</td><td>{_ix_fact('us-gaap:Revenues', 'c-2', '81,615', 'f-seg')}</td></tr>"
+    + f"<tr><td>Revenue</td><td>$</td><td>{_ix_fact('us-gaap:Revenues', 'c-1', '81,615', 'f-1')}</td>"
+    + f"<td>$</td><td>{_ix_fact('us-gaap:Revenues', 'c-3', '160,000', 'f-2')}</td></tr>"
+    + "<tr><td>Net loss</td><td>$</td><td>("
+    + _ix_fact("us-gaap:NetIncomeLoss", "c-1", "1,234", "f-3", scale="3", extra=' sign="-"')
+    + ")</td></tr>"
+    + f"<tr><td>Diluted</td><td>$</td><td>{_ix_fact('us-gaap:EarningsPerShareDiluted', 'c-1', '1.08', 'f-6', scale='0')}"
+    + "</td></tr></table><p>Notes</p>"
+    + f"<table><tr><td>Total revenue</td><td>{_ix_fact('us-gaap:Revenues', 'c-1', '81,615', 'f-9')}</td></tr></table>"
+    + "</body></html>"
+)
+F4_ACC = "0001197647-26-000011"
+F4_DIR = "https://www.sec.gov/Archives/edgar/data/1045810/000119764726000011"
+F4_INDEX_HTML = (
+    f"<html><body><div>SEC Accession No. {F4_ACC}</div><table>"
+    '<tr><td>1</td><td><a href="/Archives/edgar/data/1045810/000119764726000011/xslF345X06/form4.xml">form4.html</a></td></tr>'
+    '<tr><td>1</td><td><a href="/Archives/edgar/data/1045810/000119764726000011/form4.xml">form4.xml</a></td></tr>'
+    "</table></body></html>"
+)
+F4_HTML = (
+    "<html><body><table>"
+    "<tr><td>Common</td><td>57,378</td><td>D</td></tr>"
+    "<tr><td>Common</td><td>10/07/2026</td><td>G</td><td>500,000</td><td>D</td><td>$0</td><td>23,671,360</td><td>I</td></tr>"
+    "</table></body></html>"
+)
+COMPANY_URL = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0000320193&owner=include&count=10"
+COMPANY_HTML = "<html><body><div>APPLE INC CIK#: 0000320193 (see all company filings)</div></body></html>"
+
+
+class _FakeSec:
+    """www.sec.gov stand-in: canned pages, every fetch recorded, unknown URLs fail like a network error."""
+
+    def __init__(self) -> None:
+        self.pages = {
+            OFF_INDEX: OFF_INDEX_HTML.encode(),
+            OFF_PRIMARY: OFF_PRIMARY_HTML.encode(),
+            f"{F4_DIR}/{F4_ACC}-index.htm": F4_INDEX_HTML.encode(),
+            f"{F4_DIR}/xslF345X06/form4.xml": F4_HTML.encode(),
+            COMPANY_URL: COMPANY_HTML.encode(),
+        }
+        self.calls: list[str] = []
+
+    def __call__(self, url: str) -> bytes:
+        self.calls.append(url)
+        if url not in self.pages:
+            raise OSError(f"fetch failed: {url}")
+        return self.pages[url]
+
+
+@pytest.fixture
+def sec_www(monkeypatch: pytest.MonkeyPatch) -> _FakeSec:
+    fake = _FakeSec()
+    monkeypatch.setattr(documents, "_sec_get", fake)
+    return fake
+
+
+def _official(tmp_path: Path, tool: str, row: dict[str, object], payload: dict[str, object] | None = None):
+    page = documents.resolve_sec_official(tool, row, payload or {}, root=tmp_path)
+    assert page is not None
+    payload_bytes = page["payload"]
+    assert isinstance(payload_bytes, bytes)
+    quote = page["quote"]
+    assert isinstance(quote, str) and quote
+    # The quote occurs in the same renderer output the viewer uses for its basis.
+    assert quote in documents._render_text(payload_bytes.decode("utf-8", "replace"))
+    assert page["sha256"] == hashlib.sha256(payload_bytes).hexdigest()
+    return page
+
+
+def test_official_xbrl_fact_anchor_and_row_quote(tmp_path: Path, sec_www: _FakeSec) -> None:
+    """Dimensional, hidden, YTD, and later duplicate facts all lose to the first visible statement row."""
+    row: dict[str, object] = {"concept": "us-gaap:Revenues", "value": 81615000000.0, "period_end": "2026-06-30"}
+    page = _official(tmp_path, "get_xbrl_facts", {**row, "accession": OFF_ACC}, {"cik": OFF_CIK})
+    assert (page["url"], page["media"], page["anchor"]) == (OFF_PRIMARY, "html", "f-1")
+    assert page["quote"] == "Revenue | $ | 81,615"
+
+
+def test_official_fact_scale_and_sign(tmp_path: Path, sec_www: _FakeSec) -> None:
+    loss: dict[str, object] = {"concept": "NetIncomeLoss", "period_end": "2026-06-30", "accession": OFF_ACC}
+    page = _official(tmp_path, "get_xbrl_facts", {**loss, "value": -1234000.0, "cik": OFF_CIK})
+    assert (page["anchor"], page["quote"]) == ("f-3", "Net loss | $ | (1,234)")
+    # The wrong sign matches no reported fact: the filing index page stays the official page.
+    unsigned = _official(tmp_path, "get_xbrl_facts", {**loss, "value": 1234000.0, "cik": OFF_CIK})
+    assert (unsigned["url"], unsigned["anchor"], unsigned["quote"]) == (OFF_INDEX, "", f"SEC Accession No. {OFF_ACC}")
+
+
+def test_official_eps_row_and_shares_envelope(tmp_path: Path, sec_www: _FakeSec) -> None:
+    eps: dict[str, object] = {
+        "fiscal_period": "Q2",
+        "eps_diluted": 1.08,
+        "period_end": "2026-06-30",
+        "accession": OFF_ACC,
+        "cik": OFF_CIK,
+    }
+    page = _official(tmp_path, "get_fundamentals", eps, {"metric": "eps"})
+    assert (page["anchor"], page["quote"]) == ("f-6", "Diluted | $ | 1.08")
+    envelope: dict[str, object] = {
+        "metric": "shares_outstanding",
+        "shares_outstanding": 24300000000.0,
+        "as_of": "2026-07-20",
+        "accession": OFF_ACC,
+        "cik": OFF_CIK,
+    }
+    shares = _official(tmp_path, "get_fundamentals", {}, envelope)
+    assert shares["anchor"] == "f-5"
+    assert shares["quote"] == "Shares outstanding as of July 20, 2026 was 24.3 billion."
+
+
+def test_official_filing_row_is_index_page_fetched_once(tmp_path: Path, sec_www: _FakeSec) -> None:
+    row: dict[str, object] = {"accession_no": OFF_ACC, "form": "10-Q", "filer_cik": OFF_CIK}
+    first = _official(tmp_path, "list_sec_filings", row)
+    second = _official(tmp_path, "list_sec_filings", row)
+    assert (first["url"], first["media"], first["quote"]) == (OFF_INDEX, "html", f"SEC Accession No. {OFF_ACC}")
+    assert second["payload"] == first["payload"]
+    assert sec_www.calls == [OFF_INDEX]  # the archived capture serves every later read
+    assert list((tmp_path / "raw" / "sec" / "official_page").iterdir())
+
+
+def test_official_insider_row_is_rendered_form_line(tmp_path: Path, sec_www: _FakeSec) -> None:
+    row: dict[str, object] = {
+        "accession_no": F4_ACC,
+        "issuer_cik": 1045810,
+        "transaction_date": "2026-10-07",
+        "shares": 500000.0,
+        "price": 0.0,
+        "holdings_after": 23671360.0,
+    }
+    page = _official(tmp_path, "get_insider_activity", row)
+    assert page["url"] == f"{F4_DIR}/xslF345X06/form4.xml"
+    assert page["quote"] == "Common | 10/07/2026 | G | 500,000 | D | $0 | 23,671,360 | I"
+
+
+def test_official_search_hit_is_matched_document(tmp_path: Path, sec_www: _FakeSec) -> None:
+    hit: dict[str, object] = {
+        "accession_no": OFF_ACC,
+        "filer_cik": OFF_CIK,
+        "query": '"TOTAL revenue"',
+        "snippet": None,
+    }
+    page = _official(tmp_path, "search_sec_filings", {**hit, "matched_document": "fake-10q.htm"})
+    assert (page["url"], page["quote"]) == (OFF_PRIMARY, "Total revenue")
+    # A document name that is not one plain file name never builds a URL.
+    unsafe = _official(tmp_path, "search_sec_filings", {**hit, "matched_document": "../x.htm"})
+    assert unsafe["url"] == OFF_INDEX
+
+
+def test_official_identity_gaps(tmp_path: Path, sec_www: _FakeSec) -> None:
+    assert documents.resolve_sec_official("get_valuation_metrics", {}, {"ticker": "AAPL"}, root=tmp_path) is None
+    assert sec_www.calls == []
+    # A CIK-only EPS/balance row carries a value the company page never states: no official page.
+    assert (
+        documents.resolve_sec_official(
+            "get_fundamentals",
+            {"eps_diluted": 1.08, "period_end": "2026-06-30"},
+            {"metric": "eps", "ticker": "AAPL", "cik": OFF_CIK},
+            root=tmp_path,
+        )
+        is None
+    )
+    assert sec_www.calls == []
+    company = _official(tmp_path, "get_fundamentals", {}, {"metric": "overview", "name": "APPLE INC", "cik": OFF_CIK})
+    assert (company["url"], company["quote"]) == (COMPANY_URL, "APPLE INC CIK#: 0000320193 (see all company filings)")
+    # No party CIK: the accession's filer-agent prefix CIK still names the accession directory.
+    with pytest.raises(OSError, match="fetch failed"):
+        documents.resolve_sec_official("get_material_events", {"source_accessions": [F4_ACC]}, {}, root=tmp_path)
+    assert sec_www.calls[-1] == f"https://www.sec.gov/Archives/edgar/data/1197647/000119764726000011/{F4_ACC}-index.htm"
