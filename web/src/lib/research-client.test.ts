@@ -12,6 +12,7 @@ function document(overrides: Partial<SourceDocument> = {}): SourceDocument {
     captureKind: "original",
     content: "Revenue grew.",
     quote: "Revenue grew.",
+    linkStatus: "missing",
     ...overrides,
   };
 }
@@ -69,9 +70,11 @@ describe("fetchSourceDocument", () => {
     };
     for (const body of [
       document({ representation: "html", captureKind: "provider_extraction" }),
-      document({ representation: "json", captureKind: "structured_record" }),
+      document({ linkStatus: "stockbot_render", originalUrl: "https://cdn.finra.org/equity/regsho/daily/CNMSshvol20260102.txt" }),
+      document({ linkStatus: "highlighted_original", originalUrl: "https://www.sec.gov/a.htm", highlightUrl: "https://www.sec.gov/a.htm#f-30:~:text=Revenue,81%2C615" }),
       document({ representation: "text", captureKind: "search_excerpt", ...metadata }),
-      { id, title: "10-K", representation: "pdf", captureKind: "original", quote: "Revenue grew.", pdfUrl: "/files/10-k.pdf", ...metadata },
+      document({ representation: "text", captureKind: "structured_record", content: '{\n  "symbolCode": "ACME"\n}', quote: "" }),
+      { id, title: "10-K", representation: "pdf", captureKind: "original", quote: "Revenue grew.", linkStatus: "missing", pdfUrl: "/files/10-k.pdf", ...metadata },
     ] satisfies SourceDocument[]) {
       respond(body);
       expect(await fetchSourceDocument(id)).toStrictEqual(body);
@@ -84,11 +87,9 @@ describe("fetchSourceDocument", () => {
       toolResultId: "rs:1:tr:7",
       dataset: "otcMarket/consolidatedShortInterest",
       knownAt: "2026-01-02",
-      upstreamUrl: "https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest",
-      publicUrl: "https://www.finra.org/x",
       toolArgs: { ticker: "ACME", filters: { limit: 5 } },
     };
-    const body = document({ representation: "json", captureKind: "structured_record", ...how });
+    const body = document(how);
     respond(body);
     expect(await fetchSourceDocument(id)).toStrictEqual(body);
     respond(document());
@@ -141,15 +142,41 @@ describe("fetchSourceDocument", () => {
       { ...document(), quote: 42 },
       { ...document(), representation: "markdown" },
       { ...document(), captureKind: "summary" },
-      { ...document(), representation: "pdf", captureKind: "structured_record" },
+      // JSON rows are never a representation; structured records are plain text.
+      { ...document(), representation: "json" },
       { ...document(), representation: "pdf", captureKind: "search_excerpt" },
-      ...["url", "publisher", "publishedAt", "capturedAt", "contentHash", "content", "matchingText", "pdfUrl", "toolName", "toolResultId", "dataset", "knownAt", "upstreamUrl", "publicUrl"].map((key) => ({
+      ...["url", "publisher", "publishedAt", "capturedAt", "contentHash", "content", "matchingText", "pdfUrl", "toolName", "toolResultId", "dataset", "knownAt", "originalUrl", "highlightUrl"].map((key) => ({
         ...document(),
         [key]: 42,
       })),
       ...[null, [], "query=ACME", 5].map((toolArgs) => ({ ...document(), toolArgs })),
     ]) {
       respond(body);
+      await expect(fetchSourceDocument(id)).rejects.toThrow();
+    }
+  });
+
+  test("rejects link fields that do not match their status or are not safe web URLs", async () => {
+    const page = "https://www.sec.gov/a.htm";
+    const highlight = `${page}#:~:text=Revenue`;
+    for (const links of [
+      { linkStatus: undefined },
+      { linkStatus: "public_page" },
+      { linkStatus: "stockbot_render", originalUrl: page, captureKind: "structured_record" },
+      { linkStatus: "highlighted_original", originalUrl: page, highlightUrl: highlight, captureKind: "structured_record" },
+      { linkStatus: "missing", originalUrl: page },
+      { linkStatus: "missing", highlightUrl: highlight },
+      { linkStatus: "stockbot_render" },
+      { linkStatus: "stockbot_render", originalUrl: page, highlightUrl: highlight },
+      { linkStatus: "stockbot_render", originalUrl: highlight },
+      { linkStatus: "highlighted_original", originalUrl: page },
+      { linkStatus: "highlighted_original", highlightUrl: highlight },
+      ...["javascript:alert(1)", "https://user:secret@www.sec.gov/a.htm", "file:///etc/passwd", "not a url"].flatMap((unsafe) => [
+        { linkStatus: "stockbot_render", originalUrl: unsafe },
+        { linkStatus: "highlighted_original", originalUrl: page, highlightUrl: unsafe },
+      ]),
+    ]) {
+      respond({ ...document(), ...links });
       await expect(fetchSourceDocument(id)).rejects.toThrow();
     }
   });
@@ -163,6 +190,7 @@ describe("fetchSourceDocument", () => {
     const cases: [unknown, string][] = [
       [{ ...document(), id: "other", url: 42, location: null }, "The source response is invalid."],
       [{ ...document(), url: 42, location: null }, "The source metadata is invalid."],
+      [{ ...document(), linkStatus: "stockbot_render", content: undefined, location: null }, "The source links are invalid."],
       [{ ...document(), content: undefined, location: null }, "The captured source content is missing."],
       [{ ...document(), location: null }, "The source location is invalid."],
       [{ ...document(), representation: "pdf", captureKind: "provider_extraction", content: undefined, location: null }, "The PDF does not identify an original capture."],

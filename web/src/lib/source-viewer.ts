@@ -107,23 +107,6 @@ export function sanitizeSourceHtml(sourceWindow: WindowLike, html: string): Docu
   });
 }
 
-export function originalSourceUrl(source: SourceDocument, resolved: boolean): string | undefined {
-  const safe = safeSourceUrl(source.url);
-  if (!safe) return undefined;
-  if (!resolved || source.representation !== "html") return safe;
-  const quote = source.quote.trim().replace(/\s+/gu, " ");
-  if (!quote) return safe;
-  const encode = (text: string) => encodeURIComponent(text).replace(/-/gu, "%2D");
-  let directive: string;
-  if ((quote.length > 80 && quote.split(" ").length > 10) || /[\r\n\u2028\u2029]/u.test(source.quote)) {
-    const lines = source.quote.split(/[\r\n\u2028\u2029]/u).map((line) => line.trim()).filter(Boolean);
-    const start = lines[0].split(/\s+/u).slice(0, 5).join(" ");
-    const end = lines[lines.length - 1].split(/\s+/u).slice(-5).join(" ");
-    directive = `${encode(start)},${encode(end)}`;
-  } else directive = encode(quote);
-  return `${safe}${safe.includes("#") ? "" : "#"}:~:text=${directive}`;
-}
-
 export function tagFragmentAnchors(fragment: DocumentFragment): void {
   for (const anchor of fragment.querySelectorAll("a")) {
     const href = safeSourceUrl(anchor.getAttribute("href") ?? undefined);
@@ -404,60 +387,21 @@ export function activateQuote(root: HTMLElement, marks: HTMLElement[]): void {
   marks[0]?.scrollIntoView?.({ behavior: "smooth", block: "center" });
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-// A structured record's quote is the cited row as JSON; anything else is not a row.
-function quotedRow(source: SourceDocument): Record<string, unknown> | undefined {
-  try {
-    const row: unknown = JSON.parse(source.quote);
-    return isRecord(row) ? row : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-// ponytail: fixed SEC/FINRA row keys, extend the lists when a new tool names its fields differently.
-const ROW_LABEL_KEYS = [
-  ["form", "dataset"],
-  ["filer_name", "subject_name", "symbol", "symbolCode", "issueSymbolIdentifier"],
-  ["filed_at", "date", "settlementDate", "tradeReportDate"],
-];
-
-// Readable "publisher · title · date" label. Structured records name the cited row instead of a title.
-// Returns "" when the document names nothing; callers pick their own fallback.
+// Readable "publisher · title · date" label. Returns "" when the document names nothing; callers pick their own fallback.
 export function sourceLabel(source: SourceDocument): string {
-  const row = source.captureKind === "structured_record" ? quotedRow(source) : undefined;
-  const parts = row
-    ? ROW_LABEL_KEYS.map((keys, index) => keys.map((key) => row[key]).find((value) => typeof value === "string" || typeof value === "number") ?? (index === 0 ? source.dataset : undefined))
-    : [source.title, (source.publishedAt || source.knownAt)?.slice(0, 10)];
-  return [...new Set([source.publisher, ...parts].filter((part) => part !== undefined && part !== "").map(String))].join(" · ");
+  const parts = [source.publisher, source.title, (source.publishedAt || source.knownAt)?.slice(0, 10)];
+  return [...new Set(parts.filter((part) => part !== undefined && part !== ""))].join(" · ");
 }
 
-export type RecordTable = { columns: string[]; rows: Record<string, unknown>[]; cited: number };
+export type OriginalLink = { href: string; host: string; highlighted: boolean };
 
-// Whitespace-free JSON with sorted keys: the kernel may collapse whitespace inside the cited row.
-function canonicalRow(row: Record<string, unknown>): string {
-  const sorted = (_key: string, value: unknown) => isRecord(value) ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : value;
-  return JSON.stringify(row, sorted).replace(/\s/gu, "");
-}
-
-// ponytail: only top-level arrays of objects count as rows; nested row lists render as cell JSON.
-// The table holds the list that contains the cited row, else the first list. cited is -1 when no row matches.
-export function recordTable(source: SourceDocument): RecordTable | null {
-  if (source.representation !== "json") return null;
-  let payload: unknown;
-  try {
-    payload = JSON.parse(source.content ?? "");
-  } catch {
-    return null;
-  }
-  if (!isRecord(payload)) return null;
-  const quoted = quotedRow(source);
-  const key = quoted ? canonicalRow(quoted) : undefined;
-  const lists = Object.values(payload).filter((value): value is Record<string, unknown>[] => Array.isArray(value) && value.length > 0 && value.every(isRecord));
-  const rows = lists.find((list) => list.some((row) => canonicalRow(row) === key)) ?? lists[0];
-  if (!rows) return null;
-  return { columns: [...new Set(rows.flatMap((row) => Object.keys(row)))], rows, cited: key ? rows.findIndex((row) => canonicalRow(row) === key) : -1 };
+// The official page link for a loaded source: the highlighted page when the backend verified a fragment, else the plain page.
+// fetchSourceDocument already checked both URLs with safeSourceUrl. A missing official page has no link.
+export function originalLink(source: Pick<SourceDocument, "linkStatus" | "originalUrl" | "highlightUrl">): OriginalLink | undefined {
+  const highlighted = source.linkStatus === "highlighted_original";
+  const href = highlighted ? source.highlightUrl : source.linkStatus === "stockbot_render" ? source.originalUrl : undefined;
+  if (!href) return undefined;
+  const hostname = new URL(href).hostname;
+  const host = hostname === "www.sec.gov" || hostname === "sec.gov" ? "SEC.gov" : hostname === "finra.org" || hostname.endsWith(".finra.org") ? "FINRA.org" : hostname;
+  return { href, host, highlighted };
 }

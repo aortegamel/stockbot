@@ -130,7 +130,7 @@ describe("source DOM rendering", () => {
   });
 
   function capture(html: string, text: string, quote: string, location?: SourceDocument["location"]): SourceDocument {
-    return { id: "evidence:sec:mapped", title: "10-K", representation: "html", captureKind: "original", content: html, matchingText: text, quote, location };
+    return { id: "evidence:sec:mapped", title: "10-K", representation: "html", captureKind: "original", content: html, matchingText: text, quote, location, linkStatus: "missing" };
   }
 
   test("synthetic separators highlight source cells without changing their layout", () => {

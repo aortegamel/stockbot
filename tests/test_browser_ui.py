@@ -44,6 +44,7 @@ SOURCE: dict[str, object] = {
     "captureKind": "original",
     "quote": "Revenue grew",
     "content": "\n".join("Revenue grew in the fixture year." if i == 5 else f"Capture line {i}" for i in range(1, 201)),
+    "linkStatus": "stockbot_render",
 }
 METRICS: dict[str, object] = {
     "totalMs": 1,
@@ -256,7 +257,8 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
             if url.path.startswith("/api/workspaces/"):
                 bodies[url.path] = {"sym": url.path.rsplit("/", 1)[-1], "widgets": [], "updated_at": None}
             if url.path == f"/api/research/sources/{quote(SOURCE_ID, safe='')}":
-                bodies[url.path] = {**SOURCE, "url": f"http://127.0.0.1:{port}{FIXTURE_SOURCE_PATH}"}
+                fixture = f"http://127.0.0.1:{port}{FIXTURE_SOURCE_PATH}"
+                bodies[url.path] = {**SOURCE, "url": fixture, "originalUrl": fixture}
             if url.path == "/api/portfolio":
                 self.send_response(404)
                 self.send_header("Content-Type", "application/json")
@@ -686,7 +688,7 @@ def test_chat_citation_opens_source_page_in_new_tab(browser: webdriver.Chrome, l
     browser.switch_to.window((set(browser.window_handles) - tabs_before).pop())
     try:
         wait.until(EC.text_to_be_present_in_element((By.CSS_SELECTOR, "article"), "How we got this"))
-        open_original = browser.find_element(By.LINK_TEXT, "Open original")
+        open_original = browser.find_element(By.PARTIAL_LINK_TEXT, "Original on")
         assert FIXTURE_SOURCE_PATH in (open_original.get_attribute("href") or "")
         page_tab = browser.current_window_handle
         before_original = set(browser.window_handles)

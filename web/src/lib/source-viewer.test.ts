@@ -1,21 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
-import { originalSourceUrl, resolveQuote } from "./source-viewer";
+import { originalLink, resolveQuote } from "./source-viewer";
 import { safeSourceUrl } from "../../../needle-harness/lib/agent/types";
-import type { SourceDocument } from "./research-client";
-
-function document(overrides: Partial<SourceDocument> = {}): SourceDocument {
-  return {
-    id: "evidence:sec:10-k",
-    title: "10-K",
-    url: "https://www.sec.gov/Archives/edgar/data/1/0001-10-k.htm",
-    representation: "html",
-    captureKind: "original",
-    content: "<p>Revenue grew.</p>",
-    quote: "Revenue grew.",
-    ...overrides,
-  };
-}
 
 describe("resolveQuote", () => {
   test("unique whitespace-insensitive match resolves at original offsets", () => {
@@ -114,19 +100,6 @@ describe("source URLs", () => {
     expect(safeSourceUrl(undefined)).toBeUndefined();
   });
 
-  test("resolved HTML quotes add a text fragment inside Open original", () => {
-    const url = originalSourceUrl(document({ quote: "Revenue grew" }), true);
-    expect(url).toBe(`${document().url}#:~:text=Revenue%20grew`);
-    expect(url?.startsWith("https://www.sec.gov/")).toBe(true);
-  });
-
-  test("unresolved quotes keep a plain safe link", () => {
-    const source = document({ quote: "Revenue grew" });
-    const url = originalSourceUrl(source, false);
-    expect(url).toBe(source.url);
-    expect(url).not.toContain(":~:text=");
-  });
-
   test("only http and https URLs without credentials are safe", () => {
     expect(safeSourceUrl("http://www.sec.gov/filing")).toBe("http://www.sec.gov/filing");
     expect(safeSourceUrl("ftp://www.sec.gov/filing")).toBeUndefined();
@@ -137,65 +110,6 @@ describe("source URLs", () => {
     expect(safeSourceUrl("https://:secret@example.com/")).toBeUndefined();
   });
 
-  test("text fragments collapse single-line whitespace and preserve an existing anchor", () => {
-    const source = document({ quote: "  Revenue \t  grew  " });
-    expect(originalSourceUrl(source, true)).toBe(`${source.url}#:~:text=Revenue%20grew`);
-    const anchored = document({ url: "https://www.sec.gov/a.htm#item7", quote: "Revenue grew" });
-    expect(originalSourceUrl(anchored, true)).toBe("https://www.sec.gov/a.htm#item7:~:text=Revenue%20grew");
-  });
-
-  test("multiline quotes select the first and last five words from nonempty lines", () => {
-    const source = document({ quote: "\n \r\nYear-over-year revenue, profit & cash rose sharply.\r\n\nCosts decreased.\nThe board expects steady growth, margins & buy-backs.\n " });
-    expect(originalSourceUrl(source, true)).toBe(`${source.url}#:~:text=Year%2Dover%2Dyear%20revenue%2C%20profit%20%26%20cash,steady%20growth%2C%20margins%20%26%20buy%2Dbacks.`);
-  });
-
-  test("short multiline quotes still use a range", () => {
-    const source = document({ quote: "Revenue\n grew" });
-    expect(originalSourceUrl(source, true)).toBe(`${source.url}#:~:text=Revenue,grew`);
-  });
-
-  test("single-line quotes above ten words use a range only above 80 normalized characters", () => {
-    const quote = `Alpha beta gamma delta ${"x".repeat(25)} epsilon zeta eta theta nu omega`;
-    expect(quote.length).toBe(80);
-    expect(originalSourceUrl(document({ quote }), true)).toBe(`${document().url}#:~:text=${encodeURIComponent(quote)}`);
-    const long = `${quote}!`;
-    expect(originalSourceUrl(document({ quote: long }), true)).toBe(`${document().url}#:~:text=Alpha%20beta%20gamma%20delta%20${"x".repeat(25)},zeta%20eta%20theta%20nu%20omega!`);
-    expect(originalSourceUrl(document({ quote: quote.replaceAll(" ", "   ") }), true)).toBe(`${document().url}#:~:text=${encodeURIComponent(quote)}`);
-  });
-
-  test.each([1, 5, 9, 10])("single-line quotes with %i long words use one full encoded fragment", (wordCount) => {
-    const quote = Array(wordCount).fill("long-word,&".repeat(9)).join(" ");
-    expect(quote.length).toBeGreaterThan(80);
-    const expected = `${document().url}#:~:text=${encodeURIComponent(quote).replace(/-/gu, "%2D")}`;
-    expect(originalSourceUrl(document({ quote }), true)).toBe(expected);
-    expect(originalSourceUrl(document({ quote: `  ${quote.replaceAll(" ", " \t ")}  ` }), true)).toBe(expected);
-  });
-
-  test("fragment components encode directive separators inside a short quote", () => {
-    const source = document({ quote: "Profit-margin, R&D" });
-    expect(originalSourceUrl(source, true)).toBe(`${source.url}#:~:text=Profit%2Dmargin%2C%20R%26D`);
-  });
-
-  test("range components preserve words without creating extra fragment directives", () => {
-    const words = fc.array(fc.constantFrom("net-income", "R&D", "revenue,", "margin", "growth"), { minLength: 1, maxLength: 10 });
-    fc.assert(fc.property(words, words, (first, last) => {
-      const quote = `${first.join(" ")}\n${last.join(" ")}`;
-      const directive = originalSourceUrl(document({ quote }), true)?.split(":~:text=")[1] ?? "";
-      const components = directive.split(",");
-      expect(components).toHaveLength(2);
-      expect(components.every((component) => !/[-&]/u.test(component))).toBe(true);
-      expect(components.map(decodeURIComponent)).toEqual([first.slice(0, 5).join(" "), last.slice(-5).join(" ")]);
-    }), { seed: 20261018, numRuns: 100 });
-  });
-
-  test("text fragments apply only to safe HTML sources with a quote", () => {
-    const pdf = document({ representation: "pdf", quote: "Revenue grew" });
-    expect(originalSourceUrl(pdf, true)).toBe(pdf.url);
-    const blank = document({ quote: "   " });
-    expect(originalSourceUrl(blank, true)).toBe(blank.url);
-    expect(originalSourceUrl(document({ url: "javascript:alert(1)" }), true)).toBeUndefined();
-  });
-
   test("unparseable, hostless, and non-web URLs are dropped", () => {
     for (const value of ["https://", "not a url at all", "//www.sec.gov/filing", "file:///etc/passwd"]) {
       expect(safeSourceUrl(value)).toBeUndefined();
@@ -204,5 +118,31 @@ describe("source URLs", () => {
     expect(safeSourceUrl("https://www.sec.gov:8443/filing")).toBe("https://www.sec.gov:8443/filing");
     // A third slash parses "filing" as the host, so the URL survives and normalizes.
     expect(safeSourceUrl("https:///filing")).toBe("https://filing/");
+  });
+});
+
+describe("originalLink", () => {
+  const page = "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm";
+  const highlight = `${page}#f-30:~:text=Revenue,81%2C615`;
+
+  test("a highlighted original links the backend-verified fragment", () => {
+    expect(originalLink({ linkStatus: "highlighted_original", originalUrl: page, highlightUrl: highlight })).toEqual({ href: highlight, host: "SEC.gov", highlighted: true });
+  });
+
+  test("a Stockbot render links the plain official page without a fragment", () => {
+    const link = originalLink({ linkStatus: "stockbot_render", originalUrl: page });
+    expect(link).toEqual({ href: page, host: "SEC.gov", highlighted: false });
+    expect(link?.href).not.toContain("#:~:");
+  });
+
+  test("a missing official page has no link", () => {
+    expect(originalLink({ linkStatus: "missing" })).toBeUndefined();
+  });
+
+  test("hosts read as SEC.gov, FINRA.org, or the hostname", () => {
+    const host = (url: string) => originalLink({ linkStatus: "stockbot_render", originalUrl: url })?.host;
+    expect(host("https://cdn.finra.org/equity/regsho/daily/CNMSshvol20260102.txt")).toBe("FINRA.org");
+    expect(host("https://finra.org/rules")).toBe("FINRA.org");
+    expect(host("https://news.example/article")).toBe("news.example");
   });
 });

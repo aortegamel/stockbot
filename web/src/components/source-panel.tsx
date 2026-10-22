@@ -1,17 +1,16 @@
 import type { WindowLike } from "dompurify";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { fetchSourceDocument } from "../lib/research-client";
 import type { SourceDocument } from "../lib/research-client";
-import { activateQuote, highlightMappedQuote, mapSourceHtml, markQuote, originalSourceUrl, recordTable, resolveQuote, sanitizeSourceHtml, sourceLabel, tagFragmentAnchors } from "../lib/source-viewer";
-import { safeSourceUrl } from "../../../needle-harness/lib/agent/types";
-import type { QuoteResolution, RecordTable } from "../lib/source-viewer";
+import { activateQuote, highlightMappedQuote, mapSourceHtml, markQuote, originalLink, resolveQuote, sanitizeSourceHtml, sourceLabel, tagFragmentAnchors } from "../lib/source-viewer";
+import type { QuoteResolution } from "../lib/source-viewer";
 
 const SourcePdf = lazy(() => import("./source-pdf"));
 
 const CAPTURE_LABELS: Record<SourceDocument["captureKind"], string> = {
   original: "Original document",
   provider_extraction: "Provider extraction — not the original document",
-  structured_record: "Structured record",
+  structured_record: "Structured record — no official page",
   search_excerpt: "Search excerpt only",
 };
 
@@ -107,19 +106,21 @@ function useSourceHighlight(content: React.RefObject<HTMLDivElement | null>, sou
 
 const NOT_RECORDED = "Not recorded";
 
-function SourceHeader({ source, original }: { source: SourceDocument; original: string | undefined }) {
-  const upstream = safeSourceUrl(source.upstreamUrl);
+// This page is the Stockbot view. The one external link opens the official page; a missing official page shows none.
+function SourceHeader({ source }: { source: SourceDocument }) {
+  const original = originalLink(source);
   return (<>
     <h1 className="mt-1 text-base font-semibold">{sourceLabel(source) || source.title}</h1>
     <p className="mt-1 text-amber-200">{CAPTURE_LABELS[source.captureKind]}</p>
+    {original && <p className="mt-1"><a className="text-blue-300 underline" href={original.href} target="_blank" rel="noopener noreferrer">
+      {original.highlighted ? `Open on ${original.host} (highlighted) ↗` : `Original on ${original.host} ↗`}
+    </a></p>}
     <h2 className="mt-3 text-sm font-semibold">How we got this</h2>
     <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs text-zinc-400">
       <dt>Source</dt><dd>{source.publisher || NOT_RECORDED}</dd>
       <dt>Published</dt><dd>{source.publishedAt || NOT_RECORDED}</dd>
       <dt>Tool</dt><dd className="font-mono">{source.toolName || NOT_RECORDED}</dd>
       <dt>Arguments</dt><dd>{source.toolArgs ? <pre className="whitespace-pre-wrap font-mono">{JSON.stringify(source.toolArgs, null, 2)}</pre> : NOT_RECORDED}</dd>
-      <dt>Upstream API</dt><dd className="break-all">{upstream ? <a className="text-blue-300 underline" href={upstream} target="_blank" rel="noopener noreferrer">{upstream}</a> : NOT_RECORDED}</dd>
-      <dt>Public page</dt><dd>{original ? <a className="text-blue-300 underline" href={original} target="_blank" rel="noopener noreferrer">Open original</a> : NOT_RECORDED}</dd>
       <dt>Retrieved</dt><dd>{source.capturedAt || NOT_RECORDED}</dd>
       <dt>Known at</dt><dd>{source.knownAt || NOT_RECORDED}</dd>
       <dt>Content hash</dt><dd className="break-all font-mono">{source.contentHash || NOT_RECORDED}</dd>
@@ -136,32 +137,6 @@ function SourceQuote({ quote, resolution }: { quote: string; resolution: QuoteRe
   </>);
 }
 
-function cellText(value: unknown): string {
-  if (value === null || value === undefined) return "";
-  return typeof value === "object" ? JSON.stringify(value) : String(value);
-}
-
-// A structured record reads as a table. The cited row carries the citation highlight instead of a raw JSON quote.
-function RecordRows({ table, root, marks }: { table: RecordTable; root: React.RefObject<HTMLDivElement | null>; marks: React.RefObject<HTMLElement[]> }) {
-  const cited = useRef<HTMLTableRowElement>(null);
-  useEffect(() => {
-    marks.current = cited.current ? [cited.current] : [];
-    if (root.current && cited.current) activateQuote(root.current, marks.current);
-  }, [table, root, marks]);
-  return (
-    <div ref={root} aria-label="Captured source content" className="source-html max-h-[65vh] overflow-auto rounded bg-white p-4 text-sm text-zinc-900">
-      <table>
-        <thead><tr>{table.columns.map((column) => <th key={column} scope="col">{column}</th>)}</tr></thead>
-        <tbody>{table.rows.map((row, index) => (
-          <tr key={index} ref={index === table.cited ? cited : undefined} aria-current={index === table.cited ? "true" : undefined}>
-            {table.columns.map((column) => <td key={column}>{cellText(row[column])}</td>)}
-          </tr>
-        ))}</tbody>
-      </table>
-    </div>
-  );
-}
-
 function CapturedSource({ source, painted, pdfResolution, content, marks, onPdfResolve }: {
   source: SourceDocument;
   painted: PaintedQuote | null;
@@ -170,30 +145,17 @@ function CapturedSource({ source, painted, pdfResolution, content, marks, onPdfR
   marks: React.RefObject<HTMLElement[]>;
   onPdfResolve: React.Dispatch<React.SetStateAction<QuoteResolution | null>>;
 }) {
-  const table = useMemo(() => recordTable(source), [source]);
-  const tableRoot = useRef<HTMLDivElement>(null);
-  const status: QuoteResolution | null = table
-    ? table.cited >= 0 ? { status: "resolved", start: table.cited, end: table.cited + 1 } : { status: "unresolved" }
-    : source.representation === "pdf" ? pdfResolution : painted?.resolution ?? null;
-  // Display and Open original use the quote that the passage resolved against. PDF never paints here.
+  const status: QuoteResolution | null = source.representation === "pdf" ? pdfResolution : painted?.resolution ?? null;
+  // The display uses the quote that the passage resolved against. PDF never paints here.
   const quote = painted?.quote ?? source.quote ?? "";
-  // FINRA records have no public page; their url names the API, which the Upstream API row shows.
-  const publicUrl = source.publicUrl ?? (source.captureKind === "structured_record" ? undefined : source.url);
-  // A structured SEC row links its filing index page; the accession number is the text that page shows for the row.
-  const accession = table && table.cited >= 0 ? cellText(table.rows[table.cited].accession_no) : "";
-  const original = accession
-    ? originalSourceUrl({ ...source, url: publicUrl, representation: "html", quote: accession }, true)
-    : originalSourceUrl({ ...source, url: publicUrl, quote }, status?.status === "resolved");
   return (<>
-    <SourceHeader source={source} original={original} />
-    <SourceQuote quote={table ? "" : quote} resolution={status} />
+    <SourceHeader source={source} />
+    <SourceQuote quote={quote} resolution={status} />
     {status?.status === "resolved" && source.representation !== "pdf" && <button type="button" className="source-control mb-2" onClick={() => {
-      const root = content.current ?? tableRoot.current;
-      if (root) activateQuote(root, marks.current);
+      if (content.current) activateQuote(content.current, marks.current);
     }}>Go to quote</button>}
-    {table ? <RecordRows table={table} root={tableRoot} marks={marks} />
-      : source.representation === "pdf" ? <Suspense fallback={<p role="status">Loading the PDF renderer…</p>}><SourcePdf source={source} onResolve={onPdfResolve} /></Suspense>
-        : <div ref={content} aria-label="Captured source content" className={`max-h-[65vh] overflow-auto rounded bg-white p-4 text-sm text-zinc-900 ${source.representation === "html" ? "source-html" : "whitespace-pre-wrap font-mono"}`} />}
+    {source.representation === "pdf" ? <Suspense fallback={<p role="status">Loading the PDF renderer…</p>}><SourcePdf source={source} onResolve={onPdfResolve} /></Suspense>
+      : <div ref={content} aria-label="Captured source content" className={`max-h-[65vh] overflow-auto rounded bg-white p-4 text-sm text-zinc-900 ${source.representation === "html" ? "source-html" : "whitespace-pre-wrap font-mono"}`} />}
     <p className="mt-2 text-xs text-zinc-400">This page shows the immutable capture. The original link can show a newer document.</p>
   </>);
 }

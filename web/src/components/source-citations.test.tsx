@@ -55,7 +55,7 @@ describe("AgentConsole source citations", () => {
       { type: "done", metrics: metrics() },
     ];
     const out = renderToStaticMarkup(<AgentConsole events={events} reasoning={true} debug={false} />);
-    expect(out).toContain(`<span class="text-xs text-zinc-500">Sources:</span><a href="${SEC_HREF}" target="_blank" rel="noopener noreferrer"`);
+    expect(out).toContain(`<span class="text-xs text-zinc-500">Sources:</span><span class="flex items-center gap-2 rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-300"><span>10-K</span><a href="${SEC_HREF}" target="_blank" rel="noopener noreferrer" class="text-blue-300 underline">View in Stockbot</a></span>`);
     expect(out.match(/aria-label="Captured sources"[\s\S]*?<\/div>/)?.[0].match(/<a /g)).toHaveLength(1);
     expect(out).toContain("<span>[2]</span>");
     expect(out.match(/aria-label="Open source:/g)).toHaveLength(1);

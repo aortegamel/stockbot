@@ -117,6 +117,8 @@ const PDF: SourceDocument = {
   representation: "pdf",
   captureKind: "original",
   quote: "quoted",
+  linkStatus: "stockbot_render",
+  originalUrl: "https://www.sec.gov/Archives/edgar/data/1/notice.pdf",
 };
 
 describe("SourcePdf", () => {

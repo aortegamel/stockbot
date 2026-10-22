@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { FINAL_PERSONAS, type AgentEvent, type Evidence, type FinalClaim, type SourceReference } from "../../../needle-harness/lib/agent/types";
 import { fetchSourceDocument } from "../lib/research-client";
 import { routeHash } from "../lib/route";
-import { sourceLabel } from "../lib/source-viewer";
+import { originalLink, sourceLabel, type OriginalLink } from "../lib/source-viewer";
 import { ActionCards, TrioCard, type WidgetOutcomes } from "./action-cards";
 import { AgentEventView, WorkRow } from "./agent-event";
 import { Toasts } from "./toasts";
@@ -59,11 +59,13 @@ function evidenceById(events: AgentEvent[]): Map<string, Evidence> {
   return new Map(evidence.map((entry) => [entry.id, entry]));
 }
 
-// Readable labels read once from each captured document. A failed read keeps the caller's fallback label.
-function useSourceLabels(references: SourceReference[]): Map<string, string> {
+type LoadedSource = { label: string; link: OriginalLink | undefined };
+
+// Readable labels and official page links read once from each captured document. A failed read keeps the caller's fallback label and no official link.
+function useLoadedSources(references: SourceReference[]): Map<string, LoadedSource> {
   const requested = useRef(new Set<string>());
   const mounted = useRef(false);
-  const [labels, setLabels] = useState(new Map<string, string>());
+  const [loaded, setLoaded] = useState(new Map<string, LoadedSource>());
   const ids = JSON.stringify([...new Set(references.map((reference) => reference.id))]);
   useEffect(() => {
     mounted.current = true;
@@ -74,12 +76,11 @@ function useSourceLabels(references: SourceReference[]): Map<string, string> {
       if (requested.current.has(id)) continue;
       requested.current.add(id);
       void fetchSourceDocument(id).then((source) => {
-        const label = sourceLabel(source);
-        if (label && mounted.current) setLabels((current) => new Map(current).set(id, label));
+        if (mounted.current) setLoaded((current) => new Map(current).set(id, { label: sourceLabel(source), link: originalLink(source) }));
       }, () => undefined);
     }
   }, [ids]);
-  return labels;
+  return loaded;
 }
 
 // Each listed source once, in evidence order, with the evidence row that cites it.
@@ -129,9 +130,9 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
   const answer = events.filter((e) => e.type === "answer_delta").map((e) => e.text).join("");
   const parts = splitAnswer(answer, known, events.findLast((e) => e.type === "claims")?.claims ?? []);
   const cited = parts.flatMap((part) => part.citation?.sources?.slice(0, 1) ?? []);
-  const labels = useSourceLabels([...cited, ...links.map((link) => link.reference)]);
+  const loaded = useLoadedSources([...cited, ...links.map((link) => link.reference)]);
   const labelOf = (reference: SourceReference, evidence: Evidence, index: number): string =>
-    labels.get(reference.id) ?? evidence.title ?? reference.title ?? `${evidence.source.toUpperCase() || "Source"} ${index}`;
+    loaded.get(reference.id)?.label || evidence.title || reference.title || `${evidence.source.toUpperCase() || "Source"} ${index}`;
   if (events.length === 0) {
     return (
       <div className="flex-1 space-y-3 overflow-y-auto p-3 text-sm">
@@ -191,11 +192,16 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
       <ActionCards events={events} />
       {links.length > 0 && <div className="flex flex-wrap items-center gap-2 pt-2" role="group" aria-label="Captured sources">
         <span className="text-xs text-zinc-500">Sources:</span>
-        {links.map(({ reference, evidence }, index) => (
-          <a key={reference.id} href={routeHash({ page: "source", id: reference.id })} target="_blank" rel="noopener noreferrer" className="rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:border-zinc-400">
-            {labelOf(reference, evidence, index + 1)}
-          </a>
-        ))}
+        {links.map(({ reference, evidence }, index) => {
+          const link = loaded.get(reference.id)?.link;
+          return (
+            <span key={reference.id} className="flex items-center gap-2 rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-300">
+              <span>{labelOf(reference, evidence, index + 1)}</span>
+              <a href={routeHash({ page: "source", id: reference.id })} target="_blank" rel="noopener noreferrer" className="text-blue-300 underline">View in Stockbot</a>
+              {link && <a href={link.href} target="_blank" rel="noopener noreferrer" className="text-blue-300 underline">{link.highlighted ? `Open on ${link.host} ↗` : `Original on ${link.host} ↗`}</a>}
+            </span>
+          );
+        })}
       </div>}
       {tail.map((e, i) => (
         <AgentEventView key={`tail-${i}`} event={e} debug={debug} onRetry={onRetry} />

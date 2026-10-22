@@ -1,6 +1,8 @@
 // Backend-state reads: research snapshot + journal tail for the terminal.
 // Snapshot restores state on reload; journal polls for logs; live work streams
 // over POST /api/agent SSE. No mock chat or positions here.
+import { safeSourceUrl } from "../../../needle-harness/lib/agent/types";
+
 export type ResearchSnapshot = {
   session?: { session_id?: string; status?: string; query?: string; objective?: string; updated_at?: string };
   jobs?: { job_id?: string; job_type?: string; status?: string; owner?: string }[];
@@ -33,7 +35,8 @@ export type SourceDocument = {
   publishedAt?: string;
   capturedAt?: string;
   contentHash?: string;
-  representation: "html" | "text" | "json" | "pdf";
+  representation: "html" | "text" | "pdf";
+  // structured_record: the held SEC/FINRA data as JSON text, only when no official page exists (linkStatus "missing").
   captureKind: "original" | "provider_extraction" | "structured_record" | "search_excerpt";
   content?: string;
   matchingText?: string;
@@ -45,14 +48,17 @@ export type SourceDocument = {
   toolResultId?: string;
   dataset?: string;
   knownAt?: string;
-  upstreamUrl?: string;
-  publicUrl?: string;
   toolArgs?: Record<string, unknown>;
+  // The official human page. highlightUrl carries a backend-verified text fragment; originalUrl never does.
+  linkStatus: "highlighted_original" | "stockbot_render" | "missing";
+  originalUrl?: string;
+  highlightUrl?: string;
 };
 
-const SOURCE_REPRESENTATIONS: SourceDocument["representation"][] = ["html", "text", "json", "pdf"];
+const SOURCE_REPRESENTATIONS: SourceDocument["representation"][] = ["html", "text", "pdf"];
 const CAPTURE_KINDS: SourceDocument["captureKind"][] = ["original", "provider_extraction", "structured_record", "search_excerpt"];
-const OPTIONAL_TEXT_KEYS = ["url", "publisher", "publishedAt", "capturedAt", "contentHash", "content", "matchingText", "pdfUrl", "toolName", "toolResultId", "dataset", "knownAt", "upstreamUrl", "publicUrl"] as const;
+const LINK_STATUSES: SourceDocument["linkStatus"][] = ["highlighted_original", "stockbot_render", "missing"];
+const OPTIONAL_TEXT_KEYS = ["url", "publisher", "publishedAt", "capturedAt", "contentHash", "content", "matchingText", "pdfUrl", "toolName", "toolResultId", "dataset", "knownAt", "originalUrl", "highlightUrl"] as const;
 const LOCATION_TEXT_KEYS = ["basis", "prefix", "suffix"] as const;
 
 function fieldOf(record: object, key: string): unknown {
@@ -140,9 +146,11 @@ export async function listSessions(limit = 20, signal?: AbortSignal): Promise<{ 
 function sourceIdentity(source: object, sourceId: string): SourceDocument {
   const representation = fieldOf(source, "representation");
   const captureKind = fieldOf(source, "captureKind");
+  const linkStatus = fieldOf(source, "linkStatus");
   if (fieldOf(source, "id") !== sourceId || typeof fieldOf(source, "title") !== "string" || typeof fieldOf(source, "quote") !== "string" ||
     !SOURCE_REPRESENTATIONS.some((value) => value === representation) ||
-    !CAPTURE_KINDS.some((value) => value === captureKind)) {
+    !CAPTURE_KINDS.some((value) => value === captureKind) ||
+    !LINK_STATUSES.some((value) => value === linkStatus)) {
     throw new Error("The source response is invalid.");
   }
   return {
@@ -151,6 +159,7 @@ function sourceIdentity(source: object, sourceId: string): SourceDocument {
     representation: representation as SourceDocument["representation"],
     captureKind: captureKind as SourceDocument["captureKind"],
     quote: fieldOf(source, "quote") as string,
+    linkStatus: linkStatus as SourceDocument["linkStatus"],
   };
 }
 
@@ -167,6 +176,17 @@ function copySourceMetadata(source: object, document: SourceDocument): void {
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("The source metadata is invalid.");
     document.toolArgs = { ...args };
   }
+}
+
+// Each link status names exactly the links it carries. Links are safe web URLs; the plain original has no text fragment.
+// A structured record stands in only for a missing official page.
+function validateLinks(document: SourceDocument): void {
+  const { linkStatus, originalUrl, highlightUrl } = document;
+  const shaped = linkStatus === "missing"
+    ? originalUrl === undefined && highlightUrl === undefined
+    : originalUrl !== undefined && (linkStatus === "highlighted_original") === (highlightUrl !== undefined) && document.captureKind !== "structured_record";
+  const safe = [originalUrl, highlightUrl].every((url) => url === undefined || safeSourceUrl(url) !== undefined);
+  if (!shaped || !safe || originalUrl?.includes(":~:")) throw new Error("The source links are invalid.");
 }
 
 function validateCapturedContent(document: SourceDocument): void {
@@ -190,6 +210,7 @@ export async function fetchSourceDocument(sourceId: string, signal?: AbortSignal
   }
   const document = sourceIdentity(source, sourceId);
   copySourceMetadata(source, document);
+  validateLinks(document);
   validateCapturedContent(document);
   const location = locationOf(source);
   if (location !== undefined) document.location = location;
