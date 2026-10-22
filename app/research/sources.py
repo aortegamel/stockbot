@@ -8,6 +8,12 @@ runtime accepted the result. Normal kernel fetch behavior stays unchanged.
 Viewer reads of SEC/FINRA record sources fetch the official page once on first
 view (``resolve_sec_official`` / ``resolve_finra_official``). The resolver
 archives those exact bytes, and every later read uses the archived bytes.
+
+Citation labels (:func:`read_source_label`) read persisted metadata only: no
+replay, no official page, no network. :func:`read_source_view` is the viewer
+entry: ordinary failures become a controlled error state with one internal
+failure class (:data:`FAILURE_REASONS`) in the ERROR log. Reads never write
+evidence or verification.
 """
 
 from __future__ import annotations
@@ -98,7 +104,13 @@ def _reference_provenance(record: Mapping[str, object]) -> tuple[str, Mapping[st
 
 
 def source_references(record: Mapping[str, object]) -> list[dict[str, str]]:
-    """Return server-created references for durable, replayable evidence rows."""
+    """Return server-created references for durable, replayable evidence rows and calculations."""
+    from app.research.synthesis.final import _is_calculation
+
+    evidence_id = _text(record, "evidence_id")
+    if evidence_id and SOURCE_ID_RE.fullmatch(f"evidence:{evidence_id}") and _is_calculation(record):
+        # The calculation's Stockbot view links each input record; it never borrows one input's original.
+        return [{"id": f"evidence:{evidence_id}", "title": "Stockbot calculation"}]
     validated = _reference_provenance(record)
     if validated is None:
         return []
@@ -428,7 +440,11 @@ def _pinned_sec_digest(evidence: Mapping[str, object], provenance: Mapping[str, 
     records = iter_archived_documents(
         _text(provenance, "accession_no"), _text(provenance, "document_name"), root=root / "raw"
     )
-    return next((r.sha256 for r in records if r.metadata.get("evidence_id") == evidence.get("evidence_id")), "")
+    digests = {r.sha256 for r in records if r.metadata.get("evidence_id") == evidence.get("evidence_id")}
+    # Two archived revisions claiming one evidence row are incompatible candidates: never pick the first.
+    if len(digests) > 1:
+        raise ValueError("Source capture is ambiguous")
+    return next(iter(digests), "")
 
 
 def _resolve_sec_source(
@@ -470,7 +486,7 @@ def _checked_replay(
 ) -> Mapping[str, object]:
     result_id = _text(provenance, "tool_result_id")
     if not result_id:
-        raise FileNotFoundError("Source replay is missing")
+        raise FileNotFoundError("Source replay identity is missing")
     tool_result = _replayed_result(store, result_id)
     if tool_result.get("session_id") != evidence.get("session_id"):
         raise ValueError("Source provenance mismatch")
@@ -480,11 +496,29 @@ def _checked_replay(
     return tool_result
 
 
-def _pinned_web_document(common: dict[str, object], provenance: Mapping[str, object]) -> dict[str, object] | None:
+def _excerpt_row(rows: object, provenance: Mapping[str, object], quoted: str) -> Mapping[str, object] | None:
+    for row in rows if isinstance(rows, list) else []:
+        if (
+            isinstance(row, Mapping)
+            and _text(row, "url") == _text(provenance, "url")
+            and " ".join(quoted.split()) in " ".join(_text(row, "highlight").split())
+        ):
+            return row
+    return None
+
+
+def _pinned_web_document(
+    common: dict[str, object], provenance: Mapping[str, object], tool_result: Mapping[str, object] | None = None
+) -> dict[str, object] | None:
     quoted = _text(provenance, "excerpt")
     content = _text(provenance, "source_content")
     if not content:
         return None
+    if tool_result is not None:
+        payload = tool_result.get("result")
+        rows = payload.get("evidence") if isinstance(payload, Mapping) else None
+        if _excerpt_row(rows, provenance, quoted) is None:
+            raise FileNotFoundError("Source excerpt is missing")
     return {
         **common,
         **_web_document(
@@ -501,17 +535,6 @@ def _pinned_web_document(common: dict[str, object], provenance: Mapping[str, obj
             quoted,
         ),
     }
-
-
-def _excerpt_row(rows: object, provenance: Mapping[str, object], quoted: str) -> Mapping[str, object] | None:
-    for row in rows if isinstance(rows, list) else []:
-        if (
-            isinstance(row, Mapping)
-            and _text(row, "url") == _text(provenance, "url")
-            and " ".join(quoted.split()) in " ".join(_text(row, "highlight").split())
-        ):
-            return row
-    return None
 
 
 def _replayed_web_document(
@@ -537,7 +560,9 @@ def _resolve_web_source(
 ) -> dict[str, object]:
     if tool_result.get("tool_name") != "search_web":
         raise ValueError("Source provenance mismatch")
-    document = _pinned_web_document(common, provenance) or _replayed_web_document(common, provenance, tool_result)
+    document = _pinned_web_document(common, provenance, tool_result) or _replayed_web_document(
+        common, provenance, tool_result
+    )
     return {**document, "toolName": "search_web", **_tool_args(tool_result, "query", "search_type")}
 
 
@@ -570,12 +595,14 @@ def _resolve_structured_record(
 
 @dataclass
 class _Resolved:
-    """One source before rendering: the viewer document plus what renders its original."""
+    """One source before rendering: the viewer document plus what renders its original and audit."""
 
     document: dict[str, object]
     kind: str
     sec: Mapping[str, object] | None = None
     record: Mapping[str, object] | None = None
+    evidence: Mapping[str, object] | None = None
+    store: object = None
 
 
 def _resolved(kind: str, document: dict[str, object]) -> _Resolved:
@@ -586,6 +613,42 @@ def _resolved(kind: str, document: dict[str, object]) -> _Resolved:
     return _Resolved(document, kind, identity, cited)
 
 
+def _calculation_document(evidence: Mapping[str, object]) -> dict[str, object]:
+    """A calculation has no single original: the viewer shows its formula and audits each input."""
+    metadata = evidence.get("metadata")
+    metric = _text(metadata, "metric") if isinstance(metadata, Mapping) else ""
+    content = _text(evidence, "content")
+    return {
+        "title": (metric or _text(evidence, "claim_text") or _text(evidence, "subject") or "Calculation")[:120],
+        "publisher": "Stockbot",
+        "capturedAt": _text(evidence, "retrieved_at"),
+        "knownAt": _text(evidence, "known_at"),
+        "representation": "text",
+        "captureKind": "calculation",
+        "content": content,
+        "contentHash": _text(evidence, "content_hash") or raw_archive.content_hash(content.encode()),
+        "quote": "",
+    }
+
+
+def _evidence_document(store: object, evidence: Mapping[str, object], root: Path) -> tuple[str, dict[str, object]]:
+    from app.research.synthesis.final import _is_calculation
+
+    if _is_calculation(evidence):
+        return "calculation", _calculation_document(evidence)
+    kind, common = _evidence_provenance(evidence)
+    provenance = evidence.get("provenance")
+    assert isinstance(provenance, Mapping)
+    if kind not in _REPLAYABLE_KINDS:
+        raise FileNotFoundError("Source identity is missing")
+    if kind == "sec_source":
+        return kind, _resolve_sec_source(evidence, provenance, common, root)
+    tool_result = _replay_tool_result(store, evidence, provenance)
+    if kind == "web_source":
+        return kind, _resolve_web_source(common, provenance, tool_result)
+    return kind, _resolve_structured_record(kind, common, provenance, tool_result)
+
+
 def _resolve(source_id: str, root: Path, repo: object = None) -> _Resolved:
     if not isinstance(source_id, str) or not SOURCE_ID_RE.fullmatch(source_id):
         raise ValueError("Source id is invalid")
@@ -593,17 +656,9 @@ def _resolve(source_id: str, root: Path, repo: object = None) -> _Resolved:
         return _resolved("", _resolve_capture(source_id, root))
     store = repo if _has_reads(repo) else ResearchRepository(data_root=root)
     evidence = store.get_evidence(source_id.removeprefix("evidence:"))
-    kind, common = _evidence_provenance(evidence)
-    provenance = evidence.get("provenance")
-    assert isinstance(provenance, Mapping)
-    if kind == "sec_source":
-        return _resolved(kind, _resolve_sec_source(evidence, provenance, common, root))
-    tool_result = _replay_tool_result(store, evidence, provenance)
-    if kind == "web_source":
-        return _resolved(kind, _resolve_web_source(common, provenance, tool_result))
-    if kind in ("finra_record", "sec_record"):
-        return _resolved(kind, _resolve_structured_record(kind, common, provenance, tool_result))
-    raise FileNotFoundError("Source capture is missing")
+    resolved = _resolved(*_evidence_document(store, evidence, root))
+    resolved.evidence, resolved.store = evidence, store
+    return resolved
 
 
 def _official_url(value: str) -> str:
@@ -826,9 +881,17 @@ def _render_sec_document(
 
 def _render_record(
     document: dict[str, object], record: Mapping[str, object], root: Path, source_id: str
-) -> tuple[str, str | None]:
-    """Render a record's official page like an SEC original. Return (official page URL, text fragment)."""
-    official = _official_page(document, record, root)
+) -> tuple[str, str | None, tuple[str, str]]:
+    """Render a record's official page like an SEC original.
+
+    Return (official page URL, text fragment, (failure, reason) for a missing page). A failed
+    official fetch drops only the public link: the held record still renders, nothing persisted changes.
+    """
+    try:
+        official = _official_page(document, record, root)
+        missing = ("PUBLIC_PAGE_UNAVAILABLE", "resolver found no official page for the cited record")
+    except OSError as exc:
+        official, missing = None, ("SOURCE_UNAVAILABLE", f"official page fetch failed: {exc}")
     if official is None:
         # No official page: the Stockbot view shows the cited row (the whole payload when none was cited).
         row, payload = record.get("row"), record.get("payload")
@@ -843,13 +906,13 @@ def _render_record(
                 "quote": "",
             }
         )
-        return "", None
+        return "", None, missing
     document.update(
         {"url": official.url, "captureKind": "original", "contentHash": official.sha256, "quote": official.quote}
     )
     if official.media == "pdf":
         document.update({"representation": "pdf", "pdfUrl": _pdf_url(source_id)})
-        return official.url, None
+        return official.url, None, missing
     location: dict[str, object] = {"basis": "rendered"}
     document["location"] = location
     basis, html = _render_sec_text(document, official.payload)
@@ -857,38 +920,136 @@ def _render_record(
     if at >= 0:
         location.update({"offset": at, "end": at + len(official.quote)})
         _attach_sec_context(document, location, basis)
-    return official.url, _quote_fragment(document, basis, official.anchor) if html else None
+    return official.url, _quote_fragment(document, basis, official.anchor) if html else None, missing
 
 
-def _log_missing(source_id: str, resolved: _Resolved, reason: str) -> None:
+def _evidence_id_of(source_id: str) -> str:
+    return source_id.removeprefix("evidence:") if source_id.startswith("evidence:") else ""
+
+
+def _log_missing(source_id: str, resolved: _Resolved, failure: str, reason: str) -> None:
     record = resolved.record or {}
     logger.error(
-        "source official page missing: source_id=%s evidence_id=%s kind=%s tool=%s tool_args=%s row=%s reason=%s",
+        "source official page missing: source_id=%s evidence_id=%s kind=%s tool=%s tool_args=%s row=%s reason=%s"
+        " failure=%s",
         source_id,
-        source_id.removeprefix("evidence:") if source_id.startswith("evidence:") else "",
+        _evidence_id_of(source_id),
         resolved.kind,
         _text(resolved.document, "toolName") or _text(record, "tool"),
         json.dumps(resolved.document.get("toolArgs", {}), sort_keys=True, default=str),
         json.dumps(record.get("row", {}), sort_keys=True, default=str),
         reason,
+        failure,
     )
 
 
+_AUDIT_TEXT_KEYS = (
+    ("value", "value"),
+    ("entity", "entity"),
+    ("period", "period"),
+    ("unit", "unit"),
+    ("known_at", "knownAt"),
+    ("formula", "formula"),
+    ("formulaId", "formulaId"),
+    ("formulaVersion", "formulaVersion"),
+    ("recomputedValue", "recomputedValue"),
+)
+
+
+def _audit_node(view: Mapping[str, object]) -> dict[str, object]:
+    """Viewer shape of one audit view: typed value, verification, source identity, inputs. No API URLs."""
+    evidence_id = _text(view, "evidence_id")
+    node: dict[str, object] = {
+        "evidenceId": evidence_id,
+        "claimType": _text(view, "claim_type"),
+        "verification": _text(view, "verification") or "unverified",
+        "verificationReason": _text(view, "verification_reason"),
+        **{name: _text(view, key) for key, name in _AUDIT_TEXT_KEYS if _text(view, key)},
+    }
+    if evidence_id and SOURCE_ID_RE.fullmatch(f"evidence:{evidence_id}"):
+        node["sourceId"] = f"evidence:{evidence_id}"
+    raw_source = view.get("source")
+    source: Mapping[str, object] = raw_source if isinstance(raw_source, Mapping) else {}
+    fields = (("name", "source_name"), ("document", "document"), ("accession", "accession_no"), ("hash", "sourceId"))
+    identity = {name: _text(source, key) for name, key in fields if _text(source, key)}
+    if identity:
+        node["source"] = identity
+    inputs = view.get("inputs")
+    if isinstance(inputs, list):
+        node["inputs"] = [_audit_node(item) for item in inputs if isinstance(item, Mapping)]
+    return node
+
+
+def _repair_summary(store: object, evidence_id: str, session_id: str | None) -> list[dict[str, object]]:
+    """Immutable repair history of one legacy row: status and identity, never a verified citation.
+
+    Repairs stay artifact-only (the publication gates never read them), so the
+    viewer shows them as audit history: repair id, status, reason, category,
+    datapoint, and value. A read failure yields no repairs rather than an error.
+    """
+    if not evidence_id or not isinstance(session_id, str) or not session_id:
+        return []
+    try:
+        from app.research.repository import ResearchRepository
+
+        repairs = store.list_evidence_repairs(session_id, evidence_id) if isinstance(store, ResearchRepository) else []
+    except Exception:  # noqa: BLE001 - best-effort audit history, never blocks the view
+        return []
+    out: list[dict[str, object]] = []
+    for repair in repairs:
+        if not isinstance(repair, Mapping):
+            continue
+        summary = {key: repair.get(key) for key in ("repair_id", "status", "reason", "category", "datapoint", "value")}
+        if isinstance(summary.get("repair_id"), str) and summary["repair_id"]:
+            out.append({key: value for key, value in summary.items() if value not in (None, "")})
+    return out
+
+
+def _audit(store: object, evidence: Mapping[str, object], source_id: str) -> dict[str, object]:
+    """Replay the observation or calculation proof against this session's ledger. Read-only: nothing persists."""
+    from app.research.service import _session_rows
+    from app.research.synthesis.final import _calculation_view, _is_calculation
+
+    session_id = evidence.get("session_id")
+    rows: dict[str, Mapping[str, object]] = {}
+    if isinstance(store, ResearchRepository) and isinstance(session_id, str):
+        rows.update(_session_rows(store, session_id))
+    rows.setdefault(_text(evidence, "evidence_id"), evidence)
+    audit = _audit_node(_calculation_view(evidence, rows, ""))
+    repairs = _repair_summary(
+        store, _text(evidence, "evidence_id"), session_id if isinstance(session_id, str) else None
+    )
+    if repairs:
+        audit["repairs"] = repairs
+    if _is_calculation(evidence) and audit["verification"] != "verified":
+        logger.error(
+            "source calculation invalid: failure=CALCULATION_INVALID source_id=%s evidence_id=%s reason=%s",
+            source_id,
+            _evidence_id_of(source_id),
+            audit["verificationReason"],
+        )
+    return audit
+
+
 def read_source_document(source_id: str, *, data_root: Path | None = None, repo: object = None) -> dict[str, object]:
-    """Resolve one source into the shared viewer document with its official-page links."""
+    """Resolve one source into the shared viewer document with its official-page links and proof audit."""
     root = data_root if data_root is not None else get_data_root()
     resolved = _resolve(source_id, root, repo)
     document = resolved.document
+    missing = ("PUBLIC_PAGE_UNAVAILABLE", "")
     if resolved.sec is not None:
         original, fragment = _render_sec_document(document, resolved.sec, root, source_id)
-        reason = "archived SEC document URL is not an official page"
+        missing = ("PUBLIC_PAGE_UNAVAILABLE", "archived SEC document URL is not an official page")
     elif resolved.record is not None:
-        original, fragment = _render_record(document, resolved.record, root, source_id)
-        reason = "resolver found no official page for the cited record"
+        original, fragment, missing = _render_record(document, resolved.record, root, source_id)
+    elif resolved.kind == "calculation":
+        # Never one arbitrary original for a calculation: its audit links each input record instead.
+        original, fragment = "", None
     else:
-        # Web sources hold the provider extraction, never the page bytes: no verified highlight.
+        # Web sources verify against the persisted highlight only: the provider extraction or
+        # excerpt text renders verbatim, never today's page text (no verified highlight).
         original, fragment = _url(_text(document, "url")), None
-        reason = "web source has no page URL"
+        missing = ("PUBLIC_PAGE_UNAVAILABLE", "web source has no page URL")
     if original:
         document["originalUrl"] = original
         document["linkStatus"] = "highlighted_original" if fragment else "stockbot_render"
@@ -896,9 +1057,110 @@ def read_source_document(source_id: str, *, data_root: Path | None = None, repo:
             document["highlightUrl"] = original + fragment
     else:
         document["linkStatus"] = "missing"
-        _log_missing(source_id, resolved, reason)
+        if missing[1]:
+            _log_missing(source_id, resolved, *missing)
+    if resolved.evidence is not None:
+        document["audit"] = _audit(resolved.store, resolved.evidence, source_id)
     document["id"] = source_id
     return document
+
+
+FAILURE_REASONS = (
+    "PUBLIC_PAGE_UNAVAILABLE",
+    "SOURCE_IDENTITY_MISSING",
+    "SOURCE_MISMATCH",
+    "SOURCE_AMBIGUOUS",
+    "SOURCE_UNAVAILABLE",
+    "SOURCE_CORRUPT",
+    "CALCULATION_INVALID",
+)
+# First matching message fragment wins. These are this module's and the official resolvers' own messages.
+_FAILURE_MESSAGES = (
+    ("mbiguous", "SOURCE_AMBIGUOUS"),
+    ("hash", "SOURCE_CORRUPT"),
+    ("archive path is invalid", "SOURCE_CORRUPT"),
+    ("capture is invalid", "SOURCE_CORRUPT"),
+    ("page is invalid", "SOURCE_CORRUPT"),
+    ("id is invalid", "SOURCE_IDENTITY_MISSING"),
+    ("identity", "SOURCE_IDENTITY_MISSING"),
+    ("provenance is missing", "SOURCE_IDENTITY_MISSING"),
+    ("Pinned source capture is missing", "SOURCE_IDENTITY_MISSING"),
+    ("mismatch", "SOURCE_MISMATCH"),
+    ("excerpt is missing", "SOURCE_MISMATCH"),
+    ("disagrees", "SOURCE_MISMATCH"),
+    ("no line for", "SOURCE_MISMATCH"),
+)
+_SOURCE_ERRORS = {404: "source capture not found", 409: "invalid source capture", 502: "source read failed"}
+
+
+def failure_reason(exc: BaseException) -> str:
+    """Internal failure class of one source read error (never shown to the reader)."""
+    if isinstance(exc, KeyError):
+        return "SOURCE_UNAVAILABLE"
+    message = str(exc)
+    reason = next((reason for fragment, reason in _FAILURE_MESSAGES if fragment in message), "")
+    return reason or ("SOURCE_CORRUPT" if isinstance(exc, ValueError) else "SOURCE_UNAVAILABLE")
+
+
+def read_source_view(source_id: str, *, data_root: Path | None = None, repo: object = None) -> dict[str, object]:
+    """Viewer read: the document, or a controlled error state. Unexpected failures still raise.
+
+    A failed read never writes evidence or verification; it logs the internal failure class.
+    """
+    try:
+        return read_source_document(source_id, data_root=data_root, repo=repo)
+    except (KeyError, OSError, ValueError) as exc:
+        missing = isinstance(exc, (KeyError, FileNotFoundError))
+        status = 404 if missing else 409 if isinstance(exc, ValueError) else 502
+        failure = failure_reason(exc)
+        logger.error(
+            "source read failed: failure=%s source_id=%s evidence_id=%s error=%s: %s",
+            failure,
+            source_id,
+            _evidence_id_of(source_id) if isinstance(source_id, str) else "",
+            type(exc).__name__,
+            exc,
+            exc_info=exc,
+        )
+        return {"id": source_id, "error": _SOURCE_ERRORS[status], "status": status, "failure": failure}
+
+
+def read_source_label(source_id: str, *, data_root: Path | None = None, repo: object = None) -> dict[str, object]:
+    """Citation label from persisted metadata only: no tool replay, no official page, no network.
+
+    The link is the already pinned human page (archived SEC URL or the web page). Record sources
+    get their official page only when the viewer resolves them.
+    """
+    root = data_root if data_root is not None else get_data_root()
+    if not isinstance(source_id, str) or not SOURCE_ID_RE.fullmatch(source_id):
+        raise ValueError("Source id is invalid")
+    if source_id.startswith("capture:"):
+        document = _resolve_capture(source_id, root)
+        url = _text(document, "url")
+        original = _official_url(url) if "sec" in document else "" if "record" in document else _url(url)
+    else:
+        store = repo if _has_reads(repo) else ResearchRepository(data_root=root)
+        document, original = _evidence_label(store.get_evidence(source_id.removeprefix("evidence:")), root)
+    label = {"id": source_id, "title": _text(document, "title")}
+    label.update({key: _text(document, key) for key in ("publisher", "publishedAt", "knownAt") if _text(document, key)})
+    if not original:
+        return {**label, "linkStatus": "missing"}
+    return {**label, "linkStatus": "stockbot_render", "originalUrl": original}
+
+
+def _evidence_label(evidence: Mapping[str, object], root: Path) -> tuple[Mapping[str, object], str]:
+    from app.research.synthesis.final import _is_calculation
+
+    if _is_calculation(evidence):
+        return _calculation_document(evidence), ""
+    kind, common = _evidence_provenance(evidence)
+    provenance = evidence.get("provenance")
+    assert isinstance(provenance, Mapping)
+    if kind == "sec_source":
+        identity = _resolve_sec_source(evidence, provenance, common, root)["sec"]
+        assert isinstance(identity, Mapping)
+        return common, _official_url(_sec_record(identity, root).url)
+    return common, _url(_text(common, "url")) if kind == "web_source" else ""
 
 
 def read_source_pdf(source_id: str, *, data_root: Path | None = None, repo: object = None) -> bytes:

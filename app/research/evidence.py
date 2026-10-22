@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
+from itertools import pairwise
+from typing import NamedTuple
 
 from .models import JSONValue, pit_unverified, pit_violated, validate_json_mapping
 
 __all__ = [
     "ACCESSION_RE",
     "CLAIM_KINDS",
+    "PROOF_KINDS",
     "PROVENANCE_KINDS",
     "RECORD_KINDS",
+    "VERIFICATION_STATUSES",
     "DiscoveryRecord",
     "Evidence",
     "EvidenceIntegrityError",
@@ -22,6 +26,9 @@ __all__ = [
     "EvidenceNotFoundError",
     "EvidenceRecord",
     "EvidenceRejectedError",
+    "ProofVerdict",
+    "assumption_proof",
+    "calculation_proof",
     "discovery_only",
     "edgartools_version",
     "evidence_bundle_entry",
@@ -33,23 +40,49 @@ __all__ = [
     "finra_record_ref",
     "ingest_evidence",
     "normalize_accession",
+    "observation_proof",
     "search_run_ref",
     "sec_record_ref",
     "sec_source_ref",
+    "validate_proof",
     "validate_provenance",
+    "value_hash",
+    "verify_calculation",
+    "verify_observation",
     "web_source_ref",
 ]
 
 ACCESSION_RE = re.compile(r"^\d{10}-\d{2}-\d{6}$")
 """Canonical SEC accession; a bare 18-digit run normalizes into it (``normalize_accession``)."""
 
-CLAIM_KINDS = ("observed_fact",)
+CLAIM_KINDS = ("observed_fact", "calculation", "inference", "assumption")
 """Closed claim vocabulary: what the record asserts, stated by the caller, never inferred from wording.
 
-Only raw-document claims are evidence. A search-derived absence observation is a
-session coverage artifact (``ResearchRepository.save_coverage_artifact``), never a
-ledger row: evidence is what a human/source document states, coverage is what a
-search did or did not reach.
+An observed fact is read off a source, a calculation is derived from proven
+inputs by a named formula, an inference reasons over cited rows (it carries no
+proof of its own), and an assumption is a declared hypothetical. A
+search-derived absence observation is a session coverage artifact
+(``ResearchRepository.save_coverage_artifact``), never a ledger row: evidence is
+what a source states or code derives, coverage is what a search did or did not reach.
+"""
+
+PROOF_KINDS = ("observation", "calculation", "assumption")
+"""Closed proof vocabulary: what backs one datapoint row (``Evidence.proof['kind']``)."""
+
+_CLAIM_PROOF_KIND: dict[str, str | None] = {
+    "observed_fact": "observation",
+    "calculation": "calculation",
+    "assumption": "assumption",
+    "inference": None,
+}
+"""The one proof kind each claim kind may carry; an inference carries none."""
+
+VERIFICATION_STATUSES = ("verified", "unverified", "conflicted")
+"""Closed verification vocabulary, computed at publication and never stored.
+
+It stays separate from the public link status (``app.research.sources``).
+Missing or ambiguous identity is ``unverified``; a value, hash, or byte
+disagreement is ``conflicted``. Only ``verified`` may publish.
 """
 
 PROVENANCE_KINDS = ("sec_source", "sec_record", "finra_record", "web_source", "search_run", "none")
@@ -294,7 +327,8 @@ def web_source_ref(
     The kernel, never the model, reloads that persisted result and stores its
     bytes; a model-authored URL/quote never qualifies.
     ``tool_result_id`` is the persisted kernel tool result this ref replays (None for legacy rows).
-    ``source_content`` is the bounded provider extraction behind the row (absent on excerpt-only rows).
+    ``source_content`` is the bounded provider extraction the viewer shows (absent on excerpt-only
+    rows); the cited claim verifies against ``excerpt`` only, never the full extraction.
     """
     link = url.strip() if isinstance(url, str) else ""
     quote = excerpt.strip() if isinstance(excerpt, str) else ""
@@ -414,6 +448,166 @@ def _sec_source_provenance(value: Mapping[str, object], where: str) -> dict[str,
         raise EvidenceIntegrityError(f"{where}: {exc}") from None
 
 
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+_PROOF_FIELDS: dict[str, tuple[str, ...]] = {
+    "observation": ("sourceId", "locator", "valueHash"),
+    "calculation": ("formulaId", "formulaVersion", "inputProofIds", "valueHash"),
+    "assumption": ("origin", "description"),
+}
+"""Exact keys per proof kind (besides ``kind``); anything else fails closed."""
+
+
+def value_hash(value: str) -> str:
+    """Canonical datapoint value hash (sha256 hex over the exact utf-8 text)."""
+    return sha256(value.encode("utf-8")).hexdigest()
+
+
+def _proof_field(key: str, raw: object, where: str) -> JSONValue:
+    """One validated proof field; the shape is fixed per key."""
+    if key == "locator":
+        if not isinstance(raw, Mapping) or not raw:
+            raise EvidenceIntegrityError(f"{where}: 'locator' must be a non-empty object")
+        return validate_json_mapping(dict(raw), where)
+    if key == "inputProofIds":
+        if not isinstance(raw, (list, tuple)) or not raw or any(not isinstance(i, str) or not i.strip() for i in raw):
+            raise EvidenceIntegrityError(f"{where}: 'inputProofIds' must be a non-empty list of evidence ids")
+        return list(raw)
+    if not isinstance(raw, str) or not raw.strip():
+        raise EvidenceIntegrityError(f"{where}: {key!r} must be a non-empty string")
+    if key == "valueHash" and not _HEX64.fullmatch(raw):
+        raise EvidenceIntegrityError(f"{where}: 'valueHash' must be a sha256 hex digest")
+    if key == "sourceId" and not (raw.startswith("sha256:") and _HEX64.fullmatch(raw[7:])):
+        raise EvidenceIntegrityError(f"{where}: 'sourceId' must be sha256:<hex> of the archived source bytes")
+    return raw
+
+
+def validate_proof(value: object, where: str = "<evidence>: 'proof'") -> dict[str, JSONValue]:
+    """Validate one proof mapping; empty means no proof recorded (legacy rows)."""
+    if not isinstance(value, Mapping):
+        raise EvidenceIntegrityError(f"{where} must be an object")
+    if not value:
+        return {}
+    kind = value.get("kind")
+    fields = _PROOF_FIELDS.get(kind) if isinstance(kind, str) else None
+    if fields is None:
+        raise EvidenceIntegrityError(f"{where}: 'kind' must be one of {list(PROOF_KINDS)}, got {kind!r}")
+    if set(value) != {"kind", *fields}:
+        raise EvidenceIntegrityError(f"{where}: {kind} proof keys must be exactly {['kind', *fields]}")
+    proof: dict[str, JSONValue] = {"kind": kind}
+    for key in fields:
+        proof[key] = _proof_field(key, value[key], where)
+    return proof
+
+
+def _proof_locator(provenance: Mapping[str, object]) -> dict[str, JSONValue] | None:
+    """Identifying locator of one validated provenance; None when the source revision is ambiguous.
+
+    A legacy SEC ref without window coordinates, or a tool-result ref without the
+    persisted ``tool_result_id``, cannot pin one exact source, so it locates nothing.
+    """
+    kind = provenance.get("kind")
+    if kind == "sec_source" and "text_hash" in provenance:
+        keys: tuple[str, ...] = ("kind", "accession_no", "document_name", "offset", "end", "basis", "text_hash")
+    elif kind in ("sec_record", "finra_record") and provenance.get("tool_result_id"):
+        keys = ("kind", "tool_name", "record_identity", "tool_result_id")
+    elif kind == "web_source" and provenance.get("tool_result_id"):
+        keys = ("kind", "url", "tool_result_id")
+    else:
+        return None
+    return validate_json_mapping({key: provenance.get(key) for key in keys}, "<proof>: 'locator'")
+
+
+def _value_in_passage(provenance: Mapping[str, object], source_bytes: bytes, value: str) -> bool:
+    """Value occurs verbatim in the kernel-located passage and only that passage.
+
+    SEC rows check their exact passage, web rows their excerpt, FINRA/SEC-record
+    rows their cited record JSON. Falling back to the whole archived payload
+    would let one row in a multi-row result prove another row's value, so the
+    fallback is gone: a value outside the cited record fails as conflicted.
+    """
+    kind = provenance.get("kind")
+    if kind == "sec_source":
+        texts: tuple[object, ...] = (provenance.get("passage"),)
+    elif kind == "web_source":
+        texts = (provenance.get("excerpt"),)
+    elif kind in ("finra_record", "sec_record"):
+        texts = (_canonical_record_text(provenance.get("record_identity")),)
+    else:
+        texts = (source_bytes.decode("utf-8", "replace"),)
+    return any(isinstance(text, str) and value in text for text in texts)
+
+
+def _canonical_record_text(identity: object) -> str | None:
+    """Canonical JSON of the cited record identity (sorted keys), or None when not a record mapping."""
+    import json as _json
+
+    if not isinstance(identity, str):
+        return None
+    try:
+        parsed = _json.loads(identity)
+    except ValueError:
+        return identity
+    if not isinstance(parsed, Mapping):
+        return None
+    return _json.dumps(dict(parsed), sort_keys=True, default=str)
+
+
+def _datapoint_text(value: object, key: str) -> str:
+    text = value.strip() if isinstance(value, str) else ""
+    if not text:
+        raise ValueError(f"proof: {key} must be a non-empty string")
+    return text
+
+
+def observation_proof(*, provenance: Mapping[str, object], source_bytes: bytes, value: object) -> dict[str, JSONValue]:
+    """Observation proof: the archived source bytes, the provenance locator, and the value hash.
+
+    Refuses an ambiguous source identity, absent bytes, and a value that is not
+    verbatim in the located passage. Store the stripped ``value`` on the row.
+    """
+    prov = validate_provenance(provenance, "<proof>: 'provenance'")
+    text = _datapoint_text(value, "value")
+    locator = _proof_locator(prov)
+    if locator is None:
+        raise ValueError("observation_proof: provenance does not identify one exact source revision")
+    if not isinstance(source_bytes, bytes) or not source_bytes:
+        raise ValueError("observation_proof: source_bytes must be the non-empty archived bytes")
+    if not _value_in_passage(prov, source_bytes, text):
+        raise ValueError(f"observation_proof: value {text!r} is not verbatim in the located source passage")
+    return {
+        "kind": "observation",
+        "sourceId": f"sha256:{sha256(source_bytes).hexdigest()}",
+        "locator": locator,
+        "valueHash": value_hash(text),
+    }
+
+
+def calculation_proof(
+    *, formula_id: object, formula_version: object, input_proof_ids: object, value: object
+) -> dict[str, JSONValue]:
+    """Calculation proof: formula id + version over input evidence ids (formula argument order)."""
+    return validate_proof(
+        {
+            "kind": "calculation",
+            "formulaId": _datapoint_text(formula_id, "formula_id"),
+            "formulaVersion": _datapoint_text(formula_version, "formula_version"),
+            "inputProofIds": list(input_proof_ids) if isinstance(input_proof_ids, (list, tuple)) else input_proof_ids,
+            "valueHash": value_hash(_datapoint_text(value, "value")),
+        },
+        "<proof>",
+    )
+
+
+def assumption_proof(*, origin: object, description: object) -> dict[str, JSONValue]:
+    """Assumption proof: who declared it and what it assumes; never a sourced fact."""
+    return {
+        "kind": "assumption",
+        "origin": _datapoint_text(origin, "origin"),
+        "description": _datapoint_text(description, "description"),
+    }
+
+
 @dataclass(frozen=True)
 class DiscoveryRecord:
     """One catalog/tool-discovery hit: provenance of the search, never substantive coverage."""
@@ -469,6 +663,12 @@ class Evidence:
     # What the record asserts (never inferred from wording) and what backs it.
     claim_kind: str = "observed_fact"
     provenance: dict[str, JSONValue] = field(default_factory=dict)
+    # Typed datapoint (verbatim value text) and what proves it; None/{} on legacy rows.
+    value: str | None = None
+    entity: str | None = None
+    period: str | None = None
+    unit: str | None = None
+    proof: dict[str, JSONValue] = field(default_factory=dict)
 
     def _check_record_kind(self) -> None:
         if self.record_kind not in RECORD_KINDS:
@@ -488,10 +688,27 @@ class Evidence:
         if evidence_content_hash(self.content) != self.content_hash:
             raise EvidenceIntegrityError(f"evidence {self.evidence_id}: content_hash mismatch")
 
+    def _check_proof(self) -> dict[str, JSONValue]:
+        """Proof kind matches claim kind; valueHash pins the row value; datapoint fields are text."""
+        where = f"evidence {self.evidence_id}"
+        proof = validate_proof(self.proof, f"{where}: 'proof'")
+        if proof and (self.record_kind == "discovery" or proof["kind"] != _CLAIM_PROOF_KIND[self.claim_kind]):
+            raise EvidenceIntegrityError(
+                f"{where}: {proof['kind']} proof cannot back a {self.record_kind} {self.claim_kind} row"
+            )
+        for key in ("value", "entity", "period", "unit"):
+            text = getattr(self, key)
+            if text is not None and (not isinstance(text, str) or not text.strip()):
+                raise EvidenceIntegrityError(f"{where}: {key!r} must be a non-empty string or null")
+        if "valueHash" in proof and (self.value is None or value_hash(self.value) != proof["valueHash"]):
+            raise EvidenceIntegrityError(f"{where}: 'value' does not match proof valueHash")
+        return proof
+
     def __post_init__(self) -> None:
         self._check_record_kind()
         self._check_claim_kind()
         self._check_wave_hash()
+        proof = self._check_proof()
         if self.confidence is not None and not 0.0 <= self.confidence <= 1.0:
             raise EvidenceIntegrityError(f"evidence {self.evidence_id}: 'confidence' must be within 0..1")
         object.__setattr__(self, "supports", tuple(self.supports))
@@ -501,6 +718,200 @@ class Evidence:
             "provenance",
             validate_provenance(self.provenance, f"evidence {self.evidence_id}: 'provenance'"),
         )
+        object.__setattr__(self, "proof", proof)
+
+
+class ProofVerdict(NamedTuple):
+    """Publication-time verification result: one VERIFICATION_STATUSES value plus why."""
+
+    status: str
+    reason: str
+
+
+_VERIFIED = ProofVerdict("verified", "")
+
+
+def _datapoint_verdict(evidence: Evidence, kind: str, value: object) -> ProofVerdict | None:
+    """Shared preconditions: proof kind, datapoint identity, claimed value vs proven hash."""
+    if evidence.proof.get("kind") != kind:
+        return ProofVerdict("unverified", f"row carries no {kind} proof")
+    missing = [key for key in ("value", "entity", "period") if getattr(evidence, key) is None]
+    if missing:
+        return ProofVerdict("unverified", f"datapoint identity missing: {', '.join(missing)}")
+    claimed = value.strip() if isinstance(value, str) else ""
+    if not claimed:
+        return ProofVerdict("unverified", "claim carries no value")
+    if value_hash(claimed) != evidence.proof["valueHash"]:
+        return ProofVerdict("conflicted", f"claimed value {claimed!r} does not match the proven value hash")
+    return None
+
+
+def verify_observation(evidence: Evidence, *, value: object, source_bytes: bytes | None) -> ProofVerdict:
+    """Check one claimed value against an observation row: value hash, locator, archived bytes, passage.
+
+    ``source_bytes`` are the raw_archive bytes the caller loaded for ``proof.sourceId``;
+    None (bytes absent) fails closed as unverified. Never raises.
+    """
+    early = _datapoint_verdict(evidence, "observation", value)
+    if early is not None:
+        return early
+    locator = _proof_locator(evidence.provenance)
+    if locator is None:
+        return ProofVerdict("unverified", "provenance does not identify one exact source revision")
+    if evidence.proof["locator"] != locator:
+        return ProofVerdict("conflicted", "proof locator differs from the row provenance")
+    if source_bytes is None:
+        return ProofVerdict("unverified", "archived source bytes absent")
+    if f"sha256:{sha256(source_bytes).hexdigest()}" != evidence.proof["sourceId"]:
+        return ProofVerdict("conflicted", "archived source bytes do not match proof sourceId")
+    if not _value_in_passage(evidence.provenance, source_bytes, evidence.value or ""):
+        return ProofVerdict("conflicted", "value is not verbatim in the located source passage")
+    return _VERIFIED
+
+
+def _calculation_metadata(row: Evidence, key: str, alias: str = "") -> object:
+    """Read a financial compatibility field from the row's metadata."""
+    return row.metadata.get(key, row.metadata.get(alias)) if alias else row.metadata.get(key)
+
+
+def _calculation_period(row: Evidence) -> tuple[date, date]:
+    """Read the explicit interval for a temporal formula."""
+    start = date.fromisoformat(str(_calculation_metadata(row, "period_start", "periodStart")))
+    end = date.fromisoformat(str(_calculation_metadata(row, "period_end", "periodEnd")))
+    if start > end:
+        raise ValueError("period_start follows period_end")
+    return start, end
+
+
+def _temporal_input_defect(evidence: Evidence, rows: Sequence[Evidence], semantics: str) -> str | None:
+    """Check contiguous quarters and FY/YTD boundaries without inferring dates from labels."""
+    try:
+        periods = [_calculation_period(row) for row in rows]
+        output = _calculation_period(evidence)
+    except ValueError:
+        return "temporal formulas require valid period_start and period_end"
+    if semantics == "quarter":
+        if len(periods) != 2:
+            return "Q4 requires FY and YTD Q3 inputs"
+        (fy_start, fy_end), (ytd_start, ytd_end) = periods
+        if (
+            fy_start != ytd_start
+            or not 330 <= (fy_end - fy_start).days <= 380
+            or not 250 <= (ytd_end - ytd_start).days <= 290
+            or not 60 <= (fy_end - ytd_end).days <= 110
+            or output != (ytd_end + timedelta(days=1), fy_end)
+        ):
+            return "Q4 requires matching FY and YTD Q3 periods"
+        return None
+    if len(periods) != 4 or len({row.evidence_id for row in rows}) != 4:
+        return "TTM requires four distinct quarters"
+    if (
+        any(not 60 <= (end - start).days <= 110 for start, end in periods)
+        or any(left[1] + timedelta(days=1) != right[0] for left, right in pairwise(periods))
+        or output != (periods[0][0], periods[-1][1])
+    ):
+        return "TTM requires four contiguous quarters in formula argument order"
+    return None
+
+
+def _calculation_input_defect(evidence: Evidence, rows: Sequence[Evidence]) -> str | None:
+    """Reject incompatible typed operands before arithmetic or ledger persistence."""
+    from .service import _FORMULAS
+
+    formula = _FORMULAS.get((str(evidence.proof["formulaId"]), str(evidence.proof["formulaVersion"])))
+    if formula is None:
+        return "formula is unknown"
+    semantics = formula[1]
+    if not evidence.entity or any(
+        not row.entity or row.entity.casefold() != evidence.entity.casefold() for row in rows
+    ):
+        return "calculation entities are incompatible"
+    if not evidence.period or any(not row.period for row in rows):
+        return "calculation periods are missing"
+    row_periods = [row.period.casefold() for row in rows if row.period]
+    output_period = evidence.period.casefold() if evidence.period else ""
+    same_period = len(set(row_periods)) == 1 and row_periods[0] == output_period
+    if semantics in ("growth_pct", "growth_ratio", "change"):
+        period_ok = len(rows) == 2 and len(set(row_periods)) == 2 and output_period not in row_periods
+    elif semantics == "percentage":
+        period_ok = same_period and len(rows) == 2
+    elif semantics == "multiple":
+        period_ok = len(rows) == 2 and (same_period or (len(set(row_periods)) == 2 and output_period in row_periods))
+    else:
+        period_ok = same_period
+    if not period_ok:
+        return "calculation periods are incompatible"
+    if semantics in ("quarter", "ttm"):
+        defect = _temporal_input_defect(evidence, rows, semantics)
+        if defect:
+            return defect
+    units = [row.unit.casefold().replace(" ", "") if row.unit else "" for row in rows]
+    output_unit = evidence.unit.casefold().replace(" ", "") if evidence.unit else ""
+    if not units or not all(units) or not output_unit:
+        return "calculation units are missing"
+    same = len(set(units)) == 1
+    if semantics in ("add", "quarter", "ttm", "change"):
+        valid = same and output_unit == units[0]
+    elif semantics in ("growth_pct", "percentage"):
+        valid = same and output_unit in ("%", "percent", "percentage")
+    elif semantics == "growth_ratio":
+        valid = same and output_unit == "ratio"
+    elif semantics in ("ratio", "multiple"):
+        valid = same and output_unit in ("ratio", "dimensionless", "multiple", "x", "1")
+        if len(units) == 2:
+            valid = valid or output_unit == f"{units[0]}/{units[1]}"
+    elif semantics == "product":
+        valid = len(units) == 2 and (
+            output_unit == f"{units[0]}*{units[1]}"
+            or (units[0] in ("ratio", "dimensionless", "multiple", "x", "1") and output_unit == units[1])
+            or (units[1] in ("ratio", "dimensionless", "multiple", "x", "1") and output_unit == units[0])
+        )
+    elif semantics == "scale":
+        valid = len(units) == 2 and output_unit == units[0]
+    elif semantics == "per_share":
+        valid = len(units) == 2 and output_unit in ("usd/share", "currency/share", "pershare", "$/share")
+    else:
+        valid = False
+    return None if valid else "calculation units are incompatible"
+
+
+def verify_calculation(
+    evidence: Evidence,
+    *,
+    value: object,
+    inputs: Sequence[tuple[Evidence, ProofVerdict]],
+    recompute: Callable[[str, str, tuple[str, ...]], str | None],
+) -> ProofVerdict:
+    """Check one claimed value against a calculation row: verified inputs, formula recompute, value hash.
+
+    ``inputs`` are the rows named by ``proof.inputProofIds`` in that order, each with
+    the verdict the caller computed for it. ``recompute(formula_id, formula_version,
+    input_values)`` returns the exact value text, or None for an unknown formula.
+    Never raises for arithmetic/value errors inside ``recompute``.
+    """
+    early = _datapoint_verdict(evidence, "calculation", value)
+    if early is not None:
+        return early
+    if [row.evidence_id for row, _ in inputs] != evidence.proof["inputProofIds"]:
+        return ProofVerdict("unverified", "input proofs do not resolve to inputProofIds")
+    statuses = {verdict.status for _, verdict in inputs}
+    if "conflicted" in statuses:
+        return ProofVerdict("conflicted", "an input proof is conflicted")
+    if statuses != {"verified"}:
+        return ProofVerdict("unverified", "an input proof is not verified")
+    defect = _calculation_input_defect(evidence, [row for row, _ in inputs])
+    if defect is not None:
+        return ProofVerdict("unverified", defect)
+    formula_id, version = str(evidence.proof["formulaId"]), str(evidence.proof["formulaVersion"])
+    try:
+        recomputed = recompute(formula_id, version, tuple(row.value or "" for row, _ in inputs))
+    except (ArithmeticError, ValueError) as exc:
+        return ProofVerdict("unverified", f"formula {formula_id}@{version} failed: {exc}")
+    if recomputed is None:
+        return ProofVerdict("unverified", f"formula {formula_id}@{version} is unknown")
+    if recomputed.strip() != evidence.value:
+        return ProofVerdict("conflicted", f"formula recomputes {recomputed.strip()!r}, row states {evidence.value!r}")
+    return _VERIFIED
 
 
 class EvidenceLedger:
@@ -673,7 +1084,10 @@ def ingest_evidence(
     Refusals journal ``evidence.rejected`` ({evidence_id, reason, known_at, as_of})
     via ``on_reject`` (wire KernelCore's append_event with functools.partial) then raise.
     """
-    missing = _ingest_missing(evidence)
+    inputs = evidence.proof.get("inputProofIds")
+    missing = _ingest_missing(evidence) + [
+        f"input proof {eid}" for eid in (inputs if isinstance(inputs, list) else []) if eid not in ledger
+    ]
     if missing:
         reason, detail = "PROVENANCE_FAILURE", f"missing: {', '.join(missing)}"
     else:
@@ -712,6 +1126,11 @@ def evidence_to_dict(evidence: Evidence) -> dict[str, JSONValue]:
         "record_kind": evidence.record_kind,
         "claim_kind": evidence.claim_kind,
         "provenance": dict(evidence.provenance),
+        "value": evidence.value,
+        "entity": evidence.entity,
+        "period": evidence.period,
+        "unit": evidence.unit,
+        "proof": dict(evidence.proof),
         "source_domain": evidence_domain(evidence.provenance),
         "integrity_class": evidence_integrity(evidence.provenance),
     }
@@ -811,6 +1230,12 @@ def _evidence_claim_kind(d: dict[str, object]) -> str:
     raise EvidenceIntegrityError(f"evidence: 'claim_kind' must be one of {list(CLAIM_KINDS)}, got {raw!r}")
 
 
+def _evidence_proof(d: dict[str, object]) -> dict[str, JSONValue]:
+    """proof; absent or null means no proof recorded so persisted history stays readable."""
+    raw = d.get("proof")
+    return {} if raw is None else validate_proof(raw)
+
+
 def evidence_from_dict(data: Mapping[str, object]) -> Evidence:
     """Rebuild validated Evidence (constructor re-checks hash/confidence)."""
     d = dict(data)
@@ -848,6 +1273,11 @@ def evidence_from_dict(data: Mapping[str, object]) -> Evidence:
         record_kind=_evidence_record_kind(d),
         claim_kind=_evidence_claim_kind(d),
         provenance=provenance,
+        value=_opt_str(d, "value"),
+        entity=_opt_str(d, "entity"),
+        period=_opt_str(d, "period"),
+        unit=_opt_str(d, "unit"),
+        proof=_evidence_proof(d),
     )
 
 

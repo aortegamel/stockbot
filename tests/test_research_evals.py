@@ -417,7 +417,9 @@ def test_gs_arch_facts_inference_split() -> None:
 
     assert tuple(CLAIM_TYPES) == (
         "observed_fact",
+        "calculation",
         "inference",
+        "assumption",
         "unknown",
         "contradicted",
         "conditional_risk",
@@ -544,6 +546,7 @@ def test_gs_arch_claim_type_render_gate() -> None:
 def test_gs_arch_material_claims_trace_to_raw(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     from app.research import service as _svc
+    from app.research.agents import CLAIM_TYPES
     from app.research.repository import ResearchRepository as _Repo
 
     repo = _Repo()
@@ -557,7 +560,7 @@ def test_gs_arch_material_claims_trace_to_raw(tmp_path: Path, monkeypatch: pytes
         _svc.record_committee_analysis(sid, jid, role, _gs_envelope(eid), repo=repo)
     out = _svc.finalize_session(
         sid,
-        "GS exposure is filing-backed.",
+        "GS 10-K discloses OpenAI-linked exposure. GS exposure is filing-backed.",
         [{"text": "GS 10-K discloses OpenAI-linked exposure", "claim_type": "observed_fact", "evidence_ids": [eid]}],
         repo=repo,
     )
@@ -571,20 +574,14 @@ def test_gs_arch_material_claims_trace_to_raw(tmp_path: Path, monkeypatch: pytes
     assert isinstance(claims, list) and claims
     for claim in claims:
         assert isinstance(claim, dict)
-        assert claim.get("claim_type") in (
-            "observed_fact",
-            "inference",
-            "unknown",
-            "contradicted",
-            "conditional_risk",
-            "attributed_report",
-        )
+        assert claim.get("claim_type") in CLAIM_TYPES
         refs = claim.get("evidence_ids", [])
         assert isinstance(refs, list)
         if claim.get("claim_type") != "unknown":  # only unknown may cite nothing
             assert refs and set(refs) <= frozen
     assert final.get("grounded_claims") == claims
-    assert final.get("answer") == "GS exposure is filing-backed."
+    # The uncovered sentence is deleted before publication; the claim-backed one stays.
+    assert final.get("answer") == "GS 10-K discloses OpenAI-linked exposure."
 
 
 # ---------------------------------------------------------------------------
@@ -1351,7 +1348,7 @@ def test_promotion_derives_raw_declared_scoped_unknown_from_ledger(
         svc.record_committee_analysis(sid, jid, role, _gs_envelope(eid), repo=repo)
     svc.finalize_session(
         sid,
-        "GS exposure is filing-backed.",
+        "GS 10-K discloses OpenAI-linked exposure.",
         [{"text": "GS 10-K discloses OpenAI-linked exposure", "claim_type": "observed_fact", "evidence_ids": [eid]}],
         repo=repo,
     )
@@ -1360,7 +1357,7 @@ def test_promotion_derives_raw_declared_scoped_unknown_from_ledger(
     promoted = load_fixture("gs-openai-sec-only", fixtures)
     assert promoted["question"] == _GS_Q
     assert promoted["evidence_ids"] == [eid] and promoted["known_ats"] == ["2025-05-01T00:00:00+00:00"]
-    assert promoted["answer_excerpt"] == "GS exposure is filing-backed."
+    assert promoted["answer_excerpt"] == "GS 10-K discloses OpenAI-linked exposure."
     assert promoted["freeze_before"] == fid and promoted["freeze_after"] == fid
     assert promoted["trace"]["filings_opened"] == [_GS_ACC]
     assert promoted["trace"]["documents_opened"] == [f"{_GS_ACC}|{_GS_DOC}"]

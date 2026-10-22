@@ -8,6 +8,7 @@ admission is exercised end to end without touching the network.
 
 from datetime import datetime
 from hashlib import sha256
+from pathlib import Path
 
 import pytest
 
@@ -180,3 +181,35 @@ def install(monkeypatch: pytest.MonkeyPatch) -> None:
     _SOURCE_ARCHIVE_PATH.clear()
     monkeypatch.setattr("app.sec.documents.get_sec_document", fake_sec_document)
     monkeypatch.setattr("app.research.service._exact_source_bytes", _fake_exact_source_bytes)
+
+
+def proven_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, passages: dict[str, str]) -> str:
+    """A research session whose ledger holds one archived SEC observation per evidence id.
+
+    Final gates verify claims against this ledger (content hash + archive bytes),
+    so a gate test cites these ids instead of ids the ledger never admitted.
+    """
+    from app.research import service
+    from app.research.repository import ResearchRepository
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path / "data"))
+    install(monkeypatch)
+    register_document(DEFAULT_ACCESSION, DEFAULT_DOCUMENT, "\n".join(passages.values()))
+    sid = service.create_research("support?", "support?", as_of="2025-06-30T00:00:00+00:00")
+    job = ResearchRepository().list_jobs(sid)[0].job_id
+    for eid, passage in passages.items():
+        item: dict[str, object] = {
+            "evidence_id": eid,
+            "content": passage,
+            "claim_text": passage,
+            "subject": "NVDA",
+            "source_name": "SEC",
+            "source_record_id": DEFAULT_ACCESSION,
+            "document_name": DEFAULT_DOCUMENT,
+            "matching_passage": passage,
+            "known_at": "2025-05-01T00:00:00+00:00",
+            "source_handle": handle_for_registered(passage),
+        }
+        service.record_evidence(sid, job, item)
+    return sid

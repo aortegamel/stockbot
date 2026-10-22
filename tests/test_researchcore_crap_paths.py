@@ -855,6 +855,20 @@ def test_materialize_sec_passage_fails_closed_per_handle_defect() -> None:
         materialize_sec_passage(handle, "   ")
 
 
+@pytest.mark.parametrize(
+    ("window", "locator"),
+    [
+        ("Revenue was 7 million. Revenue was 7 million.", "Revenue was 7 million."),
+        ("Revenue\twas 7 million.\nRevenue   was 7 million.", "Revenue was 7 million."),
+        ("a a a", "a a"),
+    ],
+)
+def test_materialize_sec_passage_rejects_ambiguous_normalized_occurrences(window: str, locator: str) -> None:
+    handle = seam.handle_for(window)
+    with pytest.raises(ValueError, match="ERR_PASSAGE_AMBIGUOUS"):
+        svc.materialize_sec_passage(handle, locator)
+
+
 def test_live_handle_survives_archival_when_text_hash_differs_from_source_bytes(tmp_path: Path) -> None:
     """Live binary/PDF handles stay valid after archival: text_hash names the window, source bytes name the revision."""
     import hashlib as _hashlib
@@ -1465,7 +1479,7 @@ def test_finalize_terminal_on_repeat(tmp_path: Path, monkeypatch: pytest.MonkeyP
     eid = f"{sid}:ev:1"
     _full_trio(repo, sid, src, eid)
     svc.decide_next_wave(sid, repo=repo)
-    out = svc.finalize_session(sid, "answer", [{"text": "finding", "evidence_ids": [eid]}], repo=repo)
+    out = svc.finalize_session(sid, "finding", [{"text": "finding", "evidence_ids": [eid]}], repo=repo)
     assert out["status"] == "completed"
     with pytest.raises(ValueError, match="terminal"):
         svc.finalize_session(sid, "answer", [{"text": "finding", "evidence_ids": [eid]}], repo=repo)
@@ -1553,6 +1567,221 @@ def test_finalize_rejects_empty_synthesis(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.setattr("app.research.synthesis.final.synthesize_final", _synth_blank)
     with pytest.raises(ValueError, match="empty answer"):
         svc.finalize_session(sid, "answer", [{"text": "finding", "evidence_ids": [eid]}], repo=repo)
+
+
+# -- finalize publication proof: typed datapoints replay from ledger + archive bytes --
+
+_DP_DC = "Data Center revenue was $22,563 million for the first quarter."
+_DP_TOT = "Total revenue was $26,044 million for the first quarter."
+_DP_TYPED: dict[str, object] = {"entity": "NVDA", "period": "Q1 FY2025", "unit": "USD millions"}
+
+
+def _dp_item(eid: str, passage: str, value: str, *, typed: bool = True) -> dict[str, object]:
+    """One SEC observation item carrying a typed datapoint value for a registered passage."""
+    item = _item(eid, matching_passage=passage, content=passage, source_handle=seam.handle_for_registered(passage))
+    item["value"] = value
+    if typed:
+        item.update(_DP_TYPED)
+    return item
+
+
+def _dp_frozen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ResearchRepository, str, dict[str, str]]:
+    """Frozen session with two SEC observations (data center, total) and one difference calculation."""
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path / "data"))
+    repo = _repo(tmp_path, monkeypatch)
+    sid, src = _sid(repo)
+    seam.register_document(seam.DEFAULT_ACCESSION, seam.DEFAULT_DOCUMENT, f"Item 2.\n{_DP_DC}\n{_DP_TOT}")
+    ids = {"dc": f"{sid}:ev:dc", "tot": f"{sid}:ev:tot", "calc": f"{sid}:ev:calc"}
+    for key, passage, value in (("dc", _DP_DC, "22,563"), ("tot", _DP_TOT, "26,044")):
+        svc.record_evidence(sid, src, _dp_item(ids[key], passage, value), repo=repo)
+    calc = {
+        "evidence_id": ids["calc"],
+        "claim_kind": "calculation",
+        "formula_id": "difference",
+        "formula_version": "1",
+        "input_evidence_ids": [ids["tot"], ids["dc"]],
+        "value": "3481",
+        "claim_text": "non-data-center revenue",
+        "subject": "NVDA",
+        "known_at": KNOWN,
+        **_DP_TYPED,
+    }
+    svc.record_evidence(sid, src, calc, repo=repo)
+    svc.complete_job(src, {}, repo=repo)
+    svc.freeze_session(sid, 1, repo=repo)
+    return repo, sid, ids
+
+
+def _dp_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ResearchRepository, str, dict[str, str]]:
+    """The frozen datapoint session with the committee trio recorded and the next wave decided."""
+    repo, sid, ids = _dp_frozen(tmp_path, monkeypatch)
+    _trio(repo, sid, ids["dc"])
+    svc.decide_next_wave(sid, repo=repo)
+    return repo, sid, ids
+
+
+def test_committee_analysis_rejects_fabricated_number(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The committee write is a factual path: a number no cited row holds fails before the job completes."""
+    repo, sid, ids = _dp_frozen(tmp_path, monkeypatch)
+    jobs = svc.create_committee_jobs(sid, 1, repo=repo)["jobs"]
+    assert isinstance(jobs, list) and isinstance(jobs[0], str)
+    bad = _ana(ids["dc"])
+    bad["claims"] = [{"text": "Data Center revenue was $99,999 million.", "evidence_ids": [ids["dc"]]}]
+    with pytest.raises(ValueError, match="record_committee_analysis: ERR_DATAPOINT_UNVERIFIED"):
+        svc.record_committee_analysis(sid, jobs[0], "stockbot", bad, repo=repo)
+    assert repo.get_job(jobs[0]).status != "completed"
+    good = _ana(ids["dc"])
+    good["claims"] = [{"text": "Data Center revenue was $22,563 million.", "evidence_ids": [ids["dc"]]}]
+    svc.record_committee_analysis(sid, jobs[0], "stockbot", good, repo=repo)
+    assert repo.get_job(jobs[0]).status == "completed"
+
+
+def _dp_claim(
+    text: str, claim_type: str, eids: list[str], value: str | None = None, **typed: object
+) -> dict[str, object]:
+    claim: dict[str, object] = {"text": text, "claim_type": claim_type, "evidence_ids": eids}
+    if value is not None:
+        claim.update({"value": value, **_DP_TYPED, **typed})
+    return claim
+
+
+def test_finalize_rejects_fabricated_and_unrelated_datapoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A number the ledger cannot replay never publishes: fail closed, nothing persisted."""
+    repo, sid, ids = _dp_session(tmp_path, monkeypatch)
+    dc_text = "Data Center revenue was $22,563 million."
+    fabricated = [
+        # Fabricated typed value against a real row.
+        _dp_claim("Data Center revenue was $22,564 million.", "observed_fact", [ids["dc"]], "22,564"),
+        # Real value, but the cited evidence id proves a different datapoint.
+        _dp_claim(dc_text, "observed_fact", [ids["tot"]], "22,563"),
+        # Real value and row, wrong entity.
+        _dp_claim(dc_text, "observed_fact", [ids["dc"]], "22,563", entity="AMD"),
+        # Untyped number in prose that no cited source text holds.
+        _dp_claim("Data Center revenue was $99,999 million.", "observed_fact", [ids["dc"]]),
+        # Calculation claim whose value the formula does not recompute.
+        _dp_claim("Other revenue was $3480 million.", "calculation", [ids["calc"]], "3480"),
+    ]
+    for claim in fabricated:
+        with pytest.raises(ValueError, match="finalize_session: ERR_DATAPOINT_UNVERIFIED"):
+            svc.finalize_session(sid, str(claim["text"]), [claim], repo=repo)
+    session = repo.get_session(sid)
+    assert session.status != "completed" and not session.final_result
+
+
+def test_finalize_publishes_valid_observation_calculation_and_qualified_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Valid chains replay; uncovered factual answer prose is deleted before publication."""
+    repo, sid, ids = _dp_session(tmp_path, monkeypatch)
+    dc_text = "Data Center revenue was $22,563 million."
+    calc_text = "Non-data-center revenue was $3481 million."
+    inference = "Demand may stay supply-constrained."
+    claims: list[object] = [
+        _dp_claim(dc_text, "observed_fact", [ids["dc"]], "22,563"),
+        _dp_claim(calc_text, "calculation", [ids["calc"]], "3481"),
+        _dp_claim(inference, "inference", [ids["dc"]]),
+    ]
+    answer = f"{dc_text} {calc_text} {inference} Revenue will triple to $90,000 million next year."
+    out = svc.finalize_session(sid, answer, claims, repo=repo)
+    assert out["status"] == "completed"
+    final = repo.get_session(sid).final_result
+    assert isinstance(final, dict)
+    published = final["answer"]
+    assert isinstance(published, str)
+    assert dc_text in published and calc_text in published and inference in published
+    assert "90,000" not in published  # uncovered factual sentence deleted surgically
+    rows = final["claims"]
+    assert isinstance(rows, list)
+    typed = {
+        (r.get("claim_type"), r.get("value"), r.get("entity"), r.get("period")) for r in rows if isinstance(r, dict)
+    }
+    assert ("observed_fact", "22,563", "NVDA", "Q1 FY2025") in typed
+    assert ("calculation", "3481", "NVDA", "Q1 FY2025") in typed
+    assert ("inference", None, None, None) in typed  # an inference stays qualified, never a datapoint
+
+
+def test_finalize_fails_closed_when_archived_source_bytes_are_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Freeze membership alone never publishes: the archived revision must still replay."""
+    from app.storage import raw_archive
+
+    repo, sid, ids = _dp_session(tmp_path, monkeypatch)
+    key = f"{seam.DEFAULT_ACCESSION}/{seam.DEFAULT_DOCUMENT}"
+    revisions = list(raw_archive.iter_archive("sec", "document", key))
+    assert revisions
+    for record in revisions:
+        record.payload_path.unlink()
+    claim = _dp_claim("Data Center revenue was $22,563 million.", "observed_fact", [ids["dc"]], "22,563")
+    with pytest.raises(ValueError, match="finalize_session: ERR_PROOF_UNVERIFIED"):
+        svc.finalize_session(sid, str(claim["text"]), [claim], repo=repo)
+    assert repo.get_session(sid).status != "completed"
+
+
+def test_record_evidence_refuses_unprovable_datapoints_before_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Admission archives then verifies: an unprovable value or calculation never becomes a ledger row."""
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path / "data"))
+    repo = _repo(tmp_path, monkeypatch)
+    sid, src = _sid(repo)
+    seam.register_document(seam.DEFAULT_ACCESSION, seam.DEFAULT_DOCUMENT, f"Item 2.\n{_DP_DC}\n{_DP_TOT}")
+    dc = f"{sid}:ev:dc"
+    with pytest.raises(ValueError, match="record_evidence: ERR_DATAPOINT_UNVERIFIED"):
+        svc.record_evidence(sid, src, _dp_item(dc, _DP_DC, "26,044"), repo=repo)
+    with pytest.raises(ValueError, match="record_evidence: ERR_DATAPOINT_INCOMPLETE"):
+        svc.record_evidence(sid, src, _dp_item(dc, _DP_DC, "22,563", typed=False), repo=repo)
+    svc.record_evidence(sid, src, _dp_item(dc, _DP_DC, "22,563"), repo=repo)
+    calc: dict[str, object] = {
+        "claim_kind": "calculation",
+        "formula_id": "sum",
+        "formula_version": "1",
+        "input_evidence_ids": [dc, dc],
+        "value": "45126",
+        "claim_text": "doubled",
+        "subject": "NVDA",
+        "known_at": KNOWN,
+        **_DP_TYPED,
+    }
+    for bad in (
+        {"value": "45127"},
+        {"formula_id": "magic"},
+        {"formula_version": "2"},
+        {"input_evidence_ids": [dc, f"{sid}:ev:missing"]},
+        {"entity": "AMD"},
+        {"period": "Q2 FY2025"},
+        {"unit": "EUR millions"},
+    ):
+        with pytest.raises(ValueError, match="record_evidence: ERR_CALCULATION_INVALID"):
+            svc.record_evidence(sid, src, {**calc, **bad, "evidence_id": f"{sid}:ev:bad"}, repo=repo)
+    svc.record_evidence(sid, src, {**calc, "evidence_id": f"{sid}:ev:sum"}, repo=repo)
+    assert sorted(str(r.get("evidence_id")) for r in repo.list_evidence(sid)) == sorted([dc, f"{sid}:ev:sum"])
+
+
+def test_finalize_published_calculation_carries_replayable_audit_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, sid, ids = _dp_session(tmp_path, monkeypatch)
+    calc_text = "Non-data-center revenue was $3481 million."
+    claim = _dp_claim(calc_text, "calculation", [ids["calc"]], "3481")
+    assert svc.finalize_session(sid, calc_text, [claim], repo=repo)["status"] == "completed"
+    final = repo.get_session(sid).final_result
+    assert isinstance(final, dict)
+    assert "calculations" in final
+    calculations = final["calculations"]
+    assert isinstance(calculations, list)
+    calc = next(row for row in calculations if isinstance(row, dict) and row.get("evidence_id") == ids["calc"])
+    assert (calc.get("formulaId"), calc.get("formulaVersion")) == ("difference", "1")
+    assert calc.get("formula_id") == "difference" and calc.get("formula_version") == "1"
+    assert calc.get("result") == "3481" and calc.get("value") == "3481"
+    inputs = calc.get("inputs")
+    assert isinstance(inputs, list) and {row.get("evidence_id") for row in inputs if isinstance(row, dict)} == {
+        ids["tot"],
+        ids["dc"],
+    }
+    assert [row.get("evidence_id") for row in inputs if isinstance(row, dict)] == [ids["tot"], ids["dc"]]
+    assert calc.get("recomputedValue") == "3481" and calc.get("recomputed_result") == "3481"
+    assert calc.get("verification") == "verified" and calc.get("verification_status") == "verified"
 
 
 # --- kernel: repository/jobs/director/agents (from /tmp/rc_corekernel.py) ---
@@ -5207,7 +5436,9 @@ def _grounded(prompt: str) -> str:
             if (tok.startswith("EV-") or ":sec:" in tok) and tok not in seen:
                 seen.append(tok)
     claims: list[dict[str, object]] = (
-        [] if not seen else [{"text": f"grounded finding {i}", "evidence_ids": [eid]} for i, eid in enumerate(seen[:6])]
+        []
+        if not seen
+        else [{"text": f"grounded finding {chr(97 + i)}", "evidence_ids": [eid]} for i, eid in enumerate(seen[:6])]
     )
     if "Temporary assignment" in prompt:
         return json.dumps(claims)
@@ -6221,7 +6452,10 @@ def _prompt_wave(prompt: str) -> int:
 
 def _scripted_claims(prompt: str) -> list[dict[str, object]]:
     """Grounded claims citing up to six ids the prompt actually acquired."""
-    return [{"text": f"finding {i}", "evidence_ids": [eid]} for i, eid in enumerate(_prompt_evidence_ids(prompt)[:6])]
+    return [
+        {"text": f"finding {chr(97 + i)}", "evidence_ids": [eid]}
+        for i, eid in enumerate(_prompt_evidence_ids(prompt)[:6])
+    ]
 
 
 def _scripted_envelope(prompt: str, follow_ups: list[dict[str, object]]) -> str:
@@ -6720,7 +6954,7 @@ def test_structured_provenance_replays_dataset_uri_and_timing(
         assert declared["source_uri"] == "https://sec.gov/declared"
 
 
-def test_web_provenance_skips_uncitable_rows_and_selects_matching_url(
+def test_web_provenance_skips_uncitable_rows_and_rejects_ambiguous_match(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = _repo(tmp_path, monkeypatch)
@@ -6753,8 +6987,8 @@ def test_web_provenance_skips_uncitable_rows_and_selects_matching_url(
     assert out["excerpt"] == "citation"
     assert "source_content" not in out
     assert "source_representation" not in out
-    first = svc._web_provenance({"tool_result_id": "web", "matching_passage": "citation"}, store=repo)
-    assert first["url"] == "https://example.com/first"
+    with pytest.raises(ValueError, match="ERR_PASSAGE_AMBIGUOUS"):
+        svc._web_provenance({"tool_result_id": "web", "matching_passage": "citation"}, store=repo)
 
 
 def test_web_provenance_preserves_normalized_highlight_and_stored_fields(
@@ -7110,3 +7344,317 @@ def test_prop_today_stamp_is_idempotent_and_well_formed() -> None:
         assert query_with_today_utc(stamped) == stamped
 
     check()
+
+
+def _regweb_persist(repo: ResearchRepository, sid: str, job: str, rid: str, highlight: str) -> str:
+    return str(
+        svc.persist_tool_result(
+            sid,
+            job,
+            "search_web",
+            rid,
+            {
+                "evidence": [
+                    {
+                        "url": "https://example.com/a",
+                        "source_domain": "example.com",
+                        "title": "NVDA news",
+                        "published_at": "2025-06-20",
+                        "retrieved_at": "2025-06-21",
+                        "highlight": highlight,
+                        "source_content": f"{highlight} Quarter body.",
+                    }
+                ]
+            },
+            repo=repo,
+        )["tool_result_id"]
+    )
+
+
+def test_regweb_web_admission_replays_persisted_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A web claim replays from the persisted search_web result; excerpt mismatch fails closed."""
+    from app.research import service as _svc
+
+    repo = _repo(tmp_path, monkeypatch)
+    sid = _svc.create_research(
+        "NVDA demand?",
+        "o",
+        as_of=SVC_ASOF,
+        policy={"research_sources": {"mode": "allowlist", "sources": ["SEC", "FINRA", "WEB"]}},
+        repo=repo,
+    )
+    web = str(_svc.start_job(sid, "source_agent", source="WEB", repo=repo, wave_id=1)["job_id"])
+    highlight = "NVDA demand rises this quarter"
+    rid = _regweb_persist(repo, sid, web, f"{sid}:tr:web-exact", highlight)
+    out = _svc.record_evidence(
+        sid,
+        web,
+        {
+            "evidence_id": f"{sid}:ev:web-exact",
+            "content": highlight,
+            "claim_text": highlight,
+            "subject": "NVDA",
+            "source_name": "web",
+            "tool_result_id": rid,
+            "matching_passage": highlight,
+            "known_at": KNOWN,
+        },
+        repo=repo,
+    )
+    prov = out["provenance"]
+    assert isinstance(prov, dict) and prov["excerpt"] == highlight
+    assert prov["source_content"] == f"{highlight} Quarter body."
+    with pytest.raises(ValueError, match="ERR_PASSAGE_NOT_IN_SOURCE"):
+        _svc.record_evidence(
+            sid,
+            web,
+            {
+                "evidence_id": f"{sid}:ev:web-drift",
+                "content": "fabricated tail",
+                "claim_text": "fabricated tail",
+                "subject": "NVDA",
+                "source_name": "web",
+                "tool_result_id": rid,
+                "matching_passage": "fabricated tail",
+                "known_at": KNOWN,
+            },
+            repo=repo,
+        )
+
+
+def test_regweb_web_datapoint_value_must_be_excerpt_verbatim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A value found only in the wider extraction but not the excerpt fails ERR_DATAPOINT_UNVERIFIED."""
+    from app.research import service as _svc
+
+    repo = _repo(tmp_path, monkeypatch)
+    sid = _svc.create_research(
+        "NVDA demand?",
+        "o",
+        as_of=SVC_ASOF,
+        policy={"research_sources": {"mode": "allowlist", "sources": ["SEC", "FINRA", "WEB"]}},
+        repo=repo,
+    )
+    web = str(_svc.start_job(sid, "source_agent", source="WEB", repo=repo, wave_id=1)["job_id"])
+    rid = _regweb_persist(repo, sid, web, f"{sid}:tr:web-val", "NVDA demand rises")
+    with pytest.raises(ValueError, match="ERR_DATAPOINT_UNVERIFIED"):
+        _svc.record_evidence(
+            sid,
+            web,
+            {
+                "evidence_id": f"{sid}:ev:web-val",
+                "content": "NVDA demand rises",
+                "claim_text": "NVDA demand rises",
+                "subject": "NVDA",
+                "source_name": "web",
+                "tool_result_id": rid,
+                "matching_passage": "NVDA demand rises",
+                "known_at": KNOWN,
+                "value": "Quarter body",
+                "entity": "NVDA",
+                "period": "2025-Q2",
+            },
+            repo=repo,
+        )
+
+
+def test_regweb_web_bytes_absent_and_unavailable_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Missing tool bytes fail closed; a web row only ever shows the persisted extraction."""
+    from app.research.sources import read_source_document
+
+    provenance = {
+        "kind": "web_source",
+        "url": "https://example.com/a",
+        "excerpt": "quoted excerpt",
+        "tool_result_id": "tr-gone",
+    }
+
+    class _Gone:
+        def get_evidence(self, evidence_id: str) -> dict[str, object]:
+            return {"evidence_id": evidence_id, "session_id": "s", "provenance": provenance}
+
+        def get_tool_result(self, tool_result_id: str) -> dict[str, object]:
+            raise KeyError(tool_result_id)
+
+    with pytest.raises(FileNotFoundError, match="replay"):
+        read_source_document("evidence:ev-gone", data_root=tmp_path, repo=_Gone())
+
+
+def test_regweb_web_absence_carries_coverage_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A web absence records its searched query/scope/period and stays per-domain."""
+    from app.research import service as _svc
+
+    repo = _repo(tmp_path, monkeypatch)
+    sid = _svc.create_research(
+        "NVDA demand?",
+        "o",
+        as_of=SVC_ASOF,
+        policy={"research_sources": {"mode": "allowlist", "sources": ["SEC", "FINRA", "WEB"]}},
+        repo=repo,
+    )
+    web = str(_svc.start_job(sid, "source_agent", source="WEB", repo=repo, wave_id=1)["job_id"])
+    out = _svc.record_evidence(
+        sid,
+        web,
+        {
+            "wave_id": 1,
+            "content": "no NVDA web result",
+            "claim_text": "not located in searched web scope: NVDA demand",
+            "claim_kind": "absence_observation",
+            "subject": "NVDA",
+            "source_name": "web",
+            "known_at": KNOWN,
+            "search_id": "w1",
+            "query": "NVDA demand",
+            "coverage": _cov(entities=["NVDA"], docs=["search_web:NVDA demand"]),
+        },
+        repo=repo,
+    )
+    assert out.get("recorded_as") == "coverage_artifact"
+    stored = repo.list_coverage_artifacts(sid)[0]
+    assert stored.get("source_domain") == "WEB"
+    coverage = stored.get("coverage")
+    assert isinstance(coverage, dict) and coverage.get("docs") == ["search_web:NVDA demand"]
+    assert _svc._finalize_absence_texts(repo, sid, domain="WEB") == [out["claim_text"]]
+
+
+# ---------------------------------------------------------------------------
+# Change 4 regression: FINRA proof + coverage paths
+# ---------------------------------------------------------------------------
+def test_reg4_finra_record_texts_cover_every_row_shape() -> None:
+    """Every contributing row is citable; non-row payloads never cite."""
+    result: dict[str, object] = {
+        "result": {
+            "records": [{"symbolCode": "AAA", "v": 1}, "not-a-row", {"symbolCode": "BBB", "v": 2}],
+            "query": {"ticker": "AAA"},
+            "briefing": "  threshold screen  ",
+            "metrics": {"listed": 2},
+        }
+    }
+    texts = svc._finra_record_texts(result)
+    assert any('"AAA"' in text for text in texts) and any('"BBB"' in text for text in texts)
+    assert "not-a-row" not in " ".join(texts)
+    assert '"ticker": "AAA"' in " ".join(texts) and "threshold screen" in texts
+    assert svc._finra_record_texts({"result": ["not", "a", "mapping"]}) == []
+    assert svc._finra_record_texts({}) == []
+
+
+def test_reg4_finra_replay_selects_cited_not_first_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The persisted second record replays; a first-row-only read would cite the wrong record."""
+    repo = _repo(tmp_path, monkeypatch)
+    sid, jid = _sid(repo)
+    repo.save_tool_result(
+        {
+            "tool_result_id": "board",
+            "session_id": sid,
+            "job_id": jid,
+            "tool_name": "query_finra",
+            "result": {
+                "records": [{"ticker": "AAA", "pct": 30.0}, {"ticker": "BBB", "pct": 20.0}],
+                "dataset_id": "otcMarket/consolidatedShortInterest",
+            },
+        }
+    )
+    out = svc._finra_provenance(
+        {"tool_result_id": "board", "matching_passage": '"pct": 20.0'}, store=repo, session_id=sid
+    )
+    assert '"pct": 20.0' in str(out["record_identity"]) and '"pct": 30.0' not in str(out["record_identity"])
+
+
+def test_reg4_finra_conflict_preserved_not_silently_preferred(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cited value absent from the persisted result fails closed; the conflict is preserved."""
+    repo = _repo(tmp_path, monkeypatch)
+    sid, jid = _sid(repo)
+    repo.save_tool_result(
+        {
+            "tool_result_id": "one",
+            "session_id": sid,
+            "job_id": jid,
+            "tool_name": "query_finra",
+            "result": {"records": [{"ticker": "AAA", "pct": 30.0}]},
+        }
+    )
+    with pytest.raises(ValueError, match="ERR_PASSAGE_NOT_IN_SOURCE"):
+        svc._finra_provenance({"tool_result_id": "one", "matching_passage": '"pct": 99.9'}, store=repo, session_id=sid)
+
+
+def test_reg4_finra_absence_stays_coverage_never_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A FINRA absence observation records as a coverage artifact, never ledger evidence."""
+    repo = _repo(tmp_path, monkeypatch)
+    sid, src = _sid(repo)
+    item = {**_neg_item(_neg_eid(sid, 1)), "subject": "NVDA", "source_name": "FINRA", "query": "NVDA threshold"}
+    out = svc.record_evidence(sid, src, item, repo=repo)
+    assert out["recorded_as"] == "coverage_artifact" and out["citable"] is False
+    assert repo.list_evidence(sid) == [] and len(repo.list_coverage_artifacts(sid)) == 1
+
+
+def test_reg4_finra_incomplete_pagination_coverage_visible(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Incomplete pagination stays visible: the artifact pins pagination_complete False."""
+    repo = _repo(tmp_path, monkeypatch)
+    sid, src = _sid(repo)
+    item = {
+        **_neg_item(_neg_eid(sid, 2), query="NVDA weekly"),
+        "coverage": _cov(pagination_complete=False, complete=False),
+        "subject": "NVDA",
+    }
+    out = svc.record_evidence(sid, src, item, repo=repo)
+    assert out["recorded_as"] == "coverage_artifact"
+    artifact = repo.list_coverage_artifacts(sid)[0]
+    assert isinstance(artifact, dict)
+    coverage = artifact["coverage"]
+    assert isinstance(coverage, dict) and coverage["pagination_complete"] is False
+
+
+def test_e2e_legacy_numeric_text_cannot_publish_without_datapoint_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Archived text alone cannot promote a legacy numeric assertion into verified publication."""
+    from app.research.agents import GroundedClaim
+
+    sid = seam.proven_session(monkeypatch, tmp_path, {"EV-LEGACY-NUMBER": "Revenue was 12345 USD."})
+    repo = ResearchRepository()
+    legacy = repo.get_evidence("EV-LEGACY-NUMBER")
+    assert not legacy["proof"] and legacy["value"] is None
+    claim = GroundedClaim(
+        text="Revenue was 12345 USD.",
+        claim_type="observed_fact",
+        evidence_ids=["EV-LEGACY-NUMBER"],
+    )
+    with pytest.raises(ValueError, match="ERR_DATAPOINT_UNVERIFIED"):
+        svc.require_verified_claims(repo, sid, [claim], "acceptance")
+    assert repo.get_evidence("EV-LEGACY-NUMBER") == legacy
+
+
+def test_e2e_archived_bytes_removed_after_freeze_never_publish(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Freeze membership and a real public URL cannot replace the missing bytes that a proof pins."""
+    from app.research.agents import GroundedClaim
+    from app.research.evidence import evidence_from_dict
+    from app.research.freeze import freeze_from_dict, verify_freeze
+    from app.sec.archive import find_archived_document
+    from tests.test_research_harness import _e2e_rows, _e2e_session
+
+    e2e = _e2e_session(tmp_path, monkeypatch)
+    rows = _e2e_rows(e2e)
+    evidence = rows["tot"]
+    frozen = freeze_from_dict(e2e.repo.get_freeze(f"{e2e.sid}:1:freeze"))
+    original = find_archived_document(
+        seam.DEFAULT_ACCESSION,
+        seam.DEFAULT_DOCUMENT,
+        sha256=str(evidence.proof["sourceId"])[7:],
+        root=e2e.data / "raw",
+    )
+    assert original is not None
+    original.payload_path.unlink()
+    # Ledger hashes stay stable. The publication check must still replay the missing archive.
+    verify_freeze(frozen, list(rows.values()))
+    claim = GroundedClaim(
+        text="NVDA revenue was 26,044 million",
+        claim_type="observed_fact",
+        evidence_ids=[evidence.evidence_id],
+        value="26,044",
+        entity=evidence.entity,
+        period=evidence.period,
+        unit=evidence.unit,
+    )
+    with pytest.raises(ValueError, match="ERR_PROOF_UNVERIFIED"):
+        svc.require_verified_claims(e2e.repo, e2e.sid, [claim], "acceptance")
+    assert evidence_from_dict(e2e.repo.get_evidence(evidence.evidence_id)) == evidence

@@ -10,6 +10,7 @@ from app import valuation
 from app.domain.market.securities import TickerAlias
 from app.normalization import normalize_sec_company_facts, normalize_sec_tickers
 from app.policy import LOCAL_CONTEXT
+from app.services import sec_facts
 from app.tools import execute_tool
 
 
@@ -833,3 +834,50 @@ def test_valuation_through_real_normalization_with_instant_prefix(monkeypatch: p
     tiers = projected["tiers"]
     assert isinstance(tiers, list)
     assert tiers
+
+
+def test_valuation_eps_carries_formula_lineage_and_nested_q4(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = _LiveLikeSecFactsGateway()
+    gateway.alias_rows.extend(
+        normalize_sec_tickers(
+            {"0": {"cik_str": _NVDA_CIK, "ticker": "NVDA", "title": "NVDA Corp"}},
+            retrieved_at=_VALUATION_FACTS_RETRIEVED_AT,
+            content_hash="valuation-tickers-lineage",
+        ).get("entity_aliases", [])
+    )
+    monkeypatch.setattr(valuation.sec_facts, "_gateway", lambda: gateway)
+    payload: dict[str, object] = {
+        "cik": _NVDA_CIK,
+        "entityName": "NVDA Corp",
+        "facts": {
+            "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": _valuation_shares_prefix(1)}}},
+            "us-gaap": {
+                "EarningsPerShareDiluted": {"units": {"USD/shares": _valuation_diluted()}},
+                "EarningsPerShareBasic": {"units": {"USD/shares": _valuation_basic()}},
+            },
+        },
+    }
+    datasets = normalize_sec_company_facts(
+        payload,
+        retrieved_at=_VALUATION_FACTS_RETRIEVED_AT,
+        content_hash="valuation-eps-lineage",
+        source_url=f"https://data.sec.gov/api/xbrl/companyfacts/CIK{_NVDA_CIK:010d}.json",
+        source_record_id=f"cik{_NVDA_CIK:010d}",
+    )
+    gateway.facts_by_cik[_NVDA_CIK] = datasets
+    result = sec_facts.get_fundamentals("NVDA", "eps", as_of="2026-08-10")
+    calculation_inputs = result["calculation_inputs"]
+    assert isinstance(calculation_inputs, dict)
+    inputs = calculation_inputs["ttm_eps_diluted"]
+    assert isinstance(inputs, list)
+    q4 = next(row for row in inputs if row["period_end"] == "2026-01-25")
+    assert isinstance(q4, dict)
+    assert q4["derived"] is True
+    assert q4["accession"] == ""
+    assert "source_identity" not in q4
+    assert [row["accession"] for row in q4["derivation_inputs"]] == ["v-a7", "v-a5"]
+    calculations = result["calculations"]
+    assert isinstance(calculations, dict)
+    assert calculations["ttm_eps_diluted"]["formulaId"] == "sec_eps_ttm"
+    assert calculations["ttm_eps_diluted"]["formulaVersion"] == "1"
+    assert calculations["ttm_eps_diluted"]["verification"] == "unverified"

@@ -388,7 +388,7 @@ export function activateQuote(root: HTMLElement, marks: HTMLElement[]): void {
 }
 
 // Readable "publisher · title · date" label. Returns "" when the document names nothing; callers pick their own fallback.
-export function sourceLabel(source: SourceDocument): string {
+export function sourceLabel(source: Pick<SourceDocument, "publisher" | "title" | "publishedAt" | "knownAt">): string {
   const parts = [source.publisher, source.title, (source.publishedAt || source.knownAt)?.slice(0, 10)];
   return [...new Set(parts.filter((part) => part !== undefined && part !== ""))].join(" · ");
 }

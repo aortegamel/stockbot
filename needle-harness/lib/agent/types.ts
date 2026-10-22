@@ -86,7 +86,9 @@ export function sourceReferences(raw: unknown): SourceReference[] {
 // carried through, never a reject threshold.
 export const FINAL_CLAIM_TYPES = [
   "observed_fact",
+  "calculation",
   "inference",
+  "assumption",
   "unknown",
   "contradicted",
   "conditional_risk",
@@ -94,11 +96,17 @@ export const FINAL_CLAIM_TYPES = [
 ] as const;
 export type FinalClaimType = (typeof FINAL_CLAIM_TYPES)[number];
 
+// The typed datapoint keys (value/entity/period/unit) use the Python ledger
+// names. Each is a non-empty string when present. `value` is verbatim in `text`.
 export type FinalClaim = {
   text: string;
   claimType: FinalClaimType;
   evidenceIds: string[];
   confidence?: number;
+  value?: string;
+  entity?: string;
+  period?: string;
+  unit?: string;
 };
 
 export type FinalPersonaResult = {

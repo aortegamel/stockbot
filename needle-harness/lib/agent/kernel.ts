@@ -144,6 +144,7 @@ export type KernelResponse = {
   reasoning?: string;
   verdict?: string;
   error?: string;
+  content?: string;
   watchlist?: WatchlistRow[];
   terminal?: { category: FailureCategory; message: string };
 };
@@ -170,11 +171,15 @@ export type FinalGateCaller = (
 // Whole-response must reject prose claims missing from inventory; the Python
 // worker then judges qualified wording as written (attribution/qualification,
 // not the underlying event) via decide() core + _persist + .70/.50 policy.
+// A typed datapoint is local too: its value is verbatim in its text and cited;
+// a calculation always carries its value. The worker proves it against the ledger.
 export function inventoryDefect(prose: string, claims: FinalClaim[], evidenceIds: ReadonlySet<string>): string | undefined {
   for (const c of claims) {
     if (!c.text || !prose.includes(c.text)) return `inventory text not a prose substring: ${c.text.slice(0, 80)}`;
     for (const id of c.evidenceIds) if (!evidenceIds.has(id)) return `inventory cites unknown evidence id: ${id}`;
-    if (c.claimType !== "unknown" && c.evidenceIds.length === 0) return `uncited non-unknown claim: ${c.text.slice(0, 80)}`;
+    if (c.claimType !== "unknown" && c.claimType !== "assumption" && c.evidenceIds.length === 0) return `uncited non-unknown claim: ${c.text.slice(0, 80)}`;
+    if (c.value !== undefined && (c.evidenceIds.length === 0 || !c.text.includes(c.value))) return `datapoint value not cited verbatim: ${c.text.slice(0, 80)}`;
+    if (c.claimType === "calculation" && c.value === undefined) return `calculation without value: ${c.text.slice(0, 80)}`;
   }
   return undefined;
 }
@@ -184,7 +189,36 @@ function toWireClaim(c: FinalClaim): Record<string, unknown> {
     claim_type: c.claimType,
     evidence_ids: [...c.evidenceIds],
     ...(c.confidence !== undefined ? { confidence: c.confidence } : {}),
+    ...(c.value !== undefined ? { value: c.value } : {}),
+    ...(c.entity !== undefined ? { entity: c.entity } : {}),
+    ...(c.period !== undefined ? { period: c.period } : {}),
+    ...(c.unit !== undefined ? { unit: c.unit } : {}),
   };
+}
+// A sentence ends at a line break, or at [.!?] before whitespace, so decimals stay whole.
+const SENTENCE = /[^\n]*?(?:[.!?](?=\s|$)|\n|$)/g;
+// A datapoint is a number token no letter or digit precedes: "$35.1B", "2025", "10-K"; not "Q3" or "p1".
+const NUMBER = /(?<![A-Za-z\d])\d(?:[\d.,]*\d)?/g;
+// Exhaustive inventory: a sentence keeps a number only inside a kept claim's
+// text, so an unproven number never shows. `all` also drops every sentence that
+// no kept claim overlaps. Citation brackets hold ids, never datapoints.
+// ponytail: number-token heuristic; non-numeric uncovered facts rely on the whole-response gate.
+export function dropUncovered(text: string, kept: readonly FinalClaim[], all: boolean): string {
+  const spans: [number, number][] = [];
+  for (const c of kept) {
+    for (let at = c.text ? text.indexOf(c.text) : -1; at >= 0; at = text.indexOf(c.text, at + 1)) spans.push([at, at + c.text.length]);
+  }
+  const masked = text.replace(/\[[^\]]*\]/g, (b) => " ".repeat(b.length));
+  let out = "";
+  for (const m of text.matchAll(SENTENCE)) {
+    const at = m.index;
+    const end = at + m[0].length;
+    const covered = spans.some(([a, b]) => a < end && b > at);
+    const proven = [...masked.slice(at, end).matchAll(NUMBER)].every((n) => spans.some(([a, b]) => a <= at + n.index && at + n.index + n[0].length <= b));
+    if (proven && (covered || !all)) out += m[0];
+    else if (m[0].endsWith("\n")) out += "\n";
+  }
+  return out.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 function gatePasses(v: FinalGateVerdict): boolean {
   if (typeof v.error === "string" && v.error) return false;
@@ -225,8 +259,9 @@ async function callGate(ctx: FinalGateContext, body: Record<string, unknown>): P
     return { failure: `final gate unavailable: ${errorText(err)}` };
   }
 }
-// One persona through both gate stages: a passing whole-response keeps the prose,
-// a reject runs the per-claim ops and deletes only the rejected substrings.
+// One persona through both gate stages: a passing whole-response keeps the prose
+// minus uncovered datapoints; a reject runs the per-claim ops and keeps only
+// prose that a supported claim covers.
 async function gateResult(r: FinalPersonaResult, ctx: FinalGateContext): Promise<{ text: string } | { failure: string }> {
   const whole = await callGate(ctx, {
     op: "assess_final_response",
@@ -238,13 +273,13 @@ async function gateResult(r: FinalPersonaResult, ctx: FinalGateContext): Promise
     ...(r.confidence !== undefined ? { confidence: r.confidence } : {}),
   });
   if ("failure" in whole) return { failure: `${r.persona}: ${whole.failure}` };
-  if (gatePasses(whole.verdict)) return { text: r.text };
+  if (gatePasses(whole.verdict)) return keptProse(r.persona, dropUncovered(r.text, r.claims, false));
   return deleteRejectedClaims(r, ctx);
 }
 // Per-claim ops run only after a whole-response reject, all claims at once. The
 // verdict reads them in inventory order, as a serial loop would: the first
-// failed op fails the persona, and each rejected claim loses its substring.
-// Prose left empty by the deletions fails the run.
+// failed op fails the persona. Prose no supported claim covers drops, and each
+// rejected claim loses its substring.
 async function deleteRejectedClaims(r: FinalPersonaResult, ctx: FinalGateContext): Promise<{ text: string } | { failure: string }> {
   const checked = await Promise.all(r.claims.map(async (c) => ({
     c,
@@ -257,14 +292,19 @@ async function deleteRejectedClaims(r: FinalPersonaResult, ctx: FinalGateContext
       ...(c.confidence !== undefined ? { confidence: c.confidence } : {}),
     }),
   })));
-  let kept = r.text;
+  const supported: FinalClaim[] = [];
   for (const { c, one } of checked) {
     if ("failure" in one) return { failure: `${r.persona}: ${one.failure}` };
-    if (!gatePasses(one.verdict)) kept = kept.split(c.text).join("");
+    if (gatePasses(one.verdict)) supported.push(c);
   }
-  kept = kept.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-  if (!kept) return { failure: `${r.persona}: all claims rejected` };
-  return { text: kept };
+  let kept = dropUncovered(r.text, supported, true);
+  for (const { c } of checked) if (!supported.includes(c)) kept = kept.split(c.text).join("");
+  return keptProse(r.persona, kept);
+}
+// Prose left empty by the deletions fails the run.
+function keptProse(persona: Persona, text: string): { text: string } | { failure: string } {
+  const kept = text.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  return kept ? { text: kept } : { failure: `${persona}: all claims rejected` };
 }
 // Every selected persona appears exactly once, in the requested order; the
 // answer labels each block with its persona.
@@ -276,22 +316,22 @@ function assembleGated(gated: readonly { persona: Persona; text: string }[], per
   const blocks = personaOrder.map((p) => `── ${p.charAt(0).toUpperCase()}${p.slice(1)} ──\n${byPersona.get(p) ?? ""}`);
   return { text: blocks.join("\n\n") };
 }
-// Final accuracy gates: inventory -> whole-response JEV via Python worker ops ->
-// on reject per-claim gates -> surgical deletion of rejected substrings ->
-// single answer_delta. Fail closed; never deletes evidence rows. Personas
+// Final accuracy gates: inventory -> whole-response JEV and ledger proof via
+// Python worker ops -> on reject per-claim gates -> surgical deletion of
+// rejected substrings and uncovered prose -> single answer_delta. Fail closed;
+// never deletes evidence rows. Personas
 // before the first inventory defect gate at once; the verdict is the first
 // failure in result order, the same verdict a serial loop gives.
 // `sessionId` is the run's session: the worker judges gates against that
 // session's persisted rows, and its request-id fallback (the numeric kernel
 // request id) fails closed with "unknown session_id" for every call.
-export async function applyFinalGates(opts: {
-  results: FinalPersonaResult[];
+type GateOptions = {
   evidence: Evidence[];
-  personaOrder: readonly Persona[];
   gate: FinalGateCaller;
   sessionId?: string;
   gateOpts?: { signal?: AbortSignal; timeoutMs?: number };
-}): Promise<{ text: string } | { failure: string }> {
+};
+async function gatePersonas(results: FinalPersonaResult[], opts: GateOptions): Promise<{ persona: Persona; text: string }[] | { failure: string }> {
   const known = new Set(opts.evidence.map((e) => e.id));
   const ctx: FinalGateContext = {
     gate: opts.gate,
@@ -299,16 +339,26 @@ export async function applyFinalGates(opts: {
     ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
     opts: opts.gateOpts,
   };
-  const defects = opts.results.map((r) => inventoryDefect(r.text, r.claims, known));
+  const defects = results.map((r) => inventoryDefect(r.text, r.claims, known));
   const cut = defects.findIndex((d) => d !== undefined);
-  const checked = await Promise.all(opts.results.slice(0, cut < 0 ? undefined : cut).map(async (r) => ({ persona: r.persona, outcome: await gateResult(r, ctx) })));
+  const checked = await Promise.all(results.slice(0, cut < 0 ? undefined : cut).map(async (r) => ({ persona: r.persona, outcome: await gateResult(r, ctx) })));
   const gated: { persona: Persona; text: string }[] = [];
   for (const { persona, outcome } of checked) {
     if ("failure" in outcome) return outcome;
     gated.push({ persona, text: outcome.text });
   }
-  if (cut >= 0) return { failure: `${opts.results[cut]?.persona}: ${defects[cut]}` };
-  return assembleGated(gated, opts.personaOrder);
+  if (cut >= 0) return { failure: `${results[cut]?.persona}: ${defects[cut]}` };
+  return gated;
+}
+export async function applyFinalGates(opts: GateOptions & { results: FinalPersonaResult[]; personaOrder: readonly Persona[] }): Promise<{ text: string } | { failure: string }> {
+  const gated = await gatePersonas(opts.results, opts);
+  return Array.isArray(gated) ? assembleGated(gated, opts.personaOrder) : gated;
+}
+// One unlabeled answer through the same gates: the route's single-tool answer
+// and the early brief. Buffer the answer, gate it, then emit the kept text.
+export async function gateAnswer(opts: GateOptions & { result: FinalPersonaResult }): Promise<{ text: string } | { failure: string }> {
+  const gated = await gatePersonas([opts.result], opts);
+  return Array.isArray(gated) ? { text: gated[0]?.text ?? "" } : gated;
 }
 type RunKernelDeps = {
   spawnFn?: KernelSpawn;
@@ -850,14 +900,17 @@ function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSign
       }
       return;
     }
+    // The worker names its session before intake; the brief gates against it.
+    if (stage === "session" && typeof detail?.session_id === "string" && detail.session_id) run.sessionId = detail.session_id;
     if (stage === "intake_evidence" && run.briefPromise === undefined) startBrief(run, detail);
     run.emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage });
     const status = workerStatus(stage, detail);
     if (status !== undefined) run.emit(statusEvent(status));
   };
 
-  // Early brief: one short streamed stockbot call over the intake rows while the
-  // nodes continue. Never throws; a failed brief leaves no trace.
+  // Early brief: one short stockbot call over the intake rows while the nodes
+  // continue. Buffered, gated, then shown. Never throws; a failed or rejected
+  // brief leaves no trace.
   function startBrief(run: KernelRun, detail: Record<string, unknown> | undefined): void {
     const rows = kernelEvidence(detail?.evidence);
     if (rows.length === 0) return;
@@ -866,14 +919,12 @@ function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSign
     run.briefPromise = (async (): Promise<string | undefined> => {
       try {
         const started = performance.now();
-        // Buffered, not streamed: r.text already has any inventory fence stripped,
-        // so a habitual trailing ```json block never reaches the display.
+        // r.text already has the inventory fence stripped; r.claims feed the gates.
         const r = await run.reasonFn({
           prompt: `${run.prompt}\n\nBrief: say what the sources below establish so far, citing their ids. Two sentences max.`,
           ...(run.scope.watchlist === undefined && run.currentChartTicker !== undefined ? { ticker: run.currentChartTicker } : {}),
           evidence: rows,
-          // Non-direct: the EVIDENCE section is included so ids exist to cite.
-          // No drafts, so no inventory fence — the brief stays two sentences.
+          // Non-direct: the EVIDENCE section and the inventory rule are included so ids exist to cite.
           direct: false,
           persona: "stockbot",
           objective: run.objective,
@@ -885,8 +936,15 @@ function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSign
         });
         run.museCalls += 1;
         run.museMs += performance.now() - started;
-        run.emit({ type: "answer_delta", text: r.text });
-        return r.text;
+        const gated = await gateAnswer({
+          result: { persona: "stockbot", text: r.text, claims: r.claims ?? [], ...(r.confidence !== undefined ? { confidence: r.confidence } : {}) },
+          evidence: rows,
+          ...(run.sessionId ? { sessionId: run.sessionId } : {}),
+          gate: (body, gateOpts) => run.router.call(body, { ...(run.signal ? { signal: run.signal } : {}), ...gateOpts }),
+        });
+        if ("failure" in gated) return undefined;
+        run.emit({ type: "answer_delta", text: gated.text });
+        return gated.text;
       } catch {
         return undefined;
       }
@@ -1197,7 +1255,7 @@ function endStageFailure(run: KernelRun, pass: Pass): boolean {
 }
 
 // A research answer is gated before display; a direct answer carries no
-// inventory and shows every selected persona as-is. Neither announces gaps.
+// inventory and shows every selected persona minus its datapoint sentences. Neither announces gaps.
 // Briefed and nothing new: the brief already answered over these rows.
 function briefCoversAll(run: KernelRun): boolean {
   return run.briefText !== undefined && run.briefRows !== undefined
@@ -1207,7 +1265,14 @@ function briefCoversAll(run: KernelRun): boolean {
 async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
   const results = pass.results;
   if (run.direct || results === undefined) {
-    const blocks = results === undefined ? [] : results.map((r) => `── ${r.persona.charAt(0).toUpperCase()}${r.persona.slice(1)} ──\n${r.text}`);
+    // A direct answer has no evidence to cite, so no datapoint in it can be proven.
+    const kept = (results ?? []).map((r) => ({ persona: r.persona, text: dropUncovered(r.text, [], false) }));
+    const empty = kept.find((k) => !k.text);
+    if (empty !== undefined) {
+      endFailed(run, "muse", "provider_error", `${empty.persona}: all claims rejected`);
+      return;
+    }
+    const blocks = kept.map((k) => `── ${k.persona.charAt(0).toUpperCase()}${k.persona.slice(1)} ──\n${k.text}`);
     if (briefCoversAll(run) && blocks.length === 0) {
       offerTrio(run);
       run.emit({ type: "done", metrics: metricsOf(run, run.escalations) });

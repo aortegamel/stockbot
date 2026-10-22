@@ -1865,7 +1865,7 @@ def test_widget_data_insider_rows_newest_first(agg: dict[str, object]) -> None:
     [
         (100.0, {"ttm_eps_diluted": 4.0}, 25.0, 0.04, None),
         (100.0, {"ttm_eps_diluted": 0}, None, 0.0, None),
-        (0.0, {"ttm_eps_diluted": 4.0}, 0.0, None, None),
+        (0.0, {"ttm_eps_diluted": 4.0}, None, None, None),
         (100.0, {"ttm_eps_diluted": -4.0}, -25.0, -0.04, None),
         (100.0, {"error": "company facts not available"}, None, None, "company facts not available"),
         (None, {"ttm_eps_diluted": 4.0}, None, None, None),
@@ -1895,15 +1895,43 @@ def test_widget_data_multiples_current_only(
     expected: dict[str, object] = {
         "sym": "NVDA",
         "type": "multiples",
-        "price": price,
+        "price": price if isinstance(price, (int, float)) and price > 0 else None,
         "ttm_eps": eps.get("ttm_eps_diluted"),
         "pe": pe,
         "earnings_yield": ey,
         "as_of": "2026-10-20T14:00:00Z",
         "history": None,
+        "derived": True,
+        "calculations": {
+            "pe": {
+                "derived": True,
+                "formulaId": "pe",
+                "formulaVersion": "1",
+                "value": pe,
+                "unit": "ratio",
+                "verification": "unverified",
+            },
+            "earnings_yield": {
+                "derived": True,
+                "formulaId": "earnings_yield",
+                "formulaVersion": "1",
+                "value": ey,
+                "unit": "ratio",
+                "verification": "unverified",
+            },
+        },
     }
     if error:
         expected["error"] = error
+    for field in ("pe", "earnings_yield"):
+        marker = body["calculations"][field]
+        assert isinstance(marker, dict)
+        assert [row["value"] for row in marker["derivation_inputs"]] == (
+            [body["price"], body["ttm_eps"]] if field == "pe" else [body["ttm_eps"], body["price"]]
+        )
+        body["calculations"][field] = {
+            key: marker[key] for key in ("derived", "formulaId", "formulaVersion", "value", "unit", "verification")
+        }
     assert body == expected
     assert seen == [("NVDA", "eps")]
 
@@ -2019,3 +2047,78 @@ def test_positioning_sums_insider_shares_and_nulls_unavailable(agg: dict[str, ob
     listed = client.get("/api/positioning?sym=CCC").json()
     assert listed["threshold_listed"] is True
     assert listed["threshold_as_of"] == "2026-01-14"
+
+
+def test_regweb_news_feed_rows_are_headline_only_never_article_body(
+    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RSS news/feed/briefing rows carry headline fields only; no body is fetched or implied."""
+    feed = (
+        b'<?xml version="1.0"?><rss version="2.0"><channel>'
+        b"<item><title>NVDA rallies</title><link>https://n.example/nvda</link>"
+        b"<pubDate>Tue, 06 Oct 2026 10:00:00 GMT</pubDate><source>Wire</source></item>"
+        b"</channel></rss>"
+    )
+
+    def _feed(url: str, **kwargs: object) -> bytes:
+        return feed
+
+    monkeypatch.setattr(mp, "_http_bytes", _feed)
+    monkeypatch.setenv("STOCKBOT_NEWSQUANT", "0")
+    out = mp.get_news("NVDA")
+    items = out["items"]
+    assert isinstance(items, list) and len(items) == 1
+    first = items[0]
+    assert isinstance(first, dict) and first.get("link") == "https://n.example/nvda"
+    assert set(first) == {"title", "link", "published", "source"}
+    assert "body" not in first and "content" not in first and "excerpt" not in first
+
+
+# ---------------------------------------------------------------------------
+# Change 4 regression: FINRA multi-record aggregation, incomplete coverage
+# ---------------------------------------------------------------------------
+def test_reg4_short_volume_sums_all_venue_records_not_first(
+    agg: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two same-date venue records sum; a first-row-only read would undercount."""
+
+    def row(short: int, total: int) -> dict[str, object]:
+        return {"tradeReportDate": "2026-10-19", "shortParQuantity": short, "totalParQuantity": total}
+
+    calls = _finra(
+        monkeypatch,
+        [
+            {"records": [row(300, 1000), row(200, 1000)]},
+            {"records": []},
+            {"records": []},
+            {"records": []},
+        ],
+    )
+    body = TestClient(app).get("/api/widget-data?type=short-volume&sym=NVDA").json()
+    assert body["rows"] == [{"date": "2026-10-19", "short_qty": 500, "total_qty": 2000, "short_pct": 25}]
+    assert len(calls) == 4
+
+
+def test_reg4_threshold_uses_latest_record_and_incomplete_stays_visible(
+    agg: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Threshold replays the queried day; an incomplete short-volume window keeps its error."""
+    import app.finra_client as finra
+
+    seen: list[dict[str, object]] = []
+
+    def fake_threshold(ticker: str | None = None, trade_date: str | None = None) -> dict[str, object]:
+        seen.append({"ticker": ticker, "trade_date": trade_date})
+        return {
+            "records": [{"issueSymbolIdentifier": "NVDA", "tradeDate": "2026-10-15"}],
+            "as_of_date": "2026-10-15",
+        }
+
+    monkeypatch.setattr(finra, "get_threshold_securities", fake_threshold)
+    body = TestClient(app).get("/api/positioning?sym=NVDA").json()
+    assert body["threshold_listed"] is True and body["threshold_as_of"] == "2026-10-15"
+    assert seen == [{"ticker": "NVDA", "trade_date": None}]
+    calls = _finra(monkeypatch, [{"records": [], "may_have_more": True, "next_offset": 25}] * 4)
+    short = TestClient(app).get("/api/widget-data?type=short-volume&sym=NVDA").json()
+    assert short["rows"] == [] and "incomplete" in str(short["error"]).lower()
+    assert len(calls) == 4

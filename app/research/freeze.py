@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,6 +16,7 @@ __all__ = [
     "FreezeIntegrityError",
     "create_freeze",
     "freeze_content_hash",
+    "freeze_datapoint_hash",
     "freeze_from_dict",
     "freeze_to_dict",
     "verify_freeze",
@@ -36,6 +38,8 @@ class EvidenceFreeze:
     as_of: datetime | None
     evidence_ids: tuple[str, ...]
     content_hash: str
+    # Pins value/entity/period/unit/proof per row; None only on pre-datapoint (legacy) freezes.
+    datapoint_hash: str | None = None
 
     def _check_ids(self) -> None:
         if not self.freeze_id:
@@ -44,6 +48,8 @@ class EvidenceFreeze:
             raise FreezeIntegrityError("freeze: 'session_id' must be non-empty")
         if not self.content_hash:
             raise FreezeIntegrityError(f"freeze {self.freeze_id}: 'content_hash' must be non-empty")
+        if self.datapoint_hash is not None and not self.datapoint_hash:
+            raise FreezeIntegrityError(f"freeze {self.freeze_id}: 'datapoint_hash' must be a non-empty string or null")
 
     def __post_init__(self) -> None:
         self._check_ids()
@@ -60,6 +66,22 @@ def freeze_content_hash(records: Sequence[Evidence]) -> str:
     """Canonical hash over sorted ``evidence_id:content_hash`` pairs."""
     body = "\n".join(f"{e.evidence_id}:{e.content_hash}" for e in sorted(records, key=_sort_key))
     return sha256(body.encode("utf-8")).hexdigest()
+
+
+def freeze_datapoint_hash(records: Sequence[Evidence]) -> str:
+    """Canonical hash over sorted rows: id, value, entity, period, unit, proof as sorted-key JSON lines.
+
+    Kept apart from ``freeze_content_hash`` so legacy freezes keep their stored hash.
+    """
+    body = "\n".join(
+        json.dumps([e.evidence_id, e.value, e.entity, e.period, e.unit, e.proof], sort_keys=True, separators=(",", ":"))
+        for e in sorted(records, key=_sort_key)
+    )
+    return sha256(body.encode("utf-8")).hexdigest()
+
+
+def _has_datapoint(record: Evidence) -> bool:
+    return bool(record.proof) or any(getattr(record, k) is not None for k in ("value", "entity", "period", "unit"))
 
 
 def _coerce_time(value: datetime | str | None, key: str) -> datetime | None:
@@ -128,16 +150,26 @@ def create_freeze(
         as_of=frozen_as_of,
         evidence_ids=ids,
         content_hash=freeze_content_hash(recs),
+        datapoint_hash=freeze_datapoint_hash(recs),
     )
 
 
 def verify_freeze(freeze: EvidenceFreeze, records: Sequence[Evidence]) -> None:
-    """Recompute the hash over ``records``; raise on id-set or content drift."""
+    """Recompute both hashes over ``records``; raise on id-set, content, or datapoint drift.
+
+    A legacy freeze (no ``datapoint_hash``) pinned rows that carried no datapoint,
+    so any datapoint field on those rows now is drift.
+    """
     recs = list(records)
     if {record.evidence_id for record in recs} != set(freeze.evidence_ids):
         raise FreezeIntegrityError(f"freeze {freeze.freeze_id}: evidence id set drifted")
     if freeze_content_hash(recs) != freeze.content_hash:
         raise FreezeIntegrityError(f"freeze {freeze.freeze_id}: content_hash mismatch")
+    if freeze.datapoint_hash is None:
+        if any(_has_datapoint(record) for record in recs):
+            raise FreezeIntegrityError(f"freeze {freeze.freeze_id}: legacy freeze rows gained datapoint fields")
+    elif freeze_datapoint_hash(recs) != freeze.datapoint_hash:
+        raise FreezeIntegrityError(f"freeze {freeze.freeze_id}: datapoint_hash mismatch")
 
 
 def freeze_to_dict(freeze: EvidenceFreeze) -> dict[str, object]:
@@ -150,6 +182,7 @@ def freeze_to_dict(freeze: EvidenceFreeze) -> dict[str, object]:
         "as_of": freeze.as_of.isoformat() if freeze.as_of else None,
         "evidence_ids": list(freeze.evidence_ids),
         "content_hash": freeze.content_hash,
+        "datapoint_hash": freeze.datapoint_hash,
     }
 
 
@@ -185,6 +218,14 @@ def _freeze_evidence_tuple(d: dict[str, object]) -> tuple[str, ...]:
     return tuple(evidence_ids)
 
 
+def _freeze_datapoint_field(d: dict[str, object]) -> str | None:
+    """datapoint_hash; absent or null reads as a legacy freeze."""
+    raw = d.get("datapoint_hash")
+    if raw is None or (isinstance(raw, str) and raw):
+        return raw
+    raise FreezeIntegrityError("freeze: 'datapoint_hash' must be a non-empty string or null")
+
+
 def freeze_from_dict(data: Mapping[str, object]) -> EvidenceFreeze:
     """Rebuild a freeze; missing timestamps stay None, never invented."""
     d = dict(data)
@@ -197,4 +238,5 @@ def freeze_from_dict(data: Mapping[str, object]) -> EvidenceFreeze:
         as_of=_coerce_time(_narrow_opt_time(d.get("as_of"), "as_of"), "as_of"),
         evidence_ids=_freeze_evidence_tuple(d),
         content_hash=content_hash,
+        datapoint_hash=_freeze_datapoint_field(d),
     )

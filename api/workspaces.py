@@ -9,6 +9,7 @@
 """
 
 import json
+import math
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Self, cast
 from urllib.parse import urlsplit
@@ -242,8 +243,12 @@ def _multiples(sym: str) -> dict[str, object]:
     eps = sec_facts.get_fundamentals(sym, "eps")
     price = quote.get("price")
     ttm = eps.get("ttm_eps_diluted")
-    price_n = price if isinstance(price, (int, float)) else None
-    ttm_n = ttm if isinstance(ttm, (int, float)) else None
+    price_n = (
+        price
+        if isinstance(price, (int, float)) and not isinstance(price, bool) and math.isfinite(price) and price > 0
+        else None
+    )
+    ttm_n = ttm if isinstance(ttm, (int, float)) and not isinstance(ttm, bool) and math.isfinite(ttm) else None
     out: dict[str, object] = {
         "price": price_n,
         "ttm_eps": ttm_n,
@@ -261,6 +266,23 @@ def _multiples(sym: str) -> dict[str, object]:
             out["earnings_yield"] = earnings_yield(ttm_n, price_n)
         except ValueError:
             out["earnings_yield"] = None
+    inputs = {
+        "price": {"id": f"quote:{sym}", "value": price_n, "unit": "USD/share", "source": quote},
+        "ttm_eps": {"id": f"ttm_eps_diluted:{sym}", "value": ttm_n, "unit": "USD/share", "source": eps},
+    }
+    out["derived"] = True
+    out["calculations"] = {
+        field: {
+            "derived": True,
+            "formulaId": field,
+            "formulaVersion": "1",
+            "value": out[field],
+            "unit": "ratio",
+            "derivation_inputs": [inputs[name] for name in names],
+            "verification": "unverified",
+        }
+        for field, names in (("pe", ("price", "ttm_eps")), ("earnings_yield", ("ttm_eps", "price")))
+    }
     errors = [str(e) for e in (quote.get("error"), eps.get("error")) if e]
     if errors:
         out["error"] = "; ".join(errors)

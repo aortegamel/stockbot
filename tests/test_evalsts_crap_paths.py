@@ -902,10 +902,10 @@ def test_final_branches():
     stock, bull, bear = _trio()
     stock.claims.append(GroundedClaim(text="same", evidence_ids=["EV-1"]))
     bull.claims.append(GroundedClaim(text="same", evidence_ids=["EV-2"]))
-    stock.unknowns.append("u1")
-    bull.unknowns.append("u1")
-    bull.what_would_change.append("c1")
-    bear.what_would_change.append("c1")
+    stock.unknowns.append("terms undisclosed")
+    bull.unknowns.append("terms undisclosed")
+    bull.what_would_change.append("a new filing")
+    bear.what_would_change.append("a new filing")
     disagreement = compute_disagreement(stock, bull, bear)
     final = synthesize_final(
         "q",
@@ -919,7 +919,7 @@ def test_final_branches():
         disagreement=disagreement,
     )
     assert final.claims[0].evidence_ids == ["EV-1", "EV-2"]
-    assert final.unknowns == ["u1"] and final.what_would_change == ["c1"]
+    assert final.unknowns == ["terms undisclosed"] and final.what_would_change == ["a new filing"]
     override = synthesize_final(
         "q",
         session_id="rs:t",
@@ -930,9 +930,10 @@ def test_final_branches():
         bull=bull,
         bear=bear,
         disagreement=disagreement,
-        model="draft",
+        model="same. Unsupported draft.",
     )
-    assert override.answer == "draft"
+    # The caller's answer passes the prose gate: only the claim-covered sentence survives.
+    assert override.answer == "same."
 
 
 def test_opt_telemetry_rejects_bad_int_type() -> None:

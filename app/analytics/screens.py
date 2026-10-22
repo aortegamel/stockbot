@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from calendar import monthrange
 from datetime import UTC, date, datetime, timedelta
@@ -337,14 +338,58 @@ def _empty_screen_error(settlement_date: str, as_of: str) -> dict[str, object]:
     }
 
 
+def _finite_number(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(str(value))
+    except ValueError, TypeError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _screen_calculation(formula: str, value: object, unit: str, inputs: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "derived": True,
+        "formulaId": formula,
+        "formulaVersion": "1",
+        "value": value,
+        "unit": unit,
+        "derivation_inputs": inputs,
+        "verification": "unverified",
+    }
+
+
+def _short_interest_calculation(row: dict[str, object], fact: dict[str, object], value: float) -> dict[str, object]:
+    return _screen_calculation(
+        "short_interest_percent",
+        value,
+        "%",
+        [
+            {
+                "id": f"finra:{row.get('symbol_code')}:{row.get('settlement_date')}:short_position",
+                "value": row.get("short_position"),
+                "unit": "shares",
+                "source": row,
+            },
+            {
+                "id": fact.get("fact_id") or f"sec:{fact.get('accession')}:{_SHARES_CONCEPT}:{fact.get('period_end')}",
+                "value": fact.get("value"),
+                "unit": "shares",
+                "source": fact,
+            },
+        ],
+    )
+
+
 def _short_shares(row: dict[str, object], accum: _ScreenAccum) -> float | None:
     """Validated short shares, None when invalid (existing boundary)."""
-    short_shares_raw = row.get("short_position")
-    if short_shares_raw is None or float(str(short_shares_raw)) < 0:
+    short_shares = _finite_number(row.get("short_position"))
+    if short_shares is None or short_shares < 0:
         accum.exclusions["invalid_short_interest"] += 1
         return None
     accum.counters["valid_short_interest_rows"] += 1
-    return float(str(short_shares_raw))
+    return short_shares
 
 
 def _screen_entity(symbol: str, inputs: _ScreenInputs, accum: _ScreenAccum) -> str | None:
@@ -391,6 +436,7 @@ def _screen_candidate(
 ) -> dict[str, object]:
     """One ranked candidate row (existing boundary)."""
     shares = float(str(fact["value"]))
+    percent = 100 * short_shares / shares
     return {
         "entity_id": entity_id,
         "security_id": f"sec:equity:{entity_id.rsplit(':', 1)[1]}",
@@ -398,11 +444,13 @@ def _screen_candidate(
         "issue_name": row.get("issue_name"),
         "short_shares": short_shares,
         "shares_outstanding": shares,
-        "short_interest_percent": 100 * short_shares / shares,
+        "short_interest_percent": percent,
         "sec_shares_as_of": _date_str(fact["period_end"]),
         "sec_filed_at": _date_str(fact["filed_at"]),
         "sec_accession": fact.get("accession"),
         "sec_source_url": fact.get("source_url"),
+        "derived": True,
+        "calculations": {"short_interest_percent": _short_interest_calculation(row, fact, percent)},
     }
 
 
@@ -465,6 +513,7 @@ def _compute_leaderboard(settlement_date: str, as_of: str, limit: int | None) ->
         "as_of_date": as_of,
         "data_freshness": freshness,
         "calculation_version": SCREEN_CALC_VERSION,
+        "derived": True,
         "environment": finra_client._environment(),
         "row_count": len(ranked),
         "returned_count": len(entries),
@@ -497,6 +546,8 @@ def _compute_leaderboard(settlement_date: str, as_of: str, limit: int | None) ->
                 "sec_filed_at": entry["sec_filed_at"],
                 "sec_accession": entry["sec_accession"],
                 "sec_source_url": entry["sec_source_url"],
+                "derived": True,
+                "calculations": entry["calculations"],
             }
             for index, entry in enumerate(entries, 1)
         ],
@@ -690,7 +741,8 @@ def _cycle_item(symbol: str, row: dict[str, object], inputs: _ScreenInputs) -> _
     """One ranked row: short position, resolved common equity, and period fact required."""
     from ..domain.market.securities import SecurityResolution
 
-    if row.get("short_position") is None:
+    short_shares = _finite_number(row.get("short_position"))
+    if short_shares is None or short_shares < 0:
         return None
     resolution = inputs.resolutions.get(symbol)
     if not isinstance(resolution, SecurityResolution) or not resolution.resolved or not resolution.entity_id:
@@ -711,8 +763,8 @@ def _select_fact_for_period(facts: list[dict[str, object]], settlement_date: str
         period_end = _date_str(fact.get("period_end") or "")
         if not period_end or period_end[:10] > settlement_date:
             continue
-        value = fact.get("value")
-        if value is None or float(str(value)) <= 0:
+        value = _finite_number(fact.get("value"))
+        if value is None or value <= 0 or fact.get("unit", "shares") != "shares":
             continue
         return fact
     return None
@@ -781,11 +833,17 @@ def short_interest_change_screen(
             "si_pp_change": None,
             "finra_source_url": row.get("source_url"),
         }
+        calculations = {
+            "short_interest_percent_current": _short_interest_calculation(row, fact, si_pct_current),
+        }
         prior_item = prior.get(symbol)
         if prior_item is not None:
             prior_row, prior_fact = prior_item["row"], prior_item["fact"]
             short_prior = float(str(prior_row["short_position"]))
             si_pct_prior = 100 * short_prior / float(str(prior_fact["value"]))
+            calculations["short_interest_percent_prior"] = _short_interest_calculation(
+                prior_row, prior_fact, si_pct_prior
+            )
             entry.update(
                 {
                     "short_shares_prior": short_prior,
@@ -804,6 +862,34 @@ def short_interest_change_screen(
                     "si_pp_change": si_pct_current - si_pct_prior,
                 }
             )
+            for field, current_field, prior_field, formula, unit in (
+                ("short_change_abs", "short_shares_current", "short_shares_prior", "change", "shares"),
+                ("short_change_pct", "short_shares_current", "short_shares_prior", "percent_change", "%"),
+                ("shares_change_abs", "shares_outstanding_current", "shares_outstanding_prior", "change", "shares"),
+                ("shares_change_pct", "shares_outstanding_current", "shares_outstanding_prior", "percent_change", "%"),
+                (
+                    "si_pp_change",
+                    "short_interest_percent_current",
+                    "short_interest_percent_prior",
+                    "change",
+                    "percentage_points",
+                ),
+            ):
+                calculations[field] = _screen_calculation(
+                    formula,
+                    entry[field],
+                    unit,
+                    [
+                        {"id": current_field, "value": entry[current_field], "source": {"finra": row, "sec": fact}},
+                        {
+                            "id": prior_field,
+                            "value": entry[prior_field],
+                            "source": {"finra": prior_row, "sec": prior_fact},
+                        },
+                    ],
+                )
+        entry["derived"] = True
+        entry["calculations"] = calculations
         entries.append(entry)
     entries.sort(key=_change_key)
     for index, entry in enumerate(entries, 1):
@@ -815,6 +901,7 @@ def short_interest_change_screen(
         "settlement_current": current_date,
         "settlement_prior": prior_date,
         "calculation_version": SLICE_CALC_VERSION,
+        "derived": True,
         "coverage": {"current_finra_rows": len(current), "eligible_rows": len(entries)},
         "unresolved": sorted(_unresolved_symbols(inputs)),
         "entries": entries[:limit],

@@ -397,3 +397,18 @@ def test_valuation_explanation_handles_missing_price_and_no_methods() -> None:
     assert ValuationEngine({}).explain_valuation_differences() == (
         "Insufficient inputs for valuation: no method produced a usable target."
     )
+
+
+def test_equity_pure_ratios_report_missing_inputs_as_unavailable() -> None:
+    from calculations import valuation as pure_valuation
+
+    assert pure_valuation.pe(213.05, 6.53) == pytest.approx(213.05 / 6.53)
+    assert pure_valuation.dividend_yield(2.07, 65.0) == pytest.approx(2.07 / 65.0)
+    assert pure_valuation.payout_ratio(2.07, 6.53) == pytest.approx(2.07 / 6.53)
+    for call in (
+        lambda: pure_valuation.pe(213.05, 0.0),
+        lambda: pure_valuation.dividend_yield(2.07, 0.0),
+        lambda: pure_valuation.payout_ratio(2.07, 0.0),
+    ):
+        with pytest.raises(ValueError, match="zero"):
+            call()

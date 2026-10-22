@@ -70,13 +70,18 @@ def test_nonverbatim_quote_rejected_when_evidence_supplied():
         "interpretation": "i",
         "evidenceRefs": ["ev-nvda-10k"],
     }
-    paraphrase = dict(
-        base, numbers=[{"value": "12.5%", "evidenceId": "ev-nvda-10k", "quote": "twelve point five percent"}]
-    )
-    with pytest.raises(ValueError):
+    paraphrase = dict(base, numbers=[{"value": "12.5%", "evidenceId": "ev-nvda-10k", "quote": "exposure of 12.5%"}])
+    with pytest.raises(ValueError, match="not found in evidence content"):
         check_grounded_analysis(paraphrase, {"ev-nvda-10k"}, _evidence())
-    # Without evidence bytes the gate only checks non-empty (back-compat for id-only callers).
-    assert check_grounded_analysis(paraphrase, {"ev-nvda-10k"}) is paraphrase
+    # Without evidence bytes the gate fails closed: no id-only publication path remains.
+    with pytest.raises(ValueError, match="ERR_SOURCE_BYTES_ABSENT"):
+        check_grounded_analysis(paraphrase, {"ev-nvda-10k"})
+    # A real quote next to a fabricated number is still a fabricated number.
+    fabricated = dict(base, numbers=[{"value": "13.5%", "evidenceId": "ev-nvda-10k", "quote": NVDA_EXPOSURE}])
+    with pytest.raises(ValueError, match=r"value '13\.5%' not in quote"):
+        check_grounded_analysis(fabricated, {"ev-nvda-10k"}, _evidence())
+    verbatim = dict(base, numbers=[{"value": "12.5%", "evidenceId": "ev-nvda-10k", "quote": NVDA_EXPOSURE}])
+    assert check_grounded_analysis(verbatim, {"ev-nvda-10k"}, _evidence()) is verbatim
 
 
 def test_attach_scenario_impact_exact_and_fail_open():
@@ -268,7 +273,7 @@ def test_verbatim_bytes_in_prompt_context():
         "numbers": [{"value": "12.5%", "evidenceId": "ev-nvda-10k", "quote": NVDA_EXPOSURE}],
         "assumptions": [{"assumptionId": "openai-ipo-terrible", "text": ASSUMPTION_TEXT}],
     }
-    assert grounding.check_grounded_analysis(fake, grounded_ids) is fake
+    assert grounding.check_grounded_analysis(fake, grounded_ids, split["grounded"]) is fake
     out = check_analyses("analyze", [fake], "s1", {"n1"}, grounded_ids)
     assert out[0]["evidenceRefs"] == ["ev-nvda-10k"]
 
@@ -390,10 +395,15 @@ def test_grounded_assumptions_reject_malformed_entries(entry: object, error: str
 
 
 def test_grounding_keeps_validation_precedence_and_missing_source_contract() -> None:
-    number = {"value": "12%", "evidenceId": "ev-1", "quote": "source"}
+    number = {"value": "12%", "evidenceId": "ev-1", "quote": "source 12%"}
     analysis: dict[str, object] = {"evidenceRefs": ["ev-1", "ev-1"], "numbers": [number]}
-    assert check_grounded_analysis(analysis, {"ev-1"}, []) is analysis
-    assert check_grounded_analysis(analysis, {"ev-1"}, [{"evidence_id": "ev-1"}]) is analysis
+    stored: list[JSONValue] = [{"evidence_id": "ev-1", "content": "the source 12% row"}]
+    assert check_grounded_analysis(analysis, {"ev-1"}, stored) is analysis
+    # Missing bytes fail closed: no evidence list, or a cited row without stored content.
+    absent_cases: list[list[JSONValue]] = [[], [{"evidence_id": "ev-1"}]]
+    for absent in absent_cases:
+        with pytest.raises(ValueError, match="ERR_SOURCE_BYTES_ABSENT"):
+            check_grounded_analysis(analysis, {"ev-1"}, absent)
     # The refs gate runs first, so admit "ev-1" to reach the numbers-before-assumptions precedence.
     with pytest.raises(ValueError, match="analysis numbers must be a list"):
         check_grounded_analysis(dict(analysis, numbers="bad", assumptions="bad"), {"ev-1"})
@@ -403,7 +413,7 @@ def test_grounding_keeps_validation_precedence_and_missing_source_contract() -> 
     # Unsupported containers admit nothing. Valid containers ignore non-string members.
     with pytest.raises(ValueError, match="unknown evidence"):
         unchecked(analysis, "ev-1")
-    assert unchecked(analysis, ["ev-1", None, 5]) is analysis
+    assert unchecked(analysis, ["ev-1", None, 5], stored) is analysis
 
 
 @pytest.mark.parametrize(

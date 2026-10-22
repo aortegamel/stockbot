@@ -557,15 +557,19 @@ _REG_SHO_FILE_COLUMNS = {
 
 
 def resolve_finra_official(
-    dataset: str, row: Mapping[str, object], payload: Mapping[str, object], *, root: Path
+    dataset: str,
+    row: Mapping[str, object],
+    payload: Mapping[str, object],
+    *,
+    root: Path,
 ) -> dict[str, object] | None:
     """Official cdn.finra.org file and the exact cited line for one FINRA row.
 
-    ``row`` is the cited row ({} = the payload's first record); analysis
-    envelopes cite their query JSON, so the symbol may be ``ticker`` and the day
-    the payload's ``as_of_date``. None when FINRA publishes no static file for
-    the dataset or no symbol/day is known. Fetch failures raise; a missing or
-    disagreeing line raises ValueError.
+    ``row`` is the cited row (empty = no official page; the first record is never
+    substituted). Analysis envelopes cite their query JSON, so the symbol may be
+    ``ticker`` and the day the payload's ``as_of_date``. None when FINRA publishes
+    no static file for the dataset or no symbol/day is known. Fetch failures raise;
+    a missing or disagreeing line raises ValueError.
     """
     name = dataset.rpartition("/")[2].casefold().removesuffix("mock")
     if name == "regshodaily":
@@ -574,9 +578,7 @@ def resolve_finra_official(
         symbol_field, date_field = "symbolCode", "settlementDate"
     else:
         return None
-    records = payload.get("records")
-    first = records[0] if isinstance(records, list) and records else None
-    cited: Mapping[str, object] = row or (first if isinstance(first, Mapping) else {})
+    cited: Mapping[str, object] = row
     query = payload.get("query")
     symbol = (
         cited.get(symbol_field) or cited.get("ticker") or (query.get("ticker") if isinstance(query, Mapping) else None)
@@ -590,10 +592,12 @@ def resolve_finra_official(
         facility = _REG_SHO_FILE_PREFIXES.get(str(cited.get("marketCode"))) or _REG_SHO_FILE_PREFIXES.get(
             str(cited.get("reportingFacilityCode"))
         )
-        # ponytail: no facility (analysis envelope, trimmed fields) cites the consolidated line unchecked.
-        url = f"https://cdn.finra.org/equity/regsho/daily/{facility or 'CNMS'}shvol{stamp}.txt"
+        # Venue-less analysis envelopes fail closed: a consolidated CNMS line never proves a venue claim.
+        if facility is None:
+            return None
+        url = f"https://cdn.finra.org/equity/regsho/daily/{facility}shvol{stamp}.txt"
         symbol_column = "Symbol"
-        columns = _REG_SHO_FILE_COLUMNS if facility else {}
+        columns = _REG_SHO_FILE_COLUMNS
     else:
         url = f"https://cdn.finra.org/equity/otcmarket/biweekly/shrt{stamp}.csv"
         symbol_column = "symbolCode"
@@ -610,11 +614,20 @@ def resolve_finra_official(
 
 
 def _official_file(url: str, root: Path) -> bytes:
-    """Archived bytes of one official file; fetched and archived once."""
+    """Archived bytes of one official file; fetched and archived once.
+
+    The archive read re-checks the content hash. A fetch whose request or any redirect hop
+    leaves https://cdn.finra.org/ raises OSError and archives nothing.
+    """
     record = raw_archive.find("finra", _OFFICIAL_FILE_KIND, url, root=root / "raw")
     if record is not None:
-        return record.payload_path.read_bytes()
+        archived = raw_archive.read_payload("finra", _OFFICIAL_FILE_KIND, url, sha256=record.sha256, root=root / "raw")
+        if archived is None:
+            raise ValueError("Archived FINRA file does not match its content hash")
+        return archived
     resp = requests.get(url, timeout=60)
+    if not all(hop.url.startswith("https://cdn.finra.org/") for hop in (*resp.history, resp)):
+        raise OSError(f"{url}: redirect left the official FINRA host")
     resp.raise_for_status()
     raw_archive.archive("finra", _OFFICIAL_FILE_KIND, url, resp.content, url=url, root=root / "raw")
     return resp.content
@@ -792,6 +805,56 @@ def _query_analysis_warnings(analysis: dict[str, object], as_of: str | None, fre
     return warnings
 
 
+def _provenance_observation(
+    *,
+    spec: DatasetSpec,
+    payload: dict[str, object] | None,
+    records: list[dict[str, object]],
+    headers: dict[str, object],
+    sort: list[str] | None = None,
+) -> dict[str, object]:
+    """Replayable observation pinned to the API response bytes.
+
+    Archive exact bytes first, then record hashes. Bytes absent fails closed.
+    Freeze content_hash + datapoint_hash cover FINRA rows.
+    """
+    response_body = json.dumps({"records": records}, sort_keys=True, default=str).encode()
+    archived = raw_archive.archive(
+        "finra",
+        "tool_result",
+        spec.dataset_id,
+        response_body,
+        url=f"{FINRA_API_BASE}/data/group/{spec.group}/name/{spec.name}",
+    )
+    query: dict[str, object] = dict(payload) if isinstance(payload, dict) else {}
+    raw_sort: object = sort if sort is not None else query.get("sortFields", [])
+    sort_list: list[str] = (
+        list(sort)
+        if sort is not None
+        else [s for s in raw_sort if isinstance(s, str)]
+        if isinstance(raw_sort, list)
+        else []
+    )
+    raw_filters: object = query.get("compareFilters")
+    as_of, freshness = _freshness_status(spec, records)
+    return {
+        "dataset": spec.dataset_id,
+        "group": spec.group,
+        "schema": [str(f["name"]) for f in spec.fields if f.get("name")],
+        "query": query,
+        "filters": list(raw_filters) if isinstance(raw_filters, list) else [],
+        "sort": sort_list,
+        "pagination": dict(headers),
+        "retrieved_at": archived.retrieved_at,
+        "point_in_time": {"as_of_date": as_of, "data_freshness": freshness},
+        "environment": _environment(),
+        "response_hash": archived.sha256,
+        "record_hashes": [
+            raw_archive.content_hash(json.dumps(row, sort_keys=True, default=str).encode()) for row in records
+        ],
+    }
+
+
 def _query_result_row(
     spec: DatasetSpec,
     ticker: str | None,
@@ -806,9 +869,10 @@ def _query_result_row(
     effective_limit: int,
     effective_offset: int,
     pagination: dict[str, object],
+    provenance: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Final analyzed-briefing result row for query_dataset."""
-    return {
+    result: dict[str, object] = {
         "dataset": spec.name,
         "group": spec.group,
         "dataset_id": spec.dataset_id,
@@ -839,6 +903,9 @@ def _query_result_row(
         "total_records": pagination["total_records"],
         "pagination_source": pagination["source"],
     }
+    if provenance is not None:
+        result["provenance_observation"] = provenance
+    return result
 
 
 def _query_apply_recovery(
@@ -945,6 +1012,7 @@ def query_dataset(
         _query_cache_key(spec, payload),
         pagination=pagination,
     )
+    provenance = _provenance_observation(spec=spec, payload=payload, records=records, headers=pagination)
     return _query_result_row(
         spec,
         ticker,
@@ -959,6 +1027,7 @@ def query_dataset(
         effective_limit,
         effective_offset,
         pagination,
+        provenance,
     )
 
 
@@ -1123,6 +1192,7 @@ def _datapoints_result_row(
     sort: list[str],
     via_partitions: bool,
     partition_queries: int,
+    provenance: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Final exact-datapoints result row."""
     result: dict[str, object] = {
@@ -1149,6 +1219,8 @@ def _datapoints_result_row(
     if via_partitions:
         result["sort_source"] = "partitions"
         result["partition_queries"] = partition_queries
+    if provenance is not None:
+        result["provenance_observation"] = provenance
     return result
 
 
@@ -1244,6 +1316,7 @@ def get_finra_datapoints(
     as_of, freshness = _freshness_status(spec, records)
     if _datapoints_is_stale_short_interest(spec, sort, freshness):
         return _stale_short_interest_error(ticker or dataset, as_of)
+    provenance = _provenance_observation(spec=spec, payload=payload, records=records, headers=headers, sort=sort)
     return _datapoints_result_row(
         spec,
         selected,
@@ -1256,6 +1329,7 @@ def get_finra_datapoints(
         sort,
         via_partitions,
         partition_queries,
+        provenance,
     )
 
 

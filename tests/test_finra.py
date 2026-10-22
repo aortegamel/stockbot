@@ -1686,13 +1686,11 @@ def test_official_reg_sho_facility_code_alone_selects_file(official_get: MagicMo
 
 
 def test_official_reg_sho_envelope_cites_consolidated_line(official_get: MagicMock, tmp_path: Path) -> None:
-    """Analysis envelopes cite their query JSON: ticker + as_of_date -> CNMS; Mock suffix stripped."""
+    """Venue-less analysis envelopes fail closed: no CNMS line proves a venue claim."""
     query = {"ticker": "NVDA", "start_date": None, "end_date": None, "limit": 100, "offset": 0, "filters": None}
     payload = {"dataset_id": "otcMarket/regShoDaily", "query": query, "as_of_date": "2026-10-15"}
-    page = finra_client.resolve_finra_official("otcMarket/regShoDailyMock", query, payload, root=tmp_path)
-    assert page is not None
-    assert page["url"] == "https://cdn.finra.org/equity/regsho/daily/CNMSshvol20261015.txt"
-    assert page["quote"] == "20261015|NVDA|18013290.539633|100349|51176540.043723|B,Q,N"
+    assert finra_client.resolve_finra_official("otcMarket/regShoDailyMock", query, payload, root=tmp_path) is None
+    official_get.assert_not_called()
 
 
 def test_official_reg_sho_disagreeing_or_missing_line_raises(official_get: MagicMock, tmp_path: Path) -> None:
@@ -1731,10 +1729,12 @@ def test_official_short_interest_cites_quoted_symbol_line_once(official_get: Mag
 
 
 def test_official_empty_row_cites_first_payload_record(official_get: MagicMock, tmp_path: Path) -> None:
+    """An empty row cites nothing: the first payload record is never substituted."""
     payload = {"records": [{"symbolCode": "NVDA", "settlementDate": "2026-09-30"}]}
-    page = finra_client.resolve_finra_official("otcMarket/consolidatedShortInterest", {}, payload, root=tmp_path)
-    assert page is not None
-    assert '"NVDA"' in str(page["quote"])
+    assert (
+        finra_client.resolve_finra_official("otcMarket/consolidatedShortInterest", {}, payload, root=tmp_path) is None
+    )
+    official_get.assert_not_called()
 
 
 def test_official_file_absent_for_other_datasets_or_unknown_subject(official_get: MagicMock, tmp_path: Path) -> None:
@@ -1745,3 +1745,358 @@ def test_official_file_absent_for_other_datasets_or_unknown_subject(official_get
     assert finra_client.resolve_finra_official("", row, {}, root=tmp_path) is None
     assert finra_client.resolve_finra_official("otcMarket/regShoDaily", {"ticker": "NVDA"}, {}, root=tmp_path) is None
     official_get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Change 4 regression: published-file matching, conflicts, archive integrity
+# ---------------------------------------------------------------------------
+def _reg4_facility_file(market: str) -> bytes:
+    return (
+        b"Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market\n"
+        + f"20261015|NVDA|274457.043010|1022|934921.209763|{market}\n".encode()
+    )
+
+
+_REG4_CNMS_LINE = "20261015|NVDA|18013290.539633|100349|51176540.043723|B,Q,N"
+
+
+@pytest.fixture
+def reg4_get(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Fake cdn.finra.org: every daily facility file plus the biweekly short-interest file."""
+    files = {
+        "https://cdn.finra.org/equity/regsho/daily/FNQCshvol20261015.txt": _reg4_facility_file("B"),
+        "https://cdn.finra.org/equity/regsho/daily/FNSQshvol20261015.txt": _reg4_facility_file("Q"),
+        "https://cdn.finra.org/equity/regsho/daily/FNYXshvol20261015.txt": _reg4_facility_file("N"),
+        "https://cdn.finra.org/equity/regsho/daily/FORFshvol20261015.txt": _reg4_facility_file("O"),
+        "https://cdn.finra.org/equity/regsho/daily/CNMSshvol20261015.txt": (
+            b"Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market\n" + _REG4_CNMS_LINE.encode() + b"\n"
+        ),
+        "https://cdn.finra.org/equity/otcmarket/biweekly/shrt20260930.csv": _SHRT_FILE,
+    }
+
+    def fake_get(url: str, timeout: int) -> MagicMock:
+        assert timeout == 60
+        resp = MagicMock()
+        resp.content = files[url]
+        return resp
+
+    get_mock = MagicMock(side_effect=fake_get)
+    monkeypatch.setattr("app.finra_client.requests.get", get_mock)
+    return get_mock
+
+
+def _reg4_row(market: str) -> dict[str, object]:
+    return {
+        **_NVDA_FNQC_ROW,
+        "marketCode": market,
+        "reportingFacilityCode": {"B": "NCTRF", "Q": "NQTRF", "N": "NYTRF", "O": "ORF"}[market],
+    }
+
+
+@pytest.mark.parametrize("market", ["Q", "N", "O"])
+def test_reg4_venue_specific_line_beats_consolidated(reg4_get: MagicMock, tmp_path: Path, market: str) -> None:
+    """A venue row cites its own facility file, never the consolidated/CNMS line."""
+    row = _reg4_row(market)
+    page = finra_client.resolve_finra_official("otcMarket/regShoDaily", row, {}, root=tmp_path)
+    assert page is not None
+    expect = {"Q": "FNSQ", "N": "FNYX", "O": "FORF"}[market]
+    assert page["url"] == f"https://cdn.finra.org/equity/regsho/daily/{expect}shvol20261015.txt"
+    assert isinstance(page["quote"], str) and page["quote"].endswith(f"|{market}")
+    assert _REG4_CNMS_LINE != page["quote"]
+
+
+def test_reg4_consolidated_line_insufficient_for_venue_claim(reg4_get: MagicMock, tmp_path: Path) -> None:
+    """A venue row never validates against the CNMS (B,Q,N) line: first row is not a match."""
+    payload = {"records": [{"securitiesInformationProcessorSymbolIdentifier": "NVDA", "tradeReportDate": "2026-10-15"}]}
+    row = _reg4_row("B")
+    page = finra_client.resolve_finra_official("otcMarket/regShoDaily", row, payload, root=tmp_path)
+    assert page is not None and isinstance(page["quote"], str) and page["quote"].endswith("|B")
+    with pytest.raises(ValueError, match="disagrees"):
+        finra_client.resolve_finra_official(
+            "otcMarket/regShoDaily", {**row, "shortParQuantity": 18013290.539633}, payload, root=tmp_path
+        )
+
+
+def test_reg4_duplicate_symbols_cite_exact_symbol_cell(reg4_get: MagicMock, tmp_path: Path) -> None:
+    """NVDA never matches the NVDL prefix or the NV prefix row in the short-interest file."""
+    row = {
+        "symbolCode": "NVDA",
+        "settlementDate": "2026-09-30",
+        "accountingYearMonthNumber": 20260930,
+        "currentShortPositionQuantity": 311389688,
+        "stockSplitFlag": None,
+        "changePercent": 5.83,
+    }
+    page = finra_client.resolve_finra_official("otcMarket/consolidatedShortInterest", row, {}, root=tmp_path)
+    assert page is not None and isinstance(page["quote"], str)
+    assert '"NVDA"' in page["quote"] and '"NVDL"' not in page["quote"]
+    assert '"NV"' not in page["quote"].split("|")[1]
+    with pytest.raises(ValueError, match="currentShortPositionQuantity"):
+        finra_client.resolve_finra_official(
+            "otcMarket/consolidatedShortInterest", {**row, "symbolCode": "NV"}, {}, root=tmp_path
+        )
+
+
+def test_reg4_missing_file_raises_not_none(
+    reg4_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fetch failure for a dataset with a known file raises; the absence is explicit."""
+    import requests as _requests
+
+    def boom(url: str, timeout: int) -> MagicMock:
+        raise _requests.ConnectionError("cdn.finra.org unreachable")
+
+    monkeypatch.setattr("app.finra_client.requests.get", boom)
+    with pytest.raises(_requests.ConnectionError):
+        finra_client.resolve_finra_official("otcMarket/regShoDaily", _NVDA_FNQC_ROW, {}, root=tmp_path)
+
+
+def test_reg4_file_vs_api_conflict_preserved(reg4_get: MagicMock, tmp_path: Path) -> None:
+    """A file line that disagrees with the API row raises; neither side is silently preferred."""
+    wrong = {**_NVDA_FNQC_ROW, "shortParQuantity": 1.0}
+    with pytest.raises(ValueError, match="ShortVolume"):
+        finra_client.resolve_finra_official("otcMarket/regShoDaily", wrong, {}, root=tmp_path)
+    absent = {**_NVDA_FNQC_ROW, "securitiesInformationProcessorSymbolIdentifier": "ZZZ"}
+    with pytest.raises(ValueError, match="no line for ZZZ"):
+        finra_client.resolve_finra_official("otcMarket/regShoDaily", absent, {}, root=tmp_path)
+
+
+def test_reg4_archive_hash_mismatch_fails_closed(reg4_get: MagicMock, tmp_path: Path) -> None:
+    """Edited archived bytes never verify: the archive read re-checks the content hash and never refetches."""
+    from app.storage import raw_archive as _archive
+
+    row = dict(_NVDA_FNQC_ROW)
+    first = finra_client.resolve_finra_official("otcMarket/regShoDaily", row, {}, root=tmp_path)
+    assert first is not None and isinstance(first["url"], str) and reg4_get.call_count == 1
+    record = _archive.find("finra", "official_file", first["url"], root=tmp_path / "raw")
+    assert record is not None
+    record.payload_path.write_bytes(_reg4_facility_file("B").replace(b"274457.043010", b"274457.043011"))
+    with pytest.raises(ValueError, match="does not match its content hash"):
+        finra_client.resolve_finra_official("otcMarket/regShoDaily", row, {}, root=tmp_path)
+    assert reg4_get.call_count == 1
+
+
+def test_official_file_rejects_redirect_off_finra_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A redirect hop off https://cdn.finra.org/ raises OSError and archives nothing."""
+    from types import SimpleNamespace
+
+    url = "https://cdn.finra.org/equity/regsho/daily/FNQCshvol20261015.txt"
+    hop = SimpleNamespace(url="https://evil.example/FNQCshvol20261015.txt")
+    final = SimpleNamespace(url=url, history=[hop], content=_FNQC_FILE, raise_for_status=lambda: None)
+
+    def redirected(u: str, timeout: int) -> SimpleNamespace:
+        assert (u, timeout) == (url, 60)
+        return final
+
+    monkeypatch.setattr("app.finra_client.requests.get", redirected)
+    with pytest.raises(OSError, match="redirect left the official FINRA host"):
+        finra_client.resolve_finra_official("otcMarket/regShoDaily", _NVDA_FNQC_ROW, {}, root=tmp_path)
+    assert finra_client.raw_archive.find("finra", "official_file", url, root=tmp_path / "raw") is None
+
+
+def test_reg4_api_only_dataset_has_no_public_page(http: dict[str, MagicMock], tmp_path: Path) -> None:
+    """thresholdList/weeklySummary resolve None: no static file, so no fabricated citation."""
+    http["post"].side_effect = [_token_response()]
+    assert (
+        finra_client.resolve_finra_official(
+            "otcMarket/thresholdList", {"issueSymbolIdentifier": "NVDA"}, {}, root=tmp_path
+        )
+        is None
+    )
+    assert (
+        finra_client.resolve_finra_official(
+            "otcMarket/weeklySummary", {"issueSymbolIdentifier": "NVDA"}, {}, root=tmp_path
+        )
+        is None
+    )
+    assert (
+        finra_client.resolve_finra_official(
+            "fixedIncomeMarket/treasuryDailyAggregates", {"tradeDate": "2026-10-15"}, {}, root=tmp_path
+        )
+        is None
+    )
+
+
+def test_reg4_weekly_threshold_records_cite_payload_json(
+    http: dict[str, MagicMock], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """API-only datasets admit observation proofs over archived payload bytes, not a public page."""
+    from app.research.evidence import finra_record_ref, observation_proof, verify_observation
+    from app.storage import raw_archive as _archive
+
+    http["post"].side_effect = [_token_response()]
+    row = {"issueSymbolIdentifier": "NVDA", "weekStartDate": "2026-10-13", "totalShareQuantity": 12345}
+    payload_bytes = json.dumps({"records": [row]}, sort_keys=True).encode()
+    digest = _archive.archive(
+        "finra", "tool_result", "tr-weekly", payload_bytes, url="api.finra.org", root=tmp_path / "raw"
+    ).sha256
+    prov = finra_record_ref(
+        tool_name="query_finra",
+        record_identity=json.dumps(row, sort_keys=True),
+        dataset="otcMarket/weeklySummary",
+        tool_result_id="tr-weekly",
+    )
+    proof = observation_proof(provenance=prov, source_bytes=payload_bytes, value="12345")
+    assert proof["sourceId"] == f"sha256:{digest}"
+    row_proof = {
+        "kind": "observation",
+        "sourceId": proof["sourceId"],
+        "locator": proof["locator"],
+        "valueHash": proof["valueHash"],
+    }
+    from datetime import UTC as _UTC
+    from datetime import datetime
+
+    from app.research.evidence import Evidence, evidence_content_hash
+
+    evidence = Evidence(
+        evidence_id="e1",
+        session_id="s",
+        wave_id=1,
+        source_type="finra",
+        source_name="FINRA",
+        source_uri="",
+        source_record_id="x",
+        subject="NVDA",
+        claim_text="c",
+        content="c",
+        content_hash=evidence_content_hash("c"),
+        known_at=datetime.now(_UTC),
+        retrieved_at=datetime.now(_UTC),
+        job_id="j",
+        agent_id="a",
+        claim_kind="observed_fact",
+        provenance=dict(prov),
+        value="12345",
+        entity="NVDA",
+        period="2026-10-13",
+        proof=row_proof,
+    )
+    assert verify_observation(evidence, value="12345", source_bytes=payload_bytes).status == "verified"
+    assert verify_observation(evidence, value="12346", source_bytes=payload_bytes).status == "conflicted"
+    assert verify_observation(evidence, value="12345", source_bytes=None).status == "unverified"
+
+
+def test_reg4_treasury_aggregate_identity_needs_no_symbol(http: dict[str, MagicMock], tmp_path: Path) -> None:
+    """Market aggregates carry no symbol field; the date alone is the valid identity."""
+    http["post"].side_effect = [_token_response()]
+    spec = finra_client.describe_dataset("fixedIncomeMarket/treasuryDailyAggregates")
+    assert spec["supports_ticker"] is False and spec["supports_date"] is True
+    assert (
+        finra_client.resolve_finra_official(
+            "fixedIncomeMarket/treasuryDailyAggregates", {"tradeDate": "2026-10-15"}, {}, root=tmp_path
+        )
+        is None
+    )
+
+
+def test_reg4_no_symbol_no_date_is_invalid_identity(tmp_path: Path) -> None:
+    """An empty row/payload cites nothing: no symbol and no day means no page."""
+    assert finra_client.resolve_finra_official("otcMarket/regShoDaily", {}, {}, root=tmp_path) is None
+    assert finra_client.resolve_finra_official("otcMarket/consolidatedShortInterest", {}, {}, root=tmp_path) is None
+
+
+def test_reg4_incomplete_pagination_marks_may_have_more(http: dict[str, MagicMock]) -> None:
+    """A partial page against a larger total keeps may_have_more True: incomplete coverage is explicit."""
+    records = [{"issueSymbolIdentifier": f"S{i}"} for i in range(2)]
+    http["post"].side_effect = [
+        _token_response(),
+        _response(records, headers={"Record-Total": "5", "Record-Offset": "0", "Record-Limit": "2"}),
+    ]
+    result = execute_tool(
+        "query_finra",
+        {"dataset": "otcMarket/weeklySummary", "limit": 2},
+        model="test",
+        context=LOCAL_CONTEXT,
+    )
+    assert "error" not in result, result
+    assert result["pagination_source"] == "finra_header"
+    assert result["may_have_more"] is True
+    assert result["returned_count"] == 2 and result["total_records"] == 5
+
+
+def test_finra_prov_query_carries_replayable_observation(
+    http: dict[str, MagicMock], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """query_dataset pins archive-bytes-first provenance: dataset/group/identity/query/filters/sort/pagination/environment/retrieved/PIT/response/cited-record hashes."""
+    import app.finra_client as _client
+    from app.storage import raw_archive as _archive
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    records = [{"symbolCode": "NVDA", "settlementDate": "2026-09-30", "currentShortPositionQuantity": 10}]
+    http["post"].side_effect = [_token_response(), _response(records)]
+    result = _client.query_dataset("otcMarket/consolidatedShortInterest", ticker="NVDA")
+    prov = result.get("provenance_observation")
+    assert isinstance(prov, dict), result
+    assert prov["dataset"] == "otcMarket/consolidatedShortInterest"
+    assert prov["group"] == "otcMarket"
+    assert "symbolCode" in prov["schema"]
+    assert isinstance(prov["query"], dict) and prov["query"].get("compareFilters")
+    assert isinstance(prov["filters"], list) and prov["filters"]
+    assert isinstance(prov["pagination"], dict)
+    assert prov["environment"] == "production"
+    assert isinstance(prov["retrieved_at"], str) and prov["retrieved_at"]
+    assert prov["point_in_time"]["as_of_date"] == "2026-09-30"
+    body = json.dumps({"records": records}, sort_keys=True).encode()
+    assert prov["response_hash"] == _archive.content_hash(body)
+    assert prov["record_hashes"] == [_archive.content_hash(json.dumps(records[0], sort_keys=True).encode())]
+    # Archive bytes replay: the pinned response hash matches stored bytes.
+    stored = _archive.find("finra", "tool_result", "otcMarket/consolidatedShortInterest", root=tmp_path / "raw")
+    assert stored is not None and stored.payload_path.read_bytes() == body
+
+
+def test_finra_prov_datapoints_carries_replayable_observation(
+    http: dict[str, MagicMock], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """get_finra_datapoints pins the same observation shape for exact-record requests."""
+    import app.finra_client as _client
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("FINRA_USE_MOCK", "")
+    records = [{"symbolCode": "NVDA", "settlementDate": "2026-09-30"}]
+    http["post"].side_effect = [_token_response(), _response(records)]
+    result = _client.get_finra_datapoints(
+        "otcMarket/consolidatedShortInterest",
+        fields=["symbolCode", "settlementDate"],
+        ticker="NVDA",
+    )
+    prov = result.get("provenance_observation")
+    assert isinstance(prov, dict), result
+    assert prov["dataset"] == "otcMarket/consolidatedShortInterest"
+    assert isinstance(prov["response_hash"], str) and isinstance(prov["record_hashes"], list)
+
+
+def test_finra_prov_unavailable_or_disagreeing_file_distinguished(http: dict[str, MagicMock], tmp_path: Path) -> None:
+    """API-only datasets admit observation proofs; published-file rows without a file raise, never silently use row one."""
+    import app.finra_client as _client
+
+    http["post"].side_effect = [_token_response()]
+    assert (
+        _client.resolve_finra_official(
+            "otcMarket/thresholdList", {"issueSymbolIdentifier": "NVDA", "tradeDate": "2026-10-15"}, {}, root=tmp_path
+        )
+        is None
+    )
+    assert (
+        _client.resolve_finra_official(
+            "fixedIncomeMarket/treasuryDailyAggregates", {"tradeDate": "2026-10-15"}, {}, root=tmp_path
+        )
+        is None
+    )
+
+
+def test_finra_prov_gateway_rows_carry_no_unverified_response_hash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gateway rows carry no response_hash: the tool-result replay path is the single verified source."""
+    from app import data_sources as _ds
+
+    def fake_datapoints(dataset: str, **kwargs: object) -> dict[str, object]:
+        assert dataset == "otcMarket/consolidatedShortInterest"
+        return {
+            "records": [{"symbolCode": "NVDA", "settlementDate": "2026-09-30"}],
+            "provenance_observation": {"response_hash": "abc123"},
+        }
+
+    monkeypatch.setattr(_ds._finra, "get_finra_datapoints", fake_datapoints)
+    gateway = _ds.SourceGateway()
+    rows = gateway.short_interest("NVDA")
+    assert rows and all("response_hash" not in row for row in rows)

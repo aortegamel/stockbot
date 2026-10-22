@@ -6,6 +6,9 @@ Request:  {"id", "op": "run", "prompt", "asOf"?, "deadlineAt"? (epoch ms),
           {"id", "op": "watchlist", "watchlist": [tickers], "deadlineAt"?} -> {"id", "watchlist": [rows]}
           (read-only page-load fan-out: no session, no evidence; same tool handlers and caches as intake)
           {"id", "op": "route", "prompt", "ticker"?, "watchlist"?, "currentChartTicker"?, "context"?}
+          {"id", "op": "entry_tool", "prompt", "tool", "arguments", "sessionId"?}
+            -> {"id", "sessionId", "evidence": [persisted rows], "content", "error"?}
+          (one fixed-argument call through research admission, with no graph or model planning)
 Response: {"id", "objective", "evidence": [{id, content}],
            "nodes": [{node_id, question, status, depends_on}],
            "decisions": [...persisted JEV records...], "unresolved": [node_ids],
@@ -2209,6 +2212,51 @@ def _assess_entry(req: Mapping[str, JSONValue], jev: JevClient | None = None) ->
     return {"id": rid, "verdict": verdict}
 
 
+def _entry_tool(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+    """Execute one entry tool through the research ledger before the final gates."""
+    from app.research import scheduler, service
+    from app.research.repository import ResearchRepository
+
+    rid = _request_id(req)
+    prompt, tool, arguments = req.get("prompt"), req.get("tool"), req.get("arguments")
+    if (
+        not isinstance(prompt, str)
+        or not prompt.strip()
+        or not isinstance(tool, str)
+        or not isinstance(arguments, dict)
+    ):
+        return _terminal(rid, "invalid_params", "prompt, tool, and arguments required")
+    registry = scheduler.build_registry()
+    if tool not in {entry.get("name") for entry in registry}:
+        return _terminal(rid, "invalid_params", "unknown entry tool")
+    store = ResearchRepository()
+    sid = _final_session(req)
+    if sid is None:
+        sid = service.create_research(
+            prompt, prompt, policy={"research_sources": {"mode": "all", "sources": []}}, repo=store
+        )
+        service.complete_job(store.list_jobs(sid)[0].job_id, repo=store)
+    else:
+        store.get_session(sid)
+    kernel = scheduler._default_kernel()
+    session = scheduler._load_session(sid, kernel)
+    record = asyncio.run(_intake_attempt(tool, dict(arguments), sid, session, registry, None, kernel, None))
+    outcomes = {"admitted": 0, "duplicate": 0, "not_citable": 0, "error": 0, "timeout": 0}
+    _intake_admit_call(kernel, sid, tool, record, outcomes, [])
+    evidence, _ = _run_evidence(store.list_evidence(sid))
+    out: dict[str, JSONValue] = {
+        "id": rid,
+        "sessionId": sid,
+        "evidence": evidence,
+        "content": str(record.get("outcome_summary") or ""),
+    }
+    if record.get("error") is not None:
+        out["error"] = str(record["error"])[:500]
+        category = record.get("error_type")
+        out["category"] = category if isinstance(category, str) and category else "tool_error"
+    return out
+
+
 def _final_ids(item: object, key: str) -> list[str]:
     """Non-empty string id list under key; [] when absent or malformed."""
     if not isinstance(item, Mapping):
@@ -2219,13 +2267,52 @@ def _final_ids(item: object, key: str) -> list[str]:
     return [eid for eid in raw if isinstance(eid, str) and eid.strip()]
 
 
-def _final_sid(req: Mapping[str, JSONValue], rid: str) -> str:
-    """Session id: sessionId (camelCase, matches run op) with session_id alias."""
+def _final_session(req: Mapping[str, JSONValue]) -> str | None:
+    """Caller session id: sessionId (camelCase, matches run op) with session_id alias; None when absent."""
     for key in ("sessionId", "session_id"):
         raw = req.get(key)
         if isinstance(raw, str) and raw.strip():
             return raw.strip()
-    return rid
+    return None
+
+
+def _final_sid(req: Mapping[str, JSONValue], rid: str) -> str:
+    """Session id for JEV calls: the caller session, else the request id."""
+    return _final_session(req) or rid
+
+
+def _final_proof_defect(req: Mapping[str, JSONValue], raw_claims: object) -> str | None:
+    """Deterministic ledger proof for wire claims before any JEV call; None when every claim verifies.
+
+    Claims resolve against the research session's persisted ledger (content hash,
+    archive bytes / persisted tool result, observation/calculation proof, numbers
+    in kernel-held text). No session id, an unknown session, or any unproven
+    non-unknown claim fails closed.
+    """
+    from app.research import service
+    from app.research.agents import DATAPOINT_FIELDS, parse_grounded_claims
+    from app.research.repository import ResearchRepository
+
+    keys = ("text", "claim_type", "evidence_ids", *DATAPOINT_FIELDS)
+    rows = [
+        {key: item[key] for key in keys if item.get(key) is not None}
+        for item in (raw_claims if isinstance(raw_claims, list) else [])
+        if isinstance(item, Mapping)
+    ]
+    if not rows:
+        return None
+    sid = _final_session(req)
+    if sid is None:
+        return "proof: sessionId required to verify claims against the research ledger"
+    try:
+        store = ResearchRepository()
+        store.get_session(sid)
+        cited = [eid for row in rows for eid in (row.get("evidence_ids") or []) if isinstance(eid, str)]
+        claims = parse_grounded_claims(json.dumps(rows), frozen=cited)
+        service.require_verified_claims(store, sid, claims, "assess_final")
+    except (KeyError, ValueError) as exc:
+        return f"proof: {exc}"
+    return None
 
 
 def _final_evidence(req: Mapping[str, JSONValue]) -> list[JSONValue]:
@@ -2300,12 +2387,16 @@ def _final_claim_evidence(req: Mapping[str, JSONValue], holder: Mapping[str, JSO
 
 
 def _assess_final_response(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
-    """Whole-response gate (runs even with empty claims): JEV judges the qualified wording as written."""
+    """Whole-response gate (runs even with empty claims): ledger proof first, then JEV judges the wording as written."""
     rid = _request_id(req)
     text = req.get("text")
     if not isinstance(text, str) or not text.strip():
         logger.info("toolflow assess_final_response rid=%s reason=blank-text", rid)
         return _final_fail(rid, "text required")
+    defect = _final_proof_defect(req, req.get("claims"))
+    if defect is not None:
+        logger.info("toolflow assess_final_response rid=%s reason=proof %.300s", rid, defect)
+        return _final_fail(rid, defect)
     try:
         client = _jev_client(jev)
         out = asyncio.run(
@@ -2337,7 +2428,7 @@ def _assess_final_response(req: Mapping[str, JSONValue], jev: JevClient | None =
 
 
 def _assess_final_claim(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
-    """Per-claim gate (only after whole-response reject): JEV judges one qualified claim as written."""
+    """Per-claim gate (only after whole-response reject): ledger proof first, then JEV judges the claim as written."""
     rid = _request_id(req)
     holder, text, ctype = _final_claim_inputs(req)
     if not isinstance(text, str) or not text.strip():
@@ -2345,6 +2436,10 @@ def _assess_final_claim(req: Mapping[str, JSONValue], jev: JevClient | None = No
         return _final_fail(rid, "text required")
     if not isinstance(ctype, str) or not ctype.strip():
         return _final_fail(rid, "claim_type required")
+    defect = _final_proof_defect(req, [holder])
+    if defect is not None:
+        logger.info("toolflow assess_final_claim rid=%s reason=proof %.300s", rid, defect)
+        return _final_fail(rid, defect)
     confidence = _confidence(holder.get("confidence", req.get("confidence")))
     evidence = _final_claim_evidence(req, holder)
     try:
@@ -2725,6 +2820,7 @@ _KERNEL_OPS = (
     "route",
     "arguments",
     "assess_entry",
+    "entry_tool",
     "assess_final_response",
     "assess_final_claim",
 )
@@ -2770,6 +2866,8 @@ def _direct_op(req: Mapping[str, JSONValue], jev: JevClient | None) -> dict[str,
             return _route(req, jev=jev)
         if op == "arguments":
             return _arguments(req)
+        if op == "entry_tool":
+            return _entry_tool(req)
         if op == "assess_final_response":
             return _assess_final_response(req, jev=jev)
         if op == "assess_final_claim":

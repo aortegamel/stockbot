@@ -268,6 +268,17 @@ def test_historical_never_calls_yahoo(gateway: _Gateway, monkeypatch: pytest.Mon
     assert result["price_retrieved_at"] is None
     assert result["dividend_status"] == "paying"
     assert result["annual_history"] == [{"fiscal_year": 2025, "dividend_per_share": 2.04}]
+    calculation_inputs = result["calculation_inputs"]
+    assert isinstance(calculation_inputs, dict)
+    inputs = calculation_inputs["ttm_dividend_per_share"]
+    assert isinstance(inputs, list)
+    assert [row["accession"] for row in inputs] == ["k4", "k6", "k7", "k8"]
+    assert all(not row.get("derived") for row in inputs)
+    assert all(row["unit"] == "USD/shares" for row in inputs)
+    calculations = result["calculations"]
+    assert isinstance(calculations, dict)
+    assert calculations["ttm_dividend_per_share"]["formulaId"] == "sec_dividend_ttm"
+    assert calculations["ttm_dividend_per_share"]["formulaVersion"] == "1"
 
 
 def test_derived_q4_uses_fy_minus_ytd(gateway: _Gateway, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -280,6 +291,39 @@ def test_derived_q4_uses_fy_minus_ytd(gateway: _Gateway, monkeypatch: pytest.Mon
     assert result["price"] is None
     assert result["dividend_status"] == "paying"
     assert result["annual_history"] == [{"fiscal_year": 2026, "dividend_per_share": 2.04}]
+    calculation_inputs = result["calculation_inputs"]
+    assert isinstance(calculation_inputs, dict)
+    inputs = calculation_inputs["ttm_dividend_per_share"]
+    assert isinstance(inputs, list)
+    assert len(inputs) == 4
+    q4 = next(row for row in inputs if row["period_end"] == "2026-01-25")
+    assert q4["derived"] is True
+    assert q4["formulaId"] == "sec_q4_difference"
+    assert q4["formulaVersion"] == "1"
+    assert q4["accession"] == ""
+    assert "source_identity" not in q4
+    assert [row["accession"] for row in q4["derivation_inputs"]] == ["d7", "d5"]
+
+
+def test_growth_formulas_pin_annual_facts_and_version(gateway: _Gateway, monkeypatch: pytest.MonkeyPatch) -> None:
+    _fail_on_price(monkeypatch)
+    _seed_growth(gateway)
+    result = sec_facts.get_fundamentals("KO", "dividends", as_of=AS_OF)
+    calculations = result["calculations"]
+    assert isinstance(calculations, dict)
+    growth_1y = calculations["growth_1y"]
+    assert isinstance(growth_1y, dict)
+    assert growth_1y["formulaId"] == "sec_dividend_growth_1y"
+    assert growth_1y["formulaVersion"] == "1"
+    assert growth_1y["verification"] == "unverified"
+    assert growth_1y["unit"] == "ratio"
+    inputs = growth_1y["derivation_inputs"]
+    assert isinstance(inputs, list)
+    assert [row["period_end"][:4] for row in inputs] == ["2024", "2025"]
+    assert result["growth_1y"] == 0.0526
+    missing_inputs = result["calculation_inputs"]
+    assert isinstance(missing_inputs, dict)
+    assert missing_inputs["growth_1y"] == inputs
 
 
 def test_exact_gap_growth_and_cagr(gateway: _Gateway, monkeypatch: pytest.MonkeyPatch) -> None:

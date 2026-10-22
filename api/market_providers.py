@@ -480,12 +480,13 @@ def _dedup_by_link(items: list[dict[str, object]]) -> list[dict[str, object]]:
 def get_news(sym: str, limit: int = 12) -> dict[str, object]:
     """Per-ticker headlines merged newest-first: Google + Yahoo + SA + CNBC/MW + newsquant.
 
-    Per-ticker heads (Google search, Yahoo ?s=SYM, Seeking Alpha ticker feed)
-    merge with ticker-filtered topic tails (CNBC top news, MarketWatch top
-    stories). Dedup by link, newest-first sort, single ``news:{ticker}`` cache
-    key. newsquant enrichment appends only when STOCKBOT_NEWSQUANT=1 (else the
-    keyless merge stands alone). Exa is intentionally absent here — paid
-    research path only (app/exa_client.search).
+    Headline rows only (title/link/published/source): no article body is fetched
+    here, so a headline never proves a full-page read. Per-ticker heads (Google
+    search, Yahoo ?s=SYM, Seeking Alpha ticker feed) merge with ticker-filtered
+    topic tails (CNBC top news, MarketWatch top stories). Dedup by link,
+    newest-first sort, single ``news:{ticker}`` cache key. newsquant enrichment
+    appends only when STOCKBOT_NEWSQUANT=1 (else the keyless merge stands alone).
+    Exa is intentionally absent here — paid research path only (app/exa_client.search).
     """
     ticker = sym.strip().upper()
     if not ticker:

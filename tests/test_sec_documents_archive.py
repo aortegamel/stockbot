@@ -1,6 +1,7 @@
 """Archive-first bounded SEC documents (offline; edgar faked via monkeypatch)."""
 
 import hashlib
+import json
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -517,9 +518,17 @@ def _ix_context(context_id: str, period: str, segment: str = "") -> str:
     )
 
 
-def _ix_fact(name: str, context: str, text: str, fact_id: str, scale: str = "6", extra: str = "") -> str:
+def _ix_fact(
+    name: str,
+    context: str,
+    text: str,
+    fact_id: str,
+    scale: str = "6",
+    extra: str = "",
+    unit: str = "usd",
+) -> str:
     return (
-        f'<ix:nonFraction name="{name}" contextRef="{context}" unitRef="usd" decimals="-6" scale="{scale}" '
+        f'<ix:nonFraction name="{name}" contextRef="{context}" unitRef="{unit}" decimals="-6" scale="{scale}" '
         f'format="ixt:num-dot-decimal" id="{fact_id}"{extra}>{text}</ix:nonFraction>'
     )
 
@@ -532,18 +541,25 @@ OFF_PRIMARY_HTML = (
     + _ix_context("c-2", _Q2, _SEGMENT)
     + _ix_context("c-3", _YTD)
     + _ix_context("c-4", "<xbrli:instant>2026-07-20</xbrli:instant>")
+    + '<xbrli:unit id="usd"><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unit>'
+    + '<xbrli:unit id="shares"><xbrli:measure>xbrli:shares</xbrli:measure></xbrli:unit>'
+    + '<xbrli:unit id="usdPerShare"><xbrli:divide><xbrli:unitNumerator>'
+    + "<xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unitNumerator><xbrli:unitDenominator>"
+    + "<xbrli:measure>xbrli:shares</xbrli:measure></xbrli:unitDenominator></xbrli:divide></xbrli:unit>"
     + "</ix:resources></ix:header></div>"
+    + "<h2>Management discussion</h2><p>Revenue was 81,615 million.</p>"
     + "<p>Shares outstanding as of July 20, 2026 was "
-    + _ix_fact("dei:EntityCommonStockSharesOutstanding", "c-4", "24.3", "f-5", scale="9")
+    + _ix_fact("dei:EntityCommonStockSharesOutstanding", "c-4", "24.3", "f-5", scale="9", unit="shares")
     + " billion.</p><table>"
     + f"<tr><td>Data center</td><td>$</td><td>{_ix_fact('us-gaap:Revenues', 'c-2', '81,615', 'f-seg')}</td></tr>"
     + f"<tr><td>Revenue</td><td>$</td><td>{_ix_fact('us-gaap:Revenues', 'c-1', '81,615', 'f-1')}</td>"
-    + f"<td>$</td><td>{_ix_fact('us-gaap:Revenues', 'c-3', '160,000', 'f-2')}</td></tr>"
+    + f"<td>$</td><td>{_ix_fact('us-gaap:Revenues', 'c-3', '81,615', 'f-2')}</td></tr>"
     + "<tr><td>Net loss</td><td>$</td><td>("
     + _ix_fact("us-gaap:NetIncomeLoss", "c-1", "1,234", "f-3", scale="3", extra=' sign="-"')
     + ")</td></tr>"
-    + f"<tr><td>Diluted</td><td>$</td><td>{_ix_fact('us-gaap:EarningsPerShareDiluted', 'c-1', '1.08', 'f-6', scale='0')}"
+    + f"<tr><td>Diluted</td><td>$</td><td>{_ix_fact('us-gaap:EarningsPerShareDiluted', 'c-1', '1.08', 'f-6', scale='0', unit='usdPerShare')}"
     + "</td></tr></table><p>Notes</p>"
+    + f"<table><tr><td>Revenue shares</td><td>{_ix_fact('us-gaap:Revenues', 'c-1', '81,615', 'f-shares', unit='shares')}</td></tr></table>"
     + f"<table><tr><td>Total revenue</td><td>{_ix_fact('us-gaap:Revenues', 'c-1', '81,615', 'f-9')}</td></tr></table>"
     + "</body></html>"
 )
@@ -605,21 +621,55 @@ def _official(tmp_path: Path, tool: str, row: dict[str, object], payload: dict[s
     return page
 
 
-def test_official_xbrl_fact_anchor_and_row_quote(tmp_path: Path, sec_www: _FakeSec) -> None:
-    """Dimensional, hidden, YTD, and later duplicate facts all lose to the first visible statement row."""
-    row: dict[str, object] = {"concept": "us-gaap:Revenues", "value": 81615000000.0, "period_end": "2026-06-30"}
-    page = _official(tmp_path, "get_xbrl_facts", {**row, "accession": OFF_ACC}, {"cik": OFF_CIK})
-    assert (page["url"], page["media"], page["anchor"]) == (OFF_PRIMARY, "html", "f-1")
-    assert page["quote"] == "Revenue | $ | 81,615"
+def _revenue_row(**changes: object) -> dict[str, object]:
+    return {
+        "concept": "us-gaap:Revenues",
+        "value": 81615000000.0,
+        "unit": "USD",
+        "period_start": "2026-04-01",
+        "period_end": "2026-06-30",
+        "dimensions": {},
+        "accession": OFF_ACC,
+        "cik": OFF_CIK,
+        **changes,
+    }
+
+
+def test_official_xbrl_fact_preserves_equivalent_occurrences(tmp_path: Path, sec_www: _FakeSec) -> None:
+    """Equivalent facts preserve each occurrence instead of choosing the first visible value."""
+    page = documents.resolve_sec_official("get_xbrl_facts", _revenue_row(), {}, root=tmp_path)
+    assert page is not None
+    assert page["url"] == OFF_PRIMARY
+    assert page["quote"] == ""
+    assert page["anchor"] == ""
+    canonical = page["canonical_fact"]
+    assert isinstance(canonical, dict)
+    assert {key: canonical[key] for key in ("concept", "cik", "period_start", "period_end", "unit")} == {
+        "concept": "Revenues",
+        "cik": str(OFF_CIK),
+        "period_start": "2026-04-01",
+        "period_end": "2026-06-30",
+        "unit": "USD",
+    }
+    assert float(str(canonical["value"])) == 81615000000.0
+    assert canonical["dimensions"] == {}
+    occurrences = page["occurrences"]
+    assert isinstance(occurrences, list)
+    assert len(occurrences) == 3
+    assert {item["element_id"] for item in occurrences if isinstance(item, dict)} == {"f-hidden", "f-1", "f-9"}
 
 
 def test_official_fact_scale_and_sign(tmp_path: Path, sec_www: _FakeSec) -> None:
     loss: dict[str, object] = {"concept": "NetIncomeLoss", "period_end": "2026-06-30", "accession": OFF_ACC}
     page = _official(tmp_path, "get_xbrl_facts", {**loss, "value": -1234000.0, "cik": OFF_CIK})
     assert (page["anchor"], page["quote"]) == ("f-3", "Net loss | $ | (1,234)")
-    # The wrong sign matches no reported fact: the filing index page stays the official page.
-    unsigned = _official(tmp_path, "get_xbrl_facts", {**loss, "value": 1234000.0, "cik": OFF_CIK})
-    assert (unsigned["url"], unsigned["anchor"], unsigned["quote"]) == (OFF_INDEX, "", f"SEC Accession No. {OFF_ACC}")
+    # The filing index proves filing metadata, not an absent numeric fact.
+    assert (
+        documents.resolve_sec_official(
+            "get_xbrl_facts", {**loss, "value": 1234000.0, "cik": OFF_CIK}, {}, root=tmp_path
+        )
+        is None
+    )
 
 
 def test_official_eps_row_and_shares_envelope(tmp_path: Path, sec_www: _FakeSec) -> None:
@@ -628,6 +678,8 @@ def test_official_eps_row_and_shares_envelope(tmp_path: Path, sec_www: _FakeSec)
         "eps_diluted": 1.08,
         "period_end": "2026-06-30",
         "accession": OFF_ACC,
+        "period_start": "2026-04-01",
+        "unit": "USD/shares",
         "cik": OFF_CIK,
     }
     page = _official(tmp_path, "get_fundamentals", eps, {"metric": "eps"})
@@ -636,6 +688,8 @@ def test_official_eps_row_and_shares_envelope(tmp_path: Path, sec_www: _FakeSec)
         "metric": "shares_outstanding",
         "shares_outstanding": 24300000000.0,
         "as_of": "2026-07-20",
+        "instant": "2026-07-20",
+        "unit": "shares",
         "accession": OFF_ACC,
         "cik": OFF_CIK,
     }
@@ -658,6 +712,7 @@ def test_official_insider_row_is_rendered_form_line(tmp_path: Path, sec_www: _Fa
     row: dict[str, object] = {
         "accession_no": F4_ACC,
         "issuer_cik": 1045810,
+        "filer_cik": 1197647,
         "transaction_date": "2026-10-07",
         "shares": 500000.0,
         "price": 0.0,
@@ -698,7 +753,247 @@ def test_official_identity_gaps(tmp_path: Path, sec_www: _FakeSec) -> None:
     assert sec_www.calls == []
     company = _official(tmp_path, "get_fundamentals", {}, {"metric": "overview", "name": "APPLE INC", "cik": OFF_CIK})
     assert (company["url"], company["quote"]) == (COMPANY_URL, "APPLE INC CIK#: 0000320193 (see all company filings)")
-    # No party CIK: the accession's filer-agent prefix CIK still names the accession directory.
-    with pytest.raises(OSError, match="fetch failed"):
+    # The accession prefix identifies a filing agent, not the issuer directory.
+    calls = list(sec_www.calls)
+    assert (
         documents.resolve_sec_official("get_material_events", {"source_accessions": [F4_ACC]}, {}, root=tmp_path)
-    assert sec_www.calls[-1] == f"https://www.sec.gov/Archives/edgar/data/1197647/000119764726000011/{F4_ACC}-index.htm"
+        is None
+    )
+    assert sec_www.calls == calls
+
+
+@pytest.mark.parametrize(
+    ("changes", "anchor"),
+    [
+        ({"element_id": "f-1"}, "f-1"),
+        ({"context_id": "c-2", "dimensions": {"a:SegmentAxis": "a:DataCenter"}}, "f-seg"),
+        ({"context_id": "c-3", "period_start": "2026-01-01"}, "f-2"),
+        ({"unit": "shares"}, "f-shares"),
+    ],
+)
+def test_official_fact_uses_context_unit_dimension_and_locator(
+    changes: dict[str, object], anchor: str, tmp_path: Path, sec_www: _FakeSec
+) -> None:
+    page = _official(tmp_path, "get_xbrl_facts", _revenue_row(**changes))
+    assert page["anchor"] == anchor
+    quote = page["quote"]
+    assert isinstance(quote, str)
+    assert "Management discussion" not in quote
+    assert page["canonical_fact"]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"period_start": None},
+        {"period_start": "2026-05-01"},
+        {"unit": "EUR"},
+        {"unit": None},
+        {"dimensions": {"a:SegmentAxis": "a:Unknown"}},
+        {"element_id": "f-absent"},
+        {"context_id": "c-absent"},
+        {"value": 81615000001.0},
+    ],
+)
+def test_official_financial_fact_never_falls_back_to_available_index(
+    changes: dict[str, object], tmp_path: Path, sec_www: _FakeSec
+) -> None:
+    assert documents.resolve_sec_official("get_xbrl_facts", _revenue_row(**changes), {}, root=tmp_path) is None
+    assert OFF_INDEX in sec_www.calls
+
+
+def test_official_hidden_fact_uses_canonical_case_two(tmp_path: Path, sec_www: _FakeSec) -> None:
+    page = documents.resolve_sec_official("get_xbrl_facts", _revenue_row(element_id="f-hidden"), {}, root=tmp_path)
+    assert page is not None
+    assert (page["url"], page["quote"], page["anchor"]) == (OFF_PRIMARY, "", "")
+    assert page["canonical_fact"]
+    occurrences = page["occurrences"]
+    assert isinstance(occurrences, list) and len(occurrences) == 1
+    assert page["sha256"] == hashlib.sha256(OFF_PRIMARY_HTML.encode()).hexdigest()
+
+
+def test_official_shares_without_inline_fact_stays_unresolved(tmp_path: Path, sec_www: _FakeSec) -> None:
+    """An available filing and equal-looking prose do not prove the requested shares fact."""
+    sec_www.pages[OFF_PRIMARY] = b"<html><body><p>Shares outstanding were 24.3 billion.</p></body></html>"
+    payload: dict[str, object] = {
+        "metric": "shares_outstanding",
+        "shares_outstanding": 24300000000.0,
+        "instant": "2026-07-20",
+        "unit": "shares",
+        "accession": OFF_ACC,
+        "cik": OFF_CIK,
+    }
+    assert documents.resolve_sec_official("get_fundamentals", {}, payload, root=tmp_path) is None
+    assert sec_www.calls == [OFF_INDEX, OFF_PRIMARY]
+
+
+def test_official_fact_rejects_wrong_context_entity(tmp_path: Path, sec_www: _FakeSec) -> None:
+    sec_www.pages[OFF_PRIMARY] = OFF_PRIMARY_HTML.replace(
+        "<xbrli:identifier>320193</xbrli:identifier>", "<xbrli:identifier>1045810</xbrli:identifier>"
+    ).encode()
+    assert documents.resolve_sec_official("get_xbrl_facts", _revenue_row(), {}, root=tmp_path) is None
+
+
+@pytest.mark.parametrize("state", ["valid", "missing", "tampered", "wrong_hash", "wrong_identity"])
+def test_official_canonical_companyfact_requires_exact_archived_bytes(
+    state: str, tmp_path: Path, sec_www: _FakeSec
+) -> None:
+    """An archived canonical fact can support an absent visible fact, but an unpinned record cannot."""
+    from app.normalization import normalize_sec_company_facts
+    from app.storage import raw_archive
+
+    source_fact = {
+        "start": "2026-04-01",
+        "end": "2026-06-30",
+        "val": 81615000000,
+        "accn": OFF_ACC,
+        "filed": "2026-08-01",
+        "fy": 2026,
+        "fp": "Q2",
+        "form": "10-Q",
+    }
+    payload = {
+        "cik": OFF_CIK,
+        "entityName": "APPLE INC",
+        "facts": {"us-gaap": {"Revenues": {"units": {"USD": [source_fact]}}}},
+    }
+    raw = json.dumps(payload, sort_keys=True).encode()
+    source_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{OFF_CIK:010d}.json"
+    archived = raw_archive.archive(
+        "sec",
+        f"cik{OFF_CIK:010d}",
+        "companyfacts",
+        raw,
+        url=source_url,
+        retrieved_at="2026-08-02T00:00:00Z",
+        root=tmp_path / "raw",
+    )
+    normalized = normalize_sec_company_facts(
+        payload,
+        retrieved_at="2026-08-02T00:00:00Z",
+        content_hash=archived.sha256,
+        source_url=source_url,
+        source_record_id=f"cik{OFF_CIK:010d}",
+    )
+    row = dict(normalized["financial_facts"][0])
+    row["concept"] = row["original_concept"]
+    sec_www.pages[OFF_PRIMARY] = b"<html><body><p>Financial statements omit this visible fact.</p></body></html>"
+    if state == "missing":
+        archived.payload_path.unlink()
+    elif state == "tampered":
+        archived.payload_path.write_bytes(raw + b" ")
+    elif state == "wrong_hash":
+        row["content_hash"] = "0" * 64
+    elif state == "wrong_identity":
+        row["source_identity"] = {**source_fact, "accn": "0000320193-26-999999"}
+    page = documents.resolve_sec_official("get_xbrl_facts", row, {}, root=tmp_path)
+    if state != "valid":
+        assert page is None
+        return
+    assert page is not None
+    assert (page["url"], page["quote"], page["anchor"]) == (OFF_PRIMARY, "", "")
+    canonical = page["canonical_fact"]
+    assert isinstance(canonical, dict)
+    assert canonical["content_hash"] == archived.sha256
+    assert canonical["sourceId"] == f"sha256:{archived.sha256}"
+    assert page["canonical_payload"] == raw
+    assert page["occurrences"] == []
+    assert archived.payload_path.read_bytes() == raw
+    assert page["sha256"] == hashlib.sha256(sec_www.pages[OFF_PRIMARY]).hexdigest()
+    sec_www.pages.clear()
+    assert documents.resolve_sec_official("get_xbrl_facts", row, {}, root=tmp_path) == page
+    assert sec_www.calls == [OFF_INDEX, OFF_PRIMARY]
+
+
+@pytest.mark.parametrize("markup", ["nested", "continued", "css-hidden"])
+def test_official_fact_markup_preserves_value_without_invented_highlight(
+    markup: str, tmp_path: Path, sec_www: _FakeSec
+) -> None:
+    original = _ix_fact("us-gaap:Revenues", "c-1", "81,615", "f-1")
+    if markup == "nested":
+        replacement = _ix_fact("us-gaap:Revenues", "c-1", "<span>81,615</span>", "f-1")
+    elif markup == "continued":
+        replacement = _ix_fact("us-gaap:Revenues", "c-1", "81,", "f-1", extra=' continuedAt="continued-1"')
+        replacement += '<ix:continuation id="continued-1">615</ix:continuation>'
+    else:
+        replacement = f'<div style="display:none">{original}</div>'
+    sec_www.pages[OFF_PRIMARY] = OFF_PRIMARY_HTML.replace(original, replacement).encode()
+    page = documents.resolve_sec_official("get_xbrl_facts", _revenue_row(element_id="f-1"), {}, root=tmp_path)
+    assert page is not None
+    assert page["url"] == OFF_PRIMARY
+    canonical = page["canonical_fact"]
+    assert isinstance(canonical, dict)
+    assert float(str(canonical["value"])) == 81615000000.0
+    if markup == "nested":
+        assert page["anchor"] == "f-1"
+        assert page["quote"]
+    else:
+        assert (page["quote"], page["anchor"]) == ("", "")
+
+
+@pytest.mark.parametrize("wrapper", ["<!--{}-->", "<script>{}</script>"])
+def test_official_fact_ignores_noncontent_markup(wrapper: str, tmp_path: Path, sec_www: _FakeSec) -> None:
+    fake_fact = _ix_fact("us-gaap:Revenues", "c-1", "81,615", "f-1")
+    sec_www.pages[OFF_PRIMARY] = (
+        "<html><body>"
+        + _ix_context("c-1", _Q2)
+        + '<xbrli:unit id="usd"><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unit>'
+        + wrapper.format(fake_fact)
+        + "<p>Revenue was 81,615 million.</p></body></html>"
+    ).encode()
+    assert documents.resolve_sec_official("get_xbrl_facts", _revenue_row(), {}, root=tmp_path) is None
+
+
+def test_official_fact_rejects_conflicting_precision(tmp_path: Path, sec_www: _FakeSec) -> None:
+    incompatible = _ix_fact("us-gaap:Revenues", "c-1", "81,615", "f-precision", extra=' precision="2"')
+    sec_www.pages[OFF_PRIMARY] = OFF_PRIMARY_HTML.replace("</body>", incompatible + "</body>").encode()
+    assert documents.resolve_sec_official("get_xbrl_facts", _revenue_row(), {}, root=tmp_path) is None
+
+
+def test_official_fact_rejects_ambiguous_taxonomy(tmp_path: Path, sec_www: _FakeSec) -> None:
+    alien = _ix_fact("alien:Revenues", "c-1", "81,615", "f-alien")
+    sec_www.pages[OFF_PRIMARY] = OFF_PRIMARY_HTML.replace("</body>", alien + "</body>").encode()
+    unresolved = _revenue_row(concept="Revenues")
+    assert documents.resolve_sec_official("get_xbrl_facts", unresolved, {}, root=tmp_path) is None
+    resolved = documents.resolve_sec_official(
+        "get_xbrl_facts", {**unresolved, "namespace": "us-gaap", "element_id": "f-1"}, {}, root=tmp_path
+    )
+    assert resolved is not None
+    assert resolved["anchor"] == "f-1"
+
+
+def test_official_beneficial_ownership_uses_subject_not_reporting_filer(tmp_path: Path, sec_www: _FakeSec) -> None:
+    index = f"{F4_DIR}/{F4_ACC}-index.htm"
+    primary = f"{F4_DIR}/schedule13d.htm"
+    sec_www.pages[index] = F4_INDEX_HTML.replace("xslF345X06/form4.xml", "schedule13d.htm").encode()
+    sec_www.pages[primary] = (
+        b"<html><body><table><tr><td>Beneficial owner</td><td>500,000</td><td>5%</td></tr></table></body></html>"
+    )
+    row: dict[str, object] = {
+        "accession_no": F4_ACC,
+        "subject_cik": 1045810,
+        "filer_cik": 1197647,
+        "shares": 500000.0,
+        "percent": 5.0,
+    }
+    page = _official(tmp_path, "get_beneficial_ownership", row)
+    assert page["url"] == primary
+    assert page["quote"] == "Beneficial owner | 500,000 | 5%"
+    assert sec_www.calls == [index, primary]
+
+
+@pytest.mark.parametrize("reporting_owner_cik", ["not-a-cik", {}, True])
+def test_official_malformed_reporting_owner_cik_is_unresolved(
+    reporting_owner_cik: object, tmp_path: Path, sec_www: _FakeSec
+) -> None:
+    primary = f"{F4_DIR}/xslF345X06/form4.xml"
+    identities = "<issuerCik>1045810</issuerCik><rptOwnerCik>1197647</rptOwnerCik>"
+    sec_www.pages[primary] = F4_HTML.replace("<body>", f"<body>{identities}").encode()
+    row: dict[str, object] = {
+        "accession_no": F4_ACC,
+        "issuer_cik": 1045810,
+        "reporting_owner_cik": reporting_owner_cik,
+        "transaction_date": "2026-10-07",
+        "shares": 500000.0,
+    }
+    assert documents.resolve_sec_official("get_insider_activity", row, {}, root=tmp_path) is None

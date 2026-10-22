@@ -111,25 +111,26 @@ class SourceGateway:
         key = ("company_facts", cik_int)
         cached: object = self._cache.get(key)
         if cached is None:
-            _sec.ensure_identity()
-            from edgar.entity.entity_facts import download_company_facts_from_sec
+            from edgar.urls import build_company_facts_url
 
-            raw = download_company_facts_from_sec(cik_int)
-            if not isinstance(raw, dict):
+            from .services.research_data import _edgar_get
+            from .storage import raw_archive
+
+            source_url = build_company_facts_url(cik_int)
+            payload = _edgar_get(source_url)
+            raw = json.loads(payload)
+            if not isinstance(raw, dict) or _norm._parse_company_cik(raw) != cik_int:
                 cached = dict(_EMPTY_FACTS)
             else:
                 retrieved_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-                from edgar.urls import build_company_facts_url
-
-                source_url = build_company_facts_url(cik_int)
                 record_id = f"cik{cik_int:010d}"
-                content_hash = hashlib.sha256(
-                    json.dumps(raw, sort_keys=True, separators=(",", ":"), default=str).encode()
-                ).hexdigest()
+                archive = raw_archive.archive(
+                    "sec", record_id, "companyfacts", payload, url=source_url, retrieved_at=retrieved_at
+                )
                 normalized: dict[str, list[dict[str, object]]] = _norm.normalize_sec_company_facts(
                     raw,
                     retrieved_at=retrieved_at,
-                    content_hash=content_hash,
+                    content_hash=archive.sha256,
                     source_url=source_url,
                     source_record_id=record_id,
                 )

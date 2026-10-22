@@ -16,7 +16,7 @@ function requiredEnv(name: string): string {
 
 const SYSTEM = "You are Stockbot.";
 
-// Single-tool/direct callers: no inventory, but inline row ids still count as citations.
+// Single-tool callers: inline row ids still count as citations, and the inventory feeds the final gates.
 const CITE_IDS = " After a fact from EVIDENCE, put its row id in brackets, e.g. [ev:abc123].";
 
 // Stance sentences adapted from the old committee roles (app/research/agents/*bot.py) to standalone prose.
@@ -43,15 +43,18 @@ const PERSONAS: Record<Persona, { name: string; stance: string }> = {
 // exactly, EVIDENCE row ids only, model-declared confidence (carried, never a threshold).
 const INVENTORY_RULE =
   " End your answer with a fenced inventory block and nothing after it:" +
-  " ```json {\"claims\": [{\"text\": \"<verbatim prose substring>\", \"claim_type\": \"<observed_fact|inference|unknown|contradicted|conditional_risk|attributed_report>\", \"evidence_ids\": [\"<EVIDENCE row ids>\"], \"confidence\": 0.9}], \"confidence\": 0.9}```" +
+  " ```json {\"claims\": [{\"text\": \"<verbatim prose substring>\", \"claim_type\": \"<observed_fact|calculation|inference|assumption|unknown|contradicted|conditional_risk|attributed_report>\", \"evidence_ids\": [\"<EVIDENCE row ids>\"], \"value\": \"<datapoint as written>\", \"entity\": \"<who>\", \"period\": \"<when>\", \"unit\": \"<unit>\", \"confidence\": 0.9}], \"confidence\": 0.9}```" +
+  " Every factual sentence needs a claims row. Prose not covered by the inventory is deleted, and a number outside it never shows." +
   " Each claims[].text copies your prose above verbatim, qualified wording as written including attribution/qualification" +
   " (conditional_risk states the condition and consequence as qualified, not that it will occur;" +
   " attributed_report states who reported it, not that the event happened)." +
   " claim_type is declared by you, never inferred: observed_fact the cited passage states it directly;" +
-  " inference reasoned from cited evidence; contradicted cited evidence conflicts with it;" +
+  " calculation computed from the cited rows; inference reasoned from cited evidence;" +
+  " assumption a premise you state, not evidence; contradicted cited evidence conflicts with it;" +
   " unknown the evidence does not establish it." +
+  " A claim with a number sets value to that number exactly as written in its text, plus entity, period, and unit when known." +
   " evidence_ids lists only exact ids of rows in the EVIDENCE section, never node ids or decision records." +
-  " Unknown claims may cite none. All other types need at least one." +
+  " Unknown and assumption claims may cite none and carry no value. All other types need at least one." +
   " confidence is your own 0..1, carried through, never a threshold." +
   " Nothing found means {\"claims\": []}." +
   " The block is stripped before display; prose claims missing from it fail the accuracy gate.";
@@ -74,6 +77,9 @@ function declaredEvidenceIds(value: unknown): string[] {
   return raw.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
 }
 
+// Datapoint keys are optional; a present key that is not a non-empty string
+// makes the row malformed, so it drops instead of losing its datapoint.
+const DATAPOINT_KEYS = ["value", "entity", "period", "unit"] as const;
 function parseInventoryClaim(item: unknown): FinalClaim | undefined {
   if (!item || typeof item !== "object" || Array.isArray(item)) return undefined;
   const rec = item as Record<string, unknown>;
@@ -82,6 +88,12 @@ function parseInventoryClaim(item: unknown): FinalClaim | undefined {
   if (!(FINAL_CLAIM_TYPES as readonly string[]).includes(rawType)) return undefined;
   const claim: FinalClaim = { text: rec.text, claimType: rawType as FinalClaimType, evidenceIds: declaredEvidenceIds(rec.evidence_ids) };
   if (isConf(rec.confidence)) claim.confidence = rec.confidence;
+  for (const key of DATAPOINT_KEYS) {
+    const v = rec[key];
+    if (v === undefined || v === null) continue;
+    if (typeof v !== "string" || !v.trim()) return undefined;
+    claim[key] = v;
+  }
   return claim;
 }
 const FENCE_OPEN = "```json";
@@ -293,10 +305,11 @@ function reasonSignal(opts: ReasonOptions): AbortSignal {
 
 function reasonInput(opts: ReasonOptions): { role: string; content: string }[] {
   const persona = opts.persona ?? "stockbot";
-  // An omitted persona retains the original prompt for direct and single-tool callers.
+  // An omitted persona keeps the Stockbot prompt for direct and single-tool callers;
+  // a single-tool answer is gated, so it carries the inventory rule too.
   const system = opts.direct
     ? directSystem(persona)
-    : opts.persona ? researchSystem(opts.persona) : SYSTEM + CITE_IDS;
+    : opts.persona ? researchSystem(opts.persona) : SYSTEM + CITE_IDS + INVENTORY_RULE;
   const stockContext = opts.ticker
     ? `\n\nCURRENT STOCK CONTEXT\nThe current chart stock is ${opts.ticker}. Use this stock only if the user request does not name a stock. An explicit stock in the user request takes precedence.`
     : "";

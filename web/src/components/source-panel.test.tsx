@@ -7,7 +7,7 @@ import type { Root } from "react-dom/client";
 import { AgentConsole } from "./agent-console";
 import { SourcePage } from "./source-panel";
 import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
-import type { SourceDocument } from "../lib/research-client";
+import type { SourceAudit, SourceDocument, SourceLabel } from "../lib/research-client";
 
 // Static import cannot work: react-dom reads canUseDOM once at module load, so it loads after the jsdom globals exist.
 const { createRoot } = await import("react-dom/client");
@@ -29,6 +29,7 @@ const TEXT: SourceDocument = {
 };
 
 const TEXT_URL = "/api/research/sources/evidence%3Apanel%3Atext";
+const labelUrl = (id: string) => `/api/research/sources/${encodeURIComponent(id)}/label`;
 
 const realFetch = globalThis.fetch;
 let mounted: Root | null = null;
@@ -471,16 +472,118 @@ describe("SourcePage", () => {
     }
   });
 
-  test("console source cards link the Stockbot view and, once loaded, the official page per link status", async () => {
+  // Each term of one audit <dl> with its shown value.
+  const auditFields = (list: Element | null | undefined) => Object.fromEntries([...list?.querySelectorAll(":scope > dt") ?? []].map((term) => [term.textContent, term.nextElementSibling?.textContent]));
+  const auditInput = (id: string, value: string, extra: Partial<SourceAudit> = {}): SourceAudit => ({
+    evidenceId: id, sourceId: `evidence:${id}`, claimType: "observed_fact", verification: "verified", verificationReason: "", value, entity: "NVDA", period: "Q1 FY2025", unit: "USD millions",
+    source: { name: "SEC", document: "nvda-20240428.htm", accession: "0001045810-24-000124", hash: "sha256:abc" }, ...extra,
+  });
+  const CALCULATION: SourceDocument = {
+    id: "evidence:panel:calc", title: "Non-data-center revenue", publisher: "Stockbot", representation: "text", captureKind: "calculation", content: "Total revenue minus Data Center revenue", quote: "", linkStatus: "missing",
+    audit: {
+      evidenceId: "panel:calc", sourceId: "evidence:panel:calc", claimType: "calculation", verification: "verified", verificationReason: "", value: "3481", entity: "NVDA", period: "Q1 FY2025", unit: "USD millions",
+      formula: "total - data center", formulaId: "difference", formulaVersion: "1", recomputedValue: "3481", inputs: [auditInput("EV-TOT", "26,044"), auditInput("EV-DC", "22,563")],
+    },
+  };
+
+  test("a calculation view shows the formula and opens each input record, never one arbitrary original", async () => {
+    const root = await open(CALCULATION);
+    const audit = root.querySelector('[aria-label="Source audit"]');
+    expect(audit?.querySelector("h2")?.textContent).toBe("Calculation");
+    expect(root.textContent).toContain("Stockbot calculation — no single original document");
+    expect(auditFields(audit?.querySelector(":scope > dl"))).toEqual({
+      Verification: "Verified", Value: "3481", Entity: "NVDA", Period: "Q1 FY2025", Unit: "USD millions", Formula: "total - data center", Recomputed: "3481",
+    });
+    const inputs = [...root.querySelectorAll('[aria-label="Calculation inputs"] > li')].map((item) => [
+      auditFields(item.querySelector("dl")),
+      [...item.querySelectorAll("a")].map((anchor) => [anchor.textContent, anchor.getAttribute("href"), anchor.getAttribute("target"), anchor.getAttribute("rel")]),
+    ]);
+    const source = "SEC · nvda-20240428.htm · 0001045810-24-000124";
+    expect(inputs).toEqual([
+      [{ Verification: "Verified", Value: "26,044", Entity: "NVDA", Period: "Q1 FY2025", Unit: "USD millions", Source: source, "Evidence hash": "sha256:abc" }, [["View in Stockbot", "#/source/evidence%3AEV-TOT", "_blank", "noopener noreferrer"]]],
+      [{ Verification: "Verified", Value: "22,563", Entity: "NVDA", Period: "Q1 FY2025", Unit: "USD millions", Source: source, "Evidence hash": "sha256:abc" }, [["View in Stockbot", "#/source/evidence%3AEV-DC", "_blank", "noopener noreferrer"]]],
+    ]);
+    // The only links are the inputs' own Stockbot views: no official page stands in for the calculation.
+    expect(official(root)).toBeUndefined();
+    expect(hrefs(root)).toEqual(["#/source/evidence%3AEV-TOT", "#/source/evidence%3AEV-DC"]);
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  test("an invalid calculation opens with its failed verification and no frontend warning", async () => {
+    const reason = "The input is absent from the frozen observations.";
+    const root = await open({
+      ...CALCULATION,
+      audit: { ...CALCULATION.audit!, verification: "unverified", verificationReason: "EV-GONE is not verified", recomputedValue: undefined, inputs: [auditInput("EV-TOT", "26,044"), { evidenceId: "EV-GONE", sourceId: "evidence:EV-GONE", claimType: "", verification: "unverified", verificationReason: reason }] },
+    });
+    const audit = root.querySelector('[aria-label="Source audit"]');
+    expect(auditFields(audit?.querySelector(":scope > dl")).Verification).toBe("Not verified — EV-GONE is not verified");
+    expect(Object.keys(auditFields(audit?.querySelector(":scope > dl")))).not.toContain("Recomputed");
+    expect([...root.querySelectorAll('[aria-label="Calculation inputs"] > li dl')].map((list) => auditFields(list).Verification)).toEqual(["Verified", `Not verified — ${reason}`]);
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+    expect(root.textContent).not.toContain("CALCULATION_INVALID");
+  });
+
+  test("an observation audit sits beside the two-link header and names its verification result", async () => {
+    for (const [verification, reason, shown] of [["verified", "", "Verified"], ["conflicted", "value hash disagrees", "Conflicted — value hash disagrees"]] as const) {
+      const root = await open({ ...TEXT, audit: auditInput("panel:text", "12", { verification, verificationReason: reason }) });
+      const audit = root.querySelector('[aria-label="Source audit"]');
+      expect(audit?.querySelector("h2")?.textContent).toBe("Observation");
+      expect(auditFields(audit?.querySelector(":scope > dl"))).toMatchObject({ Verification: shown, Value: "12", "Evidence hash": "sha256:abc" });
+      expect(root.querySelector('[aria-label="Calculation inputs"]')).toBeNull();
+      expect([official(root)?.textContent, originalHref(root)]).toEqual(["Original on SEC.gov ↗", "https://www.sec.gov/filing"]);
+      expect(root.querySelectorAll("mark").length).toBe(1);
+      await close();
+    }
+  });
+
+  test("a repaired legacy row shows repair history as read-only text with no links", async () => {
+    const audit = auditInput("panel:text", "12", {
+      verification: "unverified",
+      verificationReason: "no proof",
+      repairs: [{ repair_id: "repair:abc", status: "verified", category: "eps_without_accession", datapoint: "eps_diluted", value: "0.76" }],
+    });
+    const root = await open({ ...TEXT, audit });
+    const items = [...root.querySelectorAll('[aria-label="Legacy repairs"] > li')];
+    expect(items.map((item) => item.textContent)).toEqual(["repair:abc — verified · eps_without_accession · eps_diluted · 0.76"]);
+    expect(items.flatMap((item) => [...item.querySelectorAll("a")])).toEqual([]);
+    await close();
+  });
+  test("a later source failure shows only the controlled error and retries without the internal failure class", async () => {
+    for (const [status, error, failure] of [
+      [404, "source capture not found", "SOURCE_IDENTITY_MISSING"],
+      [409, "invalid source capture", "SOURCE_MISMATCH"],
+      [409, "invalid source capture", "SOURCE_AMBIGUOUS"],
+      [404, "source capture not found", "SOURCE_UNAVAILABLE"],
+      [502, "source read failed", "SOURCE_UNAVAILABLE"],
+      [409, "invalid source capture", "SOURCE_CORRUPT"],
+    ] as const) {
+      const requests = serve({ body: { id: TEXT.id, error, status, failure }, status }, { body: TEXT });
+      const root = await mount(panel(TEXT.id));
+      await until(() => root.querySelector('[role="alert"]') !== null);
+      expect(root.querySelector('[role="alert"]')?.textContent).toBe(`${error}Retry source`);
+      expect(root.textContent).not.toContain(failure);
+      expect([root.querySelector("h1"), root.querySelector('[aria-label="Source audit"]'), official(root)]).toEqual([null, null, undefined]);
+      await click(root, "Retry source");
+      await until(resolved(root));
+      expect(requests).toEqual([TEXT_URL, TEXT_URL]);
+      expect(root.querySelector('[role="alert"]')).toBeNull();
+      await close();
+    }
+  });
+
+  test("console source cards read labels only and link the Stockbot view plus the plain official page", async () => {
     const page = "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm";
     const highlight = `${page}#f-30:~:text=Revenue%20grew`;
-    const source: SourceDocument = { ...TEXT, title: "10-K annual report" };
-    const highlighted: SourceDocument = { ...TEXT, id: "evidence:panel:highlighted", title: "10-Q", url: "https://data.sec.gov/submissions/CIK0001045810.json", representation: "html", content: "<p>Revenue grew</p>", linkStatus: "highlighted_original", originalUrl: page, highlightUrl: highlight };
-    const missing: SourceDocument = { ...TEXT, id: "evidence:panel:missing", title: "Short interest", publisher: "FINRA", url: "https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest", linkStatus: "missing", originalUrl: undefined };
+    const label = (id: string, title: string, extra: Partial<SourceLabel>): SourceLabel => ({ id, title, publisher: "SEC", publishedAt: "2026-01-01", linkStatus: "missing", ...extra });
+    const source = label(TEXT.id, "10-K annual report", { linkStatus: "stockbot_render", originalUrl: "https://www.sec.gov/filing" });
+    const plain = label("evidence:panel:plain", "10-Q", { linkStatus: "stockbot_render", originalUrl: page });
+    const missing = label("evidence:panel:missing", "Short interest", { publisher: "FINRA" });
+    // A label never carries a highlighted link: such a reply is rejected and the card keeps its fallback.
+    const highlighted = { ...label("evidence:panel:highlighted", "10-Q", {}), linkStatus: "highlighted_original", originalUrl: page, highlightUrl: highlight };
     const { promise: loaded, resolve: release } = Promise.withResolvers<void>();
-    const requests = serve({ body: source, gate: loaded }, { body: highlighted }, { body: missing });
+    const requests = serve({ body: source, gate: loaded }, { body: plain }, { body: missing }, { body: highlighted });
     const events: AgentEvent[] = [
-      { type: "evidence", evidence: [{ id: "ev:cited", source: "sec", title: "Evidence title", retrievedAt: "", content: "", sources: [{ id: source.id, title: "Reference title" }, { id: highlighted.id }, { id: missing.id }] }] },
+      { type: "evidence", evidence: [{ id: "ev:cited", source: "sec", title: "Evidence title", retrievedAt: "", content: "", sources: [{ id: source.id, title: "Reference title" }, { id: plain.id }, { id: missing.id }, { id: highlighted.id }] }] },
       { type: "answer_delta", text: "Revenue rose [ev:cited]. Margins held [ev:cited]." },
     ];
     const root = await mount(<AgentConsole events={events} reasoning={false} debug={false} />);
@@ -489,23 +592,44 @@ describe("SourcePage", () => {
     expect(inline().map((anchor) => [anchor.textContent, anchor.getAttribute("href"), anchor.getAttribute("target"), anchor.getAttribute("rel"), anchor.getAttribute("title")])).toEqual(
       Array(2).fill(["[1]", "#/source/evidence%3Apanel%3Atext", "_blank", "noopener noreferrer", "Evidence title"]),
     );
-    await until(() => sourceCards(root)[1]?.[0] === "SEC · 10-Q · 2026-01-01" && sourceCards(root)[2]?.[0] === "FINRA · Short interest · 2026-01-01");
+    await until(() => sourceCards(root)[1]?.[0] === "SEC · 10-Q · 2026-01-01" && sourceCards(root)[2]?.[0] === "FINRA · Short interest · 2026-01-01" && requests.length === 4);
+    await act(async () => { });
     expect(sourceCards(root)).toEqual([
       ["Evidence title", view(source.id)],
-      ["SEC · 10-Q · 2026-01-01", view(highlighted.id), ["Open on SEC.gov ↗", highlight, "_blank", "noopener noreferrer"]],
+      ["SEC · 10-Q · 2026-01-01", view(plain.id), ["Original on SEC.gov ↗", page, "_blank", "noopener noreferrer"]],
       ["FINRA · Short interest · 2026-01-01", view(missing.id)],
+      ["Evidence title", view(highlighted.id)],
     ]);
     await act(async () => release());
     await until(() => sourceCards(root)[0]?.[0] === "SEC · 10-K annual report · 2026-01-01");
     expect(sourceCards(root)[0]).toEqual(["SEC · 10-K annual report · 2026-01-01", view(source.id), ["Original on SEC.gov ↗", "https://www.sec.gov/filing", "_blank", "noopener noreferrer"]]);
     expect(inline().map((anchor) => anchor.getAttribute("aria-label"))).toEqual(Array(2).fill("Open source: SEC · 10-K annual report · 2026-01-01"));
-    expect(hrefs(root).some((href) => API_HOST.test(href))).toBe(false);
+    expect(hrefs(root).some((href) => API_HOST.test(href) || href.includes(":~:"))).toBe(false);
     await act(async () => mounted?.render(<AgentConsole events={[...events, { type: "answer_delta", text: " More text." }]} reasoning={false} debug={false} />));
-    expect(requests).toEqual([TEXT_URL, "/api/research/sources/evidence%3Apanel%3Ahighlighted", "/api/research/sources/evidence%3Apanel%3Amissing"]);
+    // Labels come from persisted metadata only: the full source endpoint (resolve, replay, archive) is never read.
+    expect(requests).toEqual([source.id, plain.id, missing.id, highlighted.id].map(labelUrl));
     // Raw evidence ids never reach the reader, and no in-drawer panel opens.
     expect(root.textContent).not.toContain("ev:cited");
     expect(root.textContent).not.toContain("evidence:panel");
     expect(root.querySelector("aside")).toBeNull();
+  });
+
+  test("opening a cited source is the first and only full source read", async () => {
+    const labels = serve({ body: { id: TEXT.id, title: "10-K", publisher: "SEC", linkStatus: "stockbot_render", originalUrl: "https://www.sec.gov/filing" } });
+    const events: AgentEvent[] = [
+      { type: "evidence", evidence: [{ id: "ev:cited", source: "sec", retrievedAt: "", content: "", sources: [{ id: TEXT.id }] }] },
+      { type: "answer_delta", text: "Revenue rose [ev:cited]." },
+    ];
+    const chat = await mount(<AgentConsole events={events} reasoning={false} debug={false} />);
+    await until(() => sourceCards(chat)[0]?.[0] === "SEC · 10-K");
+    expect(labels).toEqual([labelUrl(TEXT.id)]);
+    const href = chat.querySelector('a[aria-label^="Open source:"]')?.getAttribute("href");
+    expect(href).toBe(`#/source/${encodeURIComponent(TEXT.id)}`);
+    await close();
+    const reads = serve({ body: TEXT });
+    const viewer = await mount(panel(decodeURIComponent(href?.slice("#/source/".length) ?? "")));
+    await until(resolved(viewer));
+    expect(reads).toEqual([TEXT_URL]);
   });
 
   test("console source labels fall back to the reference title, then the publisher and index", async () => {

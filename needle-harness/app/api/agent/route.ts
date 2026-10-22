@@ -1,6 +1,5 @@
 import { reason } from "@/lib/muse/client";
-import { asksWatchlist, kernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type KernelResponse } from "@/lib/agent/kernel";
-import { tools } from "@/lib/tools";
+import { asksWatchlist, dropUncovered, gateAnswer, kernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type KernelResponse } from "@/lib/agent/kernel";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
 import { ASK_CONTEXT_KINDS, FINAL_PERSONAS, foundStatus, redactArgs, safeSourceUrl, sourceReferences, statusEvent, toolStatus, WIDGET_TYPES, type AgentEvent, type AskContext, type Evidence, type FailureCategory, type Persona, type Timings } from "@/lib/agent/types";
 function requiredEnv(name: string): string {
@@ -202,13 +201,18 @@ export async function POST(req: Request): Promise<Response> {
       const timings: Timings = {};
       const send = streamSender(req, controller, requestAt, timings);
       // JEV owns the original route independently from the optional chart action.
+      // A direct answer has no evidence, so it is buffered and shown minus every
+      // datapoint sentence; nothing left means research answers instead.
       const answerDirect = async (): Promise<boolean> => {
         const t0 = performance.now();
         send({ type: "agent_start", prompt });
         send(statusEvent("Thinking…"));
         send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
         try {
-          const r = await reason({ prompt, evidence: [], direct: true, ...reasonContext(), onDelta: (text) => send({ type: "answer_delta", text }) });
+          const r = await reason({ prompt, evidence: [], direct: true, ...reasonContext(), onDelta: () => { } });
+          const text = dropUncovered(r.text, [], false);
+          if (!text) return false;
+          send({ type: "answer_delta", text });
           send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: performance.now() - t0, ...r.usage }, evidence: { count: 0, characters: 0 }, failures: {} } });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -257,79 +261,108 @@ export async function POST(req: Request): Promise<Response> {
         const failures: Partial<Record<FailureCategory, number>> = {};
         let needleCalls = 0;
         let toolCalls = 0;
+        // The worker creates the ledger session before it executes the first tool.
+        let sessionId: string | undefined;
         const executeTool = async (tool: string, args: Record<string, unknown>): Promise<ToolOutcome> => {
-          const sessionId = newSessionId();
-          let outcome: ToolOutcome;
           try {
-            const entry = tools[tool];
-            const res = entry?.execute ? await entry.execute(args, { sessionId }) : await invoke(tool, args, sessionId);
+            const res = await kernelRouter.call(
+              { op: "entry_tool", prompt, tool, arguments: args, ...(sessionId ? { sessionId } : {}) },
+              { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) },
+            );
             toolCalls += 1;
-            if (res.ok) {
-              // A repeated call with the same name+args returns the same evidence id: keep one copy.
-              const fresh = !evidence.some((e) => e.id === res.evidence.id);
-              if (fresh) {
-                evidence.push(res.evidence);
-                singleShotEvidence.push(res.evidence);
-              }
-              send({ type: "tool_result", tool, evidenceId: res.evidence.id, preview: res.evidence.content.slice(0, 160) });
-              send(statusEvent(foundStatus(fresh ? 1 : 0)));
-              send({ type: "evidence", evidence: [...evidence] });
-              outcome = { ok: true, content: res.evidence.content.slice(0, 1500) };
-            } else {
-              failures[res.category] = (failures[res.category] ?? 0) + 1;
-              send({ type: "tool_result", tool, preview: res.error.slice(0, 160) });
-              send(statusEvent("That source had no usable data"));
-              send({ type: "tool_failed", tool, category: res.category, preview: res.error.slice(0, 160) });
-              outcome = { ok: false, error: res.error.slice(0, 500), category: res.category };
+            if (typeof res.sessionId !== "string" || !res.sessionId || (sessionId && res.sessionId !== sessionId)) {
+              throw new Error("The source result has no matching research session.");
             }
+            sessionId = res.sessionId;
+            if (res.error) throw new Error(res.error);
+            let fresh = 0;
+            for (const row of res.evidence ?? []) {
+              if (evidence.some((e) => e.id === row.id)) continue;
+              const ev: Evidence = {
+                id: row.id, source: row.source ?? tool, content: row.content,
+                retrievedAt: row.retrievedAt ?? new Date().toISOString(),
+                ...(row.title !== undefined ? { title: row.title } : {}),
+                ...(row.url !== undefined ? { url: row.url } : {}),
+                sources: sourceReferences(row.sources),
+              };
+              evidence.push(ev);
+              singleShotEvidence.push(ev);
+              fresh += 1;
+            }
+            const content = res.content ?? "";
+            send({ type: "tool_result", tool, preview: content.slice(0, 160) });
+            send(statusEvent(foundStatus(fresh)));
+            send({ type: "evidence", sessionId, evidence: [...evidence] });
+            return { ok: true, content: content.slice(0, 1500) };
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             failures.tool_error = (failures.tool_error ?? 0) + 1;
             send({ type: "tool_failed", tool, category: "tool_error", preview: msg.slice(0, 160) });
             send(statusEvent("That source had no usable data"));
-            outcome = { ok: false, error: msg.slice(0, 500), category: "tool_error" };
-          } finally {
-            await endSession(sessionId);
+            return { ok: false, error: msg.slice(0, 500), category: "tool_error" };
           }
-          return outcome;
         };
-        const answerFromEvidence = async (): Promise<void> => {
+        // Only ledger-backed claims may publish. A gate rejection ends this path visibly.
+        const answerFromEvidence = async (defect?: string): Promise<boolean> => {
+          if (defect || evidence.length === 0) {
+            failures.tool_error = (failures.tool_error ?? 0) + 1;
+            send({ type: "failed", category: "tool_error", message: `No verified answer: ${defect ?? "this source has no admissible research evidence."}` });
+            send({ type: "answer_delta", text: "I could not verify an answer from this source. I withheld its factual claims." });
+            send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures } });
+            return true;
+          }
           send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
           try {
             const m0 = performance.now();
-            const r = await reason({ prompt, evidence, direct: evidence.length === 0, ...reasonContext(), onDelta: (text) => send({ type: "answer_delta", text }) });
+            const r = await reason({ prompt, evidence, direct: evidence.length === 0, ...reasonContext(), onDelta: () => { } });
+            const gated = await gateAnswer({
+              result: { persona: "stockbot", text: r.text, claims: r.claims, ...(r.confidence !== undefined ? { confidence: r.confidence } : {}) },
+              evidence,
+              sessionId,
+              gate: (body, gateOpts) => kernelRouter.call(body, { signal: req.signal, ...gateOpts }),
+            });
+            if ("failure" in gated) {
+              failures.provider_error = (failures.provider_error ?? 0) + 1;
+              send({ type: "failed", category: "provider_error", message: `No verified answer: ${gated.failure}` });
+              send({ type: "answer_delta", text: "I could not verify an answer from this source. I withheld its factual claims." });
+              send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures } });
+              return true;
+            }
+            send({ type: "answer_delta", text: gated.text });
+            const claims = r.claims.filter((c) => gated.text.includes(c.text));
+            if (claims.length > 0) send({ type: "claims", claims });
             send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures } });
           } catch (err) {
             send({ type: "error", message: err instanceof Error ? err.message : String(err) });
           }
+          return true;
         };
-        let current: string | null = toolName;
-        for (let step = 0; step < 3 && current; step++) {
-          const tool = current;
-          current = null;
-          const generated = await generateArguments(tool);
-          if (!generated) return false;
-          const { args, confidence } = generated;
-          needleCalls += 1;
-          send({ type: "needle_decision", step, tool, arguments: redactArgs(args), confidence });
-          send({ type: "tool_start", tool });
-          send(statusEvent(toolStatus(tool, tool === "search_web" ? (typeof args.query === "string" ? args.query : undefined) : parseTicker(args.ticker))));
-          const outcome = await executeTool(tool, args);
-          const verdict = await assessTool(tool, args, outcome);
-          if (verdict === null) return false;
-          if (verdict === "node_resolved" || verdict === "reasoning_required") {
-            await answerFromEvidence();
-            return true;
+        {
+          let current: string | null = toolName;
+          for (let step = 0; step < 3 && current; step++) {
+            const tool = current;
+            current = null;
+            const generated = await generateArguments(tool);
+            if (!generated) return false;
+            const { args, confidence } = generated;
+            needleCalls += 1;
+            send({ type: "needle_decision", step, tool, arguments: redactArgs(args), confidence });
+            send({ type: "tool_start", tool });
+            send(statusEvent(toolStatus(tool, tool === "search_web" ? (typeof args.query === "string" ? args.query : undefined) : parseTicker(args.ticker))));
+            const outcome = await executeTool(tool, args);
+            if (!outcome.ok) return await answerFromEvidence(outcome.error ?? "The source result failed.");
+            if (outcome.ok && evidence.length === 0) return await answerFromEvidence();
+            const verdict = await assessTool(tool, args, outcome);
+            if (verdict === null) return false;
+            if (verdict === "node_resolved" || verdict === "reasoning_required") return await answerFromEvidence();
+            if (verdict === "research_required" || verdict === "set_chart_symbol" || verdict === "update_watchlist" || verdict === "add_widget") return false;
+            // ponytail: worker output is untrusted — only identifier-shaped tool names chain; anything else researches.
+            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(verdict)) return false;
+            current = verdict;
           }
-          if (verdict === "research_required" || verdict === "set_chart_symbol" || verdict === "update_watchlist" || verdict === "add_widget") return false;
-          // ponytail: worker output is untrusted — only identifier-shaped tool names chain; anything else researches.
-          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(verdict)) return false;
-          current = verdict;
+          // The cap answers from the ledger or ends with an explicit verification failure.
+          return await answerFromEvidence();
         }
-        // Cap reached with another tool pending: admitted evidence answers now; none left researches.
-        if (evidence.length === 0) return false;
-        await answerFromEvidence();
-        return true;
       };
       // The watchlist action is a UI receipt, never evidence: Needle fills its arguments and only
       // a validated canonical receipt emits watchlist_update. A failure answers visibly, never researches.

@@ -46,6 +46,39 @@ SOURCE: dict[str, object] = {
     "content": "\n".join("Revenue grew in the fixture year." if i == 5 else f"Capture line {i}" for i in range(1, 201)),
     "linkStatus": "stockbot_render",
 }
+CALCULATION_ID = "evidence:browser:calculation"
+INPUT_IDS = ["evidence:browser:total", "evidence:browser:segment"]
+INPUT_AUDITS = [
+    {
+        "evidenceId": source_id.removeprefix("evidence:"),
+        "sourceId": source_id,
+        "claimType": "observed_fact",
+        "verification": "verified",
+        "verificationReason": "",
+        "value": value,
+    }
+    for source_id, value in zip(INPUT_IDS, ["26,044", "22,563"], strict=True)
+]
+CALCULATION: dict[str, object] = {
+    "id": CALCULATION_ID,
+    "title": "Non-data-center revenue",
+    "publisher": "Stockbot",
+    "representation": "text",
+    "captureKind": "calculation",
+    "content": "Total revenue minus Data Center revenue",
+    "quote": "",
+    "linkStatus": "missing",
+    "audit": {
+        "evidenceId": "browser:calculation",
+        "claimType": "calculation",
+        "verification": "verified",
+        "verificationReason": "",
+        "value": "3481",
+        "formula": "total - data center",
+        "recomputedValue": "3481",
+        "inputs": INPUT_AUDITS,
+    },
+}
 METRICS: dict[str, object] = {
     "totalMs": 1,
     "needle": {"calls": 0, "totalMs": 0, "escalations": 0},
@@ -134,7 +167,7 @@ def watchlist_rows(symbols: list[str]) -> list[dict[str, object]]:
     return rows
 
 
-UI = tuple[str, Queue[object], Queue[str]]
+UI = tuple[str, Queue[object], Queue[str], Queue[str]]
 
 
 @pytest.fixture(scope="module")
@@ -142,6 +175,7 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
     requests: Queue[object] = Queue()
     watch: Queue[str] = Queue()
     unknown: Queue[str] = Queue()
+    source_reads: Queue[str] = Queue()
 
     class Provider(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -259,6 +293,38 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
             if url.path == f"/api/research/sources/{quote(SOURCE_ID, safe='')}":
                 fixture = f"http://127.0.0.1:{port}{FIXTURE_SOURCE_PATH}"
                 bodies[url.path] = {**SOURCE, "url": fixture, "originalUrl": fixture}
+            source_path = "/api/research/sources/"
+            if url.path.startswith(source_path):
+                source_reads.put(url.path)
+                fixture = f"http://127.0.0.1:{port}{FIXTURE_SOURCE_PATH}"
+                bodies[source_path + quote(SOURCE_ID, safe="") + "/label"] = {
+                    "id": SOURCE_ID,
+                    "title": "10-K",
+                    "linkStatus": "stockbot_render",
+                    "originalUrl": fixture,
+                }
+                bodies[source_path + quote(CALCULATION_ID, safe="")] = CALCULATION
+                for audit in INPUT_AUDITS:
+                    source_id = audit["sourceId"]
+                    value = audit["value"]
+                    bodies[source_path + quote(source_id, safe="")] = {
+                        **SOURCE,
+                        "id": source_id,
+                        "title": value,
+                        "captureKind": "structured_record",
+                        "linkStatus": "missing",
+                        "content": f"Recorded value: {value}",
+                        "quote": value,
+                        "audit": audit,
+                    }
+                if url.path == source_path + quote("evidence:browser:missing", safe=""):
+                    body = json.dumps({"error": "invalid source capture", "failure": "SOURCE_CORRUPT"}).encode()
+                    self.send_response(409)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
             if url.path == "/api/portfolio":
                 self.send_response(404)
                 self.send_header("Content-Type", "application/json")
@@ -383,7 +449,7 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
                         time.sleep(0.05)
                 else:
                     pytest.fail(f"Vite did not start. {log.read_text()}")
-                yield url, requests, watch
+                yield url, requests, watch, source_reads
             finally:
                 process.terminate()
                 try:
@@ -676,11 +742,16 @@ def test_chat_chart_update_moves_chart_to_amd(browser: webdriver.Chrome, local_u
 
 def test_chat_citation_opens_source_page_in_new_tab(browser: webdriver.Chrome, local_ui: UI) -> None:
     wait = WebDriverWait(browser, 10)
+    drain(local_ui[3])
     send_chat(browser, local_ui, CITATION_PROMPT)
     citation = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'a[aria-label^="Open source: "]')))
     assert citation.text == "[1]"
     assert "ev:fixture" not in (citation.get_attribute("aria-label") or "")
     assert (citation.get_attribute("href") or "").endswith(f"#/source/{quote(SOURCE_ID, safe='')}")
+    label_path = f"/api/research/sources/{quote(SOURCE_ID, safe='')}/label"
+    wait.until(lambda _: not local_ui[3].empty())
+    assert local_ui[3].get_nowait() == label_path
+    assert local_ui[3].empty()
     original = browser.current_window_handle
     tabs_before = set(browser.window_handles)
     citation.click()
@@ -688,6 +759,10 @@ def test_chat_citation_opens_source_page_in_new_tab(browser: webdriver.Chrome, l
     browser.switch_to.window((set(browser.window_handles) - tabs_before).pop())
     try:
         wait.until(EC.text_to_be_present_in_element((By.CSS_SELECTOR, "article"), "How we got this"))
+        assert local_ui[3].get(timeout=5) == label_path.removesuffix("/label")
+        # Vite uses React StrictMode. Its remount can repeat the full read after the user opens the viewer.
+        while not local_ui[3].empty():
+            assert local_ui[3].get_nowait() == label_path.removesuffix("/label")
         open_original = browser.find_element(By.PARTIAL_LINK_TEXT, "Original on")
         assert FIXTURE_SOURCE_PATH in (open_original.get_attribute("href") or "")
         page_tab = browser.current_window_handle
@@ -704,6 +779,38 @@ def test_chat_citation_opens_source_page_in_new_tab(browser: webdriver.Chrome, l
         browser.switch_to.window(original)
     assert browser.current_window_handle == original
     assert "#/source/" not in browser.current_url
+
+
+def test_source_calculation_opens_each_input_and_controls_errors(browser: webdriver.Chrome, local_ui: UI) -> None:
+    wait = WebDriverWait(browser, 10)
+    browser.get(f"{local_ui[0]}/#/source/{quote(CALCULATION_ID, safe='')}")
+    audit = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, '[aria-label="Source audit"]')))
+    assert "total - data center" in audit.text
+    assert "3481" in audit.text
+    assert not browser.find_elements(By.PARTIAL_LINK_TEXT, "Original on")
+    links = browser.find_elements(By.CSS_SELECTOR, '[aria-label="Calculation inputs"] a')
+    assert [(link.get_attribute("href") or "").rsplit("/", 1)[-1] for link in links] == [
+        quote(source_id, safe="") for source_id in INPUT_IDS
+    ]
+    calculation_tab = browser.current_window_handle
+    for index, value in enumerate(["26,044", "22,563"]):
+        before = set(browser.window_handles)
+        links[index].click()
+        wait.until(lambda _, before=before: len(set(browser.window_handles) - before) == 1)
+        browser.switch_to.window((set(browser.window_handles) - before).pop())
+        try:
+            wait.until(EC.text_to_be_present_in_element((By.CSS_SELECTOR, "h1"), value))
+            assert browser.find_element(By.CSS_SELECTOR, "mark").text == value
+            assert not browser.find_elements(By.PARTIAL_LINK_TEXT, "Original on")
+            assert not browser.find_elements(By.CSS_SELECTOR, '[role="alert"]')
+        finally:
+            browser.close()
+            browser.switch_to.window(calculation_tab)
+    browser.get(f"{local_ui[0]}/#/source/{quote('evidence:browser:missing', safe='')}")
+    alert = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, '[role="alert"]')))
+    assert alert.text == "invalid source capture\nRetry source"
+    assert "SOURCE_CORRUPT" not in browser.find_element(By.TAG_NAME, "body").text
+    assert not browser.find_elements(By.CSS_SELECTOR, '[aria-label="Source audit"], h1, mark')
 
 
 def test_chat_watchlist_update_shows_amd_without_moving_chart(browser: webdriver.Chrome, local_ui: UI) -> None:

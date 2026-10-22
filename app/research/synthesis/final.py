@@ -25,11 +25,15 @@ within the freeze and ``answer`` is non-empty with no invented evidence.
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 
 from app.research.agents import (
     CLAIM_TYPES,
+    DATAPOINT_FIELDS,
     GroundedClaim,
     claims_refs,
     conservative_claim_type,
@@ -38,6 +42,7 @@ from app.research.agents.bearbot import BearAnalysis
 from app.research.agents.bullbot import BullAnalysis
 from app.research.agents.stockbot import StockbotAnalysis
 from app.research.evidence import evidence_domain, evidence_integrity
+from app.research.grounding import numeric_tokens
 
 from .committee import CommitteeDisagreement, _coerce_wave_id
 
@@ -54,7 +59,9 @@ SEC_ONLY_LIMITATION = (
 
 _CLAIM_SEVERITY = {
     "observed_fact": "direct",
+    "calculation": "derived",
     "inference": "indirect",
+    "assumption": "hypothetical",
     "unknown": "uncertain",
     "contradicted": "contested",
     "conditional_risk": "conditional",
@@ -94,6 +101,7 @@ class FinalSynthesis:
     catalysts: list[str] = field(default_factory=list)
     coverage: dict[str, object] = field(default_factory=dict)
     sources: list[dict[str, object]] = field(default_factory=list)
+    calculations: list[dict[str, object]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.wave_id = _coerce_wave_id(self.wave_id)
@@ -108,6 +116,7 @@ class FinalSynthesis:
             "base_case": self.base_case,
             "major_evidence": _copy_rows(self.direct_evidence),
             "direct_evidence": _copy_rows(self.direct_evidence),
+            "calculations": deepcopy(self.calculations),
             "bull_case": {"summary": self.bull_case, "evidence_ids": list(self.bull_evidence_ids)},
             "bear_case": {"summary": self.bear_case, "evidence_ids": list(self.bear_evidence_ids)},
             "impact_channels": _copy_rows(self.impact_channels),
@@ -282,8 +291,17 @@ def _channels_from_claims(claims: list[GroundedClaim]) -> list[dict[str, object]
 
 
 def _effect_row(claim: GroundedClaim) -> dict[str, object]:
-    """One effect row: claim text with its declared type and freeze refs."""
-    return {"text": claim.text, "claim_type": claim.claim_type, "evidence_ids": list(claim.evidence_ids)}
+    """One effect row: claim text with its declared type, freeze refs, and any typed datapoint fields."""
+    row: dict[str, object] = {
+        "text": claim.text,
+        "claim_type": claim.claim_type,
+        "evidence_ids": list(claim.evidence_ids),
+    }
+    for key in DATAPOINT_FIELDS:
+        value = getattr(claim, key)
+        if value is not None:
+            row[key] = value
+    return row
 
 
 def _observation_field(row: Mapping[str, object], key: str) -> str:
@@ -316,6 +334,8 @@ def _observation_row(row: Mapping[str, object]) -> dict[str, object] | None:
     claim. The record's own claim text rides along as ``claim`` for the
     structured payload; committee statements are interpretations over these rows.
     """
+    if _is_calculation(row):
+        return None
     evidence_id = _observation_field(row, "evidence_id")
     document, accession = _observation_identity(row, _observation_provenance(row))
     text = _observation_text(document, accession, _observation_excerpt(row))
@@ -354,19 +374,192 @@ def _observation_rows(
     return [row for row in (_observation_row(item) for item in (observations or [])) if row is not None]
 
 
+_SOURCE_ID_KEYS = ("source_uri", "source_record_id", "accession_no", "source_name", "tool_result_id")
+"""Exact source-identity keys included in each calculation input's provenance."""
+
+
+def _is_calculation(row: Mapping[str, object]) -> bool:
+    """Keep calculated values separate from passages in external documents."""
+    proof = row.get("proof")
+    return row.get("claim_kind") == "calculation" or (isinstance(proof, Mapping) and proof.get("kind") == "calculation")
+
+
+def _audit_verification(
+    row: Mapping[str, object], by_id: Mapping[str, Mapping[str, object]], depth: int
+) -> tuple[str, str]:
+    """Replay the canonical proof instead of trusting a persisted status."""
+    from app.research.evidence import evidence_from_dict
+    from app.research.service import _proof_verdict
+
+    try:
+        evidence = evidence_from_dict(row)
+    except ValueError as exc:
+        return "unverified", f"Ledger integrity failed: {exc}"
+    verdict = _proof_verdict(by_id, evidence, evidence.value, depth)
+    return verdict.status, verdict.reason
+
+
+def _audit_source(row: Mapping[str, object], proof: Mapping[str, object]) -> dict[str, object]:
+    """Identify each input's own source without attributing calculations to it."""
+    if _is_calculation(row):
+        return {"producer": "Stockbot", "evidence_id": row.get("evidence_id")}
+    provenance = _observation_provenance(row)
+    document, accession = _observation_identity(row, provenance)
+    identity = {key: row.get(key) for key in _SOURCE_ID_KEYS if row.get(key) is not None}
+    identity.update({key: provenance.get(key) for key in _SOURCE_ID_KEYS if provenance.get(key) is not None})
+    return {
+        "domain": _observation_domain(row),
+        "document": document,
+        "accession_no": accession,
+        "source_name": row.get("source_name"),
+        "source_record_id": row.get("source_record_id"),
+        "source_uri": row.get("source_uri"),
+        "sourceId": proof.get("sourceId"),
+        "locator": deepcopy(proof.get("locator")),
+        "provenance": deepcopy(dict(provenance)),
+        "source_identity": identity,
+    }
+
+
+def _calculation_view(
+    row: Mapping[str, object],
+    by_id: Mapping[str, Mapping[str, object]],
+    as_of: str,
+    ancestors: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Render ordered inputs with a maximum of sixteen calculation levels."""
+    from app.research.service import _MAX_PROOF_DEPTH, _recompute
+
+    evidence_id = _observation_field(row, "evidence_id")
+    raw_proof = row.get("proof")
+    proof = raw_proof if isinstance(raw_proof, Mapping) else {}
+    calculated = _is_calculation(row)
+    status, reason = _audit_verification(row, by_id, len(ancestors))
+    view: dict[str, object] = {
+        "evidence_id": evidence_id,
+        "claim_type": "calculation" if calculated else row.get("claim_kind", "observed_fact"),
+        "value": row.get("value"),
+        "entity": row.get("entity"),
+        "period": row.get("period"),
+        "unit": row.get("unit"),
+        "as_of": as_of,
+        "known_at": row.get("known_at"),
+        "source": _audit_source(row, proof),
+        "verification": status,
+        "verification_status": status,
+        "verification_reason": reason,
+    }
+    if not calculated:
+        return view
+    metadata = row.get("metadata")
+    metric = _as_text(metadata.get("metric")) if isinstance(metadata, Mapping) else ""
+    raw_ids = proof.get("inputProofIds")
+    input_ids: list[object] = list(raw_ids) if isinstance(raw_ids, (list, tuple)) else []
+    view.update(
+        metric=metric or _as_text(row.get("subject")) or _as_text(row.get("claim_text")),
+        result=row.get("value"),
+        formula=_as_text(row.get("content")),
+        formulaId=proof.get("formulaId"),
+        formulaVersion=proof.get("formulaVersion"),
+        formula_id=proof.get("formulaId"),
+        formula_version=proof.get("formulaVersion"),
+        inputProofIds=input_ids,
+        inputs=[],
+        recomputedValue=None,
+        recomputed_result=None,
+    )
+    if evidence_id in ancestors or len(ancestors) >= _MAX_PROOF_DEPTH:
+        view.update(
+            verification="unverified",
+            verification_status="unverified",
+            verification_reason="Calculation inputs contain a cycle or exceed the depth limit.",
+        )
+        return view
+    inputs: list[dict[str, object]] = []
+    for input_id in input_ids:
+        source = by_id.get(str(input_id))
+        if source is None:
+            inputs.append(
+                {
+                    "evidence_id": input_id,
+                    "verification": "unverified",
+                    "verification_status": "unverified",
+                    "verification_reason": "The input is absent from the frozen observations.",
+                }
+            )
+        else:
+            inputs.append(_calculation_view(source, by_id, as_of, (*ancestors, evidence_id)))
+    view["inputs"] = inputs
+    values = tuple(item.get("value") for item in inputs)
+    if values and all(isinstance(value, str) for value in values):
+        try:
+            recomputed = _recompute(
+                str(proof.get("formulaId", "")), str(proof.get("formulaVersion", "")), tuple(str(v) for v in values)
+            )
+        except ArithmeticError, ValueError:
+            recomputed = None  # The replay verdict retains the reason for failure.
+        view.update(recomputedValue=recomputed, recomputed_result=recomputed)
+    return view
+
+
+def _calculation_views(observations: Sequence[Mapping[str, object]], as_of: str) -> list[dict[str, object]]:
+    """Build audit views only from the supplied freeze, including nested inputs."""
+    by_id = _source_observations_by_id(observations)
+    return [_calculation_view(row, by_id, as_of) for row in by_id.values() if _is_calculation(row)]
+
+
+def _calculation_lines(rows: Sequence[Mapping[str, object]], depth: int = 0) -> list[str]:
+    """Render the audit tree without describing computed results as source passages."""
+    lines: list[str] = []
+    for index, row in enumerate(rows, 1):
+        prefix = "  " * depth
+        identity = f"[{row.get('evidence_id', '')}]"
+        verification = f"{row.get('verification', 'unverified')}: {row.get('verification_reason', '')}"
+        if row.get("claim_type") == "calculation":
+            lines.extend(
+                (
+                    f"{prefix}Stockbot calculation {identity}: {row.get('metric')} = {row.get('result')} "
+                    + f"{row.get('unit') or ''}",
+                    f"{prefix}Formula: {row.get('formulaId')}@{row.get('formulaVersion')} — {row.get('formula')}",
+                    f"{prefix}Recomputed result: {row.get('recomputedValue')}. "
+                    + f"Entity: {row.get('entity')}. Period: {row.get('period')}. As of: {row.get('as_of')}.",
+                    f"{prefix}Verification: {verification}",
+                )
+            )
+            raw_inputs = row.get("inputs")
+            inputs = [item for item in raw_inputs if isinstance(item, Mapping)] if isinstance(raw_inputs, list) else []
+            lines.extend(_calculation_lines(inputs, depth + 1))
+        else:
+            lines.append(
+                f"{prefix}Input {index} {identity}: {row.get('value')} {row.get('unit') or ''}. "
+                f"Entity: {row.get('entity')}. Period: {row.get('period')}. As of: {row.get('as_of')}. "
+                f"Verification: {verification}. Source: {json.dumps(row.get('source'), sort_keys=True)}"
+            )
+    return lines
+
+
 def _split_effects(claims: Sequence[GroundedClaim]) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Directly observed claims vs reasoned/contested/qualified claims; unknown reads stay in the unknowns section."""
-    first = [_effect_row(c) for c in claims if c.claim_type == "observed_fact"]
+    """Observed/calculated claims vs reasoned/contested/qualified claims; unknown reads stay in the unknowns section."""
+    first = [_effect_row(c) for c in claims if c.claim_type in ("observed_fact", "calculation")]
     second = [
         _effect_row(c)
         for c in claims
-        if c.claim_type in ("inference", "contradicted", "conditional_risk", "attributed_report")
+        if c.claim_type in ("inference", "assumption", "contradicted", "conditional_risk", "attributed_report")
     ]
     return first, second
 
 
+def _datapoint_fields(item: object) -> dict[str, str | None]:
+    """Typed datapoint fields of one caller claim (non-blank strings only; everything else None)."""
+    out: dict[str, str | None] = {}
+    for key in DATAPOINT_FIELDS:
+        raw = _channel_field(item, key)
+        out[key] = raw.strip() if isinstance(raw, str) and raw.strip() else None
+    return out
+
+
 def _coerce_extra_claim(item: object) -> GroundedClaim | None:
-    """One caller claim in grounded shape; None when blank, ungrounded, or mistyped."""
+    """One caller claim in grounded shape (typed datapoint kept); None when blank, ungrounded, or mistyped."""
     if isinstance(item, GroundedClaim):
         raw_text, raw_type, raw_ids = item.text, item.claim_type, item.evidence_ids
     elif isinstance(item, Mapping):
@@ -379,14 +572,32 @@ def _coerce_extra_claim(item: object) -> GroundedClaim | None:
     declared = raw_type.strip().lower() if isinstance(raw_type, str) else ""
     claim_type = declared if declared in CLAIM_TYPES else "inference"
     ids = _cited_channel_ids(raw_ids)
-    if not text or not (ids or claim_type == "unknown"):
+    datapoint = _datapoint_fields(item)
+    citeless = claim_type == "unknown" or (claim_type == "assumption" and datapoint["value"] is None)
+    if not text or not (ids or citeless):
         return None
-    return GroundedClaim(text=text[:500], claim_type=claim_type, evidence_ids=ids)
+    if claim_type in ("inference", "unknown"):
+        datapoint["value"] = None  # an inference stays qualified: no datapoint value rides it
+    return GroundedClaim(text=text[:500], claim_type=claim_type, evidence_ids=ids, **datapoint)
 
 
 def _normalize_extra(extra: Sequence[GroundedClaim | dict[str, object]] | None) -> list[GroundedClaim]:
     """Caller claims into grounded records (drops ungrounded entries)."""
     return [claim for claim in (_coerce_extra_claim(item) for item in extra or []) if claim is not None]
+
+
+def _merged_claim(prior: GroundedClaim, claim: GroundedClaim) -> GroundedClaim:
+    """Two same-text claims as one: union refs, least assertive type, first datapoint unless the type drops values."""
+    claim_type = conservative_claim_type([prior.claim_type, claim.claim_type])
+    datapoint = {key: getattr(prior, key) or getattr(claim, key) for key in DATAPOINT_FIELDS}
+    if claim_type in ("inference", "unknown"):
+        datapoint["value"] = None
+    return GroundedClaim(
+        text=prior.text,
+        claim_type=claim_type,
+        evidence_ids=list(dict.fromkeys([*prior.evidence_ids, *claim.evidence_ids])),
+        **datapoint,
+    )
 
 
 def _merge_claims(*groups: Sequence[GroundedClaim]) -> list[GroundedClaim]:
@@ -400,18 +611,9 @@ def _merge_claims(*groups: Sequence[GroundedClaim]) -> list[GroundedClaim]:
         prior_index = index.get(text)
         if prior_index is None:
             index[text] = len(merged)
-            merged.append(
-                GroundedClaim(
-                    text=text, claim_type=claim.claim_type, evidence_ids=list(dict.fromkeys(claim.evidence_ids))
-                )
-            )
+            merged.append(replace(claim, text=text, evidence_ids=list(dict.fromkeys(claim.evidence_ids))))
             continue
-        prior = merged[prior_index]
-        merged[prior_index] = GroundedClaim(
-            text=text,
-            claim_type=conservative_claim_type([prior.claim_type, claim.claim_type]),
-            evidence_ids=list(dict.fromkeys([*prior.evidence_ids, *claim.evidence_ids])),
-        )
+        merged[prior_index] = _merged_claim(merged[prior_index], claim)
     return merged
 
 
@@ -712,6 +914,7 @@ def _deep_answer(synth: FinalSynthesis) -> str:
     out += _section(
         "Major evidence \u2014 What the evidence directly shows", [_effect_line(row) for row in synth.direct_evidence]
     )
+    out += _section("Stockbot calculations — Auditable derivations", _calculation_lines(synth.calculations))
     out += _section(
         "First-order effects \u2014 First-order impact", [_effect_line(row) for row in synth.first_order_effects]
     )
@@ -777,7 +980,9 @@ def synthesize_final(
     ``model`` overrides the deterministic deep answer when it is a string
     (e.g. the caller's drafted answer); otherwise the sections are joined
     deterministically so synthesis stays reproducible. Cited ids derive only
-    from accepted per-claim mappings, never the whole freeze.
+    from accepted per-claim mappings, never the whole freeze. Every prose
+    field, the caller's answer included, passes ``gate_uncovered_prose``: a
+    factual sentence no claim row covers is deleted before publication.
 
     ``observations`` are the freeze's canonical EvidenceLedger rows: the
     direct-evidence section is built from them, never from a model-labeled
@@ -826,6 +1031,7 @@ def synthesize_final(
         evidence_limitations=_synth_limitations(evidence_limitations, scope),
         research_scope=scope,
         direct_evidence=_observation_rows(observations_list),
+        calculations=_calculation_views(observations_list, as_of),
         absence_observations=[scoped_absence(text) for text in _strs(absence_observations)],
         filing_references=claims_refs(claims),
         positioning=_strs(positioning),
@@ -833,7 +1039,84 @@ def synthesize_final(
         coverage=coverage_norm,
         sources=_normalize_sources(sources, claims, observations_list),
     )
-    synth.answer = _deep_answer(synth) if model is None else str(model)
+    gate_uncovered_prose(synth)
+    synth.answer = _deep_answer(synth) if model is None else _gate_text(str(model), _claim_texts(synth), True)
+    return synth
+
+
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+_DIGIT = re.compile(r"\d")
+
+
+def _claim_texts(synth: FinalSynthesis) -> list[tuple[str, frozenset[str]]]:
+    """(whitespace-normalized text, numbers it states in text or typed fields) per inventory row, unknowns included."""
+    rows: list[tuple[str, frozenset[str]]] = []
+    for claim in synth.claims:
+        text = " ".join(claim.text.split())
+        if text:
+            stated = " ".join(v for v in (claim.text, claim.value, claim.entity, claim.period, claim.unit) if v)
+            rows.append((text, frozenset(numeric_tokens(stated))))
+    return rows
+
+
+def _covered(sentence: str, inventory: Sequence[tuple[str, frozenset[str]]]) -> bool:
+    """Covered when a claim row's text sits verbatim in the sentence (or the sentence inside it) and every
+    number the sentence states belongs to that row, so no number rides along on a covered sentence."""
+    norm = " ".join(sentence.split())
+    numbers = numeric_tokens(norm)
+    return any((text in norm or norm in text) and numbers <= stated for text, stated in inventory)
+
+
+def _gate_text(text: str, inventory: Sequence[tuple[str, frozenset[str]]], assertive: bool) -> str:
+    """Surgically delete uncovered factual sentences, line by line; covered and non-factual ones stay.
+
+    Assertive prose treats every sentence as factual. Hedge prose (unknowns,
+    changes, limitations, coverage detail) treats a sentence as factual when it
+    carries a number. ponytail: the digit rule is the deterministic datapoint
+    signal; a qualitative fact inside hedge prose needs a judge to catch it.
+    """
+    lines: list[str] = []
+    for line in text.splitlines():
+        kept = [
+            s
+            for s in _SENTENCE_END.split(line.strip())
+            if s and (_covered(s, inventory) or not (assertive or _DIGIT.search(s)))
+        ]
+        if kept:
+            lines.append(" ".join(kept))
+    return "\n".join(lines)
+
+
+def _gate_list(items: Sequence[str], inventory: Sequence[tuple[str, frozenset[str]]], assertive: bool) -> list[str]:
+    """Gate every entry of one prose list; entries left empty drop out."""
+    return [kept for kept in (_gate_text(item, inventory, assertive) for item in items) if kept]
+
+
+def gate_uncovered_prose(synth: FinalSynthesis) -> FinalSynthesis:
+    """Exhaustive prose inventory: every factual sentence needs a claim row, else it is deleted in place.
+
+    Covers base/bull/bear, executive summary, positioning, catalysts (assertive)
+    and unknowns, what-would-change, limitations, coverage detail (hedge).
+    Absence observations are coverage artifacts: never citable, never gated.
+    """
+    texts = _claim_texts(synth)
+    synth.base_case = _gate_text(synth.base_case, texts, True)
+    synth.bull_case = _gate_text(synth.bull_case, texts, True)
+    synth.bear_case = _gate_text(synth.bear_case, texts, True)
+    synth.executive_summary = _gate_text(synth.executive_summary, texts, True) or "No grounded findings."
+    synth.positioning = _gate_list(synth.positioning, texts, True)
+    synth.catalysts = _gate_list(synth.catalysts, texts, True)
+    synth.unknowns = _gate_list(synth.unknowns, texts, False)
+    synth.what_would_change = _gate_list(synth.what_would_change, texts, False)
+    synth.evidence_limitations = _gate_list(synth.evidence_limitations, texts, False)
+    for section in synth.coverage.values():
+        raw = section.get("detail") if isinstance(section, dict) else None
+        if isinstance(section, dict) and isinstance(raw, str):
+            detail = _gate_text(raw, texts, False)
+            if detail:
+                section["detail"] = detail
+            else:
+                del section["detail"]
     return synth
 
 
@@ -843,6 +1126,7 @@ __all__ = [
     "SEC_ONLY_LIMITATION",
     "SEC_SCOPE_ABSENCE",
     "FinalSynthesis",
+    "gate_uncovered_prose",
     "scoped_absence",
     "synthesize_final",
 ]

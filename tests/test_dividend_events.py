@@ -322,6 +322,23 @@ def test_amended_amount_supersedes_via_latest_known_at(gateway: _Gateway, monkey
     assert next_declared["accession"] == "0000000007"
 
 
+def test_events_carry_record_identity_without_projections(gateway: _Gateway, monkeypatch: pytest.MonkeyPatch) -> None:
+    _fail_on_price(monkeypatch)
+    _seed_quarters(gateway)
+    _seed_events(
+        gateway,
+        [_event(KO_CIK, "ev-proj", 0.54, decl="2026-08-01", record="2026-08-29", pay="2026-09-15", accn="0000000010")],
+    )
+    result = sec_facts.get_fundamentals("KO", "dividends", as_of=AS_OF)
+    assert isinstance(result, dict)
+    upcoming = result["next_declared_dividend"]
+    assert isinstance(upcoming, dict)
+    assert upcoming["source_url"]
+    assert upcoming["accession"] == "0000000010"
+    assert upcoming["status"] == "upcoming"
+    assert "projected" not in upcoming
+
+
 def test_incomplete_event_excluded_from_last_next(gateway: _Gateway, monkeypatch: pytest.MonkeyPatch) -> None:
     _fail_on_price(monkeypatch)
     _seed_quarters(gateway)

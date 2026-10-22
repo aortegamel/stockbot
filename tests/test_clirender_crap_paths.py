@@ -1417,7 +1417,13 @@ def test_edgar_fact_field_and_copy_meta_arms():
     with pytest.raises(RuntimeError, match="^x$"):
         ec._fact_field(_boom_row(), "a")
     meta = ec._copy_fact_meta(pd.Series({"accn": "A1", "filed_at": "2024-01-01", "form": "4"}, dtype=object))
-    assert meta == {"accession": "A1", "form": "4", "filed": "2024-01-01"}
+    assert meta == {
+        "accession": "A1",
+        "form": "4",
+        "filed": "2024-01-01",
+        "filed_at": "2024-01-01",
+        "known_at": "2024-01-01",
+    }
     with pytest.raises(RuntimeError, match="^x$"):
         ec._copy_fact_meta(_boom_row())
 

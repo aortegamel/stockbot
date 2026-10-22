@@ -53,7 +53,9 @@ def _grounded(prompt: str) -> str:
             if (tok.startswith("EV-") or ":sec:" in tok) and tok not in seen:
                 seen.append(tok)
     claims: list[dict[str, object]] = (
-        [] if not seen else [{"text": f"grounded finding {i}", "evidence_ids": [eid]} for i, eid in enumerate(seen[:6])]
+        []
+        if not seen
+        else [{"text": f"grounded finding {chr(97 + i)}", "evidence_ids": [eid]} for i, eid in enumerate(seen[:6])]
     )
     if "Temporary assignment" in prompt:
         return json.dumps(claims)

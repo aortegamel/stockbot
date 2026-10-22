@@ -83,6 +83,10 @@ CREATE TABLE IF NOT EXISTS coverage_artifacts (
   artifact_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
   created_at TEXT NOT NULL, record TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS ix_coverage_artifacts_session ON coverage_artifacts(session_id);
+CREATE TABLE IF NOT EXISTS evidence_repairs (
+  repair_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, evidence_id TEXT NOT NULL,
+  created_at TEXT NOT NULL, record TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS ix_evidence_repairs_session ON evidence_repairs(session_id, evidence_id);
 CREATE TABLE IF NOT EXISTS tool_results (
   tool_result_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, job_id TEXT NOT NULL,
   tool_name TEXT NOT NULL, created_at TEXT NOT NULL, record TEXT NOT NULL);
@@ -1119,6 +1123,45 @@ class ResearchRepository:
         return [
             validate_json_mapping(json.loads(str(r["record"])), "<research.sqlite>: coverage artifact") for r in rows
         ]
+
+    def save_evidence_repair(self, record: Mapping[str, object]) -> str:
+        """Insert one immutable legacy-evidence repair artifact; the evidence row it names is never written.
+
+        ``repair_id`` is a content hash, so a rerun with the same outcome is a no-op
+        (``created_at`` aside). Different content under the same id raises ValueError.
+        """
+        if not isinstance(record, Mapping):
+            raise ValueError("<research.sqlite>: evidence repair record must be a mapping")  # noqa: TRY004 - public error contract pins ValueError
+        where = "<research.sqlite>: evidence repair"
+        ids = [record.get(key) for key in ("repair_id", "session_id", "evidence_id")]
+        if not all(isinstance(value, str) and value for value in ids):
+            raise ValueError(f"{where}: 'repair_id', 'session_id' and 'evidence_id' must be non-empty strings")
+        repair_id, session_id, evidence_id = (str(value) for value in ids)
+        created = _iso_or_none(record.get("created_at"), "created_at", where) or utcnow().isoformat()
+        encoded = _record_json(record, where)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO evidence_repairs (repair_id, session_id, evidence_id, created_at, record)"
+                " VALUES (?, ?, ?, ?, ?) ON CONFLICT(repair_id) DO NOTHING",
+                (repair_id, session_id, evidence_id, created, encoded),
+            )
+            row = conn.execute("SELECT record FROM evidence_repairs WHERE repair_id = ?", (repair_id,)).fetchone()
+        stored = json.loads(str(row["record"])) if row is not None else None
+        if not isinstance(stored, dict) or {k: v for k, v in stored.items() if k != "created_at"} != {
+            k: v for k, v in json.loads(encoded).items() if k != "created_at"
+        }:
+            raise ValueError(f"{where}: conflicting repair_id {repair_id!r}")
+        return repair_id
+
+    def list_evidence_repairs(self, session_id: str, evidence_id: str | None = None) -> list[dict[str, JSONValue]]:
+        """Repair history for one session (optionally one evidence row), oldest first."""
+        sql = "SELECT record FROM evidence_repairs WHERE session_id = ?"
+        params: tuple[str, ...] = (session_id,)
+        if evidence_id is not None:
+            sql, params = sql + " AND evidence_id = ?", (session_id, evidence_id)
+        with self._connect() as conn:
+            rows = conn.execute(sql + " ORDER BY created_at, repair_id", params).fetchall()
+        return [validate_json_mapping(json.loads(str(r["record"])), "<research.sqlite>: evidence repair") for r in rows]
 
     def save_tool_result(self, record: Mapping[str, object]) -> str:
         """Insert one immutable staged tool result; duplicate ids raise ValueError.

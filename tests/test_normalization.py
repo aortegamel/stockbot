@@ -116,6 +116,14 @@ def test_facts_canonical_concepts():
     assert facts["Revenue"]["original_concept"] == "dei:RevenueFromContractWithCustomerExcludingAssessedTax"
     assert facts["Revenue"]["value"] == 123.5
     assert facts["Revenue"]["unit"] == "USD"
+    assert facts["Revenue"]["namespace"] == "dei"
+    assert facts["Revenue"]["taxonomy"] == "dei"
+    assert facts["Revenue"]["source_identity"] == {
+        "end": "2026-06-30",
+        "val": 123.5,
+        "accn": "a2",
+        "filed": "2026-08-02",
+    }
     assert facts[SHARES_OUTSTANDING_CONCEPT]["unit"] == "shares"
 
 
@@ -347,6 +355,19 @@ def test_eps_facts_normalized_with_period_metadata():
     assert diluted_row["fiscal_period"] == "Q2"
     assert diluted_row["known_at"] == "2025-08-28"
     assert diluted_row["parser_version"] == "sec-companyfacts-v6"
+    assert diluted_row["entity_id"] == "sec:cik:0000000001"
+    assert diluted_row["cik"] == 1
+    assert diluted_row["issuer_cik"] == 1
+    assert diluted_row["namespace"] == "us-gaap"
+    assert diluted_row["taxonomy"] == "us-gaap"
+    assert diluted_row["source_identity"] == diluted[0]
+    assert diluted_row["dimensions"] == {}
+    assert diluted_row["filed_at"] == "2025-08-28"
+    assert diluted_row["accession"] == "a1"
+    assert diluted_row["source_url"] == "u"
+    assert diluted_row["content_hash"] == "h1"
+    assert diluted_row["source_record_id"] == "cik0000000001"
+    assert diluted_row["retrieved_at"] == RETRIEVED_AT
     assert diluted_row["parser_version"] == COMPANY_FACTS_PARSER_VERSION
 
 
@@ -363,6 +384,88 @@ def test_eps_instant_fact_without_period_metadata_is_nullable():
     assert row["period_start"] is None
     assert row["fiscal_year"] is None
     assert row["fiscal_period"] is None
+    assert row["period_instant"] == "2025-01-31"
+    assert row["dimensions"] == {}
+
+
+@pytest.mark.parametrize("duration", [False, True], ids=["instant", "duration"])
+def test_fact_identity_preserves_context_dimensions_and_source(duration: bool) -> None:
+    raw_fact: dict[str, object] = {
+        "end": "2025-07-31",
+        "val": 1.5,
+        "accn": "0000000001-25-000123",
+        "fy": 2025,
+        "fp": "Q2",
+        "filed": "2025-08-28",
+        "form": "10-Q/A",
+        "dimensions": {"us-gaap:StatementBusinessSegmentsAxis": "example:CloudMember"},
+        "document_name": "alpha-20250731.htm",
+        "context_id": "cloud-quarter",
+        "unit_id": "usd-per-share",
+        "element_id": "diluted-eps-cloud",
+        "locator": "#diluted-eps-cloud",
+        "decimals": "2",
+        "precision": "INF",
+        "scale": "0",
+        "presentation_location": "income-statement",
+    }
+    if duration:
+        raw_fact["start"] = "2025-05-01"
+    (row,) = _normalize(_eps_payload(diluted=[raw_fact]))["financial_facts"]
+    assert row["source_identity"] == raw_fact
+    assert row["source_identity"] is not raw_fact
+    assert row["original_concept"] == "us-gaap:EarningsPerShareDiluted"
+    assert row["concept"] == "EarningsPerShareDiluted"
+    assert row["unit"] == "USD/shares"
+    assert row["duration_type"] == ("duration" if duration else "instant")
+    assert row["period_start"] == ("2025-05-01" if duration else None)
+    assert row["period_end"] == "2025-07-31"
+    assert row["period_instant"] == (None if duration else "2025-07-31")
+    assert row["known_at"] == row["filed_at"] == "2025-08-28"
+    for field in (
+        "dimensions",
+        "document_name",
+        "context_id",
+        "unit_id",
+        "element_id",
+        "locator",
+        "decimals",
+        "precision",
+        "scale",
+        "presentation_location",
+    ):
+        assert row[field] == raw_fact[field]
+
+
+def test_equal_fact_values_keep_separate_contexts_and_amendment_identity() -> None:
+    original: dict[str, object] = {
+        "start": "2025-05-01",
+        "end": "2025-07-31",
+        "val": 1.5,
+        "accn": "0000000001-25-000123",
+        "filed": "2025-08-28",
+        "form": "10-Q",
+        "context_id": "consolidated",
+        "dimensions": {},
+    }
+    segment = {
+        **original,
+        "context_id": "cloud",
+        "dimensions": {"us-gaap:StatementBusinessSegmentsAxis": "example:CloudMember"},
+    }
+    amended = {
+        **original,
+        "accn": "0000000001-25-000124",
+        "filed": "2025-09-05",
+        "form": "10-Q/A",
+        "context_id": "consolidated-amended",
+    }
+    rows = _normalize(_eps_payload(diluted=[original, segment, amended]))["financial_facts"]
+    assert len(rows) == 3
+    assert [row["source_identity"] for row in rows] == [original, segment, amended]
+    assert [row["context_id"] for row in rows] == ["consolidated", "cloud", "consolidated-amended"]
+    assert [row["dimensions"] for row in rows] == [{}, segment["dimensions"], {}]
+    assert [row["known_at"] for row in rows] == ["2025-08-28", "2025-08-28", "2025-09-05"]
 
 
 @pytest.mark.parametrize("reverse", [False, True], ids=["null-prefix", "duration-prefix"])
@@ -435,6 +538,14 @@ def test_mixed_facts_preserve_metadata_after_long_null_prefix(reverse: bool) -> 
                 "fy": st.one_of(st.none(), st.integers(min_value=1900, max_value=2100)),
                 "fp": st.one_of(st.none(), st.sampled_from(["FY", "Q1", "Q2", "Q3", "Q4"])),
                 "frame": st.one_of(st.none(), st.sampled_from(["CY2025", "CY2025Q2", "CY2025Q2I"])),
+                "context_id": st.one_of(st.none(), st.sampled_from(["quarter", "year-to-date"])),
+                "unit_id": st.one_of(st.none(), st.sampled_from(["usd-per-share", "usd-per-share-2"])),
+                "element_id": st.one_of(st.none(), st.sampled_from(["eps-primary", "eps-repeat"])),
+                "dimensions": st.dictionaries(
+                    st.sampled_from(["us-gaap:StatementBusinessSegmentsAxis"]),
+                    st.sampled_from(["example:CloudMember", "example:HardwareMember"]),
+                    max_size=1,
+                ),
             },
         ),
         min_size=1,
@@ -454,7 +565,12 @@ def test_prop_optional_fact_metadata_preserves_values(metadata: list[dict[str, o
     ]
     rows = _normalize(_eps_payload(diluted=facts))["financial_facts"]
     assert len(rows) == len(facts)
-    for row, fields in zip(rows, metadata, strict=True):
+    for row, raw_fact, fields in zip(rows, facts, metadata, strict=True):
+        assert row["source_identity"] == raw_fact
+        assert row["dimensions"] == fields.get("dimensions", {})
+        for field in ("context_id", "unit_id", "element_id"):
+            if field in fields:
+                assert row[field] == fields[field]
         assert (
             row["duration_type"],
             row["period_start"],

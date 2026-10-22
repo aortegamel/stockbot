@@ -388,6 +388,26 @@ describe("muse inventory fence", () => {
     expect(splitInventory(`A fact [E1].\n${block}`)).toEqual({ prose: "A fact [E1].\n", claims });
     expect(splitInventory(`A fact [E1].\n${block.slice(0, 30)}`)).toEqual({ prose: "A fact [E1].\n", claims: [] });
   });
+
+  test("datapoint keys survive on new claim types, and a malformed datapoint drops its row", () => {
+    const payload = {
+      claims: [
+        { text: "Revenue was $35.1B.", claim_type: "observed_fact", evidence_ids: ["E1"], value: "$35.1B", entity: "NVDA", period: "Q3 FY2025", unit: "USD", stray: "x" },
+        { text: "Margin is 75%.", claim_type: "calculation", evidence_ids: ["E1", "E2"], value: "75%", period: null },
+        { text: "Assume flat demand.", claim_type: "assumption" },
+        { text: "Bad value.", claim_type: "observed_fact", evidence_ids: ["E1"], value: 35.1 },
+        { text: "Blank unit.", claim_type: "observed_fact", evidence_ids: ["E1"], value: "1", unit: " " },
+      ],
+    };
+    // Only the last fenced block is the inventory; an earlier block stays prose.
+    const inv = splitInventory(`Old \`\`\`json {"claims": []}\`\`\` text.\n\`\`\`json ${JSON.stringify(payload)}\`\`\``);
+    expect(inv.prose).toBe('Old ```json {"claims": []}``` text.\n');
+    expect(inv.claims).toEqual([
+      { text: "Revenue was $35.1B.", claimType: "observed_fact", evidenceIds: ["E1"], value: "$35.1B", entity: "NVDA", period: "Q3 FY2025", unit: "USD" },
+      { text: "Margin is 75%.", claimType: "calculation", evidenceIds: ["E1", "E2"], value: "75%" },
+      { text: "Assume flat demand.", claimType: "assumption", evidenceIds: [] },
+    ]);
+  });
 });
 
 describe("server source metadata", () => {
@@ -643,6 +663,9 @@ describe("muse reason personas (fake provider)", () => {
     expect(systemOf(call.body)).not.toContain("CURRENT STOCK CONTEXT");
     expect(userOf(call.body)).toContain("EVIDENCE\n[E1]\nsource: sec");
     expect(systemOf(call.body)).toContain("After a fact from EVIDENCE, put its row id in brackets, e.g. [ev:abc123].");
+    // The single-tool answer is gated, so the prompt asks for the claims inventory with datapoint keys.
+    expect(systemOf(call.body)).toContain("End your answer with a fenced inventory block");
+    expect(systemOf(call.body)).toContain("\"value\"");
     expect(userOf(call.body)).not.toContain("SIBLING DRAFTS");
   });
 

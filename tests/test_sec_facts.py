@@ -7,8 +7,11 @@ live parity (ttm 6.53), true-filed_at restatement ordering, as_of gating,
 alias and dispatch behavior.  Live edgar_client fallbacks are monkeypatched.
 """
 
+import hashlib
+import json
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime, tzinfo
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Self, override
 from zoneinfo import ZoneInfo
@@ -197,16 +200,67 @@ def test_eps_store_parity_with_live_algorithm(gateway: _Gateway) -> None:
     assert by_end["2026-04-26"]["eps_basic"] == 2.40
     assert result["ttm_eps_diluted"] == 6.53  # matches the live fixture exactly
     assert "ttm_eps_basic" not in result
-    # Each quarter names the filing behind it (derived Q4 cites the FY 10-K) and the issuer CIK.
+    # Only independently reported quarters identify one filing.
     assert {end: q["accession"] for end, q in by_end.items()} == {
         "2025-07-27": "a4",
         "2025-10-26": "a6",
-        "2026-01-25": "a7",
+        "2026-01-25": "",
         "2026-04-26": "a8",
     }
     assert all(q["cik"] == NVDA_CIK for q in quarterly_eps)
+    assert by_end["2026-01-25"]["derived"] is True
+    assert by_end["2026-01-25"]["derivation"] == "fy_minus_ytd"
+    q4 = by_end["2026-01-25"]
+    assert "source_identity" not in q4
+    assert q4["period_start"] == "2025-10-27"
+    assert q4["formulaId"] == "sec_q4_difference"
+    assert q4["formulaVersion"] == "1"
+    assert [(row["accession"], row["value"]) for row in q4["derivation_inputs"]] == [
+        ("a7", 4.90),
+        ("a5", 3.14),
+    ]
+    assert all(row["source_identity"]["start"] == "2025-01-27" for row in q4["derivation_inputs"])
+    assert by_end["2026-04-26"]["concept"] == "EarningsPerShareDiluted"
+    assert by_end["2026-04-26"]["unit"] == "USD/shares"
+    assert by_end["2026-04-26"]["basic_fact"]["concept"] == "EarningsPerShareBasic"
+    assert by_end["2026-04-26"]["basic_fact"]["accession"] == "a9"
+    assert by_end["2026-04-26"]["basic_fact"]["source_identity"]["val"] == 2.40
+    assert result["derived_fields"] == {"ttm_eps_diluted": "sum_quarters"}
+    calculation_inputs = result["calculation_inputs"]
+    assert isinstance(calculation_inputs, dict)
+    inputs = calculation_inputs["ttm_eps_diluted"]
+    assert isinstance(inputs, list)
+    assert len(inputs) == 4
+    assert [row["period_end"] for row in inputs] == list(by_end)
+    nested_q4 = inputs[2]
+    assert nested_q4["derived"] is True
+    assert nested_q4["derivation_inputs"] == q4["derivation_inputs"]
+    calculations = result["calculations"]
+    assert isinstance(calculations, dict)
+    assert calculations["ttm_eps_diluted"]["formulaId"] == "sec_eps_ttm"
+    assert calculations["ttm_eps_diluted"]["formulaVersion"] == "1"
     assert result["source"] == "sec"
     assert result["source_label"] == "SEC EDGAR company facts (Basic & Diluted EPS)"
+
+
+@pytest.mark.parametrize("ytd_start", [None, "2025-01-28"])
+def test_q4_requires_the_matching_ytd_fact(gateway: _Gateway, ytd_start: str | None) -> None:
+    _seed_ticker(gateway, NVDA_CIK, "NVDA")
+    facts = [dict(row) for row in _NVDA_FACTS if row["val"] not in _NVDA_BASIC]
+    if ytd_start is None:
+        facts = [row for row in facts if row["accn"] != "a5"]
+    else:
+        next(row for row in facts if row["accn"] == "a5")["start"] = ytd_start
+    _seed_facts(gateway, NVDA_CIK, diluted=facts)
+
+    result = sec_facts.get_fundamentals("NVDA", "eps", as_of="2026-08-10")
+    quarterly = result["quarterly_eps"]
+    assert isinstance(quarterly, list)
+    assert "2026-01-25" not in {row["period_end"] for row in quarterly}
+    assert "ttm_eps_diluted" not in result
+    calculations = result["calculations"]
+    assert isinstance(calculations, dict)
+    assert "ttm_eps_diluted" not in calculations
 
 
 def test_eps_store_restatement_uses_true_filed_at_not_fiscal_year_proxy(gateway: _Gateway) -> None:
@@ -224,6 +278,10 @@ def test_eps_store_restatement_uses_true_filed_at_not_fiscal_year_proxy(gateway:
     assert isinstance(quarterly_eps, list)
     by_end = {q["period_end"]: q for q in quarterly_eps}
     assert by_end["2025-10-26"]["eps_diluted"] == 1.30  # latest filed_at wins
+    assert by_end["2025-10-26"]["accession"] == "a10"
+    assert by_end["2025-10-26"]["filed_at"] == "2026-03-10"
+    assert by_end["2025-10-26"]["known_at"] == "2026-03-10"
+    assert by_end["2025-10-26"]["source_identity"]["accn"] == "a10"
     assert result["ttm_eps_diluted"] == 6.53
 
 
@@ -244,6 +302,8 @@ def test_eps_store_as_of_gating_excludes_later_restatement(gateway: _Gateway) ->
     assert isinstance(quarterly_eps, list)
     by_end = {q["period_end"]: q for q in quarterly_eps}
     assert by_end["2026-09-30"]["eps_diluted"] == 1.20
+    assert by_end["2026-09-30"]["accession"] == "b3"
+    assert by_end["2026-09-30"]["source_identity"]["val"] == 1.20
     assert earlier["ttm_eps_diluted"] == 4.60
 
     later = sec_facts.get_fundamentals("NVDA", "eps", as_of="2027-02-01")
@@ -251,7 +311,130 @@ def test_eps_store_as_of_gating_excludes_later_restatement(gateway: _Gateway) ->
     assert isinstance(quarterly_eps, list)
     by_end = {q["period_end"]: q for q in quarterly_eps}
     assert by_end["2026-09-30"]["eps_diluted"] == 1.25
+    assert by_end["2026-09-30"]["accession"] == "b5"
+    assert by_end["2026-09-30"]["source_identity"]["val"] == 1.25
     assert later["ttm_eps_diluted"] == 4.65
+
+
+@pytest.mark.parametrize("metric", ["eps", "shares_outstanding"])
+@pytest.mark.parametrize(
+    ("as_of", "amended"),
+    [("2026-09-04", False), ("2026-09-05", True), ("2026-09-06", True)],
+    ids=["before-amendment", "amendment-day", "after-amendment"],
+)
+def test_fundamental_envelope_preserves_selected_fact_identity(
+    gateway: _Gateway, metric: str, as_of: str, amended: bool
+) -> None:
+    _seed_ticker(gateway, NVDA_CIK, "NVDA", retrieved_at="2025-01-01T00:00:00Z")
+    original: dict[str, object] = {
+        "end": "2026-07-31",
+        "val": 1.5 if metric == "eps" else 1000,
+        "accn": "0001045810-26-000100",
+        "filed": "2026-08-28",
+        "form": "10-Q",
+        "fy": 2026,
+        "fp": "Q2",
+        "dimensions": {},
+        "document_name": "nvda-20260731.htm",
+        "context_id": "original-quarter" if metric == "eps" else "original-instant",
+        "unit_id": "usd-per-share" if metric == "eps" else "shares",
+        "element_id": "original-fact",
+        "locator": "#original-fact",
+        "decimals": "2" if metric == "eps" else "0",
+        "precision": "INF",
+        "scale": "0",
+        "presentation_location": "income-statement" if metric == "eps" else "cover-page",
+    }
+    if metric == "eps":
+        original["start"] = "2026-05-01"
+    amendment = {
+        **original,
+        "val": 1.6 if metric == "eps" else 1200,
+        "accn": "0001045810-26-000101",
+        "filed": "2026-09-05",
+        "form": "10-Q/A",
+        "document_name": "nvda-20260731-amended.htm",
+        "context_id": "amended-quarter" if metric == "eps" else "amended-instant",
+        "element_id": "amended-fact",
+        "locator": "#amended-fact",
+    }
+    basic_original = {
+        **original,
+        "val": 1.52,
+        "accn": "0001045810-26-000102",
+        "context_id": "basic-original-quarter",
+        "element_id": "basic-original-fact",
+        "locator": "#basic-original-fact",
+    }
+    basic_amendment = {
+        **amendment,
+        "val": 1.62,
+        "accn": "0001045810-26-000103",
+        "context_id": "basic-amended-quarter",
+        "element_id": "basic-amended-fact",
+        "locator": "#basic-amended-fact",
+    }
+    if metric == "eps":
+        _seed_facts(gateway, NVDA_CIK, diluted=[original, amendment], basic=[basic_original, basic_amendment])
+    else:
+        _seed_facts(gateway, NVDA_CIK, shares=[original, amendment])
+
+    result = sec_facts.get_fundamentals("NVDA", metric, as_of=as_of)
+    expected = amendment if amended else original
+    assert result["source"] == "sec"
+    assert result["as_of_date"] == as_of
+    if metric == "eps":
+        quarters = result["quarterly_eps"]
+        assert isinstance(quarters, list)
+        (selected,) = quarters
+        assert isinstance(selected, dict)
+        assert selected["eps_diluted"] == expected["val"]
+        expected_basic = basic_amendment if amended else basic_original
+        assert selected["eps_basic"] == expected_basic["val"]
+        basic_fact = selected["basic_fact"]
+        assert isinstance(basic_fact, dict)
+        assert basic_fact["source_identity"] == expected_basic
+        assert basic_fact["accession"] == expected_basic["accn"]
+        assert basic_fact["context_id"] == expected_basic["context_id"]
+        assert basic_fact["unit_id"] == expected_basic["unit_id"]
+        assert basic_fact["element_id"] == expected_basic["element_id"]
+        assert basic_fact["namespace"] == "us-gaap"
+        assert basic_fact["concept"] == "EarningsPerShareBasic"
+        assert selected["concept"] == "EarningsPerShareDiluted"
+        assert selected["namespace"] == selected["taxonomy"] == "us-gaap"
+        assert selected["unit"] == "USD/shares"
+        assert selected["period_start"] == "2026-05-01"
+    else:
+        selected = result
+        assert selected["shares_outstanding"] == expected["val"]
+        assert selected["concept"] == "EntityCommonStockSharesOutstanding"
+        assert selected["namespace"] == selected["taxonomy"] == "dei"
+        assert selected["unit"] == "shares"
+        assert selected["period_start"] is None
+        assert selected["period_instant"] == "2026-07-31"
+    assert selected["cik"] == selected["issuer_cik"] == NVDA_CIK
+    assert selected["entity_id"] == "sec:cik:0001045810"
+    assert selected["period_end"] == "2026-07-31"
+    assert selected["accession"] == expected["accn"]
+    assert selected["filed_at"] == selected["known_at"] == expected["filed"]
+    assert selected["source_identity"] == expected
+    assert selected["source_url"] == "https://data.sec.gov/api/xbrl/companyfacts/CIK0001045810.json"
+    assert selected["content_hash"] == f"facts-{NVDA_CIK}"
+    assert selected["source_record_id"] == "cik0001045810"
+    assert selected["retrieved_at"] == RETRIEVED_AT
+    for field in (
+        "dimensions",
+        "document_name",
+        "context_id",
+        "unit_id",
+        "element_id",
+        "locator",
+        "decimals",
+        "precision",
+        "scale",
+        "presentation_location",
+    ):
+        assert selected[field] == expected[field]
 
 
 def test_derive_q4_uses_restated_fy_total():
@@ -283,9 +466,12 @@ def test_derive_q4_uses_restated_fy_total():
     ]
     derived = sec_facts._derive_q4_from_facts(rows, concept, fy_end)
     assert derived is not None
-    assert derived["value"] == pytest.approx(5.00 - 3.14, abs=1e-9)
-    assert derived["accession"] == "b2"
+    assert derived["accession"] == ""
+    assert derived["source_url"] is None
     assert derived["fiscal_period"] == "Q4"
+    assert derived["formulaId"] == "sec_q4_difference"
+    assert derived["formulaVersion"] == "1"
+    assert [row["accession"] for row in derived["derivation_inputs"]] == ["b2", "a5"]
 
 
 # ---------------------------------------------------------------------------
@@ -453,16 +639,88 @@ def test_company_facts_failure_returns_pit_unavailable(gateway: _Gateway, monkey
 
     _seed_ticker(gateway, NVDA_CIK, "NVDA")
 
-    def _down(cik: int) -> object:
-        del cik
+    def _down(url: str) -> bytes:
+        del url
         raise RuntimeError("SEC down")
 
-    monkeypatch.setattr("edgar.entity.entity_facts.download_company_facts_from_sec", _down)
-    monkeypatch.setattr(_ds._sec, "ensure_identity", lambda: None)
+    monkeypatch.setattr("app.services.research_data._edgar_get", _down)
     with pytest.raises(RuntimeError, match="SEC down"):
         _ds.SourceGateway().company_facts(NVDA_CIK)
     result = sec_facts.get_fundamentals("NVDA", "shares_outstanding", as_of="2026-08-10")
     assert result["error_type"] == "pit_data_unavailable"
+
+
+def test_company_facts_archives_exact_bytes_and_preserves_hash_in_service(
+    gateway: _Gateway, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from app import data_sources
+    from app.storage import raw_archive
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    _seed_ticker(gateway, NVDA_CIK, "NVDA", retrieved_at="2025-01-01T00:00:00Z")
+    raw_fact = {
+        "end": "2026-06-30",
+        "val": 1100,
+        "accn": "0001045810-26-000100",
+        "filed": "2026-08-02",
+        "form": "10-Q",
+        "context_id": "shares-instant",
+        "unit_id": "shares",
+        "dimensions": {},
+    }
+    raw = {
+        "cik": NVDA_CIK,
+        "entityName": "NVIDIA",
+        "facts": {
+            "dei": {
+                "EntityCommonStockSharesOutstanding": {"units": {"shares": [raw_fact]}},
+            }
+        },
+    }
+    payload = json.dumps(raw, indent=3).encode() + b"\n\n"
+    digest = hashlib.sha256(payload).hexdigest()
+    assert digest != hashlib.sha256(json.dumps(raw, sort_keys=True).encode()).hexdigest()
+    source_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{NVDA_CIK:010d}.json"
+    calls: list[str] = []
+
+    def _fetch(url: str) -> bytes:
+        calls.append(url)
+        return payload
+
+    class _Clock(datetime):
+        @classmethod
+        @override
+        def now(cls, tz: tzinfo | None = None) -> Self:
+            return cls(2026, 8, 10, 12, tzinfo=tz)
+
+    monkeypatch.setattr("app.services.research_data._edgar_get", _fetch)
+    monkeypatch.setattr(data_sources, "datetime", _Clock)
+    live_gateway = data_sources.SourceGateway()
+    monkeypatch.setattr(live_gateway, "ticker_candidates", gateway.ticker_candidates)
+    monkeypatch.setattr(sec_facts, "_gateway", lambda: live_gateway)
+    datasets = live_gateway.company_facts(NVDA_CIK)
+    facts = datasets["financial_facts"]
+    assert isinstance(facts, list)
+    (fact,) = facts
+    assert fact["source_identity"] == raw_fact
+    assert fact["content_hash"] == digest
+    assert fact["source_record_id"] == f"cik{NVDA_CIK:010d}"
+    assert fact["source_url"] == source_url
+    assert fact["retrieved_at"] == "2026-08-10T12:00:00Z"
+    result = sec_facts.get_fundamentals("NVDA", "shares_outstanding", as_of="2026-08-10")
+    assert result["shares_outstanding"] == 1100
+    assert result["source_identity"] == raw_fact
+    assert result["content_hash"] == digest
+    assert result["source_record_id"] == fact["source_record_id"]
+    assert result["source_url"] == source_url
+    assert calls == [source_url]
+    archived = raw_archive.find("sec", f"cik{NVDA_CIK:010d}", "companyfacts", sha256=digest)
+    assert archived is not None
+    assert archived.sha256 == digest
+    assert archived.size == len(payload)
+    assert archived.url == source_url
+    assert archived.retrieved_at == fact["retrieved_at"]
+    assert raw_archive.read_payload("sec", f"cik{NVDA_CIK:010d}", "companyfacts", sha256=digest) == payload
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +791,65 @@ def test_get_xbrl_facts_always_live_enveloped(monkeypatch: pytest.MonkeyPatch) -
     assert first_concept["concept"] == "Revenue"
     assert result["source_label"] == "SEC EDGAR XBRL facts"
     assert "source" not in first_concept
+
+
+def test_sdk_xbrl_rows_preserve_equal_values_with_distinct_contexts() -> None:
+    from edgar.entity.entity_facts import EntityFacts
+    from edgar.entity.models import FinancialFact
+
+    contexts: list[tuple[str, dict[str, str]]] = [
+        ("consolidated-quarter", {}),
+        ("cloud-quarter", {"us-gaap:StatementBusinessSegmentsAxis": "example:CloudMember"}),
+    ]
+    facts = EntityFacts(
+        cik=NVDA_CIK,
+        name="NVIDIA",
+        facts=[
+            FinancialFact(
+                concept="us-gaap:EarningsPerShareDiluted",
+                taxonomy="us-gaap",
+                label="Diluted EPS",
+                value=1.5,
+                numeric_value=1.5,
+                unit="USD/shares",
+                period_start=date(2026, 5, 1),
+                period_end=date(2026, 7, 31),
+                period_type="duration",
+                fiscal_year=2026,
+                fiscal_period="Q2",
+                filing_date=date(2026, 8, 28),
+                form_type="10-Q",
+                accession="0001045810-26-000100",
+                context_ref=context_id,
+                dimensions=dimensions,
+            )
+            for context_id, dimensions in contexts
+        ],
+    )
+    frame = sec_facts.edgar_client._facts_dataframe(facts)
+    rows = sec_facts.edgar_client._xbrl_result_rows(frame)
+    assert len(rows) == 2
+    by_context = {row["context_id"]: row for row in rows}
+    assert set(by_context) == {context_id for context_id, _ in contexts}
+    for context_id, dimensions in contexts:
+        row = by_context[context_id]
+        assert row["concept"] == row["original_concept"] == "us-gaap:EarningsPerShareDiluted"
+        assert row["namespace"] == row["taxonomy"] == "us-gaap"
+        assert row["cik"] == NVDA_CIK
+        assert row["value"] == 1.5
+        assert row["unit"] == "USD/shares"
+        assert row["period_start"] == "2026-05-01"
+        assert row["period_end"] == "2026-07-31"
+        assert row["accession"] == "0001045810-26-000100"
+        assert row["filed_at"] == row["known_at"] == "2026-08-28"
+        assert row["dimensions"] == dimensions
+        source_identity = row["source_identity"]
+        assert isinstance(source_identity, dict)
+        assert source_identity["context_id"] == context_id
+        assert source_identity["dimensions"] == dimensions
+        assert source_identity["taxonomy"] == "us-gaap"
+        assert source_identity["unit"] == "USD/shares"
+        assert source_identity["filing_date"] == "2026-08-28"
 
 
 def test_get_xbrl_facts_resolves_labels_and_rejects_unknown_offline(monkeypatch: pytest.MonkeyPatch) -> None:

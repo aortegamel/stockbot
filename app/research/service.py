@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from decimal import Decimal, localcontext
 from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,7 +21,6 @@ from typing import TYPE_CHECKING
 from . import jobs as _jobs
 from . import session as _session
 from .evidence import (
-    CLAIM_KINDS,
     Evidence,
     evidence_content_hash,
     evidence_domain,
@@ -34,6 +34,7 @@ from .evidence import (
     web_source_ref,
 )
 from .freeze import EvidenceFreeze
+from .grounding import numeric_tokens
 from .models import (
     DecisionRecord,
     FailureCategory,
@@ -55,7 +56,7 @@ if TYPE_CHECKING:
     from .agents.bullbot import BullAnalysis
     from .agents.stockbot import StockbotAnalysis
     from .director import Wave1Result, WaveDecision
-    from .evidence import EvidenceLedger
+    from .evidence import EvidenceLedger, ProofVerdict
     from .models import Job
     from .synthesis.committee import CommitteeDisagreement
     from .synthesis.final import FinalSynthesis
@@ -669,12 +670,17 @@ def _first_text(data: Mapping[str, object], keys: Sequence[str]) -> str | None:
     return None
 
 
+_RECORDABLE_KINDS: tuple[str, ...] = ("observed_fact", "calculation", "absence_observation")
+"""Claim kinds record_evidence admits; an inference or assumption is never ledger evidence here."""
+
+
 def _claim_kind(data: Mapping[str, object]) -> str:
     """Closed claim kind from claim_kind/evidence_type/ev_type/type; absent means observed_fact.
 
     Legacy values are aliases; anything else, or disagreeing fields, fail closed.
     ``absence_observation`` is the search-coverage route: it is recorded as a session
-    coverage artifact, never as ledger evidence.
+    coverage artifact, never as ledger evidence. ``calculation`` admits a recomputed
+    datapoint over verified input rows.
     """
     kinds: set[str] = set()
     for key in _CLAIM_KIND_KEYS:
@@ -682,7 +688,7 @@ def _claim_kind(data: Mapping[str, object]) -> str:
         if raw is None:
             continue
         name = str(raw)
-        kind = name if name in (*CLAIM_KINDS, "absence_observation") else _CLAIM_KIND_ALIASES.get(name)
+        kind = name if name in _RECORDABLE_KINDS else _CLAIM_KIND_ALIASES.get(name)
         if kind is None:
             raise ValueError(f"record_evidence: ERR_UNKNOWN_EVIDENCE_TYPE ({key}={raw!r})")
         kinds.add(kind)
@@ -1114,13 +1120,21 @@ def _web_replay_ref(row: tuple[str, str, str, str, str, str, str, str], ref_id: 
 def _matched_web_ref(
     rows: list[tuple[str, str, str, str, str, str, str, str]], url: object, locator: str, ref_id: str
 ) -> dict[str, JSONValue]:
-    """Select the first persisted highlight that matches the citation."""
-    for row in rows:
-        if url is not None and url != row[0]:
-            continue
-        norm = _normalize_record_text(row[5])
-        if locator in norm:
-            return _web_replay_ref(row, ref_id)
+    """Select the one persisted highlight the citation pins; ambiguous stays ambiguous.
+
+    A bare excerpt naming no URL must match exactly one stored highlight. Two
+    stored rows with the same highlight prove nothing about which page the model
+    read, so the citation fails ERR_PASSAGE_AMBIGUOUS instead of borrowing the
+    first row's URL.
+    """
+    hits = [row for row in rows if (url is None or url == row[0]) and locator in _normalize_record_text(row[5])]
+    if len(hits) > 1 and url is None:
+        raise ValueError(
+            "record_evidence: ERR_PASSAGE_AMBIGUOUS (the cited excerpt matches "
+            "more than one persisted search_web result; cite the URL you read)"
+        )
+    if hits:
+        return _web_replay_ref(hits[0], ref_id)
     raise ValueError(
         "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE (the cited excerpt does not appear "
         "in the persisted search_web result)"
@@ -1220,6 +1234,10 @@ def _locate_passage(window: str, locator: str) -> tuple[int, int]:
         raise ValueError(
             "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE "
             "(the cited passage does not appear in the document window the handle names)"
+        )
+    if normalized_window.find(normalized_locator, found + 1) >= 0:
+        raise ValueError(
+            "record_evidence: ERR_PASSAGE_AMBIGUOUS (the cited passage appears more than once in the document window)"
         )
     return index[found], index[found + len(normalized_locator) - 1] + 1
 
@@ -1358,6 +1376,7 @@ def materialize_sec_passage(
     (malformed handle), ERR_SEC_HANDLE_UNREADABLE (archive cannot reload it),
     ERR_SEC_HANDLE_STALE (the reloaded window no longer hashes to the handle),
     ERR_PASSAGE_NOT_IN_SOURCE (the locator is not in that window),
+    ERR_PASSAGE_AMBIGUOUS (the locator identifies multiple window spans),
     ERR_NO_SOURCE_BYTES (no exact document bytes to archive).
     """
     if not isinstance(handle, Mapping):
@@ -1591,8 +1610,10 @@ def _build_evidence_record(
     identity_key: str,
     claim_kind: str,
     provenance: dict[str, JSONValue],
+    datapoint: Mapping[str, str | None],
+    proof: dict[str, JSONValue],
 ) -> Evidence:
-    """Assemble the Evidence row from coerced fields (no I/O)."""
+    """Assemble the Evidence row from coerced fields (no I/O); ``proof`` is {} for a value-less row."""
     kind = _svc_record_kind(data)
     return Evidence(
         evidence_id=evidence_id,
@@ -1629,6 +1650,11 @@ def _build_evidence_record(
         record_kind=kind,
         claim_kind=claim_kind,
         provenance=provenance,
+        value=datapoint.get("value"),
+        entity=datapoint.get("entity"),
+        period=datapoint.get("period"),
+        unit=datapoint.get("unit"),
+        proof=proof,
     )
 
 
@@ -1693,12 +1719,13 @@ def _persist_evidence_record(
     *,
     source: MaterializedEvidenceSource,
 ) -> dict[str, JSONValue]:
-    """PIT-gate + archive the full exact bytes before commit; missing bytes cannot arrive."""
+    """PIT-gate + archive the full exact bytes, round-trip any datapoint proof, then commit."""
     ledger = _existing_evidence_ledger(store, session_id)
     ingest_evidence(
         ledger, record, as_of=found.as_of, on_reject=lambda event, payload: _emit(store, session_id, event, payload)
     )
     _archive_materialized_source(session_id, record.evidence_id, record.retrieved_at, source)
+    _require_admission_proof(store, session_id, record)
     stored = evidence_to_dict(record)
     stored_meta = stored.get("metadata")
     attested = {
@@ -1754,14 +1781,30 @@ def _persist_evidence_record(
     return stored
 
 
+def _require_admission_proof(store: ResearchRepository, session_id: str, record: Evidence) -> None:
+    """A datapoint row must verify against the bytes just archived (or its recomputed inputs) before commit."""
+    if not record.proof:
+        return
+    verdict = _proof_verdict(_session_rows(store, session_id), record, record.value)
+    if verdict.status != "verified":
+        code = "ERR_CALCULATION_INVALID" if record.claim_kind == "calculation" else "ERR_DATAPOINT_UNVERIFIED"
+        raise ValueError(f"record_evidence: {code} ({verdict.status}: {verdict.reason})")
+
+
 def _persist_finra_web_record(
     store: ResearchRepository,
     session_id: str,
     job_id: str,
     found: ResearchSession,
     record: Evidence,
+    *,
+    proof_bytes: bytes | None,
 ) -> dict[str, JSONValue]:
-    """PIT-gate + commit a FINRA/WEB replay row; no SEC archive bytes exist to store."""
+    """PIT-gate + commit a FINRA/WEB replay or calculation row.
+
+    A datapoint row archives its exact observation bytes (the persisted tool
+    result) first and must verify against them before the commit.
+    """
     from .evidence import EvidenceLedger
 
     ledger = EvidenceLedger()
@@ -1775,6 +1818,15 @@ def _persist_finra_web_record(
     ingest_evidence(
         ledger, record, as_of=found.as_of, on_reject=lambda event, payload: _emit(store, session_id, event, payload)
     )
+    if proof_bytes is not None:
+        from app.storage import raw_archive
+
+        raw_archive.store_evidence_artifact(
+            proof_bytes,
+            url=record.source_uri or "",
+            metadata={"evidence_id": record.evidence_id, "session_id": session_id},
+        )
+    _require_admission_proof(store, session_id, record)
     stored = evidence_to_dict(record)
     updated_found = (
         found
@@ -1865,6 +1917,12 @@ def persist_tool_result(
     }
     if arguments is not None:
         record["arguments"] = validate_json_mapping(dict(arguments), "<persist_tool_result>: 'arguments'")
+    from app.storage import raw_archive
+
+    raw_archive.store_evidence_artifact(
+        json.dumps(record, sort_keys=True, default=str).encode("utf-8"),
+        metadata={"session_id": session_id, "tool_result_id": rid},
+    )
     try:
         store.save_tool_result(record)
     except ValueError as exc:
@@ -1908,10 +1966,10 @@ def _evidence_typed(data: dict[str, object], found: ResearchSession) -> tuple[di
     return metadata, subject
 
 
-def _coverage_artifact_id(session_id: str, wave: int, search_id: str, query: str) -> str:
+def _coverage_artifact_id(session_id: str, wave: int, search_id: str, query: str, domain: str = "SEC") -> str:
     """Deterministic coverage-artifact id: one scope, one artifact (a repeat is idempotent)."""
-    digest = sha256("|".join((session_id, str(wave), search_id, query)).encode("utf-8")).hexdigest()[:16]
-    return f"{session_id}:cov:{digest}"
+    scope = "|".join((session_id, str(wave), (domain or "SEC").upper(), search_id, query))
+    return f"{session_id}:cov:{sha256(scope.encode('utf-8')).hexdigest()[:16]}"
 
 
 def _record_absence_artifact(
@@ -1930,7 +1988,8 @@ def _record_absence_artifact(
     provenance, coverage = _absence_provenance(data)
     search_id = str(provenance["search_id"])
     query = str(provenance["query"])
-    artifact_id = _coverage_artifact_id(session_id, job.wave_id, search_id, query)
+    domain = (job.source_domain or "SEC").upper()
+    artifact_id = _coverage_artifact_id(session_id, job.wave_id, search_id, query, domain)
     existing = {str(row.get("artifact_id")) for row in store.list_coverage_artifacts(session_id)}
     content, claim = _evidence_content(data)
     claim_text = _svc_claim_text(claim, "evidence", "absence_observation", artifact_id, content)
@@ -1939,6 +1998,7 @@ def _record_absence_artifact(
         "session_id": session_id,
         "job_id": job_id,
         "wave_id": job.wave_id,
+        "source_domain": domain,
         "claim_kind": "absence_observation",
         "claim_text": claim_text,
         "search_id": search_id,
@@ -1985,6 +2045,123 @@ def _apply_materialized_fields(data: dict[str, object], source: MaterializedEvid
     )
 
 
+def _item_datapoint(data: Mapping[str, object]) -> dict[str, str | None]:
+    """Typed datapoint of one item: value/entity/period/unit strings; a value needs its entity and period."""
+    out: dict[str, str | None] = {}
+    for key in ("value", "entity", "period", "unit"):
+        raw = data.get(key)
+        if raw is not None and (not isinstance(raw, str) or not raw.strip()):
+            raise ValueError(f"record_evidence: ERR_DATAPOINT_INCOMPLETE ({key} must be a non-empty string)")
+        out[key] = raw.strip() if isinstance(raw, str) else None
+    if out["value"] is not None and (out["entity"] is None or out["period"] is None):
+        raise ValueError("record_evidence: ERR_DATAPOINT_INCOMPLETE (a value needs its entity and period)")
+    return out
+
+
+def _observation_source_bytes(
+    store: ResearchRepository, observed: MaterializedEvidenceSource | Mapping[str, object]
+) -> bytes:
+    """Exact observation bytes: the SEC document, else the canonical JSON of the persisted tool result."""
+    if isinstance(observed, MaterializedEvidenceSource):
+        return observed.source_bytes
+    result = store.get_tool_result(str(observed.get("tool_result_id")))
+    return json.dumps(result, sort_keys=True, default=str).encode("utf-8")
+
+
+def _admission_observation_proof(
+    store: ResearchRepository, observed: MaterializedEvidenceSource | Mapping[str, object], value: str
+) -> tuple[dict[str, JSONValue], bytes]:
+    """(observation proof, its source bytes); a value not verbatim in the located passage fails closed."""
+    from .evidence import observation_proof
+
+    provenance = observed.provenance if isinstance(observed, MaterializedEvidenceSource) else observed
+    try:
+        source_bytes = _observation_source_bytes(store, observed)
+        return observation_proof(provenance=provenance, source_bytes=source_bytes, value=value), source_bytes
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"record_evidence: ERR_DATAPOINT_UNVERIFIED ({exc})") from None
+
+
+def _calculation_inputs(store: ResearchRepository, session_id: str, proof: Mapping[str, object]) -> list[Evidence]:
+    """Decoded input rows named by ``inputProofIds`` (formula argument order); any gap fails closed."""
+    rows = _session_rows(store, session_id)
+    raw_ids = proof.get("inputProofIds")
+    inputs: list[Evidence] = []
+    for eid in raw_ids if isinstance(raw_ids, list) else []:
+        row = _ledger_row(rows, str(eid))
+        if isinstance(row, str):
+            raise ValueError(f"record_evidence: ERR_CALCULATION_INVALID ({row})")  # noqa: TRY004 - public error contract pins ValueError
+        inputs.append(row)
+    return inputs
+
+
+def _calculation_known_at(inputs: Sequence[Evidence]) -> datetime | None:
+    """A calculation is known once its last input is known; any unknown input leaves it unknown."""
+    known = [row.known_at for row in inputs]
+    return None if not known or any(k is None for k in known) else max(k for k in known if k is not None)
+
+
+def _record_calculation(
+    store: ResearchRepository,
+    session_id: str,
+    job_id: str,
+    found: ResearchSession,
+    job: Job,
+    data: dict[str, object],
+) -> dict[str, JSONValue]:
+    """Admit one calculation row: formula id/version over input rows, recomputed and verified before commit."""
+    from .evidence import calculation_proof
+
+    wave = _evidence_wave(data, job.wave_id)
+    datapoint = _item_datapoint(data)
+    try:
+        proof = calculation_proof(
+            formula_id=data.get("formula_id"),
+            formula_version=data.get("formula_version"),
+            input_proof_ids=data.get("input_evidence_ids"),
+            value=datapoint["value"],
+        )
+    except ValueError as exc:
+        raise ValueError(f"record_evidence: ERR_CALCULATION_INVALID ({exc})") from None
+    inputs = _calculation_inputs(store, session_id, proof)
+    formula = f"{proof['formulaId']}@{proof['formulaVersion']}"
+    args = ", ".join(f"{row.evidence_id}={row.value}" for row in inputs)
+    content = f"{formula}({args}) = {datapoint['value']}"
+    identity_key = "|".join(("calculation", formula, ",".join(row.evidence_id for row in inputs), content))
+    hit = store.find_evidence_by_identity(session_id, identity_key)
+    if hit is not None:
+        return {"evidence_id": hit.get("evidence_id"), "accepted": False, "duplicate_of": hit.get("evidence_id")}
+    evidence_id, _source_name, supports, contradicts = _evidence_ids_names(data, job)
+    metadata, subject = _evidence_typed(data, found)
+    _content, claim = _evidence_content(data)
+    record = Evidence(
+        evidence_id=evidence_id,
+        session_id=session_id,
+        wave_id=wave,
+        source_type="calculation",
+        source_name="calculation",
+        subject=subject,
+        claim_text=claim[:2000] if isinstance(claim, str) and claim.strip() else content[:500],
+        content=content,
+        content_hash=evidence_content_hash(content),
+        retrieved_at=utcnow(),
+        source_record_id=f"calculation:{formula}",
+        known_at=_calculation_known_at(inputs),
+        job_id=job_id,
+        agent_id=str(data.get("agent_id", "pi")),
+        supports=supports,
+        contradicts=contradicts,
+        metadata={**metadata, "identity_key": identity_key, "claim_kind": "calculation"},
+        claim_kind="calculation",
+        value=datapoint["value"],
+        entity=datapoint["entity"],
+        period=datapoint["period"],
+        unit=datapoint["unit"],
+        proof=proof,
+    )
+    return _persist_finra_web_record(store, session_id, job_id, found, record, proof_bytes=None)
+
+
 def record_evidence(
     session_id: str,
     job_id: str,
@@ -1992,31 +2169,45 @@ def record_evidence(
     *,
     repo: ResearchRepository | Path | str | None = None,
 ) -> dict[str, JSONValue]:
-    """Validate (PIT/claim-kind/provenance/IDs) + persist one finding.
+    """Validate (PIT/claim-kind/provenance/IDs/datapoint proof) + persist one finding.
 
     An ``absence_observation`` item is a search-scope record: it is validated the
     same way and then persisted as a session coverage artifact (never a ledger
-    row, never a citable evidence id).
+    row, never a citable evidence id). An observed fact carrying ``value`` (with
+    ``entity``/``period``, optional ``unit``) gets an observation proof over its
+    archived bytes. A ``calculation`` item names ``formula_id``/``formula_version``/
+    ``input_evidence_ids`` and is recomputed before commit.
     """
     if not isinstance(item, Mapping):
         raise ValueError("record_evidence: 'item' must be a mapping")  # noqa: TRY004 - public error contract pins ValueError, tests are oracle
     store = _repo(repo)
     found, job = _live_evidence_job(store, session_id, job_id)
     data = dict(item)
-    if _claim_kind(data) == "absence_observation":
+    kind = _claim_kind(data)
+    if kind == "absence_observation":
         _evidence_live_wave(found, job, session_id)
         return _record_absence_artifact(store, session_id, job_id, job, data)
+    if kind == "calculation":
+        _evidence_live_wave(found, job, session_id)
+        return _record_calculation(store, session_id, job_id, found, job, data)
     content, claim = _evidence_content(data)
     wave = _evidence_wave(data, job.wave_id)
     _evidence_live_wave(found, job, session_id)
+    datapoint = _item_datapoint(data)
     evidence_id, source_name, supports, contradicts = _evidence_ids_names(data, job)
     metadata, subject = _evidence_typed(data, found)
     observed = _observed_provenance(data, job, store=store, session_id=session_id, as_of=found.as_of)
     provenance = observed.provenance if isinstance(observed, MaterializedEvidenceSource) else observed
     identity_key = _evidence_identity(data, claim, subject, provenance)
+    if datapoint["value"] is not None:
+        identity_key = "|".join((identity_key, datapoint["value"], datapoint["period"] or ""))
     hit = store.find_evidence_by_identity(session_id, identity_key)
     if hit is not None:
         return {"evidence_id": hit.get("evidence_id"), "accepted": False, "duplicate_of": hit.get("evidence_id")}
+    proof: dict[str, JSONValue] = {}
+    proof_bytes: bytes | None = None
+    if datapoint["value"] is not None:
+        proof, proof_bytes = _admission_observation_proof(store, observed, datapoint["value"])
     if isinstance(observed, MaterializedEvidenceSource):
         _apply_materialized_fields(data, observed)
     record = _build_evidence_record(
@@ -2035,10 +2226,12 @@ def record_evidence(
         identity_key=identity_key,
         claim_kind="observed_fact",
         provenance=provenance,
+        datapoint=datapoint,
+        proof=proof,
     )
     if isinstance(observed, MaterializedEvidenceSource):
         return _persist_evidence_record(store, session_id, job_id, found, record, source=observed)
-    return _persist_finra_web_record(store, session_id, job_id, found, record)
+    return _persist_finra_web_record(store, session_id, job_id, found, record, proof_bytes=proof_bytes)
 
 
 def _submit_str_list_field(cov: dict[str, object], key: str, *, required: bool = False) -> list[str]:
@@ -3000,8 +3193,8 @@ def _freeze_wave_telemetry(store: ResearchRepository, session_id: str) -> dict[s
     return _derive_telemetry(store, session_id)
 
 
-def _freeze_save_idempotent(store: ResearchRepository, frozen: EvidenceFreeze) -> None:
-    """Persist the freeze; a duplicate save is a no-op (idempotent retry)."""
+def _freeze_save_idempotent(store: ResearchRepository, frozen: EvidenceFreeze, wave_recs: Sequence[Evidence]) -> None:
+    """Persist the freeze. A retry must match the stored freeze's content and datapoints."""
     from . import freeze as _freeze
 
     if not isinstance(frozen, EvidenceFreeze):
@@ -3009,7 +3202,7 @@ def _freeze_save_idempotent(store: ResearchRepository, frozen: EvidenceFreeze) -
     try:
         store.save_freeze(_freeze.freeze_to_dict(frozen))
     except ValueError:
-        pass
+        _freeze.verify_freeze(_freeze.freeze_from_dict(store.get_freeze(frozen.freeze_id)), wave_recs)
 
 
 def _freeze_track_session(store: ResearchRepository, found: ResearchSession, fid: str, wave_id: int) -> ResearchSession:
@@ -3067,24 +3260,38 @@ def _freeze_result_payload(
     return out_dict
 
 
+def _freeze_require_proofs(store: ResearchRepository, session_id: str, wave_recs: Sequence[Evidence]) -> None:
+    """A row that carries a datapoint proof must still verify (archive bytes, recompute) to be frozen."""
+    rows = _session_rows(store, session_id)
+    for rec in wave_recs:
+        verdict = (
+            _proof_verdict(rows, rec, rec.value) if rec.proof.get("kind") in ("observation", "calculation") else None
+        )
+        if verdict is not None and verdict.status != "verified":
+            raise ValueError(
+                f"freeze_session: ERR_PROOF_UNVERIFIED ({rec.evidence_id} {verdict.status}: {verdict.reason})"
+            )
+
+
 def freeze_session(
     session_id: str,
     wave_id: int = 1,
     *,
     repo: ResearchRepository | Path | str | None = None,
 ) -> dict[str, object]:
-    """Freeze wave evidence (PIT-checked) and move RESEARCHING -> FREEZING."""
+    """Freeze wave evidence (PIT-checked, every datapoint proof verified) and move RESEARCHING -> FREEZING."""
     from . import freeze as _freeze
 
     store = _repo(repo)
     found = _freeze_ready_session(store, session_id, wave_id)
     wave_recs = _freeze_wave_records(store, session_id, wave_id)
+    _freeze_require_proofs(store, session_id, wave_recs)
     fid = f"{session_id}:{wave_id}:freeze"
     frozen = _freeze.create_freeze(
         freeze_id=fid, session_id=session_id, wave_id=wave_id, records=wave_recs, as_of=found.as_of
     )
     _freeze.verify_freeze(frozen, wave_recs)
-    _freeze_save_idempotent(store, frozen)
+    _freeze_save_idempotent(store, frozen, wave_recs)
     _freeze_track_session(store, found, fid, wave_id)
     _emit(store, session_id, "freeze.created", {"freeze_id": fid, "wave_id": wave_id})
     note = _freeze_empty_note(wave_recs, _freeze_coverage_note(store, session_id))
@@ -3217,8 +3424,10 @@ def _committee_verify_write(store: ResearchRepository, session_id: str, fid: str
     _freeze.verify_freeze(frozen, recs)
 
 
-def _committee_envelope(analysis: Mapping[str, object], role: str, freeze_ids: list[str]) -> dict[str, object]:
-    """JSON-shape the analysis and ground it against the freeze; return the dict form."""
+def _committee_envelope(
+    analysis: Mapping[str, object], role: str, freeze_ids: list[str]
+) -> tuple[dict[str, object], list[GroundedClaim]]:
+    """JSON-shape the analysis and ground it against the freeze; return (dict form, parsed claims)."""
     from .agents import parse_committee_envelope
 
     try:
@@ -3229,7 +3438,7 @@ def _committee_envelope(analysis: Mapping[str, object], role: str, freeze_ids: l
     out = dict(analysis)
     out.setdefault("role", role)
     out.setdefault("executive_view", env.executive_view)
-    return out
+    return out, env.claims
 
 
 def _committee_track_run(cur: ResearchSession, fid: str, job_id: str, job_wave: int):
@@ -3275,7 +3484,8 @@ def record_committee_analysis(
     found, job = _committee_live_job(store, session_id, job_id, role, analysis)
     fid, freeze_ids = _committee_freeze_ids(store, session_id, found, job.wave_id)
     _committee_verify_write(store, session_id, fid)
-    result = _committee_envelope(analysis, role, freeze_ids)
+    result, claims = _committee_envelope(analysis, role, freeze_ids)
+    require_verified_claims(store, session_id, claims, "record_committee_analysis")
     done = _jobs.complete_job(job, result=result)
     cur = found
     if cur.status == SessionStatus.FREEZING.value:
@@ -3647,20 +3857,292 @@ def _claim_mappings(claims: Sequence[object]) -> list[Mapping[str, object]]:
 
 
 def _shaped_claim(item: Mapping[str, object]) -> dict[str, object]:
-    """One caller claim narrowed to the grounded envelope: text + evidence_ids (+ explicit claim_type)."""
+    """One caller claim narrowed to the grounded envelope: text + evidence_ids (+ explicit claim_type/datapoint)."""
+    from .agents import DATAPOINT_FIELDS
+
     refs = item.get("evidence_ids", [])
     shaped: dict[str, object] = {
         "text": _first_present(item, "text", "claim_text", "claim"),
         "evidence_ids": list(refs) if isinstance(refs, (list, tuple)) else [],
     }
-    if item.get("claim_type") is not None:
-        # Explicit claim_type survives; an absent one stays absent (parsers default to inference).
-        shaped["claim_type"] = item.get("claim_type")
+    # Explicit keys survive verbatim (the strict parser types them); absent ones stay absent
+    # (parsers default claim_type to inference).
+    for key in ("claim_type", *DATAPOINT_FIELDS):
+        if item.get(key) is not None:
+            shaped[key] = item.get(key)
     return shaped
 
 
+# --- Publication proof gate: every published claim resolves to verified ledger proof. ---
+
+_MAX_PROOF_DEPTH = 16
+
+
+def _decimal(text: str) -> Decimal:
+    """Number of one datapoint value ("$1,234.5" / "12.5%"); InvalidOperation (ArithmeticError) on prose."""
+    return Decimal(text.strip().lstrip("$").rstrip("%").replace(",", "").strip())
+
+
+def _pair(values: tuple[Decimal, ...]) -> tuple[Decimal, Decimal]:
+    """Exactly two formula inputs, in inputProofIds order."""
+    if len(values) != 2:
+        raise ValueError(f"expected 2 inputs, got {len(values)}")
+    return values[0], values[1]
+
+
+def _triple(values: tuple[Decimal, ...]) -> tuple[Decimal, Decimal, Decimal]:
+    """Exactly three formula inputs, in inputProofIds order."""
+    if len(values) != 3:
+        raise ValueError(f"expected 3 inputs, got {len(values)}")
+    return values[0], values[1], values[2]
+
+
+_FORMULAS: dict[tuple[str, str], tuple[Callable[[tuple[Decimal, ...]], Decimal], str]] = {
+    ("sum", "1"): (lambda xs: sum(xs, Decimal(0)), "add"),
+    ("difference", "1"): (lambda xs: _pair(xs)[0] - _pair(xs)[1], "add"),
+    ("ratio", "1"): (lambda xs: _pair(xs)[0] / _pair(xs)[1], "ratio"),
+    ("multiply", "1"): (lambda xs: _pair(xs)[0] * _pair(xs)[1], "product"),
+    ("change", "1"): (lambda xs: _pair(xs)[0] - _pair(xs)[1], "change"),
+    ("pct_change", "1"): (lambda xs: (_pair(xs)[1] - _pair(xs)[0]) / _pair(xs)[0] * 100, "growth_pct"),
+    ("percent_change", "1"): (lambda xs: (_pair(xs)[0] - _pair(xs)[1]) / _pair(xs)[1] * 100, "growth_pct"),
+    ("pe", "1"): (lambda xs: round(_pair(xs)[0] / _pair(xs)[1], 1), "multiple"),
+    ("earnings_yield", "1"): (lambda xs: _pair(xs)[0] / _pair(xs)[1], "multiple"),
+    ("short_interest_percent", "1"): (lambda xs: _pair(xs)[0] / _pair(xs)[1] * 100, "percentage"),
+    ("sec_q4_difference", "1"): (lambda xs: _pair(xs)[0] - _pair(xs)[1], "quarter"),
+    ("sec_eps_ttm", "1"): (lambda xs: round(_four_quarters(xs), 2), "ttm"),
+    ("sec_cash_ttm", "1"): (lambda xs: round(_four_quarters(xs), 2), "ttm"),
+    ("sec_cash_outflow_ttm", "1"): (lambda xs: round(_four_quarters(tuple(abs(x) for x in xs)), 2), "ttm"),
+    ("sec_dividend_ttm", "1"): (lambda xs: round(_four_quarters(xs), 4), "ttm"),
+    ("sec_dividend_growth_1y", "1"): (lambda xs: _growth(xs, 1), "growth_ratio"),
+    ("sec_dividend_growth_3y", "1"): (lambda xs: _growth(xs, 3), "growth_ratio"),
+    ("sec_dividend_growth_5y", "1"): (lambda xs: _growth(xs, 5), "growth_ratio"),
+    ("sec_dividend_growth_10y", "1"): (lambda xs: _growth(xs, 10), "growth_ratio"),
+    ("sec_ratio", "1"): (lambda xs: round(_pair(xs)[0] / _pair(xs)[1], 4), "ratio"),
+    ("sec_fcf", "1"): (lambda xs: round(_pair(xs)[0] - _pair(xs)[1], 2), "add"),
+    ("valuation_adjusted_eps", "1"): (lambda xs: round(_pair(xs)[0] - _pair(xs)[1], 2), "add"),
+    ("valuation_scenario_eps", "1"): (
+        lambda xs: round(_triple(xs)[0] - _triple(xs)[1] - _triple(xs)[2], 2),
+        "add",
+    ),
+    ("valuation_projected_price", "1"): (lambda xs: round(_pair(xs)[0] * _pair(xs)[1], 2), "product"),
+    ("valuation_projected_change", "1"): (
+        lambda xs: round((_pair(xs)[1] - _pair(xs)[0]) / _pair(xs)[0] * 100, 1),
+        "growth_pct",
+    ),
+    ("valuation_after_tax", "1"): (lambda xs: round(_pair(xs)[0] * (1 - _pair(xs)[1]), 3), "scale"),
+    ("valuation_eps_impact", "1"): (lambda xs: round(-_pair(xs)[0] / _pair(xs)[1], 3), "per_share"),
+    ("valuation_per_share_impact", "1"): (lambda xs: _pair(xs)[0] / _pair(xs)[1], "per_share"),
+    ("valuation_implied_revenue", "1"): (lambda xs: round(_pair(xs)[0] / (1 - _pair(xs)[1]), 1), "scale"),
+}
+"""The sole versioned formula registry. Each entry pins arithmetic and dimensional semantics."""
+
+
+def _growth(values: tuple[Decimal, ...], years: int) -> Decimal:
+    """Annual DPS growth (1y) or CAGR over an exact year gap; a non-positive base stays unavailable."""
+    older, latest = _pair(values)
+    if older <= 0:
+        raise ValueError("growth needs a positive base value")
+    if years == 1:
+        return round((latest - older) / older, 4)
+    return round((latest / older) ** (Decimal(1) / Decimal(years)) - 1, 4)
+
+
+def _four_quarters(values: tuple[Decimal, ...]) -> Decimal:
+    """Require four positional quarter inputs before calculating their total."""
+    if len(values) != 4:
+        raise ValueError(f"expected 4 quarters, got {len(values)}")
+    return sum(values, Decimal(0))
+
+
+def _recompute(formula_id: str, version: str, values: tuple[str, ...]) -> str | None:
+    """Return the versioned result, or None for an unknown formula."""
+    formula = _FORMULAS.get((formula_id, version))
+    if formula is None:
+        return None
+    numbers = tuple(_decimal(v) for v in values)
+    if not all(value.is_finite() for value in numbers):
+        raise ValueError("formula inputs must be finite")
+    with localcontext() as context:
+        context.prec = max(50, sum(len(value.as_tuple().digits) for value in numbers) + 16)
+        result = formula[0](numbers)
+        if not result.is_finite():
+            raise ValueError("formula result must be finite")
+        return format(result.normalize(), "f")
+
+
+def _archived_bytes(provenance: Mapping[str, object], digest: str) -> bytes | None:
+    """Pinned archive bytes: the SEC document revision for a sec_source row, else the evidence artifact."""
+    from app.storage import raw_archive
+
+    if provenance.get("kind") == "sec_source":
+        key = f"{provenance.get('accession_no')}/{provenance.get('document_name')}"
+        return raw_archive.read_payload("sec", "document", key, sha256=digest)
+    return raw_archive.read_payload("artifacts", "sha256", digest, sha256=digest)
+
+
+def _proof_bytes(evidence: Evidence) -> bytes | None:
+    """Archive bytes the observation proof pins (``sourceId``); None when absent or tampered."""
+    source_id = evidence.proof.get("sourceId")
+    if not isinstance(source_id, str) or not source_id.startswith("sha256:"):
+        return None
+    return _archived_bytes(evidence.provenance, source_id[len("sha256:") :])
+
+
+def _ledger_row(rows: Mapping[str, Mapping[str, object]], evidence_id: str) -> Evidence | str:
+    """Decoded substantive row of this session (the constructor re-checks content_hash), else why not."""
+    from .evidence import evidence_from_dict
+
+    raw = rows.get(evidence_id)
+    if raw is None:
+        return f"{evidence_id} is not a substantive ledger row of this session"
+    try:
+        return evidence_from_dict(raw)
+    except ValueError as exc:
+        return f"{evidence_id} fails ledger integrity: {exc}"
+
+
+def _proof_verdict(
+    rows: Mapping[str, Mapping[str, object]], evidence: Evidence, value: object, depth: int = 0
+) -> ProofVerdict:
+    """verify_observation / verify_calculation for one row against one claimed value (inputs recursively)."""
+    from .evidence import ProofVerdict, verify_calculation, verify_observation
+
+    kind = evidence.proof.get("kind")
+    if kind == "observation":
+        return verify_observation(evidence, value=value, source_bytes=_proof_bytes(evidence))
+    if kind != "calculation":
+        return ProofVerdict("unverified", f"{evidence.evidence_id} carries no observation or calculation proof")
+    if depth >= _MAX_PROOF_DEPTH:
+        return ProofVerdict("unverified", f"{evidence.evidence_id} calculation chain deeper than {_MAX_PROOF_DEPTH}")
+    raw_ids = evidence.proof.get("inputProofIds")
+    inputs: list[tuple[Evidence, ProofVerdict]] = []
+    for eid in raw_ids if isinstance(raw_ids, list) else []:
+        row = _ledger_row(rows, str(eid))
+        if isinstance(row, str):
+            return ProofVerdict("unverified", row)
+        inputs.append((row, _proof_verdict(rows, row, row.value, depth + 1)))
+    return verify_calculation(evidence, value=value, inputs=inputs, recompute=_recompute)
+
+
+def _row_integrity_defect(store: ResearchRepository, session_id: str, evidence: Evidence) -> str | None:
+    """Replayable source of one cited row: archived SEC bytes or this session's persisted tool result."""
+    prov = evidence.provenance
+    kind = prov.get("kind")
+    if kind == "sec_source":
+        digest = evidence.metadata.get("source_content_hash")
+        if not isinstance(digest, str) or _archived_bytes(prov, digest) is None:
+            return f"{evidence.evidence_id}: archived source bytes absent"
+        return None
+    if kind in ("sec_record", "finra_record", "web_source"):
+        result_id = prov.get("tool_result_id")
+        try:
+            result = store.get_tool_result(str(result_id)) if result_id else None
+        except KeyError:
+            result = None
+        if result is None or result.get("session_id") not in (None, "", session_id):
+            return f"{evidence.evidence_id}: persisted tool result for this session absent"
+        payload = json.dumps(result, sort_keys=True, default=str).encode("utf-8")
+        if _archived_bytes(prov, sha256(payload).hexdigest()) is None:
+            return f"{evidence.evidence_id}: archived tool result bytes absent"
+        return None
+    if evidence.claim_kind == "calculation":
+        return None  # replayed through its calculation proof
+    return f"{evidence.evidence_id}: no replayable source identity"
+
+
+def _kernel_text(rows: Mapping[str, Mapping[str, object]], evidence: Evidence, depth: int = 0) -> str:
+    """Kernel-held text of one row (passage/excerpt/record identity/value), calculation inputs included.
+
+    Never the caller-supplied ``content``: only text the kernel materialized or recomputed.
+    """
+    prov = evidence.provenance
+    parts = [prov.get(key) for key in ("passage", "excerpt", "source_content", "record_identity")]
+    parts.append(evidence.value)
+    raw_ids = evidence.proof.get("inputProofIds")
+    for eid in raw_ids if isinstance(raw_ids, list) and depth < _MAX_PROOF_DEPTH else []:
+        row = _ledger_row(rows, str(eid))
+        parts.append(_kernel_text(rows, row, depth + 1) if isinstance(row, Evidence) else None)
+    return " ".join(part for part in parts if isinstance(part, str))
+
+
+def _datapoint_matches(claim: GroundedClaim, evidence: Evidence) -> bool:
+    """Claimed entity/period/unit agree with the row's (case-insensitive) wherever both state one."""
+    for key in ("entity", "period", "unit"):
+        mine, theirs = getattr(claim, key), getattr(evidence, key)
+        if mine is not None and theirs is not None and mine.casefold() != theirs.casefold():
+            return False
+    return True
+
+
+def _claim_proof_defect(
+    store: ResearchRepository, session_id: str, rows: Mapping[str, Mapping[str, object]], claim: GroundedClaim
+) -> str | None:
+    """Why one claim may not publish, or None.
+
+    ``unknown`` and a value-less ``assumption`` stay qualified and need no proof.
+    Every cited row must decode (content hash), replay (archive bytes / persisted
+    tool result / calculation proof), and verify any proof it carries. A
+    claimed ``value`` needs one cited row whose observation or calculation proof
+    verifies that exact value with agreeing entity/period/unit. Every number in
+    the claim text must sit in the cited rows' kernel-held text, so a number with
+    no typed ``value`` is still never fabricated.
+    """
+    if claim.claim_type == "unknown" or (claim.claim_type == "assumption" and claim.value is None):
+        return None
+    texts: list[str] = []
+    proven = False
+    proof_rows: list[Evidence] = []
+    for eid in claim.evidence_ids:
+        row = _ledger_row(rows, eid)
+        if isinstance(row, str):
+            return f"ERR_PROOF_UNVERIFIED ({row})"
+        integrity = _row_integrity_defect(store, session_id, row)
+        if integrity is not None:
+            return f"ERR_PROOF_UNVERIFIED ({integrity})"
+        own = _proof_verdict(rows, row, row.value) if row.proof else None
+        if own is not None and own.status != "verified":
+            return f"ERR_PROOF_UNVERIFIED ({row.evidence_id} {own.status}: {own.reason})"
+        texts.append(_kernel_text(rows, row))
+        proof_rows.append(row)
+        if claim.value is not None and own is not None and _datapoint_matches(claim, row):
+            proven = proven or _proof_verdict(rows, row, claim.value).status == "verified"
+    if claim.value is not None and not proven:
+        return f"ERR_DATAPOINT_UNVERIFIED (value {claim.value!r} has no verified proof among {claim.evidence_ids})"
+    if claim.claim_type in ("observed_fact", "calculation") and claim.value is None and numeric_tokens(claim.text):
+        missing_proof = sorted(eid for eid, row in zip(claim.evidence_ids, proof_rows) if not row.proof)
+        if missing_proof:
+            return (
+                f"ERR_DATAPOINT_UNVERIFIED (proof-less evidence {missing_proof} cannot back "
+                "a verified observed_fact/calculation claim)"
+            )
+    missing = sorted(numeric_tokens(claim.text) - numeric_tokens(" ".join(texts)))
+    if missing:
+        return f"ERR_DATAPOINT_UNVERIFIED (numbers {missing} are not in the cited source text)"
+    return None
+
+
+def _session_rows(store: ResearchRepository, session_id: str) -> dict[str, Mapping[str, object]]:
+    """Substantive ledger rows of one session by evidence id (discovery rows are never citable)."""
+    return {
+        str(row.get("evidence_id")): row
+        for row in store.list_evidence(session_id)
+        if _freeze_row_kind(row) != "discovery"
+    }
+
+
+def require_verified_claims(
+    store: ResearchRepository, session_id: str, claims: Sequence[GroundedClaim], where: str
+) -> None:
+    """Publication gate: raise ``{where}: ERR_*`` for the first claim lacking verified ledger proof."""
+    rows = _session_rows(store, session_id)
+    for claim in claims:
+        defect = _claim_proof_defect(store, session_id, rows, claim)
+        if defect is not None:
+            raise ValueError(f"{where}: {defect} for claim {claim.text[:120]!r}")
+
+
 def _finalize_claims(session_id: str, claims: object, freeze_ids: list[str]):
-    """Shape caller claims and ground every citation against the freeze."""
+    """Shape caller claims and ground every citation against the freeze (proof is checked by the caller)."""
     from .agents import parse_grounded_claims
 
     if not isinstance(claims, list):
@@ -3745,9 +4227,11 @@ def _finalize_persist(
     grounded: list[GroundedClaim],
     synth: FinalSynthesis,
 ) -> dict[str, object]:
-    """Persist the synthesis result and walk ANALYZING->SYNTHESIZING->COMPLETED."""
+    """Re-verify every published claim, persist the synthesis result, walk ANALYZING->SYNTHESIZING->COMPLETED."""
+    from .agents import DATAPOINT_FIELDS
     from .models import SessionStatus
 
+    require_verified_claims(store, session_id, synth.claims, "finalize_session")
     final = dict(synth.to_dict())
     final.setdefault("answer", answer)
     final.setdefault("freeze_id", fid)
@@ -3761,6 +4245,7 @@ def _finalize_persist(
                 "text": claim.text,
                 "claim_type": claim.claim_type,
                 "evidence_ids": validate_json_value(list(claim.evidence_ids), "<service>"),
+                **{key: getattr(claim, key) for key in DATAPOINT_FIELDS if getattr(claim, key) is not None},
             }
             claims_json.append(row)
         final["claims"] = claims_json
@@ -3802,10 +4287,12 @@ def _finalize_observations(
     ]
 
 
-def _finalize_absence_texts(store: ResearchRepository, session_id: str) -> list[str]:
+def _finalize_absence_texts(store: ResearchRepository, session_id: str, domain: str | None = None) -> list[str]:
     """Claim texts of the session's coverage artifacts (search-scope absence records)."""
     texts: list[str] = []
     for artifact in store.list_coverage_artifacts(session_id):
+        if domain is not None and str(artifact.get("source_domain") or "SEC").upper() != domain.upper():
+            continue
         text = artifact.get("claim_text")
         if isinstance(text, str) and text.strip():
             texts.append(text.strip())
@@ -3856,12 +4343,13 @@ def _finalize_synth(
     session_id: str,
     store: ResearchRepository,
 ):
-    """Ground claims + run the trio synthesis; return (synth, grounded)."""
+    """Ground + proof-verify caller claims, then run the trio synthesis; return (synth, grounded)."""
     from .synthesis.final import synthesize_final
 
     ids_raw = meta["evidence_ids"]
     assert isinstance(ids_raw, list)
     grounded = _finalize_claims(session_id, claims, [e for e in ids_raw if isinstance(e, str)])
+    require_verified_claims(store, session_id, grounded, "finalize_session")
     assert wave1.stock is not None and wave1.bull is not None and wave1.bear is not None
     wave_raw = meta["wave_id"]
     as_of_raw = meta["as_of"]
@@ -3877,14 +4365,7 @@ def _finalize_synth(
         bear=wave1.bear,
         disagreement=disagreement,
         model=model,
-        extra_claims=[
-            {
-                "text": c.text,
-                "claim_type": c.claim_type,
-                "evidence_ids": list(c.evidence_ids),
-            }
-            for c in grounded
-        ],
+        extra_claims=list(grounded),
         evidence_limitations=_finalize_limitations(store, session_id),
         research_scope=_finalize_scope(found),
         observations=_finalize_observations(store, session_id, ids_raw),
@@ -3892,7 +4373,9 @@ def _finalize_synth(
         coverage=_finalize_coverage(store, session_id),
     )
     if not synth.answer.strip():
-        raise ValueError("finalize_session: synthesis produced an empty answer")
+        raise ValueError(
+            "finalize_session: synthesis produced an empty answer (no answer sentence is covered by a claim row)"
+        )
     return synth, grounded
 
 

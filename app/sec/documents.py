@@ -11,8 +11,9 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Iterable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, override
@@ -54,10 +55,34 @@ class _ViewTextParser(HTMLParser):
         self._chunks: list[str] = []
         self._cell: list[str] | None = None
         self._row: list[str] | None = None
+        self._hidden: list[str] = []
 
     @override
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         name = _tag_name(tag)
+        attributes = dict(attrs)
+        hidden = "hidden" in attributes or bool(
+            re.search(r"(?:display\s*:\s*none|visibility\s*:\s*hidden)", attributes.get("style") or "", re.IGNORECASE)
+        )
+        if self._hidden or hidden:
+            if name not in {
+                "area",
+                "base",
+                "br",
+                "col",
+                "embed",
+                "hr",
+                "img",
+                "input",
+                "link",
+                "meta",
+                "param",
+                "source",
+                "track",
+                "wbr",
+            }:
+                self._hidden.append(name)
+            return
         if name in _BLOCK_TAGS:
             self._chunks.append("\n")
         if name == "tr":
@@ -79,6 +104,10 @@ class _ViewTextParser(HTMLParser):
     @override
     def handle_endtag(self, tag: str) -> None:
         name = _tag_name(tag)
+        if self._hidden:
+            if name in self._hidden:
+                self._hidden = self._hidden[: len(self._hidden) - 1 - self._hidden[::-1].index(name)]
+            return
         if name in _CELL_TAGS:
             self._close_cell()
         elif name == "tr":
@@ -88,6 +117,8 @@ class _ViewTextParser(HTMLParser):
 
     @override
     def handle_data(self, data: str) -> None:
+        if self._hidden:
+            return
         if self._cell is not None:
             self._cell.append(data)
         else:
@@ -1384,7 +1415,7 @@ _SEC_WWW = "https://www.sec.gov"
 _OFFICIAL_KIND = "official_page"
 _ACCESSION_RE = re.compile(r"[0-9]{10}-[0-9]{2}-[0-9]{6}")
 _ACCESSION_KEYS = ("accession_no", "accession", "accn", "current_accession")
-_CIK_KEYS = ("filer_cik", "issuer_cik", "subject_cik", "cik")
+_CIK_KEYS = ("issuer_cik", "subject_cik", "cik", "filer_cik")
 _FACTS_CIK_RE = re.compile(r"/api/xbrl/companyfacts/CIK([0-9]{10})\.json")
 # Same HTML test the source viewer applies before it renders a basis.
 _HTML_RE = re.compile(r"<(?:html|body|div|p|table|tr|td)\b", re.IGNORECASE)
@@ -1411,19 +1442,57 @@ _ATTR_RE = re.compile(r"([\w:.-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')")
 _MARK_OPEN_RE = re.compile("\ue000([0-9]+)\ue001")
 _MARK_RE = re.compile("\ue000[0-9]+\ue001|\ue002")
 
-_FactSpec = tuple[tuple[str, ...], float, str | None, str]
-"""(concept names, reported value, period start or None, period end/instant)."""
+
+@dataclass(frozen=True)
+class _FactSpec:
+    concepts: tuple[str, ...]
+    value: str
+    start: str | None
+    end: str
+    cik: int | None
+    namespace: str
+    unit: str
+    dimensions: tuple[tuple[str, str], ...]
+    context_id: str
+    unit_id: str
+    element_id: str
+    decimals: str
+    precision: str
+    scale: str
+    presentation_location: str
+
+
+@dataclass(frozen=True)
+class _FactHit:
+    start: int
+    end: int
+    anchor: str
+    context_id: str
+    unit_id: str
+    identity: tuple[object, ...]
+    continued: bool = False
 
 
 def _sec_get(url: str) -> bytes:
-    """One www.sec.gov GET through EdgarTools (declared identity, throttle, retry). Raises on failure."""
+    """One www.sec.gov GET through EdgarTools (declared identity, throttle, retry).
+
+    EdgarTools follows redirects itself: the final response must still come from https://www.sec.gov/.
+    Transport and HTTP failures raise OSError, so a viewer read treats them as an unavailable page.
+    """
     from .client import ensure_identity
 
     ensure_identity()
+    import httpx
+    from edgar.exceptions import TransportError
     from edgar.httprequests import get_with_retry, inspect_response
 
-    response = get_with_retry(url)
-    inspect_response(response)
+    try:
+        response = get_with_retry(url)
+        inspect_response(response)
+    except (httpx.HTTPError, TransportError) as exc:
+        raise OSError(f"{url}: official SEC fetch failed") from exc
+    if not str(response.url).startswith(f"{_SEC_WWW}/"):
+        raise OSError(f"{url}: redirect left the official SEC host")
     return bytes(response.content)
 
 
@@ -1434,7 +1503,10 @@ def _official_bytes(url: str, root: Path) -> bytes:
     raw_root = root / "raw"
     record = raw_archive.find("sec", _OFFICIAL_KIND, url, root=raw_root)
     if record is not None:
-        return record.payload_path.read_bytes()
+        archived = raw_archive.read_payload("sec", _OFFICIAL_KIND, url, sha256=record.sha256, root=raw_root)
+        if archived is None:
+            raise ValueError("Archived SEC page does not match its content hash")
+        return archived
     payload = _sec_get(url)
     raw_archive.archive("sec", _OFFICIAL_KIND, url, payload, url=url, root=raw_root)
     return payload
@@ -1462,30 +1534,34 @@ def _page(url: str, payload: bytes, media: str, quote: str, anchor: str = "") ->
 
 
 def _record_accession(*records: Mapping[str, object]) -> str | None:
+    """Prefer the row identity. Reject conflicting or multi-filing identities within a record."""
     for record in records:
-        listed = record.get("source_accessions")
         candidates = [record.get(key) for key in _ACCESSION_KEYS]
-        candidates += listed[:1] if isinstance(listed, list) else []
-        for value in candidates:
-            accession = _normalize_accession(value) if isinstance(value, str) else None
-            if accession is not None and _ACCESSION_RE.fullmatch(accession):
-                return accession
+        listed = record.get("source_accessions")
+        if not any(candidates) and isinstance(listed, list):
+            candidates.extend(listed)
+        accessions = {
+            _normalize_accession(value)
+            for value in candidates
+            if isinstance(value, str) and _ACCESSION_RE.fullmatch(_normalize_accession(value))
+        }
+        if accessions:
+            return next(iter(accessions)) if len(accessions) == 1 else None
     return None
 
 
 def _record_cik(record: Mapping[str, object], accession: str | None) -> int | None:
-    """A party CIK, else the companyfacts URL CIK, else the accession's filer-agent prefix."""
-    for key in _CIK_KEYS:
-        value = record.get(key)
+    """Resolve the issuer before a reporting person. An accession prefix does not identify the issuer."""
+    del accession
+    match = _FACTS_CIK_RE.search(str(record.get("source_url") or ""))
+    candidates = [record.get(key) for key in _CIK_KEYS[:-1]]
+    candidates.extend((match[1] if match else None, record.get("filer_cik")))
+    for value in candidates:
         if isinstance(value, str) and value.isascii() and value.isdigit():
             value = int(value)
         if type(value) is int and value > 0:
             return value
-    match = _FACTS_CIK_RE.search(str(record.get("source_url") or ""))
-    if match:
-        return int(match[1])
-    # EDGAR serves every accession directory under its filer-agent prefix CIK too (checked live).
-    return (int(accession[:10]) or None) if accession else None
+    return None
 
 
 def _company_page(cik: int, root: Path) -> dict[str, object]:
@@ -1512,107 +1588,276 @@ def _primary_url(index_payload: bytes, accession: str) -> str | None:
 
 
 def _number(value: object) -> float | None:
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    number = float(value)
+    return number if Decimal(str(number)).is_finite() else None
 
 
 def _fact_spec(record: Mapping[str, object]) -> _FactSpec | None:
-    """The reported XBRL fact a fact row names; None for rows that are not facts."""
-    end = str(record.get("period_end") or record.get("as_of") or "")[:10]
+    """Retain the requested fact identity without inventing missing context coordinates."""
+    if record.get("derived") is True:
+        return None
+    end = str(record.get("period_end") or record.get("instant") or record.get("as_of") or "")[:10]
     start = record.get("period_start")
     start = start[:10] if isinstance(start, str) and start else None
-    concept = record.get("concept")
-    if "eps_diluted" in record:
-        concepts, value = ("EarningsPerShareDiluted",), _number(record.get("eps_diluted"))
+    concept = record.get("original_concept") or record.get("concept")
+    if isinstance(record.get("original_concept"), str) and isinstance(concept, str):
+        concepts, value = (concept,), record.get("value")
+    elif "eps_diluted" in record:
+        concepts, value = ("EarningsPerShareDiluted",), record.get("value", record.get("eps_diluted"))
     elif "shares_outstanding" in record:
         concepts = ("EntityCommonStockSharesOutstanding", "CommonStockSharesOutstanding")
-        value = _number(record.get("shares_outstanding"))
+        value = record.get("value", record.get("shares_outstanding"))
     elif isinstance(concept, str) and concept:
-        concepts, value = (concept,), _number(record.get("value"))
+        concepts, value = (concept,), record.get("value")
     else:
         return None
-    return (concepts, value, start, end) if value is not None and _ISO_DATE_RE.fullmatch(end) else None
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation:
+        return None
+    if not number.is_finite() or not _ISO_DATE_RE.fullmatch(end):
+        return None
+    raw_dimensions = record.get("dimensions")
+    dimensions: dict[object, object] = dict(raw_dimensions) if isinstance(raw_dimensions, Mapping) else {}
+    if not isinstance(raw_dimensions, Mapping) and raw_dimensions is not None:
+        return None
+    if any(not isinstance(key, str) or not isinstance(member, str) for key, member in dimensions.items()):
+        return None
+    locator = record.get("locator")
+    coordinates = {**record, **(locator if isinstance(locator, Mapping) else {})}
+    return _FactSpec(
+        concepts=tuple(name.rsplit(":", 1)[-1] for name in concepts),
+        value=str(number),
+        start=start,
+        end=end,
+        cik=_record_cik(record, None),
+        namespace=str(
+            record.get("namespace")
+            or record.get("taxonomy")
+            or (concept.split(":", 1)[0] if isinstance(concept, str) and ":" in concept else "")
+        ),
+        unit=str(
+            record.get("unit")
+            or ("USD/shares" if "eps_diluted" in record else "shares" if "shares_outstanding" in record else "")
+        ),
+        dimensions=tuple(sorted((str(key), str(member)) for key, member in dimensions.items())),
+        **{
+            key: str(coordinates.get(key) if coordinates.get(key) is not None else "")
+            for key in (
+                "context_id",
+                "unit_id",
+                "element_id",
+                "decimals",
+                "precision",
+                "scale",
+                "presentation_location",
+            )
+        },
+    )
 
 
 def _attrs(text: str) -> dict[str, str]:
     return {name.lower(): double or single for name, double, single in _ATTR_RE.findall(text)}
 
 
-def _contexts(source: str) -> dict[str, tuple[str | None, str]]:
-    """Dimensionless contexts: id -> (start, end) for durations, (None, instant) for instants."""
-    out: dict[str, tuple[str | None, str]] = {}
+def _contexts(source: str) -> dict[str, tuple[str | None, str, str, tuple[tuple[str, str], ...]]]:
+    """Read periods, entity identifiers, and explicit or typed dimensions from all contexts."""
+    out: dict[str, tuple[str | None, str, str, tuple[tuple[str, str], ...]]] = {}
+    seen: set[str] = set()
     for match in _IX_CONTEXT_RE.finditer(source):
         context_id = _attrs(match[2]).get("id")
-        if not context_id or _IX_DIMENSION_RE.search(match[3]):
+        if not context_id:
             continue
-        period = {name.lower(): value[:10] for name, value in _IX_PERIOD_RE.findall(match[3])}
+        if context_id in seen:
+            out.pop(context_id, None)
+            continue
+        seen.add(context_id)
+        body = match[3]
+        period = {name.lower(): value[:10] for name, value in _IX_PERIOD_RE.findall(body)}
         end = period.get("instant") or period.get("enddate")
-        if end:
-            out[context_id] = (period.get("startdate"), end)
+        entity = re.search(r"<(?:\w+:)?identifier\b[^>]*>\s*([0-9]+)\s*</", body, re.IGNORECASE)
+        dimensions = []
+        for member in re.finditer(
+            r"<((?:\w+:)?(?:explicitMember|typedMember))\b([^>]*)>(.*?)</\1\s*>", body, re.IGNORECASE | re.DOTALL
+        ):
+            axis = _attrs(member[2]).get("dimension", "")
+            value = member[3] if member[1].lower().endswith("typedmember") else _TAG_RE.sub(" ", member[3])
+            dimensions.append((axis, " ".join(value.split())))
+        if _IX_DIMENSION_RE.search(body) and not dimensions:
+            continue
+        if end and entity:
+            out[context_id] = (period.get("startdate"), end, str(int(entity[1])), tuple(sorted(dimensions)))
     return out
 
 
-def _ix_value(attrs: Mapping[str, str], inner: str) -> float | None:
-    """Reported value of one ix:nonFraction after its format, scale, and sign."""
-    from decimal import Decimal, InvalidOperation
+def _ix_value(attrs: Mapping[str, str], inner: str) -> Decimal | None:
+    """Read the reported value after the inline format, scale, and sign."""
     from html import unescape
 
+    if attrs.get("xsi:nil", "").lower() in {"true", "1"}:
+        return None
     fmt = attrs.get("format", "").lower().replace("-", "")
+    inner = re.sub(r"<ix:exclude\b[^>]*>.*?</ix:exclude\s*>", "", inner, flags=re.IGNORECASE | re.DOTALL)
     text = "".join(unescape(_TAG_RE.sub("", inner)).split())
-    if "zero" in fmt:  # ixt:fixed-zero / zerodash display a dash for 0
+    if "zero" in fmt:
         text = "0"
-    elif "commadecimal" in fmt:
+    elif any(name in fmt for name in ("commadecimal", "dotcomma", "spacecomma")):
         text = text.replace(".", "").replace(",", ".")
-    else:
+    elif not fmt or any(name in fmt for name in ("dotdecimal", "commadot", "spacedot")):
         text = text.replace(",", "")
+    else:
+        return None
     try:
         number = Decimal(text).scaleb(int(attrs.get("scale") or 0))
     except InvalidOperation, ValueError:
         return None
     if not number.is_finite():
         return None
-    return float(-number if attrs.get("sign") == "-" else number)
+    return -number if attrs.get("sign") == "-" else number
 
 
-def _fact_hits(source: str, spec: _FactSpec) -> list[tuple[int, int, str]]:
-    """(start, end, id) of every matching fact's trimmed text, document order."""
-    import math
+def _units(source: str) -> dict[str, str]:
+    """Normalize XBRL unit measures, including divided units."""
+    units: dict[str, str] = {}
+    seen: set[str] = set()
+    for match in re.finditer(r"<((?:\w+:)?unit)\b([^>]*)>(.*?)</\1\s*>", source, re.IGNORECASE | re.DOTALL):
+        unit_id = _attrs(match[2]).get("id")
+        if not unit_id:
+            continue
+        if unit_id in seen:
+            units.pop(unit_id, None)
+            continue
+        seen.add(unit_id)
+        measures = re.findall(r"<(?:\w+:)?measure\b[^>]*>\s*([^<]+?)\s*</", match[3], re.IGNORECASE)
+        if unit_id and measures:
+            values = [value.rsplit(":", 1)[-1] for value in measures]
+            units[unit_id] = (
+                "/".join(values)
+                if re.search(r"<(?:\w+:)?divide\b", match[3], re.IGNORECASE)
+                else "*".join(sorted(values))
+            )
+    return units
 
-    concepts, value, start, end = spec
-    wanted = {c.lower() for c in concepts}
-    contexts = _contexts(source)
-    hits: list[tuple[int, int, str]] = []
+
+def _continued_inner(source: str, attrs: Mapping[str, str], inner: str) -> str | None:
+    """Join a continuation chain. Reject missing, duplicate, or cyclic continuation identities."""
+    next_id = attrs.get("continuedat", "")
+    seen: set[str] = set()
+    while next_id:
+        if next_id in seen:
+            return None
+        seen.add(next_id)
+        matches = [
+            match
+            for match in re.finditer(
+                r"<ix:continuation\b([^>]*)>(.*?)</ix:continuation\s*>", source, re.IGNORECASE | re.DOTALL
+            )
+            if _attrs(match[1]).get("id") == next_id
+        ]
+        if len(matches) != 1:
+            return None
+        continuation = matches[0]
+        inner += continuation[2]
+        next_id = _attrs(continuation[1]).get("continuedat", "")
+    return inner
+
+
+def _fact_hits(source: str, spec: _FactSpec) -> list[_FactHit] | None:
+    """Keep equivalent occurrences. Reject incomplete identity matches and incompatible candidates."""
+
+    def mask(match: re.Match[str]) -> str:
+        return " " * len(match[0])
+
+    source = _COMMENT_RE.sub(mask, source)
+    source = _STYLE_SCRIPT_RE.sub(mask, source)
+    wanted = {concept.lower() for concept in spec.concepts}
+    contexts, units = _contexts(source), _units(source)
+    namespaces = {key[6:]: value for key, value in _attrs(source).items() if key.startswith("xmlns:")}
+    hits: list[_FactHit] = []
     for match in _IX_FACT_RE.finditer(source):
         attrs = _attrs(match[1])
-        name = attrs.get("name", "").lower()
-        if name not in wanted and name.rsplit(":", 1)[-1] not in wanted:
+        name = attrs.get("name", "")
+        prefix, _, local = name.partition(":")
+        if name.lower() not in wanted and local.lower() not in wanted:
             continue
-        period = contexts.get(attrs.get("contextref", ""))
-        if period is None or period[1] != end or (start is not None and period[0] != start):
+        namespace = namespaces.get(prefix, prefix)
+        if spec.namespace and spec.namespace not in {prefix, namespace}:
             continue
-        reported = _ix_value(attrs, match[2])
-        if reported is None or not math.isclose(reported, value, rel_tol=1e-9, abs_tol=0.005):
+        context_id, unit_id = attrs.get("contextref", ""), attrs.get("unitref", "")
+        context = contexts.get(context_id)
+        if context is None or spec.cik is None:
             continue
-        inner = match[2]
-        lo, hi = match.start(2) + len(inner) - len(inner.lstrip()), match.end(2) - len(inner) + len(inner.rstrip())
-        if lo < hi:
-            hits.append((lo, hi, attrs.get("id", "")))
-    return hits
+        start, end, cik, dimensions = context
+        if end != spec.end or (spec.start is not None and start != spec.start):
+            continue
+        if cik != str(spec.cik) or dimensions != spec.dimensions:
+            continue
+        unit = units.get(unit_id)
+        if unit is None or (spec.unit and spec.unit.lower() != unit.lower()):
+            continue
+        coordinates = {
+            "context_id": context_id,
+            "unit_id": unit_id,
+            "element_id": attrs.get("id", ""),
+            "decimals": attrs.get("decimals", ""),
+            "precision": attrs.get("precision", ""),
+            "scale": attrs.get("scale", ""),
+        }
+        if any(getattr(spec, key) and getattr(spec, key) != value for key, value in coordinates.items()):
+            continue
+        if spec.presentation_location:
+            prefix_text = source[: match.start()]
+            headings = list(
+                re.finditer(r"<(?:h[1-6])\b[^>]*>(.*?)</h[1-6]\s*>", prefix_text, re.IGNORECASE | re.DOTALL)
+            )
+            heading = _render_text(headings[-1][1]) if headings else ""
+            if spec.presentation_location not in {attrs.get("id", ""), context_id, heading}:
+                continue
+        inner = _continued_inner(source, attrs, match[2])
+        if inner is None:
+            continue
+        reported = _ix_value(attrs, inner)
+        if reported is None or reported != Decimal(spec.value):
+            continue
+        identity = (
+            local or name,
+            namespace,
+            cik,
+            start,
+            end,
+            unit,
+            dimensions,
+            str(reported),
+            attrs.get("decimals", ""),
+            attrs.get("precision", ""),
+            attrs.get("scale", ""),
+        )
+        hits.append(
+            _FactHit(
+                match.start(2),
+                match.end(2),
+                attrs.get("id", ""),
+                context_id,
+                unit_id,
+                identity,
+                bool(attrs.get("continuedat")),
+            )
+        )
+    return hits if len({hit.identity for hit in hits}) <= 1 else None
 
 
-def _marked_quote(source: str, hits: list[tuple[int, int, str]]) -> tuple[str, str] | None:
-    """(quote, anchor) of the first visible hit: its rendered line from the row label through the fact's cell.
-
-    Private-use markers wrap each hit before rendering, so the renderer itself says where
-    each fact lands; hidden facts vanish with their markers. The quote must occur in the
-    unmarked rendering.
-    """
+def _marked_quote(source: str, hits: list[_FactHit]) -> tuple[str, str] | None:
+    """Return a quote only when one occurrence has one visible rendered span."""
     parts: list[str] = []
     cursor = 0
-    for index, (lo, hi, _anchor) in enumerate(hits):
-        parts += [source[cursor:lo], f"\ue000{index}\ue001", source[lo:hi], "\ue002"]
-        cursor = hi
+    for index, hit in enumerate(hits):
+        parts += [source[cursor : hit.start], f"\ue000{index}\ue001", source[hit.start : hit.end], "\ue002"]
+        cursor = hit.end
     marked = _render_text("".join(parts) + source[cursor:])
     plain = _render_text(source)
+    located: list[tuple[str, str]] = []
     for found in _MARK_OPEN_RE.finditer(marked):
         line_start = marked.rfind("\n", 0, found.start()) + 1
         line_end = marked.find("\n", found.end())
@@ -1623,21 +1868,143 @@ def _marked_quote(source: str, hits: list[tuple[int, int, str]]) -> tuple[str, s
         cell_end = marked.find(" | ", close, line_end)
         quote = _WS_RE.sub(" ", _MARK_RE.sub("", marked[line_start : line_end if cell_end < 0 else cell_end]))
         quote = quote.strip(" |")
-        if quote and quote in plain:
-            return quote, hits[int(found[1])][2]
-    return None
+        if quote and plain.count(quote) == 1:
+            located.append((quote, hits[int(found[1])].anchor))
+    return located[0] if len(located) == 1 else None
 
 
-def _fact_page(spec: _FactSpec, url: str, root: Path) -> dict[str, object] | None:
-    """The primary document's ix fact: anchor = its id. First visible match in document order wins."""
-    # ponytail: document order stands in for "the financial statements"; the presentation linkbase if notes ever lead.
-    payload = _official_bytes(url, root)
-    if _media(payload) != "html":
+def _canonical_fact_page(
+    record: Mapping[str, object], spec: _FactSpec, url: str, payload: bytes, root: Path
+) -> dict[str, object] | None:
+    """Validate the complete fact against pinned companyfacts bytes before using a case-2 document."""
+    from edgar.urls import build_company_facts_url
+
+    from ..services.research_data import _normalize_company_facts
+    from ..storage import raw_archive
+
+    digest = record.get("content_hash")
+    identity = record.get("source_identity")
+    if spec.cik is None or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
         return None
+    source_id = f"sha256:{digest}"
+    if record.get("sourceId", record.get("source_id", source_id)) != source_id:
+        return None
+    source_url = build_company_facts_url(spec.cik)
+    source_record_id = f"cik{spec.cik:010d}"
+    if not isinstance(identity, Mapping):
+        return None
+    if any(
+        key not in record
+        for key in ("known_at", "fiscal_year", "fiscal_period", "period_start", "period_end", "unit", "dimensions")
+    ):
+        return None
+    if not isinstance(record.get("filed_at") or record.get("filed"), str):
+        return None
+    if record.get("source_url") != source_url or record.get("source_record_id") != source_record_id:
+        return None
+    archive = raw_archive.find("sec", source_record_id, "companyfacts", sha256=digest, root=root / "raw")
+    if archive is None or archive.url != source_url:
+        return None
+    try:
+        canonical_bytes = raw_archive.read_payload(
+            "sec", source_record_id, "companyfacts", sha256=digest, root=root / "raw"
+        )
+        if canonical_bytes is None:
+            return None
+        datasets = _normalize_company_facts(
+            spec.cik, canonical_bytes, retrieved_at=archive.retrieved_at, url=source_url
+        )
+    except OSError, ValueError, TypeError, KeyError:
+        return None
+    matches = [
+        candidate
+        for candidate in datasets["financial_facts"]
+        if candidate.get("source_identity") == identity
+        and _fact_spec({**candidate, "original_concept": candidate.get("original_concept") or candidate.get("concept")})
+        == spec
+        and candidate.get("accession") == _record_accession(record)
+        and all(
+            str(candidate.get(key) or "")[:10] == str(record.get(key) or "")[:10] for key in ("filed_at", "known_at")
+        )
+        and all(candidate.get(key) == record.get(key) for key in ("fiscal_year", "fiscal_period"))
+    ]
+    if not matches or any(candidate != matches[0] for candidate in matches[1:]):
+        return None
+    page = _page(url, payload, _media(payload), "")
+    page["canonical_fact"] = {
+        **matches[0],
+        "sourceId": source_id,
+        "document_name": url.rsplit("/", 1)[-1],
+        "public_document_hash": hashlib.sha256(payload).hexdigest(),
+    }
+    occurrences: list[object] = []
+    page["occurrences"] = occurrences
+    page["canonical_payload"] = canonical_bytes
+    return page
+
+
+def _fact_page(spec: _FactSpec, url: str, root: Path, record: Mapping[str, object]) -> dict[str, object] | None:
+    """Resolve the actual inline fact. Hidden or equivalent occurrences use the case-2 public document."""
+    payload = _official_bytes(url, root)
+    media = _media(payload)
     source = payload.decode("utf-8", "replace")
     hits = _fact_hits(source, spec)
-    located = _marked_quote(source, hits) if hits else None
-    return _page(url, payload, "html", *located) if located else None
+    if hits is None:
+        return None
+    if not hits:
+        return _canonical_fact_page(record, spec, url, payload, root)
+    located = _marked_quote(source, hits) if media == "html" and not any(hit.continued for hit in hits) else None
+    page = _page(url, payload, media, *(located or ("", "")))
+    fields = (
+        "concept",
+        "namespace",
+        "cik",
+        "period_start",
+        "period_end",
+        "unit",
+        "dimensions",
+        "value",
+        "decimals",
+        "precision",
+        "scale",
+    )
+    canonical = dict(zip(fields, hits[0].identity))
+    canonical["dimensions"] = dict(spec.dimensions)
+    canonical.update({"document_name": url.rsplit("/", 1)[-1], "content_hash": hashlib.sha256(payload).hexdigest()})
+    canonical["sourceId"] = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+    canonical["accession"] = _record_accession(record)
+    canonical.update(
+        {
+            key: record[key]
+            for key in (
+                "filed_at",
+                "known_at",
+                "fiscal_year",
+                "fiscal_period",
+                "form",
+                "frame",
+                "source_identity",
+                "original_concept",
+                "taxonomy",
+            )
+            if key in record
+        }
+    )
+    canonical["locations"] = [
+        {"element_id": hit.anchor, "context_id": hit.context_id, "unit_id": hit.unit_id} for hit in hits
+    ]
+    page["canonical_fact"] = canonical
+    page["occurrences"] = [
+        {
+            "element_id": hit.anchor,
+            "context_id": hit.context_id,
+            "unit_id": hit.unit_id,
+            "source_start": hit.start,
+            "source_end": hit.end,
+        }
+        for hit in hits
+    ]
+    return page
 
 
 def _number_tokens(value: float) -> tuple[str, ...]:
@@ -1655,18 +2022,32 @@ def _row_tokens(record: Mapping[str, object]) -> list[tuple[str, ...]]:
             fields.append((f"{match[2]}/{match[3]}/{match[1]}", match[0]))
     for key in _ROW_COUNT_KEYS:
         value = _number(record.get(key))
-        if value is not None and value >= 1:
+        if value is not None and value >= 0:
             fields.append(_number_tokens(value))
+    price = _number(record.get("price"))
+    if price is not None and price >= 0:
+        fields.append((*_number_tokens(price), f"${price:g}"))
     percent = _number(record.get("percent"))
-    if percent is not None and percent > 0:
+    if percent is not None and percent >= 0:
         fields.append((f"{percent:g}%", f"{percent:g} %"))
+    for key in ("transaction_code", "acquired_disposed", "direct_indirect", "security_title"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            fields.append((value.strip(),))
     return fields
 
 
 def _row_line_page(record: Mapping[str, object], url: str, root: Path) -> dict[str, object] | None:
-    """The rendered form line holding most of the row's values (first such line wins)."""
-    # ponytail: value-overlap line match, a per-form XML field map if rows ever collide.
+    """Require one rendered row to contain every supplied transaction coordinate."""
     payload = _official_bytes(url, root)
+    source = payload.decode("utf-8", "replace")
+    for field, tag in (("issuer_cik", "issuerCik"), ("reporting_owner_cik", "rptOwnerCik")):
+        wanted = record.get(field)
+        actual = re.findall(rf"<{tag}\b[^>]*>\s*([0-9]+)\s*</{tag}\s*>", source, re.IGNORECASE)
+        if wanted is not None:
+            wanted_cik = _record_cik({"cik": wanted}, None)
+            if wanted_cik is None or (actual and str(wanted_cik) not in {str(int(cik)) for cik in actual}):
+                return None
     media = _media(payload)
     basis = _basis(payload, media)
     fields = [
@@ -1675,12 +2056,12 @@ def _row_line_page(record: Mapping[str, object], url: str, root: Path) -> dict[s
     ]
     if basis is None or not fields:
         return None
-    best, best_score = "", 0
-    for line in basis.splitlines():
-        score = sum(any(p.search(line) for p in variants) for variants in fields)
-        if score > best_score:
-            best, best_score = line, score
-    return _page(url, payload, media, best) if best_score else None
+    matches = [
+        line
+        for line in basis.splitlines()
+        if all(any(pattern.search(line) for pattern in variants) for variants in fields)
+    ]
+    return _page(url, payload, media, matches[0]) if len(matches) == 1 else None
 
 
 def _search_quotes(record: Mapping[str, object]) -> list[str]:
@@ -1712,31 +2093,48 @@ def _search_page(record: Mapping[str, object], accession: str, cik: int, root: P
 def resolve_sec_official(
     tool_name: str, row: Mapping[str, object], payload: Mapping[str, object], *, root: Path
 ) -> dict[str, object] | None:
-    """Official www.sec.gov page behind one cited SEC row, fetched once and archived under ``root / "raw"``.
+    """Resolve a human SEC page from the exact row identity.
 
-    Fact rows map to the primary document's inline-XBRL fact, ownership rows to the
-    SEC-rendered form line, search hits to the matched document; every row with an
-    accession falls back to its filing index page. A CIK-only overview payload maps
-    to the company filing page; other accession-less rows carry values the company
-    page never states, so they resolve to None (case 3). Fetch failures raise.
+    Numeric facts require an actual fact match. Only filing metadata can cite an index.
+    Hidden facts retain canonical evidence without a fabricated visible quote.
     """
-    record = {**{k: v for k, v in payload.items() if not isinstance(v, (Mapping, list))}, **row}
+    record = {**payload, **row}
     accession = _record_accession(row, payload)
-    cik = _record_cik(record, accession)
+    entity = {key: record.get(key) for key in ("issuer_cik", "subject_cik", "cik")}
+    cik = _record_cik(entity if tool_name in _OWNERSHIP_TOOLS else record, accession)
     if cik is None:
         return None
+    numeric_fact = any(key in record for key in ("concept", "eps_diluted", "shares_outstanding", "value"))
     if accession is None:
+        if numeric_fact:
+            return None
         overview = tool_name == "get_fundamentals" and str(payload.get("metric") or "") == "overview"
         if not (overview or tool_name in {"get_sec_filing", "list_sec_filings"}):
             return None
         return _company_page(cik, root)
     index_url = f"{_SEC_WWW}/Archives/edgar/data/{cik}/{accession.replace('-', '')}/{accession}-index.htm"
-    page: dict[str, object] | None = None
     spec = _fact_spec(record)
     if tool_name == "search_sec_filings":
         page = _search_page(record, accession, cik, root)
-    elif spec is not None or tool_name in _OWNERSHIP_TOOLS:
+        return page if page is not None or numeric_fact else _index_page(index_url, accession, root)
+    if numeric_fact or tool_name in _OWNERSHIP_TOOLS:
+        if numeric_fact and spec is None:
+            return None
         primary = _primary_url(_official_bytes(index_url, root), accession)
-        if primary is not None:
-            page = _fact_page(spec, primary, root) if spec is not None else _row_line_page(record, primary, root)
-    return page or _index_page(index_url, accession, root)
+        document = record.get("document_name") or record.get("document")
+        if isinstance(document, str) and document:
+            if not _DOCUMENT_NAME_RE.fullmatch(document):
+                return None
+            primary = f"{_SEC_WWW}/Archives/edgar/data/{cik}/{accession.replace('-', '')}/{document}"
+        if primary is None or not primary.startswith(f"{_SEC_WWW}/Archives/edgar/data/{cik}/"):
+            return None
+        return _fact_page(spec, primary, root, record) if spec is not None else _row_line_page(record, primary, root)
+    if tool_name in {
+        "get_sec_filing",
+        "list_sec_filings",
+        "list_sec_documents",
+        "get_filing_exhibits",
+        "get_filing_exhibit",
+    }:
+        return _index_page(index_url, accession, root)
+    return None

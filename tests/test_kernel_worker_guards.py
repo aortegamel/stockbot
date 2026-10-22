@@ -2658,8 +2658,10 @@ async def _text_result(*a: object, **k: object) -> object:
     return "not-a-mapping"
 
 
-def test_assess_final_malformed_results_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_assess_final_malformed_results_fail_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A non-mapping JEV result is a fail-closed verdict carrying the malformed-result text."""
+    import tests.research_source_seam as seam
+
     jev = JevClient()
     monkeypatch.setattr(jev, "assess_final_response", _list_result)
     monkeypatch.setattr(jev, "assess_final_claim", _text_result)
@@ -2671,7 +2673,19 @@ def test_assess_final_malformed_results_fail_closed(monkeypatch: pytest.MonkeyPa
         "support_answer": None,
         "evidence_state": "insufficient",
     }
-    claim = kw._assess_final_claim({"id": "c1", "claim": {"text": "claim text", "claim_type": "inference"}}, jev=jev)
+    # A claim without a session never reaches JEV: the ledger proof gate fails closed first.
+    unproven = kw._assess_final_claim({"id": "c0", "claim": {"text": "claim text", "claim_type": "inference"}}, jev=jev)
+    assert str(unproven["error"]).startswith("proof: sessionId required")
+    assert unproven["support"] is None and unproven["evidence_state"] == "insufficient"
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "claim text from the filing."})
+    claim = kw._assess_final_claim(
+        {
+            "id": "c1",
+            "sessionId": sid,
+            "claim": {"text": "claim text", "claim_type": "inference", "evidence_ids": ["ev-1"]},
+        },
+        jev=jev,
+    )
     assert claim == {
         "id": "c1",
         "error": "assess_final_claim: malformed result",
@@ -2685,10 +2699,9 @@ def test_assess_final_malformed_results_fail_closed(monkeypatch: pytest.MonkeyPa
 def test_final_response_gate_validates_inventory_before_model_assessment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, confidence: JSONValue
 ) -> None:
-    from app.research import service
+    import tests.research_source_seam as seam
 
-    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
-    sid = service.create_research("support?", "support?")
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "WSJ reported X in the filing."})
     seen: list[dict[str, JSONValue]] = []
 
     async def _transport(state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
@@ -2711,29 +2724,29 @@ def test_final_response_gate_validates_inventory_before_model_assessment(
             }
         }
 
-    out = kw._direct_op(
-        {
-            "id": "f2",
-            "op": "assess_final_response",
-            "sessionId": sid,
-            "text": " WSJ reported X. ",
-            "confidence": confidence,
-            "claims": [
-                {
-                    "text": f"  {'c' * 2100}  ",
-                    "claim_type": " inference ",
-                    "confidence": 0.5,
-                    "evidence_ids": [" ev-1 ", 7, ""],
-                },
-                {"text": "  ", "claim_type": "inference"},
-                {"text": "x", "claim_type": ""},
-                "not-a-mapping",
-                {"text": "y", "claim_type": "fact", "confidence": True},
-                {"text": "z", "claim_type": "fact", "evidence_ids": "ev-1"},
-            ],
-        },
-        JevClient(transport=_transport, data_root=tmp_path),
-    )
+    jev = JevClient(transport=_transport, data_root=tmp_path)
+    malformed: list[JSONValue] = [
+        {"text": "  ", "claim_type": "inference"},
+        {"text": "x", "claim_type": ""},
+        "not-a-mapping",
+        {"text": "y", "claim_type": "fact", "confidence": True},
+        {"text": "z", "claim_type": "fact", "evidence_ids": "ev-1"},
+    ]
+    request: dict[str, JSONValue] = {
+        "id": "f2",
+        "op": "assess_final_response",
+        "sessionId": sid,
+        "text": " WSJ reported X. ",
+        "confidence": confidence,
+    }
+    # A malformed inventory row fails the ledger proof gate before any model assessment.
+    rejected = kw._direct_op({**request, "claims": malformed}, jev)
+    assert rejected is not None and str(rejected["error"]).startswith("proof:")
+    assert rejected["support_answer"] is None and seen == []
+    clean: list[JSONValue] = [
+        {"text": f"  {'c' * 2100}  ", "claim_type": " inference ", "confidence": 0.5, "evidence_ids": ["ev-1"]},
+    ]
+    out = kw._direct_op({**request, "claims": clean}, jev)
     assert out is not None
     expected_confidence = None if isinstance(confidence, bool) else confidence
     assert out["id"] == "f2"
@@ -2744,9 +2757,7 @@ def test_final_response_gate_validates_inventory_before_model_assessment(
     assert state["text"] == "WSJ reported X." and state["evidence"] == []
     assert state["confidence"] == expected_confidence
     assert state["claims"] == [
-        {"text": "c" * 2000, "claim_type": "inference", "evidence_ids": [" ev-1 "], "confidence": 0.5},
-        {"text": "y", "claim_type": "fact", "evidence_ids": [], "confidence": None},
-        {"text": "z", "claim_type": "fact", "evidence_ids": [], "confidence": None},
+        {"text": "c" * 2000, "claim_type": "inference", "evidence_ids": ["ev-1"], "confidence": 0.5},
     ]
     decisions = ResearchRepository().list_decisions(sid)
     assert len(decisions) == 1 and decisions[0].decision_type == "final_response_assessment"
@@ -2756,14 +2767,14 @@ def test_final_response_gate_validates_inventory_before_model_assessment(
     ("payload", "evidence", "confidence", "claim_type"),
     [
         (
-            {"claim": {"text": "X.", "claim_type": "inference", "evidence_ids": ["ev-1", 7], "confidence": 0.5}},
+            {"claim": {"text": "X.", "claim_type": "inference", "evidence_ids": ["ev-1"], "confidence": 0.5}},
             [{"id": "ev-1", "content": ""}],
             0.5,
             "inference",
         ),
         (
-            {"claim": {"text": "X.", "claim_type": "inference"}, "confidence": 0.6},
-            [],
+            {"claim": {"text": "X.", "claim_type": "inference", "evidence_ids": ["ev-1"]}, "confidence": 0.6},
+            [{"id": "ev-1", "content": ""}],
             0.6,
             "inference",
         ),
@@ -2777,7 +2788,12 @@ def test_final_response_gate_validates_inventory_before_model_assessment(
             0.5,
             "inference",
         ),
-        ({"text": "X.", "claim_type": "attributed_report"}, [], None, "attributed_report"),
+        (
+            {"text": "X.", "claim_type": "attributed_report", "evidence_ids": ["ev-1"]},
+            [{"id": "ev-1", "content": ""}],
+            None,
+            "attributed_report",
+        ),
     ],
 )
 def test_final_claim_gate_assesses_available_evidence(
@@ -2788,10 +2804,9 @@ def test_final_claim_gate_assesses_available_evidence(
     confidence: float | None,
     claim_type: str,
 ) -> None:
-    from app.research import service
+    import tests.research_source_seam as seam
 
-    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
-    sid = service.create_research("support?", "support?")
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "X. The filing says so."})
     seen: list[object] = []
     supported = any(isinstance(row, dict) and row.get("content") for row in evidence)
 
@@ -2826,6 +2841,16 @@ def test_final_claim_gate_assesses_available_evidence(
     assert seen == [{"text": "X.", "claim_type": claim_type, "evidence": evidence, "confidence": confidence}]
     decisions = ResearchRepository().list_decisions(sid)
     assert len(decisions) == 1 and decisions[0].decision_type == "final_claim_assessment"
+    # An uncited inference or an id the ledger never admitted fails the proof gate; JEV never runs.
+    id_cases: list[list[JSONValue]] = [[], ["ev-404"]]
+    for ids in id_cases:
+        claim: dict[str, JSONValue] = {"text": "X.", "claim_type": "inference", "evidence_ids": ids}
+        unproven = kw._direct_op(
+            {"id": "u", "op": "assess_final_claim", "sessionId": sid, "claim": claim},
+            JevClient(transport=_transport, data_root=tmp_path),
+        )
+        assert unproven is not None and str(unproven["error"]).startswith("proof:")
+    assert len(seen) == 1
 
     missing = kw._assess_final_claim({"id": "c3", "claim": {"text": "X."}})
     assert missing == {
@@ -3924,3 +3949,146 @@ def test_decompose_plain_transient_twice_raises_transient(monkeypatch: pytest.Mo
     assert calls["n"] == 2
     assert ("reasoner_retry", {"attempt": 2}) in events
     assert ("reasoner_retry", {"attempt": 2, "reason": "rate_limited"}) not in events
+
+
+@pytest.mark.parametrize("tool", ["list_sec_filings", "get_short_interest", "search_web"])
+def test_entry_tool_admits_into_its_gated_session_before_return(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tool: str
+) -> None:
+    from app.research import service
+    from app.storage import raw_archive
+    from app.tool_runtime import outcome_from_result
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "entry.sqlite"))
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(sched, "build_registry", lambda: [{"name": tool}])
+    payloads: dict[str, dict[str, object]] = {
+        "list_sec_filings": {"filings": [{"ticker": "NVDA", "revenue": 123}]},
+        "get_short_interest": {"records": [{"ticker": "GME", "short_interest": 123}]},
+        "search_web": {"evidence": [{"url": "https://example.test/report", "highlight": "Revenue reached 123."}]},
+    }
+
+    async def attempt(
+        name: str,
+        args: dict[str, object],
+        sid: str,
+        session: object,
+        registry: object,
+        jev: object,
+        kernel: sched._Kernel,
+        as_of: str | None,
+    ) -> dict[str, object]:
+        domain = "SEC" if name == "list_sec_filings" else "FINRA" if name == "get_short_interest" else "WEB"
+        job_id = sched._attempt_job(kernel, sid, domain)
+        payload = dict(payloads[name])
+        ref = service.persist_tool_result(sid, job_id, name, None, payload, arguments=args)["tool_result_id"]
+        payload["tool_result_id"] = ref
+        return sched._success_attempt(name, args, outcome_from_result(name, payload), payload, domain, "fixed", job_id)
+
+    monkeypatch.setattr(kw, "_intake_attempt", attempt)
+    request: dict[str, JSONValue] = {
+        "id": "entry",
+        "op": "entry_tool",
+        "prompt": "What is the figure?",
+        "tool": tool,
+        "arguments": {},
+    }
+    first = kw._direct_op(request, None)
+    sid = first["sessionId"]
+    assert isinstance(sid, str)
+    store = ResearchRepository()
+    assert store.get_session(sid).query == request["prompt"]
+    rows = first["evidence"]
+    assert isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict)
+    eid = rows[0]["id"]
+    assert isinstance(eid, str)
+    claims: list[JSONValue] = [{"text": "The source reports 123.", "claim_type": "inference", "evidence_ids": [eid]}]
+    assert kw._final_proof_defect({"sessionId": sid}, claims) is None
+    assert "not a substantive ledger row" in str(
+        kw._final_proof_defect(
+            {"sessionId": sid}, [{**claims[0], "evidence_ids": ["ev:bridge"]}] if isinstance(claims[0], dict) else []
+        )
+    )
+    second = kw._direct_op({**request, "sessionId": sid}, None)
+    assert second["sessionId"] == sid
+    # SEC identity includes the persisted result ID. FINRA and WEB dedupe the located passage.
+    assert len(store.list_evidence(sid)) == (2 if tool == "list_sec_filings" else 1)
+    second_rows = second["evidence"]
+    assert isinstance(second_rows, list)
+    assert any(row.get("id") == eid for row in second_rows if isinstance(row, dict))
+    assert len(store.list_tool_results(sid)) == 2
+    assert all(job.status == "completed" for job in store.list_jobs(sid))
+
+    def no_archive(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(raw_archive, "read_payload", no_archive)
+    defect = kw._final_proof_defect({"sessionId": sid}, claims)
+    assert "archived tool result bytes absent" in str(defect)
+
+
+def test_entry_tool_rejects_bridge_only_session_without_executing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "entry.sqlite"))
+    monkeypatch.setattr(sched, "build_registry", lambda: [{"name": "get_short_interest"}])
+    out = kw._direct_op(
+        {
+            "id": "entry",
+            "op": "entry_tool",
+            "prompt": "GME short interest?",
+            "tool": "get_short_interest",
+            "arguments": {},
+            "sessionId": "tool-bridge-only",
+        },
+        None,
+    )
+    assert "unknown session_id" in str(out.get("error"))
+
+
+def test_entry_clock_result_stays_uncitable_without_a_source_admission_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "entry.sqlite"))
+    monkeypatch.setattr(sched, "build_registry", lambda: [{"name": "get_current_time"}])
+
+    def clock(name: str, arguments: object, session: object, **kwargs: object) -> dict[str, object]:
+        assert name == "get_current_time"
+        return {"utc_now": "2026-10-21T12:00:00Z", "source": "system-clock"}
+
+    monkeypatch.setattr("app.tool_runtime.execute_agent_tool", clock)
+    out = kw._direct_op(
+        {
+            "id": "clock",
+            "op": "entry_tool",
+            "prompt": "What time is it?",
+            "tool": "get_current_time",
+            "arguments": {},
+        },
+        None,
+    )
+    assert out["evidence"] == []
+    sid = out["sessionId"]
+    assert isinstance(sid, str)
+    assert ResearchRepository().get_session(sid).query == "What time is it?"
+    assert all(job.status == "completed" for job in ResearchRepository().list_jobs(sid))
+
+
+def test_tool_result_archive_failure_prevents_persisting_the_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from app.research import service
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "entry.sqlite"))
+    sid = service.create_research("NVDA filings?")
+    store = ResearchRepository()
+    job_id = service.start_job(sid, source="SEC")["job_id"]
+    assert isinstance(job_id, str)
+
+    def unavailable(*args: object, **kwargs: object) -> None:
+        raise OSError("archive unavailable")
+
+    monkeypatch.setattr("app.storage.raw_archive.store_evidence_artifact", unavailable)
+    with pytest.raises(OSError, match="archive unavailable"):
+        service.persist_tool_result(sid, job_id, "list_sec_filings", None, {"filings": []})
+    assert store.list_tool_results(sid) == []

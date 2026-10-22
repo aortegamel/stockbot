@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { FINAL_PERSONAS, type AgentEvent, type Evidence, type FinalClaim, type SourceReference } from "../../../needle-harness/lib/agent/types";
-import { fetchSourceDocument } from "../lib/research-client";
+import { fetchSourceLabel } from "../lib/research-client";
 import { routeHash } from "../lib/route";
 import { originalLink, sourceLabel, type OriginalLink } from "../lib/source-viewer";
 import { ActionCards, TrioCard, type WidgetOutcomes } from "./action-cards";
@@ -61,7 +61,8 @@ function evidenceById(events: AgentEvent[]): Map<string, Evidence> {
 
 type LoadedSource = { label: string; link: OriginalLink | undefined };
 
-// Readable labels and official page links read once from each captured document. A failed read keeps the caller's fallback label and no official link.
+// Readable labels and already pinned official links from persisted metadata only: no full resolve, replay, or
+// official download happens until the user opens the Stockbot view. A failed read keeps the fallback label and no link.
 function useLoadedSources(references: SourceReference[]): Map<string, LoadedSource> {
   const requested = useRef(new Set<string>());
   const mounted = useRef(false);
@@ -75,7 +76,7 @@ function useLoadedSources(references: SourceReference[]): Map<string, LoadedSour
     for (const id of JSON.parse(ids) as string[]) {
       if (requested.current.has(id)) continue;
       requested.current.add(id);
-      void fetchSourceDocument(id).then((source) => {
+      void fetchSourceLabel(id).then((source) => {
         if (mounted.current) setLoaded((current) => new Map(current).set(id, { label: sourceLabel(source), link: originalLink(source) }));
       }, () => undefined);
     }

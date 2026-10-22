@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { fetchJournal, fetchSnapshot, fetchSourceDocument, listSessions } from "./research-client";
-import type { SourceDocument } from "./research-client";
+import { fetchJournal, fetchSnapshot, fetchSourceDocument, fetchSourceLabel, listSessions } from "./research-client";
+import type { SourceAudit, SourceDocument, SourceLabel } from "./research-client";
 
 const originalFetch = globalThis.fetch;
 const id = `capture:${"b".repeat(64)}`;
@@ -244,5 +244,134 @@ describe("research reads", () => {
     await expect(listSessions(3)).rejects.toThrow("sessions 503");
     capture({}, 502);
     await expect(fetchSnapshot("rs:9")).rejects.toThrow("snapshot 502");
+  });
+});
+
+describe("fetchSourceLabel", () => {
+  const evidenceId = "evidence:rs:1:ev:7";
+  const label = (overrides: Partial<SourceLabel> = {}): SourceLabel => ({ id: evidenceId, title: "10-K", linkStatus: "missing", ...overrides });
+  const requested: { url: string; init?: RequestInit }[] = [];
+  function reply(body: unknown, status = 200): void {
+    (globalThis as { fetch?: typeof fetch }).fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      requested.push({ url: String(input), init });
+      return Promise.resolve(new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } }));
+    }) as unknown as typeof fetch;
+  }
+
+  afterEach(() => {
+    requested.length = 0;
+  });
+
+  test("reads the label endpoint, never the full source endpoint", async () => {
+    reply(label());
+    expect(await fetchSourceLabel(evidenceId)).toStrictEqual(label());
+    expect(requested.map((request) => [request.url, request.init?.cache])).toEqual([["/api/research/sources/evidence%3Ars%3A1%3Aev%3A7/label", "no-store"]]);
+  });
+
+  test("keeps exactly the persisted label fields and drops everything the viewer resolves", async () => {
+    const full = label({ publisher: "SEC", publishedAt: "2026-01-01", knownAt: "2026-01-02", linkStatus: "stockbot_render", originalUrl: "https://www.sec.gov/a.htm" });
+    reply({ ...full, content: "body", quote: "q", audit: { evidenceId: "x" }, highlightUrl: "https://www.sec.gov/a.htm#:~:text=q", toolArgs: { q: 1 } });
+    expect(await fetchSourceLabel(evidenceId)).toStrictEqual(full);
+  });
+
+  test("rejects labels that claim a highlight, mismatch their links, or name another source", async () => {
+    const page = "https://www.sec.gov/a.htm";
+    for (const body of [
+      label({ id: "evidence:other" }),
+      { ...label(), title: 5 },
+      { ...label(), linkStatus: "highlighted_original", originalUrl: page },
+      { ...label(), linkStatus: undefined },
+      label({ originalUrl: page }),
+      label({ linkStatus: "stockbot_render" }),
+      label({ linkStatus: "stockbot_render", originalUrl: `${page}#:~:text=Revenue` }),
+      label({ linkStatus: "stockbot_render", originalUrl: "javascript:alert(1)" }),
+      label({ linkStatus: "stockbot_render", originalUrl: "https://user:pw@www.sec.gov/a.htm" }),
+      ...["publisher", "publishedAt", "knownAt"].map((key) => ({ ...label(), [key]: 7 })),
+      null,
+      [],
+    ]) {
+      reply(body);
+      await expect(fetchSourceLabel(evidenceId)).rejects.toThrow();
+    }
+  });
+
+  test("surfaces the controlled server error, then the status", async () => {
+    reply({ id: evidenceId, error: "source capture not found", status: 404, failure: "SOURCE_IDENTITY_MISSING" }, 404);
+    await expect(fetchSourceLabel(evidenceId)).rejects.toThrow("source capture not found");
+    reply({}, 502);
+    await expect(fetchSourceLabel(evidenceId)).rejects.toThrow("Source request failed (502).");
+  });
+});
+
+describe("fetchSourceDocument audit", () => {
+  const node = (overrides: Partial<SourceAudit> = {}): SourceAudit => ({ evidenceId: "EV-1", claimType: "observed_fact", verification: "verified", verificationReason: "", ...overrides });
+  const calculation = (audit: unknown): Record<string, unknown> => ({ ...document({ captureKind: "calculation", content: "a - b", quote: "" }), audit });
+
+  test("keeps a nested calculation audit with each input's own source id and no API link", async () => {
+    const audit = node({
+      evidenceId: "EV-C", sourceId: "evidence:EV-C", claimType: "calculation", value: "3481", entity: "NVDA", period: "Q1", unit: "USD millions", knownAt: "2025-05-01",
+      formula: "a - b", formulaId: "difference", formulaVersion: "1", recomputedValue: "3481",
+      inputs: [
+        node({ evidenceId: "EV-A", sourceId: "evidence:EV-A", value: "26,044", source: { name: "SEC", document: "x.htm", accession: "0001045810-24-000124", hash: "sha256:abc" } }),
+        node({ evidenceId: "EV-B", verification: "unverified", verificationReason: "absent" }),
+      ],
+    });
+    respond(calculation(audit));
+    expect((await fetchSourceDocument(id)).audit).toStrictEqual(audit);
+  });
+
+  test("keeps repair history as typed display text, never a citation link", async () => {
+    const audit = node({
+      verification: "unverified",
+      verificationReason: "no proof",
+      repairs: [{ repair_id: "repair:abc", status: "verified", category: "eps_without_accession", datapoint: "eps_diluted", value: "0.76" }],
+    });
+    respond(calculation(audit));
+    expect((await fetchSourceDocument(id)).audit).toStrictEqual(audit);
+    for (const repairs of [[{ status: "verified" }], [{ repair_id: "" }], [{ repair_id: "repair:abc", status: 1 }], "repairs"]) {
+      respond(calculation(node({ repairs: repairs as never })));
+      await expect(fetchSourceDocument(id)).rejects.toThrow("The source audit is invalid.");
+    }
+  });
+  test("drops unknown audit and audit-source keys", async () => {
+    respond(calculation({ ...node({ source: { name: "SEC" } }), upstreamUrl: "https://data.sec.gov/x.json", source: { name: "SEC", url: "https://data.sec.gov/x.json" } }));
+    expect((await fetchSourceDocument(id)).audit).toStrictEqual(node({ source: { name: "SEC" } }));
+  });
+
+  test("rejects malformed audits, links that are not server source ids, and calculations with an original link", async () => {
+    const bad: unknown[] = [
+      null, [], "audit",
+      { ...node(), evidenceId: undefined },
+      { ...node(), claimType: 1 },
+      { ...node(), verification: "passed" },
+      { ...node(), verificationReason: undefined },
+      node({ sourceId: "https://data.sec.gov/x.json" }),
+      node({ sourceId: "evidence:../x" }),
+      { ...node(), value: 3481 },
+      { ...node(), source: "SEC" },
+      { ...node(), source: { hash: 1 } },
+      { ...node(), inputs: {} },
+      { ...node(), inputs: [{ ...node(), verification: "ok" }] },
+    ];
+    for (const audit of bad) {
+      respond(calculation(audit));
+      await expect(fetchSourceDocument(id)).rejects.toThrow("The source audit is invalid.");
+    }
+    respond({ ...calculation(node()), linkStatus: "stockbot_render", originalUrl: "https://www.sec.gov/a.htm" });
+    await expect(fetchSourceDocument(id)).rejects.toThrow("The source links are invalid.");
+  });
+
+  test("bounds audit depth at the backend proof limit", async () => {
+    const chain = (depth: number): SourceAudit => (depth === 0 ? node() : node({ claimType: "calculation", inputs: [chain(depth - 1)] }));
+    respond(calculation(chain(16)));
+    expect((await fetchSourceDocument(id)).audit).toStrictEqual(chain(16));
+    respond(calculation(chain(17)));
+    await expect(fetchSourceDocument(id)).rejects.toThrow("The source audit is invalid.");
+  });
+
+  test("a controlled viewer error surfaces only its public message", async () => {
+    respond({ id, error: "source read failed", status: 502, failure: "SOURCE_UNAVAILABLE" }, 502);
+    // Exactly the public message: the internal failure class never reaches the reader.
+    await expect(fetchSourceDocument(id)).rejects.toThrow(/^source read failed$/u);
   });
 });

@@ -64,7 +64,7 @@ function bridgeSuccess(stdout: string, isSource: boolean): BridgeOut {
 
 async function runBridge(payload: Record<string, unknown>): Promise<BridgeOut> {
   const py = join(ROOT, "venv/bin/python");
-  const isSource = payload.kind === "source" || payload.kind === "source_pdf";
+  const isSource = payload.kind === "source" || payload.kind === "source_pdf" || payload.kind === "source_label";
   const script = `
 import base64, json, sys
 sys.path.insert(0, ${JSON.stringify(ROOT)})
@@ -77,11 +77,19 @@ except Exception as e:
 try:
     req = json.loads(sys.argv[1])
     kind = req.get("kind")
-    if kind in ("source", "source_pdf"):
+    if kind in ("source", "source_pdf", "source_label"):
         try:
-            from app.research.sources import read_source_document, read_source_pdf
+            from app.config import configure_logging
+            from app.research.sources import read_source_label, read_source_pdf, read_source_view
+            configure_logging()
             if kind == "source":
-                out = read_source_document(req["source_id"])
+                # Ordinary failures come back as a controlled state; the reader sees only the status message.
+                out = read_source_view(req["source_id"])
+                if "error" in out:
+                    print(json.dumps({"ok": False, "status": out["status"], "error": out["error"]}))
+                    sys.exit(1)
+            elif kind == "source_label":
+                out = read_source_label(req["source_id"])
             else:
                 out = {"pdf_base64": base64.b64encode(read_source_pdf(req["source_id"])).decode("ascii")}
         except (KeyError, FileNotFoundError):
@@ -116,21 +124,28 @@ except Exception as e:
     sys.exit(2)
 `;
   let stdout: string;
+  let stderr: string;
   try {
-    ({ stdout } = await execFileAsync(py, ["-c", script, JSON.stringify(payload)], {
+    ({ stdout, stderr } = await execFileAsync(py, ["-c", script, JSON.stringify(payload)], {
       encoding: "utf8",
       timeout: 15_000,
       // Source PDFs ride back as base64; no output cap.
       maxBuffer: Infinity,
     }));
   } catch (error: unknown) {
+    // Source ERROR logs (failure class + context) reach the server log, never the client.
+    if (isSource && error instanceof Error && "stderr" in error && typeof error.stderr === "string" && error.stderr) console.error(error.stderr.trimEnd());
     return bridgeFailure(error, isSource);
   }
+  if (isSource && stderr) console.error(stderr.trimEnd());
   return bridgeSuccess(stdout, isSource);
 }
 
+// /api/research/sources/:id[/pdf|/label] -> bridge kind; anything else is unknown.
+const SOURCE_SUFFIX_KINDS: Record<string, string> = { pdf: "source_pdf", label: "source_label" };
+
 function sourceIdFromPath(parts: string[], headers: Record<string, string>): string | Response {
-  if ((parts.length !== 5 && parts.length !== 6) || (parts.length === 6 && parts[5] !== "pdf")) {
+  if ((parts.length !== 5 && parts.length !== 6) || (parts.length === 6 && !Object.hasOwn(SOURCE_SUFFIX_KINDS, parts[5]))) {
     return Response.json({ error: "unknown source path" }, { status: 404, headers });
   }
   let sourceId: string;
@@ -147,13 +162,13 @@ function sourceIdFromPath(parts: string[], headers: Record<string, string>): str
 
 async function readSource(pathname: string): Promise<Response> {
   const headers = { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" };
-  // /api/research/sources/:id | /api/research/sources/:id/pdf (raw split keeps empty segments visible)
+  // Label reads persisted metadata only; the document read resolves and replays the full source.
   const parts = pathname.split("/");
   const sourceId = sourceIdFromPath(parts, headers);
   if (sourceId instanceof Response) return sourceId;
-  const isPdf = parts.length === 6;
-  const r = await runBridge({ kind: isPdf ? "source_pdf" : "source", source_id: sourceId });
-  if (!isPdf || r.status !== 200) return Response.json(r.body, { status: r.status, headers });
+  const kind = parts.length === 6 ? SOURCE_SUFFIX_KINDS[parts[5]] : "source";
+  const r = await runBridge({ kind, source_id: sourceId });
+  if (kind !== "source_pdf" || r.status !== 200) return Response.json(r.body, { status: r.status, headers });
   return sourcePdfResponse(r.body, headers);
 }
 

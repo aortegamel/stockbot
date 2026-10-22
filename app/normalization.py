@@ -915,9 +915,11 @@ def _envelope_document(
     }
 
 
-def _fact_float(fact: dict[str, object]) -> float | None:
+def _fact_float(fact: dict[str, object]) -> int | float | None:
     """Numeric val for a fact (missing/unparseable -> None)."""
     val_raw: object = fact.get("val")
+    if isinstance(val_raw, int) and not isinstance(val_raw, bool):
+        return val_raw
     try:
         if val_raw is None:
             return None
@@ -968,17 +970,39 @@ def _fact_row(
 ) -> dict[str, object]:
     """One normalized financial-fact row."""
     start_raw = fact.get("start")
+    namespace = original_concept.split(":", 1)[0]
+    inline_fields = {
+        key: fact[key]
+        for key in (
+            "document_name",
+            "context_id",
+            "unit_id",
+            "element_id",
+            "locator",
+            "decimals",
+            "precision",
+            "scale",
+            "presentation_location",
+        )
+        if key in fact
+    }
     return {
         "fact_id": ids.sec_fact_id(cik, accession, concept, period_end, value),
         "entity_id": entity_id,
         "security_id": security_id,
+        "cik": cik,
+        "issuer_cik": cik,
         "concept": concept,
         "original_concept": original_concept,
+        "namespace": namespace,
+        "taxonomy": namespace,
         "value": value,
         "unit": unit,
         "duration_type": "duration" if fact.get("start") else "instant",
         "period_end": period_end,
         "period_start": str(start_raw) if start_raw else None,
+        "period_instant": None if start_raw else period_end,
+        "dimensions": fact.get("dimensions", {}),
         "fiscal_year": _fact_fiscal_year(fact),
         "fiscal_period": str(fact.get("fp") or "") or None,
         "filed_at": filed_at,
@@ -988,8 +1012,10 @@ def _fact_row(
         "retrieved_at": retrieved_at,
         "source_url": source_url,
         "source_record_id": source_record_id,
+        "source_identity": dict(fact),
         "content_hash": content_hash,
         "parser_version": COMPANY_FACTS_PARSER_VERSION,
+        **inline_fields,
     }
 
 

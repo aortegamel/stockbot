@@ -67,7 +67,7 @@ def query_with_today_utc(text: str, today: date | datetime | str | None = None) 
     """Prefix a query/objective with `[Today UTC YYYY-MM-DD]` (idempotent)."""
     if not isinstance(text, str) or not text.strip():
         return text
-    if "[Today UTC " in text:
+    if re.match(r"^\[Today UTC \d{4}-\d{2}-\d{2}\] ", text):
         return text
     if today is None:
         day = utcnow().date().isoformat()

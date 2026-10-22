@@ -359,6 +359,18 @@ describe("research source route", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+  test("serves the citation label without the full source bridge", async () => {
+    const directory = await fixture(false, echoPython(`{"ok": True, "data": {"title": "Filing", "payload": payload}}`));
+    try {
+      const response = await readRaw(directory, sourcePath(captureId, "/label"));
+      expect(response.status).toBe(200);
+      expect(response.headers).toMatchObject({ cache: "no-store", nosniff: "nosniff" });
+      expect(JSON.parse(response.text)).toEqual({ title: "Filing", payload: { kind: "source_label", source_id: captureId } });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
 
   test("accepts encoded evidence IDs at the length boundary", async () => {
     const directory = await fixture(false, echoPython(`{"ok": True, "data": payload}`));
@@ -391,6 +403,8 @@ describe("research source route", () => {
         "evidence:with space",
         "evidence:a\n",
         `${captureId}\n`,
+        `repair:${"a".repeat(64)}`,
+        "repair:abc",
       ];
       for (const path of [...invalid.map((id) => sourcePath(id)), "/api/research/sources/%ZZ"]) {
         const response = await readRaw(directory, path);
@@ -408,6 +422,9 @@ describe("research source route", () => {
         ["/api/research/sources/%ZZ/raw", 404, "unknown source path"],
         ["/api/research/sources/%ZZ/pdf", 400, "bad source_id"],
         ["/api/research/sources//pdf", 400, "bad source_id"],
+        [sourcePath(captureId, "/label/extra"), 404, "unknown source path"],
+        ["/api/research/sources/%ZZ/label", 400, "bad source_id"],
+        ["/api/research/sources//label", 400, "bad source_id"],
         [`/api//research/sources/${captureId}`, 404, "unknown source path"],
       ] as const) {
         const response = await readRaw(directory, path);
@@ -419,6 +436,77 @@ describe("research source route", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+  test("rejects repair artifact ids on document, label, and pdf paths before the bridge", async () => {
+    // A bridge call would answer 200; every repair id must stop before it.
+    const directory = await fixture(false, echoPython(`{"ok": True, "data": {}}`));
+    try {
+      const repairId = `repair:${"a".repeat(64)}`;
+      for (const suffix of ["", "/label", "/pdf"]) {
+        const response = await readRaw(directory, sourcePath(repairId, suffix));
+        expect(response.status).toBe(400);
+        expect(JSON.parse(response.text)).toEqual({ error: "bad source_id" });
+        expect(response.headers).toMatchObject({ cache: "no-store", nosniff: "nosniff" });
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("real bridge: calc label lacks audit, calc view audits each input, EV-BAD stays unverified", async () => {
+    const directory = await fixture();
+    const previousDataDir = process.env.STOCKBOT_DATA_DIR;
+    process.env.STOCKBOT_DATA_DIR = directory;
+    try {
+      const seed = [
+        "from pathlib import Path",
+        "import json",
+        "import pytest",
+        "from tests.test_source_documents import _proof_ledger",
+        `repo, _ = _proof_ledger(Path(${JSON.stringify(directory)}), pytest.MonkeyPatch())`,
+        'print(json.dumps(repo.list_evidence("S-proof"), sort_keys=True))',
+      ].join("\n");
+      const before = await execute(python, ["-c", seed], { cwd: root, env: { ...process.env, STOCKBOT_DATA_DIR: directory, RESEARCH_DB_PATH: join(directory, "research.sqlite") } });
+      const [label, view, tot, dc, badLabel, bad] = await readRoutes(directory, [
+        sourcePath("evidence:EV-NONDC", "/label"),
+        sourcePath("evidence:EV-NONDC"),
+        sourcePath("evidence:EV-TOT"),
+        sourcePath("evidence:EV-DC"),
+        sourcePath("evidence:EV-BAD", "/label"),
+        sourcePath("evidence:EV-BAD"),
+      ]);
+      expect(label.status).toBe(200);
+      expect(label.body).toMatchObject({ id: "evidence:EV-NONDC", linkStatus: "missing" });
+      expect(label.body).not.toHaveProperty("audit");
+      expect(label.body).not.toHaveProperty("content");
+      const audit = (view.body as Record<string, unknown>).audit as Record<string, unknown>;
+      expect(view.status).toBe(200);
+      expect(audit).toMatchObject({ sourceId: "evidence:EV-NONDC", verification: "verified" });
+      expect(view.body).toMatchObject({ captureKind: "calculation", linkStatus: "missing" });
+      expect(view.body).not.toHaveProperty("originalUrl");
+      expect(view.body).not.toHaveProperty("highlightUrl");
+      const inputs = audit.inputs as Record<string, unknown>[];
+      expect(inputs.map((item) => item.sourceId)).toEqual(["evidence:EV-TOT", "evidence:EV-DC"]);
+      expect(tot.body).toMatchObject({ captureKind: "original", audit: { sourceId: "evidence:EV-TOT", verification: "verified", value: "26,044" } });
+      expect(dc.body).toMatchObject({ captureKind: "original", audit: { sourceId: "evidence:EV-DC", verification: "verified", value: "22,563" } });
+      expect(badLabel.status).toBe(200);
+      expect(badLabel.body).toMatchObject({ id: "evidence:EV-BAD", linkStatus: "missing" });
+      expect(bad.status).toBe(200);
+      expect((bad.body as Record<string, unknown>).audit).toMatchObject({ verification: "unverified" });
+      const check = [
+        "import json",
+        "from app.research.repository import ResearchRepository",
+        'repo = ResearchRepository()',
+        'assert repo.list_evidence_repairs("S-proof") == []',
+        'print(json.dumps(repo.list_evidence("S-proof"), sort_keys=True))',
+      ].join("\n");
+      const { stdout } = await execute(python, ["-c", check], { cwd: root, env: { ...process.env, STOCKBOT_DATA_DIR: directory, RESEARCH_DB_PATH: join(directory, "research.sqlite") } });
+      expect(stdout.trim()).toBe(before.stdout.trim());
+    } finally {
+      if (previousDataDir === undefined) delete process.env.STOCKBOT_DATA_DIR;
+      else process.env.STOCKBOT_DATA_DIR = previousDataDir;
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   test("maps missing, corrupt, and unreadable captures to fixed messages", async () => {
     for (const [status, error] of [
@@ -431,7 +519,7 @@ describe("research source route", () => {
         echoPython(`{"ok": False, "status": ${status}, "error": "Traceback: /private/data/capture.pdf"}`, 1),
       );
       try {
-        for (const suffix of ["", "/pdf"]) {
+        for (const suffix of ["", "/label", "/pdf"]) {
           const response = await readRaw(directory, sourcePath(captureId, suffix));
           expect(response.status).toBe(status);
           expect(JSON.parse(response.text)).toEqual({ error });
@@ -714,12 +802,22 @@ describe("research route in-process", () => {
     expect(pdf.text).toBe("%PDF");
     expect(bridgeCalls).toEqual([{ kind: "source", source_id: captureId }, { kind: "source_pdf", source_id: captureId }]);
   });
+  test("serves citation labels without the full source bridge", async () => {
+    bridgeReply = (payload) => ({ stdout: JSON.stringify({ ok: true, data: { title: "Filing", payload } }) });
+    const label = await readInProcess(sourcePath(captureId, "/label"));
+    expect({ status: label.status, cache: label.cache, nosniff: label.nosniff, type: label.type, body: JSON.parse(label.text) }).toEqual({
+      status: 200, cache: "no-store", nosniff: "nosniff", type: "application/json;charset=utf-8",
+      body: { title: "Filing", payload: { kind: "source_label", source_id: captureId } },
+    });
+    expect(bridgeCalls).toEqual([{ kind: "source_label", source_id: captureId }]);
+  });
+
 
   test("stops invalid source paths and ids before the bridge", async () => {
     bridgeReply = (payload) => ({ stdout: JSON.stringify({ ok: true, data: payload }) });
     const invalidIds = ["https://example.com/file.pdf", "/etc/passwd", "../capture", "evidence:../../secret", "capture:not-a-hash",
       `capture:${"A".repeat(64)}`, `capture:${"a".repeat(63)}`, `capture:${"a".repeat(65)}`, "evidence:",
-      `evidence:${"a".repeat(257)}`, "evidence:with space", "evidence:a\n", `${captureId}\n`];
+      `evidence:${"a".repeat(257)}`, "evidence:with space", "evidence:a\n", `${captureId}\n`, `repair:${"a".repeat(64)}`, "repair:abc"];
     const cases: [string, number, string][] = [
       ...invalidIds.map((id): [string, number, string] => [sourcePath(id), 400, "bad source_id"]),
       ["/api/research/sources", 404, "unknown source path"],
@@ -728,9 +826,14 @@ describe("research route in-process", () => {
       ["/api/research/sources/%ZZ/raw", 404, "unknown source path"],
       ["/api/research/sources/%ZZ/pdf", 400, "bad source_id"],
       ["/api/research/sources//pdf", 400, "bad source_id"],
+      ["/api/research/sources/%ZZ/label", 400, "bad source_id"],
+      ["/api/research/sources//label", 400, "bad source_id"],
       [sourcePath(captureId, "/"), 404, "unknown source path"],
       [sourcePath(captureId, "/raw"), 404, "unknown source path"],
       [sourcePath(captureId, "/pdf/extra"), 404, "unknown source path"],
+      [sourcePath(captureId, "/label/extra"), 404, "unknown source path"],
+      [sourcePath(`repair:${"a".repeat(64)}`, "/label"), 400, "bad source_id"],
+      [sourcePath(`repair:${"a".repeat(64)}`, "/pdf"), 400, "bad source_id"],
       [`/api/research/sources//${captureId}`, 404, "unknown source path"],
       [`/api//research/sources/${captureId}`, 404, "unknown source path"],
     ];
@@ -774,9 +877,11 @@ describe("research route in-process", () => {
         .toEqual({ outcome, status, cache: "no-store", nosniff: "nosniff", body: { error } });
     }
     bridgeReply = () => envelope(404, 1);
-    const document = await readInProcess(sourcePath(captureId));
-    expect({ status: document.status, cache: document.cache, nosniff: document.nosniff, body: JSON.parse(document.text) })
-      .toEqual({ status: 404, cache: "no-store", nosniff: "nosniff", body: { error: "source capture not found" } });
+    for (const suffix of ["", "/label"]) {
+      const document = await readInProcess(sourcePath(captureId, suffix));
+      expect({ status: document.status, cache: document.cache, nosniff: document.nosniff, body: JSON.parse(document.text) })
+        .toEqual({ status: 404, cache: "no-store", nosniff: "nosniff", body: { error: "source capture not found" } });
+    }
   });
 
   test("reads a real research store through the production bridge", async () => {

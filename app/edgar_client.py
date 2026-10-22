@@ -140,7 +140,41 @@ _DERIVED_Q4_OFFSET_DAYS = 91
 
 
 def _facts_dataframe(facts: EntityFacts) -> pd.DataFrame:
-    """EntityFacts frame with filing metadata when the SDK offers it."""
+    """Keep context and dimensions that the SDK dataframe export omits."""
+    import pandas as pd
+
+    if hasattr(facts, "get_all_facts"):
+        records = [
+            {
+                **{
+                    key: getattr(fact, key, None)
+                    for key in (
+                        "concept",
+                        "label",
+                        "value",
+                        "numeric_value",
+                        "unit",
+                        "period_type",
+                        "period_start",
+                        "period_end",
+                        "fiscal_year",
+                        "fiscal_period",
+                        "accession",
+                        "filing_date",
+                        "form_type",
+                        "statement_type",
+                        "taxonomy",
+                        "scale",
+                        "dimensions",
+                    )
+                },
+                "context_id": fact.context_ref,
+                "cik": facts.cik,
+            }
+            for fact in facts.get_all_facts()
+        ]
+        if records:
+            return pd.DataFrame(records).sort_values(["concept", "period_end"]).reset_index(drop=True)
     try:
         return facts.to_dataframe(include_metadata=True)
     except TypeError:
@@ -236,6 +270,8 @@ def _derive_q4_from_facts(full_facts: pd.DataFrame, concept: str, fy_end: pd.Tim
     row = fy_winner.copy()
     row["value"] = q4
     row["fiscal_period"] = "Q4"
+    row["derived"] = True
+    row["derivation"] = "fy_minus_ytd"
     return pd.DataFrame([row])
 
 
@@ -464,7 +500,7 @@ def _fact_field(row: pd.Series[str], name: str, *alts: str) -> str | None:
 
 
 def _copy_fact_meta(r: pd.Series[str]) -> dict[str, object]:
-    """accession/form/filed meta off a fact row (first alias wins)."""
+    """Retain fact identity and normalize the SDK's filing aliases."""
     meta: dict[str, object] = {}
     for _k in ("accession", "accn", "form", "form_type", "filed", "filed_at", "filing_date"):
         try:
@@ -482,6 +518,63 @@ def _copy_fact_meta(r: pd.Series[str]) -> dict[str, object]:
                 )
             )
             meta.setdefault(_out, str(_v))
+    if "filed" in meta:
+        meta["filed_at"] = meta["filed"]
+        meta["known_at"] = meta["filed"]
+    for key in (
+        "cik",
+        "issuer_cik",
+        "entity_id",
+        "concept",
+        "original_concept",
+        "namespace",
+        "taxonomy",
+        "value",
+        "unit",
+        "period_start",
+        "period_end",
+        "period_instant",
+        "fiscal_year",
+        "fiscal_period",
+        "dimensions",
+        "known_at",
+        "source_identity",
+        "source_url",
+        "source_record_id",
+        "content_hash",
+        "document_name",
+        "context_id",
+        "unit_id",
+        "element_id",
+        "locator",
+        "decimals",
+        "precision",
+        "scale",
+        "presentation_location",
+        "derived",
+        "derivation",
+    ):
+        value = r.get(key)
+        if value is not None and str(value) not in ("", "nan", "NaT", "<NA>"):
+            meta[key] = str(value) if key in ("period_start", "period_end", "period_instant", "known_at") else value
+    concept = str(meta.get("original_concept") or meta.get("concept") or "")
+    namespace = concept.split(":", 1)[0] if ":" in concept else meta.get("namespace") or meta.get("taxonomy")
+    if namespace and concept:
+        meta.setdefault("namespace", namespace)
+        meta.setdefault("taxonomy", namespace)
+        meta.setdefault("original_concept", concept if ":" in concept else f"{namespace}:{concept}")
+    if concept:
+        meta.setdefault("dimensions", {})
+        if not meta.get("period_start"):
+            meta.setdefault("period_instant", meta.get("period_end"))
+        meta.setdefault(
+            "source_identity",
+            {
+                str(key): value.isoformat() if isinstance(value, _dt.date) else value
+                for key, value in r.items()
+                if value is not None and str(value) not in ("nan", "NaT", "<NA>")
+            },
+        )
     return meta
 
 
@@ -523,6 +616,10 @@ def _fundamentals_shares(ticker: str, company: Company, cik: object, facts_url: 
         "source": "SEC EDGAR company facts",
         "note": "SEC-reported shares outstanding, not public float",
     }
+    out.update(_copy_fact_meta(latest))
+    if out.get("filed"):
+        out["filed_at"] = out["filed"]
+        out.setdefault("known_at", out["filed"])
     if cik is not None:
         out["cik"] = cik
     if facts_url:
@@ -566,6 +663,7 @@ def _merge_eps_quarters(recent_diluted: pd.DataFrame, recent_basic: pd.DataFrame
             matching = recent_basic[recent_basic["period_end"] == r_diluted["period_end"]]
             if not matching.empty:
                 q_entry["eps_basic"] = round(float(matching.iloc[0]["value"]), 2)
+                q_entry["basic_fact"] = _copy_fact_meta(matching.iloc[0])
         quarterly_eps.append(q_entry)
     return quarterly_eps
 
@@ -593,6 +691,7 @@ def _eps_result(
         result["ttm_eps_diluted"] = round(sum(float(r["value"]) for _, r in recent_diluted.iterrows()), 2)
     if recent_basic is not None and len(recent_basic) == 4:
         result["ttm_eps_basic"] = round(sum(float(r["value"]) for _, r in recent_basic.iterrows()), 2)
+    result["derived_fields"] = {key: "sum_quarters" for key in ("ttm_eps_diluted", "ttm_eps_basic") if key in result}
     return result
 
 
@@ -752,6 +851,9 @@ def _ownership_filing_doc(filing: Filing) -> tuple[dict[str, object], object | N
         "filed": str(getattr(filing, "filing_date", "")),
         "accession_no": getattr(filing, "accession_no", None),
     }
+    filer_cik = getattr(filing, "cik", None)
+    if filer_cik is not None:
+        row["filer_cik"] = filer_cik
     return row, filing.obj()
 
 

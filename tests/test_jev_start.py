@@ -1907,9 +1907,12 @@ def test_assess_final_ops_fail_closed() -> None:
     assert down_c["support"] is None and down_c["evidence_state"] == "insufficient"
 
 
-def test_assess_final_ops_shape_and_alias(tmp_path: Path) -> None:
+def test_assess_final_ops_shape_and_alias(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import app.research.kernel_worker as kw
+    import tests.research_source_seam as seam
 
+    # The worker verifies every claim against the session ledger before JEV sees it.
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "WSJ reported X.", "ev-2": "If Y then Z."})
     client = _final_client(tmp_path, 0.8, "sufficient_support")
     resp = kw._assess_final_response(
         {
@@ -1934,7 +1937,7 @@ def test_assess_final_ops_shape_and_alias(tmp_path: Path) -> None:
                 {"id": "ev-2", "content": "Y risk."},
                 {"id": "x"},
             ],
-            "sessionId": "sess-9",
+            "sessionId": sid,
             "confidence": 0.75,
         },
         jev=client,
@@ -1951,7 +1954,7 @@ def test_assess_final_ops_shape_and_alias(tmp_path: Path) -> None:
                 "evidence_ids": ["ev-1"],
             },
             "evidence": [{"id": "ev-1", "content": "WSJ: X."}],
-            "session_id": "sess-9",
+            "session_id": sid,
         },
         jev=client,
     )

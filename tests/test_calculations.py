@@ -1042,6 +1042,20 @@ def test_prop_beneish_associates_each_component_with_its_weight(
     )
 
 
+def test_valuation_pure_units_and_missing_inputs_fail_closed() -> None:
+    assert va.pe(10.0, 2.0) == pytest.approx(5.0)
+    assert va.earnings_yield(2.0, 10.0) == pytest.approx(0.2)
+    assert va.dividend_yield(0.5, 10.0) == pytest.approx(0.05)
+    assert va.payout_ratio(0.5, 2.0) == pytest.approx(0.25)
+    for call in (
+        lambda: va.pe(10.0, 0.0),
+        lambda: va.earnings_yield(2.0, 0.0),
+        lambda: va.payout_ratio(0.5, 0.0),
+    ):
+        with pytest.raises(ValueError, match="zero"):
+            call()
+
+
 @seed(20261014)
 @settings(max_examples=100, derandomize=True)
 @given(st.integers(1, 100), st.integers(0, 100), st.integers(1, 10), st.integers(-100, 100))

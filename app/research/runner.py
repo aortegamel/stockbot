@@ -603,6 +603,8 @@ class _LiveRun:
         self.wave_id = wave_id
         self._actor = actor
         self.ledger: EvidenceLedger = EvidenceLedger()
+        # Materialized SEC sources awaiting admission: archived (bytes first) right before the row commits.
+        self._sources: dict[str, MaterializedEvidenceSource] = {}
         self.dossier_ids: list[str] = []
         self.source_jobs: list[str] = []
         self.budget = BudgetLedger(limits.max_tool_calls)
@@ -1181,6 +1183,10 @@ class _LiveRun:
             search_id=search_id,
             scope=_first_str(inner_args, ("ticker", "cik")),
         )
+        if materialized is not None:
+            # Candidate only: the bytes are archived at admission (_ingest_tool_evidence), never here.
+            metadata = {**metadata, "source_content_hash": materialized.source_content_hash}
+            self._sources[eid] = materialized
         content_hash = evidence_content_hash(content)
         retrieved_at, source_uri, published_at, source_known_at = _record_source_fields(materialized, uri, known_at)
         return Evidence(
@@ -1316,6 +1322,12 @@ class _LiveRun:
                 _dur,
             )
             return {"evidence_ids": []}
+        source = self._sources.pop(eid, None)
+        if source is not None:
+            from app.research.service import _archive_materialized_source
+
+            # Exact source bytes first, then the row (service admission order); raises, never best-effort.
+            _archive_materialized_source(sid, eid, record.retrieved_at, source)
         try:
             with self._lock:
                 self.store.save_evidence(evidence_to_dict(record))
@@ -2282,7 +2294,9 @@ class _LiveRun:
             self.store.save_session(sess)
         fid: str = f"{session_id}:{wave}:freeze"
         frozen_ids: object = self.store.get_freeze(fid).get("evidence_ids")
-        ev_ids: list[str] = [e for e in frozen_ids if isinstance(e, str)] if isinstance(frozen_ids, list) else []
+        raw_ids: list[str] = [e for e in frozen_ids if isinstance(e, str)] if isinstance(frozen_ids, list) else []
+        # A pre-fix freeze may carry navigation ids: the committee reads (and cites) substantive rows only.
+        ev_ids = _substantive_ids(raw_ids, {e.evidence_id for e in _ledger_evidence(self.ledger, session_id)})
         pending: list[Job] = list(self.store.list_jobs(session_id))
         ran: list[str] = []
         self._open_committee_jobs(session_id, wave, pending, self.store.get_session(session_id), ran)
@@ -2369,19 +2383,22 @@ class _LiveRun:
         self._emit(session_id, "wave.stopped", {"reason": reason})
 
     def _store_final(self, session_id: str, freeze_id: str, answer: str, claims: Sequence[object]) -> None:
-        """Persist the synthesis answer, then close the session as completed."""
+        """Require verified ledger proof for every claim, persist the synthesis answer, close as completed."""
+        from app.research import service as _svc
+        from app.research.agents import DATAPOINT_FIELDS
         from app.research.agents import GroundedClaim as _GC
 
-        claims_json: list[JSONValue] = []
-        for claim in claims:
-            if isinstance(claim, _GC):
-                claims_json.append(
-                    {
-                        "text": claim.text,
-                        "claim_type": claim.claim_type,
-                        "evidence_ids": list(claim.evidence_ids),
-                    }
-                )
+        grounded = [claim for claim in claims if isinstance(claim, _GC)]
+        _svc.require_verified_claims(self.store, session_id, grounded, "runner")
+        claims_json: list[JSONValue] = [
+            {
+                "text": claim.text,
+                "claim_type": claim.claim_type,
+                "evidence_ids": list(claim.evidence_ids),
+                **{key: getattr(claim, key) for key in DATAPOINT_FIELDS if getattr(claim, key) is not None},
+            }
+            for claim in grounded
+        ]
         final: dict[str, JSONValue] = {
             "answer": answer,
             "freeze_id": freeze_id,

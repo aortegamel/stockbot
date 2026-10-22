@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
-import { applyFinalGates, asksWatchlist, inventoryDefect, KernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type FinalGateCaller, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
+import { applyFinalGates, asksWatchlist, dropUncovered, inventoryDefect, KernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type FinalGateCaller, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
 import { FINAL_PERSONAS, type AgentEvent, type AskContext, type Evidence, type FinalClaim, type Metrics, type Persona } from "./types";
 
 class FakeChild implements KernelChild {
@@ -756,6 +756,26 @@ describe("runKernelAgent final personas", () => {
     expect(deltas.at(-1)).toMatch(/^── Full answer ──\n/);
   });
 
+  test("the early brief is gated against the worker session before display; a rejected brief leaves no trace", async () => {
+    const progress = (id: string, stage: string, detail: Record<string, unknown>): string => `${JSON.stringify({ type: "progress", id, stage, detail })}\n`;
+    const brief = "Brief says 42 units.";
+    const { events, gates } = await runFinal({
+      personas: ["stockbot"],
+      reply: (id) =>
+        progress(id, "session", { session_id: "rs:live" }) +
+        progress(id, "intake_evidence", { evidence: [{ id: "ev:0", content: "intake fact" }] }) +
+        sessionGraphReply(id),
+      // The brief (pass 0) states an uninventoried number; the gate passes the wording, the number still drops.
+      decide: (_p, pass) => (pass === 0 ? { text: brief, claims: [] } : {}),
+    });
+    const briefGate = gates.find((g) => g.text === brief);
+    expect(briefGate).toMatchObject({ op: "assess_final_response", sessionId: "rs:live", persona: "stockbot", evidence: [{ id: "ev:0", content: "intake fact" }] });
+    const deltas = answers(events);
+    expect(deltas.some((d) => d.includes("42"))).toBe(false);
+    // No brief shown, so the full answer carries no divider.
+    expect(deltas).toEqual([`${label("stockbot")}\nstockbot p1`]);
+  });
+
   test("a brief over the full evidence ends the stream with no second answer", async () => {
     const progress = (id: string, stage: string, detail: Record<string, unknown>): string => `${JSON.stringify({ type: "progress", id, stage, detail })}\n`;
     const reply = (id: string): string =>
@@ -975,19 +995,26 @@ describe("runKernelAgent final personas", () => {
     for (const g of gates) expect(g.sessionId).toBe("rs:live");
   });
 
-  test("a gate error rejects a claim instead of keeping its ungraded text", async () => {
+  test("a gate error rejects a claim, and a reject drops every sentence no supported claim covers", async () => {
     const claim = "bearbot claim here";
+    const kept = "Bearbot kept sentence.";
     const { events, gates } = await runFinal({
       personas: ["bearbot"],
       reply: sessionGraphReply,
-      decide: () => ({ text: `preamble ${claim} tail`, claims: [{ text: claim, claimType: "inference", evidenceIds: ["ev:1"] }] }),
-      gate: () => ({ error: "unknown session_id: '39'" }),
+      decide: () => ({
+        text: `${kept} Preamble ${claim} tail. Uncovered remark.`,
+        claims: [
+          { text: kept, claimType: "inference", evidenceIds: ["ev:1"] },
+          { text: claim, claimType: "inference", evidenceIds: ["ev:1"] },
+        ],
+      }),
+      gate: (body) => {
+        if (body.op === "assess_final_response") return { support_answer: "no" };
+        return (body.claim as Record<string, unknown>).text === kept ? { support_answer: "yes" } : { error: "unknown session_id: '39'" };
+      },
     });
-    expect(gates.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_claim"]);
-    const out = answers(events);
-    expect(out.length).toBe(1);
-    expect(out[0]).toContain("preamble");
-    expect(out[0]).not.toContain(claim);
+    expect(gates.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_claim", "assess_final_claim"]);
+    expect(answers(events)).toEqual([`${label("bearbot")}\n${kept}`]);
     expect(events.some((e) => e.type === "failed")).toBe(false);
   });
 
@@ -1202,6 +1229,62 @@ describe("runKernelAgent final personas", () => {
     expect(inventoryDefect("prose has it", [{ text: "has it", claimType: "inference", evidenceIds: ["ev:9"] }], known)).toMatch(/unknown evidence id/);
     expect(inventoryDefect("prose has it", [{ text: "has it", claimType: "observed_fact", evidenceIds: [] }], known)).toMatch(/uncited/);
     expect(inventoryDefect("prose has it", [{ text: "has it", claimType: "unknown", evidenceIds: [] }], known)).toBeUndefined();
+  });
+
+  test("inventoryDefect checks typed datapoints: cited, verbatim value, calculations carry a value", () => {
+    const known = new Set(["ev:1"]);
+    const prose = "Revenue was $35.1B. Margin is 75%. Assume flat demand.";
+    const fact: FinalClaim = { text: "Revenue was $35.1B.", claimType: "observed_fact", evidenceIds: ["ev:1"], value: "$35.1B", entity: "NVDA", period: "Q3", unit: "USD" };
+    expect(inventoryDefect(prose, [fact], known)).toBeUndefined();
+    expect(inventoryDefect(prose, [{ text: "Assume flat demand.", claimType: "assumption", evidenceIds: [] }], known)).toBeUndefined();
+    expect(inventoryDefect(prose, [{ ...fact, value: "$36B" }], known)).toMatch(/datapoint value/);
+    expect(inventoryDefect(prose, [{ text: "Revenue was $35.1B.", claimType: "unknown", evidenceIds: [], value: "$35.1B" }], known)).toMatch(/datapoint value/);
+    expect(inventoryDefect(prose, [{ text: "Margin is 75%.", claimType: "calculation", evidenceIds: ["ev:1"] }], known)).toMatch(/calculation without value/);
+    expect(inventoryDefect(prose, [{ text: "Margin is 75%.", claimType: "calculation", evidenceIds: ["ev:1"], value: "75%" }], known)).toBeUndefined();
+  });
+
+  test("dropUncovered keeps a number only inside a kept claim; `all` also drops uncovered sentences", () => {
+    const claim: FinalClaim = { text: "Revenue was $35.1B", claimType: "observed_fact", evidenceIds: ["ev:1"] };
+    const text = "Revenue was $35.1B [ev:12]. Q3 looks firm. Margin hit 99%.\nGrowth was 12% too.";
+    expect(dropUncovered(text, [claim], false)).toBe("Revenue was $35.1B [ev:12]. Q3 looks firm.");
+    expect(dropUncovered(text, [claim], true)).toBe("Revenue was $35.1B [ev:12].");
+    // A covered sentence still drops a number outside the claim text.
+    expect(dropUncovered("Revenue was $35.1B, up 40%.", [claim], false)).toBe("");
+    expect(dropUncovered("No numbers here. Filed a 10-K.", [], false)).toBe("No numbers here.");
+  });
+
+  test("a fabricated or unproven number never shows; typed datapoints ride the gate wire", async () => {
+    const fact: FinalClaim = { text: "Revenue was $35.1B [ev:1].", claimType: "observed_fact", evidenceIds: ["ev:1"], value: "$35.1B", entity: "NVDA", period: "Q3 FY2025", unit: "USD" };
+    const hedge: FinalClaim = { text: "Margins may compress if demand slows.", claimType: "inference", evidenceIds: ["ev:1"] };
+    const text = `${fact.text} ${hedge.text} Margin hit 99%.`;
+    // Whole-response pass: the uninventoried 99% sentence drops; both claims replay as shown.
+    const passed = await runFinal({ personas: ["stockbot"], reply: sessionGraphReply, decide: () => ({ text, claims: [fact, hedge] }) });
+    expect(passed.gates[0]?.claims).toEqual([
+      { text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:1"], value: "$35.1B", entity: "NVDA", period: "Q3 FY2025", unit: "USD" },
+      { text: hedge.text, claim_type: "inference", evidence_ids: ["ev:1"] },
+    ]);
+    expect(answers(passed.events)).toEqual([`${label("stockbot")}\n${fact.text} ${hedge.text}`]);
+    expect(passed.events.find((e) => e.type === "claims")).toEqual({ type: "claims", claims: [fact, hedge] });
+    // A ledger proof failure on the datapoint deletes it; the qualified inference stays.
+    const proofFailed = await runFinal({
+      personas: ["stockbot"],
+      reply: sessionGraphReply,
+      decide: () => ({ text, claims: [fact, hedge] }),
+      gate: (body) => {
+        if (body.op === "assess_final_response") return { error: "proof: value conflicts with ledger" };
+        return (body.claim as Record<string, unknown>).value === undefined ? { support_answer: "yes" } : { error: "proof: value conflicts with ledger" };
+      },
+    });
+    expect(proofFailed.gates.find((g) => g.op === "assess_final_claim")?.claim).toMatchObject({ value: "$35.1B", period: "Q3 FY2025" });
+    expect(answers(proofFailed.events)).toEqual([`${label("stockbot")}\n${hedge.text}`]);
+  });
+
+  test("an empty-graph direct answer drops every datapoint sentence, and fails closed when nothing is left", async () => {
+    const kept = await runFinal({ reply: emptyReply, personas: ["stockbot"], decide: () => ({ text: "NVDA rose 12% today. Ask me for sources.", claims: [] }) });
+    expect(answers(kept.events)).toEqual([`${label("stockbot")}\nAsk me for sources.`]);
+    const empty = await runFinal({ reply: emptyReply, personas: ["stockbot"], decide: () => ({ text: "NVDA rose 12% today.", claims: [] }) });
+    expect(answers(empty.events)).toEqual([]);
+    expect(failedCategory(empty.events)).toBe("provider_error");
   });
 
   test("a research answer with no cited claim ships the gated prose with no banner", async () => {
@@ -1519,7 +1602,8 @@ describe("runKernelAgent final personas", () => {
     };
     const personas: Persona[] = ["bearbot", "bullbot", "stockbot"];
     const gated = await applyFinalGates({ results: gateResults(personas, [2, 2, 2]), evidence: gateEvidence, personaOrder: personas, gate });
-    expect(gated).toEqual({ text: personas.map((p) => `${label(p)}\n${p} lead. ${p}-c0`).join("\n\n") });
+    // The reject drops each uncovered lead sentence and each rejected claim.
+    expect(gated).toEqual({ text: personas.map((p) => `${label(p)}\n${p}-c0`).join("\n\n") });
     // Three whole-response checks in flight at once, then all six claim checks.
     expect(ops.slice(0, 3)).toEqual(["assess_final_response", "assess_final_response", "assess_final_response"]);
     expect(maxInFlight).toBe(6);
@@ -1583,10 +1667,14 @@ describe("runKernelAgent worker replies", () => {
       },
     });
   }
+  // Gate ops pass (the reasoner answers carry no datapoints); every other op gets the scripted reply.
   function scriptedWorker(reply: (id: string) => string): KernelSpawn {
     return (): KernelChild => {
       const child = new FakeChild();
-      child.reply = reply;
+      child.reply = (id) => {
+        const body = JSON.parse(child.written.at(-1) ?? "{}") as { op?: string };
+        return body.op?.startsWith("assess_final") ? `${JSON.stringify({ id, support_answer: "yes" })}\n` : reply(id);
+      };
       queueMicrotask(() => child.emitStdout('{"type":"ready"}\n'));
       return child;
     };

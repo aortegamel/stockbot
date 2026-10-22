@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
-import { originalLink, resolveQuote } from "./source-viewer";
+import { originalLink, resolveQuote, sourceLabel } from "./source-viewer";
+import type { SourceLabel } from "./research-client";
 import { safeSourceUrl } from "../../../needle-harness/lib/agent/types";
 
 describe("resolveQuote", () => {
@@ -144,5 +145,21 @@ describe("originalLink", () => {
     expect(host("https://cdn.finra.org/equity/regsho/daily/CNMSshvol20260102.txt")).toBe("FINRA.org");
     expect(host("https://finra.org/rules")).toBe("FINRA.org");
     expect(host("https://news.example/article")).toBe("news.example");
+  });
+});
+
+describe("lazy citation labels", () => {
+  const label = (overrides: Partial<SourceLabel> = {}): SourceLabel => ({ id: "evidence:ev-1", title: "10-K", linkStatus: "missing", ...overrides });
+
+  test("a persisted label reads publisher, title, and date without a loaded document", () => {
+    expect(sourceLabel(label({ publisher: "SEC", publishedAt: "2026-01-02T00:00:00Z" }))).toBe("SEC · 10-K · 2026-01-02");
+    expect(sourceLabel(label({ publisher: "Stockbot", title: "Stockbot", knownAt: "2025-05-01T00:00:00+00:00" }))).toBe("Stockbot · 2025-05-01");
+    expect(sourceLabel(label({ title: "" }))).toBe("");
+  });
+
+  test("a label link is always the plain official page, never a highlight", () => {
+    const page = "https://www.sec.gov/a.htm";
+    expect(originalLink(label({ linkStatus: "stockbot_render", originalUrl: page }))).toEqual({ href: page, host: "SEC.gov", highlighted: false });
+    expect(originalLink(label())).toBeUndefined();
   });
 });

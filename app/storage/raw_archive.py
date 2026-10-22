@@ -180,6 +180,26 @@ def has_payload(
     return find(source, kind, key, sha256=sha256, root=root) is not None
 
 
+def read_payload(
+    source: str,
+    kind: str,
+    key: str,
+    *,
+    sha256: str,
+    root: Path | None = None,
+) -> bytes | None:
+    """Exact archived bytes of one pinned revision; None when absent or no longer hashing to the pin.
+
+    Publication verification reads proof bytes here, so a missing or tampered
+    payload fails closed instead of verifying.
+    """
+    record = find(source, kind, key, sha256=sha256, root=root)
+    if record is None:
+        return None
+    payload = record.payload_path.read_bytes()
+    return payload if content_hash(payload) == sha256 else None
+
+
 def store_evidence_artifact(
     payload: bytes,
     *,

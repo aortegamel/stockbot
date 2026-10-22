@@ -2,10 +2,13 @@ import { describe, expect, mock, spyOn, test } from "bun:test";
 import fc from "fast-check";
 import { FINAL_PERSONAS, type Evidence } from "@/lib/agent/types";
 // Real validator captured before mock.module replaces the kernel exports; route.ts must see the production rule.
-import { asksWatchlist, parseTicker, parseWatchlist } from "@/lib/agent/kernel";
+// The final gates run for real too; only the worker call behind them is scripted.
+import { asksWatchlist, dropUncovered, gateAnswer, parseTicker, parseWatchlist } from "@/lib/agent/kernel";
 const realParseTicker = parseTicker;
 const realParseWatchlist = parseWatchlist;
 const realAsksWatchlist = asksWatchlist;
+const realGateAnswer = gateAnswer;
+const realDropUncovered = dropUncovered;
 
 // Mutable stubs reconfigured per test; route.ts is imported dynamically after
 // mock.module setup because static imports would bind the real kernel/muse
@@ -24,11 +27,18 @@ let argsReply: Record<string, unknown> | null = null;
 let runThrows: unknown = null;
 let assessDown = false;
 let assessReply: Record<string, unknown> | null = null;
+// The worker verdict every assess_final_* op returns.
+let gateReply: Record<string, unknown> = { support_answer: "yes" };
+const gateBodies: Record<string, unknown>[] = [];
+// The reasoner's answer text and claims inventory.
+let reasonText = "hi";
+let reasonClaims: unknown[] = [];
 let toolFailure: { category: string; error: string } | null = null;
 let toolThrows: unknown = null;
 let endThrows = false;
 // Ids the next generic bridge results carry, in call order; empty means ev:bridge.
 let bridgeIds: string[] = [];
+let entryReplies: Record<string, unknown>[] = [];
 let chartReceipt: unknown = { result_type: "chart_selection", ticker: "MSFT" };
 let watchlistReceipt: unknown = { result_type: "watchlist_update", action: "add", ticker: "AMD" };
 let widgetReceipt: unknown = { result_type: "widget_selection", widget_type: "short-volume", ticker: "AAPL" };
@@ -40,7 +50,7 @@ const personaCalls: unknown[][] = [];
 let emitOffer = false;
 type ReasonCall = { prompt: string; ticker?: string; context?: unknown; evidence: Evidence[]; onDelta?: (t: string) => void };
 const reasonCalls: ReasonCall[] = [];
-type KernelCall = { op?: unknown; tool?: unknown; prompt?: unknown; objective?: unknown; ticker?: unknown; currentChartTicker?: unknown; watchlist?: unknown; context?: unknown };
+type KernelCall = Record<string, unknown>;
 const kernelCalls: KernelCall[] = [];
 const kernelOpts: unknown[] = [];
 const invokeTimeouts: unknown[] = [];
@@ -64,6 +74,8 @@ mock.module("@/lib/agent/kernel", () => ({
   parseTicker: realParseTicker,
   parseWatchlist: realParseWatchlist,
   asksWatchlist: realAsksWatchlist,
+  gateAnswer: realGateAnswer,
+  dropUncovered: realDropUncovered,
   kernelRouter: {
     call: async (body: KernelCall, opts?: { signal?: AbortSignal; timeoutMs?: number }) => {
       kernelOpts.push(opts);
@@ -73,11 +85,28 @@ mock.module("@/lib/agent/kernel", () => ({
         if (argsDown) throw new Error("needle down");
         return argsReply ?? { tool: body.tool, arguments: { q: "x" }, confidence: 1, reasoning: "t" };
       }
+      if (body.op === "entry_tool") {
+        executionOrder.push(String(body.tool));
+        if (toolThrows !== null) throw toolThrows;
+        const reply = entryReplies.shift();
+        if (reply) return reply;
+        if (toolFailure) return { sessionId: "rs:entry", evidence: [], ...toolFailure };
+        return {
+          sessionId: "rs:entry",
+          content: bridgeEvidence.content,
+          evidence: [{ ...bridgeEvidence, id: bridgeIds.shift() ?? bridgeEvidence.id, source: body.tool }],
+        };
+      }
       if (body.op === "assess_entry") {
         if (assessDown) throw new Error("assessment down");
         if (assessReply !== null) return assessReply;
         const verdict = verdicts.length > 1 ? verdicts.shift()! : verdicts[0];
         return { verdict };
+      }
+      if (typeof body.op === "string" && body.op.startsWith("assess_final")) {
+        gateBodies.push(body as Record<string, unknown>);
+        if (body.sessionId !== "rs:entry") return { error: "proof: no admitted research session" };
+        return gateReply;
       }
       return routeReply ?? { route: winner, personas };
     },
@@ -122,8 +151,8 @@ mock.module("@/lib/muse/client", () => ({
     reasonCalls.push(opts);
     executionOrder.push("reason");
     if (reasonDown) throw new Error("muse down");
-    opts.onDelta?.("hi");
-    return { text: "hi", usage: {} };
+    opts.onDelta?.(reasonText);
+    return { text: reasonText, usage: {}, claims: reasonClaims };
   },
 }));
 
@@ -164,10 +193,15 @@ function reset(): void {
   runThrows = null;
   assessDown = false;
   assessReply = null;
+  gateReply = { support_answer: "yes" };
+  gateBodies.length = 0;
+  reasonText = "hi";
+  reasonClaims = [];
   toolFailure = null;
   toolThrows = null;
   endThrows = false;
   bridgeIds = [];
+  entryReplies = [];
   chartReceipt = { result_type: "chart_selection", ticker: "MSFT" };
   watchlistReceipt = { result_type: "watchlist_update", action: "add", ticker: "AMD" };
   widgetReceipt = { result_type: "widget_selection", widget_type: "short-volume", ticker: "AAPL" };
@@ -187,7 +221,21 @@ function reset(): void {
   process.env.OPENCODE_MODEL = "test-model";
 }
 
+function entryCalls(): KernelCall[] {
+  return kernelCalls.filter((call) => call.op === "entry_tool");
+}
+
 type AgentEventShape = { type: string;[k: string]: unknown };
+
+function expectVerificationRefusal(events: AgentEventShape[]): void {
+  expect(events.some((event) => event.type === "failed")).toBe(true);
+  const answers = events.filter((event) => event.type === "answer_delta");
+  expect(answers).toEqual([{ type: "answer_delta", text: "I could not verify an answer from this source. I withheld its factual claims." }]);
+  expect(String(answers[0]?.text)).not.toMatch(/\d/);
+  expect(events.at(-1)?.type).toBe("done");
+  expect(events.some((event) => event.type === "claims")).toBe(false);
+  expect(runCalls).toEqual([]);
+}
 
 async function eventsFor(prompt: string, ticker?: unknown, watchlist?: unknown, currentChartTicker?: unknown): Promise<AgentEventShape[]> {
   const { POST } = await import("./route");
@@ -350,8 +398,96 @@ describe("agent entry route", () => {
     expect(runCalls.length).toBe(0);
     expect(kernelCalls.filter((c) => c.op === "arguments").map((c) => c.tool)).toEqual(["get_current_time"]);
     expect(reasonCalls[0].evidence.length).toBe(1);
-    expect(ended).toEqual(["sess-test"]);
+    expect(entryCalls()).toEqual([{ op: "entry_tool", prompt: "what time is it?", tool: "get_current_time", arguments: { q: "x" } }]);
+    expect(invoked).toEqual([]);
+    expect(sessionsCreated).toBe(0);
+    expect(ended).toEqual([]);
     expect(metricCalls(events, "tools")).toBe(1);
+  });
+
+  test("a single-tool answer is buffered, gated with its session, and never shows an unproven number", async () => {
+    reset();
+    winner = "query_finra";
+    const fact = { text: "Short interest was 12.5% [ev:bridge].", claimType: "observed_fact", evidenceIds: ["ev:bridge"], value: "12.5%", entity: "NVDA", period: "2026-10-15", unit: "percent" };
+    reasonText = `${fact.text} Volume hit 99 million. More filings may follow.`;
+    reasonClaims = [fact];
+    entryReplies = [{ sessionId: "rs:entry", evidence: [{ ...bridgeEvidence, source: "FINRA", content: fact.text }], content: fact.text }];
+    const events = await eventsFor("short interest?");
+    // The streamed reasoner delta never reaches the client: one gated answer only.
+    expect(events.filter((e) => e.type === "answer_delta")).toEqual([{ type: "answer_delta", text: `${fact.text} More filings may follow.` }]);
+    expect(events.slice(-3).map((e) => e.type)).toEqual(["answer_delta", "claims", "done"]);
+    expect(events.find((e) => e.type === "claims")?.claims).toEqual([fact]);
+    expect(gateBodies).toHaveLength(1);
+    expect(gateBodies[0]).toMatchObject({
+      op: "assess_final_response",
+      sessionId: "rs:entry",
+      claims: [{ text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:bridge"], value: "12.5%", entity: "NVDA", period: "2026-10-15", unit: "percent" }],
+    });
+    expect(runCalls).toEqual([]);
+  });
+
+  test("a rejected single-tool number is withheld with an explicit refusal, never retried in research", async () => {
+    reset();
+    winner = "query_finra";
+    reasonText = "Short interest was 12.5% [ev:bridge].";
+    reasonClaims = [{ text: reasonText, claimType: "observed_fact", evidenceIds: ["ev:bridge"], value: "12.5%" }];
+    gateReply = { error: "proof: value does not match the archived row" };
+    const events = await eventsFor("short interest?");
+    expectVerificationRefusal(events);
+    expect(gateBodies.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_claim"]);
+    expect(gateBodies.map((g) => g.sessionId)).toEqual(["rs:entry", "rs:entry"]);
+    expect(ended).toEqual([]);
+  });
+
+  test("clock and OTHER results without ledger admission refuse before reasoning or gates", async () => {
+    for (const tool of ["get_current_time", "get_fundamentals"]) {
+      reset();
+      winner = tool;
+      entryReplies = [{ sessionId: "rs:entry", evidence: [], content: "The unadmitted result contains 42." }];
+      const events = await eventsFor("look it up");
+      expectVerificationRefusal(events);
+      expect(entryCalls()).toEqual([{ op: "entry_tool", prompt: "look it up", tool, arguments: { q: "x" } }]);
+      expect(kernelCalls.some((call) => call.op === "assess_entry")).toBe(false);
+      expect(reasonCalls).toEqual([]);
+      expect(gateBodies).toEqual([]);
+      expect(invoked).toEqual([]);
+      expect(sessionsCreated).toBe(0);
+      expect(ended).toEqual([]);
+    }
+  });
+
+  test("a missing or changed entry session cannot gate another session's evidence", async () => {
+    for (const sessionId of [undefined, "rs:foreign"]) {
+      reset();
+      winner = "search_sec_filings";
+      verdicts = ["get_sec_document", "node_resolved"];
+      entryReplies = [
+        { sessionId: "rs:entry", evidence: [bridgeEvidence], content: bridgeEvidence.content },
+        { ...(sessionId ? { sessionId } : {}), evidence: [{ ...bridgeEvidence, id: "ev:foreign", content: "Revenue was 99." }], content: "Revenue was 99." },
+      ];
+      reasonText = "Revenue was 99.";
+      const events = await eventsFor("read the filing");
+      expectVerificationRefusal(events);
+      expect(entryCalls().map((call) => call.sessionId)).toEqual([undefined, "rs:entry"]);
+      expect(reasonCalls).toEqual([]);
+      expect(gateBodies).toEqual([]);
+      expect(events.filter((event) => event.type === "evidence").flatMap((event) => event.evidence as Evidence[]).map((row) => row.id)).toEqual(["ev:bridge"]);
+      expect(ended).toEqual([]);
+    }
+  });
+
+  test("a direct answer is buffered and drops every datapoint sentence; nothing left researches", async () => {
+    reset();
+    reasonText = "NVDA rose 12% today. Ask me for sources.";
+    const events = await eventsFor("hello");
+    expect(events.filter((e) => e.type === "answer_delta")).toEqual([{ type: "answer_delta", text: "Ask me for sources." }]);
+    expect(gateBodies).toEqual([]);
+    expect(runCalls).toEqual([]);
+    reset();
+    reasonText = "NVDA rose 12% today.";
+    const empty = await eventsFor("hello");
+    expect(empty.some((e) => e.type === "answer_delta")).toBe(false);
+    expect(runCalls).toHaveLength(1);
   });
 
   test("status lines name the tool subject in prod, bound untrusted queries, and open the direct route", async () => {
@@ -376,13 +512,14 @@ describe("agent entry route", () => {
     expect(web[1]).toHaveLength(120);
   });
 
-  test("tool missing from TS registry executes via bridge invoke", async () => {
+  test("a tool missing from the TS registry executes through the ledger worker", async () => {
     reset();
     winner = "query_finra";
     const events = await eventsFor("short interest?");
     expect(events.filter((e) => e.type === "tool_start").length).toBe(1);
-    expect(invoked.length).toBe(1);
-    expect(invoked[0][0]).toBe("query_finra");
+    expect(entryCalls()).toHaveLength(1);
+    expect(entryCalls()[0]?.tool).toBe("query_finra");
+    expect(invoked).toEqual([]);
     expect(runCalls.length).toBe(0);
     expect(reasonCalls[0].evidence.length).toBe(1);
   });
@@ -402,7 +539,7 @@ describe("agent entry route", () => {
     winner = "query_finra";
     verdicts = ["research_required"];
     await eventsFor("short interest?");
-    expect(invoked.length).toBe(1);
+    expect(entryCalls()).toHaveLength(1);
     expect(reasonCalls.length).toBe(0);
     expect(runCalls.length).toBe(1);
   });
@@ -414,7 +551,10 @@ describe("agent entry route", () => {
     bridgeIds = ["ev:search", "ev:document"];
     const events = await eventsFor("NVDA risk factors?");
     expect(events.filter((e) => e.type === "tool_start").length).toBe(2);
-    expect(invoked.map((c) => c[0])).toEqual(["search_sec_filings", "get_sec_document"]);
+    expect(entryCalls().map((c) => c.tool)).toEqual(["search_sec_filings", "get_sec_document"]);
+    expect(entryCalls().map((c) => c.sessionId)).toEqual([undefined, "rs:entry"]);
+    expect(gateBodies.map((g) => g.sessionId)).toEqual(["rs:entry"]);
+    expect(ended).toEqual([]);
     expect(runCalls.length).toBe(0);
     expect(reasonCalls[0].evidence.length).toBe(2);
   });
@@ -656,7 +796,7 @@ describe("agent entry route", () => {
       verdicts = ["research_required"];
       await eventsFor("NVDA risk factors?", bad);
       const ops = kernelCalls.map((c) => c.op);
-      expect(ops).toEqual(["route", "arguments", "assess_entry"]);
+      expect(ops).toEqual(["route", "arguments", "entry_tool", "assess_entry"]);
       for (const call of kernelCalls) expect("ticker" in call).toBe(false);
       const argsCall = kernelCalls.find((c) => c.op === "arguments");
       expect(argsCall?.objective).toBe("NVDA risk factors?");
@@ -701,8 +841,8 @@ describe("agent entry route", () => {
     winner = "query_finra";
     argsReply = { error: "", tool: "query_finra", arguments: { q: "x" } };
     await eventsFor("short interest?");
-    expect(invoked.length).toBe(1);
-    expect(invoked[0]?.[1]).toEqual({ q: "x" });
+    expect(entryCalls()).toHaveLength(1);
+    expect(entryCalls()[0]?.arguments).toEqual({ q: "x" });
     expect(runCalls.length).toBe(0);
   });
 
@@ -765,7 +905,7 @@ describe("agent entry route", () => {
     reset();
     winner = "get_sec_document";
     await eventsFor("Summarize the latest filings for my watchlist", "aapl", ["NVDA", "QQQ"]);
-    expect(kernelCalls.map((c) => c.op)).toEqual(["route", "arguments", "assess_entry"]);
+    expect(kernelCalls.map((c) => c.op)).toEqual(["route", "arguments", "entry_tool", "assess_entry", "assess_final_response"]);
     expect(runCalls.length).toBe(0);
   });
 
@@ -878,41 +1018,35 @@ describe("agent entry route", () => {
     }
   });
 
-  test("bridge failure rows reach assessment and preserve failure metrics", async () => {
+  test("worker failures refuse before assessment without unverified evidence", async () => {
     reset();
     winner = "query_finra";
     const message = "provider unavailable ".repeat(50);
     toolFailure = { category: "provider_error", error: message };
     const events = await eventsFor("short interest?");
-    expect(events.map((event) => event.type)).toEqual([
-      "agent_start", "status", "needle_decision", "tool_start", "status", "tool_result", "status", "tool_failed", "reasoning_start", "answer_delta", "done",
-    ]);
-    expect(events.find((event) => event.type === "tool_result")?.preview).toBe(message.slice(0, 160));
-    expect(events.find((event) => event.type === "tool_failed")).toMatchObject({ category: "provider_error", preview: message.slice(0, 160) });
-    expect(kernelCalls.find((call) => call.op === "assess_entry")).toMatchObject({
-      result: { ok: false, category: "provider_error", error: message.slice(0, 500) },
-    });
-    expect(events.at(-1)).toMatchObject({ metrics: { failures: { provider_error: 1 }, evidence: { count: 0, characters: 0 } } });
+    expectVerificationRefusal(events);
+    expect(events.find((event) => event.type === "tool_failed")).toMatchObject({ category: "tool_error", preview: message.slice(0, 160) });
+    expect(kernelCalls.some((call) => call.op === "assess_entry")).toBe(false);
+    expect(gateBodies).toEqual([]);
+    expect(events.at(-1)).toMatchObject({ metrics: { evidence: { count: 0, characters: 0 } } });
     expect(metricCalls(events, "tools")).toBe(1);
-    expect(ended).toEqual(["sess-test"]);
-    expect(reasonCalls[0].evidence).toEqual([]);
+    expect(ended).toEqual([]);
+    expect(reasonCalls).toEqual([]);
   });
 
-  test("thrown tool failures close their sessions and report zero completed calls", async () => {
+  test("thrown worker failures refuse without creating bridge sessions or completed tool calls", async () => {
     for (const thrown of [new Error("tool exploded"), "tool exploded"]) {
       reset();
       winner = "query_finra";
       toolThrows = thrown;
       const events = await eventsFor("short interest?");
-      expect(events.map((event) => event.type)).toEqual([
-        "agent_start", "status", "needle_decision", "tool_start", "status", "tool_failed", "status", "reasoning_start", "answer_delta", "done",
-      ]);
+      expectVerificationRefusal(events);
       expect(events.find((event) => event.type === "tool_failed")).toEqual({
         type: "tool_failed", tool: "query_finra", category: "tool_error", preview: "tool exploded",
       });
-      expect(events.at(-1)).toMatchObject({ metrics: { failures: { tool_error: 1 } } });
+      expect(events.at(-1)).toMatchObject({ metrics: { failures: { tool_error: 2 } } });
       expect(metricCalls(events, "tools")).toBe(0);
-      expect(ended).toEqual(["sess-test"]);
+      expect(ended).toEqual([]);
     }
   });
 
@@ -924,7 +1058,7 @@ describe("agent entry route", () => {
     expect(events.map((event) => event.type)).toEqual(["agent_start", "status", "needle_decision", "tool_start", "status", "tool_result", "status", "evidence"]);
     expect(runCalls[0]?.[2]).toMatchObject({ seedEvidence: [expect.objectContaining({ id: "ev:bridge" })] });
     expect(reasonCalls).toEqual([]);
-    expect(ended).toEqual(["sess-test"]);
+    expect(ended).toEqual([]);
   });
 
   test("invalid assessment verdicts defer to research", async () => {
@@ -933,22 +1067,26 @@ describe("agent entry route", () => {
       winner = "query_finra";
       assessReply = { verdict };
       await eventsFor("short interest?");
-      expect(invoked).toHaveLength(1);
-      expect(ended).toHaveLength(1);
+      expect(entryCalls()).toHaveLength(1);
+      expect(ended).toEqual([]);
       expect(runCalls).toHaveLength(1);
       expect(runCalls[0]?.[2]).toMatchObject({ seedEvidence: expect.arrayContaining([expect.objectContaining({ id: "ev:bridge" })]) });
       expect(reasonCalls).toEqual([]);
     }
   });
 
-  test("three-tool cap with admitted evidence answers without research", async () => {
+  test("three-tool cap with admitted evidence answers without research, in one session", async () => {
     reset();
     winner = "query_finra";
     assessReply = { verdict: "query_finra" };
     bridgeIds = ["ev:1", "ev:2", "ev:3"];
     const events = await eventsFor("short interest?");
-    expect(invoked).toHaveLength(3);
-    expect(ended).toHaveLength(3);
+    expect(entryCalls()).toHaveLength(3);
+    // Worker-created research session survives each call and the gate; the route never closes it.
+    expect(entryCalls().map((call) => call.sessionId)).toEqual([undefined, "rs:entry", "rs:entry"]);
+    expect(sessionsCreated).toBe(0);
+    expect(ended).toEqual([]);
+    expect(gateBodies.map((g) => g.sessionId)).toEqual(["rs:entry"]);
     expect(events.filter((e) => e.type === "agent_start")).toHaveLength(1);
     expect(runCalls).toEqual([]);
     expect(reasonCalls).toHaveLength(1);
@@ -962,41 +1100,45 @@ describe("agent entry route", () => {
     winner = "list_sec_filings";
     verdicts = ["list_sec_filings", "node_resolved"];
     const events = await eventsFor("NVDA filings?");
-    expect(invoked.map((c) => c[0])).toEqual(["list_sec_filings", "list_sec_filings"]);
+    expect(entryCalls().map((c) => c.tool)).toEqual(["list_sec_filings", "list_sec_filings"]);
     expect(reasonCalls[0].evidence.map((e) => e.id)).toEqual(["ev:bridge"]);
     expect(events.filter((e) => e.type === "evidence").at(-1)?.evidence).toHaveLength(1);
     expect(events.at(-1)).toMatchObject({ metrics: { tools: { calls: 2 }, evidence: { count: 1 } } });
     expect(runCalls).toEqual([]);
   });
 
-  test("a no-data tool result counts as no_records, not tool_error", async () => {
+  test("no-data worker errors cannot become evidence or factual prose", async () => {
     reset();
     winner = "get_xbrl_facts";
     toolFailure = { category: "no_records", error: "No data found for MSFT: no XBRL facts found for concept 'Assets'" };
     const events = await eventsFor("MSFT total assets?");
-    expect(events.find((e) => e.type === "tool_failed")).toMatchObject({ category: "no_records" });
-    expect(events.at(-1)).toMatchObject({ metrics: { failures: { no_records: 1 } } });
+    expectVerificationRefusal(events);
+    expect(reasonCalls).toEqual([]);
   });
 
-  test("three-tool cap without admitted evidence still defers to research", async () => {
+  test("a failed source ends the chain before the cap without a research retry", async () => {
     reset();
     winner = "query_finra";
     assessReply = { verdict: "query_finra" };
     toolFailure = { category: "tool_error", error: "bad args" };
-    await eventsFor("short interest?");
-    expect(invoked).toHaveLength(3);
-    expect(runCalls).toHaveLength(1);
+    const events = await eventsFor("short interest?");
+    expect(entryCalls()).toHaveLength(1);
+    expect(kernelCalls.some((call) => call.op === "assess_entry")).toBe(false);
+    expect(gateBodies).toEqual([]);
+    expectVerificationRefusal(events);
     expect(reasonCalls).toEqual([]);
   });
 
-  test("cleanup failure retains completed evidence without assessing the tool", async () => {
+  test("a gated answer never creates or closes a bridge-only session", async () => {
     reset();
     winner = "query_finra";
     endThrows = true;
-    await eventsFor("short interest?");
-    expect(kernelCalls.map((call) => call.op)).toEqual(["route", "arguments"]);
-    expect(ended).toEqual(["sess-test"]);
-    expect(runCalls[0]?.[2]).toMatchObject({ seedEvidence: [expect.objectContaining({ id: "ev:bridge" })] });
+    const events = await eventsFor("short interest?");
+    expect(kernelCalls.map((call) => call.op)).toEqual(["route", "arguments", "entry_tool", "assess_entry", "assess_final_response"]);
+    expect(ended).toEqual([]);
+    expect(sessionsCreated).toBe(0);
+    expect(runCalls).toEqual([]);
+    expect(events.slice(-2).map((e) => e.type)).toEqual(["answer_delta", "done"]);
   });
 
   test("single-shot reasoning failure emits the original error without research", async () => {
@@ -1071,7 +1213,7 @@ describe("agent entry route", () => {
     expect(kernelCalls.filter((call) => call.op === "arguments").map((call) => [call.tool, call.ticker])).toEqual([["get_sec_document", "MSFT"]]);
     expect(kernelCalls.some((call) => call.op === "arguments" && call.tool === "set_chart_symbol")).toBe(false);
     expect(kernelCalls.filter((call) => call.op === "assess_entry")).toHaveLength(1);
-    expect(ended).toEqual(["sess-test", "sess-test"]);
+    expect(ended).toEqual(["sess-test"]);
   });
 
   test("a single-tool research fallback never seeds the chart receipt", async () => {
@@ -1227,7 +1369,8 @@ describe("agent entry route", () => {
     winner = "get_sec_document";
     verdicts = ["set_chart_symbol"];
     await eventsFor("Microsoft risk factors?", "MSFT");
-    expect(invoked.map((call) => call[0])).toEqual(["get_sec_document"]);
+    expect(entryCalls().map((call) => call.tool)).toEqual(["get_sec_document"]);
+    expect(invoked).toEqual([]);
     expect(runCalls[0]?.[2]).toMatchObject({ seedEvidence: [expect.objectContaining({ content: bridgeEvidence.content })] });
     expect(reasonCalls).toEqual([]);
   });
@@ -1360,7 +1503,8 @@ describe("watchlist chat action", () => {
     winner = "get_sec_document";
     verdicts = ["update_watchlist"];
     await eventsFor("Microsoft risk factors?", "MSFT");
-    expect(invoked.map((call) => call[0])).toEqual(["get_sec_document"]);
+    expect(entryCalls().map((call) => call.tool)).toEqual(["get_sec_document"]);
+    expect(invoked).toEqual([]);
     expect(runCalls).toHaveLength(1);
   });
 });
@@ -1415,7 +1559,8 @@ describe("workspace widget chat action", () => {
     winner = "get_sec_document";
     verdicts = ["add_widget"];
     await eventsFor("Microsoft risk factors?", "MSFT");
-    expect(invoked.map((call) => call[0])).toEqual(["get_sec_document"]);
+    expect(entryCalls().map((call) => call.tool)).toEqual(["get_sec_document"]);
+    expect(invoked).toEqual([]);
     expect(runCalls).toHaveLength(1);
   });
 });

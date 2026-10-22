@@ -1,7 +1,8 @@
 import type { WindowLike } from "dompurify";
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { Fragment, lazy, Suspense, useEffect, useRef, useState } from "react";
 import { fetchSourceDocument } from "../lib/research-client";
-import type { SourceDocument } from "../lib/research-client";
+import type { SourceAudit, SourceDocument } from "../lib/research-client";
+import { routeHash } from "../lib/route";
 import { activateQuote, highlightMappedQuote, mapSourceHtml, markQuote, originalLink, resolveQuote, sanitizeSourceHtml, sourceLabel, tagFragmentAnchors } from "../lib/source-viewer";
 import type { QuoteResolution } from "../lib/source-viewer";
 
@@ -12,6 +13,7 @@ const CAPTURE_LABELS: Record<SourceDocument["captureKind"], string> = {
   provider_extraction: "Provider extraction — not the original document",
   structured_record: "Structured record — no official page",
   search_excerpt: "Search excerpt only",
+  calculation: "Stockbot calculation — no single original document",
 };
 
 function useSourceDocument(id: string, retry: number): { source: SourceDocument | null; error: string | null } {
@@ -128,6 +130,53 @@ function SourceHeader({ source }: { source: SourceDocument }) {
   </>);
 }
 
+const VERIFICATION_LABELS: Record<SourceAudit["verification"], string> = { verified: "Verified", unverified: "Not verified", conflicted: "Conflicted" };
+
+function AuditFields({ audit }: { audit: SourceAudit }) {
+  const source = [audit.source?.name, audit.source?.document, audit.source?.accession].filter(Boolean).join(" · ");
+  const formula = audit.formula || (audit.formulaId ? `${audit.formulaId}@${audit.formulaVersion ?? ""}` : undefined);
+  const rows: [string, string | undefined][] = [
+    ["Value", audit.value], ["Entity", audit.entity], ["Period", audit.period], ["Unit", audit.unit], ["Known at", audit.knownAt],
+    ["Source", source || undefined], ["Evidence hash", audit.source?.hash], ["Formula", formula], ["Recomputed", audit.recomputedValue],
+  ];
+  return (
+    <dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs text-zinc-400">
+      <dt>Verification</dt><dd>{VERIFICATION_LABELS[audit.verification]}{audit.verificationReason ? ` — ${audit.verificationReason}` : ""}</dd>
+      {rows.filter(([, value]) => value).map(([name, value]) => <Fragment key={name}><dt>{name}</dt><dd className="break-all">{value}</dd></Fragment>)}
+    </dl>
+  );
+}
+
+// The replayed proof: typed value, source identity, hash, and verification. A calculation lists each input with
+// its own Stockbot view and never borrows one input's original link. Repairs render as read-only history text.
+function AuditSection({ audit }: { audit: SourceAudit }) {
+  const calculation = audit.claimType === "calculation";
+  return (
+    <section aria-label="Source audit" className="mt-3">
+      <h2 className="text-sm font-semibold">{calculation ? "Calculation" : "Observation"}</h2>
+      <AuditFields audit={audit} />
+      {calculation && <ol aria-label="Calculation inputs" className="mt-2 list-decimal space-y-2 pl-5">
+        {(audit.inputs ?? []).map((input, index) => (
+          <li key={`${input.evidenceId}-${index}`}>
+            <AuditFields audit={input} />
+            {input.sourceId && <a className="text-xs text-blue-300 underline" href={routeHash({ page: "source", id: input.sourceId })} target="_blank" rel="noopener noreferrer">View in Stockbot</a>}
+          </li>
+        ))}
+      </ol>}
+      {(audit.repairs?.length ?? 0) > 0 && <div className="mt-2">
+        <h3 className="text-xs font-semibold text-zinc-300">Legacy repair history</h3>
+        <ul aria-label="Legacy repairs" className="mt-1 list-disc space-y-1 pl-5 text-xs text-zinc-400">
+          {(audit.repairs ?? []).map((repair) => (
+            <li key={repair.repair_id} className="break-all">
+              {repair.repair_id}{repair.status ? ` — ${repair.status}` : ""}{repair.category ? ` · ${repair.category}` : ""}{repair.datapoint ? ` · ${repair.datapoint}` : ""}{repair.value ? ` · ${repair.value}` : ""}{repair.reason ? ` (${repair.reason})` : ""}
+            </li>
+          ))}
+        </ul>
+      </div>}
+    </section>
+  );
+}
+
 function SourceQuote({ quote, resolution }: { quote: string; resolution: QuoteResolution | null }) {
   return (<>
     {quote && <blockquote className="my-3 border-l-2 border-zinc-500 pl-3"><span className="text-xs text-zinc-400">Exact citation quote</span><p className="whitespace-pre-wrap">{quote}</p></blockquote>}
@@ -150,6 +199,7 @@ function CapturedSource({ source, painted, pdfResolution, content, marks, onPdfR
   const quote = painted?.quote ?? source.quote ?? "";
   return (<>
     <SourceHeader source={source} />
+    {source.audit && <AuditSection audit={source.audit} />}
     <SourceQuote quote={quote} resolution={status} />
     {status?.status === "resolved" && source.representation !== "pdf" && <button type="button" className="source-control mb-2" onClick={() => {
       if (content.current) activateQuote(content.current, marks.current);

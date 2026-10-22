@@ -20,6 +20,7 @@ adjusted numbers and reported separately.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections.abc import Mapping, Sequence
 from typing import TypedDict
@@ -32,6 +33,30 @@ logger = logging.getLogger(__name__)
 
 PRICE_CACHE_TTL_SECONDS = 300  # 5 minutes: numbers must be as-of-now.
 VALUATION_CACHE_TTL_SECONDS = 900
+
+
+def _finite_float(value: object) -> float | None:
+    """Finite float for a real numeric input (bool/NaN/inf/str -> None)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _calculation(formula: str, value: object, unit: str, inputs: Mapping[str, object]) -> dict[str, object]:
+    """Explicitly derived numeric marker (unverified; ledger admission only)."""
+    records: list[object] = [
+        item if isinstance(item, Mapping) else {"id": name, "value": item} for name, item in inputs.items()
+    ]
+    return {
+        "derived": True,
+        "formulaId": formula,
+        "formulaVersion": "1",
+        "value": value,
+        "unit": unit,
+        "derivation_inputs": records,
+        "verification": "unverified",
+    }
 
 
 def _no_data(ticker: str, what: str) -> dict[str, object]:
@@ -53,16 +78,16 @@ def _cached_quote(hit: object) -> LiveQuote | None:
         hit_price = hit.get("price")
         hit_retrieved = hit.get("retrieved_at")
         return {
-            "price": float(hit_price) if isinstance(hit_price, (int, float)) else None,
+            "price": _finite_float(hit_price),
             "retrieved_at": hit_retrieved if isinstance(hit_retrieved, str) else None,
         }
-    return {"price": float(hit) if isinstance(hit, (int, float)) else None, "retrieved_at": None}
+    return {"price": _finite_float(hit), "retrieved_at": None}
 
 
 def _fetched_quote(quote: object) -> tuple[float | None, str | None]:
     """Price + retrieval instant from an analyst quote payload (None-safe)."""
     quote_price = quote.get("price") if isinstance(quote, dict) else None
-    price = float(quote_price) if isinstance(quote_price, (int, float)) else None
+    price = _finite_float(quote_price)
     quote_retrieved = quote.get("retrieved_at") if isinstance(quote, dict) else None
     return price, quote_retrieved if isinstance(quote_retrieved, str) else None
 
@@ -95,8 +120,7 @@ def _tier_eps(entry: Mapping[str, object] | None, key: str) -> float | None:
     """float EPS value from a forward-EPS tier entry (missing/non-numeric -> None)."""
     if entry is None:
         return None
-    value = entry.get(key)
-    return value if isinstance(value, (int, float)) else None
+    return _finite_float(entry.get(key))
 
 
 class ObligationAnnualImpact(TypedDict):
@@ -395,14 +419,27 @@ def _projected_prices(eps_by_tier: dict[str, float | None], price: float | None)
         cells: dict[str, dict[str, object]] = {}
         for multiple in PROJECTION_MULTIPLES:
             projected = round(eps * multiple, 2)
-            pct = round((projected / price - 1) * 100, 1) if price is not None else None
-            cells[f"{multiple}x"] = {"price": projected, "pct_change_vs_current": pct}
+            pct = round((projected / price - 1) * 100, 1) if price is not None and price > 0 else None
+            cells[f"{multiple}x"] = {
+                "price": projected,
+                "pct_change_vs_current": pct,
+                "derived": True,
+                "calculations": {
+                    "price": _calculation(
+                        "valuation_projected_price", projected, "USD/share", {"eps": eps, "assumed_pe": multiple}
+                    ),
+                    "pct_change_vs_current": _calculation(
+                        "valuation_projected_change", pct, "%", {"current_price": price, "projected_price": projected}
+                    ),
+                },
+            }
         tiers.append({"tier": tier, "eps": round(eps, 2), "prices": cells})
     return {
         "assumption": (
             "projected price = scenario EPS x assumed P/E multiple; pct_change is vs the current live price"
         ),
         "multiples": list(PROJECTION_MULTIPLES),
+        "derived": True,
         "current_price": round(price, 2) if price is not None else None,
         "tiers": tiers,
     }
@@ -565,7 +602,8 @@ def _scenario_hit(
         )
         return
     after_tax = pretax_billions * (1 - tax_rate)
-    if not shares_out:
+    if shares_out is None or shares_out <= 0:
+        shares_out = None
         rows.append(
             {
                 "scenario": name,
@@ -590,6 +628,21 @@ def _scenario_hit(
             "tax_rate": round(tax_rate, 3),
             "reason": None,
             "note": note,
+            "derived": True,
+            "calculations": {
+                "after_tax_billions": _calculation(
+                    "valuation_after_tax",
+                    round(after_tax, 3),
+                    "USD billions",
+                    {"pretax_billions": pretax_billions, "effective_tax_rate": tax_rate},
+                ),
+                "eps_impact": _calculation(
+                    "valuation_eps_impact",
+                    round(-eps, 3),
+                    "USD/share",
+                    {"after_tax_billions": after_tax, "shares_billions": shares_out / 1e9},
+                ),
+            },
         }
     )
 
@@ -721,6 +774,7 @@ def _obligation_eps_scenarios(
     return {
         "assumption": _scenario_assumption(tax_rate),
         "effective_tax_rate": round(tax_rate, 3) if tax_rate is not None else None,
+        "derived": True,
         "scenarios": rows,
     }
 
@@ -743,9 +797,44 @@ def _eps_line(
         "price": round(price, 2) if price is not None else None,
         "pe": round(price / eps_value, 1) if (price is not None and eps_value) else None,
         "label": label,
+        "derived": True,
+        "calculations": {
+            "pe": _calculation(
+                "valuation_pe",
+                round(price / eps_value, 1) if price is not None and eps_value else None,
+                "ratio",
+                {"price": price, "eps": eps_value},
+            ),
+        },
     }
     _apply_contractual_drag(line, eps_value, contractual, price)
     _apply_contingent_drag(line, eps_value, contractual, contingent, price)
+    calculations = line["calculations"]
+    if isinstance(calculations, dict):
+        residual = _contingent_residual(eps_value, contractual, contingent) if contingent is not None else None
+        for field, formula, inputs, unit in (
+            ("eps_after_contractual", "valuation_adjusted_eps", {"eps": eps_value, "drag": contractual}, "USD/share"),
+            (
+                "eps_after_all_obligations",
+                "valuation_scenario_eps",
+                {"eps": eps_value, "contractual": contractual, "contingent": contingent},
+                "USD/share",
+            ),
+            (
+                "pe_after_contractual",
+                "valuation_pe",
+                {"price": price, "eps": eps_value - contractual if contractual is not None else None},
+                "ratio",
+            ),
+            (
+                "pe_after_all_obligations",
+                "valuation_pe",
+                {"price": price, "eps": residual},
+                "ratio",
+            ),
+        ):
+            if field in line:
+                calculations[field] = _calculation(formula, line[field], unit, inputs)
     return line
 
 
@@ -796,7 +885,7 @@ def _fy_ps(
     key: str,
 ) -> float | None:
     """Per-share impact for one FY bucket (missing shares/year -> None)."""
-    if shares_out and year:
+    if shares_out is not None and shares_out > 0 and year:
         return (impact_by_fy.get(year, {}).get(key, 0.0) + flat_map.get(key, 0.0)) / (shares_out / 1e9)
     return None
 
@@ -815,7 +904,7 @@ def _fy_drags(
 
 def _drag_ps(annual_billions: float, shares_out: int | None) -> float | None:
     """Annual $B bucket as per-share drag (missing shares -> None)."""
-    return annual_billions / (shares_out / 1e9) if shares_out else None
+    return annual_billions / (shares_out / 1e9) if shares_out is not None and shares_out > 0 else None
 
 
 def _estimates_by_period(estimates: dict[str, object]) -> dict[str, dict[str, object]] | None:
@@ -1092,7 +1181,12 @@ def _valuation_forward_tiers(
     year_next = _fy_year(fy_next)
     cur = _fy_drags(impact_by_fy, flat_map, shares_out, year_cur)
     nxt = _fy_drags(impact_by_fy, flat_map, shares_out, year_next)
-    return _build_forward_eps(eps_current, eps_next, cur, nxt, price), year_cur, year_next
+    forward = _build_forward_eps(eps_current, eps_next, cur, nxt, price)
+    for key in forward:
+        drags = nxt if key.endswith("_next_fy") else cur
+        if not key.startswith("consensus") and any(value is None for value in drags.values()):
+            forward[key] = None
+    return forward, year_cur, year_next
 
 
 def _cached_metrics(key: str) -> dict[str, object] | None:
@@ -1104,13 +1198,13 @@ def _cached_metrics(key: str) -> dict[str, object] | None:
 def _ttm_eps(eps: dict[str, object]) -> float | None:
     """Numeric TTM diluted EPS from an eps envelope (non-numeric -> None)."""
     ttm_raw = eps.get("ttm_eps_diluted")  # envelope keeps payload keys
-    return ttm_raw if isinstance(ttm_raw, (int, float)) else None
+    return _finite_float(ttm_raw)
 
 
 def _shares_from_estimates(estimates: dict[str, object]) -> int | None:
     """Shares outstanding from estimates (non-int -> None)."""
     shares_raw = estimates.get("shares_outstanding")
-    return shares_raw if isinstance(shares_raw, int) else None
+    return shares_raw if isinstance(shares_raw, int) and not isinstance(shares_raw, bool) and shares_raw > 0 else None
 
 
 def _fetch_obligations(ticker: str) -> tuple[dict[str, object] | None, dict[str, object]]:
@@ -1132,9 +1226,13 @@ def _fetch_estimates(ticker: str) -> tuple[dict[str, object] | None, dict[str, d
     return None, estimates_by_period
 
 
-def _fetch_eps(ticker: str, estimates: dict[str, object]) -> tuple[dict[str, object] | None, float | None, int | None]:
+def _fetch_eps(
+    ticker: str, estimates: dict[str, object], source_inputs: dict[str, object] | None = None
+) -> tuple[dict[str, object] | None, float | None, int | None]:
     """TTM EPS + shares, or the _no_data payload when the eps envelope errors."""
     eps = sec_facts.get_fundamentals(ticker, "eps")
+    if source_inputs is not None:
+        source_inputs["sec_eps"] = eps
     if "error" in eps:
         return {"error": f"No valuation data for {ticker}: {eps.get('error') or ''!s}"}, None, None
     return None, _ttm_eps(eps), _shares_from_estimates(estimates)
@@ -1152,6 +1250,7 @@ def _finish_metrics(
     impact: ObligationAnnualImpact,
     eps_scenarios: dict[str, object],
     estimates_by_period: dict[str, dict[str, object]],
+    source_inputs: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Forward EPS + coverage + final dict (+ cache when fully priced)."""
     fy_current = estimates_by_period.get("current_fiscal_year") or {}
@@ -1192,6 +1291,36 @@ def _finish_metrics(
         year_cur,
         year_next,
     )
+    value["derived"] = True
+    value["calculation_sources"] = {
+        **(source_inputs or {}),
+        "live_price_input": {"id": f"quote:{ticker}", "value": price, "unit": "USD/share"},
+        "sec_eps": {
+            "id": f"ttm_eps_diluted:{ticker}",
+            "value": (source_inputs or {}).get("sec_eps"),
+            "unit": "USD/share",
+        },
+        "analyst_estimates": estimates,
+        "consensus_basis": {
+            "kind": "assumption",
+            "description": "Yahoo sell-side consensus forward EPS and shares; treated as assumption, never fact.",
+            "as_of": estimates.get("as_of"),
+        },
+        "obligation_snapshot": ob_rows,
+        "annualization_years": {"kind": "assumption", "value": 6},
+        "annualization_policy": {
+            "kind": "assumption",
+            "description": "Use disclosed schedules first. Otherwise use six years, ten years for off-balance-sheet leases, and 0.75 years for a fiscal remainder.",
+        },
+    }
+    value["calculations"] = {
+        "trailing_pe": _calculation(
+            "valuation_pe",
+            value["trailing_pe"],
+            "ratio",
+            {"live_price": price, "sec_eps.ttm_eps_diluted": ttm_eps_diluted},
+        )
+    }
     if price_gap is None:  # never cache a quote gap; retry fresh next call
         cache.set(key, value)
     return value
@@ -1212,7 +1341,10 @@ def get_valuation_metrics(ticker: str) -> dict[str, object]:
     if est_error is not None:
         return est_error
     estimates = analyst_client.get_analyst_estimates(ticker)
-    eps_error, ttm_eps_diluted, shares_out = _fetch_eps(ticker, estimates)
+    source_inputs: dict[str, object] = {
+        "live_price": {"id": f"quote:{ticker}", "value": price, "unit": "USD/share"},
+    }
+    eps_error, ttm_eps_diluted, shares_out = _fetch_eps(ticker, estimates, source_inputs)
     if eps_error is not None:
         return eps_error
     ob_error, ob_rows = _fetch_obligations(ticker)
@@ -1233,6 +1365,7 @@ def get_valuation_metrics(ticker: str) -> dict[str, object]:
         impact,
         eps_scenarios,
         estimates_by_period,
+        source_inputs,
     )
 
 
@@ -1331,4 +1464,43 @@ def _obligations_block(
         "revenue_matched_gross_margin": gross_margin,
         "revenue_matched_margin_source": margin_source,
         "per_kind": impact["per_kind"],
+        "derived": True,
+        "calculations": {
+            **{
+                name: _calculation(
+                    "valuation_per_share_impact",
+                    value,
+                    "USD/share",
+                    {
+                        "annual_billions": annual,
+                        "shares_outstanding": "calculation_sources.analyst_estimates.shares_outstanding",
+                    },
+                )
+                for name, value, annual in (
+                    ("drag_per_share_contractual", contractual_ps, impact["contractual_annual_billions"]),
+                    ("drag_per_share_contingent", contingent_ps, impact["contingent_annual_billions"]),
+                    (
+                        "drag_per_share_default_triggered",
+                        default_triggered_ps,
+                        impact["default_triggered_annual_billions"],
+                    ),
+                    ("revenue_matched_per_share", revenue_matched_ps, impact["revenue_matched_annual_billions"]),
+                )
+            },
+            "revenue_matched_implied_revenue_billions": _calculation(
+                "valuation_implied_revenue",
+                round(implied_coverage_b, 1) if implied_coverage_b is not None else None,
+                "USD billions",
+                {"annual_billions": impact["revenue_matched_annual_billions"], "gross_margin": gross_margin},
+            ),
+        },
+        "annualization": {
+            "kind": "assumption",
+            "annualization_years": 6,
+            "description": (
+                "Disclosed schedules first; six years; ten years for off-balance-sheet leases; "
+                "0.75 years for a fiscal remainder."
+            ),
+            "inputs": {"id": "calculation_sources.obligation_snapshot", "kind": "source_snapshot"},
+        },
     }

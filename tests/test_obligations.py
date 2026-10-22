@@ -1156,7 +1156,7 @@ def test_unquantified_hash_tracks_excerpt_and_trigger():
     assert obligations._content_hash({**base, "_accession": "acc-10q"}) != obligations._content_hash(dict(base))
 
 
-def test_xbrl_gateway_long_null_prefix_keeps_duration_debt(monkeypatch: pytest.MonkeyPatch):
+def test_xbrl_gateway_long_null_prefix_keeps_duration_debt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Consumer regression: 128 nullable instant facts before duration debt.
 
     Raw companyfacts run the real normalizer through the real gateway seam
@@ -1164,6 +1164,7 @@ def test_xbrl_gateway_long_null_prefix_keeps_duration_debt(monkeypatch: pytest.M
     Without pinned nullable metadata dtypes, Polars reads the all-None
     prefix as Null and rejects the later duration strings/ints.
     """
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
     cik = 320193
     leading = [
         {"end": "2025-07-31", "val": 100 + i, "accn": f"instant-{i:03d}", "filed": "2025-08-28"} for i in range(128)
@@ -1210,13 +1211,13 @@ def test_xbrl_gateway_long_null_prefix_keeps_duration_debt(monkeypatch: pytest.M
         assert ticker == "SYN"
         return cik
 
-    def _download_company_facts(got: int) -> dict[str, object]:
-        assert got == cik
-        return dict(raw)
+    def _download_company_facts(url: str) -> bytes:
+        assert url.endswith(f"CIK{cik:010d}.json")
+        return json.dumps(raw).encode()
 
     monkeypatch.setattr("app.sec.client.ensure_identity", _no_identity)
     monkeypatch.setattr("app.sec.client.resolve_cik", _resolve_syn)
-    monkeypatch.setattr("edgar.entity.entity_facts.download_company_facts_from_sec", _download_company_facts)
+    monkeypatch.setattr("app.services.research_data._edgar_get", _download_company_facts)
     result = obligations.get_obligations("SYN")
     assert "error" not in result
     rows = result["obligations"]

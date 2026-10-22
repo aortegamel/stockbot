@@ -17,8 +17,9 @@ from __future__ import annotations
 import datetime as _dt
 import re
 from collections.abc import Mapping, Sequence
+from decimal import Decimal
 from pathlib import Path
-from typing import TypedDict
+from typing import NotRequired, TypedDict, cast
 
 from .. import edgar_client
 from ..data_sources import SourceGateway
@@ -64,6 +65,22 @@ class FinancialFactRow(TypedDict):
     fiscal_year: int | None
     fiscal_period: str | None
     source_url: str | None
+    cik: NotRequired[int]
+    issuer_cik: NotRequired[int]
+    entity_id: NotRequired[str]
+    original_concept: NotRequired[str]
+    namespace: NotRequired[str]
+    taxonomy: NotRequired[str]
+    unit: NotRequired[str]
+    period_instant: NotRequired[str | None]
+    dimensions: NotRequired[object]
+    source_identity: NotRequired[object]
+    derived: NotRequired[bool]
+    derivation: NotRequired[str]
+    formulaId: NotRequired[str]
+    formulaVersion: NotRequired[str]
+    derivation_inputs: NotRequired[list[dict[str, object]]]
+    verification: NotRequired[str]
 
 
 class DividendEventRow(TypedDict):
@@ -164,18 +181,22 @@ def _validated_fact_row(row: Mapping[str, object]) -> FinancialFactRow | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return {
-        "concept": concept,
-        "value": float(value),
-        "period_end": period_end,
-        "filed_at": _stored_text(row.get("filed_at")),
-        "accession": _stored_text(row.get("accession")),
-        "known_at": _stored_text(row.get("known_at")),
-        "period_start": _stored_opt_text(row.get("period_start")),
-        "fiscal_year": _stored_opt_int(row.get("fiscal_year")),
-        "fiscal_period": _stored_opt_text(row.get("fiscal_period")),
-        "source_url": _stored_opt_text(row.get("source_url")),
-    }
+    return cast(
+        FinancialFactRow,
+        {
+            **row,
+            "concept": concept,
+            "value": value,
+            "period_end": period_end,
+            "filed_at": _stored_text(row.get("filed_at")),
+            "accession": _stored_text(row.get("accession")),
+            "known_at": _stored_text(row.get("known_at")),
+            "period_start": _stored_opt_text(row.get("period_start")),
+            "fiscal_year": _stored_opt_int(row.get("fiscal_year")),
+            "fiscal_period": _stored_opt_text(row.get("fiscal_period")),
+            "source_url": _stored_opt_text(row.get("source_url")),
+        },
+    )
 
 
 def _gateway() -> SourceGateway:
@@ -204,12 +225,9 @@ def _resolve_entity(ticker: str, as_of: _dt.date, data_root: Path | None) -> str
 
 
 def _resolve_cik(entity_id: str) -> int | None:
-    """Trailing-digit CIK from a sec:cik entity id or a bare CIK string."""
-    try:
-        digits = "".join(ch for ch in str(entity_id or "") if ch.isdigit())
-        return int(digits) if digits else None
-    except TypeError, ValueError:
-        return None
+    """Resolve only a bare CIK or the canonical SEC entity identifier."""
+    match = re.fullmatch(r"(?:sec:cik:)?(\d+)", entity_id)
+    return int(match[1]) if match and int(match[1]) > 0 else None
 
 
 def _fact_order_key(fact: FinancialFactRow) -> tuple[str, str, str]:
@@ -389,14 +407,69 @@ def _ytd_through_q3(rows: Sequence[FinancialFactRow], concept: str, fy_end: _dt.
     return max(ytd, key=_row_period_end) if ytd else None
 
 
-def _q4_from_totals(latest_fy: FinancialFactRow, ytd_q3: FinancialFactRow, fy_end: _dt.date) -> FinancialFactRow:
-    """Q4 = FY_total - YTD_through_Q3 anchored on the FY fact's identity."""
+def _compatible_facts(rows: Sequence[Mapping[str, object]]) -> bool:
+    """Reject conflicting entity, unit, currency, basis, or share adjustments."""
+    for key in ("entity_id", "cik", "unit", "currency", "basis", "share_adjustment", "dimensions"):
+        values = [row.get(key) for row in rows if row.get(key) is not None]
+        if values and any(value != values[0] for value in values[1:]):
+            return False
+    return True
+
+
+def _calculation(
+    formula: str, rows: Sequence[Mapping[str, object]], value: float, *, unit: str | None = None
+) -> dict[str, object]:
+    """Keep complete input identities until the ledger assigns proof IDs."""
     return {
-        **latest_fy,
-        "value": latest_fy["value"] - ytd_q3["value"],
-        "period_end": fy_end.isoformat(),
-        "fiscal_period": "Q4",
+        **{
+            key: rows[0][key]
+            for key in ("entity_id", "cik", "currency", "basis", "share_adjustment", "dimensions")
+            if rows and key in rows[0]
+        },
+        "derived": True,
+        "formulaId": formula,
+        "formulaVersion": "1",
+        "value": value,
+        "unit": unit or (rows[0].get("unit") if rows else None),
+        "period_start": rows[0].get("period_start") if rows else None,
+        "period_end": rows[-1].get("period_end") if rows else None,
+        "derivation_inputs": [dict(row) for row in rows],
+        "verification": "unverified",
     }
+
+
+def _q4_from_totals(latest_fy: FinancialFactRow, ytd_q3: FinancialFactRow, fy_end: _dt.date) -> FinancialFactRow | None:
+    """Derive Q4 from FY and YTD facts, never from a standalone Q4 observation."""
+    if (
+        not _compatible_facts([latest_fy, ytd_q3])
+        or latest_fy["concept"] != ytd_q3["concept"]
+        or latest_fy.get("period_start") != ytd_q3.get("period_start")
+        or not latest_fy.get("period_start")
+        or latest_fy["period_end"] != fy_end.isoformat()
+        or not ytd_q3["period_end"] < latest_fy["period_end"]
+    ):
+        return None
+    value = float(Decimal(str(latest_fy["value"])) - Decimal(str(ytd_q3["value"])))
+    start = (_dt.date.fromisoformat(ytd_q3["period_end"]) + _dt.timedelta(days=1)).isoformat()
+    derived = {
+        key: row_value
+        for key, row_value in latest_fy.items()
+        if key
+        not in ("value", "fact_id", "source_record_id", "source_identity", "document_id", "context_id", "element_id")
+    }
+    return cast(
+        FinancialFactRow,
+        {
+            **derived,
+            **_calculation("sec_q4_difference", [latest_fy, ytd_q3], value),
+            "period_start": start,
+            "period_end": fy_end.isoformat(),
+            "fiscal_period": "Q4",
+            "accession": "",
+            "source_url": None,
+            "derivation": "fy_minus_ytd",
+        },
+    )
 
 
 def _derive_q4_from_facts(rows: Sequence[FinancialFactRow], concept: str, fy_end: _dt.date) -> FinancialFactRow | None:
@@ -446,24 +519,47 @@ def _eps_entry(
 ) -> dict[str, object]:
     """One quarterly entry: diluted value plus basic when the period matches, with its filing identity."""
     entry: dict[str, object] = {
+        **diluted,
         "fiscal_year": str(diluted["fiscal_year"]) if diluted.get("fiscal_year") is not None else "",
         "fiscal_period": (diluted.get("fiscal_period") or ""),
         "eps_diluted": round(diluted["value"], 2),
         "period_end": diluted["period_end"],
         "accession": diluted["accession"],
-        "cik": cik,
+        "cik": diluted.get("cik", cik),
     }
     matching = _basic_match_for(diluted["period_end"], recent_basic)
     if matching is not None:
         entry["eps_basic"] = round(matching["value"], 2)
+        entry["basic_fact"] = dict(matching)
     return entry
 
 
-def _eps_ttm(quarters: Sequence[FinancialFactRow] | None) -> float | None:
-    """TTM total once 4 quarters are present; None while the series builds."""
-    if quarters is None or len(quarters) != 4:
+def _ttm_total(
+    quarters: Sequence[FinancialFactRow] | None, *, precision: int = 2, outflow: bool = False
+) -> float | None:
+    """Sum four compatible contiguous quarters without discarding their identities."""
+    if (
+        quarters is None
+        or len(quarters) != 4
+        or not _compatible_facts(quarters)
+        or len({row["concept"] for row in quarters}) != 1
+        or not _has_contiguous_quarters([row["period_end"] for row in quarters])
+        or any(
+            row.get("period_start") and not _concept_duration_match(row, row["concept"], _QUARTER_DAYS)
+            for row in quarters
+        )
+    ):
         return None
-    return round(sum(r["value"] for r in quarters), 2)
+    total = sum(
+        (abs(Decimal(str(row["value"]))) if outflow else Decimal(str(row["value"])) for row in quarters),
+        Decimal(0),
+    )
+    return float(round(total, precision))
+
+
+def _eps_ttm(quarters: Sequence[FinancialFactRow] | None) -> float | None:
+    """Return TTM EPS only when four compatible quarters exist."""
+    return _ttm_total(quarters)
 
 
 def _assemble_eps_payload(
@@ -487,6 +583,20 @@ def _assemble_eps_payload(
     ttm_basic = _eps_ttm(recent_basic)
     if ttm_basic is not None:
         result["ttm_eps_basic"] = ttm_basic
+    result["derived_fields"] = {key: "sum_quarters" for key in ("ttm_eps_diluted", "ttm_eps_basic") if key in result}
+    result["calculations"] = {
+        key: _calculation("sec_eps_ttm", inputs, value)
+        for key, inputs, value in (
+            ("ttm_eps_diluted", recent_diluted, ttm_diluted),
+            ("ttm_eps_basic", recent_basic, ttm_basic),
+        )
+        if inputs is not None and value is not None
+    }
+    result["calculation_inputs"] = {
+        key: [dict(row) for row in inputs]
+        for key, inputs in (("ttm_eps_diluted", recent_diluted), ("ttm_eps_basic", recent_basic))
+        if key in result and inputs is not None
+    }
     return result
 
 
@@ -503,18 +613,43 @@ def _assemble_dividend_payload(
         and _has_contiguous_quarters([r["period_end"] for r in recent])
         and _is_recent_dividend_period(recent[-1]["period_end"], as_of)
     ):
-        ttm = round(sum(r["value"] for r in recent), 4)
+        ttm = _ttm_total(recent, precision=4)
     else:
         ttm = None
     fy_rows = _duration_rows(rows, DIVIDEND_PER_SHARE_CONCEPT, _FY_DAYS)
     history, annual = _dividend_annual_history(fy_rows)
+    annual_facts = {
+        year: max(
+            (row for row in fy_rows if row["period_end"][:4] == str(year)),
+            key=_row_period_end,
+        )
+        for year in annual
+    }
+    growth = _dividend_growth(annual)
+    calculations = {"ttm_dividend_per_share": _calculation("sec_dividend_ttm", recent, ttm)} if ttm is not None else {}
+    calculation_inputs: dict[str, object] = (
+        {"ttm_dividend_per_share": [dict(row) for row in recent]} if ttm is not None else {}
+    )
+    for key, years in (("growth_1y", 1), ("growth_3y_cagr", 3), ("growth_5y_cagr", 5), ("growth_10y_cagr", 10)):
+        value = growth[key]
+        if value is None:
+            continue
+        latest_year = max(annual)
+        inputs = [annual_facts[latest_year - years], annual_facts[latest_year]]
+        if not _compatible_facts(inputs):
+            growth[key] = None
+            continue
+        calculations[key] = _calculation(f"sec_dividend_growth_{years}y", inputs, value, unit="ratio")
+        calculation_inputs[key] = [dict(row) for row in inputs]
     return {
         "ticker": ticker,
         "dividend_status": "paying" if ttm is not None else "unknown",
         "ttm_dividend_per_share": ttm,
-        **_dividend_growth(annual),
+        **growth,
         "annual_history": history,
         "source": _DIVIDEND_SOURCE,
+        "calculations": calculations,
+        "calculation_inputs": calculation_inputs,
     }
 
 
@@ -901,10 +1036,30 @@ def _ttm_cash_total(rows: Sequence[FinancialFactRow], concept: str, *, outflow: 
     filed as negative values; coverage math needs their magnitude.
     """
     quarters = _quarters_with_derived_q4(_duration_rows(rows, concept, _QUARTER_DAYS), rows, concept)
-    if len(quarters) != 4 or not _has_contiguous_quarters([r["period_end"] for r in quarters]):
+    return _ttm_total(quarters, outflow=outflow)
+
+
+def _cash_calculation(
+    rows: Sequence[FinancialFactRow], concept: str, *, outflow: bool = False
+) -> dict[str, object] | None:
+    """Preserve all four quarterly inputs for one cash total."""
+    quarters = _recent_concept_quarters(rows, concept)
+    value = _ttm_total(quarters, outflow=outflow)
+    if value is None:
         return None
-    values = [abs(r["value"]) if outflow else r["value"] for r in quarters]
-    return round(sum(values), 2)
+    return _calculation("sec_cash_outflow_ttm" if outflow else "sec_cash_ttm", quarters, value)
+
+
+def _same_period(inputs: Sequence[Mapping[str, object] | None]) -> bool:
+    """Require complete compatible operands for the same reporting period."""
+    if any(row is None for row in inputs):
+        return False
+    rows = [row for row in inputs if row is not None]
+    return (
+        _compatible_facts(rows)
+        and len({str(row.get("period_start")) for row in rows}) == 1
+        and len({str(row.get("period_end")) for row in rows}) == 1
+    )
 
 
 def _fy_annual_totals(rows: Sequence[FinancialFactRow], concept: str, *, outflow: bool = False) -> dict[int, float]:
@@ -1202,16 +1357,68 @@ def _assemble_dividend_safety(
     Absent concepts yield nulls with reasons, never zero-filled or borrowed.
     """
     ttm_dps, ttm_ocf, ttm_capx, ttm_div_paid = _safety_ttm_inputs(rows, dividend)
+    ocf_proof = _cash_calculation(rows, _OCF_CONCEPT)
+    capex_proof = _cash_calculation(rows, _CAPEX_CONCEPT, outflow=True)
+    paid_proof = _cash_calculation(rows, _DIV_PAID_CONCEPT, outflow=True)
     ttm_fcf = _safety_fcf(ttm_ocf, ttm_capx)
+    fcf_inputs_raw: tuple[dict[str, object] | None, dict[str, object] | None] = (ocf_proof, capex_proof)
+    fcf_inputs = [proof for proof in fcf_inputs_raw if proof is not None]
+    fcf_proof = (
+        _calculation("sec_fcf", fcf_inputs, ttm_fcf)
+        if len(fcf_inputs) == 2 and _same_period(fcf_inputs) and ttm_fcf is not None
+        else None
+    )
     safety: dict[str, object] = {
         "ttm_fcf": ttm_fcf,
         "ttm_dividends_paid": ttm_div_paid,
         "methodology": _SAFETY_METHODOLOGY,
     }
+    calculations = {
+        key: proof
+        for key, proof in (("ttm_fcf", fcf_proof), ("ttm_dividends_paid", paid_proof))
+        if proof is not None and safety[key] is not None
+    }
+    safety["calculations"] = calculations
+    safety["calculation_inputs"] = {
+        key: proof["derivation_inputs"]
+        for key, proof in calculations.items()
+        if isinstance(proof, dict) and isinstance(proof.get("derivation_inputs"), list)
+    }
     flags: list[dict[str, object]] = []
     _safety_earnings_ratio(safety, flags, ttm_dps, ttm_eps_diluted)
     _safety_fcf_ratios(safety, flags, ttm_fcf, ttm_div_paid)
     _safety_cash_ratio(safety, rows, ttm_div_paid)
+    dividend_calculations = dividend.get("calculations")
+    dps_proof_raw = (
+        dividend_calculations.get("ttm_dividend_per_share") if isinstance(dividend_calculations, Mapping) else None
+    )
+    dps_proof = dps_proof_raw if isinstance(dps_proof_raw, dict) else None
+    eps_quarters = _recent_concept_quarters(rows, DILUTED_EPS_CONCEPT)
+    eps_value = _eps_ttm(eps_quarters)
+    eps_proof = _calculation("sec_eps_ttm", eps_quarters, eps_value) if eps_value is not None else None
+    cash_row = _latest_concept_value(rows, _CASH_CONCEPT)
+    numerators: tuple[object, object, object, object] = (dps_proof, paid_proof, fcf_proof, cash_row)
+    denominators: tuple[object, object, object, object] = (eps_proof, fcf_proof, paid_proof, paid_proof)
+    ratio_specs = (
+        ("earnings_payout_ratio", "sec_ratio", True),
+        ("fcf_payout_ratio", "sec_ratio", True),
+        ("fcf_coverage", "sec_ratio", True),
+        ("cash_to_annual_dividend", "sec_ratio", False),
+    )
+    for (key, formula, same_period), numerator, denominator in zip(ratio_specs, numerators, denominators):
+        value = safety.get(key)
+        inputs = [operand for operand in (numerator, denominator) if isinstance(operand, dict)]
+        if (
+            isinstance(value, (int, float))
+            and len(inputs) == 2
+            and (
+                _same_period(inputs)
+                if same_period
+                else _compatible_facts(inputs) and inputs[0].get("period_end") == inputs[1].get("period_end")
+            )
+        ):
+            calculations[key] = _calculation(formula, inputs, value, unit="ratio")
+            safety["calculation_inputs"][key] = [dict(row) for row in inputs]
     _safety_set(safety, "interest_coverage", None, "operating-income/interest-expense concepts not in store")
     debt_up = _debt_up_yoy(rows)
     safety["debt_up_yoy"] = debt_up
@@ -1451,6 +1658,7 @@ def _shares_store_payload(
 ) -> dict[str, object]:
     """Live-path shares-outstanding payload anchored on the latest row."""
     return {
+        **row,
         "ticker": ticker,
         "shares_outstanding": shares_value,
         "as_of": _stored_opt_text(row.get("period_end")) or "",
@@ -1458,7 +1666,7 @@ def _shares_store_payload(
         "note": "SEC-reported shares outstanding, not public float",
         "filed_at": _stored_text(row.get("filed_at")),
         "accession": row.get("accession"),
-        "cik": cik,
+        "cik": row.get("cik", cik),
         "source_url": row.get("source_url"),
         "known_at": _stored_text(row.get("known_at")),
     }

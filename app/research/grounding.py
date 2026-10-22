@@ -20,9 +20,19 @@ __all__ = [
     "check_grounded_analysis",
     "compute_scenario_impact",
     "format_grounded_block",
+    "numeric_tokens",
     "parse_percent",
     "split_grounded_context",
 ]
+
+_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+_FORM_RE = re.compile(r"\b(?:\d{1,2}-[A-Z]{1,2}|[A-Z]{1,2}-\d{1,2}|13[DFG](?:-HR)?|DEF ?14A|424B\d)(?:/A)?\b")
+"""SEC form identifiers (10-K, 8-K, 20-F, S-1, F-3, 13F-HR, DEF 14A, 424B5, .../A): names, never datapoints."""
+
+
+def numeric_tokens(text: str) -> set[str]:
+    """Numeric tokens of one text, SEC form names skipped, thousands separators dropped ("$1,234.5" -> "1234.5")."""
+    return {token.replace(",", "") for token in _NUMBER_RE.findall(_FORM_RE.sub(" ", text))}
 
 
 def _field(record: object, name: str, default: object = None) -> object:
@@ -112,16 +122,16 @@ def format_grounded_block(record: object) -> str:
 
 
 def _check_quote_verbatim(evidence_id: object, quote: str, texts: dict[str, str] | None) -> None:
-    """Verbatim: the quote must reproduce stored bytes, never a paraphrase."""
-    if texts is None or not isinstance(evidence_id, str):
-        return
-    source = texts.get(evidence_id)
-    if source is not None and quote.strip() not in source:
+    """Verbatim: the quote must reproduce stored bytes, never a paraphrase; absent bytes fail closed."""
+    source = texts.get(evidence_id) if texts is not None and isinstance(evidence_id, str) else None
+    if source is None:
+        raise ValueError(f"analysis numbers[] quote for {evidence_id!r}: ERR_SOURCE_BYTES_ABSENT (no stored content)")
+    if quote.strip() not in source:
         raise ValueError(f"analysis numbers[] quote for {evidence_id!r} not found in evidence content")
 
 
 def _check_number_entry(entry: object, refs: set[str], texts: dict[str, str] | None = None) -> None:
-    """One numbers[] entry: non-empty value, evidenceId inside refs, verbatim quote from stored bytes."""
+    """One numbers[] entry: non-empty value inside its verbatim quote, evidenceId inside refs, quote from stored bytes."""
     if not isinstance(entry, Mapping):
         raise ValueError(f"analysis numbers[] entries must be mappings, got {entry!r}")  # noqa: TRY004 - public error contract pins ValueError, tests are oracle
     value: object = entry.get("value")
@@ -134,6 +144,9 @@ def _check_number_entry(entry: object, refs: set[str], texts: dict[str, str] | N
     quote: object = entry.get("quote")
     if not isinstance(quote, str) or not quote.strip():
         raise ValueError("analysis numbers[] quote must be a non-empty string")
+    # A real quote next to a different number is still a fabricated number.
+    if value.strip() not in quote:
+        raise ValueError(f"analysis numbers[] value {value.strip()!r} not in quote")
     _check_quote_verbatim(evidence_id, quote, texts)
 
 

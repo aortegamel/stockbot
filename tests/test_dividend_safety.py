@@ -285,6 +285,26 @@ def test_healthy_safety_ratios(gateway: _Gateway, monkeypatch: pytest.MonkeyPatc
     assert flags["high_absolute_yield"]["status"] is None
     assert flags["growth_decelerating"]["status"] is None
     assert safety["dividend_vs_fcf_growth_5y"]["verdict"] == "insufficient_data"
+    calculations = safety["calculations"]
+    assert isinstance(calculations, dict)
+    assert calculations["ttm_fcf"]["formulaId"] == "sec_fcf"
+    assert calculations["ttm_fcf"]["formulaVersion"] == "1"
+    assert calculations["fcf_payout_ratio"]["formulaId"] == "sec_ratio"
+    assert calculations["fcf_coverage"]["formulaId"] == "sec_ratio"
+    safety_inputs = safety["calculation_inputs"]
+    assert isinstance(safety_inputs, dict)
+    ttm_fcf_inputs = safety_inputs["ttm_fcf"]
+    assert isinstance(ttm_fcf_inputs, list)
+    assert [row["formulaId"] for row in ttm_fcf_inputs] == ["sec_cash_ttm", "sec_cash_outflow_ttm"]
+    assert ttm_fcf_inputs[0]["derivation_inputs"][0]["concept"] == "OperatingCashFlow"
+    calculations = result["calculations"]
+    assert isinstance(calculations, dict)
+    assert calculations["ttm_dividend_per_share"]["verification"] == "unverified"
+    result_inputs = result["calculation_inputs"]
+    assert isinstance(result_inputs, dict)
+    ttm_dps_inputs = result_inputs["ttm_dividend_per_share"]
+    assert isinstance(ttm_dps_inputs, list)
+    assert ttm_dps_inputs[0]["concept"] == "CommonStockDividendsPerShareDeclared"
 
 
 def test_negative_eps_nulls_payout_with_flag(gateway: _Gateway, monkeypatch: pytest.MonkeyPatch) -> None:
