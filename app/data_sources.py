@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from . import finra_client as _finra
@@ -71,19 +71,25 @@ def _ticker_aliases_of(alias_rows: object) -> list[TickerAlias]:
     return built
 
 
+# Sole writer refresh_sec_tickers runs per FINRA settlement (twice a month): two cycles fit in 31 days.
+_TICKER_SNAPSHOT_MAX_AGE = timedelta(days=31)
+
+
 def _latest_ticker_snapshot(as_of: datetime) -> ArchiveRecord | None:
-    """Select the last archived snapshot at the requested knowledge horizon."""
+    """Last archived snapshot at the knowledge horizon; None when absent or older than the max age."""
     from .config import get_data_root
     from .storage import raw_archive
 
-    horizon = as_of.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    moment = as_of.astimezone(UTC)
+    horizon = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    floor = (moment - _TICKER_SNAPSHOT_MAX_AGE).strftime("%Y-%m-%dT%H:%M:%SZ")
     latest: raw_archive.ArchiveRecord | None = None
     latest_retrieved = ""
     for record in raw_archive.iter_archive("sec", "company_tickers", "company_tickers", root=get_data_root() / "raw"):
         retrieved = record.retrieved_at if isinstance(record.retrieved_at, str) else ""
-        # Latest-wins mapping is valid indefinitely; a reassignment inside the gap is invisible.
-        # Strict PIT would bracket coverage and return unresolved (future work, not this change).
-        if retrieved and retrieved <= horizon and (latest is None or retrieved >= latest_retrieved):
+        # ponytail: TTL bounds snapshot age only; a reassignment inside the window is still invisible.
+        # Strict PIT would bracket coverage between snapshots and return unresolved.
+        if retrieved and floor <= retrieved <= horizon and (latest is None or retrieved >= latest_retrieved):
             latest, latest_retrieved = record, retrieved
     return latest
 
@@ -256,7 +262,7 @@ class SourceGateway:
     def ticker_candidates(self, ticker: str, as_of: datetime) -> list[TickerAlias]:
         """Company-tickers aliases for one ticker; historical views read archived snapshots.
 
-        With an archive snapshot at or before ``as_of``, rows carry that snapshot's
+        With an archive snapshot at or before ``as_of`` and inside ``_TICKER_SNAPSHOT_MAX_AGE``, rows carry its
         ``retrieved_at`` as ``known_at`` so ``resolve_ticker_aliases`` admits them.
         Without one, the live universe applies (still now-stamped, so a historical
         view honestly resolves ``unresolved``). PIT stays with the resolver.

@@ -453,8 +453,9 @@ def test_refresh_sec_tickers_archives_and_returns_inline_counts(tmp_path: Path, 
 
 
 def test_ticker_candidates_reads_snapshot_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Historical ticker views resolve from archived company_tickers snapshots, not the live universe."""
-    from datetime import UTC, datetime
+    """Historical ticker views resolve from a fresh archived snapshot; a stale or missing one never answers."""
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
 
     from app import data_sources as _ds
     from app.domain.market.identity import resolve_ticker_aliases
@@ -480,13 +481,37 @@ def test_ticker_candidates_reads_snapshot_history(tmp_path: Path, monkeypatch: p
         retrieved_at="2026-05-01T00:00:00Z",
         root=tmp_path / "raw",
     )
-    mid = datetime(2025, 6, 1, tzinfo=UTC)
-    aliases = _ds.SourceGateway().ticker_candidates("AAA", mid)
+    live = {"0": {"cik_str": 333, "ticker": "AAA", "title": "Live AAA"}}
+
+    def _live_get(url: str) -> object:
+        del url
+        return SimpleNamespace(content=json.dumps(live).encode())
+
+    def _live_inspect(response: object) -> None:
+        del response
+
+    monkeypatch.setattr(_ds._sec, "ensure_identity", lambda: None)
+    monkeypatch.setattr("edgar.httprequests.get_with_retry", _live_get)
+    monkeypatch.setattr("edgar.httprequests.inspect_response", _live_inspect)
+
+    def entities(as_of: datetime) -> list[str]:
+        return [a.entity_id for a in _ds.SourceGateway().ticker_candidates("AAA", as_of)]
+
+    fresh = datetime(2024, 5, 15, tzinfo=UTC)
+    aliases = _ds.SourceGateway().ticker_candidates("AAA", fresh)
     assert [a.entity_id for a in aliases] == ["sec:cik:0000000111"]
-    assert resolve_ticker_aliases("AAA", aliases, as_of=mid).entity_id == "sec:cik:0000000111"
-    assert resolve_ticker_aliases("AAA", aliases, as_of=datetime(2023, 1, 1, tzinfo=UTC)).resolved is False
-    late = datetime(2026, 6, 1, tzinfo=UTC)
-    assert [a.entity_id for a in _ds.SourceGateway().ticker_candidates("AAA", late)] == ["sec:cik:0000000222"]
+    assert resolve_ticker_aliases("AAA", aliases, as_of=fresh).entity_id == "sec:cik:0000000111"
+    # 13 months after the old snapshot it is stale: the now-stamped live universe answers, so PIT reads unresolved.
+    mid = datetime(2025, 6, 1, tzinfo=UTC)
+    stale = _ds.SourceGateway().ticker_candidates("AAA", mid)
+    assert [a.entity_id for a in stale] == ["sec:cik:0000000333"]
+    assert resolve_ticker_aliases("AAA", stale, as_of=mid).resolved is False
+    # Inclusive 31-day bound at second precision: age == max age resolves, one second more expires.
+    edge = datetime(2026, 6, 1, tzinfo=UTC)
+    assert entities(edge) == ["sec:cik:0000000222"]
+    assert entities(edge + timedelta(seconds=1)) == ["sec:cik:0000000333"]
+    # Before the first snapshot no archived mapping applies.
+    assert entities(datetime(2024, 4, 30, tzinfo=UTC)) == ["sec:cik:0000000333"]
 
 
 def test_ticker_candidates_degrade_to_live_universe_on_corrupt_snapshot(

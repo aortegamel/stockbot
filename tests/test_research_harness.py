@@ -746,7 +746,7 @@ def test_post_cutoff_ticker_reassignment_never_backdates_a_session(
     )
     assert verify_observation(row, value="100", source_bytes=raw, as_of=cutoff).status == "verified"
     # Rebuilding past the reassignment, or with no cutoff, never re-verifies the alias.
-    later = datetime(2025, 9, 1, tzinfo=UTC)
+    later = datetime(2025, 7, 15, tzinfo=UTC)
     for as_of in (later, None):
         assert verify_observation(row, value="100", source_bytes=raw, as_of=as_of).status == "conflicted"
 
@@ -757,7 +757,7 @@ def test_post_cutoff_ticker_reassignment_never_backdates_a_session(
         pytest.param(
             {"ticker": "NVDA", "cik": 9999},
             9999,
-            datetime(2025, 9, 1, tzinfo=UTC),
+            datetime(2025, 7, 15, tzinfo=UTC),
             "9999",
             1045810,
             id="after-reassignment",
@@ -829,7 +829,7 @@ def test_envelope_snapshot_conflict_rejects_whole_datapoint(
     monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
     _archive_tickers(tmp_path, 1045810, "2025-05-01T00:00:00Z")
     _archive_tickers(tmp_path, 9999, "2025-07-01T00:00:00Z")  # NVDA reassigned after the cutoff
-    cutoff, later = datetime(2025, 6, 1, tzinfo=UTC), datetime(2025, 9, 1, tzinfo=UTC)
+    cutoff, later = datetime(2025, 6, 1, tzinfo=UTC), datetime(2025, 7, 15, tzinfo=UTC)
     prov, raw = _alias_source({**_ALIAS_ROW, "cik": row_cik}, {"ticker": "NVDA", "cik": 9999})
     selectors = {"metric": "revenue", "value": "100", "period": "2025-04-27"}
     for entity in ("NVDA", str(row_cik)):
