@@ -931,14 +931,14 @@ def _promote_observation(
     }
     replay = _finra_provenance if domain == "FINRA" else _sec_record_provenance
     provenance = replay(data, None, store=store, session_id=session_id)
-    proof, source_bytes, descriptor = _admission_observation_proof(store, provenance, datapoint)
+    found = _open_session(store, session_id)
+    proof, source_bytes, descriptor = _admission_observation_proof(store, provenance, datapoint, found.as_of)
     interval: dict[str, JSONValue] = {
         name: _text(row.get(name)) for name in ("period_start", "period_end") if _text(row.get(name))
     }
     content = (
         f"{datapoint['metric']} = {datapoint['value']} (repair {artifact['repair_id']} of {artifact['evidence_id']})"
     )
-    found = _open_session(store, session_id)
     record = _build_evidence_record(
         data,
         session_id=session_id,

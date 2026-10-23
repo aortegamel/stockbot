@@ -389,7 +389,7 @@ def _is_calculation(row: Mapping[str, object]) -> bool:
 
 
 def _audit_verification(
-    row: Mapping[str, object], by_id: Mapping[str, Mapping[str, object]], depth: int
+    row: Mapping[str, object], by_id: Mapping[str, Mapping[str, object]], depth: int, as_of: str
 ) -> tuple[str, str]:
     """Replay the canonical proof instead of trusting a persisted status."""
     from app.research.evidence import evidence_from_dict
@@ -399,7 +399,7 @@ def _audit_verification(
         evidence = evidence_from_dict(row)
     except ValueError as exc:
         return "unverified", f"Ledger integrity failed: {exc}"
-    verdict = _proof_verdict(by_id, evidence, evidence.value, depth)
+    verdict = _proof_verdict(by_id, evidence, evidence.value, depth, as_of=as_of)
     return verdict.status, verdict.reason
 
 
@@ -438,7 +438,7 @@ def _calculation_view(
     raw_proof = row.get("proof")
     proof = raw_proof if isinstance(raw_proof, Mapping) else {}
     calculated = _is_calculation(row)
-    status, reason = _audit_verification(row, by_id, len(ancestors))
+    status, reason = _audit_verification(row, by_id, len(ancestors), as_of)
     view: dict[str, object] = {
         "evidence_id": evidence_id,
         "claim_type": "calculation" if calculated else row.get("claim_kind", "observed_fact"),

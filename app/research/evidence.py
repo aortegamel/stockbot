@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
@@ -662,13 +662,130 @@ def _record_field(row: Mapping[str, object], metric: str) -> tuple[str, str]:
     return hits[0]
 
 
-def _record_label(
-    row: Mapping[str, object], payload: Mapping[str, object], keys: tuple[str, ...], claimed: str | None, label: str
-) -> str | None:
-    """Source spelling of one identity field (row first, else payload); a disagreeing claim fails closed.
+_TICKER_KEYS = ("ticker", "symbol")
+_CIK_KEYS = ("cik", "issuer_cik", "subject_cik", "entity_id")
+_UNIT_ALIASES = {"usd": ("$", "usd", "dollar"), "%": ("%", "percent"), "percent": ("%", "percent")}
+"""Symbol spellings a claim may use for a source unit; any other unit is stated by its own words."""
+_OWN_PERIOD_FILED_DAYS = 120
+"""A fact ends at most this long before its filing: 10-K deadline 90 days plus a 15-day Rule 12b-25 extension.
 
-    Entity and period are required. A unit absent from the source stays None,
-    and a claimed unit the source never states fails closed.
+Comparative facts end at least about a year earlier, yet SEC tags them with the filing's own fiscal_year/fiscal_period.
+"""
+
+
+def _cik(text: str) -> int | None:
+    """CIK of a CIK spelling ("1045810", "0001045810", "sec:cik:0001045810"); None for any other text."""
+    digits = text.removeprefix("sec:cik:")
+    return int(digits) if digits.isdecimal() else None
+
+
+def _spellings(source: Mapping[str, object], keys: tuple[str, ...]) -> list[str]:
+    return list(dict.fromkeys(text for key in keys if (text := _scalar_text(source.get(key))) is not None))
+
+
+def _snapshot_cik(ticker: str, as_of: datetime | str | None) -> str | None:
+    """Entity id the company_tickers snapshot archived by the session cutoff gives ``ticker``.
+
+    No tz-aware cutoff fails closed (None); never a live lookup.
+    """
+    try:
+        moment = datetime.fromisoformat(as_of) if isinstance(as_of, str) else as_of
+    except ValueError:
+        return None
+    if moment is None or moment.tzinfo is None:
+        return None
+    from app.data_sources import _archived_ticker_aliases
+    from app.domain.market.identity import resolve_ticker_aliases
+
+    want = ticker.upper()
+    aliases = _archived_ticker_aliases(want, moment)
+    resolved = resolve_ticker_aliases(want, aliases, as_of=moment) if aliases else None
+    return resolved.entity_id if resolved is not None and resolved.resolved else None
+
+
+def _entity_pairs(
+    source: Mapping[str, object], payload: Mapping[str, object], claimed: str, as_of: datetime | str | None
+) -> Iterator[tuple[str, str]]:
+    """(ticker, CIK) spellings paired by the result envelope, else by the point-in-time ticker snapshot."""
+    tickers = [text for text in _spellings(payload, _TICKER_KEYS) if _cik(text) is None]
+    ciks = _spellings(payload, _CIK_KEYS)
+    if len(tickers) == 1 and ciks and len({_cik(text) for text in ciks} - {None}) == 1:
+        yield tickers[0], next(text for text in ciks if _cik(text) is not None)
+    for ticker in dict.fromkeys((claimed, *_spellings(source, _TICKER_KEYS), *tickers)):
+        if _cik(ticker) is None and (entity_id := _snapshot_cik(ticker, as_of)) is not None:
+            yield ticker.upper(), entity_id
+
+
+def _entity_alias(values: list[str], pairs: Iterator[tuple[str, str]], claimed: str) -> tuple[str, str] | None:
+    """(source spelling, claimed display spelling) when one deterministic ticker/CIK pair links them."""
+    want = _cik(claimed)
+    for ticker, cik in pairs:
+        if want is None and claimed.casefold() == ticker.casefold():
+            hit = next((text for text in values if _cik(text) == _cik(cik)), None)
+            display = ticker
+        elif want is not None and want == _cik(cik):
+            hit = next((text for text in values if text.casefold() == ticker.casefold()), None)
+            display = str(want)
+        else:
+            continue
+        if hit is not None:
+            return hit, display
+    return None
+
+
+def _fiscal_label(source: Mapping[str, object]) -> tuple[str, str] | None:
+    """(period_end, "Qn FYyyyy" or "FYyyyy") when the fiscal fields name the filing's own period, else None."""
+    from app.services.sec_facts import _FY_DAYS, _QUARTER_DAYS
+
+    fiscal_period = (_scalar_text(source.get("fiscal_period")) or "").upper()
+    fiscal_year = _scalar_text(source.get("fiscal_year")) or ""
+    end, start = _scalar_text(source.get("period_end")), _scalar_text(source.get("period_start"))
+    filed = _scalar_text(source.get("filed_at")) or _scalar_text(source.get("filed"))
+    bounds = _FY_DAYS if fiscal_period == "FY" else _QUARTER_DAYS if re.fullmatch(r"Q[1-4]", fiscal_period) else None
+    if bounds is None or not re.fullmatch(r"\d{4}", fiscal_year) or not (end and start and filed):
+        return None
+    try:
+        days = (date.fromisoformat(end[:10]) - date.fromisoformat(start[:10])).days
+        lag = (date.fromisoformat(filed[:10]) - date.fromisoformat(end[:10])).days
+    except ValueError:
+        return None
+    if not (bounds[0] <= days <= bounds[1] and 0 <= lag <= _OWN_PERIOD_FILED_DAYS):
+        return None
+    return end, f"FY{fiscal_year}" if fiscal_period == "FY" else f"{fiscal_period} FY{fiscal_year}"
+
+
+def _unit_word(word: str, part: str) -> bool:
+    """A word names one unit part by symbol, word, or singular/plural form; never by prefix."""
+    return any(word in (name, f"{name}s") or f"{word}s" == name for name in _UNIT_ALIASES.get(part, (part,)))
+
+
+def _unit_alias(values: list[str], claimed: str) -> str | None:
+    """Source unit whose every part the claim names by symbol, word, or singular/plural form; no scaling."""
+    wanted = re.split(r"\s*/\s*|\s+per\s+", claimed.casefold().strip())
+    for text in values:
+        parts = text.casefold().split("/")
+        if len(parts) == len(wanted) and all(_unit_word(want, part) for want, part in zip(wanted, parts, strict=True)):
+            return text
+    return None
+
+
+_Alias = Callable[[Mapping[str, object], list[str], str], tuple[str, str] | None]
+
+
+def _record_label(
+    row: Mapping[str, object],
+    payload: Mapping[str, object],
+    keys: tuple[str, ...],
+    claimed: str | None,
+    label: str,
+    alias: _Alias,
+) -> tuple[str | None, str | None]:
+    """(source spelling, alias display spelling or None) of one identity field: row first, else payload.
+
+    A claim selects a source value by exact casefold spelling, else by one
+    deterministic alias of that source; anything else fails closed. Entity and
+    period are required. A unit absent from the source stays None, and a claimed
+    unit the source never states fails closed.
     """
     for source in (row, payload):
         values = [text for key in keys if (text := _scalar_text(source.get(key))) is not None]
@@ -677,20 +794,30 @@ def _record_label(
         if claimed is None:
             if label != "unit" or len(set(values)) > 1:
                 raise ValueError(f"datapoint {label} is required")
-            return values[0]
+            return values[0], None
         for text in values:
             if text.casefold() == claimed.casefold():
-                return text
+                return text, None
+        aliased = alias(source, values, claimed)
+        if aliased is not None:
+            return aliased
         raise ValueError(f"{label} {claimed!r} is not the cited record's {label}")
     if label == "unit" and claimed is None:
-        return None
+        return None, None
     raise ValueError(f"the cited record states no {label}")
 
 
 def _record_datapoint(
-    provenance: Mapping[str, object], source_bytes: bytes, claimed: Mapping[str, str | None]
+    provenance: Mapping[str, object],
+    source_bytes: bytes,
+    claimed: Mapping[str, str | None],
+    as_of: datetime | str | None,
 ) -> dict[str, JSONValue]:
-    """Descriptor body of one structured-record datapoint: the exact field of the one cited row."""
+    """Descriptor body of one structured-record datapoint: the exact field of the one cited row.
+
+    ``aliases`` holds the display spelling of each identity a claim selected
+    through a ticker/CIK pair, a fiscal-quarter label, or a unit symbol.
+    """
     try:
         result = json.loads(source_bytes)
     except ValueError:
@@ -705,15 +832,45 @@ def _record_datapoint(
     value = _scalar_text(row.get(field_key))
     if value is None or value != claimed["value"]:
         raise ValueError(f"value {claimed['value']!r} is not the exact {field_key!r} field value")
-    return {
+    labels = {
+        "entity": _record_label(
+            row,
+            payload,
+            _ENTITY_KEYS,
+            claimed["entity"],
+            "entity",
+            lambda source, values, want: _entity_alias(values, _entity_pairs(source, payload, want, as_of), want),
+        ),
+        "period": _record_label(
+            row,
+            payload,
+            _PERIOD_KEYS,
+            claimed["period"],
+            "period",
+            lambda source, _values, want: (
+                found if (found := _fiscal_label(source)) and found[1].casefold() == want.casefold() else None
+            ),
+        ),
+        "unit": _record_label(
+            row,
+            payload,
+            _UNIT_KEYS,
+            claimed["unit"],
+            "unit",
+            lambda _source, values, want: (text, want) if (text := _unit_alias(values, want)) else None,
+        ),
+    }
+    body: dict[str, JSONValue] = {
         "metric": metric,
         "field": field_key,
         "value": value,
-        "entity": _record_label(row, payload, _ENTITY_KEYS, claimed["entity"], "entity"),
-        "period": _record_label(row, payload, _PERIOD_KEYS, claimed["period"], "period"),
-        "unit": _record_label(row, payload, _UNIT_KEYS, claimed["unit"], "unit"),
+        **{key: spelling for key, (spelling, _) in labels.items()},
         "statement": json.dumps(dict(row), sort_keys=True, default=str),
     }
+    aliases: dict[str, JSONValue] = {key: shown for key, (_, shown) in labels.items() if shown is not None}
+    if aliases:
+        body["aliases"] = aliases
+    return body
 
 
 def _phrase(text: str) -> re.Pattern[str]:
@@ -727,22 +884,142 @@ def _phrase(text: str) -> re.Pattern[str]:
     return re.compile(f"{head}{body}{tail}", re.IGNORECASE)
 
 
-def _passage_label(passage: str, claimed: str | None, label: str) -> str | None:
-    """Source spelling of an entity/period/unit the labeled passage states; absent fails closed."""
-    if claimed is None:
+_ROW_CELL = " | "
+"""Cell separator of a rendered table row (``app.sec.documents``)."""
+_LINKING_WORDS = frozenset(
+    {"a", "an", "the", "of", "in", "for", "at", "on", "as", "is", "are", "was", "were", "s", "to", "record"}
+    | {"totaled", "totalled", "amounted", "reached", "reported", "recorded", "stood", "during"}
+    | {"approximately", "about", "around", "roughly"}
+    | {"thousand", "thousands", "million", "millions", "billion", "billions", "trillion", "trillions"}
+)
+"""Words that may join a metric label to its value; ``by`` (a change amount) or another label never does."""
+_LEVEL_CHANGE = re.compile(r"\b(?:increased|rose|grew|decreased|fell|declined)\s+to\b", re.IGNORECASE)
+"""A change verb links a label to a value only with ``to`` (the new level); ``increased 5`` states the change."""
+_LABEL_OPENERS = frozenset({"the", "its", "their", "our", "reported", "recorded", "posted", "had", "has"})
+"""Words that may directly precede a metric label without modifying it (never ``cost of`` / ``data center``).
+
+A stated entity/period (optionally possessive) may also directly precede it: ``NVDA's Q1 FY2025 revenue``.
+"""
+
+
+def _unstated(text: str, phrases: Sequence[str | None]) -> str:
+    """Text with every given phrase blanked."""
+    for phrase in phrases:
+        text = _phrase(phrase).sub(" ", text) if phrase else text
+    return text
+
+
+def _context_label(
+    passage: str, cutoff: int, scope: str, claimed: Mapping[str, str | None], label: str, column: tuple[int, int] | None
+) -> str | None:
+    """Source spelling of an entity/period/unit: the value's own statement first, else the context before it.
+
+    Prose takes the last earlier mention (heading or sentence) when no other value
+    follows it. A table row takes its own column header cell or a heading line;
+    a heading period over several value columns is ambiguous. Absent fails closed.
+    """
+    wanted = claimed[label]
+    if wanted is None:
         if label == "unit":
             return None
         raise ValueError(f"datapoint {label} is required")
-    found = _phrase(claimed).search(passage)
+    pattern = _phrase(wanted)
+    found = pattern.search(scope)
+    if found is not None:
+        return found.group(0)
+    before = passage[:cutoff]
+    identity = [claimed["entity"], claimed["period"], claimed["unit"]]
+    if column is None:
+        mentions = list(pattern.finditer(before))
+        if mentions and not re.search(r"[0-9]", _unstated(before[mentions[-1].end() :], identity)):
+            return mentions[-1].group(0)
+        raise ValueError(f"{label} {wanted!r} is not stated in the value's statement or the context before it")
+    index, count = column
+    for line in reversed(before.split("\n")):
+        found = pattern.search(line)
+        if found is None:
+            continue
+        if _ROW_CELL not in line:
+            if label == "period" and count > 1:
+                raise ValueError(f"period {wanted!r} heads every value column of the table row")
+            return found.group(0)
+        cells = line.split(_ROW_CELL)
+        if [i for i, cell in enumerate(cells) if pattern.search(cell)] != [len(cells) - count + index]:
+            raise ValueError(f"{label} {wanted!r} heads another column than value {claimed['value']!r}")
+        return found.group(0)
+    raise ValueError(f"{label} {wanted!r} is not stated in the value's table row or the context before it")
+
+
+def _row_metric(line: str, at: int, claimed: Mapping[str, str | None]) -> tuple[str, str, tuple[int, int]]:
+    """(metric spelling, row header, (value column, value column count)) of one table row.
+
+    The row header (cells before the first numeric cell) names exactly the metric,
+    apart from stated identity; the value's cell states no other number.
+    """
+    cells: list[tuple[int, str]] = []
+    offset = 0
+    for cell in line.split(_ROW_CELL):
+        cells.append((offset, cell))
+        offset += len(cell) + len(_ROW_CELL)
+    numeric = [
+        (start, cell)
+        for start, cell in cells
+        if start <= at < start + len(cell) or (re.search(r"[0-9]", cell) and not re.search(r"[A-Za-z]", cell))
+    ]
+    column = next(i for i, (start, cell) in enumerate(numeric) if start <= at < start + len(cell))
+    identity = [claimed["entity"], claimed["period"], claimed["unit"]]
+    if re.search(r"[0-9]", _unstated(numeric[column][1], [claimed["value"], *identity])):
+        raise ValueError("the source statement contains an unrelated metric or value")
+    header = " ".join(cell for start, cell in cells if start < numeric[0][0])
+    metric = str(claimed["metric"])
+    found = _phrase(metric).search(header)
     if found is None:
-        raise ValueError(f"{label} {claimed!r} is not stated in the located passage")
-    return found.group(0)
+        raise ValueError(f"metric {metric!r} does not label the value's source statement")
+    if _norm_key(_unstated(header, identity)) != _norm_key(metric):
+        raise ValueError(f"the source statement contains an unrelated metric or value: row {header.strip()!r}")
+    return found.group(0), header, (column, len(numeric))
+
+
+def _prose_metric(
+    passage: str,
+    sentence_start: int,
+    start: int,
+    statement: str,
+    claimed: Mapping[str, str | None],
+    identity: list[str | None],
+) -> str:
+    """Source metric spelling of one prose value.
+
+    The metric label directly heads the value: only linking words join them, no
+    modifier or second label precedes the label, and the sentence states no other value.
+    """
+    metric, value = str(claimed["metric"]), str(claimed["value"])
+    labels = list(_phrase(metric).finditer(passage, sentence_start, start))
+    if not labels:
+        raise ValueError(f"metric {metric!r} does not label the value's source statement")
+    between = _unstated(passage[labels[-1].end() : start], identity)
+    if re.search(r"[0-9]", between):
+        raise ValueError(f"metric {metric!r} labels another number before value {value!r}")
+    opener = re.sub(r"['\u2019]s$", "", passage[sentence_start : labels[-1].start()].rstrip())
+    adjoined = any(
+        phrase and re.search(f"(?:{_phrase(phrase).pattern})$", opener, re.IGNORECASE) for phrase in identity
+    )
+    words = re.findall(r"[0-9A-Za-z]+", opener.casefold())
+    joined = set(re.findall(r"[0-9A-Za-z]+", _LEVEL_CHANGE.sub(" ", between).casefold())) - _LINKING_WORDS
+    if joined or (opener[-1:].isalnum() and not adjoined and words[-1] not in _LABEL_OPENERS):
+        raise ValueError(f"the source statement contains an unrelated metric or value beside metric {metric!r}")
+    if re.search(r"[0-9]", _unstated(statement, [metric, value, *identity])):
+        raise ValueError("the source statement contains an unrelated metric or value")
+    return labels[-1].group(0)
 
 
 def _passage_datapoint(provenance: Mapping[str, object], claimed: Mapping[str, str | None]) -> dict[str, JSONValue]:
-    """Bind one metric, value and identity within one sentence of a located passage.
+    """Bind one metric and value within one sentence or table row of a located passage.
 
-    Reject additional metrics, values and identity from other sentences.
+    Entity, period and unit come from that statement, else from the context
+    before it: headings, earlier sentences, or the value's column header.
+    ponytail: words after the value stay unchecked ("$5 million from services"), so a
+    trailing qualifier can narrow the metric; add a tail rule when sources show it.
     """
     field_key = "passage" if provenance.get("kind") == "sec_source" else "excerpt"
     passage = provenance.get(field_key)
@@ -754,34 +1031,31 @@ def _passage_datapoint(provenance: Mapping[str, object], claimed: Mapping[str, s
         reason = "appears more than once in" if hits else "is not a whole token of"
         raise ValueError(f"value {value!r} {reason} the located {field_key}")
     start, end = hits[0].span()
-    sentence_start = max((m.end() for m in _SENTENCE_BREAK.finditer(passage, 0, start)), default=0)
-    after = _SENTENCE_BREAK.search(passage, end)
-    statement = passage[sentence_start : after.start() if after else len(passage)].strip()
-    entity = _passage_label(statement, claimed["entity"], "entity")
-    period = _passage_label(statement, claimed["period"], "period")
-    unit = _passage_label(statement, claimed["unit"], "unit")
-    labels = list(_phrase(str(claimed["metric"])).finditer(passage, sentence_start, start))
-    if not labels:
-        raise ValueError(f"metric {claimed['metric']!r} does not label the value's source statement")
-    between = passage[labels[-1].end() : start]
-    for stated in (entity, period, unit):
-        between = _phrase(stated).sub(" ", between) if stated else between
-    if re.search(r"[0-9]", between):
-        raise ValueError(f"metric {claimed['metric']!r} labels another number before value {value!r}")
-    remainder = statement
-    for selected in (str(claimed["metric"]), value, entity, period, unit):
-        remainder = _phrase(selected).sub(" ", remainder) if selected else remainder
-    connectors = {"a", "an", "the", "of", "in", "for", "at", "on", "as", "is", "are", "was", "were", "s"}
-    if set(re.findall(r"[0-9A-Za-z]+", remainder.casefold())) - connectors:
-        raise ValueError("the source statement contains an unrelated metric or value")
+    line_start = passage.rfind("\n", 0, start) + 1
+    line_end = passage.find("\n", end)
+    line = passage[line_start : line_end if line_end >= 0 else len(passage)]
+    column: tuple[int, int] | None = None
+    metric: str | None = None
+    if _ROW_CELL in line:
+        metric, scope, column = _row_metric(line, start - line_start, claimed)
+        statement, cutoff = line, line_start
+    else:
+        cutoff = max((m.end() for m in _SENTENCE_BREAK.finditer(passage, 0, start)), default=0)
+        after = _SENTENCE_BREAK.search(passage, end)
+        statement = scope = passage[cutoff : after.start() if after else len(passage)]
+    identity = [
+        _context_label(passage, cutoff, scope, claimed, label, column) for label in ("entity", "period", "unit")
+    ]
+    if metric is None:
+        metric = _prose_metric(passage, cutoff, start, statement, claimed, identity)
     return {
-        "metric": labels[-1].group(0),
+        "metric": metric,
         "field": field_key,
         "value": value,
-        "entity": entity,
-        "period": period,
-        "unit": unit,
-        "statement": statement,
+        "entity": identity[0],
+        "period": identity[1],
+        "unit": identity[2],
+        "statement": statement.strip(),
     }
 
 
@@ -800,13 +1074,16 @@ def canonical_datapoint(
     entity: object,
     period: object,
     unit: object = None,
+    as_of: datetime | str | None = None,
 ) -> dict[str, JSONValue]:
     """Kernel-built canonical datapoint descriptor of one observation; ValueError when the source refuses it.
 
     The caller's metric/value/entity/period/unit only select. Every descriptor
     field is read off the source: a structured record's exact field (record rows),
     or a labeled passage sentence (SEC passages, web excerpts). The ``id`` hashes
-    the source revision, the locator, and the descriptor body.
+    the source revision, the locator, and the descriptor body. ``as_of`` is the
+    session cutoff: a ticker the result envelope does not pair resolves only
+    through the company_tickers snapshot archived by then (None fails closed).
     """
     prov = validate_provenance(provenance, "<proof>: 'provenance'")
     locator = _proof_locator(prov)
@@ -823,7 +1100,7 @@ def canonical_datapoint(
     }
     kind = prov.get("kind")
     if kind in ("sec_record", "finra_record"):
-        body = _record_datapoint(prov, source_bytes, claimed)
+        body = _record_datapoint(prov, source_bytes, claimed, as_of)
     elif kind in ("sec_source", "web_source"):
         body = _passage_datapoint(prov, claimed)
     else:
@@ -841,6 +1118,7 @@ def observation_proof(
     entity: object,
     period: object,
     unit: object = None,
+    as_of: datetime | str | None = None,
 ) -> dict[str, JSONValue]:
     """Observation proof: archived source bytes, the locator with its canonical datapoint, and the value hash.
 
@@ -850,7 +1128,14 @@ def observation_proof(
     """
     prov = validate_provenance(provenance, "<proof>: 'provenance'")
     datapoint = canonical_datapoint(
-        provenance=prov, source_bytes=source_bytes, metric=metric, value=value, entity=entity, period=period, unit=unit
+        provenance=prov,
+        source_bytes=source_bytes,
+        metric=metric,
+        value=value,
+        entity=entity,
+        period=period,
+        unit=unit,
+        as_of=as_of,
     )
     locator = _proof_locator(prov)
     assert locator is not None  # canonical_datapoint refuses an unlocated provenance
@@ -1091,13 +1376,15 @@ def _datapoint_verdict(evidence: Evidence, kind: str, value: object) -> ProofVer
     return None
 
 
-def verify_observation(evidence: Evidence, *, value: object, source_bytes: bytes | None) -> ProofVerdict:
+def verify_observation(
+    evidence: Evidence, *, value: object, source_bytes: bytes | None, as_of: datetime | str | None = None
+) -> ProofVerdict:
     """Check one claimed value against an observation row: value hash, locator, archived bytes, datapoint.
 
     ``source_bytes`` are the raw_archive bytes the caller loaded for ``proof.sourceId``;
     None (bytes absent) fails closed as unverified. The stored canonical datapoint
     must rebuild from those bytes exactly; a legacy proof without one stays
-    unverified. Never raises.
+    unverified. ``as_of`` is the row's session cutoff (``canonical_datapoint``). Never raises.
     """
     early = _datapoint_verdict(evidence, "observation", value)
     if early is not None:
@@ -1115,15 +1402,21 @@ def verify_observation(evidence: Evidence, *, value: object, source_bytes: bytes
         return ProofVerdict("unverified", "archived source bytes absent")
     if f"sha256:{sha256(source_bytes).hexdigest()}" != evidence.proof["sourceId"]:
         return ProofVerdict("conflicted", "archived source bytes do not match proof sourceId")
+    # An aliased identity rebuilds from its display spelling; the row still stores the source spelling.
+    shown = datapoint.get("aliases")
+    aliases = dict(shown) if isinstance(shown, Mapping) else {}
+    if any(getattr(evidence, key, None) != datapoint.get(key) for key in aliases):
+        return ProofVerdict("conflicted", "row identity differs from the aliased canonical datapoint")
     try:
         rebuilt = canonical_datapoint(
             provenance=evidence.provenance,
             source_bytes=source_bytes,
             metric=datapoint.get("metric"),
             value=evidence.value,
-            entity=evidence.entity,
-            period=evidence.period,
-            unit=evidence.unit,
+            entity=aliases.get("entity", evidence.entity),
+            period=aliases.get("period", evidence.period),
+            unit=aliases.get("unit", evidence.unit),
+            as_of=as_of,
         )
     except ValueError as exc:
         return ProofVerdict("conflicted", f"canonical datapoint does not rebuild from the source: {exc}")

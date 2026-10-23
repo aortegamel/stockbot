@@ -2274,7 +2274,9 @@ def test_e2e_citations_open_verified_views_with_exact_replay(
     assert e2e.repo.list_evidence(e2e.sid) == before
     assert e2e.repo.list_evidence_repairs(e2e.sid) == []
     verify_freeze(frozen, list(_e2e_rows(e2e).values()))
-    assert service._proof_verdict(service._session_rows(e2e.repo, e2e.sid), rows["finra"], "12345").status == "verified"
+    rows_by_id = service._session_rows(e2e.repo, e2e.sid)
+    cutoff = e2e.repo.get_session(e2e.sid).as_of
+    assert service._proof_verdict(rows_by_id, rows["finra"], "12345", as_of=cutoff).status == "verified"
 
 
 @pytest.mark.parametrize("element_id", ["f-hidden", None], ids=["hidden-fact", "canonical-fact"])

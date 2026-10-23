@@ -539,6 +539,202 @@ def test_cited_record_preserves_exact_string_content() -> None:
     assert cited_record(payload, _json.dumps({**row, "label": "two spaces"})) is None
 
 
+_ALIAS_ROW: dict[str, JSONValue] = {
+    "cik": 1045810,
+    "fiscal_year": 2026,
+    "fiscal_period": "Q1",
+    "period_start": "2025-01-27",
+    "period_end": "2025-04-27",
+    "filed_at": "2025-05-28",
+    "unit": "USD",
+    "revenue": 100,
+}
+
+
+def _alias_source(
+    row: Mapping[str, JSONValue], envelope: Mapping[str, JSONValue]
+) -> tuple[dict[str, JSONValue], bytes]:
+    """(sec_record provenance citing ``row``, persisted tool-result bytes with ``envelope`` and created_at)."""
+    import json as _json
+
+    from app.research.evidence import sec_record_ref
+
+    result = {
+        "tool_result_id": "tr-alias",
+        "created_at": "2025-06-01T00:00:00+00:00",
+        "result": {**envelope, "facts": [dict(row)]},
+    }
+    prov = sec_record_ref(
+        tool_name="get_fundamentals", record_identity=_json.dumps(row, sort_keys=True), tool_result_id="tr-alias"
+    )
+    return prov, _json.dumps(result, sort_keys=True).encode()
+
+
+def test_canonical_datapoint_selects_by_deterministic_aliases() -> None:
+    """Ticker, fiscal label and unit symbol select the source spelling; the descriptor keeps both spellings."""
+    from app.research.evidence import canonical_datapoint, verify_observation
+
+    prov, raw = _alias_source(_ALIAS_ROW, {"ticker": "NVDA", "cik": "0001045810"})
+    point = canonical_datapoint(
+        provenance=prov, source_bytes=raw, metric="revenue", value="100", entity="nvda", period="q1 fy2026", unit="$"
+    )
+    assert (point["entity"], point["period"], point["unit"]) == ("1045810", "2025-04-27", "USD")
+    assert point["aliases"] == {"entity": "NVDA", "period": "Q1 FY2026", "unit": "$"}
+    plain = canonical_datapoint(
+        provenance=prov, source_bytes=raw, metric="revenue", value="100", entity="1045810", period="2025-04-27"
+    )
+    assert "aliases" not in plain and plain["id"] != point["id"]
+    # The row stores the source spelling; verification rebuilds from the stored display spelling.
+    from app.research.evidence import observation_proof
+
+    proof = observation_proof(
+        provenance=prov, source_bytes=raw, metric="revenue", value="100", entity="NVDA", period="Q1 FY2026", unit="$"
+    )
+    row = dataclasses.replace(
+        _ev("EV-ALIAS", "S-proof", 1, datetime(2025, 6, 1, tzinfo=UTC)),
+        provenance=prov,
+        value="100",
+        entity="1045810",
+        period="2025-04-27",
+        unit="USD",
+        proof=proof,
+    )
+    assert verify_observation(row, value="100", source_bytes=raw).status == "verified"
+    swapped = dataclasses.replace(row, period="2025-01-27")
+    assert verify_observation(swapped, value="100", source_bytes=raw).status == "conflicted"
+
+
+@pytest.mark.parametrize(
+    ("row", "envelope", "change", "reason"),
+    [
+        pytest.param(_ALIAS_ROW, {"ticker": "NVDA", "cik": 1045810}, {"entity": "AMD"}, "entity", id="other-ticker"),
+        pytest.param(_ALIAS_ROW, {"ticker": "NVDA", "cik": 2488}, {}, "entity", id="envelope-cik-differs"),
+        pytest.param(_ALIAS_ROW, {"ticker": "NVDA"}, {}, "entity", id="no-cik-no-snapshot"),
+        pytest.param(_ALIAS_ROW, {"ticker": "NVDA", "cik": 1045810}, {"period": "Q2 FY2026"}, "period", id="other-q"),
+        pytest.param(
+            {**_ALIAS_ROW, "period_start": "2024-01-29", "period_end": "2024-04-28"},
+            {"ticker": "NVDA", "cik": 1045810},
+            {},
+            "period",
+            id="comparative-row-keeps-filing-fiscal-tags",
+        ),
+        pytest.param(
+            {**_ALIAS_ROW, "period_start": "2024-10-28"},
+            {"ticker": "NVDA", "cik": 1045810},
+            {},
+            "period",
+            id="ytd-duration-is-not-a-quarter",
+        ),
+        pytest.param(_ALIAS_ROW, {"ticker": "NVDA", "cik": 1045810}, {"unit": "million"}, "unit", id="no-scaling"),
+    ],
+)
+def test_canonical_datapoint_alias_fails_closed(
+    row: Mapping[str, JSONValue],
+    envelope: Mapping[str, JSONValue],
+    change: dict[str, str],
+    reason: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.research.evidence import canonical_datapoint
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))  # no company_tickers snapshot exists
+    prov, raw = _alias_source(row, envelope)
+    selectors = {"metric": "revenue", "value": "100", "entity": "NVDA", "period": "Q1 FY2026", **change}
+    with pytest.raises(ValueError, match=f"not the cited record's {reason}"):
+        canonical_datapoint(provenance=prov, source_bytes=raw, **selectors)
+
+
+def _archive_tickers(root: Path, cik: int, retrieved_at: str, pad: bytes = b"") -> None:
+    """Archive one company_tickers snapshot that maps NVDA to ``cik``; ``pad`` keeps identical maps distinct bytes."""
+    import json as _json
+
+    from app.storage import raw_archive as _archive
+
+    _archive.archive(
+        "sec",
+        "company_tickers",
+        "company_tickers",
+        _json.dumps({"0": {"cik_str": cik, "ticker": "NVDA", "title": "NVIDIA CORP"}}).encode() + pad,
+        url="https://www.sec.gov/files/company_tickers.json",
+        retrieved_at=retrieved_at,
+        root=root / "raw",
+    )
+
+
+def test_canonical_datapoint_maps_ticker_by_archived_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without an envelope CIK, only a company_tickers snapshot archived by the session cutoff maps the ticker."""
+    from app.research.evidence import canonical_datapoint
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    prov, raw = _alias_source(_ALIAS_ROW, {})
+    selectors = {"metric": "revenue", "value": "100", "entity": "NVDA", "period": "2025-04-27"}
+    cutoff = datetime(2025, 6, 1, tzinfo=UTC)
+    _archive_tickers(tmp_path, 1045810, "2025-07-01T00:00:00Z")
+    with pytest.raises(ValueError, match="not the cited record's entity"):
+        canonical_datapoint(provenance=prov, source_bytes=raw, **selectors, as_of=cutoff)  # snapshot postdates cutoff
+    _archive_tickers(tmp_path, 1045810, "2025-05-01T00:00:00Z", pad=b" ")
+    point = canonical_datapoint(provenance=prov, source_bytes=raw, **selectors, as_of=cutoff)
+    assert (point["entity"], point["aliases"]) == ("1045810", {"entity": "NVDA"})
+    with pytest.raises(ValueError, match="not the cited record's entity"):
+        canonical_datapoint(provenance=prov, source_bytes=raw, **{**selectors, "entity": "AMD"}, as_of=cutoff)
+
+
+def test_snapshot_alias_without_session_cutoff_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tool result's created_at never dates a snapshot: no tz-aware session cutoff, no ticker alias."""
+    from app.research.evidence import canonical_datapoint
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    _archive_tickers(tmp_path, 1045810, "2025-05-01T00:00:00Z")  # predates the result's created_at
+    prov, raw = _alias_source(_ALIAS_ROW, {})
+    selectors = {"metric": "revenue", "value": "100", "entity": "NVDA", "period": "2025-04-27"}
+    for as_of in (None, "unbounded", "2025-06-01T00:00:00"):
+        with pytest.raises(ValueError, match="not the cited record's entity"):
+            canonical_datapoint(provenance=prov, source_bytes=raw, **selectors, as_of=as_of)
+    # The exact source spelling needs no snapshot and no cutoff.
+    exact = canonical_datapoint(provenance=prov, source_bytes=raw, **{**selectors, "entity": "1045810"})
+    assert exact["entity"] == "1045810" and "aliases" not in exact
+
+
+def test_post_cutoff_ticker_reassignment_never_backdates_a_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ticker reassigned after the session cutoff keeps its cutoff holder, however late the result persisted."""
+    import json as _json
+
+    from app.research.evidence import canonical_datapoint, observation_proof, verify_observation
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    _archive_tickers(tmp_path, 1045810, "2025-05-01T00:00:00Z")
+    _archive_tickers(tmp_path, 9999, "2025-07-01T00:00:00Z")  # NVDA reassigned after the cutoff
+    cutoff = datetime(2025, 6, 1, tzinfo=UTC)
+    selectors = {"metric": "revenue", "value": "100", "entity": "NVDA", "period": "2025-04-27"}
+
+    def late(row: Mapping[str, JSONValue]) -> tuple[dict[str, JSONValue], bytes]:
+        prov, raw = _alias_source(row, {})
+        return prov, _json.dumps({**_json.loads(raw), "created_at": "2025-08-01T00:00:00+00:00"}).encode()
+
+    prov, raw = late({**_ALIAS_ROW, "cik": 9999})
+    with pytest.raises(ValueError, match="not the cited record's entity"):
+        canonical_datapoint(provenance=prov, source_bytes=raw, **selectors, as_of=cutoff)
+    prov, raw = late(_ALIAS_ROW)
+    proof = observation_proof(provenance=prov, source_bytes=raw, **selectors, as_of=cutoff)
+    row = dataclasses.replace(
+        _ev("EV-PIT", "S-proof", 1, cutoff),
+        provenance=prov,
+        value="100",
+        entity="1045810",
+        period="2025-04-27",
+        unit="USD",
+        proof=proof,
+    )
+    assert verify_observation(row, value="100", source_bytes=raw, as_of=cutoff).status == "verified"
+    # Rebuilding past the reassignment, or with no cutoff, never re-verifies the alias.
+    later = datetime(2025, 9, 1, tzinfo=UTC)
+    for as_of in (later, None):
+        assert verify_observation(row, value="100", source_bytes=raw, as_of=as_of).status == "conflicted"
+
+
 @pytest.mark.parametrize(
     ("change", "reason"),
     [
@@ -570,13 +766,19 @@ def test_canonical_datapoint_binds_labeled_passage_sentence(change: dict[str, st
     [
         "NVDA revenue and net income for Q1 FY2025 were 100 and 50 million.",
         "NVDA revenue and net income for Q1 FY2025 were 100 million.",
-        "NVDA Q1 FY2025. Revenue was 100 million.",
+        "NVDA net income and revenue for Q1 FY2025 were 100 million.",
+        "NVDA Q1 FY2025 cost of revenue was 100 million.",
+        "NVDA Q1 FY2025 Data Center revenue was 100 million.",
+        "NVDA Q1 FY2025 revenue increased 100 million.",
+        "NVDA Q1 FY2025 revenue fell 100 million.",
+        "NVDA Q1 FY2025 revenue increased by 100 million.",
         "NVDA revenue was 100 million. The period was Q1 FY2025.",
         "NVDA Q1 FY2025 revenue was 100. The unit was million.",
         "NVDA Q1 FY2025 revenue was 100 million and margin was 40%.",
+        "Q1 FY2025 revenue was 90 million. NVDA revenue was 100 million.",
     ],
 )
-def test_canonical_datapoint_requires_one_metric_and_identity_in_one_sentence(passage: str) -> None:
+def test_canonical_datapoint_rejects_other_metric_value_or_later_identity(passage: str) -> None:
     from app.research.evidence import canonical_datapoint, web_source_ref
 
     prov = web_source_ref(url="https://example.com/q1", excerpt=passage, tool_result_id="tr-web")
@@ -590,6 +792,82 @@ def test_canonical_datapoint_requires_one_metric_and_identity_in_one_sentence(pa
             period="Q1 FY2025",
             unit="million",
         )
+
+
+@pytest.mark.parametrize(
+    ("passage", "statement"),
+    [
+        ("NVDA Q1 FY2025. Revenue was 100 million.", "Revenue was 100 million."),
+        ("NVDA Q1 FY2025. Revenue increased to 100 million.", "Revenue increased to 100 million."),
+        (
+            "NVDA\nQ1 FY2025 overview\nDuring the quarter, our revenue was approximately $100 million, led by gaming.",
+            "During the quarter, our revenue was approximately $100 million, led by gaming.",
+        ),
+    ],
+)
+def test_canonical_datapoint_takes_identity_from_heading_context(passage: str, statement: str) -> None:
+    from app.research.evidence import canonical_datapoint, web_source_ref
+
+    prov = web_source_ref(url="https://example.com/q1", excerpt=passage, tool_result_id="tr-web")
+    point = canonical_datapoint(
+        provenance=prov,
+        source_bytes=b"archived",
+        metric="revenue",
+        value="100",
+        entity="NVDA",
+        period="Q1 FY2025",
+        unit="million",
+    )
+    assert (str(point["metric"]).casefold(), point["entity"], point["period"], point["unit"]) == (
+        "revenue",
+        "NVDA",
+        "Q1 FY2025",
+        "million",
+    )
+    assert point["statement"] == statement
+
+
+_DP_TABLE = (
+    "NVDA\n"
+    "Condensed Statements of Income (in millions)\n"
+    "Three Months Ended\n"
+    "Q1 FY2025 | Q1 FY2024\n"
+    "Revenue | $ | 26,044 | $ | 7,192\n"
+    "Cost of revenue | 5,638 | 2,544\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("passage", "value", "period", "reason"),
+    [
+        pytest.param(_DP_TABLE, "7,192", "Q1 FY2024", None, id="column-header-period"),
+        pytest.param(_DP_TABLE, "26,044", "Q1 FY2025", None, id="first-column"),
+        pytest.param(_DP_TABLE, "26,044", "Q1 FY2024", "heads another column", id="wrong-column"),
+        pytest.param(_DP_TABLE, "5,638", "Q1 FY2025", "unrelated metric or value", id="cost-of-revenue-row"),
+        pytest.param("NVDA Q1 FY2025 (in millions)\nRevenue | 100", "100", "Q1 FY2025", None, id="heading-one-column"),
+        pytest.param(
+            "NVDA Q1 FY2025 (in millions)\nRevenue | 100 | 90",
+            "100",
+            "Q1 FY2025",
+            "every value column",
+            id="heading-many",
+        ),
+    ],
+)
+def test_canonical_datapoint_binds_table_row_through_headings_and_columns(
+    passage: str, value: str, period: str, reason: str | None
+) -> None:
+    from app.research.evidence import canonical_datapoint, web_source_ref
+
+    prov = web_source_ref(url="https://example.com/q1", excerpt=passage, tool_result_id="tr-web")
+    selectors = {"metric": "revenue", "value": value, "entity": "NVDA", "period": period, "unit": "millions"}
+    if reason is not None:
+        with pytest.raises(ValueError, match=reason):
+            canonical_datapoint(provenance=prov, source_bytes=b"archived", **selectors)
+        return
+    point = canonical_datapoint(provenance=prov, source_bytes=b"archived", **selectors)
+    assert (point["metric"], point["value"], point["period"], point["unit"]) == ("Revenue", value, period, "millions")
+    assert point["statement"] == next(line for line in passage.splitlines() if value in line)
 
 
 def test_verify_rebuilds_canonical_datapoints_and_refuses_legacy_or_altered_proofs() -> None:
@@ -7371,7 +7649,7 @@ def test_hf_sec_record_datapoint_binds_metric_field_at_admission(
     stored = evidence_from_dict(repo.get_evidence(f"{sid}:ev:rev"))
     assert (stored.value, stored.entity, stored.period, stored.unit) == ("100", "NVDA", "2025-04-27", "USD")
     rows = _svc._session_rows(repo, sid)
-    assert _svc._proof_verdict(rows, stored, "100").status == "verified"
+    assert _svc._proof_verdict(rows, stored, "100", as_of=repo.get_session(sid).as_of).status == "verified"
 
 
 def test_hf_finra_caller_known_at_never_overrides_result_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -10890,7 +11168,8 @@ def _rep_promoted(store: ResearchRepository, artifact: Mapping[str, object]) -> 
     row = evidence_from_dict(store.get_evidence(eid))
     assert row.metadata["repair_id"] == artifact["repair_id"]
     assert row.metadata["repaired_evidence_id"] == artifact["evidence_id"]
-    verdict = _proof_verdict(_session_rows(store, row.session_id), row, row.value)
+    cutoff = store.get_session(row.session_id).as_of
+    verdict = _proof_verdict(_session_rows(store, row.session_id), row, row.value, as_of=cutoff)
     assert verdict.status == "verified", verdict.reason
     return row
 
@@ -11346,6 +11625,7 @@ def test_e2e_every_supported_path_replays_from_archive_to_viewer(
     e2e = _e2e_session(tmp_path, monkeypatch)
     rows = _e2e_rows(e2e)
     ledger = _svc._session_rows(e2e.repo, e2e.sid)
+    cutoff = e2e.repo.get_session(e2e.sid).as_of
     # Absence stays a coverage artifact: no evidence id, no freeze membership, no proof.
     assert set(ledger) == set(e2e.ids.values())
     [artifact] = e2e.repo.list_coverage_artifacts(e2e.sid)
@@ -11356,7 +11636,7 @@ def test_e2e_every_supported_path_replays_from_archive_to_viewer(
         assert row.proof["kind"] == kind, key
         assert row.proof["valueHash"] == value_hash(row.value or ""), key
         assert row.known_at is not None and row.known_at <= ASOF, key
-        assert _svc._proof_verdict(ledger, row, row.value).status == "verified", key
+        assert _svc._proof_verdict(ledger, row, row.value, as_of=cutoff).status == "verified", key
         if kind == "observation":
             replay = _svc._proof_bytes(row)
             assert replay is not None and f"sha256:{sha256(replay).hexdigest()}" == row.proof["sourceId"], key
@@ -11773,6 +12053,56 @@ def test_gate_rejects_borrowed_neighbour_metric_label() -> None:
     assert "ERR_STATEMENT_UNVERIFIED" in (_wording_defect(text, [point]) or "")
 
 
+def test_gate_allows_controlled_restatement_and_rejects_unsupported_relations() -> None:
+    """Approximators, source-stated scale words and same-sign change words pass; invented relations fail."""
+    from app.research.service import _binding_defect, _wording_defect
+
+    level: dict[str, object] = {
+        "id": "dp:dc",
+        "metric": "Data Center revenue",
+        "value": "22,563",
+        "entity": "NVDA",
+        "period": "Q1 FY2025",
+        "unit": None,
+        "statement": "NVDA Q1 FY2025 Data Center revenue was $22,563 million",
+    }
+    record = {**level, "value": "22563", "unit": "USD", "statement": '{"dataCenterRevenue": 22563}'}
+    growth: dict[str, object] = {
+        "id": "dp:g",
+        "metric": "revenue growth",
+        "value": "12.5",
+        "entity": "NVDA",
+        "period": "Q1 FY2025",
+        "unit": "%",
+        "formula": "pct_change@1",
+        "inputs": ["dp:a", "dp:b"],
+        "statement": "revenue growth = pct_change@1(revenue=80, revenue=90) = 12.5",
+    }
+    fall = {**growth, "id": "dp:f", "value": "-12.5"}
+    passing = [
+        ("NVDA Data Center revenue for Q1 FY2025 was approximately $22,563 million.", level),
+        ("NVDA revenue growth for Q1 FY2025 increased 12.5%.", growth),
+        ("NVDA revenue growth for Q1 FY2025 fell 12.5%.", fall),
+    ]
+    for text, point in passing:
+        assert _binding_defect(text, [point], "observed_fact") is None, text
+        assert _wording_defect(text, [point]) is None, text
+    failing = [
+        ("NVDA Data Center revenue for Q1 FY2025 was $22,563 billion.", level),
+        ("NVDA Data Center revenue for Q1 FY2025 was $22,563 million.", record),
+        ("NVDA Data Center revenue for Q1 FY2025 increased to $22,563 million.", level),
+        ("NVDA Data Center revenue for Q1 FY2025 was more than $22,563 million.", level),
+        ("NVDA revenue growth for Q1 FY2025 decreased 12.5%.", growth),
+        ("NVDA revenue growth for Q1 FY2025 rose 12.5%.", fall),
+    ]
+    for text, point in failing:
+        assert "ERR_STATEMENT_UNVERIFIED" in (_wording_defect(text, [point]) or ""), text
+    # A change word between a level's label and its value states a change amount, not the level.
+    revenue = {**level, "id": "dp:r", "metric": "revenue", "value": "100", "unit": "%", "statement": "x"}
+    text = "NVDA revenue for Q1 FY2025 increased 100%, revenue growth 12.5%."
+    assert "ERR_DATAPOINT_UNBOUND" in (_binding_defect(text, [revenue, growth], "observed_fact") or "")
+
+
 def test_gate_rejects_swapped_entities_across_sentences() -> None:
     """Each bound value sentence states its own descriptor identity: swapped entities fail."""
     from app.research.service import _binding_defect
@@ -11797,6 +12127,35 @@ def test_gate_rejects_swapped_entities_across_sentences() -> None:
     assert "ERR_DATAPOINT_UNBOUND" in (_binding_defect(joint, points, "observed_fact") or "")
     # Other claim types keep the original claim-wide identity checks.
     assert _binding_defect(swapped, points, "inference") is None
+
+
+def test_gate_accepts_descriptor_alias_spellings() -> None:
+    """A claim may name an identity by its canonical or its deterministic alias spelling, never another."""
+    from app.research.service import _binding_defect, _wording_defect
+
+    point: dict[str, object] = {
+        "id": "dp:alias",
+        "metric": "revenue",
+        "value": "100",
+        "entity": "1045810",
+        "period": "2025-04-27",
+        "unit": "USD",
+        "aliases": {"entity": "NVDA", "period": "Q1 FY2026"},
+        "statement": "{}",
+    }
+    text = "NVDA revenue for Q1 FY2026 was $100."
+    assert _binding_defect(text, [point], "observed_fact") is None
+    assert _wording_defect(text, [point]) is None
+    assert _binding_defect("1045810 revenue for 2025-04-27 was $100.", [point], "observed_fact") is None
+    bare = {key: value for key, value in point.items() if key != "aliases"}
+    assert "ERR_DATAPOINT_UNBOUND" in (_binding_defect(text, [bare], "observed_fact") or "")
+    assert "ERR_DATAPOINT_UNBOUND" in (
+        _binding_defect("AMD revenue for Q1 FY2026 was $100.", [point], "observed_fact") or ""
+    )
+    # A unit is stated by its word, plural or symbol, never by a longer word it prefixes.
+    assert "ERR_DATAPOINT_UNBOUND" in (
+        _binding_defect("NVDA revenue for Q1 FY2026 was 100 USDT.", [point], "observed_fact") or ""
+    )
 
 
 def test_gate_binds_each_shared_value_occurrence_to_its_own_metric() -> None:
@@ -11828,3 +12187,13 @@ def test_gate_binds_each_shared_value_occurrence_to_its_own_metric() -> None:
     ]
     split = "NVDA revenue for 2025 was 100 USD. AMD revenue for 2025 was 100 USD."
     assert _binding_defect(split, cross, "observed_fact") is None
+    # Two different datapoint ids cannot bind the same stated occurrence.
+    twins = [_point("dp:a", "revenue"), _point("dp:b", "revenue")]
+    defect = _binding_defect(one, twins, "observed_fact") or ""
+    assert "ERR_DATAPOINT_UNBOUND" in defect and "binds to several datapoints" in defect
+    assert "dp:a" in defect and "dp:b" in defect
+    # A value whose stated text overlaps another datapoint's occurrence also counts as shared.
+    date = {**_point("dp:a", "report date"), "value": "2025-04-27", "unit": None}
+    year = {**date, "id": "dp:b", "value": "2025"}
+    overlap = _binding_defect("NVDA report date for 2025 likely was 2025-04-27.", [date, year], "inference") or ""
+    assert "binds to several datapoints" in overlap

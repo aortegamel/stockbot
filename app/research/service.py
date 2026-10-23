@@ -22,7 +22,9 @@ from typing import TYPE_CHECKING
 from . import jobs as _jobs
 from . import session as _session
 from .evidence import (
+    _UNIT_ALIASES,
     Evidence,
+    _unit_word,
     datapoint_descriptor,
     evidence_content_hash,
     evidence_domain,
@@ -1789,7 +1791,7 @@ def _persist_evidence_record(
         ledger, record, as_of=found.as_of, on_reject=lambda event, payload: _emit(store, session_id, event, payload)
     )
     _archive_materialized_source(session_id, record.evidence_id, record.retrieved_at, source)
-    _require_admission_proof(store, session_id, record)
+    _require_admission_proof(store, session_id, record, found.as_of)
     stored = evidence_to_dict(record)
     stored_meta = stored.get("metadata")
     attested = {
@@ -1845,11 +1847,13 @@ def _persist_evidence_record(
     return stored
 
 
-def _require_admission_proof(store: ResearchRepository, session_id: str, record: Evidence) -> None:
+def _require_admission_proof(
+    store: ResearchRepository, session_id: str, record: Evidence, as_of: datetime | None
+) -> None:
     """A datapoint row must verify against the bytes just archived (or its recomputed inputs) before commit."""
     if not record.proof:
         return
-    verdict = _proof_verdict(_session_rows(store, session_id), record, record.value)
+    verdict = _proof_verdict(_session_rows(store, session_id), record, record.value, as_of=as_of)
     if verdict.status != "verified":
         code = "ERR_CALCULATION_INVALID" if record.claim_kind == "calculation" else "ERR_DATAPOINT_UNVERIFIED"
         raise ValueError(f"record_evidence: {code} ({verdict.status}: {verdict.reason})")
@@ -1890,7 +1894,7 @@ def _persist_finra_web_record(
             url=record.source_uri or "",
             metadata={"evidence_id": record.evidence_id, "session_id": session_id},
         )
-    _require_admission_proof(store, session_id, record)
+    _require_admission_proof(store, session_id, record, found.as_of)
     stored = evidence_to_dict(record)
     updated_found = (
         found
@@ -2140,10 +2144,12 @@ def _admission_observation_proof(
     store: ResearchRepository,
     observed: MaterializedEvidenceSource | Mapping[str, object],
     datapoint: Mapping[str, object],
+    as_of: datetime | None,
 ) -> tuple[dict[str, JSONValue], bytes, dict[str, JSONValue]]:
     """(observation proof, its source bytes, canonical datapoint); a datapoint the source refuses fails closed.
 
-    ``datapoint`` holds the caller's metric/value/entity/period/unit selectors.
+    ``datapoint`` holds the caller's metric/value/entity/period/unit selectors;
+    ``as_of`` is the session cutoff that alone dates a ticker snapshot alias.
     Store the returned descriptor's value/entity/period/unit on the row.
     """
     from .evidence import observation_proof
@@ -2159,6 +2165,7 @@ def _admission_observation_proof(
             entity=datapoint.get("entity"),
             period=datapoint.get("period"),
             unit=datapoint.get("unit"),
+            as_of=as_of,
         )
     except (KeyError, ValueError) as exc:
         raise ValueError(f"record_evidence: ERR_DATAPOINT_UNVERIFIED ({exc})") from None
@@ -2336,7 +2343,7 @@ def record_evidence(
     proof: dict[str, JSONValue] = {}
     proof_bytes: bytes | None = None
     if datapoint["value"] is not None:
-        proof, proof_bytes, canonical = _admission_observation_proof(store, observed, datapoint)
+        proof, proof_bytes, canonical = _admission_observation_proof(store, observed, datapoint, found.as_of)
         # The row stores the source spelling, so replay rebuilds the same descriptor.
         datapoint = {key: text if isinstance(text := canonical.get(key), str) else None for key in datapoint}
     if isinstance(observed, MaterializedEvidenceSource):
@@ -3393,12 +3400,16 @@ def _freeze_result_payload(
     return out_dict
 
 
-def _freeze_require_proofs(store: ResearchRepository, session_id: str, wave_recs: Sequence[Evidence]) -> None:
+def _freeze_require_proofs(
+    store: ResearchRepository, session_id: str, wave_recs: Sequence[Evidence], as_of: datetime | None
+) -> None:
     """A row that carries a datapoint proof must still verify (archive bytes, recompute) to be frozen."""
     rows = _session_rows(store, session_id)
     for rec in wave_recs:
         verdict = (
-            _proof_verdict(rows, rec, rec.value) if rec.proof.get("kind") in ("observation", "calculation") else None
+            _proof_verdict(rows, rec, rec.value, as_of=as_of)
+            if rec.proof.get("kind") in ("observation", "calculation")
+            else None
         )
         if verdict is not None and verdict.status != "verified":
             raise ValueError(
@@ -3418,7 +3429,7 @@ def freeze_session(
     store = _repo(repo)
     found = _freeze_ready_session(store, session_id, wave_id)
     wave_recs = _freeze_wave_records(store, session_id, wave_id)
-    _freeze_require_proofs(store, session_id, wave_recs)
+    _freeze_require_proofs(store, session_id, wave_recs, found.as_of)
     fid = f"{session_id}:{wave_id}:freeze"
     frozen = _freeze.create_freeze(
         freeze_id=fid, session_id=session_id, wave_id=wave_id, records=wave_recs, as_of=found.as_of
@@ -4133,14 +4144,22 @@ def _ledger_row(rows: Mapping[str, Mapping[str, object]], evidence_id: str) -> E
 
 
 def _proof_verdict(
-    rows: Mapping[str, Mapping[str, object]], evidence: Evidence, value: object, depth: int = 0
+    rows: Mapping[str, Mapping[str, object]],
+    evidence: Evidence,
+    value: object,
+    depth: int = 0,
+    *,
+    as_of: datetime | str | None,
 ) -> ProofVerdict:
-    """verify_observation / verify_calculation for one row against one claimed value (inputs recursively)."""
+    """verify_observation / verify_calculation for one row against one claimed value (inputs recursively).
+
+    ``as_of`` is the session cutoff every observation rebuild resolves aliases at.
+    """
     from .evidence import ProofVerdict, verify_calculation, verify_observation
 
     kind = evidence.proof.get("kind")
     if kind == "observation":
-        return verify_observation(evidence, value=value, source_bytes=_proof_bytes(evidence))
+        return verify_observation(evidence, value=value, source_bytes=_proof_bytes(evidence), as_of=as_of)
     if kind != "calculation":
         return ProofVerdict("unverified", f"{evidence.evidence_id} carries no observation or calculation proof")
     if depth >= _MAX_PROOF_DEPTH:
@@ -4151,7 +4170,7 @@ def _proof_verdict(
         row = _ledger_row(rows, str(eid))
         if isinstance(row, str):
             return ProofVerdict("unverified", row)
-        inputs.append((row, _proof_verdict(rows, row, row.value, depth + 1)))
+        inputs.append((row, _proof_verdict(rows, row, row.value, depth + 1, as_of=as_of)))
     return verify_calculation(evidence, value=value, inputs=inputs, recompute=_recompute)
 
 
@@ -4220,6 +4239,22 @@ _GLUE_WORDS = frozenset(
 )
 """Connective words a quantitative claim may add around its referenced datapoint wording."""
 
+_REPORTING_WORDS = frozenset(
+    {"approximately", "approx", "about", "around", "roughly"}
+    | {"reported", "recorded", "posted", "totaled", "totalled", "amounted", "stood", "had", "has", "have"}
+)
+"""Approximators and reporting verbs: they restate a bound value and never relate two quantities."""
+_SCALE_WORDS = frozenset({"thousand", "million", "billion", "trillion"})
+_CHANGE_WORDS: dict[str, int] = {
+    **dict.fromkeys(("increased", "increase", "increases", "rose", "rise", "rises", "grew", "grow", "grows"), 1),
+    **dict.fromkeys(("up", "higher"), 1),
+    **dict.fromkeys(("decreased", "decrease", "decreases", "fell", "fall", "falls", "declined", "decline"), -1),
+    **dict.fromkeys(("declines", "down", "lower", "dropped"), -1),
+    **dict.fromkeys(("change", "changed", "changes", "compared", "versus", "vs"), 0),
+}
+"""Change/comparison words and the sign each asserts (0: any sign)."""
+_CHANGE_KINDS = frozenset({"change", "growth_pct", "growth_ratio"})
+
 
 def _blank(match: re.Match[str]) -> str:
     return " " * len(match.group())
@@ -4261,27 +4296,25 @@ def _metric_label(metric: str) -> str:
     return metric.rsplit(":", 1)[-1] if ":" in metric and " " not in metric.strip() else metric
 
 
-_UNIT_ALIASES = {"usd": ("$", "usd", "dollar"), "%": ("%", "percent"), "percent": ("%", "percent")}
-"""Symbol spellings a claim may use for a source unit; any other unit is stated by its own words."""
-
-
 def _states_unit(masked: str, unit: str) -> bool:
     """Every part of a unit ("USD/shares", "USD millions") is stated by word, singular/plural form, or symbol alias."""
     words = [word for word, _, _ in _words(masked)]
     for part in (p for p in re.split(r"[/*\s]+", unit.casefold()) if p):
-        names = _UNIT_ALIASES.get(part, (part,))
-        if not any(
-            name in masked
-            if not name.isalnum()
-            else any(w.startswith(name) or (len(w) >= 4 and name.startswith(w)) for w in words)
-            for name in names
-        ):
+        symbols = [name for name in _UNIT_ALIASES.get(part, (part,)) if not name.isalnum()]
+        if not any(name in masked for name in symbols) and not any(_unit_word(word, part) for word in words):
             return False
     return True
 
 
+def _spellings(point: Mapping[str, object], key: str) -> list[str]:
+    """Source spelling of one datapoint field, then its deterministic alias display spelling."""
+    aliases = point.get("aliases")
+    shown = aliases.get(key) if isinstance(aliases, Mapping) else None
+    return [text for text in (point.get(key), shown) if isinstance(text, str)]
+
+
 def _point_text(point: Mapping[str, object], keys: Sequence[str]) -> str:
-    return " ".join(str(point.get(key)) for key in keys if isinstance(point.get(key), str))
+    return " ".join(text for key in keys for text in _spellings(point, key))
 
 
 def _value_spans(masked: str, numbers: Sequence[tuple[str, int, int]], value: str) -> list[tuple[int, int]]:
@@ -4299,13 +4332,16 @@ def _bound_value_spans(
     """Value occurrences the metric label directly precedes: same sentence, only identity between.
 
     Strict (observed_fact/calculation) additionally admits only the datapoint's own
-    entity/period/unit/metric words and connectives between label and value: any
-    other word — e.g. a neighbouring metric label like ``net income`` — breaks
+    entity/period/unit/metric words, connectives, approximators and reporting verbs
+    between label and value; a change-kind calculation also admits change words
+    (``_wording_defect`` checks their sign). Any other word — e.g. a neighbouring
+    metric label like ``net income`` or ``increased`` before a level value — breaks
     the binding, so a value cannot borrow a neighbouring metric's label. Other
     claim types keep the original number/sentence checks plus their qualifier policy.
     """
     context = numeric_tokens(_point_text(point, ("entity", "period", "unit")))
-    identity = {word for word, _, _ in _words(_point_text(point, ("metric", "entity", "period", "unit")))} | _GLUE_WORDS
+    identity = {word for word, _, _ in _words(_point_text(point, ("metric", "entity", "period", "unit")))}
+    identity |= _GLUE_WORDS | _REPORTING_WORDS | (_CHANGE_WORDS.keys() if _change_sign(point) is not None else set())
     labels = _phrase_spans(masked, _metric_label(str(point["metric"])))
     bound: list[tuple[int, int]] = []
     for start, end in _value_spans(masked, numbers, str(point["value"])):
@@ -4342,6 +4378,7 @@ def _binding_defect(text: str, points: Sequence[Mapping[str, object]], claim_typ
     bound: list[tuple[int, int]] = []
     context: set[str] = set()
     owner: dict[tuple[int, int], int] = {}
+    by_span: dict[tuple[int, int], set[int]] = {}
     for index, point in enumerate(points):
         pid = point.get("id")
         missing = [key for key in ("metric", "value", "entity", "period") if not str(point.get(key) or "").strip()]
@@ -4354,9 +4391,9 @@ def _binding_defect(text: str, points: Sequence[Mapping[str, object]], claim_typ
                 at = next(i for i in range(len(bounds) - 1) if bounds[i] <= start < bounds[i + 1])
                 scope = masked[bounds[at] : bounds[at + 1]]
                 unit = point.get("unit")
-                if all(_phrase_spans(scope, str(point[key])) for key in ("entity", "period")) and (
-                    not isinstance(unit, str) or not unit.strip() or _states_unit(scope, unit)
-                ):
+                if all(
+                    any(_phrase_spans(scope, text) for text in _spellings(point, key)) for key in ("entity", "period")
+                ) and (not isinstance(unit, str) or not unit.strip() or _states_unit(scope, unit)):
                     kept.append((start, end))
             spans = kept
         else:
@@ -4369,15 +4406,16 @@ def _binding_defect(text: str, points: Sequence[Mapping[str, object]], claim_typ
         if not strict:
             scope = masked
             for key in ("entity", "period"):
-                if not _phrase_spans(scope, str(point[key])):
+                if not any(_phrase_spans(scope, text) for text in _spellings(point, key)):
                     return f"ERR_DATAPOINT_UNBOUND (claim does not state datapoint {pid} {key} {point[key]!r})"
             unit = point.get("unit")
             if isinstance(unit, str) and unit.strip() and not _states_unit(scope, unit):
                 return f"ERR_DATAPOINT_UNBOUND (claim does not state datapoint {pid} unit {unit!r})"
         bound.extend(spans)
         context |= numeric_tokens(_point_text(point, ("entity", "period", "unit", "metric")))
-        for start, end in spans:
-            owner[(start, end)] = index
+        for span in spans:
+            owner[span] = index
+            by_span.setdefault(span, set()).add(index)
     if strict:
         by_sentence: dict[tuple[int, int], set[int]] = {}
         for (start, _), index in owner.items():
@@ -4406,8 +4444,8 @@ def _binding_defect(text: str, points: Sequence[Mapping[str, object]], claim_typ
                 f"ERR_DATAPOINT_UNBOUND (datapoint {pid} is referenced twice; state each value beside its own metric)"
             )
         seen[pid] = index
-    by_span: dict[tuple[int, int], set[int]] = {}
-    for (start, end), members in sorted(by_span.items()):
+    for start, end in sorted(by_span):
+        members = {i for (a, b), group in by_span.items() if a < end and start < b for i in group}
         if len(members) > 1:
             disputed = sorted(str(points[i].get("id")) for i in members)
             return (
@@ -4430,21 +4468,91 @@ def _binding_defect(text: str, points: Sequence[Mapping[str, object]], claim_typ
     return None
 
 
-def _wording_defect(text: str, points: Sequence[Mapping[str, object]]) -> str | None:
-    """A quantitative fact adds only connective words to its datapoints' own metric/entity/period/unit wording.
+def _change_sign(point: Mapping[str, object]) -> int | None:
+    """Sign of a change-kind calculation datapoint's value; None for any other datapoint."""
+    formula_id, _, version = str(point.get("formula") or "").partition("@")
+    entry = _FORMULAS.get((formula_id, version))
+    if entry is None or entry[1] not in _CHANGE_KINDS:
+        return None
+    try:
+        value = _decimal(str(point.get("value")))
+    except ArithmeticError:
+        return None
+    return int(value > 0) - int(value < 0)
 
+
+def _relation_supported(
+    masked: str, at: int, word: str, numbers: Sequence[tuple[str, int, int]], points: Sequence[Mapping[str, object]]
+) -> bool:
+    """A scale or change word restates referenced datapoints; it never adds a quantitative relationship.
+
+    A scale word directly follows a stated value whose source states that same
+    scale after it (or whose unit names it). A change word needs a change-kind
+    calculation datapoint stated in its sentence, with the sign the word asserts.
+    """
+    stem = word.removesuffix("s")
+    if stem in _SCALE_WORDS:
+        before = [norm for norm, _, end in numbers if end <= at and not masked[end:at].strip()]
+        return bool(before) and any(
+            before[-1] in numeric_tokens(str(point.get("value")))
+            and (
+                stem in {unit.removesuffix("s") for unit, _, _ in _words(_point_text(point, ("unit",)))}
+                or re.search(
+                    rf"(?<![0-9.,]){re.escape(str(point.get('value')))}\s*{stem}",
+                    str(point.get("statement") or ""),
+                    re.IGNORECASE,
+                )
+                is not None
+            )
+            for point in points
+        )
+    start = max((m.end() for m in _SENTENCE_END_RE.finditer(masked) if m.end() <= at), default=0)
+    after = _SENTENCE_END_RE.search(masked, at)
+    stated = {norm for norm, at_number, _ in numbers if start <= at_number < (after.end() if after else len(masked))}
+    signs = {
+        sign
+        for point in points
+        if (sign := _change_sign(point)) is not None and numeric_tokens(str(point.get("value"))) & stated
+    }
+    want = _CHANGE_WORDS[word]
+    return bool(signs) if want == 0 else want in signs
+
+
+def _wording_defect(text: str, points: Sequence[Mapping[str, object]]) -> str | None:
+    """A quantitative fact restates its datapoints through controlled transformations only.
+
+    Allowed beyond the datapoints' own metric/entity/period/unit words: connectives,
+    approximators and reporting verbs, scale words the source states after the value,
+    and change words a stated change calculation supports with the same sign.
     The full source statement (e.g. a record row's sorted-key JSON) is never
     vocabulary: a dataset metric label without its own referenced datapoint —
     like ``net income`` beside a lone revenue reference — fails here.
     """
+    masked = _masked(text)
+    numbers = _numbers(masked)
     vocabulary = {
         word for point in points for word, _, _ in _words(_point_text(point, ("metric", "entity", "period", "unit")))
     }
-    extra = sorted(
-        {word for word, _, _ in _words(_masked(text)) if not word.isdigit() and word not in vocabulary | _GLUE_WORDS}
-    )
+    extra: set[str] = set()
+    unsupported: set[str] = set()
+    for word, at, _ in _words(masked):
+        if word.isdigit() or word in vocabulary | _GLUE_WORDS | _REPORTING_WORDS:
+            continue
+        if word.removesuffix("s") in _SCALE_WORDS or word in _CHANGE_WORDS:
+            if not _relation_supported(masked, at, word, numbers, points):
+                unsupported.add(word)
+        else:
+            extra.add(word)
     if extra:
-        return f"ERR_STATEMENT_UNVERIFIED (words {extra[:8]} are not in the referenced datapoint labels or identity fields)"
+        return (
+            f"ERR_STATEMENT_UNVERIFIED (words {sorted(extra)[:8]} are not in the referenced datapoint labels"
+            " or identity fields)"
+        )
+    if unsupported:
+        return (
+            f"ERR_STATEMENT_UNVERIFIED (words {sorted(unsupported)[:8]} state a scale or change"
+            " no referenced datapoint supports)"
+        )
     return None
 
 
@@ -4497,7 +4605,11 @@ def _referenced_points(claim: GroundedClaim, verified: Sequence[Evidence]) -> li
 
 
 def _claim_proof_defect(
-    store: ResearchRepository, session_id: str, rows: Mapping[str, Mapping[str, object]], claim: GroundedClaim
+    store: ResearchRepository,
+    session_id: str,
+    rows: Mapping[str, Mapping[str, object]],
+    claim: GroundedClaim,
+    as_of: datetime | None,
 ) -> str | None:
     """Why one claim may not publish, or None.
 
@@ -4507,8 +4619,8 @@ def _claim_proof_defect(
     3. Every ``datapoint_ids`` entry is the kernel descriptor of a cited verified row;
        observed vs calculated datapoints match the declared type.
     4. The wording binds each datapoint (metric before value, entity, period, unit)
-       and states no other number; a quantitative observed fact or calculation adds
-       only connective words to its datapoint wording.
+       and states no other number; a quantitative observed fact or calculation adds only
+       connectives and controlled restatement words to its datapoint wording (``_wording_defect``).
     5. A qualitative observed fact equals a located source statement.
     """
     qualifier = _QUALIFIERS.get(claim.claim_type)
@@ -4523,7 +4635,7 @@ def _claim_proof_defect(
         if integrity is not None:
             return f"ERR_PROOF_UNVERIFIED ({integrity})"
         if row.proof:
-            own = _proof_verdict(rows, row, row.value)
+            own = _proof_verdict(rows, row, row.value, as_of=as_of)
             if own.status != "verified":
                 return f"ERR_PROOF_UNVERIFIED ({row.evidence_id} {own.status}: {own.reason})"
             verified.append(row)
@@ -4552,8 +4664,12 @@ def require_verified_claims(
 ) -> None:
     """Publication gate: raise ``{where}: ERR_*`` for the first claim lacking verified ledger proof."""
     rows = _session_rows(store, session_id)
+    try:
+        as_of = store.get_session(session_id).as_of
+    except KeyError:
+        as_of = None  # no session, no cutoff: snapshot aliases fail closed, exact spellings still verify
     for claim in claims:
-        defect = _claim_proof_defect(store, session_id, rows, claim)
+        defect = _claim_proof_defect(store, session_id, rows, claim, as_of)
         if defect is not None:
             raise ValueError(f"{where}: {defect} for claim {claim.text[:120]!r}")
 
