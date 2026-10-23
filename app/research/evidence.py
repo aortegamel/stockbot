@@ -602,6 +602,17 @@ def _record_payload(result: Mapping[str, object]) -> Mapping[str, object]:
     return payload if isinstance(payload, Mapping) else result
 
 
+def _decoded_record_result(source_bytes: bytes) -> Mapping[str, object]:
+    """Archived tool result object, else a ValueError the admission path already maps."""
+    try:
+        result = json.loads(source_bytes)
+    except ValueError:
+        raise ValueError("archived tool result is not JSON") from None
+    if not isinstance(result, Mapping):
+        raise ValueError("archived tool result is not a JSON object")  # noqa: TRY004 - proof builders raise ValueError
+    return result
+
+
 def _record_text(row: Mapping[str, object]) -> str:
     return json.dumps(dict(row), sort_keys=True, default=str)
 
@@ -721,34 +732,43 @@ def _single_envelope_pair(payload: Mapping[str, object]) -> tuple[str, str] | No
     return tickers[0], next(text for text in ciks if _cik(text) is not None)
 
 
-def _confirmed_envelope_pair(pair: tuple[str, str], as_of: datetime | str | None) -> tuple[str, str] | None:
-    """Envelope pair history confirms: unbounded cutoffs keep it, bounded cutoffs need snapshot agreement."""
-    if _bounded_as_of(as_of) is None:
+def _envelope_pair(payload: Mapping[str, object], as_of: datetime | str | None) -> tuple[str, str] | None:
+    """Single ticker-CIK pair the result envelope states, when history confirms it.
+
+    Without a bounded cutoff the envelope pair stands. Under a bounded cutoff
+    the pair stands only when the archived ticker snapshot gives its ticker the
+    same CIK. An absent or ambiguous snapshot confirms nothing, so the envelope
+    pairs nothing. A snapshot that gives another CIK is a confirmed source
+    identity conflict: the whole result is suspect, so this raises ValueError.
+    """
+    pair = _single_envelope_pair(payload)
+    if pair is None or _bounded_as_of(as_of) is None:
         return pair
     snapshot = _snapshot_cik(pair[0], as_of)
-    return pair if snapshot is not None and _cik(snapshot) == _cik(pair[1]) else None
-
-
-def _envelope_pair(payload: Mapping[str, object], as_of: datetime | str | None) -> tuple[str, str] | None:
-    """Single ticker-CIK pair the result envelope states when history confirms it under a bounded cutoff."""
-    return (
-        confirmed
-        if (single := _single_envelope_pair(payload)) and (confirmed := _confirmed_envelope_pair(single, as_of))
-        else None
-    )
+    if snapshot is None:
+        return None
+    if _cik(snapshot) != _cik(pair[1]):
+        raise ValueError(
+            f"source identity conflict: the result envelope pairs {pair[0]!r} with CIK {pair[1]!r},"
+            f" but the ticker snapshot at the session cutoff gives CIK {snapshot!r}"
+        )
+    return pair
 
 
 def _entity_pairs(
-    source: Mapping[str, object], payload: Mapping[str, object], claimed: str, as_of: datetime | str | None
+    source: Mapping[str, object],
+    payload: Mapping[str, object],
+    envelope: tuple[str, str] | None,
+    claimed: str,
+    as_of: datetime | str | None,
 ) -> Iterator[tuple[str, str]]:
-    """(ticker, CIK) spellings paired by the result envelope, else by the point-in-time ticker snapshot.
+    """(ticker, CIK) spellings paired by the confirmed result envelope, else by the point-in-time ticker snapshot.
 
-    Under a bounded cutoff the envelope pairs only when the snapshot confirms
-    its ticker-CIK mapping; without confirmation it pairs nothing. Without a
-    bounded cutoff the envelope still pairs.
+    ``envelope`` is the ``_envelope_pair`` result. A confirmed envelope-snapshot
+    contradiction already rejected the whole datapoint before any pairing.
     """
-    if (pair := _envelope_pair(payload, as_of)) is not None:
-        yield pair
+    if envelope is not None:
+        yield envelope
     for ticker in dict.fromkeys((claimed, *_spellings(source, _TICKER_KEYS), *_spellings(payload, _TICKER_KEYS))):
         if _cik(ticker) is None and (entity_id := _snapshot_cik(ticker, as_of)) is not None:
             yield ticker.upper(), entity_id
@@ -855,14 +875,12 @@ def _record_datapoint(
 
     ``aliases`` holds the display spelling of each identity a claim selected
     through a ticker/CIK pair, a fiscal-quarter label, or a unit symbol.
+    A source identity conflict (``_envelope_pair``) rejects the whole datapoint,
+    including an exact entity claim.
     """
-    try:
-        result = json.loads(source_bytes)
-    except ValueError:
-        raise ValueError("archived tool result is not JSON") from None
-    if not isinstance(result, Mapping):
-        raise ValueError("archived tool result is not a JSON object")  # noqa: TRY004 - proof builders raise ValueError
+    result = _decoded_record_result(source_bytes)
     payload = _record_payload(result)
+    envelope = _envelope_pair(payload, as_of)
     row = cited_record(result, provenance.get("record_identity"))
     if row is None:
         raise ValueError("the cited record is absent or ambiguous in the persisted result")
@@ -877,7 +895,9 @@ def _record_datapoint(
             _ENTITY_KEYS,
             claimed["entity"],
             "entity",
-            lambda source, values, want: _entity_alias(values, _entity_pairs(source, payload, want, as_of), want),
+            lambda source, values, want: _entity_alias(
+                values, _entity_pairs(source, payload, envelope, want, as_of), want
+            ),
         ),
         "period": _record_label(
             row,
@@ -940,10 +960,19 @@ A stated entity/period (optionally possessive) may also directly precede it: ``N
 """
 _SCOPE_QUALIFIER = re.compile(
     r"(?<![0-9A-Za-z])(?:from\s+(?:services?|products?|segments?|divisions?)|continuing\s+operations|discontinued"
-    r"|attributable\s+to|excluding|excl\.|adjusted|non-GAAP)(?![0-9A-Za-z])",
+    r"|attributable\s+to|excluding|excl\.|adjusted|non-GAAP"
+    r"|(?:for|of|from)\s+(?:(?:the|its|our|their|a|an)\s+)?"
+    r"(?P<name>[0-9A-Za-z][0-9A-Za-z&'-]*(?:\s+[0-9A-Za-z][0-9A-Za-z&'-]*)*?)"
+    r"\s+(?:business(?:es)?|segments?|divisions?|units?|product\s+lines?))(?![0-9A-Za-z])",
     re.IGNORECASE,
 )
-"""Words after a prose value that narrow its metric (``100 million from services``) unless the metric names them."""
+"""Words after a prose value that narrow its metric unless the metric names them.
+
+Fixed forms (``100 million from services``) must appear whole in the metric.
+A named scope (``for the Data Center business``, ``of the Gaming segment``,
+``from its Auto product line``) must have its ``name`` in the metric.
+Name words exclude punctuation, so a match stays within one clause of the sentence.
+"""
 
 
 def _unstated(text: str, phrases: Sequence[str | None]) -> str:
@@ -1066,12 +1095,16 @@ def _prose_head(
 
 
 def _prose_tail(tail: str, metric: str, value: str, identity: list[str | None]) -> str:
-    """Metric spelling when the prose after the value adds no scope the metric omits and no second value."""
+    """Metric spelling when the prose after the value adds no scope the metric omits and no second value.
+
+    A named scope tail (``for the Data Center business``) passes only when the metric names it
+    (``Data Center revenue``). Incidental prose such as ``led by gaming`` adds no scope.
+    """
     scoped = next(
         (
             qualifier.group(0)
             for qualifier in _SCOPE_QUALIFIER.finditer(_unstated(tail, [value, *identity]))
-            if not _phrase(qualifier.group(0)).search(metric)
+            if not _phrase(qualifier.group("name") or qualifier.group(0)).search(metric)
         ),
         None,
     )

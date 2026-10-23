@@ -741,18 +741,18 @@ def test_post_cutoff_ticker_reassignment_never_backdates_a_session(
         pytest.param(
             {"ticker": "NVDA", "cik": 9999},
             9999,
-            datetime(2025, 6, 1, tzinfo=UTC),
-            None,
-            1045810,
-            id="late-envelope-pre-cutoff",
-        ),
-        pytest.param(
-            {"ticker": "NVDA", "cik": 9999},
-            9999,
             datetime(2025, 9, 1, tzinfo=UTC),
             "9999",
             1045810,
             id="after-reassignment",
+        ),
+        pytest.param(
+            {"ticker": "NVDA", "cik": "0001045810"},
+            1045810,
+            datetime(2025, 6, 1, tzinfo=UTC),
+            "1045810",
+            1045810,
+            id="normalized-envelope-cik-matches-snapshot",
         ),
         pytest.param(
             {"ticker": "NVDA", "cik": 1045810}, 1045810, "unbounded", "1045810", None, id="unbounded-envelope"
@@ -777,7 +777,10 @@ def test_envelope_cik_yields_to_the_cutoff_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A bounded envelope pairs its ticker and CIK only when the cutoff snapshot confirms that mapping."""
+    """A bounded envelope pairs its ticker and CIK only when the cutoff snapshot confirms that mapping.
+
+    An absent snapshot confirms nothing, so the envelope pairs nothing and only exact claims bind.
+    """
     from app.research.evidence import canonical_datapoint
 
     monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
@@ -796,6 +799,62 @@ def test_envelope_cik_yields_to_the_cutoff_snapshot(
     # An exact numeric CIK claim needs no ticker pair.
     exact = canonical_datapoint(provenance=prov, source_bytes=raw, **{**selectors, "entity": str(row_cik)}, as_of=as_of)
     assert exact["entity"] == str(row_cik) and "aliases" not in exact
+
+
+@pytest.mark.parametrize(
+    "row_cik", [pytest.param(1045810, id="row-matches-snapshot"), pytest.param(9999, id="row-matches-envelope")]
+)
+def test_envelope_snapshot_conflict_rejects_whole_datapoint(
+    row_cik: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bounded envelope CIK the cutoff snapshot contradicts rejects every claim on the result, exact CIK included."""
+    from app.research.evidence import canonical_datapoint, observation_proof, verify_observation
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    _archive_tickers(tmp_path, 1045810, "2025-05-01T00:00:00Z")
+    _archive_tickers(tmp_path, 9999, "2025-07-01T00:00:00Z")  # NVDA reassigned after the cutoff
+    cutoff, later = datetime(2025, 6, 1, tzinfo=UTC), datetime(2025, 9, 1, tzinfo=UTC)
+    prov, raw = _alias_source({**_ALIAS_ROW, "cik": row_cik}, {"ticker": "NVDA", "cik": 9999})
+    selectors = {"metric": "revenue", "value": "100", "period": "2025-04-27"}
+    for entity in ("NVDA", str(row_cik)):
+        with pytest.raises(ValueError, match="source identity conflict"):
+            canonical_datapoint(provenance=prov, source_bytes=raw, **selectors, entity=entity, as_of=cutoff)
+    # A proof built where the envelope holds never re-verifies at the contradicted cutoff.
+    proof = observation_proof(provenance=prov, source_bytes=raw, **selectors, entity=str(row_cik), as_of=later)
+    row = dataclasses.replace(
+        _ev("EV-CONFLICT", "S-proof", 1, cutoff),
+        provenance=prov,
+        value="100",
+        entity=str(row_cik),
+        period="2025-04-27",
+        unit="USD",
+        proof=proof,
+    )
+    assert verify_observation(row, value="100", source_bytes=raw, as_of=later).status == "verified"
+    verdict = verify_observation(row, value="100", source_bytes=raw, as_of=cutoff)
+    assert verdict.status == "conflicted" and "source identity conflict" in verdict.reason
+
+
+@settings(max_examples=20, derandomize=True)
+@given(st.integers(min_value=0, max_value=6), st.booleans())
+def test_prop_equivalent_envelope_cik_spellings_never_conflict(padding: int, prefixed: bool) -> None:
+    """Zero padding and a sec:cik: prefix on the envelope CIK keep its agreement with the cutoff snapshot."""
+    import os
+    import tempfile
+    from unittest import mock
+
+    from app.research.evidence import canonical_datapoint
+
+    spelling = f"{'sec:cik:' if prefixed else ''}{'0' * padding}1045810"
+    with tempfile.TemporaryDirectory() as root, mock.patch.dict(os.environ, {"STOCKBOT_DATA_DIR": root}):
+        _archive_tickers(Path(root), 1045810, "2025-05-01T00:00:00Z")
+        prov, raw = _alias_source(_ALIAS_ROW, {"ticker": "NVDA", "cik": spelling})
+        selectors = {"metric": "revenue", "value": "100", "period": "2025-04-27"}
+        cutoff = datetime(2025, 6, 1, tzinfo=UTC)
+        point = canonical_datapoint(provenance=prov, source_bytes=raw, **selectors, entity="NVDA", as_of=cutoff)
+        assert (point["entity"], point["aliases"]) == ("1045810", {"entity": "NVDA"})
+        exact = canonical_datapoint(provenance=prov, source_bytes=raw, **selectors, entity="1045810", as_of=cutoff)
+        assert exact["entity"] == "1045810" and "aliases" not in exact
 
 
 @pytest.mark.parametrize(
@@ -845,6 +904,11 @@ def test_canonical_datapoint_binds_labeled_passage_sentence(change: dict[str, st
         "NVDA Q1 FY2025 revenue was 100 million excluding disposals.",
         "NVDA Q1 FY2025 revenue was 100 million excl. disposals.",
         "NVDA Q1 FY2025 revenue was 100 million, adjusted.",
+        "NVDA Q1 FY2025 revenue was 100 million for the Data Center business.",
+        "NVDA Q1 FY2025 revenue was 100 million of the Gaming segment.",
+        "NVDA Q1 FY2025 revenue was 100 million from the Automotive division.",
+        "NVDA Q1 FY2025 revenue was 100 million for its Networking unit.",
+        "NVDA Q1 FY2025 revenue was 100 million from the GeForce product line.",
     ],
 )
 def test_canonical_datapoint_rejects_other_metric_value_or_later_identity(passage: str) -> None:
@@ -896,14 +960,36 @@ def test_canonical_datapoint_takes_identity_from_heading_context(passage: str, s
     assert point["statement"] == statement
 
 
-def test_canonical_datapoint_keeps_tail_scope_the_claimed_metric_names() -> None:
+@pytest.mark.parametrize(
+    ("metric", "passage"),
+    [
+        ("adjusted revenue", "NVDA Q1 FY2025 adjusted revenue was 100 million on an adjusted basis."),
+        ("Data Center revenue", "NVDA Q1 FY2025 Data Center revenue was 100 million for the data center business."),
+    ],
+)
+def test_canonical_datapoint_keeps_tail_scope_the_claimed_metric_names(metric: str, passage: str) -> None:
     from app.research.evidence import canonical_datapoint, web_source_ref
 
-    passage = "NVDA Q1 FY2025 adjusted revenue was 100 million on an adjusted basis."
     prov = web_source_ref(url="https://example.com/q1", excerpt=passage, tool_result_id="tr-web")
     selectors = {"value": "100", "entity": "NVDA", "period": "Q1 FY2025", "unit": "million"}
-    point = canonical_datapoint(provenance=prov, source_bytes=b"archived", metric="adjusted revenue", **selectors)
-    assert (point["metric"], point["statement"]) == ("adjusted revenue", passage)
+    point = canonical_datapoint(provenance=prov, source_bytes=b"archived", metric=metric, **selectors)
+    assert (point["metric"], point["statement"]) == (metric, passage)
+
+
+@pytest.mark.parametrize(
+    ("metric", "passage"),
+    [
+        ("Data Center revenue", "NVDA Q1 FY2025 Data Center revenue was 100 million for the Gaming business."),
+        ("segment revenue", "NVDA Q1 FY2025 segment revenue was 100 million from the Gaming segment."),
+    ],
+)
+def test_canonical_datapoint_rejects_tail_scope_the_claimed_metric_omits(metric: str, passage: str) -> None:
+    from app.research.evidence import canonical_datapoint, web_source_ref
+
+    prov = web_source_ref(url="https://example.com/q1", excerpt=passage, tool_result_id="tr-web")
+    selectors = {"value": "100", "entity": "NVDA", "period": "Q1 FY2025", "unit": "million"}
+    with pytest.raises(ValueError, match="unrelated metric or value"):
+        canonical_datapoint(provenance=prov, source_bytes=b"archived", metric=metric, **selectors)
 
 
 _DP_TABLE = (
