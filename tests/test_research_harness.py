@@ -680,6 +680,22 @@ def test_canonical_datapoint_maps_ticker_by_archived_snapshot(tmp_path: Path, mo
         canonical_datapoint(provenance=prov, source_bytes=raw, **{**selectors, "entity": "AMD"}, as_of=cutoff)
 
 
+def test_corrupted_ticker_snapshot_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ticker snapshot failing hash verification resolves no alias, tampered mapping included."""
+    from app.research.evidence import canonical_datapoint
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    _archive_tickers(tmp_path, 1045810, "2025-05-01T00:00:00Z")
+    payloads = sorted((tmp_path / "raw" / "sec" / "company_tickers" / "company_tickers").glob("*.json"))
+    payloads = [path for path in payloads if path.suffixes != [".manifest", ".json"]]
+    assert len(payloads) == 1
+    payloads[0].write_bytes(b'{"0": {"cik_str": 9999, "ticker": "NVDA", "title": "TAMPERED"}}')
+    prov, raw = _alias_source(_ALIAS_ROW, {})
+    selectors = {"metric": "revenue", "value": "100", "entity": "NVDA", "period": "2025-04-27"}
+    with pytest.raises(ValueError, match="not the cited record's entity"):
+        canonical_datapoint(provenance=prov, source_bytes=raw, **selectors, as_of=datetime(2025, 6, 1, tzinfo=UTC))
+
+
 def test_snapshot_alias_without_session_cutoff_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The tool result's created_at never dates a snapshot: no tz-aware session cutoff, no ticker alias."""
     from app.research.evidence import canonical_datapoint

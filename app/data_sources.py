@@ -89,12 +89,20 @@ def _latest_ticker_snapshot(as_of: datetime) -> ArchiveRecord | None:
 
 
 def _archived_ticker_aliases(want: str, as_of: datetime) -> list[TickerAlias] | None:
-    """Read ticker aliases from the latest eligible archived snapshot."""
+    """Ticker aliases from the latest hash-verified archived snapshot; None when absent or tampered."""
+    from .config import get_data_root
+    from .storage import raw_archive
+
     latest = _latest_ticker_snapshot(as_of)
     if latest is None:
         return None
+    verified = raw_archive.read_payload(
+        "sec", "company_tickers", "company_tickers", sha256=latest.sha256, root=get_data_root() / "raw"
+    )
+    if verified is None:
+        return None
     try:
-        payload = json.loads(latest.payload_path.read_bytes())
+        payload = json.loads(verified)
         datasets = _norm.normalize_sec_tickers(payload, retrieved_at=latest.retrieved_at, content_hash=latest.sha256)
         return [alias for alias in _ticker_aliases_of(datasets.get("entity_aliases")) if alias.alias_value == want]
     except OSError, ValueError:
