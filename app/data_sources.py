@@ -96,9 +96,12 @@ def _archived_ticker_aliases(want: str, as_of: datetime) -> list[TickerAlias] | 
     latest = _latest_ticker_snapshot(as_of)
     if latest is None:
         return None
-    verified = raw_archive.read_payload(
-        "sec", "company_tickers", "company_tickers", sha256=latest.sha256, root=get_data_root() / "raw"
-    )
+    try:
+        verified = raw_archive.read_payload(
+            "sec", "company_tickers", "company_tickers", sha256=latest.sha256, root=get_data_root() / "raw"
+        )
+    except OSError, ValueError:
+        return None
     if verified is None:
         return None
     try:
