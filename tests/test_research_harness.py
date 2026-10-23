@@ -736,6 +736,69 @@ def test_post_cutoff_ticker_reassignment_never_backdates_a_session(
 
 
 @pytest.mark.parametrize(
+    ("envelope", "row_cik", "as_of", "bound", "snapshot_cik"),
+    [
+        pytest.param(
+            {"ticker": "NVDA", "cik": 9999},
+            9999,
+            datetime(2025, 6, 1, tzinfo=UTC),
+            None,
+            1045810,
+            id="late-envelope-pre-cutoff",
+        ),
+        pytest.param(
+            {"ticker": "NVDA", "cik": 9999},
+            9999,
+            datetime(2025, 9, 1, tzinfo=UTC),
+            "9999",
+            1045810,
+            id="after-reassignment",
+        ),
+        pytest.param(
+            {"ticker": "NVDA", "cik": 1045810}, 1045810, "unbounded", "1045810", None, id="unbounded-envelope"
+        ),
+        pytest.param({"ticker": "NVDA"}, 1045810, "unbounded", None, None, id="ticker-only-unbounded"),
+        pytest.param(
+            {"ticker": "NVDA", "cik": 9999},
+            9999,
+            datetime(2025, 6, 1, tzinfo=UTC),
+            None,
+            None,
+            id="bounded-envelope-without-snapshot",
+        ),
+    ],
+)
+def test_envelope_cik_yields_to_the_cutoff_snapshot(
+    envelope: Mapping[str, JSONValue],
+    row_cik: int,
+    as_of: datetime | str,
+    bound: str | None,
+    snapshot_cik: int | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bounded envelope pairs its ticker and CIK only when the cutoff snapshot confirms that mapping."""
+    from app.research.evidence import canonical_datapoint
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    if isinstance(as_of, datetime):
+        if snapshot_cik is not None:
+            _archive_tickers(tmp_path, snapshot_cik, "2025-05-01T00:00:00Z")
+        _archive_tickers(tmp_path, 9999, "2025-07-01T00:00:00Z")  # NVDA reassigned
+    prov, raw = _alias_source({**_ALIAS_ROW, "cik": row_cik}, envelope)
+    selectors = {"metric": "revenue", "value": "100", "entity": "NVDA", "period": "2025-04-27"}
+    if bound is None:
+        with pytest.raises(ValueError, match="not the cited record's entity"):
+            canonical_datapoint(provenance=prov, source_bytes=raw, **selectors, as_of=as_of)
+    else:
+        point = canonical_datapoint(provenance=prov, source_bytes=raw, **selectors, as_of=as_of)
+        assert (point["entity"], point["aliases"]) == (bound, {"entity": "NVDA"})
+    # An exact numeric CIK claim needs no ticker pair.
+    exact = canonical_datapoint(provenance=prov, source_bytes=raw, **{**selectors, "entity": str(row_cik)}, as_of=as_of)
+    assert exact["entity"] == str(row_cik) and "aliases" not in exact
+
+
+@pytest.mark.parametrize(
     ("change", "reason"),
     [
         pytest.param({"metric": "net income"}, "does not label", id="revenue-100-is-not-net-income"),
@@ -776,6 +839,12 @@ def test_canonical_datapoint_binds_labeled_passage_sentence(change: dict[str, st
         "NVDA Q1 FY2025 revenue was 100. The unit was million.",
         "NVDA Q1 FY2025 revenue was 100 million and margin was 40%.",
         "Q1 FY2025 revenue was 90 million. NVDA revenue was 100 million.",
+        "NVDA Q1 FY2025 revenue was 100 million from services.",
+        "NVDA Q1 FY2025 revenue was 100 million from continuing operations.",
+        "NVDA Q1 FY2025 revenue was 100 million attributable to Product X.",
+        "NVDA Q1 FY2025 revenue was 100 million excluding disposals.",
+        "NVDA Q1 FY2025 revenue was 100 million excl. disposals.",
+        "NVDA Q1 FY2025 revenue was 100 million, adjusted.",
     ],
 )
 def test_canonical_datapoint_rejects_other_metric_value_or_later_identity(passage: str) -> None:
@@ -825,6 +894,16 @@ def test_canonical_datapoint_takes_identity_from_heading_context(passage: str, s
         "million",
     )
     assert point["statement"] == statement
+
+
+def test_canonical_datapoint_keeps_tail_scope_the_claimed_metric_names() -> None:
+    from app.research.evidence import canonical_datapoint, web_source_ref
+
+    passage = "NVDA Q1 FY2025 adjusted revenue was 100 million on an adjusted basis."
+    prov = web_source_ref(url="https://example.com/q1", excerpt=passage, tool_result_id="tr-web")
+    selectors = {"value": "100", "entity": "NVDA", "period": "Q1 FY2025", "unit": "million"}
+    point = canonical_datapoint(provenance=prov, source_bytes=b"archived", metric="adjusted revenue", **selectors)
+    assert (point["metric"], point["statement"]) == ("adjusted revenue", passage)
 
 
 _DP_TABLE = (

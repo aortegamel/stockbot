@@ -703,15 +703,53 @@ def _snapshot_cik(ticker: str, as_of: datetime | str | None) -> str | None:
     return resolved.entity_id if resolved is not None and resolved.resolved else None
 
 
+def _bounded_as_of(as_of: datetime | str | None) -> datetime | None:
+    """Tz-aware session cutoff, else None for no cutoff (unbounded, missing, naive, or unparsable)."""
+    try:
+        moment = datetime.fromisoformat(as_of) if isinstance(as_of, str) else as_of
+    except ValueError:
+        return None
+    return moment if moment is not None and getattr(moment, "tzinfo", None) is not None else None
+
+
+def _single_envelope_pair(payload: Mapping[str, object]) -> tuple[str, str] | None:
+    """One ticker plus one CIK the result envelope states; None when the envelope states no such pair."""
+    tickers = [text for text in _spellings(payload, _TICKER_KEYS) if _cik(text) is None]
+    ciks = _spellings(payload, _CIK_KEYS)
+    if len(tickers) != 1 or not ciks or len({_cik(text) for text in ciks} - {None}) != 1:
+        return None
+    return tickers[0], next(text for text in ciks if _cik(text) is not None)
+
+
+def _confirmed_envelope_pair(pair: tuple[str, str], as_of: datetime | str | None) -> tuple[str, str] | None:
+    """Envelope pair history confirms: unbounded cutoffs keep it, bounded cutoffs need snapshot agreement."""
+    if _bounded_as_of(as_of) is None:
+        return pair
+    snapshot = _snapshot_cik(pair[0], as_of)
+    return pair if snapshot is not None and _cik(snapshot) == _cik(pair[1]) else None
+
+
+def _envelope_pair(payload: Mapping[str, object], as_of: datetime | str | None) -> tuple[str, str] | None:
+    """Single ticker-CIK pair the result envelope states when history confirms it under a bounded cutoff."""
+    return (
+        confirmed
+        if (single := _single_envelope_pair(payload)) and (confirmed := _confirmed_envelope_pair(single, as_of))
+        else None
+    )
+
+
 def _entity_pairs(
     source: Mapping[str, object], payload: Mapping[str, object], claimed: str, as_of: datetime | str | None
 ) -> Iterator[tuple[str, str]]:
-    """(ticker, CIK) spellings paired by the result envelope, else by the point-in-time ticker snapshot."""
-    tickers = [text for text in _spellings(payload, _TICKER_KEYS) if _cik(text) is None]
-    ciks = _spellings(payload, _CIK_KEYS)
-    if len(tickers) == 1 and ciks and len({_cik(text) for text in ciks} - {None}) == 1:
-        yield tickers[0], next(text for text in ciks if _cik(text) is not None)
-    for ticker in dict.fromkeys((claimed, *_spellings(source, _TICKER_KEYS), *tickers)):
+    """(ticker, CIK) spellings paired by the result envelope, else by the point-in-time ticker snapshot.
+
+    Under a bounded cutoff the envelope pairs only when the snapshot confirms
+    its ticker-CIK mapping; without confirmation it pairs nothing. Without a
+    bounded cutoff the envelope still pairs.
+    """
+    if (pair := _envelope_pair(payload, as_of)) is not None:
+        yield pair
+    for ticker in dict.fromkeys((claimed, *_spellings(source, _TICKER_KEYS), *_spellings(payload, _TICKER_KEYS))):
         if _cik(ticker) is None and (entity_id := _snapshot_cik(ticker, as_of)) is not None:
             yield ticker.upper(), entity_id
 
@@ -900,6 +938,12 @@ _LABEL_OPENERS = frozenset({"the", "its", "their", "our", "reported", "recorded"
 
 A stated entity/period (optionally possessive) may also directly precede it: ``NVDA's Q1 FY2025 revenue``.
 """
+_SCOPE_QUALIFIER = re.compile(
+    r"(?<![0-9A-Za-z])(?:from\s+(?:services?|products?|segments?|divisions?)|continuing\s+operations|discontinued"
+    r"|attributable\s+to|excluding|excl\.|adjusted|non-GAAP)(?![0-9A-Za-z])",
+    re.IGNORECASE,
+)
+"""Words after a prose value that narrow its metric (``100 million from services``) unless the metric names them."""
 
 
 def _unstated(text: str, phrases: Sequence[str | None]) -> str:
@@ -984,16 +1028,26 @@ def _prose_metric(
     passage: str,
     sentence_start: int,
     start: int,
-    statement: str,
     claimed: Mapping[str, str | None],
     identity: list[str | None],
+    tail: str,
 ) -> str:
     """Source metric spelling of one prose value.
 
     The metric label directly heads the value: only linking words join them, no
-    modifier or second label precedes the label, and the sentence states no other value.
+    modifier or second label precedes the label, and the tail after the value
+    adds no scope the metric omits and no second value.
     """
     metric, value = str(claimed["metric"]), str(claimed["value"])
+    return _prose_head(passage, sentence_start, start, metric, value, identity) and _prose_tail(
+        tail, metric, value, identity
+    )
+
+
+def _prose_head(
+    passage: str, sentence_start: int, start: int, metric: str, value: str, identity: list[str | None]
+) -> str:
+    """Metric spelling heading the value: only linking words join them and no modifier narrows the label."""
     labels = list(_phrase(metric).finditer(passage, sentence_start, start))
     if not labels:
         raise ValueError(f"metric {metric!r} does not label the value's source statement")
@@ -1008,9 +1062,22 @@ def _prose_metric(
     joined = set(re.findall(r"[0-9A-Za-z]+", _LEVEL_CHANGE.sub(" ", between).casefold())) - _LINKING_WORDS
     if joined or (opener[-1:].isalnum() and not adjoined and words[-1] not in _LABEL_OPENERS):
         raise ValueError(f"the source statement contains an unrelated metric or value beside metric {metric!r}")
-    if re.search(r"[0-9]", _unstated(statement, [metric, value, *identity])):
-        raise ValueError("the source statement contains an unrelated metric or value")
     return labels[-1].group(0)
+
+
+def _prose_tail(tail: str, metric: str, value: str, identity: list[str | None]) -> str:
+    """Metric spelling when the prose after the value adds no scope the metric omits and no second value."""
+    scoped = next(
+        (
+            qualifier.group(0)
+            for qualifier in _SCOPE_QUALIFIER.finditer(_unstated(tail, [value, *identity]))
+            if not _phrase(qualifier.group(0)).search(metric)
+        ),
+        None,
+    )
+    if scoped is not None or re.search(r"[0-9]", _unstated(tail, [metric, value, *identity])):
+        raise ValueError("the source statement contains an unrelated metric or value")
+    return metric
 
 
 def _passage_datapoint(provenance: Mapping[str, object], claimed: Mapping[str, str | None]) -> dict[str, JSONValue]:
@@ -1018,36 +1085,24 @@ def _passage_datapoint(provenance: Mapping[str, object], claimed: Mapping[str, s
 
     Entity, period and unit come from that statement, else from the context
     before it: headings, earlier sentences, or the value's column header.
-    ponytail: words after the value stay unchecked ("$5 million from services"), so a
-    trailing qualifier can narrow the metric; add a tail rule when sources show it.
+    Words after a prose value may not narrow its scope unless the claimed metric names that scope.
     """
     field_key = "passage" if provenance.get("kind") == "sec_source" else "excerpt"
     passage = provenance.get(field_key)
     if not isinstance(passage, str) or not passage.strip():
         raise ValueError(f"the located {field_key} is empty")
     value = str(claimed["value"])
-    hits = list(re.finditer(rf"(?<![0-9A-Za-z.,]){re.escape(value)}(?![0-9A-Za-z]|[.,][0-9])", passage))
-    if len(hits) != 1:
-        reason = "appears more than once in" if hits else "is not a whole token of"
-        raise ValueError(f"value {value!r} {reason} the located {field_key}")
-    start, end = hits[0].span()
-    line_start = passage.rfind("\n", 0, start) + 1
-    line_end = passage.find("\n", end)
-    line = passage[line_start : line_end if line_end >= 0 else len(passage)]
-    column: tuple[int, int] | None = None
+    start, end = _value_span(passage, value, field_key)
+    is_row, scope, statement, cutoff, offset = _statement_span(passage, start, end)
     metric: str | None = None
-    if _ROW_CELL in line:
-        metric, scope, column = _row_metric(line, start - line_start, claimed)
-        statement, cutoff = line, line_start
-    else:
-        cutoff = max((m.end() for m in _SENTENCE_BREAK.finditer(passage, 0, start)), default=0)
-        after = _SENTENCE_BREAK.search(passage, end)
-        statement = scope = passage[cutoff : after.start() if after else len(passage)]
+    column: tuple[int, int] | None = None
+    if is_row:
+        metric, scope, column = _row_metric(scope, offset, claimed)
     identity = [
         _context_label(passage, cutoff, scope, claimed, label, column) for label in ("entity", "period", "unit")
     ]
     if metric is None:
-        metric = _prose_metric(passage, cutoff, start, statement, claimed, identity)
+        metric = _prose_metric(passage, cutoff, start, claimed, identity, tail=passage[end : cutoff + len(statement)])
     return {
         "metric": metric,
         "field": field_key,
@@ -1057,6 +1112,27 @@ def _passage_datapoint(provenance: Mapping[str, object], claimed: Mapping[str, s
         "unit": identity[2],
         "statement": statement.strip(),
     }
+
+
+def _value_span(passage: str, value: str, field_key: str) -> tuple[int, int]:
+    """(start, end) of the one whole-token value occurrence the located passage states."""
+    hits = list(re.finditer(rf"(?<![0-9A-Za-z.,]){re.escape(value)}(?![0-9A-Za-z]|[.,][0-9])", passage))
+    if len(hits) != 1:
+        reason = "appears more than once in" if hits else "is not a whole token of"
+        raise ValueError(f"value {value!r} {reason} the located {field_key}")
+    return hits[0].span()
+
+
+def _statement_span(passage: str, start: int, end: int) -> tuple[bool, str, str, int, int]:
+    """(is row, scope, statement, cutoff, value offset) of the row or sentence holding the value span."""
+    line_start = passage.rfind("\n", 0, start) + 1
+    line_end = passage.find("\n", end)
+    if _ROW_CELL in (line := passage[line_start : line_end if line_end >= 0 else len(passage)]):
+        return True, line, line, line_start, start - line_start
+    cutoff = max((match.end() for match in _SENTENCE_BREAK.finditer(passage, 0, start)), default=0)
+    after = _SENTENCE_BREAK.search(passage, end)
+    statement = passage[cutoff : after.start() if after else len(passage)]
+    return False, statement, statement, cutoff, 0
 
 
 def _datapoint_id(anchor: Mapping[str, object]) -> str:
