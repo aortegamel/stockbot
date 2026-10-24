@@ -14,9 +14,11 @@ from app.research import scheduler
 from app.research.models import DecisionRecord, JSONValue, ToolDecision
 from app.research.programmatic_router import (
     _ambiguous,
+    _has_accession,
     _margin_pick,
     _ranked,
     _registry_names,
+    _revenue_state,
     _router_pick,
     _short_tool,
     _signals,
@@ -737,8 +739,128 @@ _LISTING: dict[str, JSONValue] = {
     "tool": "list_sec_filings",
     "arguments": {"identifier": "NVDA"},
     "error": None,
-    "outcome_summary": "filing 0001045810-26-000075 10-Q",
+    "result": {
+        "subject": "NVDA",
+        "filings": [{"accession_no": "0001045810-26-000075", "form": "10-Q", "filed_at": "2026-08-26"}],
+    },
 }
+
+
+@pytest.mark.parametrize("ask", [_TEN_Q_REVENUE, "What drove NVDA revenue last quarter?"])
+def test_revenue_state_selects_newest_structured_ten_q(ask: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The issuer's newest 10-Q wins, regardless of row order or newer foreign forms."""
+    monkeypatch.setattr("app.tools._resolve_company_to_ticker", _resolve_ticker)
+    attempt: dict[str, JSONValue] = {
+        "tool": "list_sec_filings",
+        "session_id": "s1",
+        "result": {
+            "subject": "NVDA",
+            "filings": [
+                {"accession_no": "0001045810-26-000075", "form": "10-Q", "filed_at": "2026-08-26"},
+                {"accession_no": "0001045810-26-000078", "form": "8-K", "filed_at": "2026-09-01"},
+                {"accession_no": "0001045810-26-000050", "form": "10-Q", "filed_at": "2026-05-26"},
+            ],
+        },
+        "outcome_summary": "10-Q 0001045810-26-000099",
+    }
+    _, toks = _signals(ask)
+    assert _revenue_state(ask, toks, [attempt], "s1", ask) == (
+        True,
+        False,
+        {"accession_no": "0001045810-26-000075"},
+    )
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [
+        {**_LISTING, "error": "listing failed"},
+        {
+            **_LISTING,
+            "result": {
+                "error": "listing failed",
+                "subject": "NVDA",
+                "filings": [{"accession_no": "0001045810-26-000075", "form": "10-Q"}],
+            },
+        },
+        {**_LISTING, "session_id": "foreign"},
+        {
+            **_LISTING,
+            "result": {
+                "session_id": "foreign",
+                "subject": "NVDA",
+                "filings": [{"accession_no": "0001045810-26-000075", "form": "10-Q"}],
+            },
+        },
+        {
+            **_LISTING,
+            "result": {
+                "subject": "AAPL",
+                "filings": [{"accession_no": "0000320193-26-000075", "form": "10-Q"}],
+            },
+        },
+        {
+            **_LISTING,
+            "result": {"filings": [{"accession_no": "0001045810-26-000075", "form": "10-Q"}]},
+        },
+        {"tool": "list_sec_filings", "outcome_summary": "NVDA filing 0001045810-26-000075 10-Q"},
+        {"tool": "list_sec_filings", "content": "NVDA filing 0001045810-26-000075 10-Q"},
+        {
+            "tool": "list_sec_filings",
+            "result": '{"subject":"NVDA","filings":[{"accession_no":"0001045810-26-000075","form":"10-Q"}]}',
+        },
+        {**_LISTING, "tool": "search_sec_filings"},
+    ],
+)
+@pytest.mark.parametrize("ask", [_TEN_Q_REVENUE, "What drove NVDA revenue last quarter?"])
+def test_revenue_state_rejects_untrusted_listing(
+    listing: dict[str, JSONValue], ask: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a successful structured listing from the current session proves the issuer's 10-Q."""
+    monkeypatch.setattr("app.tools._resolve_company_to_ticker", _resolve_ticker)
+    _, toks = _signals(ask)
+    assert _revenue_state(ask, toks, [listing], "s1", ask) == (True, False, None)
+    names = {"get_sec_document", "list_sec_filings"}
+    norm, toks = _signals(ask)
+    assert _router_pick(ask, norm, toks, names, [], [listing], [], "s1", ask) == (
+        "list_sec_filings",
+        "revenue-quarter",
+    )
+    assert _router_pick(ask, norm, toks, _CARRY_ONLY, [], [listing], [], "s1", ask) is None
+
+
+def test_revenue_state_uses_latest_successful_listing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A newer successful listing replaces older rows. A failed listing does not replace them."""
+    monkeypatch.setattr("app.tools._resolve_company_to_ticker", _resolve_ticker)
+    _, toks = _signals(_TEN_Q_REVENUE)
+    empty: dict[str, JSONValue] = {"tool": "list_sec_filings", "result": {"subject": "NVDA", "filings": []}}
+    assert _revenue_state(_TEN_Q_REVENUE, toks, [_LISTING, empty]) == (True, False, None)
+    assert _revenue_state(_TEN_Q_REVENUE, toks, [_LISTING, {**empty, "error": "failed"}]) == (
+        True,
+        False,
+        {"accession_no": "0001045810-26-000075"},
+    )
+
+
+def test_revenue_state_uses_objective_issuer_not_node_issuer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A generated node cannot replace the objective's issuer."""
+    monkeypatch.setattr("app.tools._resolve_company_to_ticker", _resolve_ticker)
+    text = f"{_TEN_Q_REVENUE} Read AAPL's latest 10-Q revenue"
+    _, toks = _signals(text)
+    assert _revenue_state(text, toks, [_LISTING], "s1", "Read AAPL revenue last quarter") == (True, False, None)
+
+
+@pytest.mark.parametrize("error", [None, "document failed"])
+def test_revenue_state_ignores_foreign_document_attempt(error: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A foreign document attempt neither blocks nor completes the current revenue route."""
+    monkeypatch.setattr("app.tools._resolve_company_to_ticker", _resolve_ticker)
+    attempt: dict[str, JSONValue] = {"tool": "get_sec_document", "session_id": "foreign", "error": error}
+    norm, toks = _signals(_TEN_Q_REVENUE)
+    names = {"get_sec_document", "list_sec_filings"}
+    assert _router_pick(_TEN_Q_REVENUE, norm, toks, names, [], [_LISTING, attempt], [], "s1", _TEN_Q_REVENUE) == (
+        "get_sec_document",
+        "revenue-quarter:doc",
+    )
 
 
 def test_ten_q_revenue_lists_then_reads_document_without_jev() -> None:
@@ -967,12 +1089,7 @@ def _resolve_ticker(name: str) -> str | None:
     return {"AAPL": "AAPL", "NVDA": "NVDA"}.get(name)
 
 
-_PACKET_10Q: dict[str, JSONValue] = {
-    "tool": "list_sec_filings",
-    "arguments": {"identifier": "NVDA"},
-    "error": None,
-    "outcome_summary": "filing 0001045810-26-000075 10-Q",
-}
+_PACKET_10Q = _LISTING
 
 
 def _rule(
@@ -1028,9 +1145,91 @@ def test_carry_registry_opens_packet_accession() -> None:
     eight_k: dict[str, JSONValue] = {
         "tool": "list_sec_filings",
         "error": None,
-        "outcome_summary": "8-K accession 0001045810-26-000078",
+        "result": {
+            "subject": "NVDA",
+            "filings": [{"accession_no": "0001045810-26-000078", "form": "8-K", "filed_at": "2026-09-01"}],
+        },
     }
     assert _rule("revenue 10q", [eight_k], _CARRY_ONLY) is None
+    assert _rule("NVDA revenue last quarter", [eight_k], _CARRY_ONLY) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"accession_no": "0001045810-26-000075"},
+        {"filings": [{"accession_no": "0001045810-26-000075", "form": "10-Q"}]},
+        {"documents": [{"accession_no": "0001045810-26-000075", "document_name": "nvda.htm"}]},
+    ],
+)
+def test_structured_search_results_keep_carry_only_routing(payload: dict[str, JSONValue]) -> None:
+    """Search envelopes retain carry routing through structured filing or document rows."""
+    packet: dict[str, JSONValue] = {"tool": "search_sec_filings", "session_id": "s1", "result": payload}
+    assert _has_accession([packet], "s1")
+    assert not _has_accession([packet])
+    norm, toks = _signals("read the filing document section")
+    assert _router_pick(norm, norm, toks, _CARRY_ONLY, [], [packet], [], "s1") == (
+        "get_sec_document",
+        "carry:packet-doc",
+    )
+    assert _router_pick(norm, norm, toks, _CARRY_ONLY, [], [], [packet], "s1") == (
+        "get_sec_document",
+        "carry:packet-doc",
+    )
+
+
+@pytest.mark.parametrize(
+    "packet",
+    [
+        "accession 0001045810-26-000075",
+        {"outcome_summary": "10-Q accession 0001045810-26-000075"},
+        {"content": "10-Q accession 0001045810-26-000075"},
+        {"result": '{"accession_no":"0001045810-26-000075"}'},
+        {"arguments": {"accession_no": "0001045810-26-000075"}},
+        {"result": {"hits": [{"accession": "0001045810-26-000075"}]}},
+        {"result": {"top_hits": [{"accession": "0001045810-26-000075"}]}},
+        {"error": "failed", "result": {"accession_no": "0001045810-26-000075"}},
+        {"result": {"error": "failed", "accession_no": "0001045810-26-000075"}},
+        {"session_id": "foreign", "result": {"accession_no": "0001045810-26-000075"}},
+        {"result": {"session_id": "foreign", "accession_no": "0001045810-26-000075"}},
+        {"accession_no": "not-an-accession"},
+    ],
+)
+def test_carry_registry_rejects_text_errors_and_foreign_sessions(packet: JSONValue) -> None:
+    """Text, arguments, aliases, errors, and foreign sessions never open carry routing."""
+    assert not _has_accession([packet], "s1")
+    norm, toks = _signals("read the filing document section")
+    assert _router_pick(norm, norm, toks, _CARRY_ONLY, [], [], [packet], "s1") is None
+
+
+@pytest.mark.parametrize(
+    ("packet_session", "objective", "ticker", "expected"),
+    [
+        ("s1", _TEN_Q_REVENUE, None, "get_sec_document"),
+        ("foreign", _TEN_Q_REVENUE, None, "list_sec_filings"),
+        ("s1", "What drove revenue last quarter?", None, "list_sec_filings"),
+        ("s1", "What drove revenue last quarter?", "NVDA", "get_sec_document"),
+    ],
+)
+def test_select_round_threads_actual_session_and_objective(
+    packet_session: str, objective: str, ticker: str | None, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate uses the actual session ID and original objective, not a generated issuer."""
+    monkeypatch.setattr("app.tools._resolve_company_to_ticker", _resolve_ticker)
+    action, decision = asyncio.run(
+        programmatic_select_round(
+            _BoomJev(),
+            _Kernel(),
+            "s1",
+            "n1",
+            {"session_id": "foreign", "objective": objective, "ticker": ticker},
+            _node(_TEN_Q_REVENUE),
+            scheduler.build_registry(),
+            [],
+            [{**_LISTING, "session_id": packet_session}],
+        )
+    )
+    assert (action, decision.tool_name) == ("invoke", expected)
 
 
 def test_clock_rule_answers_pure_clock_ask() -> None:

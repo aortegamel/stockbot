@@ -636,14 +636,17 @@ def test_carry_revenue_uses_listed_packet() -> None:
             "tool": "list_sec_filings",
             "arguments": {"identifier": "NVDA"},
             "error": None,
-            "outcome_summary": "filing 0001045810-26-000075 10-Q",
+            "result": {
+                "subject": "NVDA",
+                "filings": [{"accession_no": "0001045810-26-000075", "form": "10-Q", "filed_at": "2026-08-01"}],
+            },
         }
     ]
     kernel, _ = _capturing_kernel()
     action, decision = _round(
         kernel,
-        "revenue 10q read the document",
-        "revenue 10q read the document",
+        "NVDA revenue 10q read the document",
+        "NVDA revenue 10q read the document",
         scheduler.build_registry(),
         attempts=attempts,
     )
@@ -651,8 +654,8 @@ def test_carry_revenue_uses_listed_packet() -> None:
     kernel2, _ = _capturing_kernel()
     action2, decision2 = _round(
         kernel2,
-        "revenue 10q read the document",
-        "revenue 10q read the document",
+        "NVDA revenue 10q read the document",
+        "NVDA revenue 10q read the document",
         [{"name": name} for name in sorted(carry_only)],
         attempts=attempts,
     )
@@ -660,8 +663,8 @@ def test_carry_revenue_uses_listed_packet() -> None:
     kernel3, seen = _capturing_kernel()
     action3, decision3 = _round(
         kernel3,
-        "revenue 10q read the document",
-        "revenue 10q read the document",
+        "NVDA revenue 10q read the document",
+        "NVDA revenue 10q read the document",
         [{"name": "get_sec_filing"}],
         attempts=attempts,
     )
@@ -671,11 +674,22 @@ def test_carry_revenue_uses_listed_packet() -> None:
 
 def test_context_evidence_counts_for_carry() -> None:
     carry_only = {"get_sec_document", "get_sec_filing", "list_sec_documents"}
-    evidence: list[JSONValue] = [{"id": "ev:1", "content": "filing 0001045810-26-000075 10-Q"}]
+    evidence: list[JSONValue] = [
+        {
+            "id": "ev:1",
+            "content": "filing",
+            "accession_no": "0001045810-26-000075",
+            "form": "10-Q",
+            "filed_at": "2026-08-01",
+            "subject": "1045810",
+            "subject_cik": "1045810",
+            "filer_cik": "1045810",
+        }
+    ]
     kernel, _ = _capturing_kernel()
     action, decision = _round(
         kernel,
-        "read the filing document section",
+        "CIK 1045810 read the filing document section",
         "read the filing document section",
         [{"name": name} for name in sorted(carry_only)],
         evidence=evidence,

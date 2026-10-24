@@ -208,37 +208,65 @@ def _short_tool(toks: set[str], norm: str, names: set[str]) -> str | None:
     return tool if tool in names else None
 
 
-def _has_accession(packets: Sequence[JSONValue]) -> bool:
-    """Any accession-like token across attempts/ctx packets (scheduler scanner)."""
-    from app.research.scheduler import _scan_packet_accession
+def _has_accession(packets: Sequence[JSONValue], session_id: str | None = None, issuer: object = None) -> bool:
+    """Recognize structured accession rows, never summaries or content."""
+    from app.research.scheduler import _structured_accession_present
 
-    for packet in packets:
-        cands = (packet, packet.get("outcome_summary")) if isinstance(packet, dict) else (packet,)
-        for cand in cands:
-            if cand is None:
-                continue
-            found, _ = _scan_packet_accession(cand)
-            if found is not None:
-                return True
-    return False
+    return _structured_accession_present(packets, session_id, issuer)
 
 
-def _revenue_state(text: str, toks: set[str], attempts: _Attempts) -> tuple[bool, bool, dict[str, JSONValue] | None]:
-    """Reject a failed revenue read before scanning for the listed 10-Q."""
-    from app.research.scheduler import _carry_packet_accession
+def _revenue_state(
+    text: str,
+    toks: set[str],
+    attempts: _Attempts,
+    session_id: str | None = None,
+    objective: str | None = None,
+    ticker: object = None,
+) -> tuple[bool, bool, dict[str, JSONValue] | None]:
+    """Require the newest successful listing to identify the issuer's latest 10-Q."""
+    from app.research.scheduler import (
+        _inline_attempt_payloads,
+        _issuer_filing_rows,
+        _newest_filing,
+        _objective_subject_ticker,
+        _persisted_shapes,
+    )
 
     revenue_quarter = bool("revenue" in toks and toks & {"quarter", "10q"})
-    if revenue_quarter and any(a.get("tool") == "get_sec_document" and a.get("error") is not None for a in attempts):
-        return revenue_quarter, True, None
-    listed = _carry_packet_accession("get_sec_document", {}, [], attempts, text) if {"revenue", "10q"} <= toks else None
-    return revenue_quarter, False, listed
+    if not revenue_quarter:
+        return False, False, None
+    if any(
+        a.get("tool") == "get_sec_document"
+        and a.get("error") is not None
+        and a.get("session_id", session_id) == session_id
+        and _persisted_shapes(a).get("session_id", session_id) == session_id
+        for a in attempts
+    ):
+        return True, True, None
+    listings = _inline_attempt_payloads([a for a in attempts if a.get("tool") == "list_sec_filings"], session_id)
+    source = objective if objective is not None else text
+    cik = re.search(r"\bCIK\s*[:#]?\s*(\d{1,10})\b", source, re.IGNORECASE)
+    issuer = cik.group(1) if cik is not None else _objective_subject_ticker(source, ticker)
+    rows = _issuer_filing_rows(listings[:1], issuer)
+    newest = _newest_filing(rows, frozenset({"10-Q"}))
+    return True, False, {"accession_no": newest[0]} if newest is not None else None
 
 
-def _carry_only(names: set[str], attempts: _Attempts, ctx_evidence: list[JSONValue]) -> bool:
-    """Carry-only registry holding an accession-like packet (force-open narrowed)."""
+def _carry_only(
+    names: set[str],
+    attempts: _Attempts,
+    ctx_evidence: list[JSONValue],
+    session_id: str | None = None,
+    issuer: object = None,
+) -> bool:
+    """Open carry tools only when a same-session structured accession exists."""
     from app.research.scheduler import _ACCESSION_CARRY_TOOLS
 
-    return bool(names) and names <= _ACCESSION_CARRY_TOOLS and _has_accession([*attempts, *ctx_evidence])
+    return (
+        bool(names)
+        and names <= _ACCESSION_CARRY_TOOLS
+        and _has_accession([*attempts, *ctx_evidence], session_id, issuer)
+    )
 
 
 def _carry_pick(
@@ -247,11 +275,13 @@ def _carry_pick(
     attempts: _Attempts,
     ctx_evidence: list[JSONValue],
     listed_10q: dict[str, JSONValue] | None,
+    session_id: str | None = None,
+    issuer: object = None,
 ) -> tuple[str, str] | None:
     """Open packet accessions only in a carry-only registry."""
-    if not _carry_only(names, attempts, ctx_evidence):
+    if not _carry_only(names, attempts, ctx_evidence, session_id, issuer):
         return None
-    if {"revenue", "10q"} <= toks and listed_10q is None:
+    if "revenue" in toks and toks & {"quarter", "10q"} and listed_10q is None:
         return None
     if "get_sec_document" in names and toks & _READ_TOKS:
         return "get_sec_document", "carry:packet-doc"
@@ -295,35 +325,25 @@ def _mention_pick(norm: str, toks: set[str], names: set[str]) -> tuple[str, str]
     return None
 
 
-def _document_read(attempts: _Attempts) -> bool:
-    """Any successful get_sec_document attempt in the packet."""
-    return any(isinstance(a, dict) and a.get("tool") == "get_sec_document" and a.get("error") is None for a in attempts)
+def _document_read(attempts: _Attempts, session_id: str | None = None) -> bool:
+    """Recognize a successful document read from the current session."""
+    from app.research.scheduler import _inline_attempt_payloads
 
-
-def _revenue_read_pick(
-    toks: set[str], names: set[str], attempts: _Attempts, listed_10q: dict[str, JSONValue] | None
-) -> tuple[str, str] | None:
-    """Read the node's listed 10-Q, else any packet accession, when the registry carries the reader."""
-    if "get_sec_document" not in names:
-        return None
-    if listed_10q is not None if "10q" in toks else _has_accession(attempts):
-        return "get_sec_document", "revenue-quarter:doc"
-    return None
+    return bool(_inline_attempt_payloads([a for a in attempts if a.get("tool") == "get_sec_document"], session_id))
 
 
 def _revenue_pick(
-    toks: set[str],
     names: set[str],
     attempts: _Attempts,
     revenue_quarter: bool,
     listed_10q: dict[str, JSONValue] | None,
+    session_id: str | None = None,
 ) -> tuple[str, str] | None:
     """List quarterly revenue filings before reading the node's listed document."""
-    if not revenue_quarter or _document_read(attempts):
+    if not revenue_quarter or _document_read(attempts, session_id):
         return None
-    read = _revenue_read_pick(toks, names, attempts, listed_10q)
-    if read is not None:
-        return read
+    if "get_sec_document" in names and listed_10q is not None:
+        return "get_sec_document", "revenue-quarter:doc"
     if "list_sec_filings" in names:
         return "list_sec_filings", "revenue-quarter"
     return None
@@ -377,19 +397,27 @@ def _router_pick(
     ranked: list[tuple[int, str]],
     attempts: _Attempts,
     ctx_evidence: list[JSONValue],
+    session_id: str | None = None,
+    objective: str | None = None,
+    ticker: object = None,
 ) -> tuple[str, str] | None:
     """(tool, reason) or None when JEV must decide. Membership-gated: never picks outside the live registry."""
     # Rule order: 1 carry-only registry, 2 explicit Reg SHO, 3 short family, 4 insider,
     # 5 person mention, 6 revenue quarter, 7 filing list, 8 clock, 9 scorer margin.
-    revenue_quarter, blocked, listed_10q = _revenue_state(text, toks, attempts)
+    revenue_quarter, blocked, listed_10q = _revenue_state(text, toks, attempts, session_id, objective, ticker)
     if blocked:
         return None
+    from app.research.scheduler import _objective_subject_ticker
+
+    source = objective if objective is not None else text
+    cik = re.search(r"\bCIK\s*[:#]?\s*(\d{1,10})\b", source, re.IGNORECASE)
+    issuer = cik.group(1) if cik is not None else _objective_subject_ticker(source, ticker)
     return (
-        _carry_pick(toks, names, attempts, ctx_evidence, listed_10q)
+        _carry_pick(toks, names, attempts, ctx_evidence, listed_10q, session_id, issuer)
         or _short_pick(norm, toks, names)
         or _insider_pick(norm, toks, names)
         or _mention_pick(norm, toks, names)
-        or _revenue_pick(toks, names, attempts, revenue_quarter, listed_10q)
+        or _revenue_pick(names, attempts, revenue_quarter, listed_10q, session_id)
         or _general_pick(text, toks, names, ranked)
     )
 
@@ -598,7 +626,9 @@ async def programmatic_select_round(
         _THESIS_CREATED.add(sid)
         return picked
     ranked = _ranked(norm, toks, names)
-    pick = _router_pick(text, norm, toks, names, ranked, attempts or [], ctx_evidence or [])
+    pick = _router_pick(
+        text, norm, toks, names, ranked, attempts or [], ctx_evidence or [], sid, objective, session.get("ticker")
+    )
     if pick is not None:
         tool, reason = pick
         return _record_pick(kernel, sid, nid, _pick_variant(tool, norm, toks, names), reason)
