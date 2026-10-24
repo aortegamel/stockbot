@@ -3107,7 +3107,10 @@ def test_graph_intake_fetches_only_new_scope(
     objective = "What is happening with Oracle now"
     sid = kw.run_graph_prompt(objective, jev=_JevDown())
     assert [args["query"] for tool, args in calls if tool == "search_web"] == queries
-    assert [args["identifier"] for tool, args in calls if tool == "list_sec_filings"] == identifiers
+    # Four limit=1 family listings (10-Q, 10-K, 8-K, insider) per fetched ticker.
+    assert [args["identifier"] for tool, args in calls if tool == "list_sec_filings"] == [
+        ident for ident in identifiers for _ in range(4)
+    ]
     assert len(prompts) == reasoner_calls
     assert [node.question for node in ResearchRepository().list_nodes(sid)] == ["Filing risk?"]
     assert ResearchRepository().get_session(sid).objective == objective
@@ -3163,7 +3166,7 @@ def test_graph_intake_uses_current_context_only_without_resolved_stock(
     monkeypatch.setattr(kw, "_intake_attempt", _attempt)
     monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
     sid = kw.run_graph_prompt(objective, ticker="NVDA", jev=_JevDown(), setup_deadline=kw.time.perf_counter())
-    assert identifiers == expected
+    assert identifiers == [ident for ident in expected for _ in range(4)]  # one listing per filing family
     assert ResearchRepository().get_session(sid).objective == objective
     assert [node.question for node in ResearchRepository().list_nodes(sid)] == [objective]
 
@@ -3485,9 +3488,17 @@ def test_graph_intake_persists_citable_sources_dedupes_and_settles_jobs(
         result: dict[str, object]
         if tool in payloads:
             result = dict(payloads[tool])
+            forms = args.get("forms")
             if tool == "list_sec_filings" and args.get("identifier") == "MSFT":
-                result["filings"] = [{"form": "10-Q", "accession_no": "0000789019-26-000001", "title": "MSFT filing"}]
-            ref = f"{sid}:tr:{tool}:{args.get('identifier', '')}"
+                none: list[dict[str, object]] = []
+                row: dict[str, object] = {
+                    "form": "10-Q",
+                    "accession_no": "0000789019-26-000001",
+                    "title": "MSFT filing",
+                }
+                result["filings"] = [row] if isinstance(forms, list) and "10-Q" in forms else none
+            family = forms[0] if isinstance(forms, list) else ""
+            ref = f"{sid}:tr:{tool}:{args.get('identifier', '')}:{family}"
             service.persist_tool_result(sid, job_id, tool, ref, result)
             result["tool_result_id"] = ref
         elif tool == "get_reg_sho_volume":
@@ -3517,9 +3528,12 @@ def test_graph_intake_persists_citable_sources_dedupes_and_settles_jobs(
     sid = kw.run_graph_prompt("What happened?", jev=_JevDown(), watchlist=["NVDA"])
     repo = ResearchRepository()
     evidence = repo.list_evidence(sid)
-    assert len(evidence) == 4
+    assert len(evidence) == 7  # round 2 admits all four MSFT family listings, three of them empty
     ids = {row["evidence_id"] for row in evidence}
-    assert len(prompts) == 2 and all(str(eid) in prompts[-1] for eid in ids)
+    # Empty family listings share one record identity, so the digest keeps one; every listed filing reaches the planner.
+    empty = {row["evidence_id"] for row in evidence if str(row.get("content", "")).startswith("filings: none")}
+    assert len(empty) == 3 and sum(str(eid) in prompts[-1] for eid in empty) == 1
+    assert len(prompts) == 2 and all(str(eid) in prompts[-1] for eid in ids - empty)
     assert [node.question for node in repo.list_nodes(sid)] == ["What does the filing establish?"]
     decisions = repo.list_decisions(sid)
     assert [decision.decision_type for decision in decisions] == ["intake_digest", "intake_digest"]
@@ -3534,9 +3548,10 @@ def test_graph_intake_persists_citable_sources_dedupes_and_settles_jobs(
     assert isinstance(last_selected, dict)
     last_stats = last_selected["stats"]
     assert isinstance(last_stats, dict)
-    # Mock provides no doc backend, so the newest-filing chain errors on its
-    # get_sec_document follow-up and returns the list result itself.
-    assert last_stats["outcomes"] == {"admitted": 1, "duplicate": 0, "not_citable": 0, "error": 1, "timeout": 0}
+    # Mock provides no doc backend, so the 10-Q read and its one bounded retry both error;
+    # every family listing still admits.
+    assert last_stats["outcomes"] == {"admitted": 4, "duplicate": 0, "not_citable": 0, "error": 2, "timeout": 0}
+    assert last_stats["unread_material"] == ["0000789019-26-000001"]
     assert {str(row["provenance"]["kind"]) for row in evidence if isinstance(row.get("provenance"), dict)} == {
         "sec_record",
         "finra_record",
@@ -3592,6 +3607,7 @@ def test_intake_round_cancels_overdue_sources_without_losing_scope(
     sources: list[asyncio.Task[None]] = []
     started: list[tuple[str, dict[str, object]]] = []
     cancelled: list[tuple[str, dict[str, object]]] = []
+    recovered: list[tuple[str, dict[str, object]]] = []
     all_started = asyncio.Event()
     all_cancelled = asyncio.Event()
 
@@ -3599,6 +3615,11 @@ def test_intake_round_cancels_overdue_sources_without_losing_scope(
         return None
 
     async def _hang(invoke: object, to_outcome: object, tool: str, args: Mapping[str, object], *rest: object) -> None:
+        if all_started.is_set():
+            # Recovery re-lists the families the full session dropped; this source answers with a failure.
+            recovered.append((tool, dict(args)))
+            raise RuntimeError("source down")
+
         async def _source() -> None:
             started.append((tool, dict(args)))
             if len(started) == 6:
@@ -3659,15 +3680,25 @@ def test_intake_round_cancels_overdue_sources_without_losing_scope(
     assert admitted == [] and repo.list_evidence(sid) == []
     assert len(sources) == len(started) == len(cancelled) == 6
     assert all(call in cancelled for call in started)
+    # max_parallel=6: web + 4 watchlist + the 10-Q listing hold every slot; the other three families drop,
+    # then recovery re-lists them once after the overdue jobs close.
+    families = [args.get("forms") for _tool, args in recovered]
+    assert sorted(str(f[0]) for f in families if isinstance(f, list)) == ["10-K", "3", "8-K"] and len(families) == 3
     jobs = [job for job in repo.list_jobs(sid) if job.job_id != bootstrap.job_id]
-    assert len(jobs) == 6 and all(job.status == "failed" for job in jobs)
-    assert all(job.failure is not None and job.failure.category == "timeout" for job in jobs)
+    assert len(jobs) == 9 and all(job.status == "failed" for job in jobs)
+    categories = [job.failure.category if job.failure is not None else None for job in jobs]
+    assert categories.count("timeout") == 6
     assert repo.get_job(bootstrap.job_id).status == "cancelled"
-    assert stats["outcomes"] == {"admitted": 0, "duplicate": 0, "not_citable": 0, "error": 0, "timeout": 6}
+    assert stats["outcomes"] == {"admitted": 0, "duplicate": 0, "not_citable": 0, "error": 6, "timeout": 6}
     assert stats["admitted_ids"] == []
     assert any(row["tool"] == "search_web" and row["arguments"] == {"query": "my question?"} for row in raw)
     assert any(row["tool"] == "list_sec_filings" and "ORCL" in str(row["arguments"]) for row in raw)
-    assert all(isinstance(row["record"], dict) and row["record"]["error_type"] == "timeout" for row in raw)
+    error_types = [row["record"]["error_type"] for row in raw if isinstance(row["record"], dict)]
+    assert len(error_types) == 12
+    assert error_types.count("timeout") == 6 and error_types.count("parallelism_exceeded") == 3
+    assert stats["limitations"] == [
+        "Session parallelism blocked insider discovery or activity. Recovery retries material documents only."
+    ]
     coverage = stats["watchlist"]
     assert isinstance(coverage, list) and len(coverage) == 4
     assert all(

@@ -49,7 +49,17 @@ from typing import TYPE_CHECKING
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from app.child_spawn import defer_termination
-from app.research.models import JSONValue, query_with_today_utc, utcnow
+from app.research.models import (
+    _BASELINE_ANNUAL,
+    _BASELINE_CURRENT,
+    _BASELINE_QUARTERLY,
+    FailureCategory,
+    JSONValue,
+    _baseline_accession,
+    _baseline_form,
+    query_with_today_utc,
+    utcnow,
+)
 
 if TYPE_CHECKING:
     from app.decision_client import JevClient
@@ -240,9 +250,12 @@ def _evidence_id(rec: Mapping[str, JSONValue], fallback: str) -> str:
     return fallback
 
 
-_INTAKE_SEC_FORMS = ("8-K", "8-K/A", "10-Q", "10-Q/A", "10-K", "10-K/A", "3", "3/A", "4", "4/A", "5", "5/A")
+# One limit=1 listing per family: a burst of insider filings never buries the newest 10-Q/10-K/8-K.
+_INTAKE_MATERIAL_FAMILIES = tuple(sorted(f) for f in (_BASELINE_QUARTERLY, _BASELINE_ANNUAL, _BASELINE_CURRENT))
+_INTAKE_MATERIAL_FORMS = _BASELINE_QUARTERLY | _BASELINE_ANNUAL | _BASELINE_CURRENT
 _INTAKE_INSIDER_FORMS = ("3", "3/A", "4", "4/A", "5", "5/A")
 _INTAKE_INSIDER_LIMIT = 10
+_INTAKE_MAX_DOCS = 2
 _INTAKE_SEC_LIMIT = 5
 _INTAKE_DIGEST_CHARS = 6000
 _INTAKE_MAX_ROUNDS = 2
@@ -471,19 +484,30 @@ def _intake_cik(ticker: str) -> str:
     return str(cik) if cik is not None else ticker
 
 
-def _intake_newest_filing(result: object) -> tuple[str | None, str | None]:
-    """Newest accession and form from a list_sec_filings result; Nones when absent."""
-    filings: object = result.get("filings") if isinstance(result, dict) else None
-    if not isinstance(filings, list):
-        return None, None
-    for row in filings:
-        if not isinstance(row, dict):
+def _intake_listed(rows: Sequence[_IntakeCallRow]) -> list[Mapping[str, object]]:
+    """Filing rows from the per-family list_sec_filings calls; watchlist listings carry no forms filter."""
+    out: list[Mapping[str, object]] = []
+    for tool, args, record, _ms in rows:
+        result = record.get("result")
+        if tool != "list_sec_filings" or "forms" not in args or not isinstance(result, Mapping):
             continue
-        acc = row.get("accession_no") or row.get("accession_number")
-        if isinstance(acc, str) and acc.strip():
-            form = row.get("form")
-            return acc.strip(), form if isinstance(form, str) else None
-    return None, None
+        filings = result.get("filings")
+        if isinstance(filings, list):
+            out.extend(row for row in filings if isinstance(row, Mapping))
+    return out
+
+
+def _intake_filed(row: Mapping[str, object]) -> str:
+    """Filing day text of one listed row; empty when absent."""
+    filed = row.get("filed_at")
+    return filed if isinstance(filed, str) else ""
+
+
+def _intake_insider_newest(listed: Sequence[Mapping[str, object]]) -> bool:
+    """True when an insider filing is listed and postdates every listed material filing (or none is listed)."""
+    insider = [_intake_filed(r) for r in listed if _baseline_form(r) in _INTAKE_INSIDER_FORMS]
+    material = [_intake_filed(r) for r in listed if _baseline_form(r) in _INTAKE_MATERIAL_FORMS]
+    return bool(insider) and (not material or max(insider) > max(material))
 
 
 async def _intake_ticker_chain(
@@ -494,72 +518,51 @@ async def _intake_ticker_chain(
     jev: object,
     kernel: _Kernel,
     as_of: str | None,
-) -> list[tuple[str, dict[str, object], dict[str, object], float]]:
-    """List one ticker, then open its newest filing; a slow ticker never holds the others."""
-    import time as _time
+    admission: _IntakeAdmission,
+) -> _IntakeChainRows:
+    """List each filing family (limit=1) in parallel, then read the newest material documents.
 
-    out: list[tuple[str, dict[str, object], dict[str, object], float]] = []
+    Insider activity joins the reads only when the newest insider filing postdates every material row.
+    Each call is admitted as it settles, so listing jobs close before the reads start.
+    ponytail: listings (<=8s) plus reads (<=5s) can pass the chain deadline; the chain then logs as one timeout.
+    """
     ident = _intake_cik(ticker)
-    start = _time.perf_counter()
-    listing = await _intake_attempt(
-        "list_sec_filings",
-        {"identifier": ident, "forms": list(_INTAKE_SEC_FORMS), "limit": _INTAKE_SEC_LIMIT},
-        sid,
-        session,
-        registry,
-        jev,
-        kernel,
-        as_of,
-    )
-    out.append(("list_sec_filings", {"identifier": ident}, listing, (_time.perf_counter() - start) * 1000.0))
-    acc, form = _intake_newest_filing(listing.get("result"))
-    if acc is None:
-        return out
-    if (form or "").strip().upper() in _INTAKE_INSIDER_FORMS:
-        start = _time.perf_counter()
-        try:
-            activity = await asyncio.wait_for(
-                _intake_attempt(
-                    "get_insider_activity",
-                    {"ticker": ticker, "limit": _INTAKE_INSIDER_LIMIT},
-                    sid,
-                    session,
-                    registry,
-                    jev,
-                    kernel,
-                    as_of,
-                ),
-                timeout=_INTAKE_DOC_TIMEOUT_S,
-            )
-        except TimeoutError:
-            logger.warning("intake chain insider timeout ticker=%s", ticker)
-            return out
-        out.append(("get_insider_activity", {"ticker": ticker}, activity, (_time.perf_counter() - start) * 1000.0))
-        return out
-    start = _time.perf_counter()
-    # ponytail: 5s doc deadline sits inside the 8s intake budget, so the
-    # chain returns the finished list result itself; no shield, no CancelledError
-    # catch — real cancellations propagate (a sync SEC call already running in
-    # its worker thread may still finish; only the coroutine is cancelled).
-    try:
-        doc = await asyncio.wait_for(
-            _intake_attempt(
-                "get_sec_document",
-                {"accession_no": acc, "max_chars": _INTAKE_DOC_CHARS},
+    families = [*_INTAKE_MATERIAL_FAMILIES, _INTAKE_INSIDER_FORMS]
+    listings = await asyncio.gather(
+        *(
+            _intake_timed(
+                "list_sec_filings",
+                {"identifier": ident, "forms": list(forms), "limit": 1},
                 sid,
                 session,
                 registry,
                 jev,
                 kernel,
                 as_of,
-            ),
-            timeout=_INTAKE_DOC_TIMEOUT_S,
+                None,
+                admission,
+            )
+            for forms in families
         )
-    except TimeoutError:
-        logger.warning("intake chain doc timeout ticker=%s acc=%s", ticker, acc)
-        return out
-    out.append(("get_sec_document", {"accession_no": acc}, doc, (_time.perf_counter() - start) * 1000.0))
-    return out
+    )
+    listed = _intake_listed(listings)
+    material = sorted(
+        (r for r in listed if _baseline_form(r) in _INTAKE_MATERIAL_FORMS), key=_intake_filed, reverse=True
+    )
+    accessions = list(dict.fromkeys(acc for r in material if (acc := _baseline_accession(r)) is not None))
+    reads: list[tuple[str, dict[str, object]]] = [
+        ("get_sec_document", {"accession_no": acc, "max_chars": _INTAKE_DOC_CHARS})
+        for acc in accessions[:_INTAKE_MAX_DOCS]
+    ]
+    if _intake_insider_newest(listed):
+        reads.append(("get_insider_activity", {"ticker": ticker, "limit": _INTAKE_INSIDER_LIMIT}))
+    done = await asyncio.gather(
+        *(
+            _intake_timed(tool, args, sid, session, registry, jev, kernel, as_of, _INTAKE_DOC_TIMEOUT_S, admission)
+            for tool, args in reads
+        )
+    )
+    return [*listings, *done]
 
 
 def _ev_field(ev: Mapping[str, object], *names: str) -> str:
@@ -1029,21 +1032,29 @@ async def _intake_attempt(
 
     node = SimpleNamespace(nid="", session_id=sid, node_id="", question=session.get("objective"))
     tool_session = RuntimeToolSession(session_id=f"scheduler:{sid}")
-    record = await scheduler._attempt_tool(
-        tool_name=tool_name,
-        node=node,
-        session=session,
-        registry=registry,
-        evidence=[],
-        attempts=[],
-        kernel=kernel,
-        needle_generate=None,
-        invoke=execute_agent_tool,
-        to_outcome=outcome_from_result,
-        tool_session=tool_session,
-        as_of=as_of,
-        fixed_arguments=dict(fixed_arguments),
-    )
+    try:
+        record = await scheduler._attempt_tool(
+            tool_name=tool_name,
+            node=node,
+            session=session,
+            registry=registry,
+            evidence=[],
+            attempts=[],
+            kernel=kernel,
+            needle_generate=None,
+            invoke=execute_agent_tool,
+            to_outcome=outcome_from_result,
+            tool_session=tool_session,
+            as_of=as_of,
+            fixed_arguments=dict(fixed_arguments),
+        )
+    except ValueError as exc:
+        # A full session (max_parallel active jobs) drops only this call; no job started, the round goes on.
+        if FailureCategory.PARALLELISM_EXCEEDED not in str(exc):
+            raise
+        logger.warning("intake parallelism_exceeded tool=%s", tool_name)
+        error_type = FailureCategory.PARALLELISM_EXCEEDED.value
+        return {"tool": tool_name, "arguments": dict(fixed_arguments), "error": str(exc), "error_type": error_type}
     return record
 
 
@@ -1073,22 +1084,28 @@ async def _intake_timed(
     jev: object,
     kernel: _Kernel,
     as_of: str | None,
+    timeout_s: float | None,
+    admission: _IntakeAdmission,
 ) -> tuple[str, dict[str, object], dict[str, object], float]:
-    """One fixed-argument call under the per-call timeout, with its own elapsed milliseconds."""
+    """One fixed-argument call under the per-call timeout (or timeout_s), with its own elapsed milliseconds.
+
+    The call is admitted as soon as it settles, so its job slot frees for later calls.
+    """
+    limit_s = _INTAKE_CALL_TIMEOUT_S if timeout_s is None else timeout_s
     start = time.perf_counter()
     record: dict[str, object]
     try:
         # ponytail: timed-out thread keeps running; result discarded, logged as timeout.
         record = await asyncio.wait_for(
             _intake_attempt(tool, args, sid, session, registry, jev, kernel, as_of),
-            timeout=_INTAKE_CALL_TIMEOUT_S,
+            timeout=limit_s,
         )
     except TimeoutError:
-        logger.warning("intake timeout tool=%s timeout_s=%s", tool, _INTAKE_CALL_TIMEOUT_S)
+        logger.warning("intake timeout tool=%s timeout_s=%s", tool, limit_s)
         record = _intake_timeout_record(tool, args)
     finally:
         taken = (time.perf_counter() - start) * 1000.0
-    return tool, args, record, taken
+    return admission.admit((tool, args, record, taken))
 
 
 def _intake_watch_keys(watchlist: list[str] | None) -> list[tuple[str, str]]:
@@ -1149,9 +1166,10 @@ async def _intake_settle(
     """Wait once for every call: (flat rows, watch records, wall milliseconds).
 
     ponytail: overall budget keeps whatever finished; stragglers log as timeout.
+    Cancelled stragglers finish their cancellation first, so their jobs close before any recovery call starts.
     """
     wall_start = time.perf_counter()
-    done, _pending = await asyncio.wait(set(all_tasks), timeout=_INTAKE_BUDGET_S if all_tasks else 0.0)
+    done, pending = await asyncio.wait(set(all_tasks), timeout=_INTAKE_BUDGET_S if all_tasks else 0.0)
     wall_ms = (time.perf_counter() - wall_start) * 1000.0
     flat: _IntakeChainRows = []
     watch_records: dict[int, dict[str, object]] = {}
@@ -1160,6 +1178,7 @@ async def _intake_settle(
         flat.extend(rows)
         if watch_row is not None:
             watch_records[id(task)] = watch_row
+    await asyncio.gather(*pending, return_exceptions=True)
     return flat, watch_records, wall_ms
 
 
@@ -1227,25 +1246,36 @@ def _intake_evidence_preview(
     return preview
 
 
-def _intake_admit_all(
-    kernel: _Kernel,
-    sid: str,
-    calls: Sequence[tuple[str, dict[str, object]]],
-    timed: Sequence[tuple[dict[str, object], float]],
-) -> tuple[list[dict[str, object]], dict[str, int], list[str], float]:
-    """Admit every settled call: (raw log rows, outcome counts, admitted ids, settle milliseconds)."""
-    raw: list[dict[str, object]] = []
-    outcomes: dict[str, int] = {"admitted": 0, "duplicate": 0, "not_citable": 0, "error": 0, "timeout": 0}
-    admitted_ids: list[str] = []
-    settle_ms = 0.0
-    for (tool, args), (record, _taken) in zip(calls, timed):
-        raw.append({"tool": tool, "arguments": dict(args), "record": _jsonable_record(record)})
+class _IntakeAdmission:
+    """Admits each intake call once, as soon as it settles, so its job slot frees for dependent calls.
+
+    Keeps the round's settled rows, raw log rows, outcome counts, admitted ids and settle milliseconds.
+    """
+
+    def __init__(self, kernel: _Kernel, sid: str) -> None:
+        self.kernel = kernel
+        self.sid = sid
+        self.rows: _IntakeChainRows = []
+        self.raw: list[dict[str, object]] = []
+        self.outcomes: dict[str, int] = {"admitted": 0, "duplicate": 0, "not_citable": 0, "error": 0, "timeout": 0}
+        self.admitted_ids: list[str] = []
+        self.settle_ms = 0.0
+        self._seen: set[int] = set()
+
+    def admit(self, row: _IntakeCallRow) -> _IntakeCallRow:
+        """Admit one settled call; a record already admitted is skipped (rows keep their records alive)."""
+        tool, args, record, _taken = row
+        if id(record) in self._seen:
+            return row
+        self._seen.add(id(record))
+        self.rows.append(row)
+        self.raw.append({"tool": tool, "arguments": dict(args), "record": _jsonable_record(record)})
         started = time.perf_counter()
         try:
-            _intake_admit_call(kernel, sid, tool, record, outcomes, admitted_ids)
+            _intake_admit_call(self.kernel, self.sid, tool, record, self.outcomes, self.admitted_ids)
         finally:
-            settle_ms += (time.perf_counter() - started) * 1000.0
-    return raw, outcomes, admitted_ids, settle_ms
+            self.settle_ms += (time.perf_counter() - started) * 1000.0
+        return row
 
 
 def _intake_source_timing(
@@ -1260,6 +1290,87 @@ def _intake_source_timing(
     sec_ms = sum(v.get("ms", 0.0) for k, v in per_source.items() if k != "search_web")
     web_ms = sum(v.get("ms", 0.0) for k, v in per_source.items() if k == "search_web")
     return per_source, sec_ms, web_ms
+
+
+def _intake_doc_reads(rows: Sequence[_IntakeCallRow]) -> dict[str, str]:
+    """Document read status per accession (ok, error, timeout); a later attempt overrides an earlier one."""
+    out: dict[str, str] = {}
+    for tool, args, record, _ms in rows:
+        acc = args.get("accession_no")
+        if tool != "get_sec_document" or not isinstance(acc, str):
+            continue
+        failed = record.get("error") is not None or record.get("outcome") is None
+        out[acc] = ("timeout" if record.get("error_type") == "timeout" else "error") if failed else "ok"
+    return out
+
+
+def _intake_unread_material(
+    listed: Sequence[Mapping[str, object]], rows: Sequence[_IntakeCallRow], admitted: Sequence[Mapping[str, object]]
+) -> list[str]:
+    """Listed 10-Q/10-K/8-K accessions with no admitted evidence and no successful document read."""
+    read = {acc for acc, status in _intake_doc_reads(rows).items() if status == "ok"}
+    read |= {_ev_field(ev, "accession_no", "accession", "source_record_id") for ev in admitted}
+    material = (_baseline_accession(row) for row in listed if _baseline_form(row) in _INTAKE_MATERIAL_FORMS)
+    return list(dict.fromkeys(acc for acc in material if acc is not None and acc not in read))
+
+
+async def _intake_retry(
+    tool: str,
+    batch: Sequence[dict[str, object]],
+    timeout_s: float,
+    admission: _IntakeAdmission,
+    session: dict[str, JSONValue],
+    registry: list[dict[str, JSONValue]],
+    jev: object,
+    as_of: str | None,
+) -> float:
+    """One bounded attempt per argument set, in parallel and admitted as each settles; returns wall milliseconds."""
+    if not batch:
+        return 0.0
+    sid, kernel = admission.sid, admission.kernel
+    tasks = [
+        asyncio.ensure_future(
+            _intake_timed(tool, args, sid, session, registry, jev, kernel, as_of, timeout_s, admission)
+        )
+        for args in batch
+    ]
+    rows, _records, wall_ms = await _intake_settle(tasks, {id(t): (tool, a) for t, a in zip(tasks, batch)})
+    for row in rows:
+        admission.admit(row)
+    return wall_ms
+
+
+async def _intake_recover(
+    admission: _IntakeAdmission,
+    session: dict[str, JSONValue],
+    registry: list[dict[str, JSONValue]],
+    jev: object,
+    as_of: str | None,
+) -> float:
+    """Bounded recovery before the Reasoner plans; returns wall milliseconds.
+
+    First, family listings a full session dropped (parallelism_exceeded) run once more.
+    Then every listed material accession without admitted evidence or a successful read is read once.
+    ponytail: an insider read a full session dropped is not retried; the scheduler can still select it.
+    """
+    from app.research import scheduler
+
+    dropped = [
+        args
+        for tool, args, record, _ms in admission.rows
+        if tool == "list_sec_filings"
+        and "forms" in args
+        and record.get("error_type") == FailureCategory.PARALLELISM_EXCEEDED
+    ]
+    wall_ms = await _intake_retry(
+        "list_sec_filings", dropped, _INTAKE_CALL_TIMEOUT_S, admission, session, registry, jev, as_of
+    )
+    admitted = scheduler._load_evidence(admission.sid, admission.kernel)
+    unread = _intake_unread_material(_intake_listed(admission.rows), admission.rows, admitted)
+    reads: list[dict[str, object]] = [{"accession_no": acc, "max_chars": _INTAKE_DOC_CHARS} for acc in unread]
+    return wall_ms + await _intake_retry(
+        "get_sec_document", reads, _INTAKE_DOC_TIMEOUT_S, admission, session, registry, jev, as_of
+    )
 
 
 async def _intake_round(
@@ -1281,10 +1392,11 @@ async def _intake_round(
     """
     from app.research import scheduler
 
+    admission = _IntakeAdmission(kernel, sid)
     chains: list[asyncio.Task[_IntakeChainRows]] = [
         asyncio.ensure_future(
             asyncio.wait_for(
-                _intake_ticker_chain(ticker, sid, session, registry, jev, kernel, as_of),
+                _intake_ticker_chain(ticker, sid, session, registry, jev, kernel, as_of, admission),
                 timeout=_INTAKE_CALL_TIMEOUT_S,
             )
         )
@@ -1292,24 +1404,38 @@ async def _intake_round(
     ]
     web_queries = list(dict.fromkeys(q for q in (query_text, title_query) if q is not None))
     web: list[asyncio.Task[_IntakeCallRow]] = [
-        asyncio.ensure_future(_intake_timed("search_web", {"query": q}, sid, session, registry, jev, kernel, as_of))
+        asyncio.ensure_future(
+            _intake_timed("search_web", {"query": q}, sid, session, registry, jev, kernel, as_of, None, admission)
+        )
         for q in web_queries
     ]
     watch_keys = _intake_watch_keys(watchlist)
     watch = [
         asyncio.ensure_future(
-            _intake_timed(tool, _watchlist_args(tool, symbol), sid, session, registry, jev, kernel, as_of)
+            _intake_timed(
+                tool, _watchlist_args(tool, symbol), sid, session, registry, jev, kernel, as_of, None, admission
+            )
         )
         for symbol, tool in watch_keys
     ]
     _notify(progress, "intake_start", {"calls": len(chains) + len(web) + len(watch)})
     task_meta = _intake_task_meta(chains, tickers, web, web_queries, watch, watch_keys)
     flat, watch_records, wall_ms = await _intake_settle([*chains, *web, *watch], task_meta)
+    for row in flat:
+        admission.admit(row)  # budget stragglers and rows no call admitted yet
+    wall_ms += await _intake_recover(admission, session, registry, jev, as_of)
+    admitted: list[dict[str, JSONValue]] = scheduler._load_evidence(sid, kernel)
+    flat = admission.rows
+    raw, outcomes, admitted_ids, settle_ms = (
+        admission.raw,
+        admission.outcomes,
+        admission.admitted_ids,
+        admission.settle_ms,
+    )
+    unread = _intake_unread_material(_intake_listed(flat), flat, admitted)
     calls = [(tool, args) for tool, args, _, _ in flat]
     timed = [(record, taken) for _, _, record, taken in flat]
     ms_total = sum(taken for _, _, _, taken in flat)
-    raw, outcomes, admitted_ids, settle_ms = _intake_admit_all(kernel, sid, calls, timed)
-    admitted: list[dict[str, JSONValue]] = scheduler._load_evidence(sid, kernel)
     per_source, sec_ms, web_ms = _intake_source_timing(calls, timed)
     logger.info(
         "intake round_timing sid=%s calls=%s admitted=%s sec_ms=%.1f web_ms=%.1f settle_ms=%.1f wall_ms=%.1f",
@@ -1345,7 +1471,21 @@ async def _intake_round(
         "per_source": per_source,
         "sec_ms": sec_ms,
         "web_ms": web_ms,
+        "filing_inventory": [
+            {"form": _baseline_form(row), "accession_no": _baseline_accession(row), "filed_at": _intake_filed(row)}
+            for row in _intake_listed(flat)
+        ],
+        "unread_material": unread,
+        "material_docs": [{"accession_no": acc, "status": s} for acc, s in _intake_doc_reads(flat).items()],
     }
+    if any(
+        record.get("error_type") == FailureCategory.PARALLELISM_EXCEEDED
+        and (tool == "get_insider_activity" or args.get("forms") == list(_INTAKE_INSIDER_FORMS))
+        for tool, args, record, _ms in flat
+    ):
+        stats["limitations"] = [
+            "Session parallelism blocked insider discovery or activity. Recovery retries material documents only."
+        ]
     if watch:
         # Admitted rows carry their evidence_id; failures, no-record answers and timeouts stay explicit.
         stats["watchlist"] = [

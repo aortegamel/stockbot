@@ -10315,9 +10315,16 @@ def test_intake_newest_4a_digest_carries_insider_transactions(tmp_path: Path, mo
         as_of: str | None,
     ) -> dict[str, object]:
         calls.append(tool)
+        if tool == "get_sec_document":
+            return {"tool": tool, "arguments": args, "error": "no document backend", "outcome": None}
         job_id = sched._attempt_job(kernel, sid, "SEC")
         result = dict(payloads[tool])
-        ref = f"{sid}:tr:{tool}"
+        forms = args.get("forms")
+        if isinstance(forms, list):
+            filings = result["filings"]
+            assert isinstance(filings, list)
+            result["filings"] = [r for r in filings if r["form"] in forms][:1]
+        ref = f"{sid}:tr:{tool}:{forms[0] if isinstance(forms, list) else ''}"
         _svc.persist_tool_result(sid, job_id, tool, ref, result)
         result["tool_result_id"] = ref
         return sched._success_attempt(tool, args, outcome_from_result(tool, result), result, "SEC", "intake", job_id)
@@ -10330,8 +10337,11 @@ def test_intake_newest_4a_digest_carries_insider_transactions(tmp_path: Path, mo
     admitted, _raw, stats = asyncio.run(
         kw._intake_round(None, ["NVDA"], sid, repo.get_session(sid).to_dict(), [], None, sched._Kernel(), None)
     )
-    assert calls == ["list_sec_filings", "get_insider_activity"]
-    assert stats["outcomes"] == {"admitted": 2, "duplicate": 0, "not_citable": 0, "error": 0, "timeout": 0}
+    # Four family listings, then the 8-K read beside insider activity, then one bounded retry of the unread 8-K.
+    assert sorted(calls) == sorted(["list_sec_filings"] * 4 + ["get_sec_document"] * 2 + ["get_insider_activity"])
+    assert stats["unread_material"] == ["0001045810-26-000001"]
+    # Every family listing admits as SEC record evidence; the 8-K read and its retry fail without a doc backend.
+    assert stats["outcomes"] == {"admitted": 5, "duplicate": 0, "not_citable": 0, "error": 2, "timeout": 0}
     row = (
         "  - insider_name Huang Jen-Hsun, transaction_code S, transaction_kind open_market_sale, "
         "transaction_date 2026-09-05, acquired_disposed D, shares 2605, price 360.13, "
