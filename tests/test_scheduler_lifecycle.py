@@ -162,6 +162,10 @@ class _Kernel(sched._Kernel):
     def get_tool_result(self, tool_result_id: str) -> dict[str, JSONValue]:
         return self.tool_results[tool_result_id]
 
+    @override
+    def list_tool_results(self, session_id: str) -> list[dict[str, JSONValue]]:
+        return [row for row in self.tool_results.values() if row.get("session_id") == session_id]
+
 
 class _DupKernel(_Kernel):
     """Store already holds the identity: admission returns the stored winner, accepted False."""
@@ -205,6 +209,17 @@ def _resolve_nvda(name: str) -> str | None:
     return {"NVDA": "NVDA"}.get(name)
 
 
+@pytest.fixture(autouse=True)
+def _trusted_nvda_cik(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deterministic PIT identity: NVDA trusts to 1045810; anything else is unresolvable."""
+    import app.sec.client as _client
+
+    def _cik(value: object) -> int | None:
+        return 1045810 if str(value).strip().upper() == "NVDA" else None
+
+    monkeypatch.setattr(_client, "resolve_cik", _cik)
+
+
 _LISTED_8K, _LISTED_10Q = "0001045810-26-000078", "0001045810-26-000075"
 _8K_OBJECTIVE = "What did NVDA's latest 8-K say?"
 _8K_SESSION: dict[str, JSONValue] = {"session_id": "s1", "objective": _8K_OBJECTIVE}
@@ -230,7 +245,7 @@ def _sec_rows() -> list[JSONValue]:
     ]
 
 
-def _sec_listing(subject: str = "NVDA", rows: list[JSONValue] | None = None) -> dict[str, JSONValue]:
+def _sec_listing(subject: str = "1045810", rows: list[JSONValue] | None = None) -> dict[str, JSONValue]:
     """Successful list_sec_filings attempt whose persisted payload rides inline."""
     filings = _sec_rows() if rows is None else rows
     return {
@@ -240,6 +255,11 @@ def _sec_listing(subject: str = "NVDA", rows: list[JSONValue] | None = None) -> 
         "error": None,
         "result": {"subject": subject, "count": len(filings), "filings": filings, "source": "SEC EDGAR"},
     }
+
+
+def _ticker_listing() -> dict[str, JSONValue]:
+    """One ticker-echo listing case: subject NVDA names the same NVDA rows."""
+    return _sec_listing(subject="NVDA")
 
 
 def _revenue_listing() -> dict[str, JSONValue]:
@@ -6249,8 +6269,8 @@ def test_persisted_carry_selects_requested_revenue_form(
 
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
     rows: list[JSONValue] = [
-        {"form": "10-K", "filed_at": "2026-07-01", "accession_no": "0001045810-26-000070"},
-        {"form": "10-Q", "filed_at": "2026-05-01", "accession_no": _LISTED_10Q},
+        {"form": "10-K", "filed_at": "2026-07-01", "accession_no": "0001045810-26-000070", "filer_cik": 1045810},
+        {"form": "10-Q", "filed_at": "2026-05-01", "accession_no": _LISTED_10Q, "filer_cik": 1045810},
     ]
     listing = _sec_listing(rows=rows)
     listing["outcome_summary"] = f"10-Q {_LISTED_8K}"
@@ -6393,7 +6413,7 @@ def test_boolean_carry_gates_reject_foreign_or_failed_listings(invalid: str, mon
     import app.tools as _tools
 
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
-    listing = _sec_listing("AAPL" if invalid == "ticker" else "NVDA")
+    listing = _sec_listing("AAPL" if invalid == "ticker" else "1045810")
     if invalid == "attempt-session":
         listing["session_id"] = "other"
     if invalid == "payload-session":
@@ -6475,7 +6495,7 @@ def test_repeat_swap_rejects_foreign_or_injected_alternatives(invalid: str, monk
     import app.tools as _tools
 
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
-    listing = _sec_listing("AAPL" if invalid == "ticker" else "NVDA")
+    listing = _sec_listing("AAPL" if invalid == "ticker" else "1045810")
     if invalid == "attempt-session":
         listing["session_id"] = "other"
     if invalid == "payload-session":
@@ -8874,7 +8894,7 @@ def test_persisted_accession_rejects_invalid_source(invalid: str, monkeypatch: p
     import app.tools as _tools
 
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
-    listing = _sec_listing("AAPL" if invalid == "issuer" else "NVDA")
+    listing = _sec_listing("AAPL" if invalid == "issuer" else "1045810")
     if invalid == "malformed":
         listing = _sec_listing(rows=[{"accession_no": "invented", "form": "8-K"}])
     if invalid == "error":
@@ -8900,9 +8920,14 @@ def test_persisted_accession_newest_filed_at_wins(tie: bool, monkeypatch: pytest
 
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
     rows: list[JSONValue] = [
-        {"accession_no": _LISTED_10Q, "form": "8-K", "filed_at": "2026-09-01" if tie else "2026-08-01"},
+        {
+            "accession_no": _LISTED_10Q,
+            "form": "8-K",
+            "filed_at": "2026-09-01" if tie else "2026-08-01",
+            "filer_cik": 1045810,
+        },
         {"accession_no": "bad", "form": "8-K", "filed_at": "2026-10-01"},
-        {"accession_no": _LISTED_8K.replace("-", ""), "form": "8-K", "filed_at": "2026-09-01"},
+        {"accession_no": _LISTED_8K.replace("-", ""), "form": "8-K", "filed_at": "2026-09-01", "filer_cik": 1045810},
     ]
     actual = sched._resolve_persisted_accession(
         "get_sec_filing",
@@ -8952,7 +8977,7 @@ def test_persisted_document_name_omits_absent_primary(monkeypatch: pytest.Monkey
     import app.tools as _tools
 
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
-    listing = _sec_listing(rows=[{"accession_no": _LISTED_8K, "form": "8-K"}])
+    listing = _sec_listing(rows=[{"accession_no": _LISTED_8K, "form": "8-K", "filer_cik": 1045810}])
     schema = sched._schema_for("get_sec_document", sched.build_registry())
     assert sched._resolve_persisted_accession(
         "get_sec_document", {}, schema, _8K_SESSION, _node(), [listing], _Kernel()
@@ -9008,7 +9033,9 @@ def test_material_read_hold_recovers_then_reports_incomplete_guard(form: str, mo
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
     objective = f"What did NVDA's latest {form} say?"
     session: dict[str, JSONValue] = {"session_id": "s1", "objective": objective}
-    listing = _sec_listing(rows=[{"accession_no": _LISTED_8K, "form": form, "filed_at": "2026-09-01"}])
+    listing = _sec_listing(
+        rows=[{"accession_no": _LISTED_8K, "form": form, "filed_at": "2026-09-01", "filer_cik": 1045810}]
+    )
     selected = iter(
         [
             ("invoke", _invoke("list_sec_filings")),
@@ -9072,6 +9099,19 @@ def test_material_read_hold_recovers_then_reports_incomplete_guard(form: str, mo
     assert any(isinstance(a, dict) and a.get("error") == sched._MATERIAL_READ_HOLD for a in attempts)
 
 
+def test_generic_filing_question_requires_document_content() -> None:
+    """The exact question What are the latest filings saying holds on listing-only evidence."""
+    session: dict[str, JSONValue] = {"session_id": "s1", "objective": "What are the latest filings saying?"}
+    node = _node()
+    listing_attempt: dict[str, JSONValue] = {"tool": "list_sec_filings", "error": None}
+    assert sched._material_read_pending(session, node, [listing_attempt]) is True
+    doc_attempt: dict[str, JSONValue] = {"tool": "list_sec_filings", "error": None}
+    read_attempt: dict[str, JSONValue] = {"tool": "get_sec_document", "error": None}
+    assert sched._material_read_pending(session, node, [doc_attempt, read_attempt]) is False
+    assert sched._filing_analysis_intent("What are the latest filings saying?") is True
+    assert sched._filing_analysis_intent("What is ORCL's filing history?") is False
+
+
 @pytest.mark.parametrize("issuer_key", ["filer_cik", "subject_cik"])
 def test_persisted_accession_matches_explicit_cik(issuer_key: str) -> None:
     """An explicit objective CIK matches either SEC issuer field. A foreign CIK never carries."""
@@ -9100,6 +9140,46 @@ def test_persisted_accession_obeys_selected_schema(prop: dict[str, JSONValue]) -
         )
         is None
     )
+
+
+def test_numeric_listing_matches_ticker_issuer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A numeric intake listing subject matches ticker NVDA through its trusted CIK."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
+    session: dict[str, JSONValue] = {"session_id": "s1", "objective": "What did NVDA's latest 8-K say?"}
+    schema = sched._schema_for("get_sec_document", sched.build_registry())
+    assert sched._resolve_persisted_accession(
+        "get_sec_document", {}, schema, session, _node(), [_sec_listing()], _Kernel()
+    ) == {"accession_no": _LISTED_8K, "document_name": "nvda-8k.htm"}
+    # Ticker-echo listings still match without a trusted-CIK lookup.
+    assert sched._resolve_persisted_accession(
+        "get_sec_document", {}, schema, session, _node(), [_ticker_listing()], _Kernel()
+    ) == {"accession_no": _LISTED_8K, "document_name": "nvda-8k.htm"}
+
+
+def test_intake_persisted_listing_resolves_without_node_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed node listing still reads the intake-persisted accession from session tool results."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
+    listing = _sec_listing()
+    assert isinstance(listing["result"], dict)
+    stored: dict[str, dict[str, JSONValue]] = {
+        "s1:tr:intake": {
+            "tool_result_id": "s1:tr:intake",
+            "session_id": "s1",
+            "tool_name": "list_sec_filings",
+            "result": listing["result"],
+        }
+    }
+    failed = dict(listing)
+    failed["error"] = "listing failed"
+    session: dict[str, JSONValue] = {"session_id": "s1", "objective": "What did NVDA's latest 8-K say?"}
+    schema = sched._schema_for("get_sec_document", sched.build_registry())
+    assert sched._resolve_persisted_accession(
+        "get_sec_document", {}, schema, session, _node(), [failed], _Kernel(stored)
+    ) == {"accession_no": _LISTED_8K, "document_name": "nvda-8k.htm"}
 
 
 def test_revenue_empty_latest_listing_blocks_older_persisted_rows(monkeypatch: pytest.MonkeyPatch) -> None:

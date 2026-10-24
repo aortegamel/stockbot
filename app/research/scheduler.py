@@ -253,6 +253,9 @@ class _Kernel:
     def get_tool_result(self, tool_result_id: str) -> dict[str, JSONValue]:
         return self._store().get_tool_result(tool_result_id)
 
+    def list_tool_results(self, session_id: str) -> list[dict[str, JSONValue]]:
+        return self._store().list_tool_results(session_id)
+
 
 class _ReasonOut(TypedDict):
     """Reason-branch signals: done ends the round, decision carries the verdict."""
@@ -1293,6 +1296,18 @@ _MATERIAL_FORM_NAMES = {"10q": "10-Q", "10k": "10-K", "8k": "8-K"}
 """Material filings: a node that names one reads its document before it resolves."""
 _MATERIAL_READ_HOLD = "read the retained filing document before resolving"
 """Reselect error while a revenue or material-form node still lacks its document read."""
+_FILING_ANALYSIS_RE = re.compile(
+    r"\b(?:what (?:are|is)\b.*\b(?:saying|disclos)|summariz|explain|compar|analyz|latest filings|recent filings|newest filings)"
+)
+"""Generic filing-analysis intent: listing metadata alone never satisfies these asks."""
+
+
+def _filing_analysis_intent(text: object) -> bool:
+    """True when the ask wants filing contents summarized, not just a filing list."""
+    low = str(text or "").lower()
+    if "filing" not in low and "10-q" not in low and "10-k" not in low and "8-k" not in low and "10q" not in low:
+        return False
+    return _FILING_ANALYSIS_RE.search(low) is not None
 
 
 def _material_forms(text: object) -> frozenset[str]:
@@ -1319,6 +1334,35 @@ def _persisted_attempt_payload(
     return inline if inline.get("session_id", session_id) == session_id and inline.get("error") is None else None
 
 
+def _session_persisted_listings(
+    kernel: _Kernel, session_id: str, objective: object, supplied_ticker: object = None
+) -> list[Mapping[str, object]]:
+    """Structured list_sec_filings payloads from session tool results (intake scope), newest first."""
+    issuer = _objective_subject_ticker(objective, supplied_ticker)
+    if issuer is None:
+        return []
+    want = issuer.strip().upper()
+    try:
+        rows = kernel.list_tool_results(session_id)
+    except Exception:  # noqa: BLE001 - persistence is best-effort; attempts still gate
+        return []
+    out: list[Mapping[str, object]] = []
+    for row in reversed(rows):
+        if not isinstance(row, Mapping) or row.get("session_id") != session_id:
+            continue
+        if row.get("tool_name") != "list_sec_filings":
+            continue
+        payload = _persisted_shapes(row)
+        if payload.get("error") is not None or not isinstance(payload.get("filings"), list):
+            continue
+        subject = payload.get("subject")
+        subject_text = str(subject).strip().upper() if isinstance(subject, (str, int)) else ""
+        if subject_text and subject_text != want and _cik_int(subject_text) is None:
+            continue  # named for another issuer; numeric subjects verify later
+        out.append(payload)
+    return out
+
+
 def _cik_int(value: object) -> int | None:
     """Positive CIK from an int or a digit string; anything else is None."""
     if isinstance(value, bool) or not isinstance(value, (int, str)):
@@ -1337,11 +1381,26 @@ def _issuer_filing_rows(payloads: Sequence[Mapping[str, object]], ticker: str | 
 
     A listing proves its issuer through its subject echo (ticker, or CIK plus a matching row CIK).
     A single filing record proves it only through a CIK that a matching listing row names.
+    The trusted CIK of a lettered ticker seeds numeric-subject listings (never summaries or text).
     """
     if ticker is None:
         return []
     want = ticker.strip().upper()
     ciks = {cik} if (cik := _cik_int(want)) is not None else set()
+    if (
+        not ciks
+        and want
+        and any(
+            _cik_int(str(payload.get("subject")).strip()) is not None
+            for payload in payloads
+            if isinstance(payload.get("filings"), list)
+        )
+    ):
+        from app.sec.client import resolve_cik
+
+        trusted = resolve_cik(want)
+        if trusted is not None and trusted > 0:
+            ciks = {trusted}
     by_ticker: list[Mapping[str, object]] = []
     by_cik: list[tuple[int, Mapping[str, object]]] = []
     singles: list[Mapping[str, object]] = []
@@ -1424,7 +1483,12 @@ def _carry_forms(objective: object, text: str) -> frozenset[str]:
         return frozenset({"10-Q"})
     if _latest_revenue_objective(objective):
         return frozenset(_REVENUE_FORMS)
-    return frozenset({"10-Q"}) if want_10q else _material_forms(text)
+    named = _material_forms(text)
+    if named:
+        return frozenset({"10-Q"}) if want_10q else named
+    if _filing_analysis_intent(text):
+        return frozenset({"10-Q", "10-K", "8-K"})
+    return frozenset({"10-Q"}) if want_10q else frozenset()
 
 
 def _listed_filing(
@@ -1455,22 +1519,32 @@ def _resolve_persisted_accession(
 ) -> dict[str, JSONValue] | None:
     """Session- and issuer-checked accession from persisted SEC rows; None unless exactly one filing wins.
 
-    Reads error-free attempts newest-first. Never reads summaries or free text. Output keys stay
-    inside schema.properties and {accession_no, document_name}.
+    Reads error-free attempts newest-first, then session-persisted tool results when node
+    attempts lack a listing (intake scope). Never reads summaries or free text. Output keys
+    stay inside schema.properties and {accession_no, document_name}.
     """
     props = schema.get("properties")
     if tool_name not in _ACCESSION_CARRY_TOOLS or not isinstance(props, dict) or "accession_no" not in props:
         return None
     objective = _session_objective(session)
+    session_id = session.get("session_id")
     sources = [
         (attempt, payload)
         for attempt in reversed(attempts)
-        if (payload := _persisted_attempt_payload(attempt, session.get("session_id"), kernel)) is not None
+        if (payload := _persisted_attempt_payload(attempt, session_id, kernel)) is not None
     ]
     payloads = [payload for _attempt, payload in sources]
+    listing_present = any(attempt.get("tool") == "list_sec_filings" for attempt, _payload in sources)
+    session_listings: list[Mapping[str, object]] = []
+    if not listing_present and isinstance(session_id, str) and session_id:
+        session_listings = _session_persisted_listings(kernel, session_id, objective, session.get("ticker"))
+        payloads = [*session_listings, *payloads]
     filing_payloads: list[Mapping[str, object]] = payloads
     if _revenue_read_objective(objective):
-        listing = next((payload for attempt, payload in sources if attempt.get("tool") == "list_sec_filings"), None)
+        listing = next(
+            (payload for attempt, payload in sources if attempt.get("tool") == "list_sec_filings"),
+            session_listings[0] if session_listings else None,
+        )
         filing_payloads = [] if listing is None else [listing]
     cik = re.search(r"\bCIK\s*[:#]?\s*(\d{1,10})\b", objective, re.IGNORECASE)
     issuer = cik.group(1) if cik is not None else _objective_subject_ticker(objective, session.get("ticker"))
@@ -5085,10 +5159,10 @@ def _material_read_pending(
     node: object,
     attempts: Sequence[Mapping[str, JSONValue]],
 ) -> bool:
-    """Keep a revenue or 10-Q/10-K/8-K node active after SEC navigation until its document read succeeds."""
+    """Keep a revenue, material-form, or filing-analysis node active after SEC navigation until its document read succeeds."""
     objective = session.get("objective") or session.get("query") or ""
     question = f"{objective} {_f(node, 'question', default='')}"
-    if not (_revenue_read_objective(question) or _material_forms(question)):
+    if not (_revenue_read_objective(question) or _material_forms(question) or _filing_analysis_intent(question)):
         return False
     ok = [a.get("tool") for a in attempts if a.get("error") is None]
     return "get_sec_document" not in ok and any(t in _SEC_NAVIGATION_TOOLS for t in ok)
