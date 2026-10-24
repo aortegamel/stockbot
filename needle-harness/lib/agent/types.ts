@@ -140,12 +140,12 @@ export type FinalClaim = {
   confidence?: number;
 };
 
-export type FinalPersonaResult = {
-  persona: Persona;
-  text: string;
-  claims: FinalClaim[];
-  confidence?: number;
-};
+// One model answer before any gate: narrative prose plus the model's declared
+// claims. The claims stay unproven declarations until the final gates return
+// kept text. Nothing here is ledger proof.
+export type NarrativeResult = { prose: string; claims: FinalClaim[]; confidence?: number };
+
+export type FinalPersonaResult = NarrativeResult & { persona: Persona };
 
 // Final-answer personas in fixed output order; each runs as its own Muse call.
 export const FINAL_PERSONAS = ["stockbot", "bearbot", "bullbot"] as const;

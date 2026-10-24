@@ -1,5 +1,5 @@
 import { setTimeout as sleep } from "node:timers/promises";
-import { FINAL_CLAIM_TYPES, type AskContext, type Evidence, type FinalClaim, type FinalClaimType, type Persona } from "../agent/types";
+import { FINAL_CLAIM_TYPES, type AskContext, type Evidence, type FinalClaim, type FinalClaimType, type NarrativeResult, type Persona } from "../agent/types";
 import { reasoningFields } from "../../../decision/reasoning";
 
 export type MuseUsage = {
@@ -111,7 +111,7 @@ const FENCE_OPEN = "```json";
 // the text before it. Text after its closing fence is dropped. An unclosed
 // (cut-off) block never leaks its JSON into the prose. Claims are coerced from
 // snake_case wire to camelCase; confidence is carried when 0..1.
-export function splitInventory(raw: string): { prose: string; claims: FinalClaim[]; confidence?: number } {
+export function splitInventory(raw: string): NarrativeResult {
   const start = raw.lastIndexOf(FENCE_OPEN);
   if (start < 0) return { prose: raw, claims: [] };
   const prose = raw.slice(0, start);
@@ -133,19 +133,9 @@ export function splitInventory(raw: string): { prose: string; claims: FinalClaim
     return { prose, claims: [] };
   }
 }
-function withInventory(r: { text: string; usage: MuseUsage }): {
-  text: string;
-  usage: MuseUsage;
-  claims: FinalClaim[];
-  confidence?: number;
-} {
-  const inv = splitInventory(r.text);
-  return {
-    text: inv.prose,
-    usage: r.usage,
-    claims: inv.claims,
-    ...(inv.confidence !== undefined ? { confidence: inv.confidence } : {}),
-  };
+// The narrative split: display prose plus the declared, still unproven claims.
+function withInventory(r: { text: string; usage: MuseUsage }): NarrativeResult & { usage: MuseUsage } {
+  return { ...splitInventory(r.text), usage: r.usage };
 }
 
 // All admitted evidence reaches personas; no character budget. Each kernel
@@ -288,12 +278,13 @@ type ReasonOptions = {
   // Request cancellation and wall deadline (epoch ms), shared by every fetch and retry of this call.
   signal?: AbortSignal;
   deadlineAt?: number;
-  onDelta: (text: string) => void;
+  // Internal streaming diagnostics only: raw model deltas, inventory fence
+  // included. No caller forwards them to a client. The client sees only the
+  // gated text that the final gates return.
+  onDelta?: (text: string) => void;
   // Output tokens already spent by earlier Muse calls of the same request; the
   // answer budget subtracts them. reason() adds its own usage to it.
   spent?: { outputTokens: number };
-  // reason() strips the inventory fence: the returned text is display prose plus
-  // parsed claims (external prose unchanged; streamed deltas keep the raw block).
 };
 
 function reasonEndpoint(): { apiKey: string; model: string; base: string } {
@@ -366,7 +357,8 @@ function outputCap(spent: { outputTokens: number } | undefined): number | undefi
   return Math.min(perCall ?? left, left);
 }
 
-export async function reason(opts: ReasonOptions): Promise<{ text: string; usage: MuseUsage; claims: FinalClaim[]; confidence?: number }> {
+export async function reason(opts: ReasonOptions): Promise<NarrativeResult & { usage: MuseUsage }> {
+  const onDelta = opts.onDelta ?? ((): void => { });
   const { apiKey, model, base } = reasonEndpoint();
   const signal = reasonSignal(opts);
   const cap = outputCap(opts.spent);
@@ -379,7 +371,7 @@ export async function reason(opts: ReasonOptions): Promise<{ text: string; usage
     opts.persona ? signal : AbortSignal.any([AbortSignal.timeout(FETCH_TIMEOUT_MS), signal]);
   const send = async (): Promise<{ text: string; usage: MuseUsage }> => {
     try {
-      return await post(base, apiKey, session, "/responses", body, opts.onDelta, fetchSignal());
+      return await post(base, apiKey, session, "/responses", body, onDelta, fetchSignal());
     } catch (err) {
       // Cancelled or past deadline: no retry, no fallback.
       if (signal.aborted) throw err;
@@ -388,7 +380,7 @@ export async function reason(opts: ReasonOptions): Promise<{ text: string; usage
       // once after a short wait; only 404/405 (unsupported path) falls over.
       if (/(429|GoUsageLimit)/.test(msg)) {
         await sleep(5000, undefined, { signal });
-        return post(base, apiKey, session, "/responses", body, opts.onDelta, fetchSignal());
+        return post(base, apiKey, session, "/responses", body, onDelta, fetchSignal());
       }
       if (!/(404|405|500|502|503|504)/.test(msg)) throw err;
       // The chat fallback carries no cap: the cap name there is unverified (the
@@ -399,7 +391,7 @@ export async function reason(opts: ReasonOptions): Promise<{ text: string; usage
         session,
         "/chat/completions",
         { model, messages: input.map((m) => ({ role: m.role, content: m.content })), stream: true, ...reasoningFields("chat_completions") },
-        opts.onDelta,
+        onDelta,
         fetchSignal(),
       );
     }

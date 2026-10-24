@@ -28,8 +28,9 @@ let argsReply: Record<string, unknown> | null = null;
 let runThrows: unknown = null;
 let assessDown = false;
 let assessReply: Record<string, unknown> | null = null;
-// The worker verdict every assess_final_* op returns.
+// The worker verdict every assess_final_* op returns, unless gateScript answers the body.
 let gateReply: Record<string, unknown> = { support_answer: "yes" };
+let gateScript: ((body: Record<string, unknown>) => Record<string, unknown>) | null = null;
 const gateBodies: Record<string, unknown>[] = [];
 // The reasoner's answer text and claims inventory.
 let reasonText = "The answer is unknown.";
@@ -108,7 +109,7 @@ mock.module("@/lib/agent/kernel", () => ({
       if (typeof body.op === "string" && body.op.startsWith("assess_final")) {
         gateBodies.push(body as Record<string, unknown>);
         if (body.sessionId !== "rs:entry") return { error: "proof: no admitted research session" };
-        return gateReply;
+        return gateScript?.(body as Record<string, unknown>) ?? gateReply;
       }
       return routeReply ?? { route: winner, personas };
     },
@@ -153,8 +154,9 @@ mock.module("@/lib/muse/client", () => ({
     reasonCalls.push(opts);
     executionOrder.push("reason");
     if (reasonDown) throw new Error("muse down");
-    opts.onDelta?.(reasonText);
-    return { text: reasonText, usage: {}, claims: reasonClaims };
+    // A wired onDelta would see the raw stream, inventory fence included.
+    opts.onDelta?.(`${reasonText}\n\`\`\`json ${JSON.stringify({ claims: reasonClaims })}\`\`\``);
+    return { prose: reasonText, usage: {}, claims: reasonClaims };
   },
 }));
 
@@ -196,6 +198,7 @@ function reset(): void {
   assessDown = false;
   assessReply = null;
   gateReply = { support_answer: "yes" };
+  gateScript = null;
   gateBodies.length = 0;
   reasonText = "The answer is unknown.";
   reasonClaims = [{ text: reasonText, claimType: "unknown", evidenceIds: [] }];
@@ -429,6 +432,61 @@ describe("agent entry route", () => {
       claims: [{ text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:bridge"], datapoint_ids: ["dp:short-interest"] }],
     });
     expect(runCalls).toEqual([]);
+  });
+
+  test("a single-tool narrative publishes only gate-kept claims, with no stream callback and no raw fence", async () => {
+    reset();
+    winner = "query_finra";
+    const kept = { text: "Short interest may rise [ev:bridge].", claimType: "inference", evidenceIds: ["ev:bridge"] };
+    const unsupported = { text: "Short interest doubled [ev:bridge].", claimType: "observed_fact", evidenceIds: ["ev:bridge"] };
+    reasonText = `${kept.text} ${unsupported.text}`;
+    reasonClaims = [kept, unsupported];
+    // The inventory passes the local check; only the worker gate rejects the unsupported claim.
+    gateScript = (body) => ({ support_answer: body.op === "assess_final_claim" && (body.claim as Record<string, unknown>).text === kept.text ? "yes" : "no" });
+    const events = await eventsFor("short interest?");
+    expect(reasonCalls.map((call) => call.onDelta)).toEqual([undefined]);
+    expect(gateBodies.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_claim", "assess_final_claim"]);
+    expect(events.filter((e) => e.type === "answer_delta")).toEqual([{ type: "answer_delta", text: kept.text }]);
+    expect(events.find((e) => e.type === "claims")?.claims).toEqual([kept]);
+    expect(JSON.stringify(events)).not.toContain("```");
+    expect(JSON.stringify(events)).not.toContain("doubled");
+    // The route measures its own phases; a phase this path never runs stays absent.
+    expect(Object.keys((events.at(-1)?.metrics as { timings: Record<string, number> }).timings).sort()).toEqual(["firstTextMs", "routeMs"]);
+  });
+
+  test("a failed document read refuses before reasoning; an inspected document answers from its row", async () => {
+    const listing = "form 10-Q accession 0001045810-26-000001 filed 2026-08-27";
+    const document = "Revenue was $46.7 billion.";
+    const docFact = { text: "The 10-Q reports revenue of $46.7 billion [ev:doc].", claimType: "observed_fact", evidenceIds: ["ev:doc"] };
+    const lastEvidenceIds = (events: AgentEventShape[]): string[] => (events.filter((e) => e.type === "evidence").at(-1)?.evidence as Evidence[]).map((row) => row.id);
+    reset();
+    winner = "list_sec_filings";
+    verdicts = ["get_sec_document", "node_resolved"];
+    entryReplies = [{ sessionId: "rs:entry", evidence: [{ ...bridgeEvidence, id: "ev:list", content: listing }], content: listing }];
+    toolFailure = { category: "tool_error", error: "document read timed out" };
+    reasonText = docFact.text;
+    reasonClaims = [docFact];
+    const listed = await eventsFor("what does NVDA's 10-Q say?");
+    expectVerificationRefusal(listed);
+    expect(listed.find((e) => e.type === "failed")?.message).toBe("No verified answer: document read timed out");
+    expect(listed.some((e) => e.type === "tool_failed" && e.tool === "get_sec_document")).toBe(true);
+    expect(lastEvidenceIds(listed)).toEqual(["ev:list"]);
+    expect(reasonCalls).toEqual([]);
+    expect(gateBodies).toEqual([]);
+    reset();
+    winner = "list_sec_filings";
+    verdicts = ["get_sec_document", "node_resolved"];
+    entryReplies = [
+      { sessionId: "rs:entry", evidence: [{ ...bridgeEvidence, id: "ev:list", content: listing }], content: listing },
+      { sessionId: "rs:entry", evidence: [{ ...bridgeEvidence, id: "ev:doc", content: document }], content: document },
+    ];
+    reasonText = docFact.text;
+    reasonClaims = [docFact];
+    const read = await eventsFor("what does NVDA's 10-Q say?");
+    expect(reasonCalls[0]?.evidence.map((row) => row.id)).toEqual(["ev:list", "ev:doc"]);
+    expect(gateBodies[0]).toMatchObject({ op: "assess_final_response", sessionId: "rs:entry" });
+    expect(read.filter((e) => e.type === "answer_delta")).toEqual([{ type: "answer_delta", text: docFact.text }]);
+    expect(read.find((e) => e.type === "claims")?.claims).toEqual([docFact]);
   });
 
   test("a rejected single-tool number is withheld with an explicit refusal, never retried in research", async () => {

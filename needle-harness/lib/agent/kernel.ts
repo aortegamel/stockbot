@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { reason, type MuseUsage } from "../muse/client";
 import { FINAL_PERSONAS, foundStatus, readDatapoints, redactArgs, sourceReferences, statusEvent, toolStatus, WIDGET_TYPES } from "./types";
-import type { AgentEvent, AskContext, Evidence, FailureCategory, FinalClaim, FinalPersonaResult, Metrics, Persona, Timings } from "./types";
+import type { AgentEvent, AskContext, Evidence, FailureCategory, FinalClaim, FinalPersonaResult, Metrics, NarrativeResult, Persona, Timings } from "./types";
 
 // ponytail: persistent worker bridge (spawn-once, ready-gated); spawn/exit/stderr handling mirrors lib/needle/client.ts.
 function requiredEnv(name: string): string {
@@ -116,7 +116,7 @@ export type KernelReasonInput = {
   signal?: AbortSignal;
   // Output tokens spent by this request's Muse calls (answer budget, see muse/client.ts).
   spent?: { outputTokens: number };
-  onDelta: (text: string) => void;
+  // No onDelta: raw model deltas carry the inventory fence and never reach emit.
 };
 
 export type KernelResponse = {
@@ -161,7 +161,7 @@ export type KernelChild = {
 
 export type KernelSpawn = (cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => KernelChild;
 
-export type KernelReasonResult = { text: string; usage: MuseUsage; claims?: FinalClaim[]; confidence?: number };
+export type KernelReasonResult = NarrativeResult & { usage: MuseUsage };
 type KernelReasonFn = (opts: KernelReasonInput) => Promise<KernelReasonResult>;
 type FinalGateVerdict = { verdict?: string; support_answer?: string; error?: string };
 export type FinalGateCaller = (
@@ -174,6 +174,7 @@ export type FinalGateCaller = (
 // to the wording, exact source statements, explicit qualifiers) and judges
 // qualified wording as written via decide() core + _persist + .70/.50 policy.
 // Locally, a datapoint id must belong to a cited row, and a calculation references one.
+// A local pass is a pre-filter only. It never counts as proof: every claim still goes to the worker gates.
 export function inventoryDefect(
   prose: string,
   claims: FinalClaim[],
@@ -296,13 +297,13 @@ async function gateResult(r: FinalPersonaResult, ctx: FinalGateContext): Promise
     op: "assess_final_response",
     ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
     persona: r.persona,
-    text: r.text,
+    text: r.prose,
     claims: r.claims.map(toWireClaim),
     evidence: ctx.evidence,
     ...(r.confidence !== undefined ? { confidence: r.confidence } : {}),
   });
   if ("failure" in whole) return { failure: `${r.persona}: ${whole.failure}` };
-  if (gatePasses(whole.verdict)) return keptProse(r.persona, dropUncovered(r.text, r.claims));
+  if (gatePasses(whole.verdict)) return keptProse(r.persona, dropUncovered(r.prose, r.claims));
   return deleteRejectedClaims(r, ctx);
 }
 // Per-claim ops run only after a whole-response reject, all claims at once. The
@@ -326,7 +327,7 @@ async function deleteRejectedClaims(r: FinalPersonaResult, ctx: FinalGateContext
     if ("failure" in one) return { failure: `${r.persona}: ${one.failure}` };
     if (gatePasses(one.verdict)) supported.push(c);
   }
-  let kept = dropUncovered(r.text, supported);
+  let kept = dropUncovered(r.prose, supported);
   for (const { c } of checked) if (!supported.includes(c)) kept = kept.split(c.text).join("");
   return keptProse(r.persona, kept);
 }
@@ -369,7 +370,7 @@ async function gatePersonas(results: FinalPersonaResult[], opts: GateOptions): P
     ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
     opts: opts.gateOpts,
   };
-  const defects = results.map((r) => inventoryDefect(r.text, r.claims, known, points));
+  const defects = results.map((r) => inventoryDefect(r.prose, r.claims, known, points));
   const cut = defects.findIndex((d) => d !== undefined);
   const checked = await Promise.all(results.slice(0, cut < 0 ? undefined : cut).map(async (r) => ({ persona: r.persona, outcome: await gateResult(r, ctx) })));
   const gated: { persona: Persona; text: string }[] = [];
@@ -660,13 +661,15 @@ function graphSection(title: string, lines: string[]): string {
 }
 
 // Graph projection supplies the objective, graph state, and evidence-id format.
-// It carries no open-items or partial-coverage wording: what the run did not
-// find stays out of the answer.
+// It carries no open-items or partial-coverage wording. A failed retrieval is
+// the one exception: it shows as a LIMITATIONS line so the answer states it as
+// unknown, never as inspected filing content. The line is not evidence and has no citable id.
 function graphProjection(input: {
   objective: string;
   nodes: KernelGraphNode[];
   decisions: Record<string, unknown>[];
   watchlist?: WatchlistRow[];
+  toolCalls?: readonly KernelToolCall[];
 }): string {
   const nodeLines = input.nodes.map(
     (n) =>
@@ -684,12 +687,19 @@ function graphProjection(input: {
     (r) =>
       `${r.symbol} ${r.source} ${r.status}${r.as_of ? ` as_of=${r.as_of}` : ""}${r.evidence_id ? ` evidence=${r.evidence_id}` : ""}${r.error ? ` error=${JSON.stringify(r.error.slice(0, 200))}` : ""}`,
   );
+  // Worker call rows are untrusted JSON: every field is quoted and bounded. A re-selection is no failure.
+  const limitLines = (input.toolCalls ?? []).filter((c) => !c.ok && c.category !== "reselect").map(
+    (c) => `${JSON.stringify(String(c.tool).slice(0, 64))} failed category=${JSON.stringify(String(c.category ?? "tool_error"))}${typeof c.error === "string" && c.error ? ` error=${JSON.stringify(c.error.slice(0, 200))}` : ""}`,
+  );
   return [
     `OBJECTIVE (verbatim user intent): ${input.objective}`,
     graphSection("NODES", nodeLines),
     graphSection("JEV DECISIONS (persisted dispositions)", decisionLines),
     ...(watchLines.length
       ? [graphSection("WATCHLIST COVERAGE (one row per symbol and source. Error/timeout means unknown.)", watchLines)]
+      : []),
+    ...(limitLines.length
+      ? [graphSection("LIMITATIONS (failed retrievals: untrusted, not evidence, no citable id. Their content was never inspected. State each only as an unknown claim that names what was not retrieved. Never state what that source contains.)", limitLines)]
       : []),
     "claims[].evidence_ids takes only EVIDENCE row ids, not node ids or decision records.",
   ].join("\n\n");
@@ -949,7 +959,7 @@ function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSign
     run.briefPromise = (async (): Promise<string | undefined> => {
       try {
         const started = performance.now();
-        // r.text already has the inventory fence stripped; r.claims feed the gates.
+        // r.prose already has the inventory fence stripped; r.claims are unproven until the gates keep them.
         const r = await run.reasonFn({
           prompt: `${run.prompt}\n\nBrief: say what the sources below establish so far, citing their ids. Two sentences max.`,
           ...(run.scope.watchlist === undefined && run.currentChartTicker !== undefined ? { ticker: run.currentChartTicker } : {}),
@@ -962,12 +972,11 @@ function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSign
           decisions: [],
           ...(run.signal ? { signal: run.signal } : {}),
           spent: run.spent,
-          onDelta: () => { },
         });
         run.museCalls += 1;
         run.museMs += performance.now() - started;
         const gated = await gateAnswer({
-          result: { persona: "stockbot", text: r.text, claims: r.claims ?? [], ...(r.confidence !== undefined ? { confidence: r.confidence } : {}) },
+          result: { persona: "stockbot", prose: r.prose, claims: r.claims, ...(r.confidence !== undefined ? { confidence: r.confidence } : {}) },
           evidence: rows,
           ...(run.sessionId ? { sessionId: run.sessionId } : {}),
           gate: (body, gateOpts) => run.router.call(body, { ...(run.signal ? { signal: run.signal } : {}), ...gateOpts }),
@@ -1141,7 +1150,7 @@ async function researchPass(run: KernelRun): Promise<boolean> {
 function reasonInput(run: KernelRun): ReasonInput {
   const prompt = run.direct
     ? run.prompt
-    : `${run.prompt}\n\n${graphProjection({ objective: run.objective, nodes: run.nodes, decisions: run.records, watchlist: run.watchlist })}`;
+    : `${run.prompt}\n\n${graphProjection({ objective: run.objective, nodes: run.nodes, decisions: run.records, watchlist: run.watchlist, toolCalls: run.toolCalls })}`;
   return {
     prompt,
     ...(run.scope.watchlist === undefined && run.currentChartTicker !== undefined ? { ticker: run.currentChartTicker } : {}),
@@ -1153,7 +1162,6 @@ function reasonInput(run: KernelRun): ReasonInput {
     decisions: run.records,
     ...(run.signal ? { signal: run.signal } : {}),
     spent: run.spent,
-    onDelta: () => { },
   };
 }
 
@@ -1170,13 +1178,13 @@ function settle(run: KernelRun, input: ReasonInput, persona: Persona, drafts?: {
 // fails the report. Results keep the model's declared inventory.
 function collectResult(pass: Pass, persona: Persona, r: KernelReasonResult): string | undefined {
   addUsage(pass.run, r.usage);
-  const text = r.text.trim();
-  if (!text) return `${persona}: empty response`;
+  const prose = r.prose.trim();
+  if (!prose) return `${persona}: empty response`;
   pass.results ??= [];
   pass.results.push({
     persona,
-    text,
-    claims: Array.isArray(r.claims) ? r.claims : [],
+    prose,
+    claims: r.claims,
     ...(r.confidence !== undefined ? { confidence: r.confidence } : {}),
   });
   return undefined;
@@ -1208,7 +1216,7 @@ async function personaStage(pass: Pass, input: ReasonInput): Promise<void> {
 // the report before its tokens are counted, so it never reports a result.
 function acceptDraft(pass: Pass, s: SettledPersona): string | undefined {
   if ("err" in s.outcome) return errorMsg(s.persona, s.outcome.err);
-  const text = s.outcome.r.text.trim();
+  const text = s.outcome.r.prose.trim();
   if (!text) return `${s.persona}: empty response`;
   pass.drafts[s.persona] = text;
   return acceptAnswer(pass, s.persona, s.outcome);
@@ -1250,17 +1258,18 @@ async function trioStage(pass: Pass, input: ReasonInput): Promise<void> {
   pass.failure = acceptAnswer(pass, "stockbot", await settle(pass.run, input, "stockbot", pass.synthDrafts));
 }
 
-// One-shot inventory correction: an unknown evidence id (often a graph node id
-// like rn:...) or a non-verbatim claims[].text retries once against the same
-// snapshot. Other defects never retry. The rejected prose and inventory are
-// untrusted model output.
+// One-shot inventory correction, a local fast path only: an unknown evidence id
+// (often a graph node id like rn:...), an unknown datapoint id, or a
+// non-verbatim claims[].text retries once against the same snapshot. Other
+// defects never retry. The corrected answer still goes through every worker
+// gate. The rejected prose and inventory are untrusted model output.
 async function correctInventory(pass: Pass, input: ReasonInput): Promise<void> {
   const results = pass.results ?? [];
   const validIds = pass.run.evidence.map((e) => e.id);
   const known = new Set(validIds);
   const points = datapointRows(pass.run.evidence);
   const rejected = results.filter((r) => {
-    const defect = inventoryDefect(r.text, r.claims, known, points);
+    const defect = inventoryDefect(r.prose, r.claims, known, points);
     return ["inventory cites unknown evidence id", "inventory cites unknown datapoint id", "inventory text not a prose substring"].some((p) => defect?.startsWith(p) === true);
   });
   if (rejected.length === 0) return;
@@ -1270,7 +1279,7 @@ async function correctInventory(pass: Pass, input: ReasonInput): Promise<void> {
     persona: r.persona,
     outcome: await settle(
       pass.run,
-      { ...input, prompt: `${input.prompt}\n\n${inventoryCorrection(validIds, r.text, r.claims)}` },
+      { ...input, prompt: `${input.prompt}\n\n${inventoryCorrection(validIds, r.prose, r.claims)}` },
       r.persona,
       r.persona === "stockbot" ? pass.synthDrafts : undefined,
     ),
@@ -1301,7 +1310,7 @@ async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
   const results = pass.results;
   if (run.direct || results === undefined) {
     // A direct answer has no evidence to cite: no fact in it can be proven, so only qualified unknown/assumption prose shows.
-    const kept = (results ?? []).map((r) => ({ persona: r.persona, text: dropUncovered(r.text, qualifiedEvidenceFree(r.claims)) }));
+    const kept = (results ?? []).map((r) => ({ persona: r.persona, text: dropUncovered(r.prose, qualifiedEvidenceFree(r.claims)) }));
     const empty = kept.find((k) => !k.text);
     if (empty !== undefined) {
       endFailed(run, "muse", "provider_error", `${empty.persona}: all claims rejected`);
@@ -1346,7 +1355,7 @@ async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
 }
 
 // The research snapshot a trio follow-up answers over: evidence plus the graph projection.
-type TrioSnapshot = Pick<KernelRun, "prompt" | "objective" | "evidence" | "nodes" | "records" | "escalated" | "watchlist" | "scope" | "currentChartTicker" | "context">;
+type TrioSnapshot = Pick<KernelRun, "prompt" | "objective" | "evidence" | "nodes" | "records" | "toolCalls" | "escalated" | "watchlist" | "scope" | "currentChartTicker" | "context">;
 // ponytail: process-local, newest 20 sessions, lost on restart; read evidence from the research store if follow-ups must survive restarts.
 const TRIO_SNAPSHOTS = new Map<string, TrioSnapshot>();
 const TRIO_SNAPSHOT_LIMIT = 20;
@@ -1357,7 +1366,7 @@ function offerTrio(run: KernelRun): void {
   if (run.personas.length !== 1 || run.personas[0] !== "stockbot" || typeof sessionId !== "string" || !sessionId) return;
   TRIO_SNAPSHOTS.delete(sessionId);
   TRIO_SNAPSHOTS.set(sessionId, {
-    prompt: run.prompt, objective: run.objective, evidence: [...run.evidence], nodes: run.nodes, records: run.records,
+    prompt: run.prompt, objective: run.objective, evidence: [...run.evidence], nodes: run.nodes, records: run.records, toolCalls: run.toolCalls,
     escalated: run.escalated, watchlist: run.watchlist, scope: run.scope, currentChartTicker: run.currentChartTicker, context: run.context,
   });
   const oldest = TRIO_SNAPSHOTS.keys().next().value;

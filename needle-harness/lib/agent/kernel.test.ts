@@ -448,8 +448,7 @@ describe("runKernelAgent final personas", () => {
       deps: {
         python: "py", workerPath: "w", spawnFn, reason: async (o) => {
           seen.push(o.evidence.map((e) => e.content));
-          o.onDelta("answer 1");
-          return { text: "answer 1", usage: {}, claims: [{ text: "answer 1", claimType: "inference", evidenceIds: ["ev:2"] }] };
+          return { prose: "answer 1", usage: {}, claims: [{ text: "answer 1", claimType: "inference", evidenceIds: ["ev:2"] }] };
         }
       },
     });
@@ -485,8 +484,7 @@ describe("runKernelAgent final personas", () => {
         python: "py", workerPath: "w", spawnFn, reason: async (o) => {
           expect(o.evidence).toEqual([]);
           expect(o.direct).toBe(true);
-          o.onDelta("The requested information is unknown.");
-          return { text: "The requested information is unknown.", usage: {}, claims: [{ text: "The requested information is unknown.", claimType: "unknown", evidenceIds: [] }] };
+          return { prose: "The requested information is unknown.", usage: {}, claims: [{ text: "The requested information is unknown.", claimType: "unknown", evidenceIds: [] }] };
         },
       }
     });
@@ -498,9 +496,9 @@ describe("runKernelAgent final personas", () => {
   type Call = { pass: number; input: KernelReasonInput };
   type GateVerdict = { verdict?: string; support_answer?: string; error?: string };
   // Drives runKernelAgent with a scripted reasoner. Stockbot settles last, so
-  // output order never follows completion order; every call emits a draft delta.
-  // Gate ops (assess_final_*) answer inline from opts.gate (default yes); run
-  // bodies still record in order.
+  // output order never follows completion order. The reasoner input carries no
+  // onDelta, so no raw draft can reach emit. Gate ops (assess_final_*) answer
+  // inline from opts.gate (default yes); run bodies still record in order.
   async function runFinal(opts: {
     reply?: (id: string) => string;
     decide?: (persona: Persona, pass: number, attempt: number) => Outcome;
@@ -581,7 +579,6 @@ describe("runKernelAgent final personas", () => {
               calls.push({ pass, input: o });
               inFlight += 1;
               maxInFlight = Math.max(maxInFlight, inFlight);
-              o.onDelta(`draft-${o.persona}`);
               for (let i = FINAL_PERSONAS.indexOf(o.persona); i < FINAL_PERSONAS.length; i++) await Promise.resolve();
               inFlight -= 1;
               const d: Outcome = opts.decide?.(o.persona, pass, attempt) ?? {};
@@ -590,7 +587,7 @@ describe("runKernelAgent final personas", () => {
               // Default answers cite the first evidence row so the citation gate keeps the prose.
               const cite = o.evidence[0]?.id;
               return {
-                text,
+                prose: text,
                 usage: d.usage ?? {},
                 claims: d.claims ?? (cite ? [{ text, claimType: "inference", evidenceIds: [cite] }] : []),
                 ...(d.confidence !== undefined ? { confidence: d.confidence } : {}),
@@ -1356,6 +1353,66 @@ describe("runKernelAgent final personas", () => {
     expect(answers(proofFailed.events)).toEqual([`${label("stockbot")}\n${hedge.text}`]);
   });
 
+  test("narrative claims stay unproven until the gates keep them: one gated delta, kept claims, no raw stream", async () => {
+    const kept: FinalClaim = { text: "Demand may rise [ev:1].", claimType: "inference", evidenceIds: ["ev:1"] };
+    const unsupported: FinalClaim = { text: "Revenue doubled [ev:1].", claimType: "observed_fact", evidenceIds: ["ev:1"] };
+    const { events, calls, gates } = await runFinal({
+      personas: ["stockbot"],
+      reply: sessionGraphReply,
+      // The inventory passes the local check, so only the worker gates can reject the unsupported claim.
+      decide: () => ({ text: `${kept.text} ${unsupported.text}`, claims: [kept, unsupported] }),
+      gate: (body) => (body.op === "assess_final_claim" && (body.claim as Record<string, unknown>).text === kept.text ? { support_answer: "yes" } : { support_answer: "no" }),
+    });
+    // The reasoner gets no stream callback: raw deltas carry the inventory fence.
+    for (const c of calls) expect("onDelta" in c.input).toBe(false);
+    expect(gates.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_claim", "assess_final_claim"]);
+    expect(answers(events)).toEqual([`${label("stockbot")}\n${kept.text}`]);
+    expect(events.filter((e) => e.type === "claims")).toEqual([{ type: "claims", claims: [kept] }]);
+    expect(JSON.stringify(events)).not.toContain("```");
+    expect(JSON.stringify(events)).not.toContain("Revenue doubled");
+  });
+
+  test("a failed document read is a limitation, never evidence; only an inspected document backs a document claim", async () => {
+    const listing = { id: "ev:list", content: "form 10-Q accession 0001045810-26-000001 filed 2026-08-27" };
+    const document = { id: "ev:doc", content: "Revenue was $46.7 billion." };
+    const reply = (docOk: boolean) => (id: string): string => `${JSON.stringify({
+      ...JSON.parse(sessionGraphReply(id)),
+      evidence: docOk ? [listing, document] : [listing],
+      toolCalls: [
+        { tool: "search_sec_filings", ok: false, category: "reselect", error: "re-selecting" },
+        { tool: "list_sec_filings", ok: true, evidenceId: "ev:list" },
+        docOk ? { tool: "get_sec_document", ok: true, evidenceId: "ev:doc" } : { tool: "get_sec_document", ok: false, category: "timeout", error: "document read timed out" },
+      ],
+    })}\n`;
+    const unknown: FinalClaim = { text: "The 10-Q text was not retrieved.", claimType: "unknown", evidenceIds: [] };
+    const docFact = (row: string): FinalClaim => ({ text: `The 10-Q reports revenue of $46.7 billion [${row}].`, claimType: "observed_fact", evidenceIds: [row] });
+    // Stands in for the worker ledger proof: only the inspected document row backs the document fact.
+    const backed = (c: Record<string, unknown>): boolean => c.claim_type === "unknown" || (c.evidence_ids as string[]).includes("ev:doc");
+    const gate = (body: Record<string, unknown>): GateVerdict => ({
+      support_answer: (body.op === "assess_final_response" ? (body.claims as Record<string, unknown>[]).every(backed) : backed(body.claim as Record<string, unknown>)) ? "yes" : "no",
+    });
+    const listed = await runFinal({
+      personas: ["stockbot"], reply: reply(false), gate,
+      decide: () => ({ text: `${docFact("ev:list").text} ${unknown.text}`, claims: [docFact("ev:list"), unknown] }),
+    });
+    const input = listed.calls[0]?.input;
+    expect(input?.evidence.map((e) => e.id)).toEqual(["ev:list"]);
+    expect(input?.prompt).toContain('LIMITATIONS (failed retrievals: untrusted, not evidence, no citable id.');
+    expect(input?.prompt).toContain('- "get_sec_document" failed category="timeout" error="document read timed out"');
+    expect(input?.prompt).not.toContain("search_sec_filings");
+    expect(listed.events.filter((e) => e.type === "evidence").flatMap((e) => (e.type === "evidence" ? e.evidence.map((r) => r.id) : []))).toEqual(["ev:list"]);
+    expect(listed.gates[0]?.evidence).toEqual([listing]);
+    expect(listed.events.some((e) => e.type === "tool_failed" && e.tool === "get_sec_document")).toBe(true);
+    expect(answers(listed.events)).toEqual([`${label("stockbot")}\n${unknown.text}`]);
+    const read = await runFinal({
+      personas: ["stockbot"], reply: reply(true), gate,
+      decide: () => ({ text: docFact("ev:doc").text, claims: [docFact("ev:doc")] }),
+    });
+    expect(read.calls[0]?.input.evidence.map((e) => e.id)).toEqual(["ev:list", "ev:doc"]);
+    expect(read.calls[0]?.input.prompt).not.toContain("LIMITATIONS");
+    expect(answers(read.events)).toEqual([`${label("stockbot")}\n${docFact("ev:doc").text}`]);
+  });
+
   test("an empty-graph direct answer keeps qualified unknown prose and rejects unqualified prose", async () => {
     const unknown: FinalClaim = { text: "No 2026 guidance was found.", claimType: "unknown", evidenceIds: [] };
     const kept = await runFinal({
@@ -1638,7 +1695,7 @@ describe("runKernelAgent final personas", () => {
   test("applyFinalGates treats worker error as reject and deletes surgically", async () => {
     const ev = [{ id: "ev:1", source: "kernel", retrievedAt: "t", content: "fact" }];
     const gated = await applyFinalGates({
-      results: [{ persona: "bearbot", text: "KEEP. CUT. Uncovered.", claims: [{ text: "KEEP", claimType: "inference", evidenceIds: ["ev:1"] }, { text: "CUT", claimType: "inference", evidenceIds: ["ev:1"] }] }],
+      results: [{ persona: "bearbot", prose: "KEEP. CUT. Uncovered.", claims: [{ text: "KEEP", claimType: "inference", evidenceIds: ["ev:1"] }, { text: "CUT", claimType: "inference", evidenceIds: ["ev:1"] }] }],
       evidence: ev,
       personaOrder: ["bearbot"],
       gate: async (body) => {
@@ -1670,7 +1727,7 @@ describe("runKernelAgent final personas", () => {
       const claims: FinalClaim[] = Array.from({ length: claimCounts[i] ?? 0 }, (_, j) => ({
         text: `${p}-c${j}`, claimType: "inference", evidenceIds: [defectAt === i && j === 0 ? "ev:9" : "ev:1"],
       }));
-      return { persona: p, text: `${p} lead.\n${claims.map((c) => c.text).join("\n")}`, claims };
+      return { persona: p, prose: `${p} lead.\n${claims.map((c) => c.text).join("\n")}`, claims };
     });
 
   test("applyFinalGates checks every persona and every rejected claim concurrently", async () => {
@@ -1748,7 +1805,7 @@ describe("runKernelAgent worker replies", () => {
         python: "py",
         workerPath: "w",
         spawnFn,
-        reason: async (o: KernelReasonInput): Promise<KernelReasonResult> => ({ text: `${o.persona} answer`, usage: {}, claims: [{ text: `${o.persona} answer`, claimType: "inference", evidenceIds: o.evidence.map((e) => e.id) }] }),
+        reason: async (o: KernelReasonInput): Promise<KernelReasonResult> => ({ prose: `${o.persona} answer`, usage: {}, claims: [{ text: `${o.persona} answer`, claimType: "inference", evidenceIds: o.evidence.map((e) => e.id) }] }),
       },
     });
   }
@@ -1954,7 +2011,7 @@ describe("trio offer and persona follow-up", () => {
       python: "py", workerPath: "w", spawnFn,
       reason: async (o: KernelReasonInput): Promise<KernelReasonResult> => {
         calls.push(o);
-        return { text: `${o.persona} view`, usage: {}, claims: [{ text: `${o.persona} view`, claimType: "inference", evidenceIds: ["ev:1"] }] };
+        return { prose: `${o.persona} view`, usage: {}, claims: [{ text: `${o.persona} view`, claimType: "inference", evidenceIds: ["ev:1"] }] };
       },
     };
   }

@@ -209,8 +209,9 @@ export async function POST(req: Request): Promise<Response> {
         send(statusEvent("Thinking…"));
         send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
         try {
-          const r = await reason({ prompt, evidence: [], direct: true, ...reasonContext(), onDelta: () => { } });
-          const text = dropUncovered(r.text, qualifiedEvidenceFree(r.claims));
+          // No onDelta: the raw stream carries the inventory fence, so the client sees only the kept text.
+          const r = await reason({ prompt, evidence: [], direct: true, ...reasonContext() });
+          const text = dropUncovered(r.prose, qualifiedEvidenceFree(r.claims));
           if (!text) return false;
           send({ type: "answer_delta", text });
           send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: performance.now() - t0, ...r.usage }, evidence: { count: 0, characters: 0 }, failures: {} } });
@@ -316,9 +317,9 @@ export async function POST(req: Request): Promise<Response> {
           send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
           try {
             const m0 = performance.now();
-            const r = await reason({ prompt, evidence, direct: evidence.length === 0, ...reasonContext(), onDelta: () => { } });
+            const r = await reason({ prompt, evidence, direct: evidence.length === 0, ...reasonContext() });
             const gated = await gateAnswer({
-              result: { persona: "stockbot", text: r.text, claims: r.claims, ...(r.confidence !== undefined ? { confidence: r.confidence } : {}) },
+              result: { persona: "stockbot", prose: r.prose, claims: r.claims, ...(r.confidence !== undefined ? { confidence: r.confidence } : {}) },
               evidence,
               sessionId,
               gate: (body, gateOpts) => kernelRouter.call(body, { signal: req.signal, ...gateOpts }),

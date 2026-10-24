@@ -146,7 +146,11 @@ The kernel runs exactly one worker research run and one persona round.
 An unresolved node, a tripped guard, or an escalation never starts more research.
 The persona prompts never ask for a missing-evidence line.
 The graph projection carries no open-items list or partial-coverage line, and no persona stance mentions gaps.
-An answer never announces missing evidence: what the run did not find is left out.
+One exception exists: each failed tool call shows as a `LIMITATIONS` line with its tool, category, and error.
+That line is untrusted and is not evidence. It has no citable ID.
+The model states a failed retrieval only as an `unknown` claim and never states what that source contains.
+A failed retrieval never becomes an evidence row.
+Otherwise, an answer never announces missing evidence: what the run did not find is left out.
 
 Final gates check the claim inventory and the whole response.
 The gate requests carry the research session id of the run they judge.
@@ -156,8 +160,9 @@ The kernel removes each rejected claim substring.
 Other prose stays unchanged, including uncertainty.
 Node IDs and decision records never count as evidence IDs.
 
-An inventory with an unknown evidence ID retries once for each affected persona on the same evidence snapshot.
+An inventory with an unknown evidence ID or an unknown datapoint ID retries once for each affected persona on the same evidence snapshot.
 An inventory whose `claims[].text` is not a verbatim prose substring uses the same retry.
+This local check is a pre-filter only. A local pass never counts as proof.
 The correction states valid evidence IDs and requires exact evidence row IDs and verbatim claim text.
 The correction includes rejected prose and inventory as untrusted output.
 The corrected answer passes the same gates.
@@ -172,6 +177,9 @@ An unclosed (cut-off) block never shows raw JSON: the prose ends at the fence.
 An unresolved node does not emit `failed` when the final gates pass.
 A research answer with no cited claim ships its gated prose with no warning banner.
 The kernel emits one `answer_delta` with labeled persona sections.
+The reasoner returns narrative prose plus declared claims. The claims stay unproven until the gates keep them.
+The reasoner's raw stream (`onDelta`) is internal diagnostics only, because it carries the inventory fence.
+The kernel and the route pass no stream callback, so the client sees only the gated text and the kept claims.
 The trio emits Bearbot and Bullbot drafts before the Stockbot response.
 Partial selections emit sections in canonical order.
 Metrics count all attempted calls and token usage across retries.

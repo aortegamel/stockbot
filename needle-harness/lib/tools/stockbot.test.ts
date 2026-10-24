@@ -549,7 +549,7 @@ describe("muse reason personas (fake provider)", () => {
 
   test("personas see the same request and evidence on separate sessions", async () => {
     const results = await Promise.all(FINAL_PERSONAS.map((persona) => reason({ ...input, ticker: "NVDA", persona })));
-    expect(results.map((r) => r.text)).toEqual(["Stockbot read [E1].", "Bearbot read [E1].", "Bullbot read [E1]."]);
+    expect(results.map((r) => r.prose)).toEqual(["Stockbot read [E1].", "Bearbot read [E1].", "Bullbot read [E1]."]);
     expect(results[0].usage).toEqual({ inputTokens: 7, outputTokens: 3 });
     expect(seen.map((s) => s.path)).toEqual(["/v1/responses", "/v1/responses", "/v1/responses"]);
     expect(new Set(seen.map((s) => s.session)).size).toBe(3);
@@ -661,7 +661,7 @@ describe("muse reason personas (fake provider)", () => {
       );
     const deltas: string[] = [];
     const r = await reason({ ...input, persona: "bullbot", onDelta: (t) => deltas.push(t) });
-    expect(r.text).toBe("partial chat");
+    expect(r.prose).toBe("partial chat");
     expect(deltas).toEqual(["partial", " chat"]);
     expect(r.usage).toEqual({ inputTokens: 9 });
     expect(r.claims).toEqual([]);
@@ -669,7 +669,7 @@ describe("muse reason personas (fake provider)", () => {
 
   test.each([undefined, "NVDA"])("a direct call sends the direct system prompt without evidence (ticker %s)", async (ticker) => {
     const r = await reason({ prompt: "What is ACME?", ticker, evidence: [], direct: true, onDelta: () => { } });
-    expect(r.text).toBe("Stockbot read [E1].");
+    expect(r.prose).toBe("Stockbot read [E1].");
     expect(seen.length).toBe(1);
     const [call] = seen;
     if (!call) throw new Error("expected one provider call");
@@ -690,7 +690,7 @@ describe("muse reason personas (fake provider)", () => {
 
   test("a single-tool call without a persona keeps the evidence prompt", async () => {
     const r = await reason({ ...input, persona: undefined, onDelta: () => { } });
-    expect(r.text).toBe("Stockbot read [E1].");
+    expect(r.prose).toBe("Stockbot read [E1].");
     const [call] = seen;
     if (!call) throw new Error("expected one provider call");
     expect(systemOf(call.body)).not.toContain("Bearbot");
@@ -712,12 +712,12 @@ describe("muse reason personas (fake provider)", () => {
     respond = () => sse(`Bearbot read [E1].\n\`\`\`json ${fence}\`\`\``);
     const deltas: string[] = [];
     const r = await reason({ ...input, persona: "bearbot", onDelta: (t) => deltas.push(t) });
-    expect(r.text).toBe("Bearbot read [E1].\n");
+    expect(r.prose).toBe("Bearbot read [E1].\n");
     expect(r.claims).toEqual([{ text: "Bearbot read [E1].", claimType: "observed_fact", evidenceIds: ["E1"], confidence: 0.8 }]);
     expect(r.confidence).toBe(0.6);
     // Streamed deltas keep the raw block; only the returned prose is display text.
     expect(deltas.join("")).toContain("```json");
-    expect(r.text).not.toContain("```json");
+    expect(r.prose).not.toContain("```json");
   });
 
   test("unsupported /responses falls back to chat on the same session and persona prompt", async () => {
@@ -728,7 +728,7 @@ describe("muse reason personas (fake provider)", () => {
           headers: { "Content-Type": "text/event-stream" },
         });
     const r = await reason({ ...input, persona: "bullbot", signal: new AbortController().signal, deadlineAt: Date.now() + 10_000 });
-    expect(r.text).toBe("Bullbot via chat");
+    expect(r.prose).toBe("Bullbot via chat");
     expect(seen.map((s) => s.path)).toEqual(["/v1/responses", "/v1/chat/completions"]);
     expect(seen[1].session).toBe(seen[0].session);
     expect(seen[1].body.messages).toEqual(seen[0].body.input);
@@ -797,9 +797,9 @@ describe("muse reason personas (fake provider)", () => {
     respond = () => sse("Bearbot read [E1].\n", '```json {"claims": [{"text": "Bearbot re');
     const r = await reason({ ...input, persona: "bearbot" });
     expect(seen[0]?.body.max_output_tokens).toBe(600);
-    expect(r.text).toBe("Bearbot read [E1].\n");
-    expect(r.text).not.toContain("```");
-    expect(r.text).not.toContain("{");
+    expect(r.prose).toBe("Bearbot read [E1].\n");
+    expect(r.prose).not.toContain("```");
+    expect(r.prose).not.toContain("{");
     expect(r.claims).toEqual([]);
   });
 
@@ -860,7 +860,7 @@ describe("muse reason personas (fake provider)", () => {
       advance(121_000);
       release();
       const results = await Promise.all(calls.map((c) => c.result));
-      expect(results.map((r) => r.text)).toEqual(["Stockbot late.", "Bearbot late.", "Bullbot late."]);
+      expect(results.map((r) => r.prose)).toEqual(["Stockbot late.", "Bearbot late.", "Bullbot late."]);
       expect(seen.map((s) => s.path)).toEqual(["/v1/responses", "/v1/responses", "/v1/responses"]);
     });
 
