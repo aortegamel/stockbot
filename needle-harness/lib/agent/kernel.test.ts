@@ -1372,6 +1372,24 @@ describe("runKernelAgent final personas", () => {
     expect(JSON.stringify(events)).not.toContain("Revenue doubled");
   });
 
+  test("a bound grounded explanation passes; an unbound narrative fails closed", async () => {
+    const bound: FinalClaim = { text: "Demand may rise [ev:1].", claimType: "inference", evidenceIds: ["ev:1"] };
+    const passed = await runFinal({
+      personas: ["stockbot"],
+      reply: sessionGraphReply,
+      decide: () => ({ text: bound.text, claims: [bound] }),
+    });
+    expect(answers(passed.events)).toEqual([`${label("stockbot")}\n${bound.text}`]);
+    // The binder bound nothing: the gates pass, but uncovered prose still drops and the run fails closed.
+    const unbound = await runFinal({
+      personas: ["stockbot"],
+      reply: sessionGraphReply,
+      decide: () => ({ text: "Revenue doubled [ev:1].", claims: [] }),
+    });
+    expect(answers(unbound.events)).toEqual([]);
+    expect(failedCategory(unbound.events)).toBe("provider_error");
+  });
+
   test("a failed document read is a limitation, never evidence; only an inspected document backs a document claim", async () => {
     const listing = { id: "ev:list", content: "form 10-Q accession 0001045810-26-000001 filed 2026-08-27" };
     const document = { id: "ev:doc", content: "Revenue was $46.7 billion." };

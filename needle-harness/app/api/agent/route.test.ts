@@ -454,6 +454,18 @@ describe("agent entry route", () => {
     expect(Object.keys((events.at(-1)?.metrics as { timings: Record<string, number> }).timings).sort()).toEqual(["firstTextMs", "routeMs"]);
   });
 
+  test("an unbound single-tool narrative with no bound claims is withheld", async () => {
+    reset();
+    winner = "query_finra";
+    reasonText = "NVDA short interest for 2026-10-15 was 12.5% [ev:bridge].";
+    reasonClaims = [];
+    entryReplies = [{ sessionId: "rs:entry", evidence: [{ ...bridgeEvidence }], content: reasonText }];
+    const events = await eventsFor("short interest?");
+    // The binder bound nothing, so the gates keep no prose: explicit refusal, never the number.
+    expectVerificationRefusal(events);
+    expect(gateBodies.map((g) => g.op)).toEqual(["assess_final_response"]);
+  });
+
   test("a failed document read refuses before reasoning; an inspected document answers from its row", async () => {
     const listing = "form 10-Q accession 0001045810-26-000001 filed 2026-08-27";
     const document = "Revenue was $46.7 billion.";
