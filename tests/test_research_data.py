@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Self, override
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 import cli
 from app import data_sources
@@ -551,6 +553,245 @@ def test_ticker_candidates_degrade_to_live_universe_on_corrupt_snapshot(
     assert [a.entity_id for a in aliases] == ["sec:cik:0000000333"]
     # The live fallback is now-stamped, so a historical horizon reads unresolved.
     assert resolve_ticker_aliases("AAA", aliases, as_of=datetime(2026, 6, 1, tzinfo=UTC)).resolved is False
+
+
+_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+_LIVE_AAA = "sec:cik:0000000333"
+
+
+def _aaa_payload(cik: int) -> bytes:
+    return json.dumps({"0": {"cik_str": cik, "ticker": "AAA", "title": f"AAA {cik}"}}).encode()
+
+
+def _refresh_aaa(monkeypatch: pytest.MonkeyPatch, data_root: Path, cik: int, stamp: str) -> dict[str, object]:
+    """Run the real refresh_sec_tickers with a patched SEC fetch and a pinned clock."""
+
+    def _get(url: str) -> bytes:
+        del url
+        return _aaa_payload(cik)
+
+    def _now() -> str:
+        return stamp
+
+    monkeypatch.setattr(research_data, "_edgar_get", _get)
+    monkeypatch.setattr(research_data, "_utc_now", _now)
+    return research_data.refresh_sec_tickers(data_root=data_root)
+
+
+def _stub_live_aaa(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The live universe maps AAA to CIK 333, so an answer without an archived mapping is visible."""
+    from types import SimpleNamespace
+
+    live = SimpleNamespace(content=_aaa_payload(333))
+
+    def _live_get(url: str) -> object:
+        del url
+        return live
+
+    def _live_inspect(response: object) -> None:
+        del response
+
+    monkeypatch.setattr(data_sources._sec, "ensure_identity", lambda: None)
+    monkeypatch.setattr("edgar.httprequests.get_with_retry", _live_get)
+    monkeypatch.setattr("edgar.httprequests.inspect_response", _live_inspect)
+
+
+def _aaa_at(as_of: datetime) -> list[tuple[str, str | None, str | None]]:
+    """(entity_id, known_at, retrieved_at) of each AAA candidate at ``as_of``."""
+    aliases = data_sources.SourceGateway().ticker_candidates("AAA", as_of)
+    return [(alias.entity_id, alias.known_at, alias.retrieved_at) for alias in aliases]
+
+
+def _is_live(as_of: datetime) -> bool:
+    return [entity for entity, _, _ in _aaa_at(as_of)] == [_LIVE_AAA]
+
+
+def _utc(stamp: str) -> datetime:
+    return datetime.fromisoformat(stamp)
+
+
+def _ticker_payload_files(data_root: Path) -> list[Path]:
+    directory = data_root / "raw" / "sec" / "company_tickers" / "company_tickers"
+    return [path for path in directory.glob("*.json") if not path.name.endswith(raw_archive.MANIFEST_SUFFIX)]
+
+
+def test_refresh_sec_tickers_identical_repeat_dates_its_own_retrieval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Identical bytes dedup to one payload, yet a repeat 59 days later answers with its own timestamp."""
+    from app.domain.market.identity import resolve_ticker_aliases
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    _stub_live_aaa(monkeypatch)
+    t1, t2 = "2026-01-01T00:00:00Z", "2026-03-01T00:00:00Z"
+    first = _refresh_aaa(monkeypatch, tmp_path, 111, t1)
+    repeat = _refresh_aaa(monkeypatch, tmp_path, 111, t2)
+
+    digest = str(first["content_hash"])
+    assert repeat["content_hash"] == digest
+    assert repeat["retrieved_at"] == t2
+    assert len(_ticker_payload_files(tmp_path)) == 1
+    record = raw_archive.find("sec", "company_tickers", "company_tickers", root=tmp_path / "raw")
+    assert record is not None
+    assert record.retrieved_at == t1  # the first-write manifest stays immutable
+    events = list(raw_archive.iter_retrievals("sec", "company_tickers", "company_tickers", root=tmp_path / "raw"))
+    assert events[-2:] == [
+        raw_archive.RetrievalEvent(sha256=digest, retrieved_at=t1, url=_TICKERS_URL),
+        raw_archive.RetrievalEvent(sha256=digest, retrieved_at=t2, url=_TICKERS_URL),
+    ]
+
+    a = "sec:cik:0000000111"
+    assert _aaa_at(_utc("2026-02-01T00:00:00Z")) == [(a, t1, t1)]  # exactly 31 days: inclusive
+    assert _is_live(_utc("2026-02-01T00:00:01Z"))
+    assert _is_live(_utc("2026-02-28T23:59:59Z"))  # no observation inside the window
+    assert _aaa_at(_utc(t2)) == [(a, t2, t2)]
+    assert _aaa_at(_utc("2026-04-01T00:00:00Z")) == [(a, t2, t2)]  # 31 days after the repeat, not the first write
+    assert _is_live(_utc("2026-04-01T00:00:01Z"))
+    as_of = _utc("2026-03-15T00:00:00Z")
+    resolution = resolve_ticker_aliases(
+        "AAA", data_sources.SourceGateway().ticker_candidates("AAA", as_of), as_of=as_of
+    )
+    assert resolution.resolved is True
+    assert resolution.entity_id == a
+
+
+def test_refresh_sec_tickers_stamps_only_after_successful_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The clock is read after the fetch returns; a failed fetch logs no retrieval."""
+    stamp = "2026-01-01T00:00:00Z"
+    calls: list[str] = []
+
+    def _get(url: str) -> bytes:
+        del url
+        calls.append("fetch")
+        return _aaa_payload(111)
+
+    def _now() -> str:
+        calls.append("clock")
+        return stamp
+
+    def _fail(url: str) -> bytes:
+        del url
+        calls.append("fetch")
+        raise RuntimeError("HTTP 503")
+
+    monkeypatch.setattr(research_data, "_edgar_get", _get)
+    monkeypatch.setattr(research_data, "_utc_now", _now)
+    research_data.refresh_sec_tickers(data_root=tmp_path)
+    assert calls == ["fetch", "clock"]
+
+    monkeypatch.setattr(research_data, "_edgar_get", _fail)
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        research_data.refresh_sec_tickers(data_root=tmp_path)
+    assert calls == ["fetch", "clock", "fetch"]
+    events = raw_archive.iter_retrievals("sec", "company_tickers", "company_tickers", root=tmp_path / "raw")
+    assert [event.retrieved_at for event in events] == [stamp, stamp]  # manifest seed + the one logged success
+
+
+def test_ticker_snapshot_follows_a_b_a_reassignment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A→B→A keeps two immutable payloads and resolves A, B, A at their horizons; no future event leaks back."""
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    _stub_live_aaa(monkeypatch)
+    t1, t2, t3 = "2026-01-01T00:00:00Z", "2026-01-10T00:00:00Z", "2026-01-20T00:00:00Z"
+    for cik, stamp in ((111, t1), (222, t2), (111, t3)):
+        _refresh_aaa(monkeypatch, tmp_path, cik, stamp)
+
+    assert len(_ticker_payload_files(tmp_path)) == 2
+    a, b = "sec:cik:0000000111", "sec:cik:0000000222"
+    assert _is_live(_utc("2025-12-31T23:59:59Z"))
+    assert _aaa_at(_utc(t1)) == [(a, t1, t1)]
+    assert _aaa_at(_utc("2026-01-09T23:59:59Z")) == [(a, t1, t1)]  # B is still future
+    assert _aaa_at(_utc(t2)) == [(b, t2, t2)]
+    assert _aaa_at(_utc("2026-01-19T23:59:59Z")) == [(b, t2, t2)]  # A's repeat is future; its t1 manifest loses
+    assert _aaa_at(_utc(t3)) == [(a, t3, t3)]
+    assert _aaa_at(_utc("2026-02-20T00:00:00Z")) == [(a, t3, t3)]
+    assert _is_live(_utc("2026-02-20T00:00:01Z"))
+
+
+@pytest.mark.parametrize("damage", ["tamper", "delete"])
+def test_ticker_snapshot_bad_newest_bytes_never_revive_older_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    """The newest eligible event alone answers: its missing or tampered bytes fall back to live, not to A."""
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    _stub_live_aaa(monkeypatch)
+    t1 = "2026-01-01T00:00:00Z"
+    _refresh_aaa(monkeypatch, tmp_path, 111, t1)
+    newest = _refresh_aaa(monkeypatch, tmp_path, 222, "2026-01-10T00:00:00Z")
+    record = raw_archive.find(
+        "sec", "company_tickers", "company_tickers", sha256=str(newest["content_hash"]), root=tmp_path / "raw"
+    )
+    assert record is not None
+    if damage == "tamper":
+        record.payload_path.write_bytes(_aaa_payload(999))
+    else:
+        record.payload_path.unlink()
+
+    assert _is_live(_utc("2026-01-15T00:00:00Z"))
+    assert _aaa_at(_utc("2026-01-05T00:00:00Z")) == [("sec:cik:0000000111", t1, t1)]  # intact older horizon
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        b"{not json\n",
+        b"[]\n",
+        b"\xff\xfe\n",
+        json.dumps({"sha256": "0" * 64, "retrieved_at": "2026-01-12T00:00:00Z"}).encode() + b"\n",
+        json.dumps({"sha256": "0" * 64, "retrieved_at": "2026-01-12T00:00:00+00:00", "url": _TICKERS_URL}).encode()
+        + b"\n",
+        json.dumps({"sha256": "XYZ", "retrieved_at": "2026-01-12T00:00:00Z", "url": _TICKERS_URL}).encode() + b"\n",
+    ],
+)
+def test_ticker_snapshot_corrupt_retrieval_log_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, line: bytes
+) -> None:
+    """A malformed retrieval log answers no archived mapping at any horizon, older events included."""
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    _stub_live_aaa(monkeypatch)
+    _refresh_aaa(monkeypatch, tmp_path, 111, "2026-01-01T00:00:00Z")
+    _refresh_aaa(monkeypatch, tmp_path, 222, "2026-01-10T00:00:00Z")
+    log = tmp_path / "raw" / "sec" / "company_tickers" / "company_tickers" / raw_archive.RETRIEVAL_LOG
+    with log.open("ab") as handle:
+        handle.write(line)
+
+    assert _is_live(_utc("2026-01-05T00:00:00Z"))
+    assert _is_live(_utc("2026-01-15T00:00:00Z"))
+
+
+def test_ticker_snapshot_selects_latest_fresh_retrieval_property(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Any refresh history: the last retrieval inside [as_of - 31 days, as_of] answers with its own stamp."""
+    import tempfile
+    from datetime import timedelta
+
+    _stub_live_aaa(monkeypatch)
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+
+    @settings(derandomize=True, max_examples=25, deadline=None)
+    @given(
+        st.lists(st.tuples(st.integers(0, 40 * 24), st.sampled_from([111, 222])), min_size=1, max_size=5),
+        st.integers(-24, 240 * 24),
+    )
+    def check(history: list[tuple[int, int]], query_hours: int) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monkeypatch.setenv("STOCKBOT_DATA_DIR", tmp)
+            moment = base
+            observed: list[tuple[datetime, int]] = []
+            for gap_hours, cik in history:
+                moment += timedelta(hours=gap_hours)  # gap 0 ties: the later-recorded retrieval wins
+                observed.append((moment, cik))
+                _refresh_aaa(monkeypatch, Path(tmp), cik, moment.strftime("%Y-%m-%dT%H:%M:%SZ"))
+            as_of = base + timedelta(hours=query_hours)
+            fresh = [(seen, cik) for seen, cik in observed if as_of - timedelta(days=31) <= seen <= as_of]
+            if not fresh:
+                assert _is_live(as_of)
+                return
+            seen, cik = fresh[-1]
+            stamp = seen.strftime("%Y-%m-%dT%H:%M:%SZ")
+            assert _aaa_at(as_of) == [(f"sec:cik:{cik:010d}", stamp, stamp)]
+
+    check()
 
 
 def test_refresh_sec_company_facts_archives_and_returns_inline_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

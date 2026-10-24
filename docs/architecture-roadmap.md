@@ -348,7 +348,12 @@ Complete phases in order. A phase is complete only when its acceptance criteria 
       chunk/event/evidence IDs land with their phases)
 - [ ] Add database migrations and repository interfaces.
 - [x] Implement the immutable raw archive with content hashes.
-      (`app/storage/raw_archive.py`: write-once `data/raw/` payloads + retrieval manifests)
+      (`app/storage/raw_archive.py`: write-once `data/raw/` payloads + first-write retrieval manifests.
+      Identical bytes dedup to one payload. `refresh_sec_tickers` also appends each successful retrieval
+      (sha256, timestamp taken after the fetch, url) to the key's `retrievals.jsonl`. Historical ticker
+      lookups take the newest event inside the inclusive 31-day window at `as_of`, hash-verify its bytes,
+      and stamp `known_at` with that event's time. A malformed log or bad newest bytes fails closed. The
+      31-day TTL bounds snapshot age only: it cannot establish ticker ownership between observations.)
 - [x] Add ingestion checkpoints, retry policy, rate limiting, and structured logs.
       (`app/normalization.py` + `app/services/research_data.py`: deterministic normalizers;
       fetch -> archive -> normalize -> Parquet refresh with retry and pacing)

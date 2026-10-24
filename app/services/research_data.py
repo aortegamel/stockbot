@@ -75,13 +75,14 @@ def _parse_ticker_ciks(payload_json: object) -> dict[str, int]:
 
 
 def refresh_sec_tickers(*, data_root: Path | None = None) -> dict[str, object]:
-    """Live SEC ticker universe: archive payload, return parsed tickers (no warehouse writes)."""
+    """Live SEC ticker universe: archive payload, log this retrieval, return parsed tickers (no warehouse writes)."""
     data_root = Path(data_root) if data_root else get_data_root()
-    now = _utc_now()
     from edgar.urls import build_company_tickers_url
 
     url = build_company_tickers_url()
     payload = _edgar_get(url)
+    # Stamp after the fetch succeeds: the event dates this observation, not the attempt.
+    now = _utc_now()
     content_hash = raw_archive.content_hash(payload)
     raw_archive.archive(
         "sec",
@@ -91,6 +92,7 @@ def refresh_sec_tickers(*, data_root: Path | None = None) -> dict[str, object]:
         url=url,
         retrieved_at=now,
         root=data_root / "raw",
+        record_retrieval=True,
     )
     payload_json = json.loads(payload)
     datasets = normalize_sec_tickers(payload_json, retrieved_at=now, content_hash=content_hash)

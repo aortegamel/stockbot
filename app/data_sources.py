@@ -22,7 +22,7 @@ from .sec import filings as _filings
 from .sec.models import Filing, SECSearchResult, pit_of
 
 if TYPE_CHECKING:
-    from .storage.raw_archive import ArchiveRecord
+    from .storage.raw_archive import RetrievalEvent
 
 _SHORT_FIELDS = (
     "symbolCode",
@@ -75,34 +75,39 @@ def _ticker_aliases_of(alias_rows: object) -> list[TickerAlias]:
 _TICKER_SNAPSHOT_MAX_AGE = timedelta(days=31)
 
 
-def _latest_ticker_snapshot(as_of: datetime) -> ArchiveRecord | None:
-    """Last archived snapshot at the knowledge horizon; None when absent or older than the max age."""
+def _latest_ticker_snapshot(as_of: datetime) -> RetrievalEvent | None:
+    """Last ticker retrieval event at the knowledge horizon; None when absent or older than the max age.
+
+    Raises OSError/ValueError on an unreadable or malformed retrieval log, so callers fail closed.
+    """
     from .config import get_data_root
     from .storage import raw_archive
 
     moment = as_of.astimezone(UTC)
     horizon = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
     floor = (moment - _TICKER_SNAPSHOT_MAX_AGE).strftime("%Y-%m-%dT%H:%M:%SZ")
-    latest: raw_archive.ArchiveRecord | None = None
-    latest_retrieved = ""
-    for record in raw_archive.iter_archive("sec", "company_tickers", "company_tickers", root=get_data_root() / "raw"):
-        retrieved = record.retrieved_at if isinstance(record.retrieved_at, str) else ""
-        # ponytail: TTL bounds snapshot age only; a reassignment inside the window is still invisible.
+    latest: raw_archive.RetrievalEvent | None = None
+    for event in raw_archive.iter_retrievals("sec", "company_tickers", "company_tickers", root=get_data_root() / "raw"):
+        # ponytail: TTL bounds snapshot age only; it cannot establish ticker ownership between observations,
+        # so a reassignment inside the window is still invisible.
         # Strict PIT would bracket coverage between snapshots and return unresolved.
-        if retrieved and floor <= retrieved <= horizon and (latest is None or retrieved >= latest_retrieved):
-            latest, latest_retrieved = record, retrieved
+        if floor <= event.retrieved_at <= horizon and (latest is None or event.retrieved_at >= latest.retrieved_at):
+            latest = event
     return latest
 
 
 def _archived_ticker_aliases(want: str, as_of: datetime) -> list[TickerAlias] | None:
-    """Ticker aliases from the latest hash-verified archived snapshot; None when absent or tampered."""
+    """Ticker aliases from the latest retrieval event's hash-verified payload; None when absent or tampered.
+
+    The newest eligible event alone answers: corrupt or missing bytes never revive an older mapping.
+    """
     from .config import get_data_root
     from .storage import raw_archive
 
-    latest = _latest_ticker_snapshot(as_of)
-    if latest is None:
-        return None
     try:
+        latest = _latest_ticker_snapshot(as_of)
+        if latest is None:
+            return None
         verified = raw_archive.read_payload(
             "sec", "company_tickers", "company_tickers", sha256=latest.sha256, root=get_data_root() / "raw"
         )
@@ -262,8 +267,8 @@ class SourceGateway:
     def ticker_candidates(self, ticker: str, as_of: datetime) -> list[TickerAlias]:
         """Company-tickers aliases for one ticker; historical views read archived snapshots.
 
-        With an archive snapshot at or before ``as_of`` and inside ``_TICKER_SNAPSHOT_MAX_AGE``, rows carry its
-        ``retrieved_at`` as ``known_at`` so ``resolve_ticker_aliases`` admits them.
+        With a ticker retrieval event at or before ``as_of`` and inside ``_TICKER_SNAPSHOT_MAX_AGE``, rows carry
+        that event's ``retrieved_at`` as ``known_at`` so ``resolve_ticker_aliases`` admits them.
         Without one, the live universe applies (still now-stamped, so a historical
         view honestly resolves ``unresolved``). PIT stays with the resolver.
         """
