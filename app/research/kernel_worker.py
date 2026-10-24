@@ -1304,12 +1304,24 @@ def _intake_doc_reads(rows: Sequence[_IntakeCallRow]) -> dict[str, str]:
     return out
 
 
+def _intake_document_accessions(admitted: Sequence[Mapping[str, object]]) -> set[str]:
+    """Accessions with admitted inspected document content (sec_source provenance only)."""
+    out: set[str] = set()
+    for ev in admitted:
+        prov = ev.get("provenance")
+        if isinstance(prov, Mapping) and prov.get("kind") == "sec_source":
+            acc = _ev_field(ev, "accession_no", "accession", "source_record_id")
+            if acc:
+                out.add(acc)
+    return out
+
+
 def _intake_unread_material(
     listed: Sequence[Mapping[str, object]], rows: Sequence[_IntakeCallRow], admitted: Sequence[Mapping[str, object]]
 ) -> list[str]:
-    """Listed 10-Q/10-K/8-K accessions with no admitted evidence and no successful document read."""
+    """Listed 10-Q/10-K/8-K accessions with no successful document read and no admitted document content."""
     read = {acc for acc, status in _intake_doc_reads(rows).items() if status == "ok"}
-    read |= {_ev_field(ev, "accession_no", "accession", "source_record_id") for ev in admitted}
+    read |= _intake_document_accessions(admitted)
     material = (_baseline_accession(row) for row in listed if _baseline_form(row) in _INTAKE_MATERIAL_FORMS)
     return list(dict.fromkeys(acc for acc in material if acc is not None and acc not in read))
 
@@ -1350,7 +1362,7 @@ async def _intake_recover(
     """Bounded recovery before the Reasoner plans; returns wall milliseconds.
 
     First, family listings a full session dropped (parallelism_exceeded) run once more.
-    Then every listed material accession without admitted evidence or a successful read is read once.
+    Then every listed material accession without a successful read or admitted document content is read once.
     ponytail: an insider read a full session dropped is not retried; the scheduler can still select it.
     """
     from app.research import scheduler
@@ -1477,6 +1489,7 @@ async def _intake_round(
         ],
         "unread_material": unread,
         "material_docs": [{"accession_no": acc, "status": s} for acc, s in _intake_doc_reads(flat).items()],
+        "material_docs_inspected": sorted(_intake_document_accessions(admitted)),
     }
     if any(
         record.get("error_type") == FailureCategory.PARALLELISM_EXCEEDED

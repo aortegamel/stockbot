@@ -864,8 +864,23 @@ def test_intake_unread_stays_reported_when_retry_times_out(monkeypatch: pytest.M
     assert isinstance(outcomes, dict) and outcomes["timeout"] == 2
 
 
+def test_listing_only_evidence_stays_unread_until_document_content_admitted() -> None:
+    """A listed accession with only listing evidence stays unread; sec_source content clears it."""
+    listing: dict[str, object] = {"result": {"filings": list(_EDGAR_ROWS[6:7])}}
+    rows: list[tuple[str, dict[str, object], dict[str, object], float]] = [
+        ("list_sec_filings", {"identifier": "X", "forms": ["10-Q"], "limit": 1}, listing, 0.0),
+    ]
+    listed = kw._intake_listed(rows)
+    listing_only = [_stored_evidence("ev-1", "text", accession="0001-26-000007")]
+    assert kw._intake_unread_material(listed, rows, listing_only) == ["0001-26-000007"]
+    inspected = dict(listing_only[0])
+    inspected["provenance"] = {"kind": "sec_source", "accession_no": "0001-26-000007"}
+    assert kw._intake_unread_material(listed, rows, [inspected]) == []
+    assert kw._intake_document_accessions([inspected]) == {"0001-26-000007"}
+
+
 def test_unread_material_skips_insider_watchlist_and_read_rows() -> None:
-    """Junk rows, insider forms and watchlist listings never count; admitted evidence or an ok read marks a row read."""
+    """Junk rows, insider forms and watchlist listings never count; a document read or sec_source evidence clears a row."""
     listing: dict[str, object] = {"result": {"filings": ["junk", {"form": "4"}, *_EDGAR_ROWS[5:]]}}
     watch: dict[str, object] = {"result": {"filings": [{"form": "10-K", "accession_no": "W"}]}}
     read: dict[str, object] = {"outcome": _outcome(), "error": None}
@@ -876,8 +891,9 @@ def test_unread_material_skips_insider_watchlist_and_read_rows() -> None:
     ]
     listed = kw._intake_listed(rows)
     assert [r.get("form") for r in listed] == ["4", "8-K", "10-Q", "10-K"]
-    admitted = [_stored_evidence("ev-1", "text", accession="0001-26-000006")]
-    assert kw._intake_unread_material(listed, rows, admitted) == ["0001-26-000007"]
+    inspected = _stored_evidence("ev-1", "text", accession="0001-26-000006")
+    inspected["provenance"] = {"kind": "sec_source", "accession_no": "0001-26-000006"}
+    assert kw._intake_unread_material(listed, rows, [inspected]) == ["0001-26-000007"]
     assert kw._intake_unread_material(listed, rows, []) == ["0001-26-000007", "0001-26-000006"]
 
 
