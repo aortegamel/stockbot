@@ -16,9 +16,11 @@ those come only from JEV decisions. Reasoner path: JEV escalates -> reasoner
 analyze -> JEV adjudicates -> reasoner expand over unresolved context -> JEV
 disposition -> JEV selects the actual tool action.
 
-The scheduler seeds known arguments for undated calls before Needle. A missing required
-argument or date constraint retains generation. Every ready node starts in the same gather.
-Each node stops after three rounds, even when a caller requests a larger budget.
+The scheduler seeds known arguments before Needle. Persisted SEC rows can supply session- and
+issuer-checked accessions without generation. Material filing nodes cannot resolve before a
+document read succeeds. Existing failure breakers and round caps report incomplete reads.
+Every ready node starts in the same gather. Each node stops after three rounds, even when a
+caller requests a larger budget.
 
 Only stdlib + existing modules here; the ``_default_*`` resolvers build the
 production kernel, JEV, reasoner and Needle clients.
@@ -36,7 +38,7 @@ import os
 import re
 import time as _time
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict
@@ -1154,37 +1156,42 @@ def _args_need_accession(tool_name: str, args: Mapping[str, object]) -> bool:
     return False
 
 
-def _scan_packet_accession(packet: object) -> tuple[str | None, str | None]:
-    """First accession-like token + co-located document_name in one packet, else (None, None)."""
-    doc = _packet_document(packet)
-    text = packet if isinstance(packet, str) else repr(packet)
-    match = _ACCESSION_TOKEN_RE.search(text)
-    if match is None and not isinstance(packet, str):
-        text = _json.dumps(packet, default=str)
-        match = _ACCESSION_TOKEN_RE.search(text)
-    if match is None:
-        return None, None
+def _inline_attempt_payloads(
+    attempts: Sequence[Mapping[str, object]], session_id: object = None
+) -> list[Mapping[str, object]]:
+    """Newest-first structured payloads from error-free attempts in this session. No kernel reads occur."""
+    payloads: list[Mapping[str, object]] = []
+    for attempt in reversed(attempts):
+        if attempt.get("error") is not None or attempt.get("session_id", session_id) != session_id:
+            continue
+        payload = _persisted_shapes(attempt)
+        if payload.get("error") is None and payload.get("session_id", session_id) == session_id:
+            payloads.append(payload)
+    return payloads
+
+
+def _structured_accession_present(packets: Sequence[object], session_id: object = None, issuer: object = None) -> bool:
+    """Accept accession fields in persisted filing or document rows, never summaries or free text."""
     from app.sec.discovery.service import normalize_accession_no
 
-    try:
-        return normalize_accession_no(match.group(1)), doc
-    except TypeError, ValueError:
-        return None, None
-
-
-def _packet_document(packet: object) -> str | None:
-    """Prefer the packet document name over its source handle document name."""
-    if not isinstance(packet, dict):
-        return None
-    raw_doc = packet.get("document_name") or packet.get("document")
-    if isinstance(raw_doc, str) and raw_doc.strip():
-        return raw_doc.strip()
-    handle = packet.get("source_handle")
-    if isinstance(handle, dict):
-        raw_doc = handle.get("document_name")
-        if isinstance(raw_doc, str) and raw_doc.strip():
-            return raw_doc.strip()
-    return None
+    attempts = [packet for packet in packets if isinstance(packet, dict)]
+    payloads = _inline_attempt_payloads(attempts, session_id)
+    rows: list[Mapping[str, object]] = []
+    for payload in payloads:
+        rows.append(payload)
+        for key in ("filings", "documents"):
+            values = payload.get(key)
+            if isinstance(values, list):
+                rows.extend(row for row in values if isinstance(row, dict))
+    if isinstance(issuer, str) and issuer.strip():
+        rows = _issuer_filing_rows(rows, issuer)
+    for row in rows:
+        try:
+            normalize_accession_no(row.get("accession_no"))
+        except TypeError, ValueError:
+            continue
+        return True
+    return False
 
 
 def _force_open_registry(
@@ -1192,20 +1199,44 @@ def _force_open_registry(
     attempts: Sequence[Mapping[str, JSONValue]],
     evidence: Sequence[JSONValue],
     admitted: int,
+    session: Mapping[str, JSONValue] | None = None,
 ) -> list[dict[str, JSONValue]] | None:
-    """Carry-tools-only registry when admitted==0 and this node's own attempts carry an accession."""
+    """Restrict the registry when this node retains a structured accession and admits no evidence."""
     if admitted != 0:
         return None
-    # ponytail: intake evidence stays out — its 8-K accession would force-open
-    # every round-1 select before the real rule (short/insider/time) matches.
-    for packet in attempts:
-        for candidate in (packet, packet.get("outcome_summary")):
-            if candidate is None:
-                continue
-            found, _ = _scan_packet_accession(candidate)
-            if found is None:
-                continue
-            return _carry_registry(registry, attempts)
+    session_id = session.get("session_id") if session is not None else None
+    objective = _session_objective(session) if session is not None else None
+    issuer = _objective_subject_ticker(objective, session.get("ticker")) if session is not None else None
+    if session is None:
+        payloads = _inline_attempt_payloads(attempts, session_id)
+    else:
+        payloads = _inline_attempt_payloads(
+            [
+                attempt
+                for attempt in attempts
+                if attempt.get("tool") not in ("search_sec_filings", "search_sec_filings_bounded")
+            ],
+            session_id,
+        )
+        search_attempts = [
+            attempt
+            for attempt in attempts
+            if attempt.get("tool") in ("search_sec_filings", "search_sec_filings_bounded")
+        ]
+        searches = _inline_attempt_payloads(search_attempts, session_id)
+        searches = [
+            payload
+            for payload in searches
+            if issuer is None
+            or (
+                isinstance(scope := payload.get("scope"), dict)
+                and isinstance(ticker := scope.get("ticker"), str)
+                and ticker.strip().upper() == issuer.strip().upper()
+            )
+        ]
+        payloads = [*_issuer_filing_rows(payloads, issuer), *searches]
+    if _structured_accession_present(payloads, session_id):
+        return _carry_registry(registry, attempts)
     return None
 
 
@@ -1218,19 +1249,6 @@ def _carry_registry(
         names = frozenset({"get_sec_document", "list_sec_documents"})
     carry = [entry for entry in registry if entry.get("name") in names]
     return carry or None
-
-
-def _ten_q_accessions(candidate: object) -> list[str]:
-    """Read exact form labels from SEC rows before legacy summary text."""
-    if isinstance(candidate, str):
-        decoded = _decoded_json_mapping(candidate)
-        if decoded is not None:
-            return _ten_q_accessions(decoded)
-    if isinstance(candidate, dict):
-        return _ten_q_payload_accessions(candidate)
-    if not isinstance(candidate, str):
-        return []
-    return _ten_q_text_accessions(candidate)
 
 
 def _ten_q_rows_accessions(rows: list[object]) -> list[str]:
@@ -1252,66 +1270,6 @@ def _ten_q_rows_accessions(rows: list[object]) -> list[str]:
     return labeled
 
 
-def _ten_q_payload_accessions(candidate: Mapping[str, object]) -> list[str]:
-    """Prefer filing rows, then the first summary field, then the packet form."""
-    from app.sec.discovery.service import normalize_accession_no
-
-    payload = _persisted_shapes(candidate)
-    rows = payload.get("filings")
-    if isinstance(rows, list):
-        return _ten_q_rows_accessions(rows)
-    summary = _summary_text_of(candidate)
-    if summary is not None:
-        return _ten_q_accessions(summary)
-    if payload.get("form") == "10-Q":
-        try:
-            return [normalize_accession_no(payload.get("accession_no"))]
-        except ValueError:
-            return []
-    return []
-
-
-def _ten_q_text_accessions(text: str) -> list[str]:
-    """Keep accession tokens with an adjacent exact 10-Q label."""
-    from app.sec.discovery.service import normalize_accession_no
-
-    labeled: list[str] = []
-    for match in _ACCESSION_TOKEN_RE.finditer(text):
-        after = re.match(r"\s+(10-Q|10-K|8-K)\b", text[match.end() :])
-        before = re.search(
-            r"\b(10-Q|10-K|8-K)\b(?:\s+\d{4}-\d{2}-\d{2})?\s+(?:accession\s+)?$",
-            text[: match.start()],
-        )
-        label = after or before
-        if label is None or label.group(1) != "10-Q":
-            continue
-        try:
-            labeled.append(normalize_accession_no(match.group(1)))
-        except ValueError:
-            continue
-    return labeled
-
-
-def _decoded_json_mapping(candidate: str) -> dict[str, object] | None:
-    """Persisted payload decoded from its JSON string form; None when it is not a mapping."""
-    import json as _json
-
-    try:
-        decoded = _json.loads(candidate)
-    except ValueError, TypeError:
-        return None
-    return decoded if isinstance(decoded, dict) else None
-
-
-def _summary_text_of(candidate: Mapping[str, object]) -> str | None:
-    """First summary text field a persisted packet carries, if any."""
-    for key in ("outcome_summary", "record_identity", "content"):
-        value = candidate.get(key)
-        if isinstance(value, str):
-            return value
-    return None
-
-
 def _revenue_rows_accessions(rows: list[object]) -> list[str]:
     """Newest-first 10-Q/10-K accessions from persisted filing rows; malformed rows drop."""
     from app.sec.discovery.service import normalize_accession_no
@@ -1330,189 +1288,231 @@ def _revenue_rows_accessions(rows: list[object]) -> list[str]:
     return labeled
 
 
-def _labeled_text_accessions(text: str) -> list[str]:
-    """Accessions the text itself labels 10-Q/10-K, in reading order."""
-    from app.sec.discovery.service import normalize_accession_no
+_MATERIAL_FORM_RE = re.compile(r"\b(10-?\s?q|10-?\s?k|8-?\s?k)\b")
+_MATERIAL_FORM_NAMES = {"10q": "10-Q", "10k": "10-K", "8k": "8-K"}
+"""Material filings: a node that names one reads its document before it resolves."""
+_MATERIAL_READ_HOLD = "read the retained filing document before resolving"
+"""Reselect error while a revenue or material-form node still lacks its document read."""
 
-    labeled: list[str] = []
-    for match in _ACCESSION_TOKEN_RE.finditer(text):
-        after = re.match(r"\s+(10-Q|10-K)\b", text[match.end() :])
-        before = re.search(
-            r"\b(10-Q|10-K)\b(?:\s+\d{4}-\d{2}-\d{2})?\s+(?:accession\s+)?$",
-            text[: match.start()],
-        )
-        label = after or before
-        if label is None or label.group(1) not in _REVENUE_FORMS:
-            continue
+
+def _material_forms(text: object) -> frozenset[str]:
+    """Canonical 10-Q/10-K/8-K forms that the text names."""
+    tokens = _MATERIAL_FORM_RE.findall(str(text or "").lower())
+    return frozenset(_MATERIAL_FORM_NAMES[re.sub(r"[-\s]", "", token)] for token in tokens)
+
+
+def _persisted_attempt_payload(
+    attempt: Mapping[str, JSONValue], session_id: object, kernel: _Kernel
+) -> Mapping[str, object] | None:
+    """Error-free attempt payload: kernel row first, inline result second. A foreign session yields None."""
+    if attempt.get("error") is not None or attempt.get("session_id", session_id) != session_id:
+        return None
+    ref = attempt.get("tool_result_ref")
+    if isinstance(ref, str) and ref:
         try:
-            labeled.append(normalize_accession_no(match.group(1)))
-        except ValueError:
-            continue
-    return labeled
+            row = kernel.get_tool_result(ref)
+        except KeyError:
+            row = None
+        if row is not None:
+            return _persisted_shapes(row) if row.get("session_id") == session_id else None
+    inline = _persisted_shapes(attempt)
+    return inline if inline.get("session_id", session_id) == session_id and inline.get("error") is None else None
 
 
-def _revenue_payload_accessions(candidate: Mapping[str, object]) -> list[str]:
-    """Persisted payload: filings rows win, then summary text, then the payload's own label."""
-    from app.sec.discovery.service import normalize_accession_no
-
-    payload = _persisted_shapes(candidate)
-    rows = payload.get("filings")
-    if isinstance(rows, list):
-        return _revenue_rows_accessions(rows)
-    summary = _summary_text_of(candidate)
-    if summary is not None:
-        return _latest_revenue_accessions(summary)
-    if payload.get("form") in _REVENUE_FORMS:
-        try:
-            return [normalize_accession_no(payload.get("accession_no"))]
-        except TypeError, ValueError:
-            return []
-    return []
+def _cik_int(value: object) -> int | None:
+    """Positive CIK from an int or a digit string; anything else is None."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    text = str(value).strip()
+    return int(text) if text.isascii() and text.isdigit() and int(text) > 0 else None
 
 
-def _latest_revenue_accessions(candidate: object) -> list[str]:
-    """Latest 10-Q/10-K accessions, newest filing first; exact row labels win over summary text."""
-    if isinstance(candidate, str):
-        decoded = _decoded_json_mapping(candidate)
-        if decoded is not None:
-            return _latest_revenue_accessions(decoded)
-    elif isinstance(candidate, dict):
-        return _revenue_payload_accessions(candidate)
-    if not isinstance(candidate, str):
+def _row_ciks(row: Mapping[str, object]) -> set[int]:
+    """Filer and subject CIKs that one filing row names."""
+    return {cik for key in ("filer_cik", "subject_cik") if (cik := _cik_int(row.get(key))) is not None}
+
+
+def _issuer_filing_rows(payloads: Sequence[Mapping[str, object]], ticker: str | None) -> list[Mapping[str, object]]:
+    """Filing rows of the objective issuer. Foreign or unverifiable rows drop.
+
+    A listing proves its issuer through its subject echo (ticker, or CIK plus a matching row CIK).
+    A single filing record proves it only through a CIK that a matching listing row names.
+    """
+    if ticker is None:
         return []
-    return _labeled_text_accessions(candidate)
-
-
-def _carry_packet_accession(
-    tool_name: str,
-    args: Mapping[str, JSONValue],
-    evidence: Sequence[JSONValue],
-    attempts: Sequence[Mapping[str, JSONValue]],
-    objective: object = None,
-) -> dict[str, JSONValue] | None:
-    """Most-recent-first packet scan for an accession to fill; None when none found."""
-    want_10q = _revenue_quarter_objective(objective)
-    explicit_10q = want_10q and _TEN_Q_RE.search(str(objective).lower()) is not None
-    want_latest = _latest_revenue_objective(objective)
-    if want_latest or explicit_10q:
-        found, listed = _listed_revenue_carry(args, attempts, explicit_10q)
-        if found:
-            return listed
-    return _carry_packet_fallback(tool_name, args, evidence, attempts, want_10q, explicit_10q, want_latest)
-
-
-def _listed_revenue_carry(
-    args: Mapping[str, JSONValue], attempts: Sequence[Mapping[str, JSONValue]], explicit_10q: bool
-) -> tuple[bool, dict[str, JSONValue] | None]:
-    """The newest successful listing controls revenue carry, even when it contains no matching filing."""
-    for packet in reversed(attempts):
-        if packet.get("tool") != "list_sec_filings" or packet.get("error") is not None:
+    want = ticker.strip().upper()
+    ciks = {cik} if (cik := _cik_int(want)) is not None else set()
+    by_ticker: list[Mapping[str, object]] = []
+    by_cik: list[tuple[int, Mapping[str, object]]] = []
+    singles: list[Mapping[str, object]] = []
+    for payload in payloads:
+        listed = payload.get("filings")
+        if not isinstance(listed, list):
+            if payload.get("accession_no") is not None:
+                singles.append(payload)
             continue
-        accessions = _ten_q_accessions(packet) if explicit_10q else _latest_revenue_accessions(packet)
-        if not accessions:
-            return True, None
-        listed: dict[str, JSONValue] = {**args, "accession_no": accessions[0]}
-        if args.get("accession_no") != accessions[0]:
-            listed.pop("document_name", None)
-        return True, listed
-    return False, None
+        subject = payload.get("subject")
+        subject_text = str(subject).strip().upper() if isinstance(subject, (str, int)) else ""
+        subject_cik = _cik_int(subject_text)
+        listed_rows = [row for row in listed if isinstance(row, dict)]
+        if subject_cik is not None:
+            by_cik.extend((subject_cik, row) for row in listed_rows)
+        elif subject_text == want:
+            by_ticker.extend(listed_rows)
+        elif not subject_text:
+            singles.extend(listed_rows)
+    for row in by_ticker:
+        issuer = _cik_int(row.get("subject_cik")) or _cik_int(row.get("filer_cik"))
+        ciks |= {issuer} if issuer is not None else set()
+    rows = [*by_ticker, *(row for subject_cik, row in by_cik if subject_cik in ciks and subject_cik in _row_ciks(row))]
+    return rows + [single for single in singles if _row_ciks(single) & ciks]
 
 
-def _carry_candidates(evidence: Sequence[JSONValue], attempts: Sequence[Mapping[str, JSONValue]]) -> Iterator[object]:
-    """Visit recent attempts before evidence, with each packet before its summary."""
-    packets: list[object] = [*reversed(attempts), *reversed(evidence)]
-    for packet in packets:
-        for candidate in (packet, packet.get("outcome_summary") if isinstance(packet, Mapping) else None):
-            if candidate is not None:
-                yield candidate
+def _newest_filing(
+    rows: Sequence[Mapping[str, object]], forms: frozenset[str]
+) -> tuple[str, Mapping[str, object]] | None:
+    """Newest filed_at wins across distinct accessions. A tie or an undated leader fails closed."""
+    from app.sec.discovery.service import normalize_accession_no
 
-
-def _fill_carried_accession(
-    tool_name: str, args: Mapping[str, JSONValue], candidate: object, accession: str
-) -> dict[str, JSONValue]:
-    """Carry the co-located document name only when a document call still lacks it."""
-    filled = dict(args)
-    filled["accession_no"] = accession
-    if tool_name == "get_sec_document":
-        _, doc = _scan_packet_accession(candidate)
-        if doc is not None and not filled.get("document_name"):
-            filled["document_name"] = doc
-    return filled
-
-
-def _scan_carried_accessions(
-    tool_name: str, args: Mapping[str, JSONValue], candidate: object, labeled: list[str]
-) -> tuple[dict[str, JSONValue] | None, dict[str, JSONValue] | None]:
-    """Return the first preferred accession and the first unlabelled fallback separately."""
-    text = candidate if isinstance(candidate, str) else _json.dumps(candidate, default=str)
-    fallback: dict[str, JSONValue] | None = None
-    for match in _ACCESSION_TOKEN_RE.finditer(text):
+    found: dict[str, tuple[str, Mapping[str, object]]] = {}
+    for row in rows:
+        if forms and row.get("form") not in forms:
+            continue
         try:
-            from app.sec.discovery.service import normalize_accession_no
-
-            accession = normalize_accession_no(match.group(1))
+            accession = normalize_accession_no(row.get("accession_no"))
         except TypeError, ValueError:
             continue
-        filled = _fill_carried_accession(tool_name, args, candidate, accession)
-        if accession in labeled:
-            return filled, fallback
-        if fallback is None:
-            fallback = filled
-    return None, fallback
+        filed = row.get("filed_at")
+        found.setdefault(accession, (filed if isinstance(filed, str) else "", row))
+    ranked = sorted(((filed, accession) for accession, (filed, _row) in found.items()), reverse=True)
+    if not ranked:
+        return None
+    if len(ranked) > 1 and (not ranked[0][0] or ranked[0][0] == ranked[1][0]):
+        return None
+    accession = ranked[0][1]
+    return accession, found[accession][1]
 
 
-def _carry_packet_fallback(
-    tool_name: str,
-    args: Mapping[str, JSONValue],
-    evidence: Sequence[JSONValue],
-    attempts: Sequence[Mapping[str, JSONValue]],
-    want_10q: bool,
-    explicit_10q: bool,
-    want_latest: bool,
-) -> dict[str, JSONValue] | None:
-    """Prefer labelled revenue filings. Never use unlabelled fallback for explicit or latest requests."""
-    fallback: dict[str, JSONValue] | None = None
-    for candidate in _carry_candidates(evidence, attempts):
-        labeled: list[str] = []
-        if want_latest and not explicit_10q:
-            labeled = _latest_revenue_accessions(candidate)[:1]
-        elif want_10q:
-            labeled = _ten_q_accessions(candidate)[:1]
-        preferred, first = _scan_carried_accessions(tool_name, args, candidate, labeled)
-        if preferred is not None:
-            return preferred
-        if fallback is None:
-            fallback = first
-    return None if (explicit_10q or want_latest) else fallback
+def _exact_document_name(
+    requested: object, accession: str, row: Mapping[str, object], payloads: Sequence[Mapping[str, object]]
+) -> str | None:
+    """A requested name only on an exact documents-list or primary_document match; else the primary document."""
+    from app.sec.discovery.service import normalize_accession_no
 
-
-def _swap_repeat_accession(
-    tool_name: str,
-    args: Mapping[str, JSONValue],
-    evidence: Sequence[JSONValue],
-    attempts: Sequence[Mapping[str, JSONValue]],
-    objective: object,
-) -> dict[str, JSONValue] | None:
-    """Swap a same-accession repeat for the packet's 10-Q on revenue questions."""
-    if tool_name not in _ACCESSION_CARRY_TOOLS:
-        return None
-    if not _revenue_quarter_objective(objective):
-        return None
-    raw = args.get("accession_no")
-    current = raw.strip() if isinstance(raw, str) else ""
-    if not current:
-        return None
-    repeats = _same_tool_accession_count(tool_name, current, attempts[-3:])
-    if repeats < 2:
-        return None
-    for candidate in _carry_candidates(evidence, attempts):
-        for accession in _ten_q_accessions(candidate):
-            if accession == current:
+    primary = row.get("primary_document")
+    primary = primary if isinstance(primary, str) and primary else None
+    names = {primary} if primary is not None else set()
+    for payload in payloads:
+        documents = payload.get("documents")
+        for doc in documents if isinstance(documents, list) else []:
+            if not isinstance(doc, dict) or not isinstance(name := doc.get("document_name"), str):
                 continue
-            swapped = dict(args)
-            swapped["accession_no"] = accession
-            return swapped
-    return None
+            try:
+                if normalize_accession_no(doc.get("accession_no")) == accession:
+                    names.add(name)
+            except TypeError, ValueError:
+                continue
+    if isinstance(requested, str) and requested:
+        return requested if requested in names else None
+    return primary
+
+
+def _carry_forms(objective: object, text: str) -> frozenset[str]:
+    """Forms the resolved filing must carry: revenue asks first, else the forms the request names."""
+    want_10q = _revenue_quarter_objective(objective)
+    if want_10q and _TEN_Q_RE.search(str(objective).lower()):
+        return frozenset({"10-Q"})
+    if _latest_revenue_objective(objective):
+        return frozenset(_REVENUE_FORMS)
+    return frozenset({"10-Q"}) if want_10q else _material_forms(text)
+
+
+def _listed_filing(
+    session: Mapping[str, JSONValue], attempts: Sequence[Mapping[str, JSONValue]]
+) -> tuple[str, Mapping[str, object]] | None:
+    """Newest issuer filing from the latest successful listing in this session. Text never satisfies this gate."""
+    listings = [
+        attempt for attempt in attempts if attempt.get("tool") == "list_sec_filings" and attempt.get("error") is None
+    ]
+    payloads = _inline_attempt_payloads(listings[-1:], session.get("session_id"))
+    if not payloads:
+        return None
+    objective = _session_objective(session)
+    cik = re.search(r"\bCIK\s*[:#]?\s*(\d{1,10})\b", objective, re.IGNORECASE)
+    issuer = cik.group(1) if cik is not None else _objective_subject_ticker(objective, session.get("ticker"))
+    rows = _issuer_filing_rows(payloads, issuer)
+    return _newest_filing(rows, _carry_forms(objective, objective))
+
+
+def _resolve_persisted_accession(
+    tool_name: str,
+    args: Mapping[str, JSONValue],
+    schema: Mapping[str, JSONValue],
+    session: Mapping[str, JSONValue],
+    node: object,
+    attempts: Sequence[Mapping[str, JSONValue]],
+    kernel: _Kernel,
+) -> dict[str, JSONValue] | None:
+    """Session- and issuer-checked accession from persisted SEC rows; None unless exactly one filing wins.
+
+    Reads error-free attempts newest-first. Never reads summaries or free text. Output keys stay
+    inside schema.properties and {accession_no, document_name}.
+    """
+    props = schema.get("properties")
+    if tool_name not in _ACCESSION_CARRY_TOOLS or not isinstance(props, dict) or "accession_no" not in props:
+        return None
+    objective = _session_objective(session)
+    sources = [
+        (attempt, payload)
+        for attempt in reversed(attempts)
+        if (payload := _persisted_attempt_payload(attempt, session.get("session_id"), kernel)) is not None
+    ]
+    payloads = [payload for _attempt, payload in sources]
+    filing_payloads: list[Mapping[str, object]] = payloads
+    if _revenue_read_objective(objective):
+        listing = next((payload for attempt, payload in sources if attempt.get("tool") == "list_sec_filings"), None)
+        filing_payloads = [] if listing is None else [listing]
+    cik = re.search(r"\bCIK\s*[:#]?\s*(\d{1,10})\b", objective, re.IGNORECASE)
+    issuer = cik.group(1) if cik is not None else _objective_subject_ticker(objective, session.get("ticker"))
+    rows = _issuer_filing_rows(filing_payloads, issuer)
+    text = f"{objective} {_f(node, 'question', default='')}"
+    newest = _newest_filing(rows, _carry_forms(objective, text))
+    if newest is None:
+        return None
+    accession, row = newest
+    resolved: dict[str, JSONValue] = {"accession_no": accession}
+    if tool_name == "get_sec_document" and "document_name" in props:
+        name = _exact_document_name(args.get("document_name"), accession, row, payloads)
+        if name is not None:
+            resolved["document_name"] = name
+    return resolved if _resolved_schema_matches(tool_name, resolved, schema) else None
+
+
+def _resolved_schema_matches(
+    tool_name: str, resolved: Mapping[str, JSONValue], schema: Mapping[str, JSONValue]
+) -> bool:
+    """Check resolved strings against the selected schema's required keys, types, patterns, and enums."""
+    from app.tools import _pattern_mismatch, _schema_enum_mismatch
+
+    props = schema.get("properties")
+    if not isinstance(props, dict) or _missing_required_argument(schema, resolved):
+        return False
+    for key, value in resolved.items():
+        prop = props.get(key)
+        if not isinstance(prop, dict) or prop.get("type", "string") != "string":
+            return False
+        pattern = prop.get("pattern")
+        if isinstance(pattern, str) and _pattern_mismatch(tool_name, key, value, pattern, prop) is not None:
+            return False
+        if _schema_enum_mismatch(tool_name, key, value, prop.get("enum")) is not None:
+            return False
+    return True
+
+
+def _merge_resolved(args: Mapping[str, JSONValue], resolved: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+    """Current arguments with their identifiers replaced by the resolved ones. Unverified names drop."""
+    kept = {key: value for key, value in args.items() if key not in ("accession_no", "document_name")}
+    return {**kept, **resolved}
 
 
 def _same_tool_accession_count(tool_name: str, current: str, attempts: Sequence[Mapping[str, JSONValue]]) -> int:
@@ -2665,7 +2665,7 @@ async def _generate_tool_arguments(
     if sid_carry is not None:
         return sid_carry
     grounded = _grounded_revenue_arguments(
-        tool_name, objective, session, node, as_of, attempts, schema, scoped, sid, nid
+        tool_name, objective, session, node, as_of, attempts, schema, scoped, sid, nid, kernel
     )
     if grounded is not None:
         return grounded
@@ -2673,10 +2673,16 @@ async def _generate_tool_arguments(
     if seeded is not None:
         _validate_repaired_args(tool_name, seeded[0], objective, session, node, evidence, attempts, kernel)
         return seeded
+    persisted = _persisted_arguments(tool_name, objective, session, node, schema, attempts, kernel, sid, nid)
+    if persisted is not None:
+        _validate_repaired_args(tool_name, persisted[0], objective, session, node, evidence, attempts, kernel)
+        return persisted
     try:
         generated = await _call_needle(needle_generate, tool_name, schema, objective, node, context)
     except (RuntimeError, ValueError) as exc:
-        return _needle_failure_args(exc, tool_name, objective, session, node, evidence, attempts, sid, nid)
+        return _needle_failure_args(
+            exc, tool_name, objective, session, node, evidence, attempts, sid, nid, schema, kernel
+        )
     needle_tool, generated_args, needle_reasoning, withheld = _split_generated(tool_name, generated)
     try:
         validate_needle_tool(tool_name, needle_tool)
@@ -2695,6 +2701,8 @@ async def _generate_tool_arguments(
             schema_empty,
             sid,
             nid,
+            schema,
+            kernel,
         )
     filled = _repair_tool_arguments(
         tool_name,
@@ -2707,7 +2715,7 @@ async def _generate_tool_arguments(
         session_as_of=session.get("as_of"),
     )
     _validate_repaired_args(tool_name, filled, objective, session, node, evidence, attempts, kernel)
-    filled = _carry_document_read(filled, tool_name, objective, evidence, attempts, sid, nid)
+    filled = _carry_document_read(filled, tool_name, session, node, evidence, attempts, schema, kernel, sid, nid)
     keys, size = _toolflow_args_summary(filled)
     logger.info(
         "toolflow args_ok sid=%s nid=%s tool=%s schema_empty=%s match=exact arg_keys=%s arg_bytes=%s",
@@ -2783,6 +2791,7 @@ def _grounded_revenue_arguments(
     scoped: Mapping[str, JSONValue],
     sid: str,
     nid: str,
+    kernel: _Kernel,
 ) -> tuple[dict[str, JSONValue], str, bool] | None:
     """Ground latest revenue arguments without Needle; None when the ask needs generation."""
     if tool_name not in ("list_sec_filings", "get_sec_document"):
@@ -2793,7 +2802,7 @@ def _grounded_revenue_arguments(
         grounded = _fallback_sec_args(tool_name, objective, session.get("ticker"))
         reasoning = "scheduler grounded latest revenue arguments from the user request"
     else:
-        grounded = _listing_carry_args(tool_name, objective, attempts)
+        grounded = _resolve_persisted_accession(tool_name, {}, schema, session, node, attempts, kernel)
         reasoning = "scheduler grounded latest revenue arguments from the successful listing"
     if grounded is None:
         return None
@@ -2841,17 +2850,33 @@ def _seeded_arguments(
     return seeded, "scheduler seeded known arguments. No Needle generation needed", False
 
 
-def _listing_carry_args(
-    tool_name: str, objective: object, attempts: Sequence[Mapping[str, JSONValue]]
-) -> dict[str, JSONValue] | None:
-    """Carry the newest successful listing only when that listing actually carries filing rows."""
-    listing = next(
-        (a for a in reversed(attempts) if a.get("tool") == "list_sec_filings" and a.get("error") is None),
-        None,
-    )
-    if listing is None or not isinstance(_persisted_shapes(listing).get("filings"), list):
+def _persisted_arguments(
+    tool_name: str,
+    objective: object,
+    session: Mapping[str, JSONValue],
+    node: object,
+    schema: Mapping[str, JSONValue],
+    attempts: Sequence[Mapping[str, JSONValue]],
+    kernel: _Kernel,
+    sid: str,
+    nid: str,
+) -> tuple[dict[str, JSONValue], str, bool] | None:
+    """Persisted-row accession for a carry tool, without Needle. None when no single filing wins."""
+    resolved = _resolve_persisted_accession(tool_name, {}, schema, session, node, attempts, kernel)
+    if resolved is None:
         return None
-    return _carry_packet_accession(tool_name, {}, [], attempts, objective)
+    filled = _repair_tool_arguments(
+        tool_name,
+        resolved,
+        objective,
+        sid,
+        nid,
+        question=_f(node, "question", default=None),
+        scope=session.get("temporal_scope"),
+        session_as_of=session.get("as_of"),
+    )
+    _log_args_carry(sid, nid, tool_name, filled)
+    return filled, "scheduler resolved persisted accession without Needle", False
 
 
 def _missing_required_argument(schema: Mapping[str, JSONValue], arguments: Mapping[str, JSONValue]) -> bool:
@@ -2916,13 +2941,13 @@ async def _call_needle(
     return await _awaited(await asyncio.get_running_loop().run_in_executor(_TOOL_POOL, call))
 
 
-def _needle_failure_recoverable(tool_name: str, exc: RuntimeError | ValueError) -> bool:
-    """Recover known outages, carry timeouts, and web grounding failures."""
+def _needle_failure_recoverable(tool_name: str, exc: RuntimeError | ValueError, carried: bool = False) -> bool:
+    """Recover outages, carry timeouts, and grounding failures (web, or SEC with a resolved accession)."""
     low = str(exc).lower()
     if isinstance(exc, ValueError):
         return tool_name == "search_web" and "needle tool mismatch" in low
     if "not grounded in the request" in low:
-        return tool_name == "search_web"
+        return tool_name == "search_web" or (carried and tool_name in _ACCESSION_CARRY_TOOLS)
     if "timed out" in low or "timeout" in low:
         return tool_name in _ACCESSION_CARRY_TOOLS
     if "needle tool mismatch" in low:
@@ -2951,27 +2976,27 @@ def _needle_failure_args(
     attempts: Sequence[Mapping[str, JSONValue]],
     sid: str,
     nid: str,
+    schema: Mapping[str, JSONValue],
+    kernel: _Kernel,
 ) -> tuple[dict[str, JSONValue], str, bool]:
-    """Recover args after a recoverable Needle failure: carry the packet accession, then seed."""
-    if not _needle_failure_recoverable(tool_name, exc):
+    """Recover args after a recoverable Needle failure: carry the accession, then seed."""
+    resolved = _resolve_persisted_accession(tool_name, {}, schema, session, node, attempts, kernel)
+    if not _needle_failure_recoverable(tool_name, exc, resolved is not None):
         raise exc
     if _needle_carry_streak(attempts) >= _NEEDLE_CARRY_LIMIT:
         raise RuntimeError(f"needle arguments.generate unavailable ({_NEEDLE_CARRY_LIMIT}x carried fallbacks used)")
-    if _args_need_accession(tool_name, {}):
-        carried = _carry_packet_accession(tool_name, {}, evidence, attempts, objective)
-        if carried is not None:
-            return _repaired_carry(
-                tool_name,
-                carried,
-                objective,
-                session,
-                node,
-                evidence,
-                attempts,
-                sid,
-                nid,
-                "carried accession from packet after needle failure",
-            )
+    carried = resolved
+    if carried is not None:
+        return _repaired_carry(
+            tool_name,
+            carried,
+            objective,
+            session,
+            node,
+            sid,
+            nid,
+            "carried accession from packet after needle failure",
+        )
     seeded = _fallback_search_web_args(tool_name, node) or _fallback_sec_args(
         tool_name, objective, session.get("ticker")
     )
@@ -3009,6 +3034,8 @@ def _withhold_args(
     schema_empty: bool,
     sid: str,
     nid: str,
+    schema: Mapping[str, JSONValue],
+    kernel: _Kernel,
 ) -> tuple[dict[str, JSONValue], str, bool]:
     """Recover withheld arguments or a web mismatch. Other tool mismatches raise."""
     web_args = _fallback_search_web_args(tool_name, node)
@@ -3017,10 +3044,17 @@ def _withhold_args(
     if needle_tool is None:
         current = generated_args if isinstance(generated_args, dict) else {}
         if _args_need_accession(tool_name, current):
-            carried = _carry_packet_accession(tool_name, current, evidence, attempts, objective)
-            if carried is not None:
+            resolved = _resolve_persisted_accession(tool_name, current, schema, session, node, attempts, kernel)
+            if resolved is not None:
                 return _repaired_carry(
-                    tool_name, carried, objective, session, node, evidence, attempts, sid, nid, needle_reasoning
+                    tool_name,
+                    _merge_resolved(current, resolved),
+                    objective,
+                    session,
+                    node,
+                    sid,
+                    nid,
+                    needle_reasoning,
                 )
         seeded = _fallback_sec_args(tool_name, objective, session.get("ticker"))
         if seeded is not None:
@@ -3051,13 +3085,11 @@ def _repaired_carry(
     objective: object,
     session: Mapping[str, JSONValue],
     node: object,
-    evidence: Sequence[JSONValue],
-    attempts: Sequence[Mapping[str, JSONValue]],
     sid: str,
     nid: str,
     reasoning: str,
 ) -> tuple[dict[str, JSONValue], str, bool]:
-    """Repair and de-swap one carried accession before returning it."""
+    """Repair the already resolved carry without selecting another accession."""
     repaired = _repair_tool_arguments(
         tool_name,
         carried,
@@ -3068,9 +3100,7 @@ def _repaired_carry(
         scope=session.get("temporal_scope"),
         session_as_of=session.get("as_of"),
     )
-    swapped = _swap_repeat_accession(tool_name, repaired, evidence, attempts, objective)
-    if swapped is not None:
-        repaired = swapped
+    # The resolver already selected the filing. Text cannot replace that accession.
     _log_args_carry(sid, nid, tool_name, repaired)
     return repaired, reasoning, False
 
@@ -3124,33 +3154,31 @@ def _explicit_revenue_read(tool_name: str, objective: object) -> str:
 def _carry_document_read(
     filled: dict[str, JSONValue],
     tool_name: str,
-    objective: object,
+    session: Mapping[str, JSONValue],
+    node: object,
     evidence: Sequence[JSONValue],
     attempts: Sequence[Mapping[str, JSONValue]],
+    schema: Mapping[str, JSONValue],
+    kernel: _Kernel,
     sid: str,
     nid: str,
 ) -> dict[str, JSONValue]:
-    """Carry the listing accession onto a document read. A missing listing reselects."""
+    """Carry the listed accession onto a document read. A missing listing reselects."""
+    objective = _session_objective(session)
     read = _explicit_revenue_read(tool_name, objective)
     if not _args_need_accession(tool_name, filled) and not read:
-        # Carry fires only on missing accession, so a same-accession repeat
-        # loop (e.g. 8-K x9 on a revenue question) never diverts on its own:
-        # swap the repeat for the packet's 10-Q so the next round reads MD&A.
-        swapped = _swap_repeat_accession(tool_name, filled, evidence, attempts, objective)
-        if swapped is None:
+        current = filled.get("accession_no")
+        if (
+            not _revenue_quarter_objective(objective)
+            or not isinstance(current, str)
+            or _same_tool_accession_count(tool_name, current.strip(), attempts[-3:]) < 2
+        ):
             return filled
-        logger.info(
-            "toolflow args_swap sid=%s nid=%s tool=%s accession=%s",
-            sid,
-            nid,
-            tool_name,
-            swapped.get("accession_no"),
-        )
-        return swapped
-    carried = _carry_packet_accession(tool_name, filled, evidence, attempts, objective)
-    if carried is None:
+    resolved = _resolve_persisted_accession(tool_name, filled, schema, session, node, attempts, kernel)
+    if resolved is None:
         _require_listed_read(read)
         return filled
+    carried = _merge_resolved(filled, resolved)
     _log_args_carry(sid, nid, tool_name, carried)
     return carried
 
@@ -3980,8 +4008,8 @@ async def _reason_phase(
         return {"done": True, "terminal": None, "decision": decision}
     verdict = await _adjudicate_analysis(jev, kernel, analysis, node, sid, nid)
     if _selection_action(verdict) == "resolved":
-        if _revenue_read_pending(session, node, attempts):
-            attempts.append(_reselect_attempt("read the retained revenue document before resolving"))
+        if _material_read_pending(session, node, attempts):
+            attempts.append(_reselect_attempt(_MATERIAL_READ_HOLD))
             return {"done": True, "terminal": None, "decision": verdict}
         terminal = _resolve_or_reselect(kernel, sid, nid, evidence, attempts, admitted)
         return {"done": True, "terminal": terminal, "decision": verdict}
@@ -4119,7 +4147,7 @@ def _upfront_section_read(
     return (
         _undated_latest_ten_q(session, node, as_of_str)
         and not any(a.get("tool") == "get_sec_document" for a in attempts)
-        and _carry_packet_accession("get_sec_document", {}, [], attempts, _session_objective(session)) is not None
+        and _listed_filing(session, attempts) is not None
     )
 
 
@@ -4638,8 +4666,8 @@ def _queue_settled_verdict(
     continuation: bool,
 ) -> bool:
     """Queue one verdict unless a document read is still pending; True when a sibling read follows."""
-    # 10-Q revenue route: a catalog listing never ends the node (resolve or fresh round) before its document read.
-    if continuation and not (session is not None and _revenue_read_pending(session, node, attempts)):
+    # Material route: a catalog listing never ends the node (resolve or fresh round) before its document read.
+    if continuation and not (session is not None and _material_read_pending(session, node, attempts)):
         verdicts.append(assessment)
     # Sibling 10-Q section reads all settle and admit before any verdict ends the round.
     return tool == "get_sec_document" and any(r.get("tool") == "get_sec_document" for r in results[index + 1 :])
@@ -4648,16 +4676,19 @@ def _queue_settled_verdict(
 def _listing_result_ref(
     successful: dict[str, JSONValue], tool: str, attempt: Mapping[str, object], kernel: _Kernel
 ) -> None:
-    """Carry the listing rows onto the settled attempt; the inline result is the fallback."""
-    ref = attempt.get("tool_result_ref")
-    if tool != "list_sec_filings" or not isinstance(ref, str):
+    """Carry SEC navigation rows onto the settled attempt. The inline result is the fallback."""
+    if tool not in _SEC_NAVIGATION_TOOLS:
         return
-    try:
-        successful["result"] = dict(_persisted_payload_for_locator(ref, kernel))
-    except KeyError:
-        inline = attempt.get("result")
-        if isinstance(inline, dict):
-            successful["result"] = dict(inline)
+    ref = attempt.get("tool_result_ref")
+    if isinstance(ref, str):
+        try:
+            successful["result"] = dict(_persisted_payload_for_locator(ref, kernel))
+            return
+        except KeyError:
+            pass
+    inline = attempt.get("result")
+    if isinstance(inline, dict):
+        successful["result"] = dict(inline)
 
 
 def _round_continuation(
@@ -4849,8 +4880,8 @@ async def _run_round(
 ) -> _RoundOut:
     """One tool round: resolved/reason dispatch, invoke, settle; returns step signals."""
     if action == "resolved":
-        if _revenue_read_pending(session, node, attempts):
-            attempts.append(_reselect_attempt("read the retained revenue document before resolving"))
+        if _material_read_pending(session, node, attempts):
+            attempts.append(_reselect_attempt(_MATERIAL_READ_HOLD))
             return {
                 "terminal": None,
                 "continue": True,
@@ -5049,15 +5080,15 @@ def _log_round_timing(
     )
 
 
-def _revenue_read_pending(
+def _material_read_pending(
     session: Mapping[str, JSONValue],
     node: object,
     attempts: Sequence[Mapping[str, JSONValue]],
 ) -> bool:
-    """Keep a revenue node active after successful SEC navigation until its document read succeeds."""
+    """Keep a revenue or 10-Q/10-K/8-K node active after SEC navigation until its document read succeeds."""
     objective = session.get("objective") or session.get("query") or ""
     question = f"{objective} {_f(node, 'question', default='')}"
-    if not (_revenue_quarter_objective(question) or _latest_revenue_objective(question)):
+    if not (_revenue_read_objective(question) or _material_forms(question)):
         return False
     ok = [a.get("tool") for a in attempts if a.get("error") is None]
     return "get_sec_document" not in ok and any(t in _SEC_NAVIGATION_TOOLS for t in ok)
@@ -5353,7 +5384,7 @@ def _force_open_round(
     nothing) so the filing must open next round. JEV still picks among the
     carry tools; no bypass.
     """
-    forced = _force_open_registry(registry, attempts, evidence, admitted)
+    forced = _force_open_registry(registry, attempts, evidence, admitted, session)
     if forced is None or _revenue_read_unlisted(session, attempts):
         return None
     if _accession_family_break(attempts) is not None or _same_accession_repeats(attempts) >= 2:
@@ -5370,9 +5401,7 @@ def _revenue_read_unlisted(session: Mapping[str, JSONValue], attempts: Sequence[
         return False
     if _document_read_failed(attempts):
         return True
-    if _carry_packet_accession("get_sec_document", {}, [], attempts, objective):
-        return False
-    return _TEN_Q_RE.search(str(objective or "").lower()) is not None or latest
+    return _listed_filing(session, attempts) is None
 
 
 def _document_read_failed(attempts: Sequence[Mapping[str, JSONValue]]) -> bool:
