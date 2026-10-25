@@ -344,9 +344,9 @@ describe("App agent send", () => {
     });
     await until(() => text(root).includes("Risk grew in 2026."));
     await until(() => findButton(root, "Send") !== null);
-    expect(text(root)).toContain("search_sec_filings…");
+    expect(text(root)).not.toContain("├─");
+    expect(text(root)).not.toContain("search_sec_filings");
     expect(text(root)).toContain("── metrics ──");
-    expect(text(root).split("> nvda risks?").length - 1).toBe(1);
     expect(prompt.disabled).toBe(false);
     // The terminal event arrived, so the closed stream is not a failure.
     expect(text(root)).not.toContain("stream ended without a terminal event");

@@ -254,7 +254,8 @@ export function AIPanel({
     <div style={{ ...panel, padding: 0, display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
       {/* Mixed case on purpose: the ticker context reads "viewing NVDA", not "VIEWING". */}
       <div className="card-head" style={{ textTransform: "none" }}>AGENT · viewing {sym}{debug ? " · DEBUG" : ""}</div>
-      <AgentConsole events={events} reasoning={events.some((event) => event.type === "reasoning_start")} debug={debug} widgetOutcomes={widgetOutcomes} />
+      {/* Backend debug mode must not expose diagnostic events in chat. */}
+      <AgentConsole events={events} reasoning={events.some((event) => event.type === "reasoning_start")} debug={false} widgetOutcomes={widgetOutcomes} />
       {context && <div style={{ padding: "0 12px 6px" }}><AskContextChip context={context} onRemove={onClearContext} /></div>}
       <form onSubmit={(event) => { event.preventDefault(); onSend(); }} style={{ display: "flex", gap: 6, padding: "0 12px 12px" }}>
         <input

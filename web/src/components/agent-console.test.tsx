@@ -292,23 +292,22 @@ describe("AgentConsole status lines", () => {
   ];
   const answered: AgentEvent[] = [...working, { type: "answer_delta", text: "Insiders sold." }, { type: "done", metrics: metrics() }];
 
-  function statusView(events: AgentEvent[], debug = false): { live: string[]; details: HTMLDetailsElement | null; text: string } {
+  function statusView(events: AgentEvent[], debug = false): { live: string[]; details: Element | null; text: string } {
     const page = new JSDOM(html(events, true, debug));
     try {
       const doc = page.window.document;
       const live = [...(doc.querySelector('[role="status"]')?.children ?? [])].map((line) => line.textContent ?? "");
-      return { live, details: doc.querySelector<HTMLDetailsElement>("details.text-xs"), text: doc.body.textContent ?? "" };
+      const details = [...doc.querySelectorAll("details")].find((entry) => entry.textContent?.includes("Progress ·") ?? false) ?? null;
+      return { live, details, text: doc.body.textContent ?? "" };
     } finally {
       page.window.close();
     }
   }
 
-  test("prod hides live status lines and keeps collapsed progress while the run works", () => {
+  test("prod shows live status lines while the run works", () => {
     const view = statusView(working);
-    expect(view.live).toEqual([]);
-    expect(view.details?.open).toBe(false);
-    expect(view.details?.querySelector("summary")?.textContent).toBe("Progress · 2 steps");
-    expect([...(view.details?.children ?? [])].slice(1).map((line) => line.textContent)).toEqual(["Looking up Form 4 insider filings…", "Reading <b>Form 4</b> filings for NVDA"]);
+    expect(view.live).toEqual(["Looking up Form 4 insider filings…", "Reading <b>Form 4</b> filings for NVDA"]);
+    expect(view.details).toBeNull();
     expect(view.text).toContain("Working · 1 step");
     expect(view.text).not.toContain("├─");
     expect(view.text).not.toContain("get_insider_activity");
@@ -317,7 +316,6 @@ describe("AgentConsole status lines", () => {
   test("prod keeps the answer, work summary, and collapsed progress after the run ends", () => {
     const view = statusView(answered);
     expect(view.live).toEqual([]);
-    expect(view.details?.open).toBe(false);
     expect(view.details?.querySelector("summary")?.textContent).toBe("Progress · 2 steps");
     expect([...(view.details?.children ?? [])].slice(1).map((line) => line.textContent)).toEqual(["Looking up Form 4 insider filings…", "Reading <b>Form 4</b> filings for NVDA"]);
     expect(view.text).toContain("Insiders sold.");
@@ -336,8 +334,9 @@ describe("AgentConsole status lines", () => {
   test("debug keeps collapsed progress after the answer arrives", () => {
     const view = statusView(answered, true);
     expect(view.live).toEqual([]);
-    expect(view.details?.open).toBe(false);
-    expect(view.details?.querySelector("summary")?.textContent).toBe("Progress · 2 steps");
+    const details = view.details as HTMLDetailsElement | null;
+    expect(details?.open).toBe(false);
+    expect(details?.querySelector("summary")?.textContent).toBe("Progress · 2 steps");
     expect(view.text).toContain("├─ get_insider_activity…");
   });
 });

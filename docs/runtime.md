@@ -18,10 +18,10 @@ proposal disposition → per-proposal nodes, then `app/research/scheduler.py
 run` over ready nodes. Each intake round logs one `intake_digest` decision
 in the research database. The request contains the raw query and summaries of tool calls.
 The response contains the intake digest and Reasoner output.
-Progress lines (`session`, `intake_start`, `intake_done`, `reasoner_*`,
-`tool_start`, `tool_done`) stream as `progress` events and stay in the
-collapsed Progress details block; prod hides the live block once the answer
-streams. Debug keeps the live block.
+Readable `status` lines show live while the run works and collapse into the
+Progress details block once the answer or a terminal event arrives.
+`progress`/`tool_start` rows stay in the work summary; chat shows plain
+phrases, debug views show raw names.
 Every query also appends ordered `{timestamp, type, payload}` JSON lines to
 `data/logs/agent-events/<UTC-timestamp>-<uuid>.jsonl` for post-query review.
 
