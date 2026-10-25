@@ -147,18 +147,15 @@ describe("AgentConsole event presentation", () => {
     expect(rows(events, false, false)).toEqual(["Working · 1 step · 0sUsed a research tool"]);
   });
 
-  test("debug progress shows optional detail and limits long detail to 160 characters", () => {
+  test("debug progress shows stage names without raw detail blobs", () => {
     const events: AgentEvent[] = [
       { type: "progress", stage: "archive started" },
       { type: "progress", stage: "archive complete", detail: { count: 2, provider: "SEC" } },
       { type: "progress", stage: "long preview", detail: { text: "x".repeat(300), secretTail: "must not appear" } },
     ];
     const rendered = rows(events, false);
-    expect(rendered[0]).toBe("├─ archive started");
-    expect(rendered[1]).toBe('├─ archive complete {"count":2,"provider":"SEC"}');
-    expect(rendered[2]).toBe(`├─ long preview {"text":"${"x".repeat(151)}`);
-    expect(rendered[2].slice("├─ long preview ".length)).toHaveLength(160);
-    expect(rendered[2]).not.toContain("must not appear");
+    expect(rendered.slice(0, 3)).toEqual(["├─ archive started", "├─ archive complete", "├─ long preview"]);
+    for (const row of rendered.slice(0, 3)) expect(row).not.toContain("must not appear");
     const production = rows(events, false, false);
     expect(production).toHaveLength(1);
     expect(production[0]).toStartWith("Working · 3 steps");

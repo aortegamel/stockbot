@@ -64,6 +64,7 @@ type Step = Extract<AgentEvent, { type: "tool_start" | "progress" }>;
 
 function stepLine(step: Step, debug: boolean): string {
   if (step.type === "tool_start") return debug ? step.tool : TOOL_PHRASES[step.tool] ?? "Used a research tool";
+  // Never print raw detail JSON: stage names stay, blobs go behind the JSONL log.
   return debug ? step.stage : STAGE_PHRASES[step.stage] ?? "Worked on the research";
 }
 
@@ -150,8 +151,7 @@ function WorkEventView({ event }: { event: AgentEvent }) {
         </div>
       );
     case "progress": {
-      const detail = event.detail !== undefined ? ` ${JSON.stringify(event.detail).slice(0, 160)}` : "";
-      return <div className="pl-4 text-zinc-500">├─ {event.stage}{detail}</div>;
+      return <div className="pl-4 text-zinc-500">├─ {event.stage}</div>;
     }
     case "tool_failed":
       return <div className="pl-4 text-zinc-500">├─ {event.tool} / ✗ {event.category} — {event.preview}</div>;
