@@ -192,7 +192,8 @@ export function AgentEventView({ event, debug = false, onRetry }: { event: Agent
         <div className="pt-2 text-xs text-zinc-500">
           <div>── metrics ──</div>
           <div>
-            Needle calls: {m.needle.calls} · Tool calls: {m.tools.calls} · Stockbot calls: {m.muse.calls} · Evidence:{" "}
+            Needle calls: {m.needle.calls} · Tool calls: {m.tools.calls} · Stockbot calls: {m.muse.calls}
+            {m.muse.providerCalls !== undefined && <> · Provider calls: {m.muse.providerCalls}</>} · Evidence:{" "}
             {m.evidence.count} · Evidence chars: {m.evidence.characters} · Stockbot input: {m.muse.inputTokens ?? "n/a"}{" "}
             · Stockbot output: {m.muse.outputTokens ?? "n/a"}
           </div>

@@ -40,6 +40,7 @@ import time as _time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from operator import itemgetter
 from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
@@ -1123,14 +1124,19 @@ def _requested_text(objective: object, node: object, scope: object) -> str:
 
 
 def _scope_has_dates(session: Mapping[str, JSONValue]) -> bool:
-    """Treat non-latest scope windows as date constraints."""
+    """Treat non-latest scope windows as date constraints.
+
+    A session-created latest-available cutoff carries no request date: mode
+    latest/latest-available with no start/end window stays undated even
+    though as_of holds the creation time.
+    """
     scope = session.get("temporal_scope")
-    return isinstance(scope, dict) and bool(
-        scope.get("start")
-        or scope.get("end")
-        or scope.get("as_of") not in (None, session.get("created_at"))
-        or scope.get("mode", "latest-available") not in {"latest", "latest-available", "as_of"}
-    )
+    if not isinstance(scope, dict):
+        return False
+    if scope.get("start") or scope.get("end"):
+        return True
+    mode = scope.get("mode", "latest-available")
+    return (mode.strip().lower() if isinstance(mode, str) else "") not in {"latest", "latest-available"}
 
 
 def _revenue_quarter_objective(objective: object) -> bool:
@@ -1428,9 +1434,13 @@ def _issuer_filing_rows(payloads: Sequence[Mapping[str, object]], ticker: str | 
 
 
 def _newest_filing(
-    rows: Sequence[Mapping[str, object]], forms: frozenset[str]
+    rows: Sequence[Mapping[str, object]],
+    forms: frozenset[str],
+    *,
+    as_of: str | None = None,
+    retrieval_tiebreak: bool = False,
 ) -> tuple[str, Mapping[str, object]] | None:
-    """Newest filed_at wins across distinct accessions. A tie or an undated leader fails closed."""
+    """Newest filed_at wins. Only revenue scans break ties by newest-first retrieval order."""
     from app.sec.discovery.service import normalize_accession_no
 
     found: dict[str, tuple[str, Mapping[str, object]]] = {}
@@ -1442,11 +1452,13 @@ def _newest_filing(
         except TypeError, ValueError:
             continue
         filed = row.get("filed_at")
+        if as_of is not None and isinstance(filed, str) and filed[:10] > as_of:
+            continue
         found.setdefault(accession, (filed if isinstance(filed, str) else "", row))
-    ranked = sorted(((filed, accession) for accession, (filed, _row) in found.items()), reverse=True)
+    ranked = sorted(((filed, accession) for accession, (filed, _row) in found.items()), key=itemgetter(0), reverse=True)
     if not ranked:
         return None
-    if len(ranked) > 1 and (not ranked[0][0] or ranked[0][0] == ranked[1][0]):
+    if not retrieval_tiebreak and len(ranked) > 1 and (not ranked[0][0] or ranked[0][0] == ranked[1][0]):
         return None
     accession = ranked[0][1]
     return accession, found[accession][1]
@@ -1494,18 +1506,24 @@ def _carry_forms(objective: object, text: str) -> frozenset[str]:
 def _listed_filing(
     session: Mapping[str, JSONValue], attempts: Sequence[Mapping[str, JSONValue]]
 ) -> tuple[str, Mapping[str, object]] | None:
-    """Newest issuer filing from the latest successful listing in this session. Text never satisfies this gate."""
+    """Select an issuer filing within the session cutoff. Revenue scans every successful listing."""
     listings = [
         attempt for attempt in attempts if attempt.get("tool") == "list_sec_filings" and attempt.get("error") is None
     ]
-    payloads = _inline_attempt_payloads(listings[-1:], session.get("session_id"))
+    objective = _session_objective(session)
+    revenue = _revenue_read_objective(objective)
+    payloads = _inline_attempt_payloads(listings if revenue else listings[-1:], session.get("session_id"))
     if not payloads:
         return None
-    objective = _session_objective(session)
     cik = re.search(r"\bCIK\s*[:#]?\s*(\d{1,10})\b", objective, re.IGNORECASE)
     issuer = cik.group(1) if cik is not None else _objective_subject_ticker(objective, session.get("ticker"))
-    rows = _issuer_filing_rows(payloads, issuer)
-    return _newest_filing(rows, _carry_forms(objective, objective))
+    rows = (
+        [row for payload in payloads for row in _issuer_filing_rows([payload], issuer)]
+        if revenue
+        else _issuer_filing_rows(payloads, issuer)
+    )
+    as_of = _as_day(session.get("as_of")) or _as_day(_f(session.get("temporal_scope"), "as_of"))
+    return _newest_filing(rows, _carry_forms(objective, objective), as_of=as_of, retrieval_tiebreak=revenue)
 
 
 def _resolve_persisted_accession(
@@ -1517,16 +1535,17 @@ def _resolve_persisted_accession(
     attempts: Sequence[Mapping[str, JSONValue]],
     kernel: _Kernel,
 ) -> dict[str, JSONValue] | None:
-    """Session- and issuer-checked accession from persisted SEC rows; None unless exactly one filing wins.
+    """Resolve an issuer-checked accession within the session cutoff.
 
-    Reads error-free attempts newest-first, then session-persisted tool results when node
-    attempts lack a listing (intake scope). Never reads summaries or free text. Output keys
-    stay inside schema.properties and {accession_no, document_name}.
+    Read successful node attempts newest-first. Revenue also scans intake listings newest-first.
+    Other requests use intake listings only when node attempts lack a listing.
+    Never read summaries or free text. Output keys stay inside schema.properties and {accession_no, document_name}.
     """
     props = schema.get("properties")
     if tool_name not in _ACCESSION_CARRY_TOOLS or not isinstance(props, dict) or "accession_no" not in props:
         return None
     objective = _session_objective(session)
+    revenue = _revenue_read_objective(objective)
     session_id = session.get("session_id")
     sources = [
         (attempt, payload)
@@ -1536,21 +1555,24 @@ def _resolve_persisted_accession(
     payloads = [payload for _attempt, payload in sources]
     listing_present = any(attempt.get("tool") == "list_sec_filings" for attempt, _payload in sources)
     session_listings: list[Mapping[str, object]] = []
-    if not listing_present and isinstance(session_id, str) and session_id:
+    if (revenue or not listing_present) and isinstance(session_id, str) and session_id:
         session_listings = _session_persisted_listings(kernel, session_id, objective, session.get("ticker"))
-        payloads = [*session_listings, *payloads]
-    filing_payloads: list[Mapping[str, object]] = payloads
-    if _revenue_read_objective(objective):
-        listing = next(
-            (payload for attempt, payload in sources if attempt.get("tool") == "list_sec_filings"),
-            session_listings[0] if session_listings else None,
-        )
-        filing_payloads = [] if listing is None else [listing]
+        payloads = [*payloads, *session_listings] if revenue else [*session_listings, *payloads]
+    filing_payloads = (
+        [payload for attempt, payload in sources if attempt.get("tool") == "list_sec_filings"] + session_listings
+        if revenue
+        else payloads
+    )
     cik = re.search(r"\bCIK\s*[:#]?\s*(\d{1,10})\b", objective, re.IGNORECASE)
     issuer = cik.group(1) if cik is not None else _objective_subject_ticker(objective, session.get("ticker"))
-    rows = _issuer_filing_rows(filing_payloads, issuer)
+    rows = (
+        [row for payload in filing_payloads for row in _issuer_filing_rows([payload], issuer)]
+        if revenue
+        else _issuer_filing_rows(filing_payloads, issuer)
+    )
     text = f"{objective} {_f(node, 'question', default='')}"
-    newest = _newest_filing(rows, _carry_forms(objective, text))
+    as_of = _as_day(session.get("as_of")) or _as_day(_f(session.get("temporal_scope"), "as_of"))
+    newest = _newest_filing(rows, _carry_forms(objective, text), as_of=as_of, retrieval_tiebreak=revenue)
     if newest is None:
         return None
     accession, row = newest

@@ -214,6 +214,7 @@ export type Metrics = {
   tools: { calls: number; totalMs: number };
   muse: {
     calls: number;
+    providerCalls?: number;
     inputTokens?: number;
     outputTokens?: number;
     cachedTokens?: number;
@@ -225,7 +226,7 @@ export type Metrics = {
   timings?: Timings;
 };
 
-export type Timings = Partial<Record<"routeMs" | "intakeMs" | "reasonerMs" | "admitMs" | "nodesMs" | "personasMs" | "gatesMs" | "firstTextMs", number>>;
+export type Timings = Partial<Record<"routeMs" | "intakeMs" | "reasonerMs" | "admitMs" | "nodesMs" | "personasMs" | "narrativeMs" | "binderMs" | "gatesMs" | "firstTextMs", number>>;
 
 const SENSITIVE_KEY_NORMS: Record<string, true> = {
   accesstoken: true,

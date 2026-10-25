@@ -3075,7 +3075,7 @@ def test_ten_q_revenue_route_settles_structured_listing(
                 "objective": prompt,
                 "created_at": "2026-10-09T12:00:00+00:00",
                 "temporal_scope": {
-                    "mode": "as_of",
+                    "mode": "latest-available",
                     "as_of": "2026-10-09T12:00:00+00:00",
                     "start": None,
                     "end": None,
@@ -7292,13 +7292,65 @@ def test_scope_latest_mode_unconstrained(monkeypatch: pytest.MonkeyPatch) -> Non
         "objective": "What is NVDA's latest revenue?",
         "temporal_scope": {"mode": "latest"},
     }
+    asyncio.run(
+        sched._generate_tool_arguments(
+            _gen, "list_sec_filings", sched.build_registry(), session, _node(), [], [], None, _Kernel()
+        )
+    )
+    assert calls == []
+
+
+def test_scope_latest_available_creation_cutoff_seeds_without_needle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A session-created latest-available cutoff carries no request date, so the ask seeds without Needle."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
+    calls: list[str] = []
+
+    async def _gen(**kw: object) -> dict[str, JSONValue]:
+        calls.append(str(kw["tool"]))
+        raise AssertionError("Needle must not run for an undated latest-filings ask")
+
+    session: dict[str, JSONValue] = {
+        "session_id": "s1",
+        "objective": "NVDA — What are the latest filings saying?",
+        "created_at": "2026-10-26T00:00:00",
+        "temporal_scope": {
+            "mode": "latest-available",
+            "as_of": "2026-10-26T00:00:00+00:00",
+            "start": None,
+            "end": None,
+        },
+    }
     out = asyncio.run(
         sched._generate_tool_arguments(
             _gen, "list_sec_filings", sched.build_registry(), session, _node(), [], [], None, _Kernel()
         )
     )
     assert calls == []
-    assert out[0] == {"identifier": "NVDA", "forms": ["10-Q", "10-K"]}
+    assert out[0] == {"identifier": "NVDA"}
+
+
+def test_scope_explicit_as_of_still_constrains(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit as_of mode stays a date constraint, so Needle generates."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
+
+    async def _gen(**kw: object) -> dict[str, JSONValue]:
+        return {"tool": "list_sec_filings", "arguments": {"identifier": "NVDA"}, "reasoning": "r"}
+
+    session: dict[str, JSONValue] = {
+        "session_id": "s1",
+        "objective": "NVDA — What are the latest filings saying?",
+        "temporal_scope": {"mode": "as_of", "as_of": "2025-06-30", "start": None, "end": None},
+    }
+    out = asyncio.run(
+        sched._generate_tool_arguments(
+            _gen, "list_sec_filings", sched.build_registry(), session, _node(), [], [], None, _Kernel()
+        )
+    )
+    assert out[0] == {"identifier": "NVDA"}
 
 
 def test_scope_raw_text_dates_constrain(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -9182,19 +9234,149 @@ def test_intake_persisted_listing_resolves_without_node_attempts(monkeypatch: py
     ) == {"accession_no": _LISTED_8K, "document_name": "nvda-8k.htm"}
 
 
-def test_revenue_empty_latest_listing_blocks_older_persisted_rows(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An empty controlling revenue listing prevents a fallback to older filing rows."""
+@pytest.mark.parametrize("source", ["node", "intake"])
+@pytest.mark.parametrize("irrelevant", ["empty", "8-K", "foreign", "mismatched-cik"])
+def test_revenue_scans_eligible_listings_before_irrelevant_latest(
+    source: str, irrelevant: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revenue reads retain an eligible 10-Q across listing families, including intake results."""
     import app.tools as _tools
 
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
-    session: dict[str, JSONValue] = {"session_id": "s1", "objective": "What was NVDA's latest revenue?"}
+    session: dict[str, JSONValue] = {
+        "session_id": "s1",
+        "objective": "What did NVDA's latest 10-Q disclose about revenue?",
+    }
     schema = sched._schema_for("get_sec_document", sched.build_registry())
-    assert (
-        sched._resolve_persisted_accession(
-            "get_sec_document", {}, schema, session, _node(), [_revenue_listing(), _sec_listing(rows=[])], _Kernel()
+    eligible = _revenue_listing()
+    newest = _sec_listing(rows=[])
+    if irrelevant != "empty":
+        newest = _sec_listing(
+            subject="AAPL" if irrelevant == "foreign" else "320193" if irrelevant == "mismatched-cik" else "1045810",
+            rows=[
+                {
+                    "accession_no": _LISTED_8K,
+                    "form": "8-K" if irrelevant == "8-K" else "10-Q",
+                    "filed_at": "2026-09-01",
+                    "filer_cik": 1045810,
+                }
+            ],
         )
-        is None
+    stored: dict[str, dict[str, JSONValue]] = {}
+    attempts = [eligible, newest]
+    if source == "intake":
+        stored["tr-intake"] = {
+            "session_id": "s1",
+            "tool_name": "list_sec_filings",
+            "result": eligible["result"],
+        }
+        attempts = [newest]
+    assert sched._resolve_persisted_accession(
+        "get_sec_document", {}, schema, session, _node(), attempts, _Kernel(stored)
+    ) == {"accession_no": _LISTED_10Q}
+    if source == "node":
+        listed = sched._listed_filing(session, attempts)
+        assert listed is not None and listed[0] == _LISTED_10Q
+        assert not sched._revenue_read_unlisted(session, attempts)
+
+
+@pytest.mark.parametrize("revenue", [False, True])
+@pytest.mark.parametrize("source", ["node", "intake"])
+@pytest.mark.parametrize(
+    ("coordinates", "expected"),
+    [
+        ({}, _LISTED_8K),
+        ({"created_at": "2026-01-01"}, _LISTED_8K),
+        ({"as_of": "2026-08-01"}, _LISTED_10Q),
+        ({"as_of": "2026-08-01T12:00:00Z"}, _LISTED_10Q),
+        ({"temporal_scope": {"as_of": "2026-08-01"}}, _LISTED_10Q),
+        ({"as_of": "2026-08-01", "temporal_scope": {"as_of": "2026-09-01"}}, _LISTED_10Q),
+        ({"as_of": "2026-07-31"}, None),
+        ({"as_of": "2026-09-01"}, _LISTED_8K),
+    ],
+)
+def test_persisted_accession_obeys_session_cutoff(
+    coordinates: dict[str, JSONValue],
+    expected: str | None,
+    source: str,
+    revenue: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The session cutoff excludes future filings. A missing cutoff preserves newest-wins selection."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
+    form = "10-Q" if revenue else "8-K"
+    session: dict[str, JSONValue] = {
+        "session_id": "s1",
+        "objective": f"What did NVDA's latest {form} disclose" + (" about revenue?" if revenue else "?"),
+        **coordinates,
+    }
+    listing = _sec_listing(
+        rows=[
+            {"accession_no": _LISTED_8K, "form": form, "filed_at": "2026-09-01", "filer_cik": 1045810},
+            {"accession_no": _LISTED_10Q, "form": form, "filed_at": "2026-08-01", "filer_cik": 1045810},
+        ]
     )
+    stored: dict[str, dict[str, JSONValue]] = {}
+    attempts: list[dict[str, JSONValue]] = [listing]
+    if source == "intake":
+        stored["tr-intake"] = {
+            "session_id": "s1",
+            "tool_name": "list_sec_filings",
+            "result": listing["result"],
+        }
+        attempts = []
+    schema = sched._schema_for("get_sec_document", sched.build_registry())
+    assert sched._resolve_persisted_accession(
+        "get_sec_document", {}, schema, session, _node(), attempts, _Kernel(stored)
+    ) == ({"accession_no": expected} if expected is not None else None)
+    if source == "node":
+        listed = sched._listed_filing(session, attempts)
+        assert (listed[0] if listed is not None else None) == expected
+
+
+@pytest.mark.parametrize("source", ["node", "intake", "node-before-intake"])
+@pytest.mark.parametrize("newest_accession", [_LISTED_8K, _LISTED_10Q])
+@pytest.mark.parametrize("same_day", [False, True])
+def test_revenue_filing_rank_uses_date_then_retrieval(
+    source: str, newest_accession: str, same_day: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revenue prefers the newest filing date. Equal dates prefer node attempts, then the newest intake result."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
+    older_accession = _LISTED_10Q if newest_accession == _LISTED_8K else _LISTED_8K
+    older = _sec_listing(
+        rows=[{"accession_no": older_accession, "form": "10-Q", "filed_at": "2026-08-01", "filer_cik": 1045810}]
+    )
+    newest = _sec_listing(
+        rows=[
+            {
+                "accession_no": newest_accession,
+                "form": "10-Q",
+                "filed_at": "2026-08-01" if same_day else "2026-07-01",
+                "filer_cik": 1045810,
+            }
+        ]
+    )
+    stored: dict[str, dict[str, JSONValue]] = {}
+    attempts: list[dict[str, JSONValue]] = [older, newest]
+    if source != "node":
+        stored = {
+            f"tr-{index}": {"session_id": "s1", "tool_name": "list_sec_filings", "result": listing["result"]}
+            for index, listing in enumerate(attempts if source == "intake" else reversed(attempts))
+        }
+        attempts = [] if source == "intake" else [newest]
+    session: dict[str, JSONValue] = {"session_id": "s1", "objective": "What did NVDA's latest 10-Q say about revenue?"}
+    expected = newest_accession if same_day else older_accession
+    schema = sched._schema_for("get_sec_document", sched.build_registry())
+    assert sched._resolve_persisted_accession(
+        "get_sec_document", {}, schema, session, _node(), attempts, _Kernel(stored)
+    ) == {"accession_no": expected}
+    if source == "node":
+        listed = sched._listed_filing(session, attempts)
+        assert listed is not None and listed[0] == expected
 
 
 @given(

@@ -214,7 +214,7 @@ export async function POST(req: Request): Promise<Response> {
           const text = dropUncovered(r.prose, qualifiedEvidenceFree(r.claims));
           if (!text) return false;
           send({ type: "answer_delta", text });
-          send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: performance.now() - t0, ...r.usage }, evidence: { count: 0, characters: 0 }, failures: {} } });
+          send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: performance.now() - t0, ...r.usage }, evidence: { count: 0, characters: 0 }, failures: {}, timings: r.timings } });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           // ponytail: muse-down shape mirrors kernel.ts — failed + error, never a silent close.
@@ -328,13 +328,13 @@ export async function POST(req: Request): Promise<Response> {
               failures.provider_error = (failures.provider_error ?? 0) + 1;
               send({ type: "failed", category: "provider_error", message: `No verified answer: ${gated.failure}` });
               send({ type: "answer_delta", text: "I could not verify an answer from this source. I withheld its factual claims." });
-              send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures } });
+              send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures, timings: r.timings } });
               return true;
             }
             send({ type: "answer_delta", text: gated.text });
             const claims = r.claims.filter((c) => gated.text.includes(c.text));
             if (claims.length > 0) send({ type: "claims", claims });
-            send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures } });
+            send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures, timings: r.timings } });
           } catch (err) {
             send({ type: "error", message: err instanceof Error ? err.message : String(err) });
           }

@@ -116,6 +116,9 @@ export type KernelReasonInput = {
   signal?: AbortSignal;
   // Output tokens spent by this request's Muse calls (answer budget, see muse/client.ts).
   spent?: { outputTokens: number };
+  // Mutable measurements retain provider activity when the reasoner throws.
+  usage?: MuseUsage;
+  timings?: Timings;
   // No onDelta: raw model deltas carry the inventory fence and never reach emit.
 };
 
@@ -161,7 +164,7 @@ export type KernelChild = {
 
 export type KernelSpawn = (cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => KernelChild;
 
-export type KernelReasonResult = NarrativeResult & { usage: MuseUsage };
+export type KernelReasonResult = NarrativeResult & { usage: MuseUsage; timings?: Timings };
 type KernelReasonFn = (opts: KernelReasonInput) => Promise<KernelReasonResult>;
 type FinalGateVerdict = { verdict?: string; support_answer?: string; error?: string };
 export type FinalGateCaller = (
@@ -801,6 +804,7 @@ function metricsOf(run: KernelRun, escalations: number): Metrics {
     // ponytail: kernel reports no routing/execution split yet; worker wall time sits on tools, TS routing is 0.
     needle: { calls: run.decisionsCount, totalMs: 0, escalations },
     tools: { calls: run.callsCount, totalMs: run.workerMs },
+    // Logical reason calls stay separate from provider POSTs in usage.
     muse: { calls: run.museCalls, totalMs: run.museMs, ...run.usage },
     evidence: { count: run.evidence.length, characters: run.evidence.reduce((n, e) => n + e.content.length, 0) },
     failures: run.failures,
@@ -872,6 +876,22 @@ function addUsage(run: KernelRun, u: MuseUsage): void {
   for (const k of ["inputTokens", "outputTokens", "cachedTokens"] as const) {
     const n = u[k];
     if (typeof n === "number") run.usage[k] = (run.usage[k] ?? 0) + n;
+  }
+}
+
+// Each call owns its measurements, including failed stages and concurrent drafts.
+async function measuredReason(run: KernelRun, input: KernelReasonInput): Promise<KernelReasonResult> {
+  const usage: MuseUsage = {};
+  const timings: Timings = {};
+  let result: KernelReasonResult | undefined;
+  try {
+    result = await run.reasonFn({ ...input, usage, timings });
+    return result;
+  } finally {
+    const providerCalls = result?.usage.providerCalls ?? usage.providerCalls;
+    if (providerCalls !== undefined) run.usage.providerCalls = (run.usage.providerCalls ?? 0) + providerCalls;
+    const measured = result?.timings ?? timings;
+    for (const key of ["narrativeMs", "binderMs"] as const) addTiming(run, key, measured[key]);
   }
 }
 
@@ -960,7 +980,7 @@ function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSign
       try {
         const started = performance.now();
         // r.prose already has the inventory fence stripped; r.claims are unproven until the gates keep them.
-        const r = await run.reasonFn({
+        const r = await measuredReason(run, {
           prompt: `${run.prompt}\n\nBrief: say what the sources below establish so far, citing their ids. Two sentences max.`,
           ...(run.scope.watchlist === undefined && run.currentChartTicker !== undefined ? { ticker: run.currentChartTicker } : {}),
           evidence: rows,
@@ -1168,7 +1188,7 @@ function reasonInput(run: KernelRun): ReasonInput {
 // One reasoner call: a rejection settles as a value, so siblings always finish.
 function settle(run: KernelRun, input: ReasonInput, persona: Persona, drafts?: { persona: Persona; text: string }[]): Promise<Settled> {
   const call: KernelReasonInput = { ...input, persona, ...(drafts !== undefined ? { drafts } : {}) };
-  return run.reasonFn(call).then(
+  return measuredReason(run, call).then(
     (r) => ({ r }) as const,
     (err: unknown) => ({ err }) as const,
   );

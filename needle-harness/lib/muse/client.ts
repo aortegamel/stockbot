@@ -1,11 +1,12 @@
 import { setTimeout as sleep } from "node:timers/promises";
-import { FINAL_CLAIM_TYPES, type AskContext, type Evidence, type FinalClaim, type FinalClaimType, type NarrativeResult, type Persona } from "../agent/types";
+import { FINAL_CLAIM_TYPES, type AskContext, type Evidence, type FinalClaim, type FinalClaimType, type NarrativeResult, type Persona, type Timings } from "../agent/types";
 import { reasoningFields } from "../../../decision/reasoning";
 
 export type MuseUsage = {
   inputTokens?: number;
   outputTokens?: number;
   cachedTokens?: number;
+  providerCalls?: number;
 };
 
 function requiredEnv(name: string): string {
@@ -37,21 +38,16 @@ const PERSONAS: Record<Persona, { name: string; stance: string }> = {
 // carries wording only (no inventory bookkeeping); the binder stage carries
 // the full INVENTORY_RULE below.
 const WORDING_RULE =
-  " Each claims[].text copies your prose above verbatim, qualified wording as written including attribution/qualification" +
-  " (conditional_risk states the condition and consequence as qualified, not that it will occur;" +
-  " attributed_report states who reported it, not that the event happened)." +
-  " claim_type is declared by you, never inferred: observed_fact the cited passage states it directly;" +
-  " calculation computed from the cited rows; inference reasoned from cited evidence;" +
-  " assumption a premise you state, not evidence; contradicted cited evidence conflicts with it;" +
-  " unknown the evidence does not establish it." +
-  " A claim that states a number lists datapoint_ids: the exact dp: ids from the datapoint lines of the rows it cites." +
+  " State a conditional risk as a qualified condition and consequence, not that it will occur." +
+  " Name who reported an event, not that the event happened." +
   " Write each datapoint's metric label, then its value, in one sentence, and name its entity, period, and unit as the datapoint spells them." +
   " State no other number. Add no wording beyond the datapoint fields and statement." +
-  " An observed_fact without a number copies one source sentence verbatim." +
-  " An observed number stays observed_fact and a calculated one stays calculation." +
-  " inference wording hedges (suggests, likely, may); an assumption opens with Assuming or If;" +
-  " unknown wording says what was not found or is unknown; conditional_risk states the condition (if, could, may, risk);" +
-  " attributed_report names who reported or stated it; contradicted says what conflicts.";
+  " Copy one source sentence verbatim for an observed fact without a number." +
+  " Distinguish observed numbers from calculated numbers." +
+  " Hedge an inference (suggests, likely, may). Open an assumption with Assuming or If." +
+  " State what was not found or is unknown when the evidence does not establish it." +
+  " State a conditional risk with if, could, may, or risk." +
+  " Name who reported or stated an attributed report. State what conflicts when evidence contradicts a claim.";
 // Final-answer claim inventory: trailing fenced block, stripped before display.
 // Verbatim qualified wording, model-declared types mirroring Python CLAIM_TYPES
 // exactly, EVIDENCE row ids and their dp: datapoint ids only, model-declared
@@ -62,6 +58,15 @@ const INVENTORY_RULE =
   " ```json {\"claims\": [{\"text\": \"<verbatim prose substring>\", \"claim_type\": \"<observed_fact|calculation|inference|assumption|unknown|contradicted|conditional_risk|attributed_report>\", \"evidence_ids\": [\"<EVIDENCE row ids>\"], \"datapoint_ids\": [\"<dp: ids of those rows>\"], \"confidence\": 0.9}], \"confidence\": 0.9}```" +
   " Every sentence needs claims rows that cover all of it. Prose not covered by the inventory is deleted." +
   WORDING_RULE +
+  " Each claims[].text copies your prose above verbatim, including attribution and qualification." +
+  " claim_type is declared by you, never inferred: observed_fact the cited passage states it directly;" +
+  " calculation computed from the cited rows; inference reasoned from cited evidence;" +
+  " assumption a premise you state, not evidence; contradicted cited evidence conflicts with it;" +
+  " unknown the evidence does not establish it." +
+  " conditional_risk states the condition and consequence as qualified, not that it will occur." +
+  " attributed_report states who reported it, not that the event happened." +
+  " An observed number stays observed_fact and a calculated one stays calculation." +
+  " A claim that states a number lists datapoint_ids: the exact dp: ids from the datapoint lines of the rows it cites." +
   " evidence_ids lists only exact ids of rows in the EVIDENCE section, never node ids or decision records." +
   " Unknown and assumption claims may cite none. All other types need at least one." +
   " confidence is your own 0..1, carried through, never a threshold." +
@@ -255,7 +260,9 @@ async function post(
   body: unknown,
   onDelta: (t: string) => void,
   signal: AbortSignal,
+  usage: MuseUsage,
 ): Promise<{ text: string; usage: MuseUsage }> {
+  usage.providerCalls = (usage.providerCalls ?? 0) + 1;
   const res = await fetch(`${base}${path}`, {
     method: "POST",
     headers: {
@@ -296,6 +303,9 @@ type ReasonOptions = {
   // Output tokens already spent by earlier Muse calls of the same request; the
   // answer budget subtracts them. reason() adds its own usage to it.
   spent?: { outputTokens: number };
+  // Mutable measurements retain POSTs and stage time when a call throws.
+  usage?: MuseUsage;
+  timings?: Timings;
 };
 
 function reasonEndpoint(): { apiKey: string; model: string; base: string } {
@@ -395,11 +405,12 @@ type Stage = {
   session: string;
   model: string;
   onDelta: (text: string) => void;
+  usage: MuseUsage;
 };
 async function callStage(stage: Stage, input: StageInput, cap: number | undefined): Promise<{ text: string; usage: MuseUsage }> {
   const body = { model: stage.model, input, stream: true, ...reasoningFields("responses"), ...(cap !== undefined ? { max_output_tokens: cap } : {}) };
   try {
-    return await post(stage.base, stage.apiKey, stage.session, "/responses", body, stage.onDelta, stage.fetchSignal());
+    return await post(stage.base, stage.apiKey, stage.session, "/responses", body, stage.onDelta, stage.fetchSignal(), stage.usage);
   } catch (err) {
     // Cancelled or past deadline: no retry, no fallback.
     if (stage.signal.aborted) throw err;
@@ -408,7 +419,7 @@ async function callStage(stage: Stage, input: StageInput, cap: number | undefine
     // once after a short wait; only 404/405 (unsupported path) falls over.
     if (/(429|GoUsageLimit)/.test(msg)) {
       await sleep(5000, undefined, { signal: stage.signal });
-      return post(stage.base, stage.apiKey, stage.session, "/responses", body, stage.onDelta, stage.fetchSignal());
+      return post(stage.base, stage.apiKey, stage.session, "/responses", body, stage.onDelta, stage.fetchSignal(), stage.usage);
     }
     if (!/(404|405|500|502|503|504)/.test(msg)) throw err;
     // The chat fallback carries no cap: the cap name there is unverified (the
@@ -421,6 +432,7 @@ async function callStage(stage: Stage, input: StageInput, cap: number | undefine
       { model: stage.model, messages: input.map((m) => ({ role: m.role, content: m.content })), stream: true, ...reasoningFields("chat_completions") },
       stage.onDelta,
       stage.fetchSignal(),
+      stage.usage,
     );
   }
 }
@@ -430,7 +442,7 @@ function bindInventory(prose: string, claims: FinalClaim[], confidence: number |
   const kept = claims.filter((c) => typeof c.text === "string" && c.text.length > 0 && prose.includes(c.text));
   return { prose, claims: kept, ...(confidence !== undefined && kept.length === claims.length ? { confidence } : {}) };
 }
-export async function reason(opts: ReasonOptions): Promise<NarrativeResult & { usage: MuseUsage }> {
+export async function reason(opts: ReasonOptions): Promise<NarrativeResult & { usage: MuseUsage; timings?: Timings }> {
   const onDelta = opts.onDelta ?? ((): void => { });
   const { apiKey, model, base } = reasonEndpoint();
   const signal = reasonSignal(opts);
@@ -441,30 +453,44 @@ export async function reason(opts: ReasonOptions): Promise<NarrativeResult & { u
   // Explicit personas have no per-fetch limit. The caller deadline still applies.
   const fetchSignal = (): AbortSignal =>
     opts.persona ? signal : AbortSignal.any([AbortSignal.timeout(FETCH_TIMEOUT_MS), signal]);
-  const stage: Stage = { signal, fetchSignal, base, apiKey, session, model, onDelta };
+  const usage = opts.usage ?? {};
+  const stage: Stage = { signal, fetchSignal, base, apiKey, session, model, onDelta, usage };
   if (opts.direct) {
     const cap = outputCap(tally);
     const raw = await callStage(stage, directInput(opts), cap);
     tally.outputTokens += raw.usage.outputTokens ?? cap ?? 0;
-    return withInventory(raw);
+    return withInventory({ ...raw, usage: { ...raw.usage, providerCalls: usage.providerCalls } });
   }
+  const timings = opts.timings ?? {};
   // Stage one: immutable prose under the wording rules, no bookkeeping.
   const narrativeCap = outputCap(tally);
-  const rawNarrative = await callStage(stage, narrativeInput(opts), narrativeCap);
+  const narrativeAt = performance.now();
+  let rawNarrative: { text: string; usage: MuseUsage };
+  try {
+    rawNarrative = await callStage(stage, narrativeInput(opts), narrativeCap);
+  } finally {
+    timings.narrativeMs = (timings.narrativeMs ?? 0) + performance.now() - narrativeAt;
+  }
   tally.outputTokens += rawNarrative.usage.outputTokens ?? narrativeCap ?? 0;
   const narrative = splitInventory(rawNarrative.text).prose;
   // Stage two binds the narrative to claims. Its own prose is discarded and
   // its deltas never reach onDelta; callers see only gated text downstream.
   const binderCap = outputCap(tally);
-  const rawBinder = await callStage({ ...stage, onDelta: (): void => { } }, binderInput(opts, narrative), binderCap);
+  const binderAt = performance.now();
+  let rawBinder: { text: string; usage: MuseUsage };
+  try {
+    rawBinder = await callStage({ ...stage, onDelta: (): void => { } }, binderInput(opts, narrative), binderCap);
+  } finally {
+    timings.binderMs = (timings.binderMs ?? 0) + performance.now() - binderAt;
+  }
   tally.outputTokens += rawBinder.usage.outputTokens ?? binderCap ?? 0;
   const bound = splitInventory(rawBinder.text);
-  const usage: MuseUsage = {
+  Object.assign(usage, {
     inputTokens: (rawNarrative.usage.inputTokens ?? 0) + (rawBinder.usage.inputTokens ?? 0) || undefined,
     outputTokens: (rawNarrative.usage.outputTokens ?? 0) + (rawBinder.usage.outputTokens ?? 0) || undefined,
     cachedTokens: (rawNarrative.usage.cachedTokens ?? 0) + (rawBinder.usage.cachedTokens ?? 0) || undefined,
-  };
+  });
   // The binder supplies claims only; the returned prose stays the original
   // narrative, never binder rewrites.
-  return { ...bindInventory(narrative, bound.claims, bound.confidence), usage };
+  return { ...bindInventory(narrative, bound.claims, bound.confidence), usage, timings };
 }

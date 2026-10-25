@@ -168,3 +168,5 @@ The navigation helpers adapt [Magellan](https://github.com/magellan-extension/ma
 With `BENCHMARK=1`, each run writes `benchmarks/<YYYYMMDD-HHmmss>-<6rand>.json`
 with prompt, needle decisions, tool calls, full evidence, Muse usage, answer, metrics.
 Never committed (gitignored).
+
+`muse.calls` counts logical Stockbot calls, `providerCalls` counts provider POSTs, and debug timings separate narrative and binder stages.

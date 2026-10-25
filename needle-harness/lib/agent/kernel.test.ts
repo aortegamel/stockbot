@@ -492,7 +492,7 @@ describe("runKernelAgent final personas", () => {
   });
   const emptyReply = (id: string): string =>
     `${JSON.stringify({ id, objective: "q", evidence: [], nodes: [], decisions: [], unresolved: [], incomplete_guard: false, toolExecutions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false })}\n`;
-  type Outcome = { text?: string; claims?: FinalClaim[]; confidence?: number; usage?: KernelReasonResult["usage"] } | Error;
+  type Outcome = { text?: string; claims?: FinalClaim[]; confidence?: number; usage?: KernelReasonResult["usage"]; timings?: KernelReasonResult["timings"] } | Error;
   type Call = { pass: number; input: KernelReasonInput };
   type GateVerdict = { verdict?: string; support_answer?: string; error?: string };
   // Drives runKernelAgent with a scripted reasoner. Stockbot settles last, so
@@ -501,7 +501,7 @@ describe("runKernelAgent final personas", () => {
   // inline from opts.gate (default yes); run bodies still record in order.
   async function runFinal(opts: {
     reply?: (id: string) => string;
-    decide?: (persona: Persona, pass: number, attempt: number) => Outcome;
+    decide?: (persona: Persona, pass: number, attempt: number, input: KernelReasonInput) => Outcome;
     gate?: (body: Record<string, unknown>) => GateVerdict;
     personas?: readonly Persona[];
     deadlineAt?: number;
@@ -581,7 +581,7 @@ describe("runKernelAgent final personas", () => {
               maxInFlight = Math.max(maxInFlight, inFlight);
               for (let i = FINAL_PERSONAS.indexOf(o.persona); i < FINAL_PERSONAS.length; i++) await Promise.resolve();
               inFlight -= 1;
-              const d: Outcome = opts.decide?.(o.persona, pass, attempt) ?? {};
+              const d: Outcome = opts.decide?.(o.persona, pass, attempt, o) ?? {};
               if (d instanceof Error) throw d;
               const text = d.text ?? `${o.persona} p${pass}`;
               // Default answers cite the first evidence row so the citation gate keeps the prose.
@@ -589,6 +589,7 @@ describe("runKernelAgent final personas", () => {
               return {
                 prose: text,
                 usage: d.usage ?? {},
+                ...(d.timings !== undefined ? { timings: d.timings } : {}),
                 claims: d.claims ?? (cite ? [{ text, claimType: "inference", evidenceIds: [cite] }] : []),
                 ...(d.confidence !== undefined ? { confidence: d.confidence } : {}),
               };
@@ -813,6 +814,61 @@ describe("runKernelAgent final personas", () => {
     expect(doneMetrics(events).timings).toEqual({
       intakeMs: 120, admitMs: 15, reasonerMs: 40, nodesMs: 300, personasMs: expect.any(Number), gatesMs: expect.any(Number),
     });
+  });
+
+  test("trio sums logical calls and per-call provider posts separately", async () => {
+    const { events } = await runFinal({
+      decide: () => ({ usage: { providerCalls: 2 }, timings: { narrativeMs: 10, binderMs: 5 } }),
+    });
+    const m = doneMetrics(events);
+    expect(m.muse.calls).toBe(3);
+    expect(m.muse.providerCalls).toBe(6);
+    expect(m.timings).toMatchObject({ narrativeMs: 30, binderMs: 15 });
+  });
+
+  test("a failed draft retry and an inventory correction add their provider posts", async () => {
+    const usage = { inputTokens: 1, providerCalls: 2 };
+    const { events: retryEvents } = await runFinal({
+      decide: (p, _pass, attempt) =>
+        p === "bearbot" && attempt === 1 ? new Error("muse down") : { usage },
+    });
+    const retry = doneMetrics(retryEvents);
+    expect(retry.muse.calls).toBe(4);
+    expect(retry.muse.providerCalls).toBe(6);
+    expect(retry.muse.inputTokens).toBe(3);
+    const { events: fixEvents } = await runFinal({
+      personas: ["bearbot"],
+      decide: (_p, _pass, attempt) =>
+        attempt === 1
+          ? { text: "bearbot p1", claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["rn:x"] }], usage }
+          : { text: "bearbot fixed", claims: [{ text: "bearbot fixed", claimType: "inference", evidenceIds: ["ev:1"] }], usage },
+    });
+    const fix = doneMetrics(fixEvents);
+    expect(fix.muse.calls).toBe(2);
+    expect(fix.muse.providerCalls).toBe(4);
+  });
+
+  test("provider posts on a failed call still count through the mutable input", async () => {
+    const { events, calls } = await runFinal({
+      personas: ["bearbot"],
+      decide: (_p, _pass, _attempt, input) => {
+        input.usage!.providerCalls = 3;
+        input.timings!.narrativeMs = 7;
+        throw new Error("muse down");
+      },
+    });
+    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
+    const m = doneMetrics(events);
+    expect(m.muse.calls).toBe(1);
+    expect(m.muse.providerCalls).toBe(3);
+    expect(m.timings).toMatchObject({ narrativeMs: 7 });
+  });
+
+  test("partial personas without provider telemetry omit the provider count", async () => {
+    const { events } = await runFinal({ personas: ["bearbot", "bullbot"] });
+    const m = doneMetrics(events);
+    expect(m.muse.calls).toBe(2);
+    expect(m.muse.providerCalls).toBeUndefined();
   });
 
   test("research opens with a status line and turns worker stages into readable counts before any tool result", async () => {

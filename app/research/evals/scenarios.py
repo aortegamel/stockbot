@@ -42,6 +42,16 @@ class Scenario:
 
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario(
+        name="factual-nvda-latest-filings",
+        family=ScenarioFamily.FACTUAL,
+        question="NVDA — What are the latest filings saying?",
+        ticker="NVDA",
+        as_of=None,
+        expected_tools=("list_sec_filings", "get_sec_document"),
+        requires_evidence=True,
+        notes="Latest-filings run: discover the 10-Q, 10-K, and 8-K families, inspect document text, and cite filing-backed evidence for every stated number.",
+    ),
+    Scenario(
         name="factual-nvda-datacenter-growth",
         family=ScenarioFamily.FACTUAL,
         question="What drove NVDA data-center revenue growth last quarter?",

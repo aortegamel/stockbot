@@ -195,27 +195,31 @@ describe("AgentConsole event presentation", () => {
     }
   });
 
-  test("terminal metrics show counts, rounded duration, and optional token counts", () => {
+  test("terminal metrics show logical and provider calls, stage timings, and optional token counts", () => {
     const measured: Metrics = {
       totalMs: 123.6,
       needle: { calls: 2, totalMs: 12.6, escalations: 1 },
       tools: { calls: 3, totalMs: 33.2 },
-      muse: { calls: 4, totalMs: 77.8, inputTokens: 42, outputTokens: 0 },
+      muse: { calls: 4, providerCalls: 8, totalMs: 77.8, inputTokens: 42, outputTokens: 0 },
       evidence: { count: 5, characters: 600 },
       failures: {},
-      timings: { routeMs: 10.4, nodesMs: 300 },
+      timings: { routeMs: 10.4, nodesMs: 300, narrativeMs: 40.6, binderMs: 12.2 },
     };
     for (const debug of [false, true]) {
       const provided = rows([{ type: "done", metrics: measured }], true, debug)[0];
       expect(provided).toContain("── metrics ──");
-      expect(provided).toContain("Needle calls: 2 · Tool calls: 3 · Stockbot calls: 4 · Evidence: 5 · Evidence chars: 600");
+      expect(provided).toContain("Needle calls: 2 · Tool calls: 3 · Stockbot calls: 4 · Provider calls: 8 · Evidence: 5 · Evidence chars: 600");
       expect(provided).toContain("Stockbot input: 42 · Stockbot output: 0");
       expect(provided).toContain("Needle: 13ms · Tools: 33ms · Stockbot: 78ms · Total: 124ms");
       // Phase timings render only in debug; an absent phase never renders.
-      expect(provided.includes("Timings: routeMs 10ms · nodesMs 300ms")).toBe(debug);
+      expect(provided.includes("Timings: routeMs 10ms · nodesMs 300ms · narrativeMs 41ms · binderMs 12ms")).toBe(debug);
       const omitted = rows([{ type: "done", metrics: metrics() }], true, debug)[0];
       expect(omitted).toContain("Stockbot input: n/a · Stockbot output: n/a");
+      expect(omitted).toContain("Stockbot calls: 1 · Evidence: 0");
+      expect(omitted).not.toContain("Provider calls:");
       expect(omitted).not.toContain("Timings:");
+      const zero = rows([{ type: "done", metrics: { ...metrics(), muse: { calls: 0, providerCalls: 0, totalMs: 0 } } }], true, debug)[0];
+      expect(zero).toContain("Stockbot calls: 0 · Provider calls: 0");
     }
   });
 
