@@ -306,26 +306,42 @@ describe("AgentConsole status lines", () => {
     }
   }
 
-  test("prod shows each status line as plain text while the run works", () => {
+  test("prod hides live status lines and keeps collapsed progress while the run works", () => {
     const view = statusView(working);
-    expect(view.live).toEqual(["Looking up Form 4 insider filings…", "Reading <b>Form 4</b> filings for NVDA"]);
-    expect(view.details).toBeNull();
-    // Raw work rows stay hidden in prod.
+    expect(view.live).toEqual([]);
+    expect(view.details?.open).toBe(false);
+    expect(view.details?.querySelector("summary")?.textContent).toBe("Progress · 2 steps");
+    expect([...(view.details?.children ?? [])].slice(1).map((line) => line.textContent)).toEqual(["Looking up Form 4 insider filings…", "Reading <b>Form 4</b> filings for NVDA"]);
+    expect(view.text).toContain("Working · 1 step");
+    expect(view.text).not.toContain("├─");
     expect(view.text).not.toContain("get_insider_activity");
   });
 
-  test("the lines collapse under one summary once the answer arrives", () => {
+  test("prod keeps the answer, work summary, and collapsed progress after the run ends", () => {
     const view = statusView(answered);
     expect(view.live).toEqual([]);
     expect(view.details?.open).toBe(false);
     expect(view.details?.querySelector("summary")?.textContent).toBe("Progress · 2 steps");
     expect([...(view.details?.children ?? [])].slice(1).map((line) => line.textContent)).toEqual(["Looking up Form 4 insider filings…", "Reading <b>Form 4</b> filings for NVDA"]);
+    expect(view.text).toContain("Insiders sold.");
+    expect(view.text).toContain("Worked for 0s · 1 step");
+    expect(view.text).not.toContain("├─");
   });
 
   test("debug keeps the raw work rows and shows each status line once", () => {
     const view = statusView(working, true);
+    expect(view.live).toEqual(["Looking up Form 4 insider filings…", "Reading <b>Form 4</b> filings for NVDA"]);
+    expect(view.details).toBeNull();
     expect(view.text).toContain("├─ get_insider_activity…");
     expect(view.text.split("Looking up Form 4 insider filings…").length).toBe(2);
+  });
+
+  test("debug keeps collapsed progress after the answer arrives", () => {
+    const view = statusView(answered, true);
+    expect(view.live).toEqual([]);
+    expect(view.details?.open).toBe(false);
+    expect(view.details?.querySelector("summary")?.textContent).toBe("Progress · 2 steps");
+    expect(view.text).toContain("├─ get_insider_activity…");
   });
 });
 

@@ -19,8 +19,11 @@ run` over ready nodes. Each intake round logs one `intake_digest` decision
 in the research database. The request contains the raw query and summaries of tool calls.
 The response contains the intake digest and Reasoner output.
 Progress lines (`session`, `intake_start`, `intake_done`, `reasoner_*`,
-`tool_start`, `tool_done`) stream as `progress` events; prod forwards a
-stripped `working` stage to keep the UI stall watchdog fed.
+`tool_start`, `tool_done`) stream as `progress` events and stay in the
+collapsed Progress details block; prod hides the live block once the answer
+streams. Debug keeps the live block.
+Every query also appends ordered `{timestamp, type, payload}` JSON lines to
+`data/logs/agent-events/<UTC-timestamp>-<uuid>.jsonl` for post-query review.
 
 The live Reasoner prompt states the exact required `objectiveId`.
 Its JSON example uses that value and an objective-scoped proposal ID.

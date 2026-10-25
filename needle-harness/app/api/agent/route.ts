@@ -1,7 +1,13 @@
+import { randomUUID } from "node:crypto";
+import { appendFile, mkdir } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { reason } from "@/lib/muse/client";
 import { asksWatchlist, dropUncovered, gateAnswer, kernelRouter, parseTicker, parseWatchlist, qualifiedEvidenceFree, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type KernelResponse } from "@/lib/agent/kernel";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
 import { ASK_CONTEXT_KINDS, FINAL_PERSONAS, foundStatus, readDatapoints, redactArgs, safeSourceUrl, sourceReferences, statusEvent, toolStatus, WIDGET_TYPES, type AgentEvent, type AskContext, type Evidence, type FailureCategory, type Persona, type Timings } from "@/lib/agent/types";
+
+const ROOT = process.cwd().endsWith("needle-harness") ? join(process.cwd(), "..") : process.cwd();
+
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
@@ -100,14 +106,31 @@ function publicEvent(e: AgentEvent): AgentEvent | null {
 }
 
 // Every done carries the request-owned timings: the route round and the first answer text.
-function streamSender(req: Request, controller: ReadableStreamDefaultController<Uint8Array>, requestAt: number, timings: Timings): (e: AgentEvent) => void {
+function streamSender(req: Request, controller: ReadableStreamDefaultController<Uint8Array>, requestAt: number, timings: Timings): { send: (e: AgentEvent) => void; flush: () => Promise<void> } {
   const enc = new TextEncoder();
   const debug = ["1", "true", "yes"].includes((process.env.STOCKBOT_DEBUG ?? "").trim().toLowerCase());
   let terminalSent = false;
-  return (e) => {
+  const directory = resolve(ROOT, process.env.STOCKBOT_DATA_DIR ?? "data", "logs/agent-events");
+  const logPath = join(directory, `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}.jsonl`);
+  let logFailed = false;
+  const warn = (error: unknown): void => {
+    if (!logFailed) console.warn("[web] [agent-api] event log failed", error);
+    logFailed = true;
+  };
+  let pending = mkdir(directory, { recursive: true }).then(() => appendFile(logPath, "")).catch(warn);
+  const send = (e: AgentEvent): void => {
     if (req.signal.aborted) return;
     if (e.type === "answer_delta") timings.firstTextMs ??= performance.now() - requestAt;
     if (e.type === "done") e = { ...e, metrics: { ...e.metrics, timings: { ...e.metrics.timings, ...timings } } };
+    // Record the full event before production filtering, in emission order.
+    if (!logFailed) {
+      try {
+        const line = `${JSON.stringify({ timestamp: new Date().toISOString(), type: e.type, payload: e })}\n`;
+        pending = pending.then(() => { if (!logFailed) return appendFile(logPath, line); }).catch(warn);
+      } catch (error) {
+        warn(error);
+      }
+    }
     let out = debug ? e : publicEvent(e);
     if (!out) return;
     if (!debug && (e.type === "failed" || e.type === "error")) {
@@ -121,6 +144,7 @@ function streamSender(req: Request, controller: ReadableStreamDefaultController<
       // The client disconnected. Later sends do not affect the closed stream.
     }
   };
+  return { send, flush: () => pending };
 }
 
 type EntrySelection = { route: string; personas: Persona[] | null; chartTicker?: string; chartError?: string } | { error: string };
@@ -165,12 +189,13 @@ function personasResponse(req: Request, input: PersonasRequest, requestAt: numbe
   console.log(`[web] [agent-api] POST personas=${input.personas.join(",")}`);
   const stream = new ReadableStream({
     async start(controller) {
-      const send = streamSender(req, controller, requestAt, {});
+      const { send, flush } = streamSender(req, controller, requestAt, {});
       try {
         await runPersonaAgent(input.sessionId, input.personas, send, { signal: req.signal });
       } catch (err) {
         send({ type: "error", message: err instanceof Error ? err.message : String(err) });
       }
+      await flush();
       controller.close();
     },
   });
@@ -199,7 +224,7 @@ export async function POST(req: Request): Promise<Response> {
   const stream = new ReadableStream({
     async start(controller) {
       const timings: Timings = {};
-      const send = streamSender(req, controller, requestAt, timings);
+      const { send, flush } = streamSender(req, controller, requestAt, timings);
       // JEV owns the original route independently from the optional chart action.
       // A direct answer has no evidence, so it is buffered and shows only its explicitly
       // qualified unknown/assumption claims; nothing left means research answers instead.
@@ -468,6 +493,7 @@ export async function POST(req: Request): Promise<Response> {
         send({ type: "agent_start", prompt });
         send({ type: "failed", category: "provider_error", message: routeError.slice(0, 160) });
         send({ type: "error", message: routeError });
+        await flush();
         controller.close();
         return;
       }
@@ -507,6 +533,7 @@ export async function POST(req: Request): Promise<Response> {
       const { personas } = selected;
       // Explicit personas skip direct and single-tool answers: research owns their evidence lifecycle.
       if (personas === null && await tryEntryAnswer(selected.route)) {
+        await flush();
         controller.close();
         return;
       }
@@ -516,6 +543,7 @@ export async function POST(req: Request): Promise<Response> {
         console.error(`[web] [agent-api] runKernelAgent error: ${err instanceof Error ? err.message : String(err)}`);
         send({ type: "error", message: err instanceof Error ? err.message : String(err) });
       }
+      await flush();
       controller.close();
       console.log("[web] [agent-api] stream close");
     },

@@ -1,4 +1,7 @@
-import { describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import fc from "fast-check";
 import { FINAL_PERSONAS, type Evidence, type Timings } from "@/lib/agent/types";
 import type { MuseUsage } from "@/lib/muse/client";
@@ -1694,5 +1697,99 @@ describe("workspace widget chat action", () => {
     expect(entryCalls().map((call) => call.tool)).toEqual(["get_sec_document"]);
     expect(invoked).toEqual([]);
     expect(runCalls).toHaveLength(1);
+  });
+});
+
+describe("agent event logs", () => {
+  let directory: string;
+  let previousDataDir: string | undefined;
+
+  beforeEach(async () => {
+    reset();
+    previousDataDir = process.env.STOCKBOT_DATA_DIR;
+    directory = await mkdtemp(join(tmpdir(), "agent-events-"));
+    process.env.STOCKBOT_DATA_DIR = directory;
+  });
+
+  afterEach(async () => {
+    if (previousDataDir === undefined) delete process.env.STOCKBOT_DATA_DIR;
+    else process.env.STOCKBOT_DATA_DIR = previousDataDir;
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  async function logs(): Promise<{ name: string; entries: { timestamp: string; type: string; payload: AgentEventShape }[] }[]> {
+    const folder = join(directory, "logs/agent-events");
+    return Promise.all((await readdir(folder)).map(async (name) => {
+      const text = await readFile(join(folder, name), "utf8");
+      expect(text.endsWith("\n")).toBe(true);
+      return { name, entries: text.trimEnd().split("\n").map((line) => JSON.parse(line)) };
+    }));
+  }
+
+  test("each direct query logs timestamped events in emission order before the stream closes", async () => {
+    const first = await eventsFor("hello");
+    const second = await eventsFor("hello again");
+    const files = await logs();
+    expect(files).toHaveLength(2);
+    for (const events of [first, second]) {
+      const file = files.find(({ entries }) => entries[0]?.payload.prompt === events[0]?.prompt)!;
+      expect(file.name).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[a-f0-9-]{36}\.jsonl$/);
+      expect(file.entries.map(({ payload }) => payload)).toEqual(events);
+      for (const entry of file.entries) {
+        expect(new Date(entry.timestamp).toISOString()).toBe(entry.timestamp);
+        expect(entry.type).toBe(entry.payload.type);
+      }
+    }
+    expect(sessionsCreated).toBe(0);
+  });
+
+  test("production logs raw tool events and worker session IDs before filtering", async () => {
+    delete process.env.STOCKBOT_DEBUG;
+    winner = "get_sec_document";
+    const events = await eventsFor("filing facts?");
+    const files = await logs();
+    expect(files).toHaveLength(1);
+    const entries = files[0]!.entries;
+    expect(entries[0]?.payload).toEqual({ type: "agent_start", prompt: "filing facts?" });
+    expect(entries.find(({ type }) => type === "tool_result")?.payload.preview).toBe(bridgeEvidence.content);
+    expect(events.some(({ type }) => type === "tool_result")).toBe(false);
+    expect(entries.find(({ type }) => type === "evidence")?.payload.sessionId).toBe("rs:entry");
+    expect(entries.at(-1)?.payload).toEqual(events.at(-1));
+  });
+
+  test("research and persona responses flush their own query logs", async () => {
+    winner = "research_required";
+    emitEvidence = true;
+    const research = await eventsFor("research question");
+    const trio = await personasEvents({ sessionId: "rs:test", personas: FINAL_PERSONAS });
+    const files = await logs();
+    expect(files).toHaveLength(2);
+    expect(files.map(({ entries }) => entries.map(({ payload }) => payload))).toContainEqual(research);
+    expect(files.map(({ entries }) => entries.map(({ payload }) => payload))).toContainEqual(trio.events);
+  });
+
+  test("route failures flush the events before the early stream close", async () => {
+    routeDown = true;
+    const events = await eventsFor("hello");
+    const files = await logs();
+    expect(files).toHaveLength(1);
+    expect(files[0]!.entries.map(({ payload }) => payload)).toEqual(events);
+    expect(events.at(-1)?.type).toBe("error");
+  });
+
+  test("a logging failure warns once without breaking the response", async () => {
+    const blocked = join(directory, "blocked");
+    await writeFile(blocked, "");
+    process.env.STOCKBOT_DATA_DIR = blocked;
+    const warning = spyOn(console, "warn").mockImplementation(() => { });
+    try {
+      const events = await eventsFor("hello");
+      expect(events.at(-1)?.type).toBe("done");
+      expect(events.find(({ type }) => type === "answer_delta")?.text).toBe(reasonText);
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(warning.mock.calls[0]?.[0]).toBe("[web] [agent-api] event log failed");
+    } finally {
+      warning.mockRestore();
+    }
   });
 });

@@ -158,7 +158,7 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
   }
   // Prod hides internal work rows; debug (.env STOCKBOT_DEBUG=1) shows all.
   // The evidence and claims events stay out of prod rows: citations + source controls read them directly.
-  // Status lines render in their own block in both modes, so the rows never repeat them.
+  // Status lines stay in collapsed Progress details in prod. Debug keeps the live block.
   const visible = debug ? events : events.filter((e) => e.type === "agent_start" || e.type === "answer_delta" || e.type === "reasoning_start" || e.type === "done" || e.type === "error" || e.type === "failed");
   const head = visible.filter(
     (e) => e.type !== "answer_delta" && e.type !== "done" && e.type !== "error" && e.type !== "failed" && e.type !== "reasoning_start" && e.type !== "evidence" && e.type !== "claims" && e.type !== "offer_trio" && e.type !== "status",
@@ -178,7 +178,7 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
       {head.map((e, i) => (
         <AgentEventView key={i} event={e} />
       ))}
-      {statuses.length > 0 && (answer
+      {statuses.length > 0 && (answer || !debug
         ? <details className="text-xs text-zinc-500"><summary className="cursor-pointer">Progress · {statuses.length} {statuses.length === 1 ? "step" : "steps"}</summary>{statuses}</details>
         : <div role="status" className="space-y-0.5 text-xs text-zinc-500">{statuses}</div>)}
       {streaming && <AgentEventView event={{ type: "reasoning_start", model: "stockbot" }} />}
