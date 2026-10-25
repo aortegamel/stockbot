@@ -356,6 +356,30 @@ describe("muse inventory fence", () => {
     expect(inv.confidence).toBe(0.75);
   });
 
+  test("explanatory claims retain distinct types and numeric descriptor references", () => {
+    const fact = "ACME drawn was $2.1B USD in 2026 [E1].";
+    const significance = "This may matter because repayment could reduce cash available for operations [E1].";
+    const explanation = "In context, the facility may function as backup financing [E1].";
+    const unknown = "The evidence does not establish whether ACME will refinance.";
+    const prose = [fact, significance, explanation, unknown].join("\n");
+    const inv = splitInventory(`${prose}\n\`\`\`json ${JSON.stringify({
+      claims: [
+        { text: fact, claim_type: "observed_fact", evidence_ids: ["E1"], datapoint_ids: ["dp:drawn"] },
+        { text: significance, claim_type: "inference", evidence_ids: ["E1"] },
+        { text: explanation, claim_type: "inference", evidence_ids: ["E1"] },
+        { text: unknown, claim_type: "unknown", evidence_ids: [] },
+      ],
+    })}\`\`\``);
+
+    expect(inv.prose).toBe(`${prose}\n`);
+    expect(inv.claims).toEqual([
+      { text: fact, claimType: "observed_fact", evidenceIds: ["E1"], datapointIds: ["dp:drawn"] },
+      { text: significance, claimType: "inference", evidenceIds: ["E1"] },
+      { text: explanation, claimType: "inference", evidenceIds: ["E1"] },
+      { text: unknown, claimType: "unknown", evidenceIds: [] },
+    ]);
+  });
+
   test("an unusable fence is stripped without inventing claims", () => {
     for (const body of ["{not json}", "[1,2]", "5", "null", '{"claims": 5}', '{"claims": [null]}']) {
       const inv = splitInventory(`Prose.\n\`\`\`json ${body}\`\`\``);

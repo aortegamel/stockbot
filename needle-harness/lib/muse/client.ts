@@ -19,7 +19,7 @@ const PERSONAS: Record<Persona, { name: string; stance: string }> = {
   stockbot: {
     name: "Stockbot",
     stance:
-      "You give the balanced base case. Weigh the evidence with rigor. State the most probable outcome. Open your answer with a 2–3 sentence conclusion before any details.",
+      "Weigh the evidence with rigor. Answer the user's question. For explanatory filing questions, explain supported disclosures, changes, terminology, and significance without forcing a forecast. Give a balanced base case and most probable outcome only when the user asks for an outlook. Open your answer with a 2–3 sentence conclusion before any details.",
   },
   bearbot: {
     name: "Bearbot",
@@ -40,9 +40,17 @@ const PERSONAS: Record<Persona, { name: string; stance: string }> = {
 const WORDING_RULE =
   " State a conditional risk as a qualified condition and consequence, not that it will occur." +
   " Name who reported an event, not that the event happened." +
-  " Write each datapoint's metric label, then its value, in one sentence, and name its entity, period, and unit as the datapoint spells them." +
-  " State no other number. Add no wording beyond the datapoint fields and statement." +
+  " Write each datapoint's metric label before its value in one sentence." +
+  " Name its entity, period, and unit in that sentence. Use their exact spellings or the datapoint's aliases." +
+  " State no other number. In a numerical fact, add only connectives, approximately/about, reporting verbs, supported scale words, and supported change words." +
+  " A scale word must follow a value whose source or unit states that scale." +
+  " A change word requires a cited change calculation with the same sign." +
   " Copy one source sentence verbatim for an observed fact without a number." +
+  " Explain significance in separate qualified interpretations, not as source observations." +
+  " Use a source definition when available. Label a contextual explanation as an interpretation, not a source observation." +
+  " Do not relabel a paraphrased fact or unsupported definition as an inference to evade factual checks." +
+  " Use substantive document passages for disclosures, not cover pages or filing metadata." +
+  " Do not infer business trends from filing dates, form labels, or ownership amendments." +
   " Distinguish observed numbers from calculated numbers." +
   " Hedge an inference (suggests, likely, may). Open an assumption with Assuming or If." +
   " State what was not found or is unknown when the evidence does not establish it." +
@@ -70,7 +78,7 @@ const INVENTORY_RULE =
   " evidence_ids lists only exact ids of rows in the EVIDENCE section, never node ids or decision records." +
   " Unknown and assumption claims may cite none. All other types need at least one." +
   " confidence is your own 0..1, carried through, never a threshold." +
-  " Nothing found means {\"claims\": []}." +
+  " When no substantive evidence was found, state the unknowns without inventing factual claims." +
   " The block is stripped before display; prose claims missing from it fail the accuracy gate.";
 // First-stage narrative: prose only from EVIDENCE under the wording rules,
 // with no fenced block. The binder stage binds this prose to claims; binder
