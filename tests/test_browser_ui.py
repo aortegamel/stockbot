@@ -292,17 +292,16 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
                 bodies[url.path] = {"sym": url.path.rsplit("/", 1)[-1], "widgets": [], "updated_at": None}
             if url.path == f"/api/research/sources/{quote(SOURCE_ID, safe='')}":
                 fixture = f"http://127.0.0.1:{port}{FIXTURE_SOURCE_PATH}"
-                bodies[url.path] = {**SOURCE, "url": fixture, "originalUrl": fixture}
+                bodies[url.path] = {
+                    **SOURCE,
+                    "url": fixture,
+                    "originalUrl": fixture,
+                    "linkStatus": "highlighted_original",
+                    "highlightUrl": fixture + "#:~:text=Revenue%20grew",
+                }
             source_path = "/api/research/sources/"
             if url.path.startswith(source_path):
                 source_reads.put(url.path)
-                fixture = f"http://127.0.0.1:{port}{FIXTURE_SOURCE_PATH}"
-                bodies[source_path + quote(SOURCE_ID, safe="") + "/label"] = {
-                    "id": SOURCE_ID,
-                    "title": "10-K",
-                    "linkStatus": "stockbot_render",
-                    "originalUrl": fixture,
-                }
                 bodies[source_path + quote(CALCULATION_ID, safe="")] = CALCULATION
                 for audit in INPUT_AUDITS:
                     source_id = audit["sourceId"]
@@ -666,13 +665,13 @@ def test_agent_transcript_scrolls_inside_panel(
     }
     WebDriverWait(browser, 10).until(EC.presence_of_element_located((By.XPATH, "//div[text()='── metrics ──']")))
     assert_prompt_reachable(browser)
-    sources = browser.find_element(By.CSS_SELECTOR, '[aria-label="Captured sources"] a')
+    sources = browser.find_element(By.XPATH, "//div[@aria-label='Captured sources']//a[text()='View provenance']")
     assert "ev:fixture" not in sources.text
     assert not visible(browser, sources), "The long answer must overflow the transcript for this check."
     wheel_until(browser, transcript_point(browser), lambda: visible(browser, sources))
     assert_prompt_reachable(browser)
 
-    # Captured source opens in its own tab; its content scrolls on its own until the final line.
+    # Provenance opens in its own tab. Its content scrolls until the final line.
     original = browser.current_window_handle
     tabs_before = set(browser.window_handles)
     sources.click()
@@ -740,40 +739,55 @@ def test_chat_chart_update_moves_chart_to_amd(browser: webdriver.Chrome, local_u
     assert "AGENT · viewing AMD" in browser.find_element(By.CSS_SELECTOR, "main").text
 
 
-def test_chat_citation_opens_source_page_in_new_tab(browser: webdriver.Chrome, local_ui: UI) -> None:
+def test_chat_citation_opens_original_and_separates_provenance(browser: webdriver.Chrome, local_ui: UI) -> None:
     wait = WebDriverWait(browser, 10)
     drain(local_ui[3])
     send_chat(browser, local_ui, CITATION_PROMPT)
     citation = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'a[aria-label^="Open source: "]')))
     assert citation.text == "[1]"
     assert "ev:fixture" not in (citation.get_attribute("aria-label") or "")
-    assert (citation.get_attribute("href") or "").endswith(f"#/source/{quote(SOURCE_ID, safe='')}")
-    label_path = f"/api/research/sources/{quote(SOURCE_ID, safe='')}/label"
-    wait.until(lambda _: not local_ui[3].empty())
-    assert local_ui[3].get_nowait() == label_path
+    destination = citation.get_attribute("href") or ""
+    assert FIXTURE_SOURCE_PATH in destination
+    assert destination.endswith("#:~:text=Revenue%20grew")
+    assert "#/source/" not in destination
+    assert citation.get_attribute("target") == "_blank"
+    assert citation.get_attribute("rel") == "noopener noreferrer"
+    source_path = f"/api/research/sources/{quote(SOURCE_ID, safe='')}"
+    assert local_ui[3].get(timeout=5) == source_path
     assert local_ui[3].empty()
+    card = browser.find_element(By.CSS_SELECTOR, '[aria-label="Captured sources"]')
+    primary = card.find_element(By.PARTIAL_LINK_TEXT, "Open on")
+    assert primary.get_attribute("href") == destination
+    assert primary.get_attribute("target") == "_blank"
+    assert primary.get_attribute("rel") == "noopener noreferrer"
+    provenance = card.find_element(By.LINK_TEXT, "View provenance")
+    assert (provenance.get_attribute("href") or "").endswith(f"#/source/{quote(SOURCE_ID, safe='')}")
     original = browser.current_window_handle
     tabs_before = set(browser.window_handles)
     citation.click()
     wait.until(lambda _: len(set(browser.window_handles) - tabs_before) == 1)
     browser.switch_to.window((set(browser.window_handles) - tabs_before).pop())
     try:
-        wait.until(EC.text_to_be_present_in_element((By.CSS_SELECTOR, "article"), "How we got this"))
-        assert local_ui[3].get(timeout=5) == label_path.removesuffix("/label")
-        # Vite uses React StrictMode. Its remount can repeat the full read after the user opens the viewer.
-        while not local_ui[3].empty():
-            assert local_ui[3].get_nowait() == label_path.removesuffix("/label")
-        open_original = browser.find_element(By.PARTIAL_LINK_TEXT, "Original on")
-        assert FIXTURE_SOURCE_PATH in (open_original.get_attribute("href") or "")
-        page_tab = browser.current_window_handle
-        before_original = set(browser.window_handles)
-        open_original.click()
-        wait.until(lambda _: len(set(browser.window_handles) - before_original) == 1)
-        browser.switch_to.window((set(browser.window_handles) - before_original).pop())
         wait.until(EC.url_contains(FIXTURE_SOURCE_PATH))
         assert "Fixture source document" in browser.page_source
+        assert "#/source/" not in browser.current_url
+        assert browser.execute_script("return window.opener === null")
+        assert local_ui[3].empty(), "Opening the original must not resolve the source again."
+    finally:
         browser.close()
-        browser.switch_to.window(page_tab)
+        browser.switch_to.window(original)
+    before_provenance = set(browser.window_handles)
+    provenance.click()
+    wait.until(lambda _: len(set(browser.window_handles) - before_provenance) == 1)
+    browser.switch_to.window((set(browser.window_handles) - before_provenance).pop())
+    try:
+        wait.until(EC.text_to_be_present_in_element((By.CSS_SELECTOR, "article"), "How we got this"))
+        assert local_ui[3].get(timeout=5) == source_path
+        # StrictMode can repeat the viewer read. It must use only the full source endpoint.
+        while not local_ui[3].empty():
+            assert local_ui[3].get_nowait() == source_path
+        assert browser.current_url.endswith(f"#/source/{quote(SOURCE_ID, safe='')}")
+        assert browser.execute_script("return window.opener === null")
     finally:
         browser.close()
         browser.switch_to.window(original)

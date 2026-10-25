@@ -424,10 +424,10 @@ describe("AIPanel", () => {
     expect(panel(root).style.overflow).toBe("hidden");
   });
 
-  test("streams answer and reasoning events into the console", async () => {
+  test("streams reasoning immediately and shows the answer after done", async () => {
     const root = await mount(<AIPanel events={[{ type: "reasoning_start", model: "research" }, { type: "answer_delta", text: "The filing reports revenue growth." }]} input="Question" setInput={() => { }} onSend={() => { }} sym="AAPL" busy={false} debug={false} />);
     expect(root.textContent).toContain("AGENT · viewing AAPL");
-    expect(root.textContent).toContain("The filing reports revenue growth.");
+    expect(root.textContent).not.toContain("The filing reports revenue growth.");
     expect(root.textContent).not.toContain("DEBUG");
   });
 
