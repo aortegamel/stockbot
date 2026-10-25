@@ -61,6 +61,8 @@ from app.research.models import (
     ResearchNode,
     ToolDecision,
     query_with_today_utc,
+    validate_json_mapping,
+    validate_json_value,
     validate_ticker,
 )
 from app.research.repository import ResearchRepository
@@ -256,6 +258,28 @@ class _Kernel:
 
     def list_tool_results(self, session_id: str) -> list[dict[str, JSONValue]]:
         return self._store().list_tool_results(session_id)
+
+    def _intake_observations(self, session_id: str) -> list[dict[str, JSONValue]]:
+        """Read document availability from intake decisions. These observations are not citable evidence."""
+        observations: list[dict[str, JSONValue]] = []
+        for decision in self._store().list_decisions(session_id):
+            selected = decision.selected
+            if decision.decision_type != "intake_digest" or not isinstance(selected, dict):
+                continue
+            stats = selected.get("stats")
+            documents = stats.get("material_docs") if isinstance(stats, dict) else None
+            for document in documents if isinstance(documents, list) else []:
+                if isinstance(document, dict):
+                    observations.append(
+                        {
+                            "tool": "intake_digest",
+                            "outcome_summary": (
+                                "Document availability only, not disclosure evidence. "
+                                "Failed, unavailable, and partial reads leave unknowns: " + _compact_json(document)
+                            ),
+                        }
+                    )
+        return observations
 
 
 class _ReasonOut(TypedDict):
@@ -500,7 +524,10 @@ def _sec_handle(result: object, outcome: object) -> dict[str, object] | None:
 
 def _sec_text(result: object, outcome: object) -> str | None:
     """Return canonical text, reloading the handle when the runtime omits it."""
-    locator = _sec_locator(_persisted_shapes(result))
+    payload = _persisted_shapes(result)
+    if payload.get("error") is not None or _f(outcome, "error") is not None:
+        return None
+    locator = _sec_locator(payload)
     if locator is not None:
         return locator
     handle = _sec_handle(result, outcome)
@@ -606,6 +633,8 @@ def _evidence_candidate(
         if not content:
             return None
         return _structured_evidence_candidate(domain, ref, content, payload)
+    if tool_name == "get_sec_document" and _sec_text(result, outcome) is None:
+        return None
     return _sec_evidence_candidate(result, outcome, kernel)
 
 
@@ -1300,11 +1329,13 @@ def _revenue_rows_accessions(rows: list[object]) -> list[str]:
 _MATERIAL_FORM_RE = re.compile(r"\b(10-?\s?q|10-?\s?k|8-?\s?k)\b")
 _MATERIAL_FORM_NAMES = {"10q": "10-Q", "10k": "10-K", "8k": "8-K"}
 """Material filings: a node that names one reads its document before it resolves."""
-_MATERIAL_READ_HOLD = "read the retained filing document before resolving"
-"""Reselect error while a revenue or material-form node still lacks its document read."""
-_FILING_ANALYSIS_RE = re.compile(
-    r"\b(?:what (?:are|is)\b.*\b(?:saying|disclos)|summariz|explain|compar|analyz|latest filings|recent filings|newest filings|filings say)"
+_MATERIAL_READ_HOLD = (
+    "Read relevant filing passages before resolving. Metadata and cover pages do not answer substantive questions. "
+    "Use get_sec_document section or offset reads for unanswered questions. "
+    "Report unavailable documents and partial coverage without inferring their contents."
 )
+"""Reselect guidance when document content or semantic support remains missing."""
+_FILING_ANALYSIS_RE = re.compile(r"\b(?:say\b|saying\b|summariz|explain|compar|analyz|disclos|contents?\b|contain)")
 """Generic filing-analysis intent: listing metadata alone never satisfies these asks."""
 
 
@@ -1603,6 +1634,101 @@ def _resolved_schema_matches(
         if _schema_enum_mismatch(tool_name, key, value, prop.get("enum")) is not None:
             return False
     return True
+
+
+def _tried_document_calls(attempts: Sequence[Mapping[str, JSONValue]]) -> set[tuple[object, object, object]]:
+    """Attempted (accession, document, section) document reads, so retries advance instead of repeating."""
+    tried: set[tuple[object, object, object]] = set()
+    for attempt in attempts:
+        if attempt.get("tool") != "get_sec_document":
+            continue
+        args = attempt.get("arguments")
+        if not isinstance(args, dict):
+            continue
+        tried.add((args.get("accession_no"), args.get("document_name"), args.get("section")))
+    return tried
+
+
+def _next_document_section(accession: str, tried: set[tuple[object, object, object]]) -> str | None:
+    """First unread 10-Q section for the accession, or None when all sections were tried."""
+    for section in ("Item 1", "Item 2", "Item 1A"):
+        if all(call[0] != accession or call[2] != section for call in tried):
+            return section
+    return None
+
+
+def _row_filed_at(row: object) -> str:
+    """Sort key for persisted filing rows: newest filed_at first."""
+    if isinstance(row, Mapping):
+        filed = row.get("filed_at")
+        return str(filed) if isinstance(filed, str) else ""
+    return ""
+
+
+def _next_untried_accession(
+    tool_name: str,
+    schema: Mapping[str, JSONValue],
+    session: Mapping[str, JSONValue],
+    node: object,
+    attempts: Sequence[Mapping[str, JSONValue]],
+    kernel: _Kernel,
+    tried: set[tuple[object, object, object]],
+) -> dict[str, JSONValue] | None:
+    """Next persisted material accession without a tried document read, or None."""
+    session_id = session.get("session_id")
+    objective = _session_objective(session)
+    issuer = _objective_subject_ticker(objective, session.get("ticker"))
+    if not isinstance(session_id, str) or not session_id or issuer is None:
+        return None
+    payloads = _session_persisted_listings(kernel, session_id, objective, session.get("ticker"))
+    rows = _issuer_filing_rows(payloads, issuer)
+    text = f"{objective} {_f(node, 'question', default='')}"
+    forms = _carry_forms(objective, text)
+    for row in sorted(rows, key=_row_filed_at, reverse=True):
+        if not isinstance(row, Mapping):
+            continue
+        if forms and row.get("form") not in forms:
+            continue
+        try:
+            from app.sec.discovery.service import normalize_accession_no
+
+            accession = normalize_accession_no(row.get("accession_no"))
+        except TypeError, ValueError:
+            continue
+        if any(call[0] == accession for call in tried):
+            continue
+        resolved: dict[str, JSONValue] = {"accession_no": accession}
+        props = schema.get("properties")
+        name = row.get("primary_document")
+        if isinstance(props, dict) and "document_name" in props and isinstance(name, str):
+            resolved["document_name"] = name
+        if _resolved_schema_matches(tool_name, resolved, schema):
+            return resolved
+    return None
+
+
+def _advance_document_retry(
+    tool_name: str,
+    filled: dict[str, JSONValue],
+    session: Mapping[str, JSONValue],
+    node: object,
+    attempts: Sequence[Mapping[str, JSONValue]],
+    kernel: _Kernel,
+    schema: Mapping[str, JSONValue],
+) -> dict[str, JSONValue]:
+    """Advance a repeated document read: next unread section, else next material accession."""
+    if tool_name != "get_sec_document":
+        return filled
+    tried = _tried_document_calls([*attempts, {"tool": tool_name, "arguments": filled}])
+    accession = filled.get("accession_no")
+    props = schema.get("properties")
+    section = _next_document_section(accession, tried) if isinstance(accession, str) else None
+    if section is not None and isinstance(props, dict) and "section" in props:
+        return {**filled, "section": section}
+    resolved = _next_untried_accession(tool_name, schema, session, node, attempts, kernel, tried)
+    if resolved is None:
+        return filled
+    return _merge_resolved(filled, resolved)
 
 
 def _merge_resolved(args: Mapping[str, JSONValue], resolved: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
@@ -2765,14 +2891,14 @@ async def _generate_tool_arguments(
     )
     if grounded is not None:
         return grounded
-    seeded = _seeded_arguments(tool_name, objective, session, node, as_of, schema, scoped, sid, nid)
-    if seeded is not None:
-        _validate_repaired_args(tool_name, seeded[0], objective, session, node, evidence, attempts, kernel)
-        return seeded
     persisted = _persisted_arguments(tool_name, objective, session, node, schema, attempts, kernel, sid, nid)
     if persisted is not None:
         _validate_repaired_args(tool_name, persisted[0], objective, session, node, evidence, attempts, kernel)
         return persisted
+    seeded = _seeded_arguments(tool_name, objective, session, node, as_of, schema, scoped, sid, nid)
+    if seeded is not None:
+        _validate_repaired_args(tool_name, seeded[0], objective, session, node, evidence, attempts, kernel)
+        return seeded
     try:
         generated = await _call_needle(needle_generate, tool_name, schema, objective, node, context)
     except (RuntimeError, ValueError) as exc:
@@ -2958,6 +3084,23 @@ def _persisted_arguments(
     nid: str,
 ) -> tuple[dict[str, JSONValue], str, bool] | None:
     """Persisted-row accession for a carry tool, without Needle. None when no single filing wins."""
+    if not attempts:
+        return None
+    tried = _tried_document_calls(attempts)
+    next_up = _next_untried_accession(tool_name, schema, session, node, attempts, kernel, tried)
+    if next_up is not None:
+        filled = _repair_tool_arguments(
+            tool_name,
+            next_up,
+            objective,
+            sid,
+            nid,
+            question=_f(node, "question", default=None),
+            scope=session.get("temporal_scope"),
+            session_as_of=session.get("as_of"),
+        )
+        _log_args_carry(sid, nid, tool_name, filled)
+        return filled, "scheduler advanced to an unread persisted accession without Needle", False
     resolved = _resolve_persisted_accession(tool_name, {}, schema, session, node, attempts, kernel)
     if resolved is None:
         return None
@@ -3269,14 +3412,14 @@ def _carry_document_read(
             or not isinstance(current, str)
             or _same_tool_accession_count(tool_name, current.strip(), attempts[-3:]) < 2
         ):
-            return filled
+            return _advance_document_retry(tool_name, filled, session, node, attempts, kernel, schema)
     resolved = _resolve_persisted_accession(tool_name, filled, schema, session, node, attempts, kernel)
     if resolved is None:
         _require_listed_read(read)
         return filled
     carried = _merge_resolved(filled, resolved)
     _log_args_carry(sid, nid, tool_name, carried)
-    return carried
+    return _advance_document_retry(tool_name, carried, session, node, attempts, kernel, schema)
 
 
 def _require_listed_read(read: str) -> None:
@@ -3785,7 +3928,9 @@ async def _reasoner_expand(
 def _has_trusted_evidence(evidence: Sequence[object], attempts: Sequence[Mapping[str, JSONValue]]) -> bool:
     """Admitted/trusted evidence present: stored records or an in-run admission."""
     non_chart = [
-        item for item in evidence if _f(item, "tool", default=None) not in ("set_chart_symbol", "update_watchlist")
+        item
+        for item in evidence
+        if _f(item, "tool", default=None) not in ("set_chart_symbol", "update_watchlist", "intake_digest")
     ]
     if non_chart:
         return True
@@ -4104,7 +4249,7 @@ async def _reason_phase(
         return {"done": True, "terminal": None, "decision": decision}
     verdict = await _adjudicate_analysis(jev, kernel, analysis, node, sid, nid)
     if _selection_action(verdict) == "resolved":
-        if _material_read_pending(session, node, attempts):
+        if _material_read_pending(session, node, attempts, evidence, adjudicated=True):
             attempts.append(_reselect_attempt(_MATERIAL_READ_HOLD))
             return {"done": True, "terminal": None, "decision": verdict}
         terminal = _resolve_or_reselect(kernel, sid, nid, evidence, attempts, admitted)
@@ -4396,7 +4541,11 @@ def _node_evidence(
     """Evidence this node produced: its own attempt jobs plus explicitly referenced evidence ids."""
     node_jobs = {job_id, *(j for a in attempts if isinstance(j := a.get("job_id"), str))}
     node_refs = {e for a in attempts if isinstance(e := a.get("evidence_id"), str)}
-    return [ev for ev in evidence if ev.get("job_id") in node_jobs or ev.get("evidence_id") in node_refs]
+    return [
+        ev
+        for ev in evidence
+        if ev.get("job_id") in node_jobs or ev.get("evidence_id") in node_refs or ev.get("tool") == "intake_digest"
+    ]
 
 
 def _admittable_candidate(
@@ -4631,6 +4780,8 @@ async def _settle_round(
         )
         if signal is not None:
             return signal
+    if session is not None and _material_read_pending(session, node, attempts, evidence):
+        verdicts.clear()
     signal = _round_continuation(verdicts, kernel, sid, nid, evidence, attempts, admitted, progressed)
     return signal or {
         "terminal": None,
@@ -4739,6 +4890,11 @@ async def _settle_executed(
         progressed = True
     _complete_attempt_job(kernel, attempt, tool)
     successful = _success_attempt_record(tool, attempt, outcome, decision, evidence_id, assess_ms)
+    if tool == "get_sec_document":
+        successful["document_content"] = _sec_text(attempt.get("result"), outcome) is not None
+        successful["evidence_state"] = _scalar(ev_state)
+        successful["resolution_support_answer"] = _scalar(assessment.get("resolution_support_answer"))
+        successful["continuation"] = _scalar(assessment.get("continuation"))
     _listing_result_ref(successful, tool, attempt, kernel)
     attempts.append(successful)
     if _queue_settled_verdict(verdicts, assessment, index, tool, results, session, node, attempts, continuation):
@@ -4763,7 +4919,16 @@ def _queue_settled_verdict(
 ) -> bool:
     """Queue one verdict unless a document read is still pending; True when a sibling read follows."""
     # Material route: a catalog listing never ends the node (resolve or fresh round) before its document read.
-    if continuation and not (session is not None and _material_read_pending(session, node, attempts)):
+    pending = session is not None and _material_read_pending(session, node, attempts)
+    if pending:
+        verdicts.clear()
+    if continuation and (
+        not pending
+        or (
+            assessment.get("continuation") == "reason_over_evidence"
+            and any(a.get("document_content") is True for a in attempts)
+        )
+    ):
         verdicts.append(assessment)
     # Sibling 10-Q section reads all settle and admit before any verdict ends the round.
     return tool == "get_sec_document" and any(r.get("tool") == "get_sec_document" for r in results[index + 1 :])
@@ -4772,16 +4937,17 @@ def _queue_settled_verdict(
 def _listing_result_ref(
     successful: dict[str, JSONValue], tool: str, attempt: Mapping[str, object], kernel: _Kernel
 ) -> None:
-    """Carry SEC navigation rows onto the settled attempt. The inline result is the fallback."""
-    if tool not in _SEC_NAVIGATION_TOOLS:
+    """Carry SEC navigation rows and retained document windows onto the settled attempt."""
+    if tool not in _SEC_NAVIGATION_TOOLS and tool != "get_sec_document":
         return
-    ref = attempt.get("tool_result_ref")
-    if isinstance(ref, str):
-        try:
-            successful["result"] = dict(_persisted_payload_for_locator(ref, kernel))
-            return
-        except KeyError:
-            pass
+    if tool != "get_sec_document":
+        ref = attempt.get("tool_result_ref")
+        if isinstance(ref, str):
+            try:
+                successful["result"] = dict(_persisted_payload_for_locator(ref, kernel))
+                return
+            except KeyError:
+                pass
     inline = attempt.get("result")
     if isinstance(inline, dict):
         successful["result"] = dict(inline)
@@ -4976,7 +5142,7 @@ async def _run_round(
 ) -> _RoundOut:
     """One tool round: resolved/reason dispatch, invoke, settle; returns step signals."""
     if action == "resolved":
-        if _material_read_pending(session, node, attempts):
+        if _material_read_pending(session, node, attempts, evidence):
             attempts.append(_reselect_attempt(_MATERIAL_READ_HOLD))
             return {
                 "terminal": None,
@@ -5080,22 +5246,60 @@ def _blocked_terminal(
     )
 
 
-def _selection_guidance(
-    ctx_evidence: Sequence[JSONValue], attempts: Sequence[Mapping[str, JSONValue]]
-) -> dict[str, JSONValue]:
-    """Give JEV intake evidence IDs, short summaries, and the instruction to avoid repeat calls."""
+def _evidence_summary_lines(ctx_evidence: Sequence[JSONValue]) -> list[JSONValue]:
+    """Compact evidence id and text lines for the selection prompt."""
     lines: list[JSONValue] = []
     for ev in ctx_evidence:
         eid = _f(ev, "evidence_id", "id", default=None)
         text = _f(ev, "content", "text", "fact", "passage", default=None)
         if isinstance(eid, str) and eid and isinstance(text, str) and text.strip():
             lines.append(f"{eid}: {' '.join(text.split())[:160]}")
+    return lines
+
+
+def _document_view_rows(attempts: Sequence[Mapping[str, JSONValue]]) -> list[JSONValue]:
+    """Document navigation windows for follow-up reads; failed reads stay visible as unknowns."""
+    rows: list[JSONValue] = []
+    for attempt in attempts:
+        if attempt.get("tool") != "get_sec_document":
+            continue
+        payload = dict(_persisted_shapes(attempt.get("result")))
+        view = validate_json_mapping(
+            {
+                key: value
+                for key in ("available_sections", "section", "next_cursor", "more_available", "warnings")
+                if (value := validate_json_value(payload.get(key), "<document_view>")) is not None
+            },
+            "<document_view>",
+        )
+        rows.append(
+            {
+                "arguments": attempt.get("arguments") if isinstance(attempt.get("arguments"), dict) else {},
+                "evidence_state": _scalar(attempt.get("evidence_state")),
+                "resolution_support_answer": _scalar(attempt.get("resolution_support_answer")),
+                **view,
+            }
+        )
+    return rows
+
+
+def _selection_guidance(
+    ctx_evidence: Sequence[JSONValue], attempts: Sequence[Mapping[str, JSONValue]]
+) -> dict[str, JSONValue]:
+    """Give JEV intake evidence IDs, short summaries, and the instruction to avoid repeat calls."""
     prior: list[JSONValue] = [f"{a.get('tool')} {a.get('arguments')!r}" for a in attempts if a.get("tool")]
     return {
         "type": "selection_guidance",
-        "intake_evidence": lines,
-        "instruction": "Do not repeat a tool call with identical arguments to an earlier attempt; pick a new tool or new arguments.",
+        "intake_evidence": _evidence_summary_lines(ctx_evidence),
+        "instruction": (
+            "Do not repeat a tool call with identical arguments. Select new arguments or another tool. "
+            "For filing analysis, identify unanswered questions from substantive passages, not evidence counts. "
+            "Use available_sections or next_cursor with get_sec_document for relevant missing passages. "
+            "Cover pages and filing metadata do not explain financial results or current disclosures. "
+            "Report failed reads and partial coverage explicitly. Do not infer business trends from ownership amendments."
+        ),
         "prior_calls": prior[-10:],
+        "document_views": _document_view_rows(attempts),
     }
 
 
@@ -5176,18 +5380,76 @@ def _log_round_timing(
     )
 
 
+def _has_sec_document_evidence(evidence: Sequence[object]) -> bool:
+    """True when admitted evidence carries inspected SEC document text."""
+    return any(
+        _f(_f(ev, "provenance"), "kind") == "sec_source"
+        and isinstance(text := _f(ev, "content"), str)
+        and bool(text.strip())
+        for ev in evidence
+    )
+
+
+def _latest_read_supported(reads: Sequence[Mapping[str, JSONValue]]) -> bool:
+    """True when the latest completed read carries semantic support for resolution."""
+    return bool(
+        reads
+        and reads[-1].get("evidence_state") in {"sufficient_support", "sufficient_contradiction"}
+        and reads[-1].get("resolution_support_answer") == "yes"
+        and reads[-1].get("continuation") == "resolve_node"
+    )
+
+
+def _pending_question(session: Mapping[str, JSONValue], node: object) -> str:
+    """Combined session objective and node question for read guards."""
+    objective = session.get("objective") or session.get("query") or ""
+    return f"{objective} {_f(node, 'question', default='')}"
+
+
+def _listing_read_pending(ok: Sequence[Mapping[str, JSONValue]]) -> bool:
+    """True when catalog navigation exists without its document read."""
+    return not any(a.get("tool") == "get_sec_document" for a in ok) and any(
+        a.get("tool") in _SEC_NAVIGATION_TOOLS for a in ok
+    )
+
+
+def _filing_read_pending(
+    attempts: Sequence[Mapping[str, JSONValue]],
+    reads: Sequence[Mapping[str, JSONValue]],
+    evidence: Sequence[object],
+    adjudicated: bool,
+) -> bool:
+    """True when document text or semantic support is still missing."""
+    if not reads and not _has_sec_document_evidence(evidence):
+        return True
+    last_read = next((a for a in reversed(attempts) if a.get("tool") == "get_sec_document"), None)
+    if (
+        not adjudicated
+        and last_read is not None
+        and (last_read.get("error") is not None or last_read.get("document_content") is not True)
+    ):
+        return True
+    return not (adjudicated or _latest_read_supported(reads))
+
+
 def _material_read_pending(
     session: Mapping[str, JSONValue],
     node: object,
     attempts: Sequence[Mapping[str, JSONValue]],
+    evidence: Sequence[object] = (),
+    *,
+    adjudicated: bool = False,
 ) -> bool:
-    """Keep a revenue, material-form, or filing-analysis node active after SEC navigation until its document read succeeds."""
-    objective = session.get("objective") or session.get("query") or ""
-    question = f"{objective} {_f(node, 'question', default='')}"
-    if not (_revenue_read_objective(question) or _material_forms(question) or _filing_analysis_intent(question)):
+    """Require document text and semantic support, not a successful read or evidence count."""
+    question = _pending_question(session, node)
+    filing_analysis = _filing_analysis_intent(question)
+    if not (_revenue_read_objective(question) or _material_forms(question) or filing_analysis):
         return False
-    ok = [a.get("tool") for a in attempts if a.get("error") is None]
-    return "get_sec_document" not in ok and any(t in _SEC_NAVIGATION_TOOLS for t in ok)
+    ok = [a for a in attempts if a.get("error") is None]
+    if not filing_analysis:
+        return _listing_read_pending(ok)
+    reads = [a for a in ok if a.get("tool") == "get_sec_document" and a.get("document_content") is True]
+    return _filing_read_pending(attempts, reads, evidence, adjudicated)
 
 
 async def _call_select_round(
@@ -5231,7 +5493,8 @@ async def _drive_rounds(
     executors = _node_hooks(hooks)
     max_rounds = executors["max_rounds"]
     deadline_at = executors["deadline_at"]
-    evidence = _load_evidence(sid, kernel)
+    intake_observations = kernel._intake_observations(sid)
+    evidence = [*_load_evidence(sid, kernel), *intake_observations]
     attempts: list[dict[str, JSONValue]] = []
     admitted = 0
     select_failures = 0
@@ -5330,9 +5593,9 @@ async def _drive_rounds(
             continue
         if step.get("fresh_round"):
             _log_drive(sid, nid, round_no, "fresh_round", admitted)
-            evidence = _load_evidence(sid, kernel)
+            evidence = [*_load_evidence(sid, kernel), *intake_observations]
             continue  # fresh select round inside the cap; JEV re-escalates if reasoning is still needed.
-        evidence = _load_evidence(sid, kernel)
+        evidence = [*_load_evidence(sid, kernel), *intake_observations]
         stale_rounds, stalled = _round_stall_guard(
             step, stale_rounds, attempts[n_before:], kernel, sid, nid, admitted, attempts
         )

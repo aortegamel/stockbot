@@ -166,6 +166,10 @@ class _Kernel(sched._Kernel):
     def list_tool_results(self, session_id: str) -> list[dict[str, JSONValue]]:
         return [row for row in self.tool_results.values() if row.get("session_id") == session_id]
 
+    @override
+    def _intake_observations(self, session_id: str) -> list[dict[str, JSONValue]]:
+        return []
+
 
 class _DupKernel(_Kernel):
     """Store already holds the identity: admission returns the stored winner, accepted False."""
@@ -3220,14 +3224,21 @@ def test_ten_q_revenue_node_reads_document_after_reason_over_listing(
     ]
     assert [args for _, args in invoked[1:]] == [{"accession_no": accq, "limit": 32000, "section": s} for s in sections]
     assert out["status"] == "resolved" and out["admitted"] == 3
-    # Boundaries: the guard holds only until one document read, and only on revenue or material-form asks.
-    listing_ok = {"tool": "list_sec_filings", "error": None}
-    read_ok = {"tool": "get_sec_document", "error": None}
+    # A filing analysis needs inspected content and semantic support.
+    listing_ok: dict[str, JSONValue] = {"tool": "list_sec_filings", "error": None}
+    read_ok: dict[str, JSONValue] = {
+        "tool": "get_sec_document",
+        "error": None,
+        "document_content": True,
+        "evidence_state": "sufficient_support",
+        "resolution_support_answer": "yes",
+        "continuation": "resolve_node",
+    }
     read_err = {"tool": "get_sec_document", "error": "timeout"}
     node = ResearchNode(node_id="n1", session_id="s1", question=prompt, why_it_matters="w")
     assert sched._material_read_pending(session, node, [listing_ok, read_err])
     assert not sched._material_read_pending(session, node, [listing_ok, read_ok])
-    assert not sched._material_read_pending(session, node, [])
+    assert sched._material_read_pending(session, node, [])
     other = ResearchNode(
         node_id="n1",
         session_id="s1",
@@ -6146,7 +6157,7 @@ def test_reason_phase_resolved_keeps_pending_revenue_read_open() -> None:
     )
     assert out["done"] is True and out["terminal"] is None and out["decision"] is verdict
     assert len(attempts) == 2
-    assert attempts[-1]["error"] == "read the retained filing document before resolving"
+    assert attempts[-1]["error"] == sched._MATERIAL_READ_HOLD
     assert attempts[-1]["error_type"] == "reselect"
 
 
@@ -9151,17 +9162,188 @@ def test_material_read_hold_recovers_then_reports_incomplete_guard(form: str, mo
     assert any(isinstance(a, dict) and a.get("error") == sched._MATERIAL_READ_HOLD for a in attempts)
 
 
-def test_generic_filing_question_requires_document_content() -> None:
-    """The exact question What are the latest filings saying holds on listing-only evidence."""
-    session: dict[str, JSONValue] = {"session_id": "s1", "objective": "What are the latest filings saying?"}
-    node = _node()
-    listing_attempt: dict[str, JSONValue] = {"tool": "list_sec_filings", "error": None}
-    assert sched._material_read_pending(session, node, [listing_attempt]) is True
-    doc_attempt: dict[str, JSONValue] = {"tool": "list_sec_filings", "error": None}
-    read_attempt: dict[str, JSONValue] = {"tool": "get_sec_document", "error": None}
-    assert sched._material_read_pending(session, node, [doc_attempt, read_attempt]) is False
-    assert sched._filing_analysis_intent("What are the latest filings saying?") is True
-    assert sched._filing_analysis_intent("What is ORCL's filing history?") is False
+@pytest.mark.parametrize("question", ["What do the latest filings say?", "What are the latest filings saying?"])
+def test_generic_filing_question_requires_document_content(question: str) -> None:
+    """A successful call without inspected text cannot satisfy a filing summary."""
+    session: dict[str, JSONValue] = {"session_id": "s1", "objective": question}
+    listing: dict[str, JSONValue] = {"tool": "list_sec_filings", "error": None}
+    missing: dict[str, JSONValue] = {
+        "tool": "get_sec_document",
+        "error": None,
+        "document_content": False,
+        "evidence_state": "sufficient_support",
+        "resolution_support_answer": "yes",
+        "continuation": "resolve_node",
+    }
+    assert sched._material_read_pending(session, _node(), [])
+    assert sched._material_read_pending(session, _node(), [listing])
+    assert sched._material_read_pending(session, _node(), [listing, missing])
+    assert sched._material_read_pending(session, _node(), [missing], adjudicated=True)
+    assert sched._material_read_pending(session, _node(), [{"tool": "get_sec_document", "error": "unavailable"}])
+    cover = {**missing, "document_content": True, "evidence_state": "insufficient", "resolution_support_answer": "no"}
+    assert sched._material_read_pending(session, _node(), [listing, cover])
+    substantive = {
+        **cover,
+        "evidence_state": "sufficient_support",
+        "resolution_support_answer": "yes",
+        "continuation": "resolve_node",
+    }
+    assert not sched._material_read_pending(session, _node(), [listing, cover, substantive])
+    assert sched._material_read_pending(session, _node(), [listing, substantive, cover])
+    assert not sched._material_read_pending(session, _node(), [cover], adjudicated=True)
+    assert sched._filing_analysis_intent(question)
+    assert not sched._filing_analysis_intent("List the latest filings")
+    assert not sched._filing_analysis_intent("What are the latest filings?")
+    assert not sched._filing_analysis_intent("What is ORCL's filing history?")
+
+
+def test_filing_summary_requires_reasoning_over_intake_document_content() -> None:
+    session: dict[str, JSONValue] = {"objective": "What do the latest filings say?"}
+    metadata = {"provenance": {"kind": "sec_record"}, "content": "Form 10-Q filed yesterday"}
+    document = {"provenance": {"kind": "sec_source"}, "content": "Revenue rose because demand increased."}
+    assert sched._material_read_pending(session, _node(), [], [metadata], adjudicated=True)
+    assert sched._material_read_pending(session, _node(), [], [document])
+    assert not sched._material_read_pending(session, _node(), [], [document], adjudicated=True)
+    assert not sched._material_read_pending({"objective": "List the latest filings"}, _node(), [])
+    assert not sched._material_read_pending({"objective": "What is the stock price?"}, _node(), [])
+
+
+@pytest.mark.parametrize(
+    ("text", "state", "support", "resolved"),
+    [
+        (None, "sufficient_support", "yes", False),
+        ("SEC Form 10-Q. Cover page. Table of contents.", "insufficient", "no", False),
+        ("Revenue increased.", "sufficient_support", "unsure", False),
+        ("Revenue rose because demand increased. Cash funded operations.", "sufficient_support", "yes", True),
+    ],
+)
+def test_filing_summary_settlement_requires_supported_document_passages(
+    text: str | None, state: str, support: str, resolved: bool
+) -> None:
+    """The scheduler retains semantic support. A successful cover read cannot complete the node."""
+    payload: dict[str, JSONValue] = {"tool_result_id": "tr-doc", "accession_no": _LISTED_10Q}
+    if text is not None:
+        payload["text"] = text
+    payload.update({"available_sections": ["Item 2"], "next_cursor": 12000, "more_available": True})
+    kernel = _Kernel({"tr-doc": {"session_id": "s1", "result": payload}})
+    attempt: dict[str, object] = {
+        "tool": "get_sec_document",
+        "arguments": {"accession_no": _LISTED_10Q},
+        "result": payload,
+        "outcome": _outcome(text or "Document metadata only"),
+        "outcome_summary": text or "Document metadata only",
+        "tool_result_ref": "tr-doc",
+        "job_id": "job-1",
+        "error": None,
+    }
+    attempts: list[dict[str, JSONValue]] = []
+
+    class _Jev(_JevAdmit):
+        @override
+        async def assess_result(self, *args: object, **kwargs: object) -> dict[str, JSONValue]:
+            return {
+                "evidence_state": state,
+                "resolution_support_answer": support,
+                "continuation": "resolve_node",
+            }
+
+    result = asyncio.run(
+        sched._settle_round(
+            [attempt],
+            _Jev(),
+            kernel,
+            _node(),
+            [],
+            attempts,
+            "s1",
+            "n1",
+            _invoke("get_sec_document"),
+            0,
+            session={"objective": "What do the latest filings say?"},
+        )
+    )
+    terminal = result["terminal"]
+    assert (isinstance(terminal, dict) and terminal.get("status") == "resolved") is resolved
+    assert attempts[0]["document_content"] is (text is not None)
+    assert attempts[0]["evidence_state"] == state
+    if text is None:
+        assert kernel.evidence == []
+    guidance = sched._selection_guidance([], attempts)
+    views = guidance["document_views"]
+    assert isinstance(views, list) and isinstance(views[0], dict)
+    assert views[0]["available_sections"] == ["Item 2"]
+    assert views[0]["next_cursor"] == 12000
+
+
+def test_later_unanswered_document_invalidates_queued_completion() -> None:
+    session: dict[str, JSONValue] = {"objective": "What do the latest filings say?"}
+    supported: dict[str, JSONValue] = {
+        "tool": "get_sec_document",
+        "document_content": True,
+        "evidence_state": "sufficient_support",
+        "resolution_support_answer": "yes",
+        "continuation": "resolve_node",
+    }
+    latest_cases: tuple[dict[str, JSONValue], ...] = (
+        {"tool": "get_sec_document", "error": "unavailable"},
+        {**supported, "evidence_state": "insufficient"},
+    )
+    for latest in latest_cases:
+        attempts: list[dict[str, JSONValue]] = [supported, latest]
+        assert sched._material_read_pending(session, _node(), attempts)
+        verdicts: list[dict[str, JSONValue]] = [{"continuation": "resolve_node"}]
+        sched._queue_settled_verdict(
+            verdicts,
+            {"continuation": "continue_research"},
+            0,
+            "get_sec_document",
+            [],
+            session,
+            _node(),
+            attempts,
+            True,
+        )
+        assert verdicts == []
+
+
+def test_intake_document_limits_remain_non_citable_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from app.research.repository import ResearchRepository
+
+    records = [
+        DecisionRecord(
+            decision_id="intake-1",
+            session_id="s1",
+            node_id=None,
+            job_id=None,
+            decision_type="intake_digest",
+            candidates={},
+            probabilities={},
+            selected={
+                "stats": {
+                    "material_docs": [
+                        {"accession_no": "unread-acc", "status": "error"},
+                        {"accession_no": "partial-acc", "status": "partial"},
+                    ]
+                }
+            },
+        )
+    ]
+
+    def decisions(repo: ResearchRepository, session_id: str) -> list[DecisionRecord]:
+        assert session_id == "s1"
+        return records
+
+    monkeypatch.setattr(ResearchRepository, "list_decisions", decisions)
+    observations = sched._Kernel(tmp_path)._intake_observations("s1")
+    assert len(observations) == 2
+    assert all(set(row) == {"tool", "outcome_summary"} for row in observations)
+    assert "error" in str(observations[0]["outcome_summary"])
+    assert "partial" in str(observations[1]["outcome_summary"])
+    assert not sched._has_trusted_evidence(observations, [])
+    assert sched._node_evidence(observations, [], "job-1") == observations
+    context, selected = sched._round_selection_context(observations, [], 0)
+    assert context == observations
+    assert selected[:2] == observations
 
 
 @pytest.mark.parametrize("issuer_key", ["filer_cik", "subject_cik"])

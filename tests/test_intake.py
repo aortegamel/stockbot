@@ -771,6 +771,15 @@ def _family_round(
             await asyncio.sleep(60)
         if mode == "error":
             return {"tool": tool, "arguments": args, "error": "source unavailable", "outcome": None}
+        if tool == "get_sec_document":
+            return {
+                **ok,
+                "result": {
+                    "tool_result_id": "s1:tr:x",
+                    "text": "Revenue rose as customer demand increased.",
+                    "more_available": False,
+                },
+            }
         return ok
 
     def _cik(t: str) -> str:
@@ -807,7 +816,7 @@ def test_intake_lists_each_family_so_insider_burst_never_buries_material(monkeyp
         {"identifier": "320193", "forms": ["3", "3/A", "4", "4/A", "5", "5/A"], "limit": 1},
     ]
     assert "search_sec_filings" not in [t for t, _ in calls]
-    # The chain reads the two newest material filings; the bounded recovery reads the third before planning.
+    # The chain reads every retained material family before planning.
     assert _doc_reads(calls) == ["0001-26-000008", "0001-26-000007", "0001-26-000006"]
     assert all(a["max_chars"] == kw._INTAKE_DOC_CHARS for t, a in calls if t == "get_sec_document")
     assert [a for t, a in calls if t == "get_insider_activity"] == [{"ticker": "ORCL", "limit": 10}]
@@ -823,7 +832,7 @@ def test_intake_lists_each_family_so_insider_burst_never_buries_material(monkeyp
         {"form": "8-K", "accession_no": "0001-26-000008", "filed_at": "2026-09-20"},
         {"form": "4/A", "accession_no": "0001-26-000015", "filed_at": "2026-10-05"},
     ]
-    assert [r["tool"] for r in raw][-1] == "get_sec_document"  # the recovery read rides the same raw log
+    assert [r["tool"] for r in raw][-1] == "get_insider_activity"
     per_source = stats["per_source"]
     assert isinstance(per_source, dict) and per_source["get_sec_document"]["count"] == 3
     assert all(10.0 <= per_source[t]["ms"] < 10_000.0 for t in ("list_sec_filings", "get_insider_activity"))
@@ -883,7 +892,7 @@ def test_unread_material_skips_insider_watchlist_and_read_rows() -> None:
     """Junk rows, insider forms and watchlist listings never count; a document read or sec_source evidence clears a row."""
     listing: dict[str, object] = {"result": {"filings": ["junk", {"form": "4"}, *_EDGAR_ROWS[5:]]}}
     watch: dict[str, object] = {"result": {"filings": [{"form": "10-K", "accession_no": "W"}]}}
-    read: dict[str, object] = {"outcome": _outcome(), "error": None}
+    read: dict[str, object] = {"outcome": _outcome(), "error": None, "result": {"text": "Material disclosure."}}
     rows: list[tuple[str, dict[str, object], dict[str, object], float]] = [
         ("list_sec_filings", {"identifier": "X", "forms": ["10-Q"], "limit": 1}, listing, 0.0),
         ("list_sec_filings", {"identifier": "X", "limit": 5}, watch, 0.0),
@@ -895,6 +904,35 @@ def test_unread_material_skips_insider_watchlist_and_read_rows() -> None:
     inspected["provenance"] = {"kind": "sec_source", "accession_no": "0001-26-000006"}
     assert kw._intake_unread_material(listed, rows, [inspected]) == ["0001-26-000007"]
     assert kw._intake_unread_material(listed, rows, []) == ["0001-26-000007", "0001-26-000006"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "error", "expected"),
+    [
+        ({}, None, "unavailable"),
+        ({"text": ""}, None, "unavailable"),
+        ({"text": "Cover page", "more_available": True}, None, "partial"),
+        ({"text": "Revenue rose because demand increased."}, None, "ok"),
+        ({"text": "Ignored", "error": "source unavailable"}, None, "error"),
+        ({"text": "Ignored"}, "timeout", "error"),
+    ],
+)
+def test_intake_document_status_reports_content_limits(
+    payload: dict[str, object], error: str | None, expected: str
+) -> None:
+    """The intake reports availability without declaring that a passage answers the question."""
+    record: dict[str, object] = {"result": payload, "outcome": _outcome(), "error": error}
+    rows: list[tuple[str, dict[str, object], dict[str, object], float]] = [
+        ("get_sec_document", {"accession_no": "acc"}, record, 0.0)
+    ]
+    assert kw._intake_doc_reads(rows) == {"acc": expected}
+
+
+def test_empty_document_provenance_does_not_clear_unread_material() -> None:
+    inspected = _stored_evidence("ev-empty", "", accession="0001-26-000007")
+    inspected["provenance"] = {"kind": "sec_source", "accession_no": "0001-26-000007"}
+    assert kw._intake_document_accessions([inspected]) == set()
+    assert kw._intake_unread_material(_EDGAR_ROWS[6:7], [], [inspected]) == ["0001-26-000007"]
 
 
 def _intake_web_queries_by_round(
