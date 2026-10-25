@@ -265,6 +265,12 @@ _INTAKE_BUDGET_S = 8.0
 _INTAKE_REASONER_TIMEOUT_S = 20.0
 _INTAKE_DOC_TIMEOUT_S = 5.0
 _INTAKE_DOC_CHARS = 3000
+# The ticker chain lists each family then reads the newest documents, so the
+# chain cap covers listings plus reads, and the outer settle waits as long.
+# A cap at or below one call starves the reads: listings settle, documents
+# time out, gates fail closed.
+_INTAKE_CHAIN_TIMEOUT_S = _INTAKE_CALL_TIMEOUT_S + _INTAKE_DOC_TIMEOUT_S + 2.0
+_INTAKE_SETTLE_TIMEOUT_S = _INTAKE_CHAIN_TIMEOUT_S + 1.0
 
 # One wall budget per op:run. Setup stops at _SETUP_S so the scheduler keeps
 # at least _SCHEDULER_MIN_S; _FINALIZE_S stays for the writer side.
@@ -1144,13 +1150,13 @@ def _intake_outcome_rows(
     tool, args = meta
     if not settled:
         task.cancel()
-        logger.warning("intake budget timeout tool=%s budget_s=%s", tool, _INTAKE_BUDGET_S)
+        logger.warning("intake budget timeout tool=%s budget_s=%s", tool, _INTAKE_SETTLE_TIMEOUT_S)
         late = _intake_timeout_record(tool, args)
         return [(tool, args, late, 0.0)], late
     try:
         res = task.result()
     except TimeoutError:
-        logger.warning("intake timeout tool=%s budget_s=%s", tool, _INTAKE_BUDGET_S)
+        logger.warning("intake timeout tool=%s budget_s=%s", tool, _INTAKE_SETTLE_TIMEOUT_S)
         return [(tool, args, _intake_timeout_record(tool, args), 0.0)], None
     if isinstance(res, list):
         return res, None
@@ -1169,7 +1175,7 @@ async def _intake_settle(
     Cancelled stragglers finish their cancellation first, so their jobs close before any recovery call starts.
     """
     wall_start = time.perf_counter()
-    done, pending = await asyncio.wait(set(all_tasks), timeout=_INTAKE_BUDGET_S if all_tasks else 0.0)
+    done, pending = await asyncio.wait(set(all_tasks), timeout=_INTAKE_SETTLE_TIMEOUT_S if all_tasks else 0.0)
     wall_ms = (time.perf_counter() - wall_start) * 1000.0
     flat: _IntakeChainRows = []
     watch_records: dict[int, dict[str, object]] = {}
@@ -1409,7 +1415,7 @@ async def _intake_round(
         asyncio.ensure_future(
             asyncio.wait_for(
                 _intake_ticker_chain(ticker, sid, session, registry, jev, kernel, as_of, admission),
-                timeout=_INTAKE_CALL_TIMEOUT_S,
+                timeout=_INTAKE_CHAIN_TIMEOUT_S,
             )
         )
         for ticker in tickers

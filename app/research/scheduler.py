@@ -1303,7 +1303,7 @@ _MATERIAL_FORM_NAMES = {"10q": "10-Q", "10k": "10-K", "8k": "8-K"}
 _MATERIAL_READ_HOLD = "read the retained filing document before resolving"
 """Reselect error while a revenue or material-form node still lacks its document read."""
 _FILING_ANALYSIS_RE = re.compile(
-    r"\b(?:what (?:are|is)\b.*\b(?:saying|disclos)|summariz|explain|compar|analyz|latest filings|recent filings|newest filings)"
+    r"\b(?:what (?:are|is)\b.*\b(?:saying|disclos)|summariz|explain|compar|analyz|latest filings|recent filings|newest filings|filings say)"
 )
 """Generic filing-analysis intent: listing metadata alone never satisfies these asks."""
 

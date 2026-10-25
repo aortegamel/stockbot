@@ -14,6 +14,8 @@ const WORKER_TIMEOUT_MS = 10 * 60 * 1000;
 // Research wall: the one worker run gets 120s from the request start. Persona
 // generation, retries, and synthesis run with no time limit.
 export const REQUEST_WALL_MS = 120_000;
+// A hung preview must never hold the answer hostage: bound the wait, drop late previews.
+const BRIEF_TIMEOUT_MS = 20_000;
 const PREWARM_TIMEOUT_MS = 120_000;
 
 const ROOT =
@@ -766,6 +768,7 @@ type KernelRun = {
   briefRows: Evidence[] | undefined;
   briefPromise: Promise<string | undefined> | undefined;
   briefText: string | undefined;
+  briefExpired: boolean;
 };
 
 // One answer pass: the reasoner stages plus the drafts that the gate stage reads.
@@ -1002,6 +1005,7 @@ function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSign
           gate: (body, gateOpts) => run.router.call(body, { ...(run.signal ? { signal: run.signal } : {}), ...gateOpts }),
         });
         if ("failure" in gated) return undefined;
+        if (run.briefExpired) return undefined;
         run.emit({ type: "answer_delta", text: gated.text });
         return gated.text;
       } catch {
@@ -1149,10 +1153,10 @@ async function researchPass(run: KernelRun): Promise<boolean> {
     return false;
   }
   run.workerMs += performance.now() - workerStart;
-  if (run.briefPromise !== undefined) run.briefText = (await run.briefPromise) ?? undefined;
   adoptFirst(run, res);
   if (typeof res.error === "string" && res.error) {
     endFailed(run, "needle", "provider_error", res.error);
+    run.briefExpired = true;
     return false;
   }
   // The replay settles whether a tool failure is already disclosed before the
@@ -1160,7 +1164,19 @@ async function researchPass(run: KernelRun): Promise<boolean> {
   replayTools(run, run.toolDecisions, run.toolCalls);
   if (run.terminal !== undefined) {
     endTerminal(run);
+    run.briefExpired = true;
     return false;
+  }
+  // The preview never holds the replayed calls or the answer: bound the wait, drop late previews.
+  if (run.briefPromise !== undefined) {
+    const gate: { promise: Promise<string | undefined>; resolve: (value: string | undefined) => void } = Promise.withResolvers<string | undefined>();
+    const timer = setTimeout(gate.resolve, BRIEF_TIMEOUT_MS, undefined);
+    try {
+      run.briefText = (await Promise.race([run.briefPromise, gate.promise])) ?? undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (run.briefText === undefined) run.briefExpired = true;
   }
   return true;
 }
@@ -1506,6 +1522,7 @@ function openRun(prompt: string, emit: (e: AgentEvent) => void, opts: KernelRunO
     briefRows: undefined,
     briefPromise: undefined,
     briefText: undefined,
+    briefExpired: false,
   };
 }
 

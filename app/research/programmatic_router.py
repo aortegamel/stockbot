@@ -66,7 +66,7 @@ _SUBJECT_FILLER_TOKS = frozenset(
 )
 _PLANNED_TOKS = frozenset({"planned", "proposed", "144"})
 _EXECUTED_TOKS = frozenset({"executed", "actual", "actually", "trade", "traded", "sell", "sold", "sale"})
-_READ_TOKS = frozenset({"revenue", "read", "text", "says", "mention", "section", "risk", "document"})
+_READ_TOKS = frozenset({"revenue", "read", "text", "says", "say", "mention", "section", "risk", "document"})
 _TIME_TOKS = frozenset({"what", "time", "is", "it", "current"})
 # Match explicit create commands, not embedded mentions or negative instructions.
 _THESIS_CREATE_RE = re.compile(r"^(?:please |can you |could you )?create (?:an? )?(?:new )?thesi\b")
@@ -277,6 +277,7 @@ def _carry_pick(
     listed_10q: dict[str, JSONValue] | None,
     session_id: str | None = None,
     issuer: object = None,
+    text: str | None = None,
 ) -> tuple[str, str] | None:
     """Open packet accessions only in a carry-only registry."""
     if not _carry_only(names, attempts, ctx_evidence, session_id, issuer):
@@ -285,6 +286,11 @@ def _carry_pick(
         return None
     if "get_sec_document" in names and toks & _READ_TOKS:
         return "get_sec_document", "carry:packet-doc"
+    if "get_sec_document" in names and text is not None:
+        from app.research.scheduler import _filing_analysis_intent
+
+        if _filing_analysis_intent(text):
+            return "get_sec_document", "carry:packet-doc"
     if "get_sec_filing" in names:
         return "get_sec_filing", "carry:packet-filing"
     return None
@@ -413,7 +419,7 @@ def _router_pick(
     cik = re.search(r"\bCIK\s*[:#]?\s*(\d{1,10})\b", source, re.IGNORECASE)
     issuer = cik.group(1) if cik is not None else _objective_subject_ticker(source, ticker)
     return (
-        _carry_pick(toks, names, attempts, ctx_evidence, listed_10q, session_id, issuer)
+        _carry_pick(toks, names, attempts, ctx_evidence, listed_10q, session_id, issuer, text)
         or _short_pick(norm, toks, names)
         or _insider_pick(norm, toks, names)
         or _mention_pick(norm, toks, names)
