@@ -179,6 +179,19 @@ def _decision_choice(decision: Mapping[str, JSONValue], default: str | None = No
     return choice if isinstance(choice, str) else default
 
 
+def _continuation_for_assessment(
+    continuation: str | None,
+    evidence_choice: str | None,
+    support_answer: str | None,
+) -> str | None:
+    """A contradictory resolve continues research: only supported evidence with yes support may resolve."""
+    if continuation != "resolve_node":
+        return continuation
+    if evidence_choice == "sufficient_support" and support_answer == "yes":
+        return continuation
+    return "continue_research"
+
+
 def _carried_confidence(confidence: object) -> float | None:
     """A caller-supplied confidence when it is a probability; None otherwise."""
     return float(confidence) if _is_prob(confidence) else None
@@ -424,14 +437,23 @@ _MAX_PRIOR_FAILURES = 3
 _MAX_OUTCOME_CONTENT = 2000
 
 
+def _outcome_text(content: str | None) -> str | None:
+    """Assessment text: document body after the rendered header, else the head."""
+    if not isinstance(content, str):
+        return content
+    _head, sep, body = content.partition("\n\n")
+    if sep and body.strip() and "source_handle:" in content[:2000]:
+        return body.strip()[:_MAX_OUTCOME_CONTENT]
+    return content[:_MAX_OUTCOME_CONTENT]
+
+
 def _outcome_dict(outcome: object) -> dict[str, JSONValue]:
     def text(value: object) -> str | None:
         return value if isinstance(value, str) else (None if value is None else str(value))
 
-    content = text(_field(outcome, "content"))
     return {
         "tool": _field(outcome, "tool_name", "tool"),
-        "content": content[:_MAX_OUTCOME_CONTENT] if isinstance(content, str) else content,
+        "content": _outcome_text(text(_field(outcome, "content"))),
         "error": text(_field(outcome, "error")),
         "error_type": text(_field(outcome, "error_type")),
         "tool_result_id": text(_field(outcome, "tool_result_id", "tool_result_ref")),
@@ -556,6 +578,11 @@ def _compact_context(items: Sequence[JSONValue] | None) -> list[JSONValue]:
                     "type": "selection_guidance",
                     "instruction": item.get("instruction"),
                     "prior_calls": prior[-_PRIOR_CALLS_TAIL:] if isinstance(prior, list) else [],
+                    **(
+                        {"document_views": item["document_views"]}
+                        if isinstance(item.get("document_views"), list)
+                        else {}
+                    ),
                 }
             )
         elif eid := item.get("evidence_id") or item.get("id"):
@@ -683,6 +710,21 @@ def _today_guidance() -> str:
     )
 
 
+_FILING_CONTENT_GUIDANCE = (
+    "When the question asks what filings say, explain, summarize, or analyze actual disclosure passages. "
+    "A filing list, metadata, cover page, signature page, or ownership amendment does not establish operating performance. "
+    "Assess whether the passages answer the question, not how many documents or evidence records exist. "
+    "For a broad latest-filings summary, examine recent financial reports and material current disclosures as relevant. "
+    "Identify unanswered questions about results, drivers, outlook, liquidity, or risks when the relevant filings address them. "
+    "Use get_sec_document with section or offset reads for missing passages. "
+    "Use available_sections and next_cursor from prior reads. "
+    "Do not require every section or infer a disclosure from its heading. "
+    "Identify unavailable documents and partial reads explicitly. Failed reads cannot support conclusions. "
+    "Resolve only when substantive passages support the answer and the answer states material coverage limits. "
+    "If the user requests only a filing list, metadata can answer that request. "
+)
+
+
 def _selection_prompt(
     node: Mapping[str, JSONValue],
     node_id: JSONValue,
@@ -701,6 +743,7 @@ def _selection_prompt(
         prompt += f" Observed {line}."
     prompt += _prior_failures(attempts)
     prompt += " " + _today_guidance()
+    prompt += " " + _FILING_CONTENT_GUIDANCE
     return prompt
 
 
@@ -2150,6 +2193,8 @@ class JevClient:
                 "instructions": (
                     f"Does the combined evidence resolve the node question, not merely mention it: {question} "
                     + "Tentative reports and contradictions do not resolve. Conflicted or insufficient evidence never resolves."
+                    + " "
+                    + _FILING_CONTENT_GUIDANCE
                 ),
             },
             "evidence_state": {
@@ -2188,6 +2233,9 @@ class JevClient:
         _distribution(probs, cont)
         continuation = _decision_choice(cont, "continue_research")
         ev_choice = _decision_choice(ev_state)
+        support_answer = _classify_probability(support.get("probability"))
+        continuation = _continuation_for_assessment(continuation, ev_choice, support_answer)
+        topical_answer = _classify_probability(topical.get("probability"))
         return {
             "probabilities": probs,
             "confidence": cont.get("confidence"),
@@ -2201,8 +2249,8 @@ class JevClient:
             "decision": ev_choice,
             "topical_relevance": topical.get("probability"),
             "resolution_support": support.get("probability"),
-            "topical_relevance_answer": _classify_probability(topical.get("probability")),
-            "resolution_support_answer": _classify_probability(support.get("probability")),
+            "topical_relevance_answer": topical_answer,
+            "resolution_support_answer": support_answer,
         }
 
     async def assess_final_response(

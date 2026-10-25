@@ -1672,6 +1672,52 @@ def test_assess_result_keeps_raw_outcome_and_compacts_evidence(tmp_path: Path, m
         assert marker not in wire
 
 
+def test_assess_result_contradictory_resolve_continues() -> None:
+    """A resolve verdict without supported yes evidence means more evidence, never resolution."""
+    from app.decision_client import _continuation_for_assessment
+
+    assert _continuation_for_assessment("resolve_node", "insufficient", "no") == "continue_research"
+    assert _continuation_for_assessment("resolve_node", "conflicted", "yes") == "continue_research"
+    assert _continuation_for_assessment("resolve_node", "sufficient_support", "unsure") == "continue_research"
+    assert _continuation_for_assessment("resolve_node", "sufficient_contradiction", "yes") == "continue_research"
+    assert _continuation_for_assessment("resolve_node", "sufficient_support", "yes") == "resolve_node"
+    assert _continuation_for_assessment("continue_research", "sufficient_support", "yes") == "continue_research"
+
+
+def test_filing_assessment_requires_substantive_passages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client, seen = _capturing_client(tmp_path, monkeypatch)
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "What do the latest filings say?"}
+    asyncio.run(client.assess_result(node, {"content": "Cover page"}, [], session_id="s"))
+    _state, questions = seen[0]
+    assert isinstance(questions, dict)
+    support = questions["resolution_support"]
+    assert isinstance(support, dict)
+    instructions = str(support["instructions"])
+    assert "cover page" in instructions
+    assert "not how many documents" in instructions
+    assert "Failed reads cannot support conclusions" in instructions
+    assert "section or offset reads" in instructions
+    assert "only a filing list" in instructions
+
+
+def test_selection_preserves_document_navigation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client, seen = _capturing_client(tmp_path, monkeypatch)
+    node: dict[str, JSONValue] = {"node_id": "n1", "question": "What do the latest filings say?"}
+    views: list[JSONValue] = [
+        {"available_sections": ["Item 2"], "next_cursor": 12000, "more_available": True, "warnings": ["partial"]}
+    ]
+    guidance: dict[str, JSONValue] = {
+        "type": "selection_guidance",
+        "instruction": "Read unanswered disclosure passages.",
+        "prior_calls": [],
+        "document_views": views,
+    }
+    asyncio.run(client.select_tool("obj", node, [{"name": "get_sec_document"}], [guidance], [], session_id="s"))
+    state, _questions = seen[0]
+    assert isinstance(state, dict)
+    assert state["evidence"] == [guidance]
+
+
 _RAW_KEYS = st.sampled_from(["content", "reasoning", "provenance", "metadata", "generate_ms", "outcome"])
 
 
