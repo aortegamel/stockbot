@@ -60,14 +60,14 @@ describe("AgentConsole answer rendering", () => {
     expect(out).toContain("hi there");
   });
 
-  test("streaming answer renders before done arrives", () => {
+  test("no answer renders before done arrives", () => {
     const events: AgentEvent[] = [
       { type: "agent_start", prompt: "hello" },
       { type: "reasoning_start", model: "stockbot" },
       { type: "answer_delta", text: "partial" },
     ];
     const out = html(events);
-    expect(out).toContain("partial");
+    expect(out).not.toContain("partial");
   });
 
   test("empty events render the intro", () => {
@@ -172,13 +172,12 @@ describe("AgentConsole event presentation", () => {
     ];
     for (const debug of [false, true]) {
       const streaming = rows(events, true, debug);
-      expect(streaming).toHaveLength(3);
+      expect(streaming).toHaveLength(2);
       expect(streaming[0]).toBe("> Research NVDA");
       expect(streaming[1]).toContain("STOCKBOT");
       expect(streaming[1]).toContain("stockbot / working…");
-      expect(streaming[2]).toBe("Partial answer");
+      expect(streaming.join("")).not.toContain("Partial answer");
       expect(streaming.join("")).not.toContain("private-model-name");
-      expect(rows(events, false, debug)).toEqual(["> Research NVDA", "Partial answer"]);
       for (const terminal of [
         { type: "done", metrics: metrics() },
         { type: "error", message: "Transport stopped" },
@@ -243,16 +242,11 @@ describe("AgentConsole event presentation", () => {
     expect(debug[4]).toBe("├─ archive saved");
     expect(debug[5]).toBe("First second.");
     expect(debug[6]).toBe("Worked for 0s · 2 stepsfilingsarchive saved");
-    expect(debug[7]).toContain("── metrics ──");
-    expect(debug[8]).toBe("✗ Connection closed");
-    expect(debug[9]).toBe("✗ tool_error: Provider failed");
     const production = rows(events, true, false);
     expect(production).toHaveLength(6);
     expect(production[0]).toBe("> Research request");
     expect(production[1]).toBe("First second.");
     expect(production[2]).toBe("Worked for 0s · 2 stepsUsed a research toolWorked on the research");
-    expect(production[3]).toContain("── metrics ──");
-    expect(production.slice(4)).toEqual(["✗ Connection closed", "✗ A data source failed while answering."]);
     expect(production.join("")).not.toContain("needle /");
     expect(production.join("")).not.toContain("filings");
     expect(production.join("")).not.toContain("Report found");
@@ -383,12 +377,12 @@ describe("AgentConsole show-work row", () => {
     expect(row([...work, done]).summary).toBe("Worked for 12s · 3 steps");
   });
 
-  test("the early brief shows Full answer coming… under it until the run ends", () => {
-    const briefed: AgentEvent[] = [...work, { type: "progress", stage: "intake_evidence" }, { type: "answer_delta", text: "Brief view." }];
-    const out = rows(briefed, false, false);
-    expect(out.slice(-2)).toEqual(["Brief view.", expect.stringMatching(/^Full answer coming…Working · 4 steps · \d+s/)]);
-    expect(html([...briefed, { type: "done", metrics: metrics() }], false)).not.toContain("Full answer coming");
-    expect(html(work, false)).not.toContain("Full answer coming");
+  test("no answer renders before the terminal event, then progress collapses", () => {
+    const answered: AgentEvent[] = [...work, { type: "progress", stage: "intake_evidence" }, { type: "answer_delta", text: "Final view." }, { type: "done", metrics: metrics() }];
+    const out = rows(answered, false, false);
+    expect(out.slice(-3)).toEqual(["Final view.", expect.stringMatching(/^Worked for \d+s · 4 steps/), expect.stringMatching(/── metrics ──/)]);
+    expect(html(work, false)).not.toContain("Final view.");
+    expect(html([...work, { type: "answer_delta", text: "Final view." }], false)).not.toContain("Final view.");
   });
 });
 

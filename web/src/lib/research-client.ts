@@ -55,7 +55,7 @@ export type SourceDocument = {
   linkStatus: "highlighted_original" | "stockbot_render" | "missing";
   originalUrl?: string;
   highlightUrl?: string;
-  // The backend's replay of the observation or calculation proof at viewer open. Evidence sources only.
+  // The backend replays the observation or calculation proof when it resolves the source. Evidence sources only.
   audit?: SourceAudit;
   // A published-file conflict does not change the captured API record's proof verdict.
   sourceConflict?: { failure: string; reason: string };
@@ -343,7 +343,7 @@ async function readSourceJson(path: string, signal?: AbortSignal): Promise<objec
   return body;
 }
 
-// Full viewer read: the backend resolves, replays, and archives the source. Only the opened viewer calls this.
+// Full source read: the backend resolves, replays, and archives the source for citations and the provenance viewer.
 export async function fetchSourceDocument(sourceId: string, signal?: AbortSignal): Promise<SourceDocument> {
   const source = await readSourceJson(`/api/research/sources/${encodeURIComponent(sourceId)}`, signal);
   const document = sourceIdentity(source, sourceId);
@@ -356,7 +356,7 @@ export async function fetchSourceDocument(sourceId: string, signal?: AbortSignal
   return document;
 }
 
-// Citation label read: persisted metadata only, so rendering labels never triggers an official download.
+// Persisted label metadata only. This endpoint does not resolve the full source or download its original.
 export async function fetchSourceLabel(sourceId: string, signal?: AbortSignal): Promise<SourceLabel> {
   const source = await readSourceJson(`/api/research/sources/${encodeURIComponent(sourceId)}/label`, signal);
   const title = fieldOf(source, "title");

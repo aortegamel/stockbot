@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { FINAL_PERSONAS, type AgentEvent, type Evidence, type FinalClaim, type SourceReference } from "../../../needle-harness/lib/agent/types";
-import { fetchSourceLabel } from "../lib/research-client";
+import { fetchSourceDocument } from "../lib/research-client";
 import { routeHash } from "../lib/route";
 import { originalLink, sourceLabel, type OriginalLink } from "../lib/source-viewer";
 import { ActionCards, TrioCard, type WidgetOutcomes } from "./action-cards";
@@ -61,12 +61,11 @@ function evidenceById(events: AgentEvent[]): Map<string, Evidence> {
 
 type LoadedSource = { label: string; link: OriginalLink | undefined };
 
-// Readable labels and already pinned official links from persisted metadata only: no full resolve, replay, or
-// official download happens until the user opens the Stockbot view. A failed read keeps the fallback label and no link.
-function useLoadedSources(references: SourceReference[]): Map<string, LoadedSource> {
+// Resolve each displayed source once. A failed read keeps its label but never creates an original link.
+function useLoadedSources(references: SourceReference[]): Map<string, LoadedSource | null> {
   const requested = useRef(new Set<string>());
   const mounted = useRef(false);
-  const [loaded, setLoaded] = useState(new Map<string, LoadedSource>());
+  const [loaded, setLoaded] = useState(new Map<string, LoadedSource | null>());
   const ids = JSON.stringify([...new Set(references.map((reference) => reference.id))]);
   useEffect(() => {
     mounted.current = true;
@@ -76,9 +75,11 @@ function useLoadedSources(references: SourceReference[]): Map<string, LoadedSour
     for (const id of JSON.parse(ids) as string[]) {
       if (requested.current.has(id)) continue;
       requested.current.add(id);
-      void fetchSourceLabel(id).then((source) => {
+      void fetchSourceDocument(id).then((source) => {
         if (mounted.current) setLoaded((current) => new Map(current).set(id, { label: sourceLabel(source), link: originalLink(source) }));
-      }, () => undefined);
+      }, () => {
+        if (mounted.current) setLoaded((current) => new Map(current).set(id, null));
+      });
     }
   }, [ids]);
   return loaded;
@@ -121,7 +122,7 @@ async function fetchTrio(sessionId: string): Promise<AgentEvent[]> {
   }
 }
 
-// A citation opens the provenance page for its first source in a new tab.
+// Citations open resolved originals. Source cards keep the audit page under a separate provenance action.
 // onRetry reruns the request behind these events; without it failures offer no Try again.
 // widgetOutcomes: what the workspace did with each widget receipt, for the toast text.
 export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes }: { events: AgentEvent[]; reasoning: boolean; debug: boolean; onRetry?: () => void; widgetOutcomes?: WidgetOutcomes }) {
@@ -129,9 +130,11 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
   const known = evidenceById(events);
   const links = sourceLinks(known);
   const answer = events.filter((e) => e.type === "answer_delta").map((e) => e.text).join("");
+  // The single research answer is final, so resolve and render sources only after the terminal event.
+  const done = events.some((e) => e.type === "done" || e.type === "error" || e.type === "failed");
   const parts = splitAnswer(answer, known, events.findLast((e) => e.type === "claims")?.claims ?? []);
   const cited = parts.flatMap((part) => part.citation?.sources?.slice(0, 1) ?? []);
-  const loaded = useLoadedSources([...cited, ...links.map((link) => link.reference)]);
+  const loaded = useLoadedSources(done ? [...cited, ...links.map((link) => link.reference)] : []);
   const labelOf = (reference: SourceReference, evidence: Evidence, index: number): string =>
     loaded.get(reference.id)?.label || evidence.title || reference.title || `${evidence.source.toUpperCase() || "Source"} ${index}`;
   if (events.length === 0) {
@@ -166,8 +169,9 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
   const statuses = events.flatMap((e, i) => (e.type === "status" ? [<div key={i}>{e.text}</div>] : []));
   const tail = visible.filter((e) => e.type === "done" || e.type === "error" || e.type === "failed");
   const streaming = reasoning && tail.length === 0;
-  // The offer appears once the stockbot answer is final; Yes or No answers it once per session.
-  const offer = tail.length > 0 ? events.findLast((e) => e.type === "offer_trio") : undefined;
+  // The offer appears once the run ends; Yes or No answers it once per session.
+  const finalAnswer = done ? answer : "";
+  const offer = done ? events.findLast((e) => e.type === "offer_trio") : undefined;
   const current = offer && trio?.sessionId === offer.sessionId ? trio : null;
   const askTrio = (sessionId: string): void => {
     setTrio({ sessionId, events: [{ type: "reasoning_start", model: "stockbot" }] });
@@ -178,28 +182,35 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
       {head.map((e, i) => (
         <AgentEventView key={i} event={e} />
       ))}
-      {statuses.length > 0 && (answer || tail.length > 0
+      {statuses.length > 0 && (tail.length > 0
         ? <details className="text-xs text-zinc-500"><summary className="cursor-pointer">Progress · {statuses.length} {statuses.length === 1 ? "step" : "steps"}</summary>{statuses}</details>
         : <div role="status" className="space-y-0.5 text-xs text-zinc-500">{statuses}</div>)}
       {streaming && <AgentEventView event={{ type: "reasoning_start", model: "stockbot" }} />}
-      {answer && <div className="whitespace-pre-wrap pt-2 text-zinc-100">{parts.map((part, i) => {
+      {finalAnswer && <div className="whitespace-pre-wrap pt-2 text-zinc-100">{parts.map((part, i) => {
         const citation = part.citation;
         const reference = citation?.sources?.[0];
         if (!citation || !reference) return <span key={i}>{part.text}</span>;
         const label = labelOf(reference, citation, part.number ?? 0);
-        return <a key={i} href={routeHash({ page: "source", id: reference.id })} target="_blank" rel="noopener noreferrer" title={label} aria-label={`Open source: ${label}`} className="rounded border border-blue-800 px-1 text-blue-300 underline decoration-dotted hover:bg-blue-950">{part.text}</a>;
+        const link = loaded.get(reference.id)?.link;
+        if (!link) {
+          const status = loaded.has(reference.id) ? "Original source unavailable" : "Loading original source…";
+          return <span key={i} title={`${label} — ${status}`} aria-label={`${status}: ${label}`} className="rounded border border-zinc-700 px-1 text-zinc-400">{part.text}</span>;
+        }
+        return <a key={i} href={link.href} target="_blank" rel="noopener noreferrer" title={label} aria-label={`Open source: ${label}`} className="rounded border border-blue-800 px-1 text-blue-300 underline decoration-dotted hover:bg-blue-950">{part.text}</a>;
       })}</div>}
       <WorkRow events={events} debug={debug} />
       <ActionCards events={events} />
-      {links.length > 0 && <div className="flex flex-wrap items-center gap-2 pt-2" role="group" aria-label="Captured sources">
+      {done && links.length > 0 && <div className="flex flex-wrap items-center gap-2 pt-2" role="group" aria-label="Captured sources">
         <span className="text-xs text-zinc-500">Sources:</span>
         {links.map(({ reference, evidence }, index) => {
           const link = loaded.get(reference.id)?.link;
           return (
             <span key={reference.id} className="flex items-center gap-2 rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-300">
               <span>{labelOf(reference, evidence, index + 1)}</span>
-              <a href={routeHash({ page: "source", id: reference.id })} target="_blank" rel="noopener noreferrer" className="text-blue-300 underline">View in Stockbot</a>
-              {link && <a href={link.href} target="_blank" rel="noopener noreferrer" className="text-blue-300 underline">{link.highlighted ? `Open on ${link.host} ↗` : `Original on ${link.host} ↗`}</a>}
+              {link
+                ? <a href={link.href} target="_blank" rel="noopener noreferrer" className="text-blue-300 underline">{link.highlighted ? `Open on ${link.host} ↗` : `Original on ${link.host} ↗`}</a>
+                : <span role="status" className="text-zinc-500">{loaded.has(reference.id) ? "Original source unavailable" : "Loading original source…"}</span>}
+              <a href={routeHash({ page: "source", id: reference.id })} target="_blank" rel="noopener noreferrer" className="text-blue-300 underline">View provenance</a>
             </span>
           );
         })}

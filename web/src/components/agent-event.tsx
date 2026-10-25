@@ -77,6 +77,7 @@ function seenAt(event: AgentEvent): number {
 }
 
 // One live line while the run works, one summary line after it ends; the steps fold out below.
+// The kernel emits one final answer, so no preliminary answer indicator exists here.
 export function WorkRow({ events, debug }: { events: AgentEvent[]; debug: boolean }) {
   const [, tick] = useState(0);
   const terminal = events.find((e) => e.type === "done" || e.type === "error" || e.type === "failed");
@@ -94,11 +95,8 @@ export function WorkRow({ events, debug }: { events: AgentEvent[]; debug: boolea
   const label = live
     ? `Working · ${count} · ${Math.max(0, Math.floor((Date.now() - start) / 1000))}s`
     : `Worked for ${Math.round((terminal.type === "done" ? terminal.metrics.totalMs : seenAt(terminal) - start) / 1000)}s · ${count}`;
-  // The early brief streams over the intake rows; the full answer follows it.
-  const briefing = live && events.some((e) => e.type === "answer_delta") && steps.some((e) => e.type === "progress" && e.stage === "intake_evidence");
   return (
     <div className="pt-2 text-xs text-zinc-400">
-      {briefing && <div>Full answer coming…</div>}
       <details>
         <summary className="cursor-pointer">{label}</summary>
         <ol className="pl-4 text-zinc-500">

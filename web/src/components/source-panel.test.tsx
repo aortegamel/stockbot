@@ -7,7 +7,7 @@ import type { Root } from "react-dom/client";
 import { AgentConsole } from "./agent-console";
 import { SourcePage } from "./source-panel";
 import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
-import type { SourceAudit, SourceDocument, SourceLabel } from "../lib/research-client";
+import type { SourceAudit, SourceDocument } from "../lib/research-client";
 
 // Static import cannot work: react-dom reads canUseDOM once at module load, so it loads after the jsdom globals exist.
 const { createRoot } = await import("react-dom/client");
@@ -29,7 +29,7 @@ const TEXT: SourceDocument = {
 };
 
 const TEXT_URL = "/api/research/sources/evidence%3Apanel%3Atext";
-const labelUrl = (id: string) => `/api/research/sources/${encodeURIComponent(id)}/label`;
+const sourceUrl = (id: string) => `/api/research/sources/${encodeURIComponent(id)}`;
 
 const realFetch = globalThis.fetch;
 let mounted: Root | null = null;
@@ -700,87 +700,125 @@ describe("SourcePage", () => {
     }
   });
 
-  test("console source cards read labels only and link the Stockbot view plus the plain official page", async () => {
+  test("console resolves displayed sources once and opens verified highlights before plain originals", async () => {
     const page = "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm";
     const highlight = `${page}#f-30:~:text=Revenue%20grew`;
-    const label = (id: string, title: string, extra: Partial<SourceLabel>): SourceLabel => ({ id, title, publisher: "SEC", publishedAt: "2026-01-01", linkStatus: "missing", ...extra });
-    const source = label(TEXT.id, "10-K annual report", { linkStatus: "stockbot_render", originalUrl: "https://www.sec.gov/filing" });
-    const plain = label("evidence:panel:plain", "10-Q", { linkStatus: "stockbot_render", originalUrl: page });
-    const missing = label("evidence:panel:missing", "Short interest", { publisher: "FINRA" });
-    // A label never carries a highlighted link: such a reply is rejected and the card keeps its fallback.
-    const highlighted = { ...label("evidence:panel:highlighted", "10-Q", {}), linkStatus: "highlighted_original", originalUrl: page, highlightUrl: highlight };
+    const source = { ...TEXT, title: "10-K annual report", originalUrl: page, linkStatus: "highlighted_original", highlightUrl: highlight } satisfies SourceDocument;
+    const plain = { ...TEXT, id: "evidence:panel:plain", title: "10-Q", originalUrl: page };
+    const missing = { ...TEXT, id: "evidence:panel:missing", title: "Short interest", publisher: "FINRA", linkStatus: "missing", originalUrl: undefined } satisfies SourceDocument;
+    const web = { ...EXA, linkStatus: "highlighted_original", highlightUrl: `${EXA.originalUrl}#:~:text=Revenue%20doubled` } satisfies SourceDocument;
+    const pdf = { ...TEXT, id: "evidence:panel:pdf", title: "Report PDF", representation: "pdf", content: undefined, originalUrl: "https://publisher.example/report.pdf", publisher: "Publisher" } satisfies SourceDocument;
+    const sources = [source, plain, missing, web, pdf];
     const { promise: loaded, resolve: release } = Promise.withResolvers<void>();
-    const requests = serve({ body: source, gate: loaded }, { body: plain }, { body: missing }, { body: highlighted });
+    const requests = serve(...[source, web, pdf, plain, missing].map((body, index) => ({ body, gate: index === 0 ? loaded : undefined })));
+    const finished: AgentEvent = { type: "done", metrics: { totalMs: 1, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: 1 }, evidence: { count: 0, characters: 0 }, failures: {} } };
     const events: AgentEvent[] = [
-      { type: "evidence", evidence: [{ id: "ev:cited", source: "sec", title: "Evidence title", retrievedAt: "", content: "", sources: [{ id: source.id, title: "Reference title" }, { id: plain.id }, { id: missing.id }, { id: highlighted.id }] }] },
-      { type: "answer_delta", text: "Revenue rose [ev:cited]. Margins held [ev:cited]." },
+      { type: "evidence", evidence: sources.map((entry, index) => ({ id: `ev:${index}`, source: "sec", title: "Evidence title", retrievedAt: "", content: "", sources: [{ id: entry.id, title: "Reference title" }] })) },
+      { type: "answer_delta", text: "Revenue rose [ev:0]. Margins held [ev:0]. Web [ev:3]. PDF [ev:4]." },
+      finished,
     ];
     const root = await mount(<AgentConsole events={events} reasoning={false} debug={false} />);
     const inline = () => [...root.querySelectorAll('a[aria-label^="Open source:"]')];
-    const view = (id: string) => ["View in Stockbot", `#/source/${encodeURIComponent(id)}`, "_blank", "noopener noreferrer"];
-    expect(inline().map((anchor) => [anchor.textContent, anchor.getAttribute("href"), anchor.getAttribute("target"), anchor.getAttribute("rel"), anchor.getAttribute("title")])).toEqual(
-      Array(2).fill(["[1]", "#/source/evidence%3Apanel%3Atext", "_blank", "noopener noreferrer", "Evidence title"]),
-    );
-    await until(() => sourceCards(root)[1]?.[0] === "SEC · 10-Q · 2026-01-01" && sourceCards(root)[2]?.[0] === "FINRA · Short interest · 2026-01-01" && requests.length === 4);
-    await act(async () => { });
+    const view = (id: string) => ["View provenance", `#/source/${encodeURIComponent(id)}`, "_blank", "noopener noreferrer"];
+    expect(root.querySelectorAll('[aria-label="Loading original source…: Evidence title"]')).toHaveLength(2);
+    expect(sourceCards(root)[0]).toEqual(["Evidence title", view(source.id)]);
+    expect(root.querySelector('[aria-label="Captured sources"] [role="status"]')?.textContent).toBe("Loading original source…");
+    await until(() => sourceCards(root)[4]?.[0] === "Publisher · Report PDF · 2026-01-01");
     expect(sourceCards(root)).toEqual([
       ["Evidence title", view(source.id)],
-      ["SEC · 10-Q · 2026-01-01", view(plain.id), ["Original on SEC.gov ↗", page, "_blank", "noopener noreferrer"]],
+      ["SEC · 10-Q · 2026-01-01", ["Original on SEC.gov ↗", page, "_blank", "noopener noreferrer"], view(plain.id)],
       ["FINRA · Short interest · 2026-01-01", view(missing.id)],
-      ["Evidence title", view(highlighted.id)],
+      ["Exa · Nvidia results · 2026-01-01", ["Open on news.example ↗", web.highlightUrl, "_blank", "noopener noreferrer"], view(web.id)],
+      ["Publisher · Report PDF · 2026-01-01", ["Original on publisher.example ↗", pdf.originalUrl, "_blank", "noopener noreferrer"], view(pdf.id)],
     ]);
+    expect(root.querySelectorAll('[aria-label="Captured sources"] [role="status"]')[1]?.textContent).toBe("Original source unavailable");
     await act(async () => release());
-    await until(() => sourceCards(root)[0]?.[0] === "SEC · 10-K annual report · 2026-01-01");
-    expect(sourceCards(root)[0]).toEqual(["SEC · 10-K annual report · 2026-01-01", view(source.id), ["Original on SEC.gov ↗", "https://www.sec.gov/filing", "_blank", "noopener noreferrer"]]);
-    expect(inline().map((anchor) => anchor.getAttribute("aria-label"))).toEqual(Array(2).fill("Open source: SEC · 10-K annual report · 2026-01-01"));
-    expect(hrefs(root).some((href) => API_HOST.test(href) || href.includes(":~:"))).toBe(false);
-    await act(async () => mounted?.render(<AgentConsole events={[...events, { type: "answer_delta", text: " More text." }]} reasoning={false} debug={false} />));
-    // Labels come from persisted metadata only: the full source endpoint (resolve, replay, archive) is never read.
-    expect(requests).toEqual([source.id, plain.id, missing.id, highlighted.id].map(labelUrl));
-    // Raw evidence ids never reach the reader, and no in-drawer panel opens.
-    expect(root.textContent).not.toContain("ev:cited");
+    await until(() => inline().length === 4);
+    expect(sourceCards(root)[0]).toEqual(["SEC · 10-K annual report · 2026-01-01", ["Open on SEC.gov ↗", highlight, "_blank", "noopener noreferrer"], view(source.id)]);
+    expect(inline().map((anchor) => [anchor.textContent, anchor.getAttribute("href"), anchor.getAttribute("target"), anchor.getAttribute("rel")])).toEqual([
+      ["[1]", highlight, "_blank", "noopener noreferrer"],
+      ["[1]", highlight, "_blank", "noopener noreferrer"],
+      ["[2]", web.highlightUrl, "_blank", "noopener noreferrer"],
+      ["[3]", pdf.originalUrl, "_blank", "noopener noreferrer"],
+    ]);
+    expect(inline()[0]?.getAttribute("aria-label")).toBe("Open source: SEC · 10-K annual report · 2026-01-01");
+    expect(hrefs(root).some((href) => API_HOST.test(href))).toBe(false);
+    await act(async () => mounted?.render(<AgentConsole events={[...events, { type: "answer_delta", text: " More text." }, finished]} reasoning={false} debug={false} />));
+    expect(requests).toEqual([source.id, web.id, pdf.id, plain.id, missing.id].map(sourceUrl));
+    expect(root.textContent).not.toContain("ev:0");
     expect(root.textContent).not.toContain("evidence:panel");
     expect(root.querySelector("aside")).toBeNull();
   });
 
-  test("opening a cited source is the first and only full source read", async () => {
-    const labels = serve({ body: { id: TEXT.id, title: "10-K", publisher: "SEC", linkStatus: "stockbot_render", originalUrl: "https://www.sec.gov/filing" } });
-    const events: AgentEvent[] = [
-      { type: "evidence", evidence: [{ id: "ev:cited", source: "sec", retrievedAt: "", content: "", sources: [{ id: TEXT.id }] }] },
-      { type: "answer_delta", text: "Revenue rose [ev:cited]." },
-    ];
-    const chat = await mount(<AgentConsole events={events} reasoning={false} debug={false} />);
-    await until(() => sourceCards(chat)[0]?.[0] === "SEC · 10-K");
-    expect(labels).toEqual([labelUrl(TEXT.id)]);
-    const href = chat.querySelector('a[aria-label^="Open source:"]')?.getAttribute("href");
-    expect(href).toBe(`#/source/${encodeURIComponent(TEXT.id)}`);
+  test("console waits for the terminal event before full resolution and keeps provenance separate", async () => {
+    const finished: AgentEvent = { type: "done", metrics: { totalMs: 1, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: 1 }, evidence: { count: 0, characters: 0 }, failures: {} } };
+    const requests = serve({ body: TEXT });
+    const evidence: AgentEvent = { type: "evidence", evidence: [{ id: "ev:cited", source: "sec", retrievedAt: "", content: "", sources: [{ id: TEXT.id }] }] };
+    const chat = await mount(<AgentConsole events={[evidence]} reasoning={false} debug={false} />);
+    expect(requests).toEqual([]);
+    await act(async () => mounted?.render(<AgentConsole events={[evidence, { type: "answer_delta", text: "Revenue rose [ev:cited]." }, finished]} reasoning={false} debug={false} />));
+    expect(requests).toEqual([TEXT_URL]);
+    expect(chat.querySelector('a[aria-label^="Open source:"]')?.getAttribute("href")).toBe(TEXT.originalUrl);
+    const provenance = [...chat.querySelectorAll("a")].find((anchor) => anchor.textContent === "View provenance");
+    expect(provenance?.getAttribute("href")).toBe(`#/source/${encodeURIComponent(TEXT.id)}`);
     await close();
     const reads = serve({ body: TEXT });
-    const viewer = await mount(panel(decodeURIComponent(href?.slice("#/source/".length) ?? "")));
+    const viewer = await mount(panel(TEXT.id));
     await until(resolved(viewer));
     expect(reads).toEqual([TEXT_URL]);
   });
 
-  test("console source labels fall back to the reference title, then the publisher and index", async () => {
-    const requests = serve({ body: { error: "source capture not found" }, status: 404 }, { body: { error: "source capture not found" }, status: 404 });
+  test("failed, unsafe, and mismatched sources never borrow reference URLs", async () => {
+    const sources = [
+      { id: "evidence:a", title: "Reference title", url: "https://publisher.example/bypass" },
+      { id: "evidence:b", url: "https://publisher.example/bypass" },
+      { id: "evidence:c", url: "https://publisher.example/bypass" },
+    ];
+    const requests = serve(
+      { body: { error: "source capture not found" }, status: 404 },
+      { body: { ...TEXT, id: sources[1]!.id, originalUrl: "javascript:alert(1)" } },
+      { body: TEXT },
+    );
+    const finished: AgentEvent = { type: "done", metrics: { totalMs: 1, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: 1 }, evidence: { count: 0, characters: 0 }, failures: {} } };
     const events: AgentEvent[] = [
-      {
-        type: "evidence", evidence: [
-          { id: "ev:a", source: "sec", retrievedAt: "", content: "", sources: [{ id: "evidence:a", title: "Reference title" }] },
-          { id: "ev:b", source: "finra", retrievedAt: "", content: "", sources: [{ id: "evidence:b" }] },
-        ]
-      },
-      { type: "answer_delta", text: "A [ev:a]. B [ev:b]." },
+      { type: "evidence", evidence: sources.map((source, index) => ({ id: `ev:${index}`, source: "finra", retrievedAt: "", content: "", sources: [source] })) },
+      { type: "answer_delta", text: "A [ev:0]. B [ev:1]. C [ev:2]." },
+      finished,
     ];
     const root = await mount(<AgentConsole events={events} reasoning={false} debug={false} />);
-    await until(() => requests.length === 2);
-    await act(async () => { });
+    await until(() => root.querySelectorAll('[aria-label^="Original source unavailable:"]').length === 3);
+    expect(requests).toEqual(sources.map((source) => sourceUrl(source.id)));
     expect(sourceCards(root)).toEqual([
-      ["Reference title", ["View in Stockbot", "#/source/evidence%3Aa", "_blank", "noopener noreferrer"]],
-      ["FINRA 2", ["View in Stockbot", "#/source/evidence%3Ab", "_blank", "noopener noreferrer"]],
+      ["Reference title", ["View provenance", "#/source/evidence%3Aa", "_blank", "noopener noreferrer"]],
+      ["FINRA 2", ["View provenance", "#/source/evidence%3Ab", "_blank", "noopener noreferrer"]],
+      ["FINRA 3", ["View provenance", "#/source/evidence%3Ac", "_blank", "noopener noreferrer"]],
     ]);
-    expect([...root.querySelectorAll('a[aria-label^="Open source:"]')].map((anchor) => [anchor.textContent, anchor.getAttribute("title")])).toEqual([["[1]", "Reference title"], ["[2]", "FINRA 2"]]);
-    expect(root.textContent).not.toContain("ev:a");
+    expect([...root.querySelectorAll('[aria-label^="Original source unavailable:"]')].map((chip) => [chip.textContent, chip.getAttribute("title")])).toEqual([
+      ["[1]", "Reference title — Original source unavailable"],
+      ["[2]", "FINRA 2 — Original source unavailable"],
+      ["[3]", "FINRA 3 — Original source unavailable"],
+    ]);
+    expect(root.querySelectorAll('[aria-label="Captured sources"] [role="status"]')).toHaveLength(3);
+    expect(root.querySelector('a[aria-label^="Open source:"]')).toBeNull();
+    expect(hrefs(root).every((href) => href.startsWith("#/source/"))).toBe(true);
+    expect(root.textContent).not.toContain("ev:0");
+  });
+
+  test("calculation citations keep audit access without borrowing an input original", async () => {
+    const requests = serve({ body: CALCULATION });
+    const finished: AgentEvent = { type: "done", metrics: { totalMs: 1, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: 1 }, evidence: { count: 0, characters: 0 }, failures: {} } };
+    const events: AgentEvent[] = [
+      { type: "evidence", evidence: [{ id: "ev:calc", source: "sec", retrievedAt: "", content: "", sources: [{ id: CALCULATION.id, url: TEXT.originalUrl }] }] },
+      { type: "answer_delta", text: "Calculated revenue is 3481 [ev:calc]." },
+      finished,
+    ];
+    const root = await mount(<AgentConsole events={events} reasoning={false} debug={false} />);
+    await until(() => root.querySelector('[aria-label^="Original source unavailable:"]') !== null);
+    expect(requests).toEqual([sourceUrl(CALCULATION.id)]);
+    expect(sourceCards(root)).toEqual([["Stockbot · Non-data-center revenue", ["View provenance", "#/source/evidence%3Apanel%3Acalc", "_blank", "noopener noreferrer"]]]);
+    expect(hrefs(root)).toEqual(["#/source/evidence%3Apanel%3Acalc"]);
+    expect(root.querySelector('[aria-label^="Original source unavailable:"]')?.textContent).toBe("[1]");
+    expect(root.querySelector('[aria-label="Captured sources"] [role="status"]')?.textContent).toBe("Original source unavailable");
   });
 
   test("rejects a provider-extracted PDF before it reaches the PDF renderer", async () => {

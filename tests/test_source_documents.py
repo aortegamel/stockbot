@@ -7,12 +7,13 @@ import re
 import tempfile
 import warnings
 from collections.abc import Callable, Mapping
+from html import escape
 from pathlib import Path
 from typing import override
 from urllib.parse import unquote
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import given, seed, settings
 from hypothesis import strategies as st
 
 from app.research import sources as _sources
@@ -950,8 +951,159 @@ def test_web_evidence_reads_pinned_provider_content(tmp_path: Path) -> None:
         "toolResultId": "tr-1",
         "toolArgs": arguments,
         "originalUrl": "https://example.com/a",
-        "linkStatus": "stockbot_render",
+        "linkStatus": "highlighted_original",
+        "highlightUrl": "https://example.com/a#:~:text=quoted%20excerpt",
     }
+
+
+@pytest.mark.parametrize(
+    ("content", "quoted", "representation", "url", "fragment"),
+    [
+        ("Intro\nRevenue rose.\nEnd", "Revenue rose.", "text", "https://example.com/a", "#:~:text=Revenue%20rose."),
+        (
+            "<p>Revenue <strong>rose</strong>.</p>",
+            "Revenue rose.",
+            "html",
+            "https://example.com/a",
+            "#:~:text=Revenue%20rose.",
+        ),
+        (
+            "<span>café &amp; costs, a-b</span>",
+            "café & costs, a-b",
+            "html",
+            "https://example.com/a",
+            "#:~:text=caf%C3%A9%20%26%20costs%2C%20a%2Db",
+        ),
+        (
+            "<p>Revenue rose.</p>",
+            "Revenue rose.",
+            "text",
+            "https://example.com/a#quarter%202",
+            "#quarter%202:~:text=Revenue%20rose.",
+        ),
+        ("<p>Revenue rose.</p>", "<p>Revenue rose.</p>", "html", "https://example.com/a", None),
+        ("<p>Revenue &amp; costs</p>", "Revenue &amp; costs", "html", "https://example.com/a", None),
+        ('<p title="Revenue rose.">Other text</p>', "Revenue rose.", "html", "https://example.com/a", None),
+        ("<script>Revenue rose.</script><p>Other text</p>", "Revenue rose.", "html", "https://example.com/a", None),
+        ("<style>Revenue rose.</style><p>Other text</p>", "Revenue rose.", "html", "https://example.com/a", None),
+        ("<head>Revenue rose.</head><p>Other text</p>", "Revenue rose.", "html", "https://example.com/a", None),
+        ("<title>Revenue rose.</title><p>Other text</p>", "Revenue rose.", "html", "https://example.com/a", None),
+        ("<template>Revenue rose.</template><p>Other text</p>", "Revenue rose.", "html", "https://example.com/a", None),
+        ("<noscript>Revenue rose.</noscript><p>Other text</p>", "Revenue rose.", "html", "https://example.com/a", None),
+        (
+            "<template><template>Other</template>Revenue rose.</template><p>Other text</p>",
+            "Revenue rose.",
+            "html",
+            "https://example.com/a",
+            None,
+        ),
+        ("<p hidden>Revenue rose.</p><p>Other text</p>", "Revenue rose.", "html", "https://example.com/a", None),
+        (
+            '<p style="display:none">Revenue rose.</p><p>Other text</p>',
+            "Revenue rose.",
+            "html",
+            "https://example.com/a",
+            None,
+        ),
+        ("<p>Other text</p>", "Missing quote", "html", "https://example.com/a", None),
+        ("Revenue", "", "text", "https://example.com/a", None),
+        ("Revenue rose. Revenue rose.", "Revenue rose.", "text", "https://example.com/a", None),
+        ("Revenue rose. REVENUE ROSE.", "Revenue rose.", "text", "https://example.com/a", None),
+        ("<p>Item 1</p><p>Revenue</p><p>Item 2</p><p>Revenue</p>", "Revenue", "html", "https://example.com/a", None),
+        ("Revenues rose.", "Revenue", "text", "https://example.com/a", None),
+        ("Revenue rose.", "Revenue rose.", "text", "https://example.com/a.pdf", None),
+        ("Revenue rose.", "Revenue rose.", "text", "https://example.com/a.PDF?download=1#page=4", None),
+        ("Revenue rose.", "Revenue rose.", "text", "https://example.com/a%2Epdf#page=4", None),
+        ("Revenue rose.", "Revenue rose.", "text", "https://example.com/a#:~:text=Other", None),
+    ],
+)
+def test_web_original_highlight_uses_only_unique_visible_provider_text(
+    content: str, quoted: str, representation: str, url: str, fragment: str | None, tmp_path: Path
+) -> None:
+    """A web highlight preserves the original anchor and exact capture without markup or invented PDF locations."""
+    provenance = {
+        "kind": "web_source",
+        "url": url,
+        "excerpt": quoted,
+        "source_content": content,
+        "source_representation": representation,
+        "tool_result_id": "tr-web",
+    }
+    repo = _Repo(
+        {"ev-web": {"evidence_id": "ev-web", "session_id": "s", "provenance": provenance}},
+        {
+            "tr-web": {
+                "tool_name": "search_web",
+                "session_id": "s",
+                "result": {"evidence": [{"url": url, "highlight": quoted}]},
+            }
+        },
+    )
+    document = read_source_document("evidence:ev-web", data_root=tmp_path, repo=repo)
+    assert document["originalUrl"] == url
+    assert document["content"] == content
+    assert document["contentHash"] == raw_archive.content_hash(content.encode())
+    assert document["quote"] == quoted
+    assert document["representation"] == representation
+    assert repo.get_evidence("ev-web")["provenance"] == provenance
+    if fragment is None:
+        assert document["linkStatus"] == "stockbot_render"
+        assert "highlightUrl" not in document
+    else:
+        assert document["linkStatus"] == "highlighted_original"
+        assert document["highlightUrl"] == url.partition("#")[0] + fragment
+
+
+@pytest.mark.parametrize("url", ["javascript:alert(1)", "file:///tmp/source", "https://user:secret@example.com/a"])
+def test_web_unsafe_original_has_no_highlight(url: str, tmp_path: Path) -> None:
+    provenance = {
+        "kind": "web_source",
+        "url": url,
+        "excerpt": "Revenue rose.",
+        "source_content": "Revenue rose.",
+        "tool_result_id": "tr-web",
+    }
+    repo = _Repo(
+        {"ev-web": {"evidence_id": "ev-web", "session_id": "s", "provenance": provenance}},
+        {
+            "tr-web": {
+                "tool_name": "search_web",
+                "session_id": "s",
+                "result": {"evidence": [{"url": url, "highlight": "Revenue rose."}]},
+            }
+        },
+    )
+    document = read_source_document("evidence:ev-web", data_root=tmp_path, repo=repo)
+    assert document["linkStatus"] == "missing"
+    assert not {"originalUrl", "highlightUrl"} & document.keys()
+
+
+@seed(2119)
+@settings(max_examples=100, deadline=None)
+@given(
+    st.lists(st.sampled_from(["Revenue", "81,615", "a-b", "x&y", "café", "東京", "100%"]), min_size=1, max_size=8),
+    st.sampled_from(["", "quarter%202", "caf%C3%A9"]),
+)
+def test_prop_web_highlights_encode_visible_text_without_changing_capture(words: list[str], anchor: str) -> None:
+    """Readable HTML quotes produce encoded directives while captures retain their exact bytes and identity."""
+    quoted = " ".join(words)
+    content = "<p>" + " ".join(f"<strong>{escape(word)}</strong>" for word in words) + "</p>"
+    url = "https://example.com/a" + ("#" + anchor if anchor else "")
+    row = {"url": url, "highlight": quoted, "source_content": content, "source_representation": "html"}
+    with tempfile.TemporaryDirectory() as tmp:
+        with capture_scope(tmp) as first:
+            capture_result("search_web", {"evidence": [row]})
+        document = read_source_document(first[0]["id"], data_root=Path(tmp))
+        with capture_scope(tmp) as repeated:
+            capture_result("search_web", {"evidence": [row]})
+    assert first == repeated
+    assert document["content"] == content
+    assert document["contentHash"] == raw_archive.content_hash(content.encode())
+    assert document["originalUrl"] == url
+    assert document["linkStatus"] == "highlighted_original"
+    fragment = "#" + anchor + ":~:text=" + _sources._term(quoted)
+    assert document["highlightUrl"] == "https://example.com/a" + fragment
+    assert _sources._fragment_ranges(quoted, fragment) == [(0, len(quoted))]
 
 
 def _record_evidence(kind: str, tool: str, row: Mapping[str, object], **extra: object) -> dict[str, object]:
@@ -1585,7 +1737,8 @@ def test_regweb_capture_pins_exact_provider_bytes_with_hash(tmp_path: Path, monk
     assert document["quote"] == "NVDA demand rises"
     assert document["content"] == "NVDA demand rises across the quarter."
     assert document["contentHash"] == raw_archive.content_hash(document["content"].encode())
-    assert document["linkStatus"] == "stockbot_render"
+    assert document["linkStatus"] == "highlighted_original"
+    assert document["highlightUrl"] == "https://example.com/nvda#:~:text=NVDA%20demand%20rises"
 
 
 def test_regweb_pinned_content_never_substitutes_today_text(tmp_path: Path) -> None:

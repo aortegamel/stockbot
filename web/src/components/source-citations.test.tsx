@@ -22,7 +22,7 @@ const SEC_SOURCE = { id: "capture:0123456789abcdef0123456789abcdef0123456789abcd
 const SEC_HREF = `#/source/${encodeURIComponent(SEC_SOURCE.id)}`;
 
 describe("AgentConsole source citations", () => {
-  test("known ids in answer text become numbered links to the provenance page in prod", () => {
+  test("known ids keep numbered loading chips until the resolver returns", () => {
     const events: AgentEvent[] = [
       { type: "agent_start", prompt: "risk?" },
       { type: "evidence", evidence: [evidence("ev:abc123", [SEC_SOURCE])] },
@@ -30,8 +30,9 @@ describe("AgentConsole source citations", () => {
       { type: "done", metrics: metrics() },
     ];
     const out = renderToStaticMarkup(<AgentConsole events={events} reasoning={true} debug={false} />);
-    expect(out).toContain(`<a href="${SEC_HREF}" target="_blank" rel="noopener noreferrer" title="10-K" aria-label="Open source: 10-K"`);
-    expect(out).toContain(">[1]</a>");
+    expect(out).toContain(`<span title="10-K — Loading original source…" aria-label="Loading original source…: 10-K"`);
+    expect(out).toContain(">[1]</span>");
+    expect(out).not.toContain('aria-label="Open source:');
     expect(out).not.toContain("ev:abc123");
   });
 
@@ -55,10 +56,10 @@ describe("AgentConsole source citations", () => {
       { type: "done", metrics: metrics() },
     ];
     const out = renderToStaticMarkup(<AgentConsole events={events} reasoning={true} debug={false} />);
-    expect(out).toContain(`<span class="text-xs text-zinc-500">Sources:</span><span class="flex items-center gap-2 rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-300"><span>10-K</span><a href="${SEC_HREF}" target="_blank" rel="noopener noreferrer" class="text-blue-300 underline">View in Stockbot</a></span>`);
+    expect(out).toContain(`<span class="text-xs text-zinc-500">Sources:</span><span class="flex items-center gap-2 rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-300"><span>10-K</span><span role="status" class="text-zinc-500">Loading original source…</span><a href="${SEC_HREF}" target="_blank" rel="noopener noreferrer" class="text-blue-300 underline">View provenance</a></span>`);
     expect(out.match(/aria-label="Captured sources"[\s\S]*?<\/div>/)?.[0].match(/<a /g)).toHaveLength(1);
     expect(out).toContain("<span>[2]</span>");
-    expect(out.match(/aria-label="Open source:/g)).toHaveLength(1);
+    expect(out.match(/aria-label="Loading original source…:/g)).toHaveLength(1);
     expect(out).not.toContain("ev:abc12");
   });
 
@@ -84,8 +85,8 @@ describe("AgentConsole source citations", () => {
       { type: "done", metrics: metrics() },
     ];
     const out = renderToStaticMarkup(<AgentConsole events={events} reasoning={true} debug={false} />);
-    expect(out.match(/aria-label="Open source:/g)).toHaveLength(1);
-    expect(out).toContain(">[1]</a><span>, stale [ev:abc123].</span>");
+    expect(out.match(/aria-label="Loading original source…:/g)).toHaveLength(1);
+    expect(out).toContain(">[1]</span><span>, stale [ev:abc123].</span>");
   });
 
   // A gated research answer: prose, then the claim inventory, then done.
@@ -99,12 +100,12 @@ describe("AgentConsole source citations", () => {
     ];
     return renderToStaticMarkup(<AgentConsole events={events} reasoning={true} debug={false} />);
   }
-  const chip = (n: number): string => `<a href="${SEC_HREF}" target="_blank" rel="noopener noreferrer" title="10-K" aria-label="Open source: 10-K" class="rounded border border-blue-800 px-1 text-blue-300 underline decoration-dotted hover:bg-blue-950">[${n}]</a>`;
+  const chip = (n: number): string => `<span title="10-K — Loading original source…" aria-label="Loading original source…: 10-K" class="rounded border border-zinc-700 px-1 text-zinc-400">[${n}]</span>`;
 
   test("a claim with evidence ids gets a numbered chip after its first exact occurrence", () => {
     const out = claimed("Risk grew this year. Risk grew again.", [{ text: "Risk grew", claimType: "observed_fact", evidenceIds: ["ev:abc123"] }]);
     expect(out).toContain(`<span>Risk grew</span>${chip(1)}<span> this year. Risk grew again.</span>`);
-    expect(out.match(/\[1\]<\/a>/g)).toHaveLength(1);
+    expect(out.match(/\[1\]<\/span>/g)).toHaveLength(1);
   });
 
   test("unmatched claim text, empty evidence ids, and unknown ids add no chip", () => {
@@ -124,7 +125,7 @@ describe("AgentConsole source citations", () => {
       { text: "Risk grew", claimType: "observed_fact", evidenceIds: ["ev:abc123"] },
       { text: "Revenue fell", claimType: "observed_fact", evidenceIds: ["ev:abc124"] },
     ]);
-    expect(out.match(/>\[1\]<\/a>/g)).toHaveLength(1);
+    expect(out.match(/>\[1\]<\/span>/g)).toHaveLength(1);
     expect(out).toContain(`${chip(1)}<span>. Revenue fell</span>${chip(2)}<span>.</span>`);
   });
 });

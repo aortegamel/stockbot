@@ -9,6 +9,10 @@ Viewer reads of SEC/FINRA record sources fetch the official page once on first
 view (``resolve_sec_official`` / ``resolve_finra_official``). The resolver
 archives those exact bytes, and every later read uses the archived bytes.
 
+Web highlights use unique quotes in held provider content after visible-text
+extraction. Snippets and PDF URLs keep their original links without a new
+highlight. Extraction never changes the captured content or its hash.
+
 Citation labels (:func:`read_source_label`) read persisted metadata only: no
 replay, no official page, no network. :func:`read_source_view` is the viewer
 entry: ordinary failures become a controlled error state with one internal
@@ -860,6 +864,29 @@ def _quote_fragment(document: Mapping[str, object], basis: str, anchor: str) -> 
     return _text_fragment(basis, at, at + len(quoted), anchor) if quoted and at >= 0 else None
 
 
+def _web_fragment(document: Mapping[str, object], original: str) -> str | None:
+    """Highlight a unique quote in held provider text. Preserve snippet and PDF links without a highlight."""
+    from app.sec.documents import _render_text
+
+    parsed = urlparse(original)
+    if (
+        not original
+        or document.get("captureKind") != "provider_extraction"
+        or unquote(parsed.path).lower().endswith(".pdf")
+        or ":~:" in parsed.fragment
+    ):
+        return None
+    # Mark non-rendered web containers hidden for the existing parser. Keep the captured bytes unchanged.
+    content = re.sub(
+        r"<(head|title|template|noscript)\b", r"<\1 hidden", _text(document, "content"), flags=re.IGNORECASE
+    )
+    basis = _render_text(content)
+    quoted = _text(document, "quote")
+    if not quoted or len(_occurrences(basis, quoted)) != 1:
+        return None
+    return _quote_fragment(document, basis, unquote(parsed.fragment))
+
+
 def _pdf_url(source_id: str) -> str:
     return f"/api/research/sources/{quote(source_id, safe='')}/pdf"
 
@@ -1066,15 +1093,14 @@ def read_source_document(source_id: str, *, data_root: Path | None = None, repo:
         # Never one arbitrary original for a calculation: its audit links each input record instead.
         original, fragment = "", None
     else:
-        # Web sources verify against the persisted highlight only: the provider extraction or
-        # excerpt text renders verbatim, never today's page text (no verified highlight).
-        original, fragment = _url(_text(document, "url")), None
+        original = _url(_text(document, "url"))
+        fragment = _web_fragment(document, original)
         missing = ("PUBLIC_PAGE_UNAVAILABLE", "web source has no page URL")
     if original:
         document["originalUrl"] = original
         document["linkStatus"] = "highlighted_original" if fragment else "stockbot_render"
         if fragment:
-            document["highlightUrl"] = original + fragment
+            document["highlightUrl"] = original.partition("#")[0] + fragment
     else:
         document["linkStatus"] = "missing"
         if missing[1]:
