@@ -14,8 +14,7 @@ const WORKER_TIMEOUT_MS = 10 * 60 * 1000;
 // Research wall: the one worker run gets 120s from the request start. Persona
 // generation, retries, and synthesis run with no time limit.
 export const REQUEST_WALL_MS = 120_000;
-// A hung preview must never hold the answer hostage: bound the wait, drop late previews.
-const BRIEF_TIMEOUT_MS = 20_000;
+// ponytail: no early preview exists; progress stays the indicator until research finishes.
 const PREWARM_TIMEOUT_MS = 120_000;
 
 const ROOT =
@@ -278,11 +277,13 @@ function inventoryCorrection(validIds: readonly string[], prose: string, claims:
     `Rejected inventory:\n${JSON.stringify(claims.map(toWireClaim))}`,
   ].join("\n");
 }
-// Gate context: every op carries the evidence rows verbatim, and the session
+// Gate context: every op carries the evidence rows, and the session
 // travels with them so the worker judges against this run's persisted rows.
+// Full canonical descriptors ride beside each row; the claim still cites only ids.
+type GateEvidenceRow = { id: string; content: string; datapoints?: { id: string; metric: string; value: string; entity: string; period: string; unit?: string; statement: string }[] };
 type FinalGateContext = {
   gate: FinalGateCaller;
-  evidence: { id: string; content: string }[];
+  evidence: GateEvidenceRow[];
   sessionId?: string;
   opts?: { signal?: AbortSignal; timeoutMs?: number };
 };
@@ -371,7 +372,23 @@ async function gatePersonas(results: FinalPersonaResult[], opts: GateOptions): P
   const points = datapointRows(opts.evidence);
   const ctx: FinalGateContext = {
     gate: opts.gate,
-    evidence: opts.evidence.map((e) => ({ id: e.id, content: e.content })),
+    evidence: opts.evidence.map((e) => ({
+      id: e.id,
+      content: e.content,
+      ...((e.datapoints?.length ?? 0) > 0
+        ? {
+          datapoints: (e.datapoints ?? []).map((p) => ({
+            id: p.id,
+            metric: p.metric,
+            value: p.value,
+            entity: p.entity,
+            period: p.period,
+            ...(p.unit !== undefined ? { unit: p.unit } : {}),
+            statement: p.statement,
+          })),
+        }
+        : {}),
+    })),
     ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
     opts: opts.gateOpts,
   };
@@ -390,8 +407,8 @@ export async function applyFinalGates(opts: GateOptions & { results: FinalPerson
   const gated = await gatePersonas(opts.results, opts);
   return Array.isArray(gated) ? assembleGated(gated, opts.personaOrder) : gated;
 }
-// One unlabeled answer through the same gates: the route's single-tool answer
-// and the early brief. Buffer the answer, gate it, then emit the kept text.
+// One unlabeled answer through the same gates: the route's single-tool answer.
+// Buffer the answer, gate it, then emit the kept text.
 export async function gateAnswer(opts: GateOptions & { result: FinalPersonaResult }): Promise<{ text: string } | { failure: string }> {
   const gated = await gatePersonas([opts.result], opts);
   return Array.isArray(gated) ? { text: gated[0]?.text ?? "" } : gated;
@@ -764,11 +781,6 @@ type KernelRun = {
   usage: MuseUsage;
   timings: Timings;
   spent: { outputTokens: number };
-  briefAt: number | undefined;
-  briefRows: Evidence[] | undefined;
-  briefPromise: Promise<string | undefined> | undefined;
-  briefText: string | undefined;
-  briefExpired: boolean;
 };
 
 // One answer pass: the reasoner stages plus the drafts that the gate stage reads.
@@ -943,76 +955,43 @@ function endTerminal(run: KernelRun): void {
 
 // Every in-flight worker call carries the request signal when the route sent one,
 // and relays worker progress with a detail only when the worker sent one.
+function trackWorkerTiming(run: KernelRun, stage: string, detail: Record<string, unknown> | undefined): void {
+  const fields = Object.hasOwn(WORKER_TIMINGS, stage) ? WORKER_TIMINGS[stage] : [];
+  for (const [field, key] of fields) addTiming(run, key, detail?.[field]);
+}
+
+function relayWidgetUpdate(run: KernelRun, stage: string, detail: Record<string, unknown> | undefined): void {
+  if (stage === "chart_update") {
+    const ticker = parseTicker(detail?.ticker);
+    if (ticker !== undefined) {
+      if (run.scope.watchlist === undefined) run.currentChartTicker = ticker;
+      run.emit({ type: "chart_update", ticker });
+    }
+    return;
+  }
+  const ticker = parseTicker(detail?.ticker);
+  const widgetType = detail?.widgetType;
+  if (ticker !== undefined && ticker === detail?.ticker && typeof widgetType === "string" && WIDGET_TYPES.includes(widgetType)) {
+    run.emit({ type: "widget_update", ticker, widgetType });
+  }
+}
+
+function relayWorkerEvent(run: KernelRun, stage: string, detail: Record<string, unknown> | undefined): void {
+  if (stage === "session" && typeof detail?.session_id === "string" && detail.session_id) run.sessionId = detail.session_id;
+  run.emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage });
+  const status = workerStatus(stage, detail);
+  if (status !== undefined) run.emit(statusEvent(status));
+}
+
 function workerCallOpts(run: KernelRun, timeoutMs: number): { signal?: AbortSignal; timeoutMs: number; onProgress: (stage: string, detail?: Record<string, unknown>) => void } {
   const onProgress = (stage: string, detail?: Record<string, unknown>): void => {
-    const fields = Object.hasOwn(WORKER_TIMINGS, stage) ? WORKER_TIMINGS[stage] : [];
-    for (const [field, key] of fields) addTiming(run, key, detail?.[field]);
-    if (stage === "chart_update") {
-      const ticker = parseTicker(detail?.ticker);
-      if (ticker !== undefined) {
-        if (run.scope.watchlist === undefined) run.currentChartTicker = ticker;
-        run.emit({ type: "chart_update", ticker });
-      }
+    trackWorkerTiming(run, stage, detail);
+    if (stage === "chart_update" || stage === "widget_update") {
+      relayWidgetUpdate(run, stage, detail);
       return;
     }
-    if (stage === "widget_update") {
-      const ticker = parseTicker(detail?.ticker);
-      const widgetType = detail?.widgetType;
-      if (ticker !== undefined && ticker === detail?.ticker && typeof widgetType === "string" && WIDGET_TYPES.includes(widgetType)) {
-        run.emit({ type: "widget_update", ticker, widgetType });
-      }
-      return;
-    }
-    // The worker names its session before intake; the brief gates against it.
-    if (stage === "session" && typeof detail?.session_id === "string" && detail.session_id) run.sessionId = detail.session_id;
-    if (stage === "intake_evidence" && run.briefPromise === undefined) startBrief(run, detail);
-    run.emit(detail !== undefined ? { type: "progress", stage, detail } : { type: "progress", stage });
-    const status = workerStatus(stage, detail);
-    if (status !== undefined) run.emit(statusEvent(status));
+    relayWorkerEvent(run, stage, detail);
   };
-
-  // Early brief: one short stockbot call over the intake rows while the nodes
-  // continue. Buffered, gated, then shown. Never throws; a failed or rejected
-  // brief leaves no trace.
-  function startBrief(run: KernelRun, detail: Record<string, unknown> | undefined): void {
-    const rows = kernelEvidence(detail?.evidence);
-    if (rows.length === 0) return;
-    run.briefRows = rows;
-    run.briefAt = performance.now();
-    run.briefPromise = (async (): Promise<string | undefined> => {
-      try {
-        const started = performance.now();
-        // r.prose already has the inventory fence stripped; r.claims are unproven until the gates keep them.
-        const r = await measuredReason(run, {
-          prompt: `${run.prompt}\n\nBrief: say what the sources below establish so far, citing their ids. Two sentences max.`,
-          ...(run.scope.watchlist === undefined && run.currentChartTicker !== undefined ? { ticker: run.currentChartTicker } : {}),
-          evidence: rows,
-          // Non-direct: the EVIDENCE section and the inventory rule are included so ids exist to cite.
-          direct: false,
-          persona: "stockbot",
-          objective: run.objective,
-          nodes: [],
-          decisions: [],
-          ...(run.signal ? { signal: run.signal } : {}),
-          spent: run.spent,
-        });
-        run.museCalls += 1;
-        run.museMs += performance.now() - started;
-        const gated = await gateAnswer({
-          result: { persona: "stockbot", prose: r.prose, claims: r.claims, ...(r.confidence !== undefined ? { confidence: r.confidence } : {}) },
-          evidence: rows,
-          ...(run.sessionId ? { sessionId: run.sessionId } : {}),
-          gate: (body, gateOpts) => run.router.call(body, { ...(run.signal ? { signal: run.signal } : {}), ...gateOpts }),
-        });
-        if ("failure" in gated) return undefined;
-        if (run.briefExpired) return undefined;
-        run.emit({ type: "answer_delta", text: gated.text });
-        return gated.text;
-      } catch {
-        return undefined;
-      }
-    })();
-  }
   return { ...(run.signal ? { signal: run.signal } : {}), timeoutMs, onProgress };
 }
 
@@ -1156,7 +1135,6 @@ async function researchPass(run: KernelRun): Promise<boolean> {
   adoptFirst(run, res);
   if (typeof res.error === "string" && res.error) {
     endFailed(run, "needle", "provider_error", res.error);
-    run.briefExpired = true;
     return false;
   }
   // The replay settles whether a tool failure is already disclosed before the
@@ -1164,20 +1142,9 @@ async function researchPass(run: KernelRun): Promise<boolean> {
   replayTools(run, run.toolDecisions, run.toolCalls);
   if (run.terminal !== undefined) {
     endTerminal(run);
-    run.briefExpired = true;
     return false;
   }
   // The preview never holds the replayed calls or the answer: bound the wait, drop late previews.
-  if (run.briefPromise !== undefined) {
-    const gate: { promise: Promise<string | undefined>; resolve: (value: string | undefined) => void } = Promise.withResolvers<string | undefined>();
-    const timer = setTimeout(gate.resolve, BRIEF_TIMEOUT_MS, undefined);
-    try {
-      run.briefText = (await Promise.race([run.briefPromise, gate.promise])) ?? undefined;
-    } finally {
-      clearTimeout(timer);
-    }
-    if (run.briefText === undefined) run.briefExpired = true;
-  }
   return true;
 }
 
@@ -1336,12 +1303,6 @@ function endStageFailure(run: KernelRun, pass: Pass): boolean {
 
 // A research answer is gated before display; a direct answer keeps only its explicitly
 // qualified evidence-free unknown/assumption claims. Neither announces gaps.
-// Briefed and nothing new: the brief already answered over these rows.
-function briefCoversAll(run: KernelRun): boolean {
-  return run.briefText !== undefined && run.briefRows !== undefined
-    && run.evidence.every((e) => run.briefRows?.some((b) => b.id === e.id));
-}
-
 async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
   const results = pass.results;
   if (run.direct || results === undefined) {
@@ -1353,12 +1314,7 @@ async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
       return;
     }
     const blocks = kept.map((k) => `── ${k.persona.charAt(0).toUpperCase()}${k.persona.slice(1)} ──\n${k.text}`);
-    if (briefCoversAll(run) && blocks.length === 0) {
-      offerTrio(run);
-      run.emit({ type: "done", metrics: metricsOf(run, run.escalations) });
-      return;
-    }
-    endReport(run, (run.briefText !== undefined ? "── Full answer ──\n" : "") + blocks.join("\n\n"));
+    endReport(run, blocks.join("\n\n"));
     return;
   }
   const order: Persona[] = run.isTrio ? ["bearbot", "bullbot", "stockbot"] : [...run.personas];
@@ -1377,12 +1333,7 @@ async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
     endFailed(run, "muse", "provider_error", gated.failure);
     return;
   }
-  if (briefCoversAll(run)) {
-    offerTrio(run);
-    run.emit({ type: "done", metrics: metricsOf(run, run.escalations) });
-    return;
-  }
-  run.emit({ type: "answer_delta", text: (run.briefText !== undefined ? "── Full answer ──\n" : "") + gated.text });
+  run.emit({ type: "answer_delta", text: gated.text });
   offerTrio(run);
   // The inventory claims the gates kept: each text still stands in the shown answer.
   const claims = results.flatMap((r) => r.claims.filter((c) => c.text !== "" && gated.text.includes(c.text)));
@@ -1518,11 +1469,6 @@ function openRun(prompt: string, emit: (e: AgentEvent) => void, opts: KernelRunO
     usage: {},
     timings: {},
     spent: { outputTokens: 0 },
-    briefAt: undefined,
-    briefRows: undefined,
-    briefPromise: undefined,
-    briefText: undefined,
-    briefExpired: false,
   };
 }
 

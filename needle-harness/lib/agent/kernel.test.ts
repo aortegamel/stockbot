@@ -738,7 +738,7 @@ describe("runKernelAgent final personas", () => {
     }
   });
 
-  test("intake evidence starts a brief first; the full answer follows below a divider", async () => {
+  test("intake evidence shows progress and emits only the final gated answer", async () => {
     const progress = (id: string, stage: string, detail: Record<string, unknown>): string => `${JSON.stringify({ type: "progress", id, stage, detail })}\n`;
     const { events, calls } = await runFinal({
       personas: ["stockbot"],
@@ -746,35 +746,14 @@ describe("runKernelAgent final personas", () => {
         progress(id, "intake_evidence", { evidence: [{ id: "ev:0", content: "intake fact" }] }) +
         sessionGraphReply(id),
     });
-    const brief = calls.find((c) => c.input.direct === false && c.input.persona === "stockbot" && !("drafts" in c.input));
-    expect(brief?.input.evidence.map((e) => e.id)).toEqual(["ev:0"]);
+    expect(calls.every((c) => c.pass === 1)).toBe(true);
+    expect(calls.map((c) => c.input.persona)).toEqual(["stockbot"]);
+    expect(calls[0]?.input.evidence.map((e) => e.id)).toEqual(["ev:1"]);
     const deltas = answers(events);
-    // Buffered brief: one delta with the stripped text, not streamed draft fragments.
-    expect(deltas[0]).toContain("stockbot p");
-    expect(deltas.at(-1)).toMatch(/^── Full answer ──\n/);
-  });
-
-  test("the early brief is gated against the worker session before display; a rejected brief leaves no trace", async () => {
-    const progress = (id: string, stage: string, detail: Record<string, unknown>): string => `${JSON.stringify({ type: "progress", id, stage, detail })}\n`;
-    const brief = "Brief says 42 units.";
-    const { events, gates } = await runFinal({
-      personas: ["stockbot"],
-      reply: (id) =>
-        progress(id, "session", { session_id: "rs:live" }) +
-        progress(id, "intake_evidence", { evidence: [{ id: "ev:0", content: "intake fact" }] }) +
-        sessionGraphReply(id),
-      // The brief (pass 0) states an uninventoried number; the gate passes the wording, the number still drops.
-      decide: (_p, pass) => (pass === 0 ? { text: brief, claims: [] } : {}),
-    });
-    const briefGate = gates.find((g) => g.text === brief);
-    expect(briefGate).toMatchObject({ op: "assess_final_response", sessionId: "rs:live", persona: "stockbot", evidence: [{ id: "ev:0", content: "intake fact" }] });
-    const deltas = answers(events);
-    expect(deltas.some((d) => d.includes("42"))).toBe(false);
-    // No brief shown, so the full answer carries no divider.
     expect(deltas).toEqual([`${label("stockbot")}\nstockbot p1`]);
   });
 
-  test("a brief over the full evidence ends the stream with no second answer", async () => {
+  test("research emits progress, then one gated answer and done without showing research text early", async () => {
     const progress = (id: string, stage: string, detail: Record<string, unknown>): string => `${JSON.stringify({ type: "progress", id, stage, detail })}\n`;
     const reply = (id: string): string =>
       `${JSON.stringify({ id, objective: "q", sessionId: "s1", evidence: [{ id: "ev:0", content: "intake fact" }], nodes: [], decisions: [], unresolved: [], incomplete_guard: false, toolExecutions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false })}\n`;
@@ -783,7 +762,35 @@ describe("runKernelAgent final personas", () => {
       reply: (id) => progress(id, "intake_evidence", { evidence: [{ id: "ev:0", content: "intake fact" }] }) + reply(id),
     });
     expect(events.filter((e) => e.type === "answer_delta").length).toBe(1);
-    expect(events.map((e) => e.type).slice(-2)).toEqual(["offer_trio", "done"]);
+    expect(events.map((e) => e.type).slice(-3)).toEqual(["offer_trio", "claims", "done"]);
+  });
+
+  test("an explanatory answer keeps facts, qualified significance, unknowns, and numeric descriptors", async () => {
+    const filed = "The 10-Q reports NVDA revenue rose year over year [ev:1].";
+    const significance = "This may matter because rising revenue can support continued profitability [ev:1].";
+    const terminology = "Gross margin means revenue left after direct product costs [ev:1].";
+    const unknown = "The filing does not identify next-quarter results.";
+    const { events, calls, gates } = await runFinal({
+      personas: ["stockbot"],
+      reply: sessionGraphReply,
+      decide: () => ({
+        text: [filed, significance, terminology, unknown].join(" "),
+        claims: [
+          { text: filed, claimType: "inference", evidenceIds: ["ev:1"] },
+          { text: significance, claimType: "inference", evidenceIds: ["ev:1"] },
+          { text: terminology, claimType: "inference", evidenceIds: ["ev:1"] },
+          { text: unknown, claimType: "unknown", evidenceIds: [] },
+        ],
+      }),
+    });
+    expect(calls.map((c) => c.input.persona)).toEqual(["stockbot"]);
+    expect(gates.some((g) => g.op === "assess_final_response" && g.persona === "stockbot")).toBe(true);
+    expect(answers(events)).toHaveLength(1);
+    expect(answers(events)[0]).toContain(filed);
+    expect(answers(events)[0]).toContain(significance);
+    expect(answers(events)[0]).toContain(terminology);
+    expect(answers(events)[0]).toContain(unknown);
+    expect(answers(events)[0]).not.toMatch(/^── Full answer ──\n/);
   });
 
   test("a gated research answer emits its kept claims once, right before done", async () => {
@@ -964,6 +971,27 @@ describe("runKernelAgent final personas", () => {
     expect(out[0]).toContain(supported);
     expect(out[0]).not.toContain(unsupported);
     expect(events.some((e) => e.type === "failed")).toBe(false);
+  });
+
+  test("gate evidence carries datapoint descriptors alongside claim wire ids", async () => {
+    const supported = "NVDA Q3 FY2025 revenue was $10M USD.";
+    const point = { id: "dp:revenue", metric: "revenue", value: "$10M", entity: "NVDA", period: "Q3 FY2025", unit: "USD", statement: supported };
+    const { gates } = await runFinal({
+      personas: ["bearbot"],
+      reply: (id) => `${JSON.stringify({
+        ...JSON.parse(graphReply(id)),
+        evidence: [{ id: "ev:1", content: "fact", datapoints: [point] }],
+      })}\n`,
+      decide: () => ({
+        text: supported,
+        claims: [{ text: supported, claimType: "observed_fact", evidenceIds: ["ev:1"], datapointIds: ["dp:revenue"] }],
+      }),
+      gate: (body) => {
+        expect(body.evidence).toEqual([{ id: "ev:1", content: "fact", datapoints: [point] }]);
+        return { support_answer: "yes" };
+      },
+    });
+    expect(gates.map((g) => g.op)).toEqual(["assess_final_response"]);
   });
 
   test("drafts, a failed-draft retry, and stockbot synthesis finish past the research wall with the request signal", async () => {

@@ -255,7 +255,6 @@ _INTAKE_MATERIAL_FAMILIES = tuple(sorted(f) for f in (_BASELINE_QUARTERLY, _BASE
 _INTAKE_MATERIAL_FORMS = _BASELINE_QUARTERLY | _BASELINE_ANNUAL | _BASELINE_CURRENT
 _INTAKE_INSIDER_FORMS = ("3", "3/A", "4", "4/A", "5", "5/A")
 _INTAKE_INSIDER_LIMIT = 10
-_INTAKE_MAX_DOCS = 2
 _INTAKE_SEC_LIMIT = 5
 _INTAKE_DIGEST_CHARS = 6000
 _INTAKE_MAX_ROUNDS = 2
@@ -264,7 +263,7 @@ _INTAKE_CALL_TIMEOUT_S = 8.0
 _INTAKE_BUDGET_S = 8.0
 _INTAKE_REASONER_TIMEOUT_S = 20.0
 _INTAKE_DOC_TIMEOUT_S = 5.0
-_INTAKE_DOC_CHARS = 3000
+_INTAKE_DOC_CHARS = 12_000
 # The ticker chain lists each family then reads the newest documents, so the
 # chain cap covers listings plus reads, and the outer settle waits as long.
 # A cap at or below one call starves the reads: listings settle, documents
@@ -526,11 +525,11 @@ async def _intake_ticker_chain(
     as_of: str | None,
     admission: _IntakeAdmission,
 ) -> _IntakeChainRows:
-    """List each filing family (limit=1) in parallel, then read the newest material documents.
+    """List each filing family, then read each retained material document.
 
     Insider activity joins the reads only when the newest insider filing postdates every material row.
     Each call is admitted as it settles, so listing jobs close before the reads start.
-    ponytail: listings (<=8s) plus reads (<=5s) can pass the chain deadline; the chain then logs as one timeout.
+    The chain deadline bounds listings and initial reads. The scheduler assesses any remaining questions.
     """
     ident = _intake_cik(ticker)
     families = [*_INTAKE_MATERIAL_FAMILIES, _INTAKE_INSIDER_FORMS]
@@ -557,8 +556,7 @@ async def _intake_ticker_chain(
     )
     accessions = list(dict.fromkeys(acc for r in material if (acc := _baseline_accession(r)) is not None))
     reads: list[tuple[str, dict[str, object]]] = [
-        ("get_sec_document", {"accession_no": acc, "max_chars": _INTAKE_DOC_CHARS})
-        for acc in accessions[:_INTAKE_MAX_DOCS]
+        ("get_sec_document", {"accession_no": acc, "max_chars": _INTAKE_DOC_CHARS}) for acc in accessions
     ]
     if _intake_insider_newest(listed):
         reads.append(("get_insider_activity", {"ticker": ticker, "limit": _INTAKE_INSIDER_LIMIT}))
@@ -1298,15 +1296,25 @@ def _intake_source_timing(
     return per_source, sec_ms, web_ms
 
 
+def _intake_doc_status(record: Mapping[str, object], payload: Mapping[str, object]) -> str:
+    """Availability of one document call: timeout/error, unavailable text, partial window, or ok."""
+    if record.get("error") is not None or record.get("outcome") is None or payload.get("error") is not None:
+        return "timeout" if record.get("error_type") == "timeout" else "error"
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return "unavailable"
+    return "partial" if payload.get("more_available") or payload.get("warnings") else "ok"
+
+
 def _intake_doc_reads(rows: Sequence[_IntakeCallRow]) -> dict[str, str]:
-    """Document read status per accession (ok, error, timeout); a later attempt overrides an earlier one."""
+    """Document availability per accession. Availability does not establish substantive support."""
     out: dict[str, str] = {}
     for tool, args, record, _ms in rows:
         acc = args.get("accession_no")
         if tool != "get_sec_document" or not isinstance(acc, str):
             continue
-        failed = record.get("error") is not None or record.get("outcome") is None
-        out[acc] = ("timeout" if record.get("error_type") == "timeout" else "error") if failed else "ok"
+        result = record.get("result")
+        out[acc] = _intake_doc_status(record, result if isinstance(result, Mapping) else {})
     return out
 
 
@@ -1315,7 +1323,12 @@ def _intake_document_accessions(admitted: Sequence[Mapping[str, object]]) -> set
     out: set[str] = set()
     for ev in admitted:
         prov = ev.get("provenance")
-        if isinstance(prov, Mapping) and prov.get("kind") == "sec_source":
+        if (
+            isinstance(prov, Mapping)
+            and prov.get("kind") == "sec_source"
+            and isinstance(content := ev.get("content"), str)
+            and content.strip()
+        ):
             acc = _ev_field(ev, "accession_no", "accession", "source_record_id")
             if acc:
                 out.add(acc)
@@ -1325,8 +1338,8 @@ def _intake_document_accessions(admitted: Sequence[Mapping[str, object]]) -> set
 def _intake_unread_material(
     listed: Sequence[Mapping[str, object]], rows: Sequence[_IntakeCallRow], admitted: Sequence[Mapping[str, object]]
 ) -> list[str]:
-    """Listed 10-Q/10-K/8-K accessions with no successful document read and no admitted document content."""
-    read = {acc for acc, status in _intake_doc_reads(rows).items() if status == "ok"}
+    """Listed material accessions without document text. Partial reads still require semantic assessment."""
+    read = {acc for acc, status in _intake_doc_reads(rows).items() if status in {"ok", "partial"}}
     read |= _intake_document_accessions(admitted)
     material = (_baseline_accession(row) for row in listed if _baseline_form(row) in _INTAKE_MATERIAL_FORMS)
     return list(dict.fromkeys(acc for acc in material if acc is not None and acc not in read))
@@ -2480,8 +2493,49 @@ def _final_proof_defect(req: Mapping[str, JSONValue], raw_claims: object) -> str
     return None
 
 
+def _final_datapoint(item: object) -> dict[str, JSONValue] | None:
+    """One validated canonical descriptor; None when malformed, never repaired."""
+    if not isinstance(item, Mapping):
+        return None
+    text = {
+        key: item[key]
+        for key in ("id", "metric", "value", "entity", "period", "unit", "statement")
+        if isinstance(item.get(key), str)
+    }
+    if not str(text.get("id", "")).startswith("dp:"):
+        return None
+    if not all(
+        text.get(key) and str(text[key]).strip() for key in ("metric", "value", "entity", "period", "statement")
+    ):
+        return None
+    point: dict[str, JSONValue] = {
+        key: str(text[key]) for key in ("id", "metric", "value", "entity", "period", "statement")
+    }
+    if isinstance(text.get("unit"), str) and text["unit"].strip():
+        point["unit"] = str(text["unit"])
+    inputs = item.get("inputs")
+    if isinstance(inputs, list):
+        kept: list[JSONValue] = [entry for entry in inputs if isinstance(entry, str) and entry]
+        if kept:
+            point["inputs"] = kept
+    return point
+
+
+def _final_datapoints(rec: Mapping[str, JSONValue]) -> list[JSONValue]:
+    """Validated canonical descriptors of one evidence row; malformed rows drop."""
+    raw = rec.get("datapoints")
+    if not isinstance(raw, list):
+        return []
+    points: list[JSONValue] = []
+    for item in raw:
+        point = _final_datapoint(item)
+        if point is not None:
+            points.append(point)
+    return points
+
+
 def _final_evidence(req: Mapping[str, JSONValue]) -> list[JSONValue]:
-    """Evidence rows narrowed to {id, content}; other keys never cross."""
+    """Evidence rows narrowed to {id, content, datapoints}; other keys never cross."""
     raw = req.get("evidence")
     if not isinstance(raw, list):
         return []
@@ -2493,7 +2547,11 @@ def _final_evidence(req: Mapping[str, JSONValue]) -> list[JSONValue]:
         if not isinstance(eid, str) or not eid.strip():
             continue
         content = rec.get("content")
-        rows.append({"id": eid.strip(), "content": content if isinstance(content, str) else ""})
+        row: dict[str, JSONValue] = {"id": eid.strip(), "content": content if isinstance(content, str) else ""}
+        datapoints = _final_datapoints(rec)
+        if datapoints:
+            row["datapoints"] = datapoints
+        rows.append(row)
     return rows
 
 
@@ -2509,23 +2567,27 @@ def _final_fail(rid: str, message: str) -> dict[str, JSONValue]:
 
 
 def _final_claim_row(item: object) -> dict[str, JSONValue] | None:
-    """One claim narrowed to the four wire fields; None when text or claim_type is blank."""
+    """One claim narrowed to the five wire fields; None when text or claim_type is blank."""
     if not isinstance(item, Mapping):
         return None
     ctext = item.get("text")
     ctype = item.get("claim_type")
     if not isinstance(ctext, str) or not ctext.strip() or not isinstance(ctype, str) or not ctype.strip():
         return None
-    return {
+    row: dict[str, JSONValue] = {
         "text": ctext.strip()[:2000],
         "claim_type": ctype.strip(),
         "evidence_ids": [*_final_ids(item, "evidence_ids")],
         "confidence": _confidence(item.get("confidence")),
     }
+    datapoint_ids: list[JSONValue] = [*_final_ids(item, "datapoint_ids")]
+    if datapoint_ids:
+        row["datapoint_ids"] = datapoint_ids
+    return row
 
 
 def _final_claims(raw: object) -> list[JSONValue]:
-    """Whole-response claims narrowed to {text, claim_type, evidence_ids, confidence}; malformed rows drop."""
+    """Whole-response claims narrowed to {text, claim_type, evidence_ids, datapoint_ids, confidence}; malformed rows drop."""
     if not isinstance(raw, list):
         return []
     rows: list[JSONValue] = []

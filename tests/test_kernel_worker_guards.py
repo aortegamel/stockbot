@@ -3020,6 +3020,39 @@ def test_final_claim_gate_assesses_available_evidence(
     }
 
 
+def test_final_evidence_carries_validated_descriptors() -> None:
+    """JEV state keeps full canonical descriptors; malformed rows drop, never repaired."""
+    import app.research.kernel_worker as kw
+
+    point: dict[str, JSONValue] = {
+        "id": "dp:revenue",
+        "metric": "revenue",
+        "value": "10",
+        "entity": "NVDA",
+        "period": "2025",
+        "statement": "Revenue was 10.",
+    }
+    rows = kw._final_evidence({"evidence": [{"id": "ev-1", "content": "fact", "datapoints": [point, {"id": "bad"}]}]})
+    assert rows == [{"id": "ev-1", "content": "fact", "datapoints": [point]}]
+    claim = kw._final_claim_row(
+        {
+            "text": "Revenue was 10.",
+            "claim_type": "observed_fact",
+            "evidence_ids": ["ev-1"],
+            "datapoint_ids": ["dp:revenue"],
+            "confidence": 0.5,
+        }
+    )
+    assert claim == {
+        "text": "Revenue was 10.",
+        "claim_type": "observed_fact",
+        "evidence_ids": ["ev-1"],
+        "datapoint_ids": ["dp:revenue"],
+        "confidence": 0.5,
+    }
+    assert kw._final_claims([claim]) == [claim]
+
+
 def test_jev_kept_keeps_everything_but_an_explicit_reject() -> None:
     """A reject drops the proposal; a missing or malformed disposition keeps it."""
     proposals = _props()
