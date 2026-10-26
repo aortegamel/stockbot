@@ -141,6 +141,12 @@ class _IntakeKernel(sched._Kernel):
         )
 
     @override
+    def record_attempt(
+        self, session_id: str, node: object, attempt: Mapping[str, object], *, event: str = "node_attempt"
+    ) -> None:
+        self.decisions.append((event, attempt))
+
+    @override
     def admit_evidence(self, session_id: str, job_id: str, data: Mapping[str, object]) -> dict[str, JSONValue]:
         return {"evidence_id": "ev-1"}
 
@@ -178,7 +184,7 @@ def test_settle_continuation_false_never_resolves() -> None:
                 "continuation": "resolve_node",
                 "evidence_state": "sufficient_support",
                 "decision": "sufficient_support",
-                "topical_relevance_answer": "yes",
+                "topical_relevance_result": {"outcome": "yes"},
                 "resolution_support_answer": "yes",
             }
 

@@ -2005,7 +2005,6 @@ def test_search_web_fallback_requires_nonblank_node_question(question: object) -
         ("search_web", "needle worker closed"),
         ("search_web", "needle timed out"),
         ("get_sec_filing", "needle arguments are not grounded in the request"),
-        ("list_sec_filings", "needle arguments are not grounded in the request"),
     ],
 )
 def test_search_web_fallback_preserves_other_generation_errors(tool_name: str, message: str) -> None:
@@ -2028,6 +2027,39 @@ def test_search_web_fallback_preserves_other_generation_errors(tool_name: str, m
                 _Kernel(),
             )
         )
+
+
+def test_sec_grounding_flake_seeds_listing_from_session_ticker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Needle grounding flake on a session-ticker listing seeds NVDA instead of failing."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
+
+    async def generate(**kw: object) -> dict[str, JSONValue]:
+        raise RuntimeError(
+            "needle arguments for 'list_sec_filings' not grounded in the request: list_sec_filings.identifier"
+        )
+
+    args, reasoning, withheld = asyncio.run(
+        sched._generate_tool_arguments(
+            generate,
+            "list_sec_filings",
+            sched.build_registry(),
+            {
+                "session_id": "s1",
+                "objective": "What do the latest filings say?",
+                "ticker": "NVDA",
+                "temporal_scope": {"mode": "as_of", "as_of": "2026-10-26T08:50:45+00:00", "start": None, "end": None},
+            },
+            _node(),
+            [],
+            [],
+            None,
+            _Kernel(),
+        )
+    )
+    assert args == {"identifier": "NVDA"} and withheld is False
+    assert reasoning == "seeded SEC identifier from objective ticker after needle failure"
 
 
 def test_sec_withhold_falls_back_to_objective_ticker_latest(

@@ -3186,7 +3186,11 @@ def _needle_failure_recoverable(tool_name: str, exc: RuntimeError | ValueError, 
     if isinstance(exc, ValueError):
         return tool_name == "search_web" and "needle tool mismatch" in low
     if "not grounded in the request" in low:
-        return tool_name == "search_web" or (carried and tool_name in _ACCESSION_CARRY_TOOLS)
+        if tool_name == "search_web" or carried:
+            return True
+        # A resolved SEC/ticker seed survives one Needle grounding flake: the
+        # seed carries no date the model must ground, only the selected subject.
+        return tool_name in _SEC_IDENTIFIER_TOOLS | _TICKER_FALLBACK_TOOLS | _SHO_FALLBACK_TOOLS
     if "timed out" in low or "timeout" in low:
         return tool_name in _ACCESSION_CARRY_TOOLS
     if "needle tool mismatch" in low:
