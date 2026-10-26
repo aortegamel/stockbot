@@ -23,6 +23,7 @@ from app.research.models import (
     new_decision_id,
     validate_json_value,
 )
+from app.research.repository import ResearchRepository
 from app.runtime import ToolResultMeta
 from app.tool_runtime import RuntimeToolSession, ToolOutcome
 
@@ -60,6 +61,24 @@ class _Kernel(sched._Kernel):
         self.decisions: list[tuple[str, object]] = []
         self.tool_results: dict[str, dict[str, JSONValue]] = dict(tool_results or {})
         self.objective = objective
+        self.attempts: list[dict[str, JSONValue]] = []
+        self.store = mock.Mock(spec=ResearchRepository)
+        self.store.list_nodes.return_value = [_node(), _node("n0")]
+
+    @override
+    def _store(self) -> ResearchRepository:
+        return self.store
+
+    @override
+    def node_attempts(self, session_id: str, node_id: str) -> list[dict[str, JSONValue]]:
+        return list(self.attempts)
+
+    @override
+    def record_attempt(
+        self, session_id: str, node: object, attempt: Mapping[str, JSONValue], *, event: str = "node_attempt"
+    ) -> None:
+        if event == "node_attempt":
+            self.attempts.append(dict(attempt))
 
     @override
     def start_job(
@@ -77,6 +96,10 @@ class _Kernel(sched._Kernel):
 
     @override
     def heartbeat_job(self, job_id: str) -> None:
+        pass
+
+    @override
+    def limit_job_deadline(self, job_id: str, deadline_at: float) -> None:
         pass
 
     @override
@@ -305,6 +328,7 @@ class _JevAdmit(JevClient):
             "evidence_state": "sufficient_support",
             "decision": "sufficient_support",
             "topical_relevance_answer": "yes",
+            "topical_relevance_result": {"outcome": "yes"},
             "resolution_support_answer": "yes",
         }
 
@@ -488,7 +512,7 @@ def test_sec_document_admits_full_window_with_bounded_summary(
             ],
             _JevAdmit(),
             kernel,
-            _node(),
+            _node(node.node_id, sid),
             [],
             attempts,
             sid,
@@ -649,7 +673,7 @@ def test_sec_list_receipt_routes_through_persisted_replay(
         _handle_fields(_bad_handle)
 
 
-def test_insufficient_evidence_state_skips_admission() -> None:
+def test_unknown_topical_relevance_skips_admission() -> None:
     class _JevWeak(_JevAdmit):
         @override
         async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
@@ -661,6 +685,7 @@ def test_insufficient_evidence_state_skips_admission() -> None:
                 "action": "continue_research",
                 "evidence_state": "insufficient",
                 "decision": "insufficient",
+                "topical_relevance_result": {"outcome": "unknown"},
             }
 
     kernel = _Kernel()
@@ -909,6 +934,356 @@ def test_session_ceiling_yields_incomplete_guard() -> None:
     ):
         out = asyncio.run(sched.run("s1", kernel=_KS(), repo=None))
     assert "runtime guard" in str(out["reason"])
+
+
+@pytest.fixture
+def _persisted_scheduler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[ResearchRepository, str, ResearchNode, sched._Kernel]:
+    from app.research import service
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    store = ResearchRepository()
+    sid = service.create_research("Read the latest 8-K for CIK 1045810.", repo=store)
+    parent = service.create_node(sid, "What does the filing disclose?", "Explain the filing.", repo=store)
+    return store, sid, parent, sched._Kernel(store)
+
+
+@pytest.mark.parametrize("resolution", ["yes", "no"], ids=["sufficient-resolution", "insufficient-resolution"])
+@pytest.mark.parametrize(
+    ("relevance", "expected"),
+    [
+        ({"outcome": "yes", "probability": 0.9, "strength": "confident"}, 1),
+        ({"outcome": "unknown"}, 0),
+        ({"outcome": "no"}, 0),
+        (None, 0),
+        ({}, 0),
+        ("yes", 0),
+    ],
+    ids=["relevant", "unknown", "irrelevant", "missing", "empty", "malformed"],
+)
+def test_substantive_source_admission_uses_topical_result_not_resolution(
+    _persisted_scheduler: tuple[ResearchRepository, str, ResearchNode, sched._Kernel],
+    monkeypatch: pytest.MonkeyPatch,
+    relevance: JSONValue,
+    expected: int,
+    resolution: str,
+) -> None:
+    """A relevant passage enters the ledger even when it cannot resolve the whole question."""
+    import tests.research_source_seam as seam
+    from app.tool_runtime import outcome_from_result
+
+    store, sid, node, kernel = _persisted_scheduler
+    seam.install(monkeypatch)
+    passage = "Demand for accelerated computing increased. Supply constraints limited deliveries."
+    handle = seam.handle_for(passage)
+    result: dict[str, object] = {"text": passage, "source_handle": handle}
+    job_id = sched._attempt_job(kernel, sid, "SEC")
+
+    class _Jev(_JevAdmit):
+        @override
+        async def assess_result(self, *args: object, **kwargs: object) -> dict[str, JSONValue]:
+            return {
+                "evidence_state": "sufficient_support" if resolution == "yes" else "insufficient",
+                "resolution_support_answer": resolution,
+                "resolution_support_result": {"outcome": resolution},
+                "topical_relevance_answer": "yes",
+                "topical_relevance_result": relevance,
+                "continuation": "reason_over_evidence",
+            }
+
+    attempts: list[dict[str, JSONValue]] = []
+    settled = asyncio.run(
+        sched._settle_round(
+            [
+                {
+                    "tool": "get_sec_document",
+                    "arguments": {"accession_no": handle["accession_no"]},
+                    "result": result,
+                    "outcome": outcome_from_result("get_sec_document", result),
+                    "outcome_summary": passage,
+                    "error": None,
+                    "job_id": job_id,
+                }
+            ],
+            _Jev(),
+            kernel,
+            node,
+            [],
+            attempts,
+            sid,
+            node.node_id,
+            _invoke("get_sec_document"),
+            0,
+            continuation=False,
+        )
+    )
+    assert settled["admitted"] == expected
+    assert settled["terminal"] is None
+    assert store.get_node(node.node_id).status != "resolved"
+    assert store.get_job(job_id).status == "completed"
+    rows = store.list_evidence(sid)
+    assert len(rows) == expected
+    if expected:
+        assert rows[0]["content"] == passage
+        assert attempts[0]["evidence_id"] == rows[0]["evidence_id"]
+    else:
+        assert attempts[0]["evidence_id"] is None
+    assert attempts[0]["resolution_support_answer"] == resolution
+
+
+def test_source_reload_after_deadline_cannot_commit_evidence(
+    _persisted_scheduler: tuple[ResearchRepository, str, ResearchNode, sched._Kernel],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source validation can finish late, but the expired job cannot commit its evidence."""
+    from datetime import UTC, datetime, timedelta
+
+    import tests.research_source_seam as seam
+    from app.research import service
+    from app.tool_runtime import outcome_from_result
+
+    store, sid, _, kernel = _persisted_scheduler
+    seam.install(monkeypatch)
+    now = [datetime.now(UTC)]
+    monkeypatch.setattr(service, "utcnow", lambda: now[0])
+    passage = "Supply constraints limited deliveries despite stronger demand."
+    result: dict[str, object] = {"text": passage, "source_handle": seam.handle_for(passage)}
+    job_id = sched._attempt_job(kernel, sid, "SEC")
+    service.limit_job_deadline(job_id, now[0] + timedelta(seconds=1), repo=store)
+    reload_source = service._exact_source_bytes
+    reloaded: list[str] = []
+
+    def finish_after_deadline(accession: str, document: str) -> tuple[bytes, str]:
+        source = reload_source(accession, document)
+        reloaded.append(accession)
+        now[0] += timedelta(seconds=2)
+        return source
+
+    monkeypatch.setattr(service, "_exact_source_bytes", finish_after_deadline)
+    evidence_id, progressed, failure = sched._admit_attempt_evidence(
+        kernel,
+        sid,
+        "get_sec_document",
+        {"result": result, "job_id": job_id, "arguments": {}, "outcome_summary": passage},
+        outcome_from_result("get_sec_document", result),
+        {"topical_relevance_result": {"outcome": "yes"}},
+    )
+    assert reloaded
+    assert evidence_id is None and progressed is False
+    assert failure is not None and "ERR_JOB_TIMED_OUT" in str(failure["error"])
+    assert store.get_job(job_id).status == "timed_out"
+    assert store.list_evidence(sid) == []
+    assert store.get_session(sid).evidence_ids == []
+    assert not any(event.event_type == "evidence.accepted" for event in store.list_events(sid))
+
+
+@pytest.mark.parametrize(
+    "decisions",
+    [
+        [],
+        "admit",
+        {},
+        {"other-question": {"choice": "admit"}},
+        {"expand-0": {}},
+        {"expand-0": None},
+        {"expand-0": []},
+        {"expand-0": "admit"},
+        {"expand-0": {"choice": True}},
+        {"expand-0": {"choice": "unknown"}},
+        {"expand-0": {"choice": "reject"}},
+    ],
+    ids=[
+        "list-envelope",
+        "string-envelope",
+        "empty",
+        "missing-id",
+        "empty-disposition",
+        "null",
+        "list",
+        "string",
+        "boolean",
+        "unknown",
+        "reject",
+    ],
+)
+def test_graph_expansion_requires_explicit_admit(
+    _persisted_scheduler: tuple[ResearchRepository, str, ResearchNode, sched._Kernel], decisions: JSONValue
+) -> None:
+    store, sid, parent, kernel = _persisted_scheduler
+    proposal = {"proposals": [{"question": "What changed?", "whyItMatters": "Explain the change."}]}
+    with mock.patch.object(JevClient, "decide", new_callable=mock.AsyncMock, return_value=decisions):
+        count = asyncio.run(
+            sched._expand_graph(JevClient(), kernel, sid, "Explain the filing.", parent.node_id, proposal)
+        )
+    assert count == 0
+    assert store.list_nodes(sid) == [parent]
+    assert kernel.ready_nodes(sid) == [parent]
+
+
+@pytest.mark.parametrize("cycle", [False, True], ids=["declared-dependencies", "dependency-cycle"])
+def test_graph_expansion_preserves_dependencies_and_rejects_cycles(
+    _persisted_scheduler: tuple[ResearchRepository, str, ResearchNode, sched._Kernel], cycle: bool
+) -> None:
+    store, sid, parent, kernel = _persisted_scheduler
+    first_id, second_id = f"{sid}-first", f"{sid}-second"
+    first_dependencies: list[str] = [second_id] if cycle else []
+    proposal = {
+        "proposals": [
+            {
+                "id": second_id,
+                "question": "Interpret the requested disclosure.",
+                "whyItMatters": "Use the acquired evidence.",
+                "dependsOn": [first_id],
+            },
+            {
+                "id": first_id,
+                "question": "Read the requested disclosure.",
+                "whyItMatters": "Acquire the evidence.",
+                "dependsOn": first_dependencies,
+            },
+        ]
+    }
+    with mock.patch.object(
+        JevClient,
+        "decide",
+        new_callable=mock.AsyncMock,
+        return_value={"expand-0": {"choice": "admit"}, "expand-1": {"choice": "admit"}},
+    ):
+        count = asyncio.run(
+            sched._expand_graph(JevClient(), kernel, sid, "Explain the filing.", parent.node_id, proposal)
+        )
+    if cycle:
+        assert count == 0
+        assert store.list_nodes(sid) == [parent]
+    else:
+        assert count == 2
+        nodes = {node.question: node for node in store.list_nodes(sid)}
+        first = nodes["Read the requested disclosure."]
+        second = nodes["Interpret the requested disclosure."]
+        assert first.depends_on == ()
+        assert second.depends_on == (first.node_id,)
+        assert {node.node_id for node in kernel.ready_nodes(sid)} == {parent.node_id, first.node_id}
+    assert store.get_node(parent.node_id) == parent
+
+
+def test_missing_evidence_runs_before_parent_and_refinement(
+    _persisted_scheduler: tuple[ResearchRepository, str, ResearchNode, sched._Kernel],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, sid, parent, kernel = _persisted_scheduler
+
+    class _Jev(JevClient):
+        @override
+        async def decide(
+            self, state: object, questions: Mapping[str, JSONValue], **kwargs: object
+        ) -> dict[str, dict[str, JSONValue]]:
+            return {qid: {"choice": "admit"} for qid in questions}
+
+    proposal = {
+        "evidenceRequests": [{"nodeId": parent.node_id, "missingEvidence": "Read the supply constraint disclosure."}],
+        "proposals": [{"question": "Compare the resolved explanation.", "whyItMatters": "Refine the answer."}],
+    }
+    assert asyncio.run(sched._expand_graph(_Jev(), kernel, sid, "Explain the filing.", parent.node_id, proposal)) == 2
+    nodes = {node.question: node for node in store.list_nodes(sid)}
+    evidence = nodes["Read the supply constraint disclosure."]
+    refinement = nodes["Compare the resolved explanation."]
+    assert evidence.depends_on == ()
+    assert store.get_node(parent.node_id).depends_on == (evidence.node_id,)
+    assert refinement.depends_on == (parent.node_id,)
+    assert kernel.ready_nodes(sid) == [evidence]
+    order: list[str] = []
+    deadline = sched._time.perf_counter() + 30.0
+
+    async def resolve(node: ResearchNode, session_id: str, **hooks: object) -> dict[str, JSONValue]:
+        assert hooks["deadline_at"] == deadline
+        order.append(node.node_id)
+        kernel.resolve_node(session_id, node.node_id)
+        return {"node_id": node.node_id, "status": "resolved", "admitted": 0}
+
+    monkeypatch.setattr(sched, "run_node", resolve)
+    out = asyncio.run(sched.run(sid, kernel=kernel, deadline_at=deadline))
+    assert order == [evidence.node_id, parent.node_id, refinement.node_id]
+    assert out["rounds"] == 3
+    assert all(node.status == "resolved" for node in store.list_nodes(sid))
+
+
+@pytest.mark.parametrize("transitive", [False, True], ids=["direct", "transitive"])
+def test_await_evidence_rejects_dependency_cycle_without_mutation(
+    _persisted_scheduler: tuple[ResearchRepository, str, ResearchNode, sched._Kernel], transitive: bool
+) -> None:
+    from app.research import service
+
+    store, sid, parent, kernel = _persisted_scheduler
+    dependency = parent
+    if transitive:
+        first = kernel.create_node(sid, "First refinement?", "Refine.", [parent.node_id])
+        dependency = kernel.create_node(sid, "Second refinement?", "Refine again.", [first.node_id])
+    before = store.list_nodes(sid)
+    events = store.list_events(sid)
+    with pytest.raises(ValueError, match="dependency cycle"):
+        service.await_node_evidence(sid, parent.node_id, [dependency.node_id], repo=store)
+    assert store.list_nodes(sid) == before
+    assert store.list_events(sid) == events
+    assert kernel.ready_nodes(sid) == [parent]
+
+
+def test_navigation_attempt_restores_document_route_without_relisting(
+    _persisted_scheduler: tuple[ResearchRepository, str, ResearchNode, sched._Kernel],
+) -> None:
+    store, sid, parent, kernel = _persisted_scheduler
+    navigation = {**_sec_listing(), "session_id": sid, "evidence_id": None}
+    kernel.record_attempt(sid, parent, navigation)
+    other = kernel.create_node(sid, "Other question?", "Keep attempts separate.")
+    kernel.record_attempt(sid, other, {"tool": "search_sec_filings", "error": "Other node's failure."})
+    resumed = sched._Kernel(ResearchRepository())
+    assert resumed.node_attempts(sid, parent.node_id) == [navigation]
+    assert store.list_evidence(sid) == []
+    invoked: list[tuple[str, dict[str, JSONValue]]] = []
+    selected_attempts: list[list[dict[str, JSONValue]]] = []
+
+    async def select(
+        jev: JevClient,
+        active_kernel: sched._Kernel,
+        session_id: str,
+        node_id: str,
+        session: Mapping[str, JSONValue],
+        node: object,
+        registry: list[dict[str, JSONValue]],
+        context: Sequence[JSONValue],
+        attempts: list[dict[str, JSONValue]],
+    ) -> tuple[str, ToolDecision]:
+        selected_attempts.append(list(attempts))
+        return "invoke", _invoke("get_sec_document")
+
+    def invoke(name: str, args: dict[str, JSONValue], session: object, **kwargs: object) -> dict[str, JSONValue]:
+        invoked.append((name, dict(args)))
+        return {"error": "The test stops after the restored document route."}
+
+    def no_needle(**kwargs: object) -> None:
+        raise AssertionError("Persisted navigation supplies the accession.")
+
+    result = asyncio.run(
+        sched.run_node(
+            parent,
+            sid,
+            kernel=resumed,
+            jev=_JevAdmit(),
+            registry=sched.build_registry(),
+            select_round=select,
+            invoke=invoke,
+            needle_generate=no_needle,
+            max_rounds=1,
+            tool_session=RuntimeToolSession(session_id=f"scheduler:{sid}"),
+        )
+    )
+    assert result["status"] != "failed"
+    assert selected_attempts == [[navigation]]
+    assert len(invoked) == 1
+    tool, arguments = invoked[0]
+    assert tool == "get_sec_document"
+    assert arguments["accession_no"] == _LISTED_8K
+    assert arguments["document_name"] == "nvda-8k.htm"
 
 
 def test_expansion_creates_jev_admitted_nodes_with_dep() -> None:
@@ -3213,7 +3588,7 @@ def test_ten_q_revenue_node_reads_document_after_reason_over_listing(
     class _Jev(JevClient):
         @override
         async def select_tool(self, *a: object, **k: object) -> ToolDecision:
-            raise AssertionError("router owns the 10-Q revenue route; JEV select must not run")
+            return ToolDecision(action="invoke", tool_name="list_sec_filings")
 
         @override
         async def assess_result(self, node: object, outcome: object, *a: object, **k: object) -> dict[str, JSONValue]:
@@ -3224,7 +3599,8 @@ def test_ten_q_revenue_node_reads_document_after_reason_over_listing(
                 "continuation": continuation,
                 "evidence_state": "sufficient_support",
                 "topical_relevance_answer": "yes",
-                "resolution_support_answer": "unsure" if listing else "yes",
+                "topical_relevance_result": {"outcome": "yes", "probability": 0.9, "strength": "confident"},
+                "resolution_support_answer": "yes",
             }
 
     session = {"session_id": "s1", "objective": prompt}
@@ -3340,6 +3716,7 @@ def test_ten_q_revenue_node_reads_document_before_supported_listing_resolve(
                 "continuation": "resolve_node",
                 "evidence_state": "sufficient_support",
                 "topical_relevance_answer": "yes",
+                "topical_relevance_result": {"outcome": "yes", "probability": 0.9, "strength": "confident"},
                 "resolution_support_answer": "yes",
             }
 
@@ -4774,7 +5151,11 @@ def test_node_round_limit_blocks_even_when_each_round_admits(cap: int | None, ex
 
         @override
         async def assess_result(self, *a: object, **k: object) -> dict[str, JSONValue]:
-            return {"evidence_state": "sufficient_support", "continuation": "continue_research"}
+            return {
+                "evidence_state": "sufficient_support",
+                "continuation": "continue_research",
+                "topical_relevance_result": {"outcome": "yes"},
+            }
 
     async def generate(**kw: object) -> dict[str, JSONValue]:
         return {"tool": "query_finra", "arguments": {"ticker": f"SYM{calls}"}}
@@ -4856,6 +5237,7 @@ def test_reason_over_evidence_selects_again_with_admitted_evidence() -> None:
                 return {
                     "continuation": "reason_over_evidence" if first else "resolve_node",
                     "evidence_state": "sufficient_support",
+                    "topical_relevance_result": {"outcome": "yes", "probability": 0.9, "strength": "confident"},
                 }
 
         out = asyncio.run(
@@ -6224,8 +6606,8 @@ def test_reason_phase_resolves_with_admitted_evidence() -> None:
     }
 
 
-def test_reason_phase_expands_then_reselects_without_a_tool() -> None:
-    """Adjudication that names no tool still runs the expansion, then re-selects carrying that verdict."""
+def test_reason_phase_expansion_returns_to_scheduler_without_a_tool() -> None:
+    """An admitted follow-up returns control to the scheduler before the parent continues."""
     verdict = ToolDecision(action="reason", probabilities={"reasoning_required": 0.8})
     kernel = _Kernel()
     attempts: list[dict[str, JSONValue]] = []
@@ -6247,8 +6629,15 @@ def test_reason_phase_expands_then_reselects_without_a_tool() -> None:
         )
     )
     assert ("graph_expansion", {"created": 1, "proposed": 1}) in kernel.decisions
-    assert out["done"] is True and out["terminal"] is None and out["decision"] is verdict
-    assert [a.get("error") for a in attempts] == ["adjudication named no tool; re-selecting"]
+    assert out["done"] is True and out["decision"] is verdict
+    assert out["terminal"] == {
+        "node_id": "n1",
+        "status": "gathering",
+        "expanded": 1,
+        "admitted": 0,
+        "attempts": [],
+    }
+    assert attempts == []
 
 
 """Scheduler survivor repairs: dependency order, deadlines, resume state, registries, replay scope, carried evidence, tool selection."""
@@ -9277,6 +9666,7 @@ def test_filing_summary_settlement_requires_supported_document_passages(
                 "evidence_state": state,
                 "resolution_support_answer": support,
                 "continuation": "resolve_node",
+                "topical_relevance_result": {"outcome": "yes"},
             }
 
     result = asyncio.run(

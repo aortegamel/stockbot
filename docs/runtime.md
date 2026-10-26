@@ -232,7 +232,7 @@ Normal request handling and post-ready shutdown remain unchanged.
 An explicit `SIGKILL` cannot run this cleanup.
 
 The kernel scheduler owns the agent loop.
-JEV selects from the whole registry when deterministic routing does not select a tool.
+JEV selects necessary operations from the whole registry based on the objective and current evidence.
 Needle fills tool arguments only.
 The browser sends the selected ticker separately from the original question.
 The route and research session retain that ticker context.
@@ -246,17 +246,13 @@ That request drops the selected-ticker scope: the list is the requested scope.
 The route passes the list to JEV as separate entry context, in the same `op:"route"` call.
 JEV sees the scope before it decides whether one registry tool fits, so the watchlist never requires a code-side route override.
 JEV's returned route governs dispatch: `no_session` and `reasoning_required` answer direct, a tool name runs single-shot, anything else researches.
-On a watchlist request the same list rides `op:"run"`, and the intake fan-out covers every symbol.
+On a watchlist request the same list accompanies `op:"run"`. JEV selects the necessary operations for that scope.
 Live JEV behavior for a watchlist prompt is unverified until a live run checks it; the mocked route replies only prove the context and the dispatch wiring.
 Every other prompt keeps the selected-ticker behavior and ignores the list, so a selected-ticker question never becomes watchlist-wide.
 
-Watchlist sources load at two triggers through one worker path:
-
-1. Page load: the watchlist panel sends `GET /api/watchlist?symbols=...` once per watchlist.
-   The worker `op:"watchlist"` runs on its own thread, so it never waits behind a research run.
-   It creates no session, job, or evidence.
-2. Watchlist question: round 1 of the intake fans out the same calls.
-   The existing boundary admits each successful result as evidence.
+The watchlist panel loads sources through `GET /api/watchlist?symbols=...` once per watchlist.
+The worker `op:"watchlist"` uses a separate thread. It creates no session, job, or evidence.
+Research questions use the scheduler instead of this fixed source fan-out.
 
 Each symbol gets four fixed-argument calls through the existing tool handlers.
 `list_sec_filings` uses `limit=5` and no forms filter, so fund forms stay in.
@@ -265,11 +261,38 @@ Every call is an independent task on the existing SEC and tool pools under the 8
 A call past the budget is cancelled and reported as a timeout.
 Each (symbol, source) row carries `status` (`ok`, `no_records`, `error`, `timeout`), `as_of`, source references, and the evidence ID when admitted.
 A FINRA "No data found" answer is `no_records`. Any other failure is `error`.
-The intake_digest decision persists the rows.
-The writer prompt lists every row under WATCHLIST COVERAGE, so a failed source is disclosed.
+Research actions persist their objective, purpose, navigation, and assessment in the existing decision journal.
+The optional `coverage` response reports SEC document availability and inspection separately from evidence.
 Reuse follows the existing caches: FINRA results use the `app.cache` 3600s TTL.
 SEC submissions use the edgartools HTTP cache with its 30s revalidation.
 A fresh entry serves the agent request without source work. An expired entry refreshes through the same path.
+
+Research starts with one objective node. It does not automatically search SEC and web sources or decompose the objective.
+JEV can request reasoning through the existing analyze, adjudicate, and expand stages.
+Only explicit JEV admission creates a proposed follow-up node.
+Missing-evidence children run before their parent. True refinements can depend on the parent.
+The existing dependency gate controls both paths.
+
+The scheduler admits a relevant passage only after canonical source proof succeeds.
+The result assessment must explicitly report topical relevance as `yes`.
+Resolution support controls continuation. A passage need not resolve the entire objective to enter the ledger.
+Catalog records remain navigation. They do not establish disclosure content.
+Per-claim assessment checks ledger identity, archived bytes, session ownership, point-in-time availability, numbers, quotations, and qualifiers.
+JEV then judges qualitative paraphrases against canonical ledger passages.
+Standalone finalization retains its stricter deterministic wording gate.
+Canonical numerical claims with complete deterministic proof need no repeated arithmetic judgment from JEV.
+
+Each worker operation receives the original `deadlineAt`. No stage renews that deadline.
+Cancellation stops the current client operation instead of the shared worker.
+Admission uses the existing SEC pool. The service checks the owning job again immediately before an evidence commit.
+A timeout preserves admitted evidence and reports its stage.
+The journal retains completed navigation and attempts for further research in the same session.
+
+SEC coverage distinguishes listed, located, retrieved, inspected, and admitted content.
+It also reports incomplete and unavailable documents.
+Inspection covers the returned document window. A retrieved window does not establish a complete filing read.
+Coverage limitations are not citable evidence.
+
 
 Tools execute through `app/tool_runtime.py` against canonical `app/tools.py`.
 Thesis monitoring runs the same scheduler in-process through `app/thesis/runner.py run_trigger`.
@@ -471,7 +494,24 @@ The answer IDs must match the question IDs exactly. Each answer must match its q
 Errors use `decision_request_failed`, `malformed_decision_response`, `malformed_decision_answer`, and `decision answers do not match questions`.
 A noul probability outside [0, 1] keeps the `invalid_probability` error.
 The client makes no retry and uses no fallback model.
-The existing thresholds, fan-out rules, and evidence gates stay unchanged for both formats.
+Both formats use the same support policy. Fan-out rules and deterministic evidence gates remain separate.
+
+Noul parsers keep the raw probability. Policy normalization adds `{outcome, probability, strength}`:
+
+- `0.70 <= p <= 1`: `outcome: "yes"` with `strength: "confident"`.
+- `0.50 <= p < 0.70`: `outcome: "yes"` with `strength: "tentative"`.
+- `0 <= p < 0.50`: `outcome: "no"` with `strength: null`.
+- Missing, invalid, or unassessable values: `outcome: "unknown"`, `probability: null`, and `strength: null`.
+
+Normalization preserves each valid numeric probability. Unknown support never becomes negative support.
+Raw `choice`, `noul`, and `score` results keep their existing shapes.
+Malformed transport responses still produce explicit errors. Normalization does not suppress those errors.
+Final assessments expose `support_result` and `support_strength` beside the existing `support_answer`.
+Result assessments expose the corresponding `resolution_support_*` and `topical_relevance_*` fields.
+Both affirmative strengths produce `yes` for existing answer consumers.
+Evidence insufficiency and conflict remain separate from probability.
+Positive JEV support cannot override source identity, content hashes, point-in-time checks, or numeric proof.
+JEV support never authorizes an external action without user approval.
 
 Decision records keep the provider-reported model and token usage as `model`, `usage.input_tokens`, and `usage.output_tokens`.
 Usage records include only integer token counts.

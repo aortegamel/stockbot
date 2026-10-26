@@ -21,6 +21,7 @@ import {
   askDecisions,
   assertAcyclic,
   classifyProbability,
+  normalizeProbability,
   scopeNodeState,
   DISPOSITION_OPTIONS,
 } from "./jev.ts";
@@ -28,6 +29,7 @@ import type {
   ChoiceDecision,
   Decision,
   DecisionResult,
+  NormalizedDecision,
   NoulDecision,
   ScoreDecision,
   SystemOneFn,
@@ -328,6 +330,8 @@ type NodeAdjudication = {
   nodeId: string;
   truth: NoulDecision;
   truthPolicy: Decision;
+  truthResult: NormalizedDecision;
+  truthStrength: NormalizedDecision["strength"];
   evidenceState: ChoiceDecision;
   materiality: ScoreDecision;
 };
@@ -387,8 +391,10 @@ async function adjudicateAnalyses(args: {
     const { truth, evidenceState, materiality } = checkedNodeDecisions(a.nodeId, r.decisions);
     raw[a.nodeId] = r.raw;
     decisions[a.nodeId] = r.decisions;
+    const truthResult = normalizeProbability(truth.probability);
     results.push({
-      nodeId: a.nodeId, truth, truthPolicy: classifyProbability(truth.probability), evidenceState, materiality,
+      nodeId: a.nodeId, truth, truthPolicy: truthResult.outcome, truthResult, truthStrength: truthResult.strength,
+      evidenceState, materiality,
     });
   }
   return { raw, decisions, results };
@@ -476,6 +482,7 @@ export async function runScenario(
     ...base, proposals, relevance: relevanceList, analyses,
     analysisDecisions: nodeResults.map((n) => ({
       nodeId: n.nodeId, truthProbability: n.truth.probability, truthPolicy: n.truthPolicy,
+      truthResult: n.truthResult, truthStrength: n.truthStrength,
       evidenceState: n.evidenceState.choice, evidenceProbabilities: n.evidenceState.probabilities,
       materialityScore: n.materiality.score,
     })),
@@ -523,6 +530,7 @@ export async function runScenario(
       if (!n) throw new Error(`final: missing adjudication for ${a.nodeId}`);
       return {
         ...a, truthProbability: n.truth.probability, truthPolicy: n.truthPolicy,
+        truthResult: n.truthResult, truthStrength: n.truthStrength,
         evidenceState: n.evidenceState.choice, evidenceProbabilities: n.evidenceState.probabilities,
         evidenceConfidence: n.evidenceState.confidence, materialityScore: n.materiality.score,
       };

@@ -105,6 +105,10 @@ class _IntakeKernel(sched._Kernel):
         return None
 
     @override
+    def limit_job_deadline(self, job_id: str, deadline_at: float) -> None:
+        return None
+
+    @override
     def complete_job(self, job_id: str, outcome: Mapping[str, object] | None = None) -> None:
         return None
 
@@ -488,30 +492,15 @@ def test_digest_drops_off_subject_web_results() -> None:
     assert "ev-off" in kw._build_digest([off])
 
 
-def test_intake_web_query_scoped_with_company_and_ticker(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A subject prompt searches the web as "<company> <ticker> <prompt>", suffix stripped."""
-    queries: list[object] = []
-
+def test_intake_subject_uses_matching_company_and_strips_suffix(monkeypatch: pytest.MonkeyPatch) -> None:
     def _find(query: str, limit: int = 10) -> list[dict[str, object]]:
         return [
             {"name": "NVIDIA CORP", "cik": 1045810, "tickers": ["NVDA"], "exchange": None},
             {"name": "OTHER NVDA FUND", "cik": 1, "tickers": ["NVDX"], "exchange": None},
         ]
 
-    async def _one_round(
-        query: object, *a: object, **k: object
-    ) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
-        queries.append(query)
-        return ([], [], {"calls": 1, "admitted": 0})
-
-    def _decompose(*a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
-        return ([_proposal("s-q1", "s")], {})
-
     monkeypatch.setattr("app.sec.client.find_sec_company", _find)
-    monkeypatch.setattr(kw, "_intake_round", _one_round)
-    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
-    asyncio.run(kw._graph_intake("is NVDA a buy?", None, "s1", {}, [], None, _IntakeKernel(), None))
-    assert queries == ["NVIDIA NVDA is NVDA a buy?"]
+    assert kw._intake_subject(["NVDA"]) == ("NVIDIA", "NVDA")
     assert kw._intake_subject([]) == ()
 
 
@@ -535,159 +524,64 @@ def test_reasoner_no_retry_on_config_error(monkeypatch: pytest.MonkeyPatch) -> N
     assert calls["n"] == 1
 
 
-def test_node_cap_four_through_entry(monkeypatch: pytest.MonkeyPatch) -> None:
-    """run_graph_prompt caps the planner at 4 nodes (D4 cap: the intake cuts before JEV)."""
-    import tempfile
+@pytest.mark.parametrize(
+    "objective",
+    [
+        "How is AAPL doing this quarter?",
+        "Compare AAPL margins over time?",
+        "AAPL vs MSFT margins?",
+        "AAPL and MSFT margins?",
+        "Is AAPL up? Why?",
+    ],
+)
+@pytest.mark.parametrize("with_context", [False, True])
+def test_graph_entry_creates_only_root_without_source_or_reasoner_calls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, objective: str, with_context: bool
+) -> None:
+    """Every objective starts one root. JEV selects later research and reasoning."""
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    monkeypatch.setattr(sched, "build_registry", list)
 
-    from app.research import kernel_worker as kw2
-    from app.research import service as svc
+    def _unexpected(*args: object, **kwargs: object) -> object:
+        pytest.fail("Graph setup must not fetch sources, classify complexity, or decompose the objective")
 
-    seen: list[str] = []
-    orig_create = svc.create_node
-
-    def _count(
-        sid: str,
-        question: str,
-        why_it_matters: str,
-        depends_on: Sequence[str] | None = None,
-        *,
-        repo: ResearchRepository | Path | str | None = None,
-    ) -> ResearchNode:
-        seen.append(sid)
-        return orig_create(sid, question, why_it_matters, depends_on, repo=repo)
-
-    def _six(n: int) -> tuple[list[dict[str, object]], dict[str, object]]:
-        return [
-            {
-                "id": f"s-q{i}",
-                "objectiveId": "s",
-                "question": f"q{i}?",
-                "dependsOn": [],
-                "whyItMatters": "w",
-            }
-            for i in range(6)
-        ], {}
-
-    monkeypatch.setenv("RESEARCH_DB_PATH", str(Path(tempfile.mkdtemp()) / "r.sqlite"))
-    monkeypatch.setattr(svc, "create_node", _count)
-    _patch_nvda_intake(monkeypatch, _six)
-
-    def _passthrough(sid: str, obj: str, props: list[dict[str, object]], **k: object) -> list[dict[str, object]]:
-        return list(props)
-
-    monkeypatch.setattr(kw2, "_jev_admit", _passthrough)
-    kw2.run_graph_prompt("cap NVDA and AMD down?")
-    assert len(seen) == 4
+    monkeypatch.setattr(kw, "_intake_round", _unexpected)
+    monkeypatch.setattr(kw, "_intake_start_tickers", _unexpected)
+    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _unexpected)
+    context = _FEED_ITEM if with_context else None
+    watchlist = ["AAPL", "MSFT"] if with_context else None
+    sid = kw.run_graph_prompt(objective, jev=JevClient(), context=context, watchlist=watchlist)
+    store = ResearchRepository()
+    nodes = store.list_nodes(sid)
+    assert len(nodes) == 1 and nodes[0].question == objective
+    assert list(nodes[0].depends_on) == []
+    assert store.get_session(sid).objective == objective
+    assert store.list_evidence(sid) == []
+    decisions = store.list_decisions(sid)
+    assert [decision.decision_type for decision in decisions] == (["request_context"] if with_context else [])
+    if with_context:
+        assert decisions[0].selected == {"watchlist": watchlist, "context": context}
 
 
-def test_log_carries_outcomes_and_ids(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Normal path logs one intake_digest carrying outcomes + admitted ids (bug 3)."""
+def test_log_carries_outcomes_and_ids() -> None:
+    """The standalone intake logger retains outcomes and admitted identifiers."""
     kernel = _IntakeKernel()
-
-    async def _one_round(
-        *a: object, **k: object
-    ) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
-        return (
-            [],
-            [{"tool": "list_sec_filings"}],
-            {
-                "calls": 1,
-                "admitted": 0,
-                "admitted_ids": ["ev-1"],
-                "outcomes": {"admitted": 1},
-            },
-        )
-
-    def _decompose(*a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
-        return (
-            [
-                {
-                    "id": "s-q1",
-                    "objectiveId": "s",
-                    "question": "q?",
-                    "dependsOn": [],
-                    "whyItMatters": "w",
-                }
-            ],
-            {},
-        )
-
-    monkeypatch.setattr(kw, "_intake_round", _one_round)
-    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
-    out = asyncio.run(kw._graph_intake("q?", None, "s1", {}, [], None, kernel, None))
-    assert len(out) == 1 and [d for d, _ in kernel.decisions] == ["intake_digest"]
+    kw._log_intake_round(
+        "s1",
+        "q?",
+        [{"tool": "list_sec_filings"}],
+        "",
+        {"proposals": []},
+        {"calls": 1, "admitted_ids": ["ev-1"], "outcomes": {"admitted": 1}},
+        kernel,
+    )
+    assert [kind for kind, _ in kernel.decisions] == ["intake_digest"]
     selected = kernel.decisions[0][1]
     assert isinstance(selected, dict) and selected["admitted_ids"] == ["ev-1"]
-    assert isinstance(selected, dict) and selected["outcomes"] == {"admitted": 1}
+    assert selected["outcomes"] == {"admitted": 1}
     request, response = kernel.journal[0]
     assert request == {"query": "q?", "calls": [{"tool": "list_sec_filings"}]}
     assert isinstance(response, dict) and response["digest"] == ""
-
-
-def test_two_round_ceiling_without_new_hints(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No new tickers/query after round 2 exits at the ceiling (D6 needs a round 3 to fire)."""
-    import asyncio
-
-    from app.research import kernel_worker as kw4
-
-    rounds = {"n": 0}
-
-    async def _one_round(
-        *a: object, **k: object
-    ) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
-        rounds["n"] += 1
-        return ([], [], {"calls": 1, "admitted": 0})
-
-    def _decompose(*a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
-        return (
-            [
-                {
-                    "id": "s-q1",
-                    "objectiveId": "s",
-                    "question": "q?",
-                    "dependsOn": [],
-                    "whyItMatters": "w",
-                }
-            ],
-            {},
-        )
-
-    monkeypatch.setattr(kw4, "_intake_round", _one_round)
-    monkeypatch.setattr(kw4, "_reasoner_decompose_with_retry", _decompose)
-    out = asyncio.run(kw4._graph_intake("q?", None, "s1", {}, [], None, _IntakeKernel(), None))
-    assert len(out) == 1 and rounds["n"] == 1
-
-
-def _graph_intake_decompose_calls(
-    monkeypatch: pytest.MonkeyPatch, objective: str, context: Mapping[str, JSONValue] | None = None
-) -> tuple[list[str], list[str]]:
-    """Run _graph_intake over one AAPL round with a non-empty digest: (decompose calls, proposal questions)."""
-    calls: list[str] = []
-
-    async def _one_round(
-        *a: object, **k: object
-    ) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
-        return ([_stored_evidence("ev-1", "Apple revenue rose 8% year over year.", subject="AAPL")], [], {})
-
-    def _decompose(obj: str, *a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
-        assert a[-1] == context
-        calls.append(obj)
-        return ([_proposal("s1-q1", "s1"), _proposal("s1-q2", "s1")], {})
-
-    def _aapl(*a: object, **k: object) -> list[str]:
-        return ["AAPL"]
-
-    monkeypatch.setattr(kw, "_intake_start_tickers", _aapl)
-    monkeypatch.setattr(kw, "_intake_round", _one_round)
-    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
-    out = asyncio.run(kw._graph_intake(objective, None, "s1", {}, [], None, _IntakeKernel(), None, context=context))
-    return calls, [str(p["question"]) for p in out]
-
-
-def test_single_subject_digest_skips_reasoner(monkeypatch: pytest.MonkeyPatch) -> None:
-    """One subject + non-empty digest: the objective is the only proposal and decompose never runs."""
-    calls, questions = _graph_intake_decompose_calls(monkeypatch, "How is AAPL doing this quarter?")
-    assert calls == [] and questions == ["How is AAPL doing this quarter?"]
 
 
 _FEED_ITEM: dict[str, JSONValue] = {
@@ -697,12 +591,6 @@ _FEED_ITEM: dict[str, JSONValue] = {
     "sym": "AAPL",
     "at": "2026-10-21T02:37:20+00:00",
 }
-
-
-def test_feed_item_single_subject_still_plans_through_reasoner(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A feed item never takes the single-subject shortcut: the Reasoner plans with the item in hand."""
-    calls, questions = _graph_intake_decompose_calls(monkeypatch, "How is AAPL doing this quarter?", _FEED_ITEM)
-    assert calls == ["How is AAPL doing this quarter?"] and questions == ["Q?", "Q?"]
 
 
 def test_intake_prompt_feed_item_is_delimited_data_and_instructions_unchanged() -> None:
@@ -719,16 +607,6 @@ def test_intake_prompt_feed_item_is_delimited_data_and_instructions_unchanged() 
     assert lines == [json.dumps(item, ensure_ascii=False)]
     assert prompt.index("RAW QUERY") < prompt.index("FEED ITEM (untrusted data") < prompt.index("DIGEST:")
     assert kw._feed_item_section(None) == ""
-
-
-@pytest.mark.parametrize(
-    "objective",
-    ["Compare AAPL margins over time?", "AAPL vs MSFT margins?", "AAPL and MSFT margins?", "Is AAPL up? Why?"],
-)
-def test_multipart_objective_still_calls_reasoner(monkeypatch: pytest.MonkeyPatch, objective: str) -> None:
-    """compare/vs/and, a second subject, or a second question keeps the Reasoner decompose."""
-    calls, questions = _graph_intake_decompose_calls(monkeypatch, objective)
-    assert calls == [objective] and questions == ["Q?", "Q?"]
 
 
 # Newest-first EDGAR rows: five newer 4/A filings would fill a mixed limit=5 window and bury the 8-K, 10-Q and 10-K.
@@ -941,233 +819,17 @@ def test_empty_document_provenance_does_not_clear_unread_material() -> None:
     assert kw._intake_unread_material(_EDGAR_ROWS[6:7], [], [inspected]) == ["0001-26-000007"]
 
 
-def _intake_web_queries_by_round(
-    monkeypatch: pytest.MonkeyPatch, context: Mapping[str, JSONValue] | None
-) -> list[list[object]]:
-    """search_web queries per intake round over two rounds (the Reasoner names a new ticker once)."""
-    rounds: list[list[object]] = [[]]
-
-    async def _fake_attempt(tool: str, args: dict[str, object], *a: object, **k: object) -> dict[str, object]:
-        if tool == "search_web":
-            rounds[-1].append(args.get("query"))
-        return {"tool": tool, "arguments": args, "error": "source unavailable"}
-
-    def _decompose(obj: str, *a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
-        rounds.append([])
-        return ([_proposal("s1-q1", "s1")], {"tickers": ["CRWV"], "corrected_query": "CRWV compute rental"})
-
-    def _no_tickers(*a: object, **k: object) -> list[str]:
-        return []
-
-    def _cik(t: str) -> str:
-        return t
-
-    monkeypatch.setattr(kw, "_intake_attempt", _fake_attempt)
-    monkeypatch.setattr(kw, "_intake_cik", _cik)
-    monkeypatch.setattr(kw, "_intake_start_tickers", _no_tickers)
-    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
-    asyncio.run(
-        kw._graph_intake("What does this mean?", None, "s1", {}, [], None, _IntakeKernel(), None, context=context)
-    )
-    return rounds[:-1]
-
-
-def test_feed_item_title_runs_one_round1_web_search() -> None:
-    """With a feed item, round 1 adds exactly one search_web on the title beside the objective search."""
-    with pytest.MonkeyPatch.context() as mp:
-        with_ctx = _intake_web_queries_by_round(mp, _FEED_ITEM)
-    with pytest.MonkeyPatch.context() as mp:
-        plain = _intake_web_queries_by_round(mp, None)
-    title = _FEED_ITEM["title"]
-    assert sorted(map(str, with_ctx[0])) == sorted(["What does this mean?", str(title)])
-    assert [q for r in with_ctx for q in r].count(title) == 1
-    assert plain == [["What does this mean?"], ["CRWV compute rental"]]
-    assert with_ctx[1:] == plain[1:]
-
-
-def _patch_nvda_intake(
-    monkeypatch: pytest.MonkeyPatch,
-    decompose: Callable[[int], tuple[list[dict[str, object]], dict[str, object]]],
-    evidence_text: str = "NVIDIA shipped new systems.",
-) -> list[list[str]]:
-    """Patch intake to NVDA with a fresh digest each round; returns the SEC tickers fetched per round."""
-    rounds: list[list[str]] = []
-
-    async def _round(
-        query: object, tickers: list[str], *a: object, **k: object
-    ) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
-        rounds.append(list(tickers))
-        return ([_stored_evidence(f"ev-{len(rounds)}", f"{evidence_text} Round {len(rounds)}.")], [], {"calls": 1})
-
-    def _decompose(*a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
-        return decompose(len(rounds))
-
-    def _nvda(*a: object, **k: object) -> list[str]:
-        return ["NVDA"]
-
-    def _subject(tickers: Sequence[str]) -> tuple[str, ...]:
-        return ("NVIDIA", "NVDA") if tickers else ()
-
-    monkeypatch.setattr(kw, "_intake_start_tickers", _nvda)
-    monkeypatch.setattr(kw, "_intake_subject", _subject)
-    monkeypatch.setattr(kw, "_intake_round", _round)
-    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
-    return rounds
-
-
-def _two_round_intake(
-    monkeypatch: pytest.MonkeyPatch,
-    decompose: Callable[[int], tuple[list[dict[str, object]], dict[str, object]]],
-    evidence_text: str = "NVIDIA shipped new systems.",
-) -> tuple[list[dict[str, object]], list[list[str]], _IntakeKernel]:
-    """_graph_intake over NVDA with a fresh digest each round: (proposals, SEC tickers per round, kernel)."""
-    rounds = _patch_nvda_intake(monkeypatch, decompose, evidence_text)
-    kernel = _IntakeKernel()
-    out = asyncio.run(kw._graph_intake("NVDA and CRWV news?", None, "s1", {}, [], None, kernel, None))
-    return out, rounds, kernel
-
-
-def test_related_question_never_lost_to_the_four_question_cut(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The planner's 4 questions plus 1 related name plan 5 nodes; extra planner questions are still cut."""
-    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
-    monkeypatch.setattr(sched, "build_registry", list)
-    _patch_nvda_intake(monkeypatch, lambda n: ([], {}), "OpenAI agreed to buy NVIDIA systems.")
-    judged: list[int] = []
-
-    def _decompose(obj: str, as_of: object, sid: str, *a: object) -> tuple[list[dict[str, object]], dict[str, object]]:
-        return [_proposal(f"{sid}-q{i}", sid) for i in range(1, 6)], {"tickers": ["OPENAI"]}
-
-    class _JevKeepAll(JevClient):
-        @override
-        async def decide(self, state: object, *a: object, **k: object) -> dict[str, dict[str, JSONValue]]:
-            judged.append(len(state["proposals"]) if isinstance(state, dict) else -1)
-            return {}
-
-    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
-    sid = kw.run_graph_prompt("NVDA and CRWV news?", jev=_JevKeepAll())
-    questions = [node.question for node in ResearchRepository().list_nodes(sid)]
-    assert judged == [5] and len(questions) == 5
-    assert questions[-1].startswith("Web search: OpenAI relationship with NVIDIA (NVDA)")
-
-
-@pytest.mark.parametrize(
-    ("objective", "context", "supplied", "expected"),
-    [
-        ("What does this mean?", {**_FEED_ITEM, "sym": "NVDA"}, "AAPL", "NVDA"),
-        ("What does this mean?", {k: v for k, v in _FEED_ITEM.items() if k != "sym"}, "AAPL", "AAPL"),
-        ("What does this mean?", None, "AAPL", "AAPL"),
-    ],
-)
-def test_feed_item_sym_is_the_subject_when_the_prompt_names_none(
-    monkeypatch: pytest.MonkeyPatch,
-    objective: str,
-    context: dict[str, JSONValue] | None,
-    supplied: str,
-    expected: str,
-) -> None:
-    """With no ticker in the prompt, the feed item's sym outranks the chart as the subject passed to resolution."""
-    seen: list[object] = []
-
-    def _start(obj: str, supplied_ticker: str | None = None) -> list[str]:
-        seen.append(supplied_ticker)
-        return [supplied_ticker] if supplied_ticker else []
-
-    _patch_nvda_intake(monkeypatch, lambda n: ([_proposal("s1-q1", "s1")], {}))
-    monkeypatch.setattr(kw, "_intake_start_tickers", _start)
-    asyncio.run(
-        kw._graph_intake(
-            objective, None, "s1", {}, [], None, _IntakeKernel(), None, supplied_ticker=supplied, context=context
-        )
-    )
-    assert seen == [expected]
-
-
-def test_feed_item_sym_subject_adds_related_question(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A feed item about SpaceX on NVDA, prompt with no ticker: the sym is the subject, SpaceX gets a web question."""
-
-    def _no_company(name: str) -> None:
-        return None
-
-    real_start = kw._intake_start_tickers
-    monkeypatch.setattr("app.tools._resolve_company_to_ticker", _no_company)
-    rounds = _patch_nvda_intake(monkeypatch, lambda n: ([_proposal("s1-q1", "s1")], {"tickers": ["SPACEX"]}))
-    monkeypatch.setattr(kw, "_intake_start_tickers", real_start)
-    item: dict[str, JSONValue] = {**_FEED_ITEM, "sym": "NVDA"}
-    out = asyncio.run(
-        kw._graph_intake("What does this mean?", None, "s1", {}, [], None, _IntakeKernel(), None, context=item)
-    )
-    assert rounds == [["NVDA"]]
-    assert [str(p["question"]).split(" (customer")[0] for p in out[1:]] == [
-        "Web search: SpaceX relationship with NVIDIA (NVDA)"
-    ]
-
-
-def test_round2_planner_timeout_keeps_round1_plan(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A round-2 planner timeout keeps round-1 questions and records the failure in that round's stats."""
-
-    def _decompose(n: int) -> tuple[list[dict[str, object]], dict[str, object]]:
-        if n == 2:
-            raise TimeoutError("reasoner decompose timed out after 20s")
-        return [_proposal("s1-q1", "s1")], {"tickers": ["CRWV", "NBIS"]}
-
-    out, rounds, kernel = _two_round_intake(monkeypatch, _decompose)
-    assert [p["id"] for p in out] == ["s1-q1"]
-    assert rounds == [["NVDA"], ["CRWV", "NBIS"]]
-    assert [d for d, _ in kernel.decisions] == ["intake_digest", "intake_digest"]
-    selected = kernel.decisions[-1][1]
-    assert isinstance(selected, dict)
-    assert selected["stats"]["planner_error"] == "TimeoutError: reasoner decompose timed out after 20s"
-
-
-def test_round1_planner_timeout_still_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Round 1 has no plan to keep: its planner timeout propagates as before."""
-
-    def _decompose(n: int) -> tuple[list[dict[str, object]], dict[str, object]]:
-        raise TimeoutError("reasoner decompose timed out after 20s")
-
-    with pytest.raises(TimeoutError, match="reasoner decompose timed out"):
-        _two_round_intake(monkeypatch, _decompose)
-
-
-def test_private_name_from_round1_text_yields_search_only_question(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A no-ticker name in the hints and round-1 evidence gets one web question; no SEC call, no round 2."""
-
-    def _decompose(n: int) -> tuple[list[dict[str, object]], dict[str, object]]:
-        return [_proposal("s1-q1", "s1")], {"tickers": ["OPENAI"]}
-
-    out, rounds, _kernel = _two_round_intake(monkeypatch, _decompose, "OpenAI agreed to buy NVIDIA systems.")
-    assert rounds == [["NVDA"]]
-    assert [p["id"] for p in out] == ["s1-q1", "s1-related1"]
-    assert out[1]["question"] == (
-        "Web search: OpenAI relationship with NVIDIA (NVDA) (customer, supplier, partner or competitor) and recent deals"
-    )
-    assert out[1]["objectiveId"] == "s1" and out[1]["dependsOn"] == []
-
-
-def test_related_names_cap_at_two_and_skip_asked_names(monkeypatch: pytest.MonkeyPatch) -> None:
-    """At most 2 related names per run; a name the planner already asked about adds no second question."""
-    asked = {**_proposal("s1-q1", "s1"), "question": "OpenAI compute purchases from NVIDIA?"}
-
-    def _decompose(n: int) -> tuple[list[dict[str, object]], dict[str, object]]:
-        return [asked], {"tickers": ["OPENAI", "SPACEX", "ANTHROPIC", "ORACLE CORP"]}
-
+def test_related_names_cap_at_two_and_skip_asked_names() -> None:
+    """Standalone related-name helpers preserve their limits without automatic graph expansion."""
     text = "OpenAI, SpaceX, Anthropic and Oracle Corp all rent NVIDIA compute."
-    out, _rounds, _kernel = _two_round_intake(monkeypatch, _decompose, text)
-    assert out[0]["question"] == asked["question"]
-    assert [str(p["question"]).split(" relationship")[0] for p in out[1:]] == ["Web search: SpaceX"]
-    assert kw._intake_related_names({"tickers": ["OPENAI", "SPACEX", "ANTHROPIC"]}, [], text) == ["OpenAI", "SpaceX"]
-
-
-@pytest.mark.parametrize("hints", [{}, {"tickers": ["OPENAI"]}, {"tickers": ["AMD"]}])
-def test_no_related_context_leaves_plan_unchanged(monkeypatch: pytest.MonkeyPatch, hints: dict[str, object]) -> None:
-    """No name, a name absent from the request and evidence, or a ticker: the plan is the planner's own."""
-
-    def _decompose(n: int) -> tuple[list[dict[str, object]], dict[str, object]]:
-        return [_proposal(f"s1-q{n}", "s1")], hints
-
-    out, rounds, _kernel = _two_round_intake(monkeypatch, _decompose)
-    assert [p["id"] for p in out] == [f"s1-q{len(rounds)}"]
-    assert rounds == ([["NVDA"], ["AMD"]] if hints == {"tickers": ["AMD"]} else [["NVDA"]])
+    names = kw._intake_related_names({"tickers": ["OPENAI", "SPACEX", "ANTHROPIC"]}, [], text)
+    assert names == ["OpenAI", "SpaceX"]
+    asked = {**_proposal("s1-q1", "s1"), "question": "OpenAI compute purchases from NVIDIA?"}
+    proposals = kw._intake_related_proposals(names, ("NVIDIA", "NVDA"), [asked], "s1")
+    assert [proposal["question"] for proposal in proposals] == [
+        "Web search: SpaceX relationship with NVIDIA (NVDA) (customer, supplier, partner or competitor) and recent deals"
+    ]
+    assert proposals[0]["objectiveId"] == "s1" and proposals[0]["dependsOn"] == []
     assert kw._intake_related_proposals(["OpenAI"], (), [], "s1") == []
 
 

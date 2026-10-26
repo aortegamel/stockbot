@@ -1678,7 +1678,7 @@ def test_assess_result_contradictory_resolve_continues() -> None:
 
     assert _continuation_for_assessment("resolve_node", "insufficient", "no") == "continue_research"
     assert _continuation_for_assessment("resolve_node", "conflicted", "yes") == "continue_research"
-    assert _continuation_for_assessment("resolve_node", "sufficient_support", "unsure") == "continue_research"
+    assert _continuation_for_assessment("resolve_node", "sufficient_support", "unknown") == "continue_research"
     assert _continuation_for_assessment("resolve_node", "sufficient_contradiction", "yes") == "continue_research"
     assert _continuation_for_assessment("resolve_node", "sufficient_support", "yes") == "resolve_node"
     assert _continuation_for_assessment("continue_research", "sufficient_support", "yes") == "continue_research"
@@ -1781,6 +1781,128 @@ def test_prop_compact_projection_clips_text_and_drops_raw(text: str, other: str,
     ]
 
 
+@pytest.mark.parametrize(
+    ("probability", "outcome", "strength"),
+    [
+        (0, "no", None),
+        (0.42, "no", None),
+        (0.4999, "no", None),
+        (0.5, "yes", "tentative"),
+        (0.6, "yes", "tentative"),
+        (0.6999, "yes", "tentative"),
+        (0.7, "yes", "confident"),
+        (1, "yes", "confident"),
+    ],
+)
+def test_support_normalization_boundaries(probability: float, outcome: str, strength: str | None) -> None:
+    from app.decision_client import _classify_probability, _normalize_probability
+
+    assert _normalize_probability(probability) == {"outcome": outcome, "probability": probability, "strength": strength}
+    assert _classify_probability(probability) == outcome
+
+
+@pytest.mark.parametrize("value", [None, "0.6", True, {}, [], -0.1, 1.1, math.nan, math.inf, -math.inf])
+def test_support_normalization_unknown(value: object) -> None:
+    from app.decision_client import _classify_probability, _normalize_probability, _support_verdict
+
+    assert _normalize_probability(value) == {"outcome": "unknown", "probability": None, "strength": None}
+    assert _classify_probability(value) == "unknown"
+    verdict = _support_verdict({}, None)
+    assert verdict["support_answer"] == "unknown"
+    assert verdict["support_result"] == {"outcome": "unknown", "probability": None, "strength": None}
+
+
+@seed(20261025)
+@settings(max_examples=100, derandomize=True)
+@given(st.floats(min_value=0, max_value=1, allow_nan=False, allow_infinity=False))
+def test_support_normalization_preserves_probability(probability: float) -> None:
+    from app.decision_client import _classify_probability, _normalize_probability
+
+    result = _normalize_probability(probability)
+    assert result["probability"] == probability
+    assert (result["outcome"] == "yes") == (probability >= 0.5)
+    assert (result["strength"] == "confident") == (probability >= 0.7)
+    assert (result["strength"] == "tentative") == (0.5 <= probability < 0.7)
+    assert _classify_probability(probability) == result["outcome"]
+
+
+def test_support_normalization_python_typescript_parity() -> None:
+    from app.decision_client import _normalize_probability
+
+    bun = shutil.which("bun")
+    assert bun is not None, "Support policy parity requires Bun."
+    root = Path(__file__).resolve().parent.parent
+    cases: list[JSONValue] = [
+        0,
+        0.42,
+        0.4999,
+        0.5,
+        0.6,
+        0.6999,
+        0.7,
+        1,
+        None,
+        "0.6",
+        True,
+        {},
+        [],
+        -0.1,
+        1.1,
+    ]
+    result = subprocess.run(
+        [
+            bun,
+            "-e",
+            (
+                'import { normalizeProbability } from "./decision/jev.ts"; '
+                "const cases = JSON.parse(await Bun.stdin.text()); "
+                "console.log(JSON.stringify(cases.map(normalizeProbability)));"
+            ),
+        ],
+        input=json.dumps(cases),
+        text=True,
+        capture_output=True,
+        cwd=root,
+        check=True,
+        timeout=30,
+    )
+    assert json.loads(result.stdout) == [_normalize_probability(value) for value in cases]
+
+
+@pytest.mark.parametrize("probability", [0.5, 0.6, 0.6999, 0.7])
+def test_assess_result_carries_affirmative_strength(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probability: float
+) -> None:
+    def transport(state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        answers: dict[str, JSONValue] = {}
+        for qid, question in questions.items():
+            assert isinstance(question, dict)
+            if question["type"] == "noul":
+                answers[qid] = {"type": "noul", "noul": probability}
+            else:
+                criteria = question["criteria"]
+                assert isinstance(criteria, dict)
+                winner = "sufficient_support" if qid == "evidence_state" else "resolve_node"
+                answers[qid] = {
+                    "type": "choice",
+                    "choice": winner,
+                    "probabilities": {label: float(label == winner) for label in criteria},
+                    "confidence": 0.9,
+                }
+        return {"answers": answers}
+
+    client = JevClient(data_root=tmp_path, transport=transport)
+    monkeypatch.setattr(client, "_persist", _noop_persist)
+    out = asyncio.run(client.assess_result({"question": "Does the filing support X?"}, {}, [], session_id="s1"))
+    strength = "confident" if probability >= 0.7 else "tentative"
+    for name in ("resolution_support", "topical_relevance"):
+        assert out[name] == probability
+        assert out[f"{name}_answer"] == "yes"
+        assert out[f"{name}_strength"] == strength
+        assert out[f"{name}_result"] == {"outcome": "yes", "probability": probability, "strength": strength}
+    assert out["continuation"] == "resolve_node"
+
+
 def _final_stub(prob: float, state: str) -> Callable[[object, Mapping[str, JSONValue]], dict[str, JSONValue]]:
     def _run(state_arg: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         assert sorted(questions.keys()) == ["evidence_state", "support"]
@@ -1846,6 +1968,29 @@ def _final_client(tmp_path: Path, prob: float, state: str) -> _FinalJev:
     return _FinalJev(tmp_path, prob, state)
 
 
+@pytest.mark.parametrize("probability", [0.42, 0.5, 0.6, 0.6999, 0.7])
+def test_final_assessments_carry_normalized_support(tmp_path: Path, probability: float) -> None:
+    client = _final_client(tmp_path, probability, "sufficient_support")
+    response = asyncio.run(client.assess_final_response("The filing supports X.", [], session_id="s1"))
+    claim = asyncio.run(client.assess_final_claim("The filing supports X.", "inference", [], session_id="s1"))
+    outcome = "yes" if probability >= 0.5 else "no"
+    strength = "confident" if probability >= 0.7 else "tentative" if probability >= 0.5 else None
+    for assessment in (response, claim):
+        assert assessment["support"] == probability
+        assert assessment["support_answer"] == outcome
+        assert assessment["support_strength"] == strength
+        assert assessment["support_result"] == {"outcome": outcome, "probability": probability, "strength": strength}
+
+
+@pytest.mark.parametrize("probability", [math.nan, math.inf, -0.1, 1.1])
+def test_final_assessments_preserve_malformed_probability_errors(tmp_path: Path, probability: float) -> None:
+    client = _final_client(tmp_path, probability, "sufficient_support")
+    with pytest.raises(ValueError, match="malformed_decision_answer"):
+        asyncio.run(client.assess_final_response("The filing supports X.", [], session_id="s1"))
+    with pytest.raises(ValueError, match="malformed_decision_answer"):
+        asyncio.run(client.assess_final_claim("The filing supports X.", "inference", [], session_id="s1"))
+
+
 def test_assess_final_response_supported(tmp_path: Path) -> None:
     client = _final_client(tmp_path, 0.85, "sufficient_support")
     out = asyncio.run(
@@ -1869,7 +2014,8 @@ def test_assess_final_response_supported(tmp_path: Path) -> None:
 def test_assess_final_response_conflicted(tmp_path: Path) -> None:
     client = _final_client(tmp_path, 0.55, "conflicted")
     out = asyncio.run(client.assess_final_response("Growth maybe.", [], session_id="s1"))
-    assert out["support_answer"] == "unsure" and out["evidence_state"] == "conflicted"
+    assert out["support_answer"] == "yes" and out["evidence_state"] == "conflicted"
+    assert out["support_strength"] == "tentative"
     assert out["confidence"] is None
 
 

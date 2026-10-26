@@ -253,7 +253,7 @@ export function qualifiedEvidenceFree(claims: readonly FinalClaim[]): FinalClaim
     return c.claimType === "assumption" || [...plain.matchAll(NUMBER)].every((n) => /^(?:19|20)\d\d$/.test(n[0]));
   });
 }
-function gatePasses(v: FinalGateVerdict): boolean {
+function normalizedYes(v: FinalGateVerdict): boolean {
   if (typeof v.error === "string" && v.error) return false;
   const verdict = typeof v.verdict === "string" ? v.verdict : undefined;
   const answer = typeof v.support_answer === "string" ? v.support_answer : undefined;
@@ -287,7 +287,7 @@ type FinalGateContext = {
   sessionId?: string;
   opts?: { signal?: AbortSignal; timeoutMs?: number };
 };
-// A gate call failure never fails the run: the affected claim is rejected instead.
+// A gate call failure or missing/unknown reply normalizes to unknown: the affected claim is rejected, never guessed.
 async function callGate(ctx: FinalGateContext, body: Record<string, unknown>): Promise<{ verdict: FinalGateVerdict } | { failure: string }> {
   try {
     return { verdict: await ctx.gate(body, ctx.opts) };
@@ -295,123 +295,122 @@ async function callGate(ctx: FinalGateContext, body: Record<string, unknown>): P
     return { failure: `final gate unavailable: ${errorText(err)}` };
   }
 }
-// One persona through both gate stages: a passing whole-response keeps the prose
-// its claims cover; a reject runs the per-claim ops and keeps only prose that a
-// supported claim covers.
-async function gateResult(r: FinalPersonaResult, ctx: FinalGateContext): Promise<{ text: string } | { failure: string }> {
-  const whole = await callGate(ctx, {
-    op: "assess_final_response",
+// Each claim is verified independently: preserved deterministic checks reject first,
+// then one existing per-claim JEV op judges its qualified wording as written.
+async function checkClaim(ctx: FinalGateContext, persona: Persona, c: FinalClaim): Promise<{ claim: FinalClaim } | { unsupported: true } | { failure: string }> {
+  const checked = await callGate(ctx, {
+    op: "assess_final_claim",
     ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
-    persona: r.persona,
-    text: r.prose,
-    claims: r.claims.map(toWireClaim),
+    persona,
+    claim: toWireClaim(c),
     evidence: ctx.evidence,
-    ...(r.confidence !== undefined ? { confidence: r.confidence } : {}),
+    ...(c.confidence !== undefined ? { confidence: c.confidence } : {}),
   });
-  if ("failure" in whole) return { failure: `${r.persona}: ${whole.failure}` };
-  if (gatePasses(whole.verdict)) return keptProse(r.persona, dropUncovered(r.prose, r.claims));
-  return deleteRejectedClaims(r, ctx);
+  if ("failure" in checked) return { failure: `${persona}: ${checked.failure}` };
+  return normalizedYes(checked.verdict) ? { claim: c } : { unsupported: true };
 }
-// Per-claim ops run only after a whole-response reject, all claims at once. The
-// verdict reads them in inventory order, as a serial loop would: the first
-// failed op fails the persona. Prose no supported claim covers drops, and each
-// rejected claim loses its substring.
-async function deleteRejectedClaims(r: FinalPersonaResult, ctx: FinalGateContext): Promise<{ text: string } | { failure: string }> {
-  const checked = await Promise.all(r.claims.map(async (c) => ({
-    c,
-    one: await callGate(ctx, {
-      op: "assess_final_claim",
-      ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
-      persona: r.persona,
-      claim: toWireClaim(c),
-      evidence: ctx.evidence,
-      ...(c.confidence !== undefined ? { confidence: c.confidence } : {}),
-    }),
-  })));
+// One persona through independent claim checks: keep only prose a supported claim covers.
+async function gateResult(r: FinalPersonaResult, ctx: FinalGateContext): Promise<{ text: string; supported: FinalClaim[]; partial?: boolean } | { failure: string; supported: FinalClaim[] }> {
+  const evidence: Evidence[] = ctx.evidence.map((e) => ({ id: e.id, source: "kernel", retrievedAt: new Date(0).toISOString(), content: e.content, ...(e.datapoints !== undefined ? { datapoints: e.datapoints } : {}) }));
+  const points = datapointRows(evidence);
   const supported: FinalClaim[] = [];
-  for (const { c, one } of checked) {
-    if ("failure" in one) return { failure: `${r.persona}: ${one.failure}` };
-    if (gatePasses(one.verdict)) supported.push(c);
+  let failures = 0;
+  let failed: string | undefined;
+  for (const c of r.claims) {
+    const localDefect = inventoryDefect(c.text, [c], new Set(ctx.evidence.map((e) => e.id)), points);
+    if (localDefect !== undefined) {
+      failures += 1;
+      continue;
+    }
+    const checked = await checkClaim(ctx, r.persona, c);
+    if ("failure" in checked) {
+      failed ??= checked.failure;
+      failures += 1;
+      continue;
+    }
+    if ("claim" in checked) supported.push(checked.claim);
+    else failures += 1;
   }
-  let kept = dropUncovered(r.prose, supported);
-  for (const { c } of checked) if (!supported.includes(c)) kept = kept.split(c.text).join("");
-  return keptProse(r.persona, kept);
+  if (supported.length === 0) return { failure: failed ?? `${r.persona}: all claims rejected`, supported };
+  const kept = keptProse(r.persona, dropUncovered(r.prose, supported), supported);
+  return "failure" in kept ? { failure: kept.failure, supported } : { text: kept.text, supported: kept.supported, ...(failures > 0 ? { partial: true as const } : {}) };
 }
-// Prose left empty by the deletions fails the run.
-function keptProse(persona: Persona, text: string): { text: string } | { failure: string } {
+// A rejected transport call or empty kept prose fails the run; an unsupported claim alone never erases supported ones.
+function keptProse(persona: Persona, text: string, supported: readonly FinalClaim[]): { text: string; supported: FinalClaim[] } | { failure: string } {
   const kept = text.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-  return kept ? { text: kept } : { failure: `${persona}: all claims rejected` };
+  return kept ? { text: kept, supported: [...supported] } : { failure: `${persona}: all claims rejected` };
 }
 // Every selected persona appears exactly once, in the requested order; the
 // answer labels each block with its persona.
-function assembleGated(gated: readonly { persona: Persona; text: string }[], personaOrder: readonly Persona[]): { text: string } | { failure: string } {
-  if (gated.length !== personaOrder.length) return { failure: `final gate persona mismatch: ${gated.length} gated, ${personaOrder.length} ordered` };
-  const byPersona = new Map(gated.map((g) => [g.persona, g.text] as const));
-  if (byPersona.size !== gated.length) return { failure: "final gate duplicate persona result" };
-  for (const p of personaOrder) if (!byPersona.has(p)) return { failure: `final gate missing persona: ${p}` };
-  const blocks = personaOrder.map((p) => `── ${p.charAt(0).toUpperCase()}${p.slice(1)} ──\n${byPersona.get(p) ?? ""}`);
-  return { text: blocks.join("\n\n") };
+function assembleGated(gated: readonly { persona: Persona; text: string; supported: FinalClaim[]; partial?: boolean }[], personaOrder: readonly Persona[]): { text: string; supported: FinalClaim[]; partial: boolean } | { failure: string; supported: FinalClaim[] } {
+  if (gated.length !== personaOrder.length) return { failure: `final gate persona mismatch: ${gated.length} gated, ${personaOrder.length} ordered`, supported: [] };
+  const byPersona = new Map(gated.map((g) => [g.persona, g] as const));
+  if (byPersona.size !== gated.length) return { failure: "final gate duplicate persona result", supported: [] };
+  for (const p of personaOrder) if (!byPersona.has(p)) return { failure: `final gate missing persona: ${p}`, supported: [] };
+  const blocks = personaOrder.map((p) => `── ${p.charAt(0).toUpperCase()}${p.slice(1)} ──\n${byPersona.get(p)?.text ?? ""}`);
+  return { text: blocks.join("\n\n"), supported: personaOrder.flatMap((p) => byPersona.get(p)?.supported ?? []), partial: personaOrder.some((p) => byPersona.get(p)?.partial === true) };
 }
-// Final accuracy gates: inventory -> whole-response JEV and ledger proof via
-// Python worker ops -> on reject per-claim gates -> surgical deletion of
-// rejected substrings and uncovered prose -> single answer_delta. Fail closed;
-// never deletes evidence rows. Personas
-// before the first inventory defect gate at once; the verdict is the first
-// failure in result order, the same verdict a serial loop gives.
+// Verified claims publish: intact inventory -> one existing per-claim verdict per claim
+// -> surgical deletion of unsupported substrings and uncovered prose -> answer snapshots.
+// Fail closed; never deletes evidence rows.
 // `sessionId` is the run's session: the worker judges gates against that
-// session's persisted rows, and its request-id fallback (the numeric kernel
-// request id) fails closed with "unknown session_id" for every call.
+// session's persisted rows, and its request-id fallback fails every gate closed.
 type GateOptions = {
   evidence: Evidence[];
   gate: FinalGateCaller;
   sessionId?: string;
   gateOpts?: { signal?: AbortSignal; timeoutMs?: number };
 };
-async function gatePersonas(results: FinalPersonaResult[], opts: GateOptions): Promise<{ persona: Persona; text: string }[] | { failure: string }> {
-  const known = new Set(opts.evidence.map((e) => e.id));
-  const points = datapointRows(opts.evidence);
-  const ctx: FinalGateContext = {
-    gate: opts.gate,
-    evidence: opts.evidence.map((e) => ({
-      id: e.id,
-      content: e.content,
-      ...((e.datapoints?.length ?? 0) > 0
-        ? {
-          datapoints: (e.datapoints ?? []).map((p) => ({
-            id: p.id,
-            metric: p.metric,
-            value: p.value,
-            entity: p.entity,
-            period: p.period,
-            ...(p.unit !== undefined ? { unit: p.unit } : {}),
-            statement: p.statement,
-          })),
-        }
-        : {}),
-    })),
-    ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
-    opts: opts.gateOpts,
-  };
-  const defects = results.map((r) => inventoryDefect(r.prose, r.claims, known, points));
-  const cut = defects.findIndex((d) => d !== undefined);
-  const checked = await Promise.all(results.slice(0, cut < 0 ? undefined : cut).map(async (r) => ({ persona: r.persona, outcome: await gateResult(r, ctx) })));
-  const gated: { persona: Persona; text: string }[] = [];
-  for (const { persona, outcome } of checked) {
-    if ("failure" in outcome) return outcome;
-    gated.push({ persona, text: outcome.text });
+async function gatePersonas(results: FinalPersonaResult[], opts: GateOptions): Promise<{ persona: Persona; text: string; supported: FinalClaim[]; partial?: boolean }[] | { failure: string; supported: FinalClaim[]; partial: boolean }> {
+  const gated: { persona: Persona; text: string; supported: FinalClaim[]; partial?: boolean }[] = [];
+  let failed: string | undefined;
+  for (const r of results) {
+    const ctx: FinalGateContext = {
+      gate: opts.gate,
+      evidence: opts.evidence.map((e) => ({
+        id: e.id,
+        content: e.content,
+        ...((e.datapoints?.length ?? 0) > 0
+          ? {
+            datapoints: (e.datapoints ?? []).map((p) => ({
+              id: p.id,
+              metric: p.metric,
+              value: p.value,
+              entity: p.entity,
+              period: p.period,
+              ...(p.unit !== undefined ? { unit: p.unit } : {}),
+              statement: p.statement,
+            })),
+          }
+          : {}),
+      })),
+      ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+      opts: opts.gateOpts,
+    };
+    const outcome = await gateResult(r, ctx);
+    if ("failure" in outcome) {
+      failed ??= outcome.failure;
+      if (outcome.supported.length > 0) gated.push({ persona: r.persona, text: "", supported: outcome.supported, partial: true });
+      continue;
+    }
+    gated.push({ persona: r.persona, text: outcome.text, supported: outcome.supported, ...(outcome.partial === true ? { partial: true as const } : {}) });
   }
-  if (cut >= 0) return { failure: `${results[cut]?.persona}: ${defects[cut]}` };
+  if (gated.length === 0) return { failure: failed ?? "all claims rejected", supported: [], partial: false };
   return gated;
 }
-export async function applyFinalGates(opts: GateOptions & { results: FinalPersonaResult[]; personaOrder: readonly Persona[] }): Promise<{ text: string } | { failure: string }> {
+export async function applyFinalGates(opts: GateOptions & { results: FinalPersonaResult[]; personaOrder: readonly Persona[] }): Promise<{ text: string; supported: FinalClaim[]; partial: boolean } | { failure: string; supported: FinalClaim[]; partial?: boolean }> {
   const gated = await gatePersonas(opts.results, opts);
-  return Array.isArray(gated) ? assembleGated(gated, opts.personaOrder) : gated;
+  if (!Array.isArray(gated)) return gated;
+  const ordered = opts.personaOrder.filter((p) => gated.some((g) => g.persona === p));
+  const assembled = assembleGated(gated, ordered);
+  return "failure" in assembled ? assembled : { text: assembled.text, supported: assembled.supported, partial: assembled.partial };
 }
-// One unlabeled answer through the same gates: the route's single-tool answer.
-// Buffer the answer, gate it, then emit the kept text.
-export async function gateAnswer(opts: GateOptions & { result: FinalPersonaResult }): Promise<{ text: string } | { failure: string }> {
+// One unlabeled answer through the same independent gates: the route's single-tool answer.
+export async function gateAnswer(opts: GateOptions & { result: FinalPersonaResult }): Promise<{ text: string; supported: FinalClaim[]; partial: boolean } | { failure: string; supported: FinalClaim[]; partial?: boolean }> {
   const gated = await gatePersonas([opts.result], opts);
-  return Array.isArray(gated) ? { text: gated[0]?.text ?? "" } : gated;
+  if (!Array.isArray(gated)) return gated;
+  const first = gated[0];
+  return first === undefined ? { failure: "all claims rejected", supported: [], partial: false } : { text: first.text, supported: first.supported, partial: first.partial === true };
 }
 type RunKernelDeps = {
   spawnFn?: KernelSpawn;
@@ -795,7 +794,7 @@ type Pass = {
 type Settled = { r: KernelReasonResult } | { err: unknown };
 type SettledPersona = { persona: Persona; outcome: Settled };
 // Everything a persona call needs except the persona and the trio drafts.
-type ReasonInput = Omit<KernelReasonInput, "persona" | "drafts">;
+type ReasonInput = Omit<KernelReasonInput, "persona" | "drafts"> & { deadlineAt?: number };
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -868,17 +867,28 @@ function workerStatus(stage: string, detail: Record<string, unknown> | undefined
 }
 
 // One shared terminal path: count the failure, disclose it, then report totals.
-function endFailed(run: KernelRun, tool: string | null, category: FailureCategory, message: string): void {
+function endFailed(run: KernelRun, tool: string | null, category: FailureCategory, message: string, status: "failed" | "cancelled" = "failed"): void {
   run.failures[category] = (run.failures[category] ?? 0) + 1;
   if (tool !== null) run.emit({ type: "tool_failed", tool, category, preview: message.slice(0, 160) });
-  run.emit({ type: "failed", category, message: message.slice(0, 160) });
-  run.emit({ type: "done", metrics: metricsOf(run, run.escalations + 1) });
+  if (run.signal?.aborted || status === "cancelled") {
+    run.emit({ type: "cancelled", message: "The request was cancelled." });
+    run.emit({ type: "done", metrics: metricsOf(run, run.escalations + 1), status: "cancelled" });
+    return;
+  }
+  run.emit({ type: "failed", category, message: message.slice(0, 160), code: category, stage: tool ?? undefined });
+  run.emit({ type: "done", metrics: metricsOf(run, run.escalations + 1), status });
 }
 
 // A finished answer: the exact text the gates cleared, then the totals.
-function endReport(run: KernelRun, text: string): void {
+function endReport(run: KernelRun, text: string, status: "completed" | "completed_with_limitations" = "completed", limitations?: string[]): void {
   run.emit({ type: "answer_delta", text });
-  run.emit({ type: "done", metrics: metricsOf(run, run.escalations) });
+  run.emit({ type: "done", metrics: metricsOf(run, run.escalations), ...(limitations !== undefined ? { status, limitations } : { status }) });
+}
+
+// A verified partial answer: checked claims only, before the terminal event.
+function emitPartial(run: KernelRun, text: string, supported: readonly FinalClaim[]): void {
+  if (!text || supported.length === 0) return;
+  run.emit({ type: "answer_partial", text, claims: [...supported] });
 }
 
 // Worker failure tallies arrive as untrusted JSON: only numbers count.
@@ -905,8 +915,12 @@ async function measuredReason(run: KernelRun, input: KernelReasonInput): Promise
   } finally {
     const providerCalls = result?.usage.providerCalls ?? usage.providerCalls;
     if (providerCalls !== undefined) run.usage.providerCalls = (run.usage.providerCalls ?? 0) + providerCalls;
+    for (const key of ["inputTokens", "outputTokens", "cachedTokens"] as const) {
+      const count = result?.usage[key] ?? (result === undefined ? usage[key] : undefined);
+      if (typeof count === "number") run.usage[key] = (run.usage[key] ?? 0) + count;
+    }
     const measured = result?.timings ?? timings;
-    for (const key of ["narrativeMs", "binderMs"] as const) addTiming(run, key, measured[key]);
+    addTiming(run, "narrativeMs", measured.narrativeMs);
   }
 }
 
@@ -1164,6 +1178,8 @@ function reasonInput(run: KernelRun): ReasonInput {
     nodes: run.nodes,
     decisions: run.records,
     ...(run.signal ? { signal: run.signal } : {}),
+    // Every provider call shares the request deadline: no stage restarts the clock.
+    deadlineAt: run.deadlineAt,
     spent: run.spent,
   };
 }
@@ -1180,7 +1196,6 @@ function settle(run: KernelRun, input: ReasonInput, persona: Persona, drafts?: {
 // Usage counts every completed call, blank answers included; a blank answer still
 // fails the report. Results keep the model's declared inventory.
 function collectResult(pass: Pass, persona: Persona, r: KernelReasonResult): string | undefined {
-  addUsage(pass.run, r.usage);
   const prose = r.prose.trim();
   if (!prose) return `${persona}: empty response`;
   pass.results ??= [];
@@ -1261,39 +1276,6 @@ async function trioStage(pass: Pass, input: ReasonInput): Promise<void> {
   pass.failure = acceptAnswer(pass, "stockbot", await settle(pass.run, input, "stockbot", pass.synthDrafts));
 }
 
-// One-shot inventory correction, a local fast path only: an unknown evidence id
-// (often a graph node id like rn:...), an unknown datapoint id, or a
-// non-verbatim claims[].text retries once against the same snapshot. Other
-// defects never retry. The corrected answer still goes through every worker
-// gate. The rejected prose and inventory are untrusted model output.
-async function correctInventory(pass: Pass, input: ReasonInput): Promise<void> {
-  const results = pass.results ?? [];
-  const validIds = pass.run.evidence.map((e) => e.id);
-  const known = new Set(validIds);
-  const points = datapointRows(pass.run.evidence);
-  const rejected = results.filter((r) => {
-    const defect = inventoryDefect(r.prose, r.claims, known, points);
-    return ["inventory cites unknown evidence id", "inventory cites unknown datapoint id", "inventory text not a prose substring"].some((p) => defect?.startsWith(p) === true);
-  });
-  if (rejected.length === 0) return;
-  const started = performance.now();
-  pass.run.museCalls += rejected.length;
-  const retried = await Promise.all(rejected.map(async (r) => ({
-    persona: r.persona,
-    outcome: await settle(
-      pass.run,
-      { ...input, prompt: `${input.prompt}\n\n${inventoryCorrection(validIds, r.prose, r.claims)}` },
-      r.persona,
-      r.persona === "stockbot" ? pass.synthDrafts : undefined,
-    ),
-  })));
-  pass.run.museMs += performance.now() - started;
-  const replaced: Record<string, true> = {};
-  for (const r of rejected) replaced[r.persona] = true;
-  pass.results = results.filter((r) => !replaced[r.persona]);
-  for (const x of retried) noteFailure(pass, acceptAnswer(pass, x.persona, x.outcome));
-}
-
 // A failed stage ends the report as provider_error; the reasoner is the tool.
 function endStageFailure(run: KernelRun, pass: Pass): boolean {
   if (pass.failure === undefined) return false;
@@ -1301,7 +1283,7 @@ function endStageFailure(run: KernelRun, pass: Pass): boolean {
   return true;
 }
 
-// A research answer is gated before display; a direct answer keeps only its explicitly
+// A research answer is verified before display; a direct answer keeps only its explicitly
 // qualified evidence-free unknown/assumption claims. Neither announces gaps.
 async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
   const results = pass.results;
@@ -1314,11 +1296,12 @@ async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
       return;
     }
     const blocks = kept.map((k) => `── ${k.persona.charAt(0).toUpperCase()}${k.persona.slice(1)} ──\n${k.text}`);
-    endReport(run, blocks.join("\n\n"));
+    endReport(run, blocks.join("\n\n"), "completed");
     return;
   }
   const order: Persona[] = run.isTrio ? ["bearbot", "bullbot", "stockbot"] : [...run.personas];
   const gatesAt = performance.now();
+  const remaining = Math.max(run.deadlineAt - Date.now(), 1);
   const gated = await applyFinalGates({
     results: order.flatMap((p) => results.filter((r) => r.persona === p)),
     evidence: run.evidence,
@@ -1326,19 +1309,22 @@ async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
     // Gates are judged against this run's session; without it the worker falls
     // back to the numeric request id and fails every gate closed.
     ...(typeof run.sessionId === "string" && run.sessionId ? { sessionId: run.sessionId } : {}),
-    gate: (body, gateOpts) => run.router.call(body, { ...(run.signal ? { signal: run.signal } : {}), ...gateOpts }),
+    gate: (body, gateOpts) => run.router.call(body, { ...(run.signal ? { signal: run.signal } : {}), timeoutMs: remaining, ...gateOpts }),
   });
   addTiming(run, "gatesMs", performance.now() - gatesAt);
   if ("failure" in gated) {
+    // Verified partial claims survive even when the whole answer cannot publish.
+    if (gated.supported.length > 0) emitPartial(run, dropUncovered(results.map((r) => r.prose).join("\n\n"), gated.supported), gated.supported);
     endFailed(run, "muse", "provider_error", gated.failure);
     return;
   }
+  const limitations = [...new Set([...run.unresolved, ...(run.guard ? ["incomplete evidence guard"] : [])])].slice(0, 5);
+  const limited = gated.partial || limitations.length > 0;
   run.emit({ type: "answer_delta", text: gated.text });
   offerTrio(run);
-  // The inventory claims the gates kept: each text still stands in the shown answer.
-  const claims = results.flatMap((r) => r.claims.filter((c) => c.text !== "" && gated.text.includes(c.text)));
-  if (claims.length > 0) run.emit({ type: "claims", claims });
-  run.emit({ type: "done", metrics: metricsOf(run, run.escalations) });
+  if (gated.supported.length > 0) run.emit({ type: "claims", claims: gated.supported });
+  if (limited) run.emit({ type: "answer_partial", text: gated.text, claims: gated.supported });
+  run.emit({ type: "done", metrics: metricsOf(run, run.escalations), ...(limited ? { status: "completed_with_limitations", limitations } : { status: "completed" }) });
 }
 
 // The research snapshot a trio follow-up answers over: evidence plus the graph projection.
@@ -1382,8 +1368,7 @@ export async function runPersonaAgent(
   await answerPass(run);
 }
 
-// One answer pass over the current snapshot: reasoning_start, the stage set, the
-// optional inventory correction, then the gated answer.
+// One answer pass over the current snapshot: the reasoner stages, then the verified answer.
 async function answerPass(run: KernelRun): Promise<void> {
   run.emit({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
   const started = performance.now();
@@ -1392,10 +1377,6 @@ async function answerPass(run: KernelRun): Promise<void> {
   if (run.isTrio) await trioStage(stage, input);
   else await personaStage(stage, input);
   run.museMs += performance.now() - started;
-  if (endStageFailure(run, stage)) return;
-  // Final accuracy gates on the research path only: the gates check the prose
-  // and drop unsupported claims.
-  if (!run.direct && stage.results !== undefined) await correctInventory(stage, input);
   if (endStageFailure(run, stage)) return;
   await finishAnswer(run, stage);
 }

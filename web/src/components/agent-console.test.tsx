@@ -60,14 +60,43 @@ describe("AgentConsole answer rendering", () => {
     expect(out).toContain("hi there");
   });
 
-  test("no answer renders before done arrives", () => {
+  test("checked answer text renders before done arrives", () => {
     const events: AgentEvent[] = [
       { type: "agent_start", prompt: "hello" },
       { type: "reasoning_start", model: "stockbot" },
       { type: "answer_delta", text: "partial" },
     ];
     const out = html(events);
-    expect(out).not.toContain("partial");
+    expect(out).toContain("partial");
+    expect(out).toContain("Partial checked answer · research continues");
+  });
+
+  test("the latest checked snapshot persists after failure and final deltas replace it", () => {
+    const events: AgentEvent[] = [
+      { type: "reasoning_start", model: "stockbot" },
+      { type: "answer_partial", text: "Earlier checked snapshot.", claims: [] },
+      { type: "answer_partial", text: "Latest checked snapshot.", claims: [] },
+      { type: "answer_delta", text: "" },
+    ];
+    for (const debug of [false, true]) {
+      const partial = html(events, true, debug);
+      expect(partial).toContain("Latest checked snapshot.");
+      expect(partial).not.toContain("Earlier checked snapshot.");
+      expect(partial).toContain("Partial checked answer · research continues");
+      for (const terminal of [
+        { type: "failed", category: "provider_error", message: "private provider diagnostic" },
+        { type: "error", message: "private transport diagnostic" },
+        { type: "done", metrics: metrics(), status: "cancelled" },
+      ] satisfies AgentEvent[]) {
+        const stopped = html([...events, terminal], true, debug);
+        expect(stopped).toContain("Latest checked snapshot.");
+        expect(stopped).not.toContain("research continues");
+      }
+      const final = html([...events, { type: "answer_delta", text: "Final checked " }, { type: "answer_delta", text: "answer." }], true, debug);
+      expect(final).toContain("Final checked answer.");
+      expect(final).not.toContain("Latest checked snapshot.");
+      expect(final).not.toContain("Earlier checked snapshot.");
+    }
   });
 
   test("empty events render the intro", () => {
@@ -75,12 +104,15 @@ describe("AgentConsole answer rendering", () => {
     expect(out).toContain("Stockbot");
   });
 
-  test("terminal error renders its message", () => {
+  test("terminal errors show safe production text and preserve debug diagnostics", () => {
     const events: AgentEvent[] = [
       { type: "agent_start", prompt: "hello" },
-      { type: "error", message: "boom happened" },
+      { type: "error", message: "boom happened", code: "provider_unavailable", stage: "answer" },
     ];
-    expect(html(events)).toContain("boom happened");
+    const production = html(events);
+    expect(production).toContain("The request failed. Please retry.");
+    for (const diagnostic of ["boom happened", "provider_unavailable", "answer:"]) expect(production).not.toContain(diagnostic);
+    expect(html(events, true, true)).toContain("answer: provider_unavailable: boom happened");
   });
 });
 
@@ -162,7 +194,7 @@ describe("AgentConsole event presentation", () => {
     expect(production[0]).not.toContain("archive");
   });
 
-  test("reasoning appears once while streaming and disappears when reasoning stops or a terminal row arrives", () => {
+  test("reasoning gives way to a checked answer before the terminal row arrives", () => {
     const events: AgentEvent[] = [
       { type: "agent_start", prompt: "Research NVDA" },
       { type: "reasoning_start", model: "private-model-name" },
@@ -171,12 +203,16 @@ describe("AgentConsole event presentation", () => {
       { type: "evidence", evidence: [] },
     ];
     for (const debug of [false, true]) {
+      const working = rows(events.slice(0, 2), true, debug);
+      expect(working).toHaveLength(2);
+      expect(working[1]).toContain("STOCKBOT");
+      expect(working[1]).toContain("stockbot / working…");
       const streaming = rows(events, true, debug);
-      expect(streaming).toHaveLength(2);
+      expect(streaming).toHaveLength(3);
       expect(streaming[0]).toBe("> Research NVDA");
-      expect(streaming[1]).toContain("STOCKBOT");
-      expect(streaming[1]).toContain("stockbot / working…");
-      expect(streaming.join("")).not.toContain("Partial answer");
+      expect(streaming[1]).toBe("Partial checked answer · research continues");
+      expect(streaming[2]).toBe("Partial answer");
+      expect(streaming.join("")).not.toContain("working…");
       expect(streaming.join("")).not.toContain("private-model-name");
       for (const terminal of [
         { type: "done", metrics: metrics() },
@@ -377,12 +413,15 @@ describe("AgentConsole show-work row", () => {
     expect(row([...work, done]).summary).toBe("Worked for 12s · 3 steps");
   });
 
-  test("no answer renders before the terminal event, then progress collapses", () => {
+  test("checked answers render before the terminal event and work continues", () => {
     const answered: AgentEvent[] = [...work, { type: "progress", stage: "intake_evidence" }, { type: "answer_delta", text: "Final view." }, { type: "done", metrics: metrics() }];
     const out = rows(answered, false, false);
     expect(out.slice(-3)).toEqual(["Final view.", expect.stringMatching(/^Worked for \d+s · 4 steps/), expect.stringMatching(/── metrics ──/)]);
     expect(html(work, false)).not.toContain("Final view.");
-    expect(html([...work, { type: "answer_delta", text: "Final view." }], false)).not.toContain("Final view.");
+    const active = html([...work, { type: "answer_delta", text: "Final view." }], false);
+    expect(active).toContain("Final view.");
+    expect(active).toContain("Partial checked answer · research continues");
+    expect(active).toContain("Working · 3 steps");
   });
 });
 

@@ -42,7 +42,7 @@ import sys
 import termios
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -50,9 +50,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from app.child_spawn import defer_termination
 from app.research.models import (
-    _BASELINE_ANNUAL,
-    _BASELINE_CURRENT,
-    _BASELINE_QUARTERLY,
     FailureCategory,
     JSONValue,
     _baseline_accession,
@@ -65,6 +62,7 @@ if TYPE_CHECKING:
     from app.decision_client import JevClient
     from app.reasoner_client import ReasonerClient
     from app.research.models import DecisionRecord, ResearchNode
+    from app.research.repository import ResearchRepository
     from app.research.scheduler import _Kernel
 
 logger = logging.getLogger(__name__)
@@ -235,6 +233,10 @@ def _evidence_text(rec: Mapping[str, JSONValue]) -> str:
     # Stored SEC document observations go out whole (revenue tables sit past 2000 chars).
     # Every other row, and any row without stored text, keeps the 2000-char wire cap.
     prov = rec.get("provenance")
+    if isinstance(prov, Mapping):
+        source_text = prov.get("passage") or prov.get("excerpt") or prov.get("record_identity")
+        if isinstance(source_text, str) and source_text.strip():
+            return source_text
     cap = None if isinstance(prov, Mapping) and prov.get("kind") == "sec_source" else 2000
     for key in ("content", "text", "fact", "passage"):
         val = rec.get(key)
@@ -250,21 +252,15 @@ def _evidence_id(rec: Mapping[str, JSONValue], fallback: str) -> str:
     return fallback
 
 
-# One limit=1 listing per family: a burst of insider filings never buries the newest 10-Q/10-K/8-K.
-_INTAKE_MATERIAL_FAMILIES = tuple(sorted(f) for f in (_BASELINE_QUARTERLY, _BASELINE_ANNUAL, _BASELINE_CURRENT))
-_INTAKE_MATERIAL_FORMS = _BASELINE_QUARTERLY | _BASELINE_ANNUAL | _BASELINE_CURRENT
-_INTAKE_INSIDER_FORMS = ("3", "3/A", "4", "4/A", "5", "5/A")
-_INTAKE_INSIDER_LIMIT = 10
-_INTAKE_SEC_LIMIT = 5
-_INTAKE_DIGEST_CHARS = 6000
-_INTAKE_MAX_ROUNDS = 2
-_INTAKE_MAX_QUESTIONS = 4
+_INTAKE_MAX_QUESTIONS = 0
 _INTAKE_CALL_TIMEOUT_S = 8.0
 _INTAKE_BUDGET_S = 8.0
 _INTAKE_REASONER_TIMEOUT_S = 20.0
 _INTAKE_DOC_TIMEOUT_S = 5.0
 _INTAKE_DOC_CHARS = 12_000
-# The ticker chain lists each family then reads the newest documents, so the
+_INTAKE_SEC_LIMIT = 5
+_INTAKE_MATERIAL_FORMS = {"10-Q", "10-Q/A", "10-K", "10-K/A", "8-K", "8-K/A"}
+_INTAKE_INSIDER_FORMS = ("3", "3/A", "4", "4/A", "5", "5/A")
 # chain cap covers listings plus reads, and the outer settle waits as long.
 # A cap at or below one call starves the reads: listings settle, documents
 # time out, gates fail closed.
@@ -532,7 +528,7 @@ async def _intake_ticker_chain(
     The chain deadline bounds listings and initial reads. The scheduler assesses any remaining questions.
     """
     ident = _intake_cik(ticker)
-    families = [*_INTAKE_MATERIAL_FAMILIES, _INTAKE_INSIDER_FORMS]
+    families = [("10-Q", "10-Q/A"), ("10-K", "10-K/A"), ("8-K", "8-K/A"), _INTAKE_INSIDER_FORMS]
     listings = await asyncio.gather(
         *(
             _intake_timed(
@@ -559,7 +555,7 @@ async def _intake_ticker_chain(
         ("get_sec_document", {"accession_no": acc, "max_chars": _INTAKE_DOC_CHARS}) for acc in accessions
     ]
     if _intake_insider_newest(listed):
-        reads.append(("get_insider_activity", {"ticker": ticker, "limit": _INTAKE_INSIDER_LIMIT}))
+        reads.append(("get_insider_activity", {"ticker": ticker, "limit": 10}))
     done = await asyncio.gather(
         *(
             _intake_timed(tool, args, sid, session, registry, jev, kernel, as_of, _INTAKE_DOC_TIMEOUT_S, admission)
@@ -683,7 +679,7 @@ def _build_digest(admitted: Sequence[Mapping[str, object]], subject: Sequence[st
     for ev, key, tkey, content in _digest_candidates(admitted, seen, seen_titles):
         if _off_subject(ev, content, named):
             continue
-        room_total = _INTAKE_DIGEST_CHARS - used
+        room_total = 6000 - used
         if room_total <= 200:
             break
         snippet = _verbatim_cut(content, room_total - 200)
@@ -696,10 +692,8 @@ def _build_digest(admitted: Sequence[Mapping[str, object]], subject: Sequence[st
         eid = _ev_field(ev, "evidence_id", "id")
         source = _ev_field(ev, "source_name", "source", "source_type", "source_domain")
         form = _ev_field(ev, "form", "filing_form", "dataset", "domain")
-        date = _ev_field(ev, "published_at", "known_at")
-        age = _digest_age_days(date)
-        block = f"[DATA evidence_id={eid} source={source} form={form} date={date} age={age}]\n{snippet}"
-        if used + len(block) > _INTAKE_DIGEST_CHARS:
+        block = f"[DATA evidence_id={eid} source={source} form={form}]\n{snippet}"
+        if used + len(block) > 6000:
             break
         items.append(block)
         used += len(block)
@@ -1660,129 +1654,6 @@ def _intake_corrected_query(hints: Mapping[str, object], fetched_queries: Sequen
     return query if query and query not in fetched_queries else None
 
 
-# compare/and/vs, or two questions (two intents), marks a multi-part objective.
-_INTAKE_MULTIPART_RE = re.compile(r"\b(?:compare|and|vs|versus)\b|\?.*\?", re.IGNORECASE | re.DOTALL)
-
-
-def _intake_single_subject(objective: str, tickers: Sequence[str], watchlist: list[str] | None) -> bool:
-    """One resolved subject and no multi-part cue: the objective is the only proposal, no Reasoner."""
-    from app.research import scheduler
-
-    if len(tickers) != 1 or len(watchlist or []) >= 2 or _INTAKE_MULTIPART_RE.search(objective):
-        return False
-    return len(scheduler._objective_chart_candidates(objective)) <= 1
-
-
-async def _graph_intake(
-    objective: str,
-    as_of: str | None,
-    sid: str,
-    session: dict[str, JSONValue],
-    registry: list[dict[str, JSONValue]],
-    jev: object,
-    kernel: _Kernel,
-    progress: ProgressFn | None = None,
-    setup_deadline: float | None = None,
-    watchlist: list[str] | None = None,
-    supplied_ticker: str | None = None,
-    context: Mapping[str, JSONValue] | None = None,
-) -> list[dict[str, object]]:
-    """Intake rounds + Reasoner + escape hatch; logs each round as intake_digest. Returns proposals.
-
-    A watchlist fans out once, in round 1; its per-source rows persist in that round's intake_digest.
-    """
-    all_raw: list[dict[str, object]] = []
-    all_stats: list[dict[str, object]] = []
-    digest = ""
-    proposals: list[dict[str, object]] = []
-    hints: dict[str, object] = {}
-    rounds = 0
-    fetched_tickers: list[str] = []
-    fetched_queries: list[str] = []
-    # The feed item's validated sym is the subject when the prompt names none; it outranks the chart.
-    feed_sym = context.get("sym") if context is not None else None
-    tickers = _intake_start_tickers(
-        objective, feed_sym if isinstance(feed_sym, str) else None if watchlist else supplied_ticker
-    )
-    # A feed item always plans through the Reasoner, so the questions target the item.
-    single_subject = context is None and _intake_single_subject(objective, tickers, watchlist)
-    subject = _intake_subject(tickers)
-    query_text: str | None = " ".join((*subject, objective))
-    # A feed item's title runs once, in round 1, as its own exact-text web search: citable coverage of the item.
-    title_query = str(context["title"]) if context is not None else None
-    # Related names (no ticker) the planner found in the request, feed item or evidence: search-only context.
-    related: list[str] = []
-    context_text = " ".join(str(v) for v in context.values()) if context is not None else ""
-    while True:
-        if _intake_round2_spent(setup_deadline, rounds):
-            break
-        pending_tickers, pending_query = _intake_pending(tickers, fetched_tickers, query_text, fetched_queries)
-        admitted, raw, stats = await _intake_round(
-            pending_query,
-            pending_tickers,
-            sid,
-            session,
-            registry,
-            jev,
-            kernel,
-            as_of,
-            progress,
-            watchlist if rounds == 0 else None,
-            title_query,
-        )
-        fetched_tickers.extend(pending_tickers)
-        fetched_queries.extend(q for q in (pending_query, title_query) if q is not None)
-        title_query = None
-        all_raw.extend(raw)
-        all_stats.append(stats)
-        prior_digest = digest
-        digest = _build_digest(admitted, subject)
-        if _intake_digest_unchanged(rounds, digest, prior_digest, hints):
-            _log_intake_round(sid, objective, raw, digest, {"proposals": proposals, "hints": hints}, stats, kernel)
-            break
-        if rounds == 0 and digest and single_subject:
-            proposals = _objective_or_admitted(objective, sid, [])
-            _log_intake_round(sid, objective, raw, digest, {"proposals": proposals, "hints": hints}, stats, kernel)
-            break
-        try:
-            proposals, hints = _reasoner_decompose_with_retry(
-                objective,
-                as_of,
-                sid,
-                digest,
-                progress,
-                _intake_decompose_timeout(setup_deadline),
-                setup_deadline,
-                context,
-            )
-        except Exception as exc:
-            if rounds == 0:
-                raise
-            # Round 2 never discards round 1: keep its plan and evidence, record the failure.
-            error = f"{type(exc).__name__}: {exc}"[:300]
-            logger.warning("intake round2_planner_failed sid=%s err=%s", sid, error)
-            stats["planner_error"] = error
-            reasoner_out: dict[str, object] = {"proposals": proposals, "hints": hints, "error": error}
-            _log_intake_round(sid, objective, raw, digest, reasoner_out, stats, kernel)
-            break
-        rounds += 1
-        related = _intake_related_names(hints, related, f"{objective}\n{context_text}\n{digest}")
-        _log_intake_round(sid, objective, raw, digest, {"proposals": proposals, "hints": hints}, stats, kernel)
-        if rounds >= _INTAKE_MAX_ROUNDS:
-            break
-        next_tickers = _intake_hint_tickers(hints, tickers)
-        # ponytail: round 2 costs ~40s; only new tickers earn it, never a
-        # corrected query alone (writer/scheduler already see it).
-        if not next_tickers:
-            break
-        query_text = _intake_corrected_query(hints, fetched_queries)
-        tickers = [*tickers, *next_tickers]
-    # ponytail: 4 planner questions max, cut BEFORE JEV so disposition never judges proposals that
-    # can't become nodes; related-company questions ride after the cut and never lose their place.
-    planned = proposals[:_INTAKE_MAX_QUESTIONS]
-    return [*planned, *_intake_related_proposals(related, subject, planned, sid)]
-
-
 def _log_intake_round(
     sid: str,
     objective: str,
@@ -1865,100 +1736,6 @@ def _topo_sort(proposals: list[dict[str, object]]) -> list[dict[str, object]]:
     return order
 
 
-def _objective_or_admitted(
-    objective: str, objective_id: str, proposals: list[dict[str, object]]
-) -> list[dict[str, object]]:
-    """JEV-outage fallback: the exact-objective proposal wins, else a synthesized one."""
-    for p in proposals:
-        if str(p.get("question")) == objective:
-            return [p]
-    return [
-        {
-            "id": f"{objective_id}-q1",
-            "objectiveId": objective_id,
-            "question": objective,
-            "dependsOn": [],
-            "whyItMatters": "Route question.",
-        }
-    ]
-
-
-def _jev_disposition(
-    proposals: Sequence[dict[str, object]],
-) -> tuple[dict[str, JSONValue], dict[str, dict[str, str]]]:
-    """(questions, choice options) for one JEV disposition round over the proposed questions."""
-    criteria: dict[str, JSONValue] = dict(_DISPOSITION_OPTIONS)
-    questions: dict[str, JSONValue] = {}
-    choice_options: dict[str, dict[str, str]] = {}
-    for p in proposals:
-        pid = str(p["id"])
-        questions[pid] = {
-            "type": "choice",
-            "instructions": (
-                "What should happen to this proposed question relative to the user's objective? "
-                f"Question: {p['question']}"
-            ),
-            "criteria": criteria,
-        }
-        choice_options[pid] = dict(_DISPOSITION_OPTIONS)
-    return questions, choice_options
-
-
-def _jev_decisions(
-    client: JevClient,
-    sid: str,
-    objective: str,
-    proposals: list[dict[str, object]],
-    setup_deadline: float | None,
-) -> dict[str, dict[str, JSONValue]]:
-    """One disposition round on the shared JEV, bounded by the setup deadline when present."""
-    questions, choice_options = _jev_disposition(proposals)
-    state = {"objective": {"prompt": objective}, "proposals": proposals}
-    call = client.decide(
-        state,
-        questions,
-        decision_type="proposal_disposition",
-        session_id=sid,
-        choice_options=choice_options,
-    )
-    if setup_deadline is None:
-        return asyncio.run(call)
-    return asyncio.run(asyncio.wait_for(call, timeout=max(setup_deadline - time.perf_counter(), 1.0)))
-
-
-def _jev_kept(proposals: Sequence[dict[str, object]], decisions: Mapping[str, object]) -> list[dict[str, object]]:
-    """Proposals JEV did not reject; a malformed disposition keeps the proposal."""
-    kept: list[dict[str, object]] = []
-    for p in proposals:
-        d = decisions.get(str(p["id"]))
-        if isinstance(d, dict) and d.get("choice") == "reject":
-            continue
-        kept.append(p)
-    return kept
-
-
-def _jev_admit(
-    sid: str,
-    objective: str,
-    proposals: list[dict[str, object]],
-    jev: JevClient | None = None,
-    setup_deadline: float | None = None,
-) -> list[dict[str, object]]:
-    """JEV disposition per proposal (run.ts relevance); JEV failures propagate.
-
-    Entry never calls this ahead of first tool selection; the scheduler's
-    reason-path expansion owns JEV disposition inside scheduler flow.
-    """
-    if len(proposals) <= 1:
-        return list(proposals)
-    # ponytail: single disposition round only; no re-ask on partial failure.
-    client = _jev_client(jev)
-    admitted = _jev_kept(proposals, _jev_decisions(client, sid, objective, proposals, setup_deadline))
-    if admitted:
-        return admitted
-    return _objective_or_admitted(objective, sid, proposals)
-
-
 def _registry_portfolio_hit() -> list[str]:
     """Fail-closed HDA: portfolio/order tools must not be runnable from research."""
     from app.research import scheduler
@@ -1990,59 +1767,28 @@ def run_graph_prompt(
     watchlist: list[str] | None = None,
     context: Mapping[str, JSONValue] | None = None,
 ) -> str:
-    """Shared graph entry: session + intake evidence + Reasoner proposals. Returns sid.
-
-    Both the JSONL bridge (_run) and the thesis trigger runner import this so
-    the two entry points cannot drift into separate single-node paths.
-    Fail-closed: a forbidden registry raises before creating anything.
-    Import has no startup side effects: a passed jev is reused, otherwise the
-    process-lifetime shared client is used lazily (thesis callers never start it).
-
-    Intake runs synchronously (asyncio.run; no event loop runs here): SEC
-    filing metadata + search snippets plus one exact-text Exa search settle
-    through _settle_round with continuation=False, so the intake admits
-    evidence but never resolves a node. The digest feeds the Reasoner, whose
-    proposals go through JEV disposition before nodes are created.
-    """
-    from app.research import scheduler, service
+    """Create a session and its root objective node. JEV performs all tool and reasoning selection."""
+    from app.research import service
 
     hit = _registry_portfolio_hit()
     if hit:
         raise RuntimeError(f"registry guard forbids portfolio tools: {hit}")
     objective = prompt.strip()
-    stamped = query_with_today_utc(objective)
-    # ponytail: multi-source graph path (JEV selects over the whole registry);
-    # SEC-only stays the default for narrow sessions created elsewhere.
     sid = service.create_research(
         objective, objective, as_of=as_of, policy={"research_sources": {"mode": "all", "sources": []}}, ticker=ticker
     )
+    _notify(progress, "session", {"session_id": sid})
     try:
-        _notify(progress, "session", {"session_id": sid})
-        client = _jev_client(jev)
-        registry: list[dict[str, JSONValue]] = scheduler.build_registry()
-        kernel = scheduler._default_kernel()
-        session = scheduler._load_session(sid, kernel)
-        session.setdefault("session_id", sid)
-        proposals: list[dict[str, object]] = asyncio.run(
-            _graph_intake(
-                objective,
-                as_of,
+        if watchlist or context:
+            service.record_decision(
                 sid,
-                session,
-                registry,
-                client,
-                kernel,
-                progress,
-                setup_deadline,
-                watchlist,
-                supplied_ticker=ticker,
-                context=context,
+                "request_context",
+                {},
+                {},
+                {"watchlist": watchlist, "context": context},
+                request={"objective": objective},
             )
-        )
-        admitted: list[dict[str, object]] = (
-            _jev_admit(sid, objective, proposals, jev=client, setup_deadline=setup_deadline) if proposals else []
-        )
-        _create_nodes_topological(sid, stamped, admitted if admitted else [])
+        service.create_node(sid, objective, "Route question.")
         return sid
     except Exception:
         _close_bootstrap_job(sid)
@@ -2166,14 +1912,16 @@ def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[s
         return {"id": rid, "route": "clarify_subject", "personas": None}
     try:
         client = _jev_client(jev)
-        routed = asyncio.run(
+        routed = _request_call(
+            req,
+            "route",
             client.route_entry(
                 query_with_today_utc(prompt.strip()),
                 route_hint=hint,
                 watchlist=watchlist,
                 current_ticker=current_ticker,
                 context=context,
-            )
+            ),
         )
     except Exception as exc:
         logger.warning("toolflow route_fail rid=%s err_type=%s", rid, type(exc).__name__, exc_info=True)
@@ -2293,9 +2041,15 @@ def _arguments_generate(rid: str, sid_display: str, tool: str, req: Mapping[str,
     except ValueError as exc:
         return {"id": rid, "error": str(exc)[:500] or "bad ticker"}
     context = _needle_request_context(context, tool, prompt, arg_ticker)
-    generated: object = _shared_needle_generate()(
-        tool=tool, schema=schema, objective=prompt, node=node, context=context
-    )
+    from app.research.scheduler import _TOOL_POOL
+
+    async def generate() -> object:
+        return await asyncio.get_running_loop().run_in_executor(
+            _TOOL_POOL,
+            lambda: _shared_needle_generate()(tool=tool, schema=schema, objective=prompt, node=node, context=context),
+        )
+
+    generated = _request_call(req, "arguments", generate())
     if generated is None:
         return _arguments_withhold(rid, tool, prompt, arg_ticker)
     return _arguments_result(rid, sid_display, tool, generated, prompt)
@@ -2380,7 +2134,9 @@ def _assess_entry(req: Mapping[str, JSONValue], jev: JevClient | None = None) ->
     args_map = _json_mapping(req.get("arguments"))
     result_map = _json_mapping(req.get("result"))
     client = _jev_client(jev)
-    verdict = asyncio.run(client.assess_entry_tool(query_with_today_utc(prompt.strip()), tool, args_map, result_map))
+    verdict = _request_call(
+        req, "assess_entry", client.assess_entry_tool(query_with_today_utc(prompt.strip()), tool, args_map, result_map)
+    )
     if not isinstance(verdict, str) or not verdict:
         logger.warning(
             "toolflow assess_fail_open rid=%s tool=%s verdict=research_required reason=blank-verdict", rid, tool
@@ -2418,15 +2174,67 @@ def _entry_tool(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         store.get_session(sid)
     kernel = scheduler._default_kernel()
     session = scheduler._load_session(sid, kernel)
-    record = asyncio.run(_intake_attempt(tool, dict(arguments), sid, session, registry, None, kernel, None))
+    as_of = session.get("as_of")
+    deadline_ms = _deadline_field(req.get("deadlineAt"))
+    if isinstance(tool, str) and isinstance(sid, str) and deadline_ms is not None:
+        _, _, run_deadline = _run_deadlines(req)
+        session["_deadline_at"] = min(run_deadline, time.perf_counter() + deadline_ms / 1000.0 - time.time())
+    record: dict[str, object]
+    try:
+        record = _request_call(
+            req,
+            "entry_tool",
+            _intake_attempt(
+                tool,
+                dict(arguments),
+                sid,
+                session,
+                registry,
+                None,
+                kernel,
+                as_of if isinstance(as_of, str) else None,
+            ),
+        )
+    except TimeoutError as exc:
+        record = {"tool": tool, "arguments": arguments, "error": str(exc), "error_type": "timeout"}
     outcomes = {"admitted": 0, "duplicate": 0, "not_citable": 0, "error": 0, "timeout": 0}
-    _intake_admit_call(kernel, sid, tool, record, outcomes, [])
+    if record.get("error") is not None:
+        record.setdefault("error_type", "tool_error")
+        if isinstance(tool, str) and isinstance(sid, str):
+            _intake_admit_call(kernel, sid, tool, record, outcomes, [])
+        evidence, _ = _run_evidence(store.list_evidence(sid))
+        out: dict[str, JSONValue] = {
+            "id": rid,
+            "sessionId": sid,
+            "evidence": evidence,
+            "content": str(record.get("outcome_summary") or ""),
+            "coverage": _session_coverage(store, sid),
+            "error": str(record.get("error"))[:500],
+        }
+        category = record.get("error_type")
+        out["category"] = category if isinstance(category, str) and category else "tool_error"
+        return out
+
+    async def admit() -> None:
+        assert isinstance(tool, str) and isinstance(sid, str)
+        await scheduler._sec_thread_call(lambda: _intake_admit_call(kernel, sid, tool, record, outcomes, []))
+
+    try:
+        _request_call(req, "evidence admission", admit())
+    except (TimeoutError, ValueError) as exc:
+        if record.get("job_id"):
+            scheduler._fail_attempt_job(
+                kernel, str(record["job_id"]), str(exc), "timeout" if isinstance(exc, TimeoutError) else "tool_error"
+            )
+        record["error"] = str(exc)
+        record["error_type"] = "timeout" if isinstance(exc, TimeoutError) else "tool_error"
     evidence, _ = _run_evidence(store.list_evidence(sid))
     out: dict[str, JSONValue] = {
         "id": rid,
         "sessionId": sid,
         "evidence": evidence,
         "content": str(record.get("outcome_summary") or ""),
+        "coverage": _session_coverage(store, sid),
     }
     if record.get("error") is not None:
         out["error"] = str(record["error"])[:500]
@@ -2459,14 +2267,10 @@ def _final_sid(req: Mapping[str, JSONValue], rid: str) -> str:
     return _final_session(req) or rid
 
 
-def _final_proof_defect(req: Mapping[str, JSONValue], raw_claims: object) -> str | None:
-    """Deterministic ledger proof for wire claims before any JEV call; None when every claim verifies.
-
-    Claims resolve against the research session's persisted ledger (content hash,
-    archive bytes / persisted tool result, observation/calculation proof, canonical
-    datapoint references bound to the wording, exact source statements, explicit
-    qualifiers). No session id, an unknown session, or any unproven claim fails closed.
-    """
+def _final_proof_defect(
+    req: Mapping[str, JSONValue], raw_claims: object, *, semantic_pending: bool = False
+) -> str | None:
+    """Check persisted ledger proof before JEV. Only qualitative entailment can defer to JEV."""
     from app.research import service
     from app.research.agents import parse_grounded_claims
     from app.research.repository import ResearchRepository
@@ -2487,7 +2291,7 @@ def _final_proof_defect(req: Mapping[str, JSONValue], raw_claims: object) -> str
         store.get_session(sid)
         cited = [eid for row in rows for eid in (row.get("evidence_ids") or []) if isinstance(eid, str)]
         claims = parse_grounded_claims(json.dumps(rows), frozen=cited)
-        service.require_verified_claims(store, sid, claims, "assess_final")
+        service.require_verified_claims(store, sid, claims, "assess_final", semantic_pending=semantic_pending)
     except (KeyError, ValueError) as exc:
         return f"proof: {exc}"
     return None
@@ -2563,6 +2367,8 @@ def _final_fail(rid: str, message: str) -> dict[str, JSONValue]:
         "support": None,
         "support_answer": None,
         "evidence_state": "insufficient",
+        "support_strength": None,
+        "support_result": {"outcome": "unknown", "probability": None, "strength": None},
     }
 
 
@@ -2606,11 +2412,15 @@ def _final_claim_inputs(req: Mapping[str, JSONValue]) -> tuple[Mapping[str, JSON
 
 
 def _final_claim_evidence(req: Mapping[str, JSONValue], holder: Mapping[str, JSONValue]) -> list[JSONValue]:
-    """Claim evidence: request evidence rows when present, else id-only rows from the claim's ids."""
-    evidence = _final_evidence(req)
-    if evidence:
-        return evidence
-    return [{"id": eid, "content": ""} for eid in _final_ids(holder, "evidence_ids")]
+    """Load canonical cited rows from the ledger. Caller-supplied source text never becomes JEV evidence."""
+    from app.research.repository import ResearchRepository
+
+    sid = _final_session(req)
+    if sid is None:
+        return []
+    cited = set(_final_ids(holder, "evidence_ids"))
+    rows, _ = _run_evidence([row for row in ResearchRepository().list_evidence(sid) if row.get("evidence_id") in cited])
+    return rows
 
 
 def _assess_final_response(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
@@ -2642,14 +2452,16 @@ def _assess_final_response(req: Mapping[str, JSONValue], jev: JevClient | None =
         return _final_fail(rid, f"coverage: sentence {uncovered[0][:120]!r} has no inventory claim")
     try:
         client = _jev_client(jev)
-        out = asyncio.run(
+        out = _request_call(
+            req,
+            "assess_final_response",
             client.assess_final_response(
                 text.strip(),
                 _final_evidence(req),
                 session_id=_final_sid(req, rid),
                 confidence=_confidence(req.get("confidence")),
                 claims=_final_claims(req.get("claims")),
-            )
+            ),
         )
         if not isinstance(out, dict):
             raise TypeError("assess_final_response: malformed result")
@@ -2671,7 +2483,7 @@ def _assess_final_response(req: Mapping[str, JSONValue], jev: JevClient | None =
 
 
 def _assess_final_claim(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
-    """Per-claim gate (only after whole-response reject): ledger proof first, then JEV judges the claim as written."""
+    """Check each claim independently. Deterministic proof precedes JEV semantic support."""
     rid = _request_id(req)
     holder, text, ctype = _final_claim_inputs(req)
     if not isinstance(text, str) or not text.strip():
@@ -2679,18 +2491,33 @@ def _assess_final_claim(req: Mapping[str, JSONValue], jev: JevClient | None = No
         return _final_fail(rid, "text required")
     if not isinstance(ctype, str) or not ctype.strip():
         return _final_fail(rid, "claim_type required")
-    defect = _final_proof_defect(req, [holder])
+    defect = _final_proof_defect(req, [holder], semantic_pending=True)
     if defect is not None:
         logger.info("toolflow assess_final_claim rid=%s reason=proof %.300s", rid, defect)
         return _final_fail(rid, defect)
+    if (
+        ctype.strip() in ("observed_fact", "calculation")
+        and _final_ids(holder, "datapoint_ids")
+        and _final_proof_defect(req, [holder]) is None
+    ):
+        return {
+            "id": rid,
+            "support": 1.0,
+            "support_answer": "yes",
+            "support_strength": "confident",
+            "support_result": {"outcome": "yes", "probability": 1.0, "strength": "confident"},
+            "evidence_state": "sufficient_support",
+        }
     confidence = _confidence(holder.get("confidence", req.get("confidence")))
     evidence = _final_claim_evidence(req, holder)
     try:
         client = _jev_client(jev)
-        out = asyncio.run(
+        out = _request_call(
+            req,
+            "assess_final_claim",
             client.assess_final_claim(
                 text.strip(), ctype.strip(), evidence, session_id=_final_sid(req, rid), confidence=confidence
-            )
+            ),
         )
         if not isinstance(out, dict):
             raise TypeError("assess_final_claim: malformed result")
@@ -2709,27 +2536,46 @@ def _assess_final_claim(req: Mapping[str, JSONValue], jev: JevClient | None = No
 
 
 def _run_select_round() -> object | None:
-    """Programmatic default (code first, JEV only on ambiguity); "catalog" restores two-step JEV.
+    """Use JEV selection by default. Keep the explicitly selected catalog mode compatible."""
+    if _toolflow() == "catalog":
+        from app.research.tool_catalogs import catalog_select_round
 
-    "full"/"whole"/"direct" keep the whole-registry JEV escape hatch and select no round.
-    """
-    _flow = _toolflow()
-    if _flow == "catalog":
-        from app.research.tool_catalogs import catalog_select_round as select_round
-
-        return select_round
-    if _flow in ("full", "whole", "direct"):
-        return None
-    from app.research.programmatic_router import programmatic_select_round as select_round
-
-    return select_round
+        return catalog_select_round
+    return None
 
 
 def _deadline_field(raw: object) -> float | None:
     """Epoch-milliseconds deadline field: a positive number that is not a bool, else None."""
-    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
-        return float(raw)
-    return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+        return None
+    # Millisecond truncation can make an immediate deadline look expired; keep sub-millisecond slack.
+    return float(raw) + 0.5
+
+
+def _request_call[T](req: Mapping[str, JSONValue], stage: str, call: Coroutine[object, object, T]) -> T:
+    """Bound one asynchronous operation by the original request deadline. Cancellation stays local to this call."""
+    deadline = _deadline_field(req.get("deadlineAt"))
+
+    async def bounded() -> T:
+        loop = asyncio.get_running_loop()
+        now_wall = time.time()
+        if deadline is not None and deadline / 1000.0 <= now_wall:
+            task = asyncio.ensure_future(call)
+            await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError, TimeoutError:
+                pass
+            raise TimeoutError(f"deadline reached during {stage}")
+        try:
+            timeout = None if deadline is None else max(deadline / 1000.0 - now_wall, 0.0)
+            async with asyncio.timeout_at(loop.time() + timeout if timeout is not None else None):
+                return await call
+        except TimeoutError as exc:
+            raise TimeoutError(f"deadline reached during {stage}") from exc
+
+    return asyncio.run(bounded())
 
 
 def _run_deadlines(req: Mapping[str, JSONValue]) -> tuple[float, float, float]:
@@ -2751,22 +2597,18 @@ def _run_graph_session(
     rid: str,
     objective: str,
     as_of: str | None,
-    client: JevClient,
-    progress: ProgressFn | None,
-    setup_deadline: float,
     run_ticker: str | None,
     watchlist: list[str] | None,
+    progress: ProgressFn | None = None,
     context: dict[str, JSONValue] | None = None,
 ) -> tuple[str, dict[str, JSONValue] | None]:
-    """Graph intake for one run: (session id, terminal response); the id is empty when denied."""
+    """Create a session and root node for one run. Returns the terminal response when denied."""
     try:
         # A watchlist request never scopes its session to the selected ticker.
         sid = run_graph_prompt(
             objective,
             as_of,
-            jev=client,
             progress=progress,
-            setup_deadline=setup_deadline,
             ticker=None if watchlist else run_ticker,
             watchlist=watchlist,
             context=context,
@@ -2855,6 +2697,92 @@ def _run_evidence(records: Sequence[Mapping[str, JSONValue]]) -> tuple[list[JSON
         evidence.append(row)
         known_ids.add(row_id)
     return evidence, known_ids
+
+
+def _session_coverage(store: ResearchRepository, sid: str) -> dict[str, JSONValue]:
+    """Project SEC navigation and inspected windows from existing records. Coverage is never citable evidence."""
+    from app.research.models import validate_json_value
+    from app.research.scheduler import _persisted_shapes
+
+    documents: dict[tuple[str, str], dict[str, JSONValue]] = {}
+
+    def document(accession: object, name: object = "") -> dict[str, JSONValue] | None:
+        if not isinstance(accession, str) or not accession:
+            return None
+        doc = name if isinstance(name, str) else ""
+        key = (accession, doc)
+        if key not in documents:
+            prior = documents.pop((accession, ""), {}) if doc else {}
+            documents[key] = {
+                "accession_no": accession,
+                "document_name": doc or None,
+                "listed": False,
+                "located": False,
+                "retrieved": False,
+                "inspected": False,
+                "admitted": False,
+                "incomplete": True,
+                "unavailable": False,
+                **prior,
+            }
+            documents[key]["document_name"] = doc or None
+        return documents[key]
+
+    for result in store.list_tool_results(sid):
+        payload = _persisted_shapes(result)
+        for key in ("filings", "documents"):
+            rows = payload.get(key)
+            for item in rows if isinstance(rows, list) else []:
+                if not isinstance(item, Mapping):
+                    continue
+                row = document(item.get("accession_no") or payload.get("accession_no"), item.get("document_name"))
+                if row is not None:
+                    row["listed"] = True
+                    row["located"] = key == "documents" or bool(item.get("primary_document"))
+    for decision in store.list_decisions(sid):
+        attempt = decision.selected
+        if decision.decision_type not in ("node_attempt", "source_retrieved") or not isinstance(attempt, Mapping):
+            continue
+        if attempt.get("tool") != "get_sec_document":
+            continue
+        raw_args = attempt.get("arguments")
+        args: Mapping[str, object] = raw_args if isinstance(raw_args, Mapping) else {}
+        payload = _persisted_shapes(attempt.get("result"))
+        row = document(payload.get("accession_no") or args.get("accession_no"), payload.get("document_name"))
+        if row is None:
+            continue
+        row["located"] = bool(payload.get("source_handle")) or row["located"]
+        row["retrieved"] = row["retrieved"] or attempt.get("document_content") is True
+        row["inspected"] = row["inspected"] or attempt.get("inspected") is True
+        row["admitted"] = row["admitted"] or bool(attempt.get("evidence_id"))
+        row["unavailable"] = attempt.get("error") is not None or not row["retrieved"]
+        row["incomplete"] = (
+            not row["inspected"]
+            or bool(payload.get("more_available") or payload.get("warnings") or payload.get("section"))
+            or bool(args.get("section") or args.get("query") or args.get("offset"))
+        )
+        for key in ("offset", "end_offset", "total_chars", "more_available", "warnings", "available_sections"):
+            if key in payload:
+                row[key] = validate_json_value(payload[key], "<coverage>")
+        if attempt.get("error"):
+            row["error"] = str(attempt["error"])[:300]
+    for evidence in store.list_evidence(sid):
+        provenance = evidence.get("provenance")
+        if not isinstance(provenance, Mapping) or provenance.get("kind") != "sec_source":
+            continue
+        row = document(provenance.get("accession_no"), provenance.get("document_name"))
+        if row is not None:
+            row.update({"located": True, "retrieved": True, "admitted": True})
+    limitations: list[JSONValue] = []
+    for row in documents.values():
+        identity = f"{row['accession_no']}/{row.get('document_name') or 'document not located'}"
+        if not row["retrieved"]:
+            limitations.append(f"SEC {identity}: no document content was retrieved.")
+        elif not row["inspected"]:
+            limitations.append(f"SEC {identity}: content was retrieved but semantic inspection did not complete.")
+        elif row["incomplete"]:
+            limitations.append(f"SEC {identity}: inspection covered only the returned window, not the complete filing.")
+    return {"sec": {"documents": list(documents.values()), "limitations": limitations}} if documents else {}
 
 
 def _run_attempt_row(step: int, attempt: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
@@ -2975,6 +2903,13 @@ def _run_result(rid: str, objective: str, sid: str, run_result: Mapping[str, JSO
     records: list[dict[str, JSONValue]] = store.list_evidence(sid)
     node_rows: list[ResearchNode] = store.list_nodes(sid)
     decision_rows: list[DecisionRecord] = store.list_decisions(sid)
+    persisted_attempts = [
+        decision.selected
+        for decision in decision_rows
+        if decision.decision_type == "node_attempt" and isinstance(decision.selected, dict)
+    ]
+    if persisted_attempts:
+        attempts = persisted_attempts
     evidence, known_ids = _run_evidence(records)
     tool_executions, tool_calls, failures = _run_call_rows(attempts, known_ids)
     nodes_payload = _run_node_rows(node_rows)
@@ -2997,11 +2932,16 @@ def _run_result(rid: str, objective: str, sid: str, run_result: Mapping[str, JSO
         "escalations": escalations,
         "escalated": escalated,
         "stalled": stalled,
+        "coverage": _session_coverage(store, sid),
     }
     if watchlist_rows:
         out["watchlist"] = watchlist_rows
     if stalled and stalled_reason is not None:
         out["stalled_reason"] = stalled_reason
+    deadlines = [decision.selected for decision in decision_rows if decision.decision_type == "deadline"]
+    if deadlines:
+        out["deadline"] = deadlines[-1]
+        out["incomplete_guard"] = True
     return out
 
 
@@ -3050,20 +2990,31 @@ def _run(
     as_of = raw_as_of if isinstance(raw_as_of, str) else None
     objective = prompt.strip()
     client = _jev_client(jev)
-    _t0, setup_deadline, run_deadline = _run_deadlines(req)
-    sid, denied = _run_graph_session(
-        rid, objective, as_of, client, progress, setup_deadline, run_ticker, watchlist, context
-    )
+    _t0, _, run_deadline = _run_deadlines(req)
+    sid = _final_session(req)
+    denied = None
+    if sid is None:
+        sid, denied = _run_graph_session(rid, objective, as_of, run_ticker, watchlist, progress, context)
     if denied is not None:
         return denied
+    assert isinstance(sid, str)
     nodes_t0 = time.perf_counter()
     try:
-        run_result: dict[str, JSONValue] = asyncio.run(
-            scheduler.run(sid, **_run_kwargs(client, progress, select_round, run_deadline))
+        run_result: dict[str, JSONValue] = _request_call(
+            req, "scheduler", scheduler.run(sid, **_run_kwargs(client, progress, select_round, run_deadline))
         )
     except Exception as exc:
         logger.exception("kernel run failed rid=%s sid=%s", rid, sid)
-        return _terminal(rid, "provider_error", f"kernel run failed: {exc}")
+        message = str(exc) or f"kernel run failed: {type(exc).__name__}"
+        stalled_out = _run_result(
+            rid,
+            objective,
+            sid,
+            {"status": "stalled", "reason": message, "error": message, "incomplete_guard": True, "nodes": []},
+        )
+        stalled_out["error"] = message
+        stalled_out["terminal"] = {"category": "provider_error", "message": message[:500]}
+        return stalled_out
     finally:
         _close_bootstrap_job(sid)
         logger.info("run wall_timing rid=%s elapsed_s=%.1f", rid, time.perf_counter() - _t0)
@@ -3122,6 +3073,12 @@ def _direct_op(req: Mapping[str, JSONValue], jev: JevClient | None) -> dict[str,
     rid = _request_id(req)
     op = req.get("op")
     try:
+        deadline = _deadline_field(req.get("deadlineAt"))
+        if deadline is not None and deadline / 1000.0 <= time.time():
+            message = f"deadline reached before {op}"
+            if op in ("assess_final_response", "assess_final_claim"):
+                return _final_fail(rid, message)
+            return _terminal(rid, "timeout", message)
         if op == "route":
             return _route(req, jev=jev)
         if op == "arguments":

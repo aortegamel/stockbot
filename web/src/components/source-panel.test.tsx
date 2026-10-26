@@ -750,17 +750,28 @@ describe("SourcePage", () => {
     expect(root.querySelector("aside")).toBeNull();
   });
 
-  test("console waits for the terminal event before full resolution and keeps provenance separate", async () => {
-    const finished: AgentEvent = { type: "done", metrics: { totalMs: 1, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: 1 }, evidence: { count: 0, characters: 0 }, failures: {} } };
+  test("console resolves checked snapshots while active and preserves sources after failure", async () => {
     const requests = serve({ body: TEXT });
     const evidence: AgentEvent = { type: "evidence", evidence: [{ id: "ev:cited", source: "sec", retrievedAt: "", content: "", sources: [{ id: TEXT.id }] }] };
     const chat = await mount(<AgentConsole events={[evidence]} reasoning={false} debug={false} />);
     expect(requests).toEqual([]);
-    await act(async () => mounted?.render(<AgentConsole events={[evidence, { type: "answer_delta", text: "Revenue rose [ev:cited]." }, finished]} reasoning={false} debug={false} />));
+    const partial: AgentEvent = { type: "answer_partial", text: "Revenue rose.", claims: [{ text: "Revenue rose.", claimType: "observed_fact", evidenceIds: ["ev:cited"] }] };
+    await act(async () => mounted?.render(<AgentConsole events={[evidence, partial]} reasoning={false} debug={false} />));
     expect(requests).toEqual([TEXT_URL]);
     expect(chat.querySelector('a[aria-label^="Open source:"]')?.getAttribute("href")).toBe(TEXT.originalUrl);
     const provenance = [...chat.querySelectorAll("a")].find((anchor) => anchor.textContent === "View provenance");
     expect(provenance?.getAttribute("href")).toBe(`#/source/${encodeURIComponent(TEXT.id)}`);
+    expect(chat.textContent).toContain("Partial checked answer · research continues");
+    const final: AgentEvent = { type: "answer_delta", text: "The final filing analysis [ev:cited]." };
+    await act(async () => mounted?.render(<AgentConsole events={[evidence, partial, final]} reasoning={false} debug={false} />));
+    expect(chat.textContent).toContain("The final filing analysis");
+    expect(chat.textContent).not.toContain("Revenue rose.");
+    await act(async () => mounted?.render(<AgentConsole events={[evidence, partial, final, { type: "failed", category: "provider_error", message: "private provider diagnostic" }]} reasoning={false} debug={false} />));
+    expect(chat.textContent).toContain("The final filing analysis");
+    expect(chat.textContent).not.toContain("research continues");
+    expect(chat.textContent).not.toContain("private provider diagnostic");
+    expect(chat.querySelector('a[aria-label^="Open source:"]')?.getAttribute("href")).toBe(TEXT.originalUrl);
+    expect(requests).toEqual([TEXT_URL]);
     await close();
     const reads = serve({ body: TEXT });
     const viewer = await mount(panel(TEXT.id));

@@ -218,6 +218,13 @@ def _enforce_live_job(store: ResearchRepository, job_id: str):
     return job
 
 
+def limit_job_deadline(job_id: str, deadline: datetime, *, repo: ResearchRepository | Path | str | None = None) -> None:
+    """Shorten an action's deadline to the original request deadline. Never extend an existing deadline."""
+    store = _repo(repo)
+    job = _require_job(store, job_id)
+    store.save_job(replace(job, deadline=min(job.deadline, deadline) if job.deadline is not None else deadline))
+
+
 def heartbeat_job(job_id: str, *, repo: ResearchRepository | Path | str | None = None) -> dict[str, JSONValue]:
     """Refresh last_heartbeat_at; read path surfaces staleness + remaining."""
     from dataclasses import replace as _replace
@@ -1812,6 +1819,7 @@ def _persist_evidence_record(
         )
     )
     try:
+        _live_evidence_job(store, session_id, job_id)
         store.save_evidence_and_session(updated_found, stored)
     except ValueError as exc:
         if "identity_key" not in str(exc):
@@ -1906,6 +1914,7 @@ def _persist_finra_web_record(
         )
     )
     try:
+        _live_evidence_job(store, session_id, job_id)
         store.save_evidence_and_session(updated_found, stored)
     except ValueError as exc:
         if "identity_key" not in str(exc):
@@ -4200,6 +4209,47 @@ def _row_integrity_defect(store: ResearchRepository, session_id: str, evidence: 
     return f"{evidence.evidence_id}: no replayable source identity"
 
 
+def _qualitative_replay_defect(
+    store: ResearchRepository, session_id: str, evidence: Evidence, as_of: datetime | None
+) -> str | None:
+    """Replay a qualitative observation without inventing a numeric datapoint."""
+    from .evidence import EvidenceLedger
+
+    provenance = evidence.provenance
+    kind = provenance.get("kind")
+    try:
+        ingest_evidence(EvidenceLedger(), evidence, as_of=as_of)
+        if kind == "sec_source":
+            from app.sec.documents import _readable_document_text, _render_text
+
+            digest = evidence.metadata.get("source_content_hash")
+            payload = _archived_bytes(provenance, str(digest))
+            if payload is None or sha256(payload).hexdigest() != digest:
+                return "archived SEC source hash does not match"
+            if not _is_hex64(provenance.get("text_hash")) or provenance.get("basis") not in ("raw", "rendered"):
+                return "SEC passage lacks canonical window identity"
+            source, _, _ = _readable_document_text(payload.decode("utf-8", "replace"), None, payload)
+            if provenance.get("basis") == "rendered":
+                source = _render_text(source)
+            passage = _normalize_record_text(provenance.get("passage"))
+            if not passage or passage not in _normalize_record_text(source):
+                return "SEC passage does not replay from archived source bytes"
+            return None
+        replay = {
+            "web_source": _web_provenance,
+            "finra_record": _finra_provenance,
+            "sec_record": _sec_record_provenance,
+        }.get(str(kind))
+        if replay is None:
+            return "qualitative observation has no replayable source"
+        rebuilt = replay(provenance, store=store, session_id=session_id)
+        if rebuilt != dict(provenance):
+            return "qualitative provenance differs from its persisted source"
+    except (KeyError, ValueError) as exc:
+        return str(exc)
+    return None
+
+
 _CITATION_RE = re.compile(r"\[[^\]]*\]")
 _TOKEN_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
@@ -4585,6 +4635,29 @@ def _statement_defect(
     return None
 
 
+def _source_identity_defect(text: str, verified: Sequence[Evidence]) -> str | None:
+    """Require literal quotations and SEC accessions to match the cited ledger sources."""
+    sources = [
+        value
+        for row in verified
+        for value in (
+            row.provenance.get("passage"),
+            row.provenance.get("excerpt"),
+            row.provenance.get("record_identity"),
+        )
+        if isinstance(value, str)
+    ]
+    for match in re.finditer(r'"([^"\n]+)"|\u201c([^\u201d]+)\u201d', text):
+        quote = " ".join((match.group(1) or match.group(2)).split())
+        if not any(quote in " ".join(source.split()) for source in sources):
+            return f"ERR_QUOTATION_UNVERIFIED (quotation {quote[:120]!r} is absent from cited sources)"
+    accessions = {str(row.provenance.get("accession_no")) for row in verified if row.provenance.get("accession_no")}
+    for accession in re.findall(r"\b\d{10}-\d{2}-\d{6}\b", text):
+        if accession not in accessions:
+            return f"ERR_SOURCE_IDENTITY (accession {accession!r} does not identify a cited source)"
+    return None
+
+
 def _kind_defect(claim: GroundedClaim, points: Sequence[Mapping[str, object]]) -> str | None:
     """Observed stays observed and calculated stays calculated: a claim type never relabels its datapoints."""
     calculated = [str(point.get("id")) for point in points if "inputs" in point]
@@ -4610,6 +4683,8 @@ def _claim_proof_defect(
     rows: Mapping[str, Mapping[str, object]],
     claim: GroundedClaim,
     as_of: datetime | None,
+    *,
+    semantic_pending: bool = False,
 ) -> str | None:
     """Why one claim may not publish, or None.
 
@@ -4621,7 +4696,7 @@ def _claim_proof_defect(
     4. The wording binds each datapoint (metric before value, entity, period, unit)
        and states no other number; a quantitative observed fact or calculation adds only
        connectives and controlled restatement words to its datapoint wording (``_wording_defect``).
-    5. A qualitative observed fact equals a located source statement.
+    5. A qualitative observed fact equals a located statement unless JEV must judge its semantic support.
     """
     qualifier = _QUALIFIERS.get(claim.claim_type)
     if qualifier is not None and not qualifier.search(_masked(claim.text)):
@@ -4631,6 +4706,8 @@ def _claim_proof_defect(
         row = _ledger_row(rows, eid)
         if isinstance(row, str):
             return f"ERR_PROOF_UNVERIFIED ({row})"
+        if row.session_id != session_id:
+            return f"ERR_PROOF_UNVERIFIED ({eid} belongs to another session)"
         integrity = _row_integrity_defect(store, session_id, row)
         if integrity is not None:
             return f"ERR_PROOF_UNVERIFIED ({integrity})"
@@ -4639,14 +4716,24 @@ def _claim_proof_defect(
             if own.status != "verified":
                 return f"ERR_PROOF_UNVERIFIED ({row.evidence_id} {own.status}: {own.reason})"
             verified.append(row)
+        elif semantic_pending:
+            replay = _qualitative_replay_defect(store, session_id, row, as_of)
+            if replay is not None:
+                return f"ERR_PROOF_UNVERIFIED ({eid}: {replay})"
+            verified.append(row)
     points = _referenced_points(claim, verified)
     if isinstance(points, str):
         return points
+    identity = _source_identity_defect(claim.text, verified)
+    if identity is not None:
+        return identity
     defect = _kind_defect(claim, points) or _binding_defect(claim.text, points, claim.claim_type)
     if defect is not None or claim.claim_type not in ("observed_fact", "calculation"):
         return defect
     if points:
         return _wording_defect(claim.text, points)
+    if semantic_pending and claim.claim_type == "observed_fact":
+        return None
     return _statement_defect(claim, points, verified)
 
 
@@ -4660,16 +4747,21 @@ def _session_rows(store: ResearchRepository, session_id: str) -> dict[str, Mappi
 
 
 def require_verified_claims(
-    store: ResearchRepository, session_id: str, claims: Sequence[GroundedClaim], where: str
+    store: ResearchRepository,
+    session_id: str,
+    claims: Sequence[GroundedClaim],
+    where: str,
+    *,
+    semantic_pending: bool = False,
 ) -> None:
-    """Publication gate: raise ``{where}: ERR_*`` for the first claim lacking verified ledger proof."""
+    """Check ledger proof. Only the worker defers qualitative wording to its subsequent JEV assessment."""
     rows = _session_rows(store, session_id)
     try:
         as_of = store.get_session(session_id).as_of
     except KeyError:
         as_of = None  # no session, no cutoff: snapshot aliases fail closed, exact spellings still verify
     for claim in claims:
-        defect = _claim_proof_defect(store, session_id, rows, claim, as_of)
+        defect = _claim_proof_defect(store, session_id, rows, claim, as_of, semantic_pending=semantic_pending)
         if defect is not None:
             raise ValueError(f"{where}: {defect} for claim {claim.text[:120]!r}")
 
@@ -5197,6 +5289,35 @@ def _transition_node(store: ResearchRepository, session_id: str, node_id: str, s
 def resolve_node(session_id: str, node_id: str, *, repo: ResearchRepository | Path | str | None = None) -> ResearchNode:
     """Mark one node resolved."""
     return _transition_node(_repo(repo), session_id, node_id, "resolved", "node.resolved")
+
+
+def await_node_evidence(
+    session_id: str,
+    node_id: str,
+    dependencies: Sequence[str],
+    *,
+    repo: ResearchRepository | Path | str | None = None,
+) -> ResearchNode:
+    """Wait for admitted evidence questions through the existing dependency gate. Reject dependency cycles."""
+    store = _repo(repo)
+    node = _require_node(store, node_id)
+    if node.session_id != session_id:
+        raise ResearchNotFound(f"unknown node_id: {node_id!r}")
+    deps = tuple(dict.fromkeys((*node.depends_on, *dependencies)))
+    _require_deps_in_session(store, session_id, deps)
+    pending = list(deps)
+    seen: set[str] = set()
+    while pending:
+        dependency = pending.pop()
+        if dependency == node_id:
+            raise ValueError("await_node_evidence: dependency cycle")
+        if dependency not in seen:
+            seen.add(dependency)
+            pending.extend(_require_node(store, dependency).depends_on)
+    updated = replace(node, status="gathering", depends_on=deps)
+    store.save_node(updated)
+    _emit(store, session_id, "node.awaiting_evidence", {"node_id": node_id, "depends_on": list(deps)})
+    return updated
 
 
 def block_node(

@@ -145,18 +145,20 @@ def _is_prob(v: object) -> TypeGuard[int | float]:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0
 
 
-def _classify_probability(value: object) -> str | None:
-    """Approved noul policy: yes >=.70, unsure >=.50, no below .50; None fail-closed."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    prob = float(value)
-    if not 0.0 <= prob <= 1.0:
-        return None
-    if prob >= 0.70:
-        return "yes"
-    if prob >= 0.50:
-        return "unsure"
-    return "no"
+def _normalize_probability(value: object) -> dict[str, JSONValue]:
+    """Separate support outcome from affirmative strength. Invalid probabilities remain unknown."""
+    if not _is_prob(value):
+        return {"outcome": "unknown", "probability": None, "strength": None}
+    if value < 0.50:
+        return {"outcome": "no", "probability": value, "strength": None}
+    return {"outcome": "yes", "probability": value, "strength": "confident" if value >= 0.70 else "tentative"}
+
+
+def _classify_probability(value: object) -> str:
+    """Return yes for both affirmative strengths. Invalid probabilities remain unknown."""
+    if not _is_prob(value):
+        return "unknown"
+    return "yes" if value >= 0.50 else "no"
 
 
 def _noul_probability(probs: dict[str, JSONValue], qid: str, decision: Mapping[str, JSONValue]) -> None:
@@ -206,11 +208,14 @@ def _support_verdict(decisions: Mapping[str, dict[str, JSONValue]], carried: flo
     _noul_probability(probs, "support", support)
     _distribution(probs, ev_state)
     ev_choice = _decision_choice(ev_state)
+    result = _normalize_probability(prob)
     return {
         "probabilities": probs,
         "confidence": carried,
-        "support": prob,
-        "support_answer": _classify_probability(prob),
+        "support": result["probability"],
+        "support_answer": result["outcome"],
+        "support_result": result,
+        "support_strength": result["strength"],
         "evidence_state": ev_choice,
         "decision": ev_choice,
     }
@@ -731,10 +736,13 @@ def _selection_prompt(
     question: JSONValue,
     evidence: Sequence[JSONValue] | None,
     attempts: Sequence[JSONValue] | None,
+    ticker: str | None = None,
 ) -> str:
     """Selection instructions: the node question, evidence on hand, prior failures, and date guidance."""
     stamped = query_with_today_utc(question) if isinstance(question, str) else question
     prompt = f"Which single tool runs next for research node {node_id}? Question: {stamped} Choose exactly one winner."
+    if ticker is not None:
+        prompt += f" Selected ticker: {ticker}. Prefer filing, fundamental, and ownership tools for that ticker when relevant."
     why = node.get("why_it_matters")
     if isinstance(why, str) and why:
         prompt += f" Why it matters: {why}"
@@ -752,6 +760,7 @@ def _tool_options_prompt(
     node: Mapping[str, JSONValue],
     evidence: Sequence[JSONValue] | None,
     attempts: Sequence[JSONValue] | None,
+    ticker: str | None = None,
 ) -> tuple[dict[str, str], str]:
     if not registry:
         raise ValueError("tool_selection: empty registry")
@@ -759,7 +768,7 @@ def _tool_options_prompt(
     question = node.get("question")
     if not node_id or not question:
         raise ValueError("tool_selection: node needs nodeId and question")
-    return _tool_options(registry), _selection_prompt(node, node_id, question, evidence, attempts)
+    return _tool_options(registry), _selection_prompt(node, node_id, question, evidence, attempts, ticker=ticker)
 
 
 def _scheduler_metadata() -> tuple[frozenset[str], frozenset[str]]:
@@ -1915,13 +1924,14 @@ class JevClient:
         *,
         session_id: str,
         job_id: str | None = None,
+        ticker: str | None = None,
     ) -> ToolDecision:
         """JEV owns ALL tool selection/transitions over the whole canonical registry every round; Needle is args-only (never selects/chains/judges). Caller assembles the whole registry; single-winner choice + 2 sentinels."""
         objective = query_with_today_utc(objective) if isinstance(objective, str) else objective
         reg = list(registry) if registry else _auto_registry()
         node_d, nid = _node_view(node)
         nid_s = _log_id(nid)
-        options, prompt = _tool_options_prompt(reg, node_d, evidence, attempts)
+        options, prompt = _tool_options_prompt(reg, node_d, evidence, attempts, ticker=ticker)
         logger.info(
             "toolflow select_entry sid=%s nid=%s registry=%d options=%d objective=%r",
             session_id,
@@ -1945,12 +1955,14 @@ class JevClient:
                 "criteria": validate_json_mapping(options, "<decision_client>: 'criteria'"),
             }
         }
-        state = {
+        state: dict[str, JSONValue] = {
             "objective": objective,
             "node": node_d,
             "evidence": _compact_context(evidence),
             "attempts": _compact_attempts(attempts),
         }
+        if ticker is not None:
+            state["ticker"] = ticker
         decisions = await self.decide(
             state,
             questions,
@@ -2192,7 +2204,7 @@ class JevClient:
                 "type": "noul",
                 "instructions": (
                     f"Does the combined evidence resolve the node question, not merely mention it: {question} "
-                    + "Tentative reports and contradictions do not resolve. Conflicted or insufficient evidence never resolves."
+                    + "Contradictions do not resolve. Conflicted or insufficient evidence never resolves."
                     + " "
                     + _FILING_CONTENT_GUIDANCE
                 ),
@@ -2233,9 +2245,11 @@ class JevClient:
         _distribution(probs, cont)
         continuation = _decision_choice(cont, "continue_research")
         ev_choice = _decision_choice(ev_state)
-        support_answer = _classify_probability(support.get("probability"))
+        support_result = _normalize_probability(support.get("probability"))
+        support_answer = _classify_probability(support_result["probability"])
         continuation = _continuation_for_assessment(continuation, ev_choice, support_answer)
-        topical_answer = _classify_probability(topical.get("probability"))
+        topical_result = _normalize_probability(topical.get("probability"))
+        topical_answer = _classify_probability(topical_result["probability"])
         return {
             "probabilities": probs,
             "confidence": cont.get("confidence"),
@@ -2247,8 +2261,12 @@ class JevClient:
             "admit": None,
             "evidence_state": ev_choice,
             "decision": ev_choice,
-            "topical_relevance": topical.get("probability"),
-            "resolution_support": support.get("probability"),
+            "topical_relevance": topical_result["probability"],
+            "resolution_support": support_result["probability"],
+            "topical_relevance_result": topical_result,
+            "topical_relevance_strength": topical_result["strength"],
+            "resolution_support_result": support_result,
+            "resolution_support_strength": support_result["strength"],
             "topical_relevance_answer": topical_answer,
             "resolution_support_answer": support_answer,
         }

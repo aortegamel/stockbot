@@ -129,12 +129,16 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
   const [trio, setTrio] = useState<TrioState>(null);
   const known = evidenceById(events);
   const links = sourceLinks(known);
-  const answer = events.filter((e) => e.type === "answer_delta").map((e) => e.text).join("");
-  // The single research answer is final, so resolve and render sources only after the terminal event.
+  const finalAnswer = events.filter((e) => e.type === "answer_delta").map((e) => e.text).join("");
+  const partial = events.findLast((e) => e.type === "answer_partial");
+  const answer = finalAnswer || partial?.text || "";
+  // The backend emits only checked answer text, so display it before the request ends.
   const done = events.some((e) => e.type === "done" || e.type === "error" || e.type === "failed");
-  const parts = splitAnswer(answer, known, events.findLast((e) => e.type === "claims")?.claims ?? []);
+  const showSources = answer.length > 0 || done;
+  const claims = finalAnswer ? events.findLast((e) => e.type === "claims")?.claims ?? [] : partial?.claims ?? [];
+  const parts = splitAnswer(answer, known, claims);
   const cited = parts.flatMap((part) => part.citation?.sources?.slice(0, 1) ?? []);
-  const loaded = useLoadedSources(done ? [...cited, ...links.map((link) => link.reference)] : []);
+  const loaded = useLoadedSources(showSources ? [...cited, ...links.map((link) => link.reference)] : []);
   const labelOf = (reference: SourceReference, evidence: Evidence, index: number): string =>
     loaded.get(reference.id)?.label || evidence.title || reference.title || `${evidence.source.toUpperCase() || "Source"} ${index}`;
   if (events.length === 0) {
@@ -161,16 +165,15 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
   }
   // Prod hides internal work rows; debug (.env STOCKBOT_DEBUG=1) shows all.
   // The evidence and claims events stay out of prod rows: citations + source controls read them directly.
-  // Show readable status lines live. Collapse their history when an answer or terminal event arrives.
+  // Show readable status lines live. Collapse their history when a terminal event arrives.
   const visible = debug ? events : events.filter((e) => e.type === "agent_start" || e.type === "answer_delta" || e.type === "reasoning_start" || e.type === "done" || e.type === "error" || e.type === "failed");
   const head = visible.filter(
-    (e) => e.type !== "answer_delta" && e.type !== "done" && e.type !== "error" && e.type !== "failed" && e.type !== "reasoning_start" && e.type !== "evidence" && e.type !== "claims" && e.type !== "offer_trio" && e.type !== "status",
+    (e) => e.type !== "answer_delta" && e.type !== "answer_partial" && e.type !== "done" && e.type !== "error" && e.type !== "failed" && e.type !== "reasoning_start" && e.type !== "evidence" && e.type !== "claims" && e.type !== "offer_trio" && e.type !== "status",
   );
   const statuses = events.flatMap((e, i) => (e.type === "status" ? [<div key={i}>{e.text}</div>] : []));
   const tail = visible.filter((e) => e.type === "done" || e.type === "error" || e.type === "failed");
   const streaming = reasoning && tail.length === 0;
   // The offer appears once the run ends; Yes or No answers it once per session.
-  const finalAnswer = done ? answer : "";
   const offer = done ? events.findLast((e) => e.type === "offer_trio") : undefined;
   const current = offer && trio?.sessionId === offer.sessionId ? trio : null;
   const askTrio = (sessionId: string): void => {
@@ -185,8 +188,9 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
       {statuses.length > 0 && (tail.length > 0
         ? <details className="text-xs text-zinc-500"><summary className="cursor-pointer">Progress · {statuses.length} {statuses.length === 1 ? "step" : "steps"}</summary>{statuses}</details>
         : <div role="status" className="space-y-0.5 text-xs text-zinc-500">{statuses}</div>)}
-      {streaming && <AgentEventView event={{ type: "reasoning_start", model: "stockbot" }} />}
-      {finalAnswer && <div className="whitespace-pre-wrap pt-2 text-zinc-100">{parts.map((part, i) => {
+      {streaming && !answer && <AgentEventView event={{ type: "reasoning_start", model: "stockbot" }} />}
+      {!done && answer && <div role="status" className="pt-2 text-xs text-zinc-400">Partial checked answer · research continues</div>}
+      {answer && <div className="whitespace-pre-wrap pt-2 text-zinc-100">{parts.map((part, i) => {
         const citation = part.citation;
         const reference = citation?.sources?.[0];
         if (!citation || !reference) return <span key={i}>{part.text}</span>;
@@ -200,7 +204,7 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
       })}</div>}
       <WorkRow events={events} debug={debug} />
       <ActionCards events={events} />
-      {done && links.length > 0 && <div className="flex flex-wrap items-center gap-2 pt-2" role="group" aria-label="Captured sources">
+      {showSources && links.length > 0 && <div className="flex flex-wrap items-center gap-2 pt-2" role="group" aria-label="Captured sources">
         <span className="text-xs text-zinc-500">Sources:</span>
         {links.map(({ reference, evidence }, index) => {
           const link = loaded.get(reference.id)?.link;

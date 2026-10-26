@@ -26,11 +26,11 @@ const LONG_ID = P("r".repeat(300));
 test("classifyProbability boundaries match approved policy", () => {
   expect(classifyProbability(1)).toBe("yes");
   expect(classifyProbability(0.7)).toBe("yes");
-  expect(classifyProbability(0.6999)).toBe("unsure");
-  expect(classifyProbability(0.5)).toBe("unsure");
+  expect(classifyProbability(0.6999)).toBe("yes");
+  expect(classifyProbability(0.5)).toBe("yes");
   expect(classifyProbability(0.4999)).toBe("no");
   expect(classifyProbability(0)).toBe("no");
-  for (const bad of [NaN, -0.1, 1.1, Infinity]) expect(() => classifyProbability(bad)).toThrow("invalid_probability");
+  for (const bad of [NaN, -0.1, 1.1, Infinity]) expect(classifyProbability(bad)).toBe("unknown");
 });
 
 // Lockstep helper: Responses API payload shape consumed by parseOpenCodeOutput.
@@ -325,6 +325,8 @@ test("full sequence: relevance, analysis, adjudication, expansion, artifacts", a
   expect(final.reasoning[0].nodeId).toBe(P("repayment"));
   expect(final.reasoning[0].truthProbability).toBe(0.85);
   expect(final.reasoning[0].truthPolicy).toBe("yes");
+  expect(final.reasoning[0].truthResult).toEqual({ outcome: "yes", probability: 0.85, strength: "confident" });
+  expect(final.reasoning[0].truthStrength).toBe("confident");
   expect(final.reasoning[0].evidenceState).toBe("sufficient_support");
   expect(final.reasoning[0].materialityScore).toBe(3);
   expect(final.unresolved).toContainEqual({ nodeId: P("collateral"), reason: "gather_evidence" });
@@ -644,6 +646,7 @@ test("a loopback Responses server accepts every OpenCode request and the run com
     expect(JSON.parse(await readFile(join(dir, "final.json"), "utf8")).reasoning).toEqual([{
       ...VALID_ANALYSIS,
       truthProbability: 0.85, truthPolicy: "yes",
+      truthResult: { outcome: "yes", probability: 0.85, strength: "confident" }, truthStrength: "confident",
       evidenceState: "sufficient_support", evidenceProbabilities: EVIDENCE_STATE_FULL, evidenceConfidence: 0.8,
       materialityScore: 3,
     }]);

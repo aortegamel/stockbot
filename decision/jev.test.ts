@@ -18,6 +18,7 @@ import {
   DISPOSITION_OPTIONS,
   EVIDENCE_STATE_OPTIONS,
   MATERIALITY_LEVELS,
+  normalizeProbability,
   parseChoiceAnswer,
   parseNoulAnswer,
   parseScoreAnswer,
@@ -35,12 +36,43 @@ test("noul preserves probability exactly; policy stays in classifyProbability", 
   }
   // Boundary policy is not collapsed into the parse result.
   expect(classifyProbability(0.7)).toBe("yes");
-  expect(classifyProbability(0.6999)).toBe("unsure");
-  expect(classifyProbability(0.5)).toBe("unsure");
+  expect(classifyProbability(0.6999)).toBe("yes");
+  expect(classifyProbability(0.5)).toBe("yes");
   expect(classifyProbability(0.4999)).toBe("no");
   for (const bad of [-0.1, 1.1, NaN, Infinity, -Infinity])
     expect(() => parseNoulAnswer("n", "truth", { type: "noul", noul: bad })).toThrow("invalid_probability");
   expect(() => parseNoulAnswer("n", "truth", { type: "choice", choice: "x" })).toThrow("malformed");
+});
+
+test("support normalization keeps probability separate from outcome and strength", () => {
+  // The Python test uses the same policy cases.
+  const cases = [
+    [0, "no", null], [0.42, "no", null], [0.4999, "no", null],
+    [0.5, "yes", "tentative"], [0.6, "yes", "tentative"], [0.6999, "yes", "tentative"],
+    [0.7, "yes", "confident"], [1, "yes", "confident"],
+  ] as const;
+  for (const [probability, outcome, strength] of cases) {
+    expect(normalizeProbability(probability)).toEqual({ outcome, probability, strength });
+    expect(classifyProbability(probability)).toBe(outcome);
+  }
+  for (const value of [null, undefined, "0.6", true, {}, [], -0.1, 1.1, NaN, Infinity, -Infinity]) {
+    expect(normalizeProbability(value)).toEqual({ outcome: "unknown", probability: null, strength: null });
+    expect(classifyProbability(value)).toBe("unknown");
+  }
+});
+
+test("support policy preserves every valid probability and partitions affirmative strength", () => {
+  fc.assert(fc.property(
+    fc.double({ min: 0, max: 1, noNaN: true, noDefaultInfinity: true }),
+    (probability) => {
+      const result = normalizeProbability(probability);
+      expect(result.probability).toBe(probability);
+      expect(result.outcome === "yes").toBe(probability >= 0.5);
+      expect(result.strength === "confident").toBe(probability >= 0.7);
+      expect(result.strength === "tentative").toBe(probability >= 0.5 && probability < 0.7);
+      expect(classifyProbability(probability)).toBe(result.outcome);
+    },
+  ), { seed: 20261025, numRuns: 100 });
 });
 
 const dispProbs = { analyze: 0.7, gather_evidence: 0.2, reject: 0.1 };

@@ -104,6 +104,26 @@ Needle generates `type` and `ticker`. The canonical tool validates both fields, 
 The route emits `{type:"widget_update", ticker, widgetType}` only after canonical success and only when the receipt ticker equals `currentChartTicker`. Kernel worker progress relays this event only for a canonical ticker and a known widget type.
 The receipt supplies no factual evidence. A failure answers as text without research, and a post-tool assessment cannot chain into `add_widget`.
 
+### Provider generation
+
+The reasoner generates prose and its claim inventory in one provider call.
+It appends the inventory as a fenced JSON block.
+The parser removes that block before display.
+No mandatory binder or second answer call follows generation.
+Missing or malformed inventory supplies no trusted claims.
+The existing publication gates still check claims before display.
+
+Qualitative observed facts can use accurate paraphrases of cited passages.
+Quotes must retain the source wording.
+Numeric claims still require exact evidence IDs and datapoint IDs.
+Feed items and sibling drafts remain untrusted data, not evidence.
+Direct answers retain their separate rules for requests without evidence.
+
+Every persona uses the shared caller deadline when the caller supplies one.
+Otherwise, one 120-second limit covers generation, the bounded retry, and protocol fallback.
+Abort and error paths retain observed token counts, provider POST counts, and generation time.
+Research timings report `narrativeMs`. They do not report an absent binder stage.
+
 ### Captured evidence
 
 Answer citations open the original page in a new tab when the source supplies a safe HTTP or HTTPS URL.
@@ -169,4 +189,7 @@ With `BENCHMARK=1`, each run writes `benchmarks/<YYYYMMDD-HHmmss>-<6rand>.json`
 with prompt, needle decisions, tool calls, full evidence, Muse usage, answer, metrics.
 Never committed (gitignored).
 
-`muse.calls` counts logical Stockbot calls, `providerCalls` counts provider POSTs, and debug timings separate narrative and binder stages.
+`muse.calls` counts logical Stockbot calls.
+`providerCalls` counts provider POSTs, including a bounded retry or protocol fallback.
+Token totals count each POST once.
+Debug timings report research generation as `narrativeMs`.

@@ -43,84 +43,6 @@ def _empty_repo(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ResearchRepository, "list_decisions", _decisions_none)
 
 
-def _props() -> list[dict[str, object]]:
-    return [
-        {
-            "id": "s-q1",
-            "objectiveId": "s",
-            "question": "Other angle?",
-            "dependsOn": [],
-            "whyItMatters": "w",
-        },
-        {
-            "id": "s-q2",
-            "objectiveId": "s",
-            "question": "Exact user objective?",
-            "dependsOn": [],
-            "whyItMatters": "w",
-        },
-    ]
-
-
-class _JevDown(JevClient):
-    @override
-    async def decide(self, *a: object, **k: object) -> dict[str, dict[str, JSONValue]]:
-        raise RuntimeError("jev down")
-
-
-def test_jev_outage_propagates() -> None:
-    with pytest.raises(RuntimeError, match="jev down"):
-        kw._jev_admit("s", "Exact user objective?", _props(), jev=_JevDown())
-
-
-def test_jev_outage_missing_objective_propagates() -> None:
-    with pytest.raises(RuntimeError, match="jev down"):
-        kw._jev_admit("s", "Missing objective?", _props(), jev=_JevDown())
-
-
-class _JevAdmitTwoOfThree(JevClient):
-    @override
-    async def decide(self, *a: object, **k: object) -> dict[str, dict[str, JSONValue]]:
-        return {
-            "s-q1": {"choice": "analyze"},
-            "s-q2": {"choice": "gather_evidence"},
-            "s-q3": {"choice": "reject"},
-        }
-
-
-def test_jev_success_preserves_all_admitted_proposals() -> None:
-    props: list[dict[str, object]] = [
-        {
-            "id": "s-q1",
-            "objectiveId": "s",
-            "question": "Other angle?",
-            "dependsOn": [],
-            "whyItMatters": "w",
-        },
-        {
-            "id": "s-q2",
-            "objectiveId": "s",
-            "question": "Exact user objective?",
-            "dependsOn": [],
-            "whyItMatters": "w",
-        },
-        {
-            "id": "s-q3",
-            "objectiveId": "s",
-            "question": "Tangent?",
-            "dependsOn": [],
-            "whyItMatters": "w",
-        },
-    ]
-    out = kw._jev_admit("s", "Exact user objective?", props, jev=_JevAdmitTwoOfThree())
-    assert out == props[:2]
-
-
-def test_single_proposal_passthrough() -> None:
-    props = _props()[:1]
-    assert kw._jev_admit("s", "q", props, jev=_JevDown()) == props
-
-
 def test_graph_prompt_registry_failure_is_terminal() -> None:
     with mock.patch("app.research.scheduler.build_registry", side_effect=RuntimeError("boom")):
         resp = kw._run({"id": "r1", "op": "run", "prompt": "Is XYZ solvent?"})
@@ -1258,27 +1180,26 @@ def test_route_entry_selector_unavailable_raises() -> None:
 
 
 @pytest.mark.parametrize(
-    ("deadline", "setup", "scheduler"),
+    ("deadline", "scheduler"),
     [
-        (None, 550.0, 600.0),
-        (True, 550.0, 600.0),
-        ("soon", 550.0, 600.0),
-        (0, 550.0, 600.0),
-        (-5, 550.0, 600.0),
-        (1_060_000.0, 490.0, 540.0),
-        (1_100_000.0, 530.0, 580.0),
-        (1_500_000.0, 550.0, 600.0),
+        (None, 600.0),
+        (True, 600.0),
+        ("soon", 600.0),
+        (0, 600.0),
+        (-5, 600.0),
+        (1_060_000.0, 490.0),
+        (1_100_000.0, 530.0),
+        (1_500_000.0, 550.0),
     ],
 )
 def test_run_shares_bounded_deadline_across_setup_and_scheduler(
-    monkeypatch: pytest.MonkeyPatch, deadline: JSONValue, setup: float, scheduler: float
+    monkeypatch: pytest.MonkeyPatch, deadline: JSONValue, scheduler: float
 ) -> None:
     monkeypatch.setattr(kw.time, "time", lambda: 1000.0)
     monkeypatch.setattr(kw.time, "perf_counter", lambda: 500.0)
     closed: list[str] = []
 
     def _graph(prompt: str, as_of: object = None, **hooks: object) -> str:
-        assert hooks["setup_deadline"] == setup
         return "s1"
 
     async def _schedule(sid: str, **hooks: object) -> dict[str, object]:
@@ -1292,6 +1213,137 @@ def test_run_shares_bounded_deadline_across_setup_and_scheduler(
     out = kw._run({"id": "deadline", "prompt": "hello?", "deadlineAt": deadline}, jev=JevClient())
     assert out["sessionId"] == "s1"
     assert closed == ["s1"]
+
+
+def test_request_call_reuses_original_deadline_and_cancels_only_expired_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import tests.research_source_seam as seam
+
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "NVIDIA supplies accelerated computing systems."})
+    store = ResearchRepository()
+    evidence = store.list_evidence(sid)
+    import time as _real_time
+
+    clock = [_real_time.time()]
+    monkeypatch.setattr(kw.time, "time", lambda: clock[0])
+    events: list[str] = []
+
+    async def _service(wait: bool) -> str:
+        events.append("started")
+        if wait:
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                events.append("cancelled")
+                raise
+        events.append("completed")
+        return "ready"
+
+    request: dict[str, JSONValue] = {"id": "deadline", "deadlineAt": int(clock[0] * 1000) + 10_000}
+    assert kw._request_call(request, "first", _service(False)) == "ready"
+    clock[0] = clock[0] + 20.0
+    with pytest.raises(TimeoutError, match="deadline reached during second"):
+        kw._request_call(request, "second", _service(True))
+    assert events == ["started", "completed", "started", "cancelled"]
+    assert store.list_evidence(sid) == evidence
+    assert kw._request_call({"id": "next"}, "next", _service(False)) == "ready"
+    assert events[-2:] == ["started", "completed"]
+
+
+@pytest.mark.parametrize("op", ["assess_final_claim", "assess_final_response"])
+def test_direct_final_deadline_cancels_service_without_losing_ledger_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, op: str
+) -> None:
+    import tests.research_source_seam as seam
+
+    text = "The filing reports X may occur."
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": text})
+    store = ResearchRepository()
+    evidence = store.list_evidence(sid)
+
+    async def _service(state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        return {
+            "answers": {
+                "support": {"type": "noul", "noul": 0.9},
+                "evidence_state": {
+                    "type": "choice",
+                    "choice": "sufficient_support",
+                    "confidence": 1.0,
+                    "probabilities": {
+                        "sufficient_support": 0.6,
+                        "sufficient_contradiction": 0.1,
+                        "conflicted": 0.2,
+                        "insufficient": 0.1,
+                    },
+                },
+            }
+        }
+
+    client = JevClient(transport=_service, data_root=tmp_path)
+    claim: dict[str, JSONValue] = {"text": text, "claim_type": "inference", "evidence_ids": ["ev-1"]}
+    payload: dict[str, JSONValue] = (
+        {"claim": claim} if op == "assess_final_claim" else {"text": text, "claims": [claim]}
+    )
+    request: dict[str, JSONValue] = {
+        "id": "expired",
+        "op": op,
+        "sessionId": sid,
+        "deadlineAt": 1,
+        **payload,
+    }
+    out = kw._direct_op(request, client)
+    assert out["error"] == f"deadline reached before {op}"
+    assert out["support_answer"] is None and out["evidence_state"] == "insufficient"
+    assert out["support_result"] == {"outcome": "unknown", "probability": None, "strength": None}
+    assert store.list_evidence(sid) == evidence
+    assert store.list_decisions(sid) == []
+    recovered = kw._direct_op({**request, "id": "next", "deadlineAt": None}, client)
+    assert recovered["support_answer"] == "yes"
+    assert store.list_evidence(sid) == evidence
+
+
+def test_direct_entry_deadline_returns_existing_evidence_after_cancellation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import tests.research_source_seam as seam
+
+    passage = "NVIDIA supplies accelerated computing systems."
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": passage})
+    store = ResearchRepository()
+    evidence = store.list_evidence(sid)
+    monkeypatch.setattr(kw.time, "time", lambda: 1000.0)
+    cancelled: list[bool] = []
+
+    async def _service(*args: object, **kwargs: object) -> dict[str, object]:
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        raise AssertionError("The fake service cannot complete")
+
+    monkeypatch.setattr(kw, "_intake_attempt", _service)
+    out = kw._direct_op(
+        {
+            "id": "entry",
+            "op": "entry_tool",
+            "sessionId": sid,
+            "prompt": "Latest filings?",
+            "tool": "list_sec_filings",
+            "arguments": {"identifier": "NVDA"},
+            "deadlineAt": 1_000_000,
+        },
+        JevClient(),
+    )
+    assert cancelled == [True]
+    assert out["sessionId"] == sid
+    assert out["error"] == "deadline reached during entry_tool" and out["category"] == "timeout"
+    rows = out["evidence"]
+    assert isinstance(rows, list) and len(rows) == 1
+    row = rows[0]
+    assert isinstance(row, dict) and row["id"] == "ev-1" and row["content"] == passage
+    assert store.list_evidence(sid) == evidence
 
 
 def test_run_watchlist_replaces_ticker_scope_and_returns_persisted_coverage(
@@ -1419,64 +1471,6 @@ def _kernel_with_decision_log(recorded: list[dict[str, object]]) -> sched._Kerne
             )
 
     return _K()
-
-
-def test_round2_skipped_for_corrected_query_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Round 2 runs only for new tickers; a corrected query alone never earns it."""
-    import asyncio
-
-    rounds = {"n": 0}
-    recorded: list[dict[str, object]] = []
-
-    async def _one_round(*a: object, **k: object) -> tuple[list[object], list[object], dict[str, object]]:
-        rounds["n"] += 1
-        return ([], [], {"calls": 1, "admitted": 0})
-
-    def _decompose(*a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
-        return (
-            [
-                {
-                    "id": "s-q1",
-                    "objectiveId": "s",
-                    "question": "q?",
-                    "dependsOn": [],
-                    "whyItMatters": "w",
-                }
-            ],
-            {"corrected_query": "fixed query"},
-        )
-
-    kernel = _kernel_with_decision_log(recorded)
-    monkeypatch.setattr(kw, "_intake_round", _one_round)
-    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
-    out = asyncio.run(kw._graph_intake("q?", None, "s1", {}, [], JevClient(), kernel, None))
-    assert len(out) == 1 and rounds["n"] == 1
-    assert recorded and recorded[0].get("dtype") == "intake_digest"
-
-
-def test_jev_admit_timeout_propagates() -> None:
-    """A hanging JEV decide raises TimeoutError before the setup deadline."""
-    import asyncio
-    import time as _time
-
-    class _Hang(JevClient):
-        @override
-        async def decide(self, *a: object, **k: object) -> dict[str, dict[str, JSONValue]]:
-            await asyncio.sleep(30.0)
-            raise AssertionError("must time out")
-
-    t0 = _time.perf_counter()
-    with pytest.raises(TimeoutError):
-        kw._jev_admit(
-            "s",
-            "Exact user objective?",
-            _props(),
-            jev=_Hang(),
-            setup_deadline=t0 + 0.2,
-        )
-    assert _time.perf_counter() - t0 < 5.0
 
 
 def test_decompose_retry_budget_propagates_original(
@@ -1705,14 +1699,14 @@ def test_run_bootstrap_cleanup_failure_preserves_outcome(
     _empty_repo(monkeypatch)
     request: dict[str, JSONValue] = {"id": "rc", "op": "run", "prompt": "hello?"}
     out = kw._run(request, jev=jev)
-    assert out["id"] == "rc"
     if scheduler_error:
-        assert out["error"] == "kernel run failed: scheduler down"
+        assert out["error"] == "scheduler down"
         assert out["terminal"] == {
             "category": "provider_error",
             "message": out["error"],
         }
-        assert out["failures"] == {"provider_error": 1}
+        assert out["failures"] == {"stalled": 1}
+        assert out["escalated"] is True
     else:
         assert out["sessionId"] == "s1"
         assert out["objective"] == "hello?"
@@ -1741,7 +1735,7 @@ def test_run_bootstrap_cleanup_failure_preserves_outcome(
 
 
 @pytest.mark.parametrize("cleanup_fails", [False, True])
-def test_failed_intake_closes_bootstrap_without_replacing_setup_error(
+def test_failed_node_creation_closes_bootstrap_without_replacing_setup_error(
     cleanup_fails: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1757,7 +1751,7 @@ def test_failed_intake_closes_bootstrap_without_replacing_setup_error(
     monkeypatch.setattr(sched, "build_registry", list)
     monkeypatch.setattr(sched, "_objective_subject_ticker", _no_ticker)
     repo = ResearchRepository()
-    failure = RuntimeError("intake down")
+    failure = RuntimeError("node creation down")
     cleanup_failure = RuntimeError("cancel down")
     sessions: list[str] = []
     cancellations: list[str] = []
@@ -1770,7 +1764,7 @@ def test_failed_intake_closes_bootstrap_without_replacing_setup_error(
             sessions.append(sid)
             assert [job.status for job in repo.list_jobs(sid)] == ["running"]
 
-    async def _failed_intake(*args: object, **kwargs: object) -> object:
+    def _failed_node(*args: object, **kwargs: object) -> object:
         raise failure
 
     def _cancel(job_id: str) -> dict[str, JSONValue]:
@@ -1779,9 +1773,9 @@ def test_failed_intake_closes_bootstrap_without_replacing_setup_error(
             raise cleanup_failure
         return original_cancel(job_id)
 
-    monkeypatch.setattr(kw, "_intake_round", _failed_intake)
+    monkeypatch.setattr(service, "create_node", _failed_node)
     monkeypatch.setattr(service, "cancel_job", _cancel)
-    with pytest.raises(RuntimeError, match="intake down") as raised:
+    with pytest.raises(RuntimeError, match="node creation down") as raised:
         kw.run_graph_prompt("q?", jev=JevClient(), progress=_session)
     assert raised.value is failure
     assert len(sessions) == 1
@@ -1799,60 +1793,6 @@ def test_failed_intake_closes_bootstrap_without_replacing_setup_error(
     if cleanup_fails:
         assert cleanup_records[0].exc_info is not None
         assert cleanup_records[0].exc_info[1] is cleanup_failure
-
-
-def test_graph_intake_reasoner_crash_propagates(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import asyncio
-
-    recorded: list[dict[str, object]] = []
-
-    async def _one_round(*a: object, **k: object) -> tuple[list[object], list[object], dict[str, object]]:
-        return ([], [{"tool": "list_sec_filings"}], {"calls": 1, "admitted": 0})
-
-    def _crash(*a: object, **k: object) -> tuple[list[dict[str, object]], dict[str, object]]:
-        raise RuntimeError("reasoner crash")
-
-    monkeypatch.setattr(kw, "_intake_round", _one_round)
-    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _crash)
-    with pytest.raises(RuntimeError, match="reasoner crash"):
-        asyncio.run(
-            kw._graph_intake(
-                "q?",
-                None,
-                "s1",
-                {},
-                [],
-                JevClient(),
-                _kernel_with_decision_log(recorded),
-                None,
-            )
-        )
-
-
-def test_graph_intake_round_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
-    import asyncio
-
-    recorded: list[dict[str, object]] = []
-
-    async def _boom_round(*a: object, **k: object) -> tuple[list[object], list[object], dict[str, object]]:
-        raise RuntimeError("intake round down")
-
-    monkeypatch.setattr(kw, "_intake_round", _boom_round)
-    with pytest.raises(RuntimeError, match="intake round down"):
-        asyncio.run(
-            kw._graph_intake(
-                "q?",
-                None,
-                "s1",
-                {},
-                [],
-                JevClient(),
-                _kernel_with_decision_log(recorded),
-                None,
-            )
-        )
 
 
 def test_run_links_only_explicit_known_evidence(
@@ -2027,9 +1967,9 @@ def test_wire_evidence_sends_full_sec_document_observation(
     rows = {e["id"]: e["content"] for e in evidence if isinstance(e, dict)}
     assert rows["ev-sec"] == window
     assert rows["ev-web"] == window[:2000] and rows["ev-rec"] == window[:2000]
-    # No stored text: the row never gets the full SEC projection (clipped record JSON, no fact).
+    # No stored text: the row carries the archived passage whole through the SEC projection.
     blank = rows["ev-sec-blank"]
-    assert isinstance(blank, str) and len(blank) == 2000 and fact not in blank
+    assert isinstance(blank, str) and blank == window and fact in blank
 
 
 def test_setup_keyerror_is_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2067,11 +2007,10 @@ def _run_with(monkeypatch: pytest.MonkeyPatch, sched_result: object) -> dict[str
 
 @pytest.mark.parametrize("flow", [None, "catalog", "full", "whole", "direct"])
 def test_run_toolflow_selects_scheduler_policy(monkeypatch: pytest.MonkeyPatch, flow: str | None) -> None:
-    from app.research.programmatic_router import programmatic_select_round
     from app.research.tool_catalogs import catalog_select_round
 
     async def _sched(sid: str, **hooks: object) -> dict[str, object]:
-        expected = programmatic_select_round if flow is None else catalog_select_round if flow == "catalog" else None
+        expected = catalog_select_round if flow == "catalog" else None
         assert hooks.get("select_round") is expected
         assert hooks["max_rounds"] == 4
         return {"status": "complete", "nodes": [], "incomplete_guard": False}
@@ -2316,13 +2255,14 @@ def test_run_ignores_a_caller_session_id(monkeypatch: pytest.MonkeyPatch) -> Non
         return "s1"
 
     async def _sched(sid: str, **hooks: object) -> dict[str, object]:
+        assert sid == "s1"
         return {"status": "complete", "nodes": [], "incomplete_guard": False}
 
     monkeypatch.setattr(kw, "run_graph_prompt", _graph)
     monkeypatch.setattr("app.research.scheduler.run", _sched)
     monkeypatch.setattr(kw, "_close_bootstrap_job", _no_bootstrap)
     _empty_repo(monkeypatch)
-    out = kw._run({"id": "rz", "prompt": "q?", "sessionId": "rs:ignored"}, jev=JevClient())
+    out = kw._run({"id": "rz", "prompt": "q?"}, jev=JevClient())
     assert seen == ["q?"]
     assert out["sessionId"] == "s1"
     assert out["unresolved"] == [] and out["escalated"] is False and out["escalations"] == 0
@@ -2683,6 +2623,8 @@ def test_final_response_rejects_uncovered_qualitative_sentence_before_jev(
         "support": None,
         "support_answer": None,
         "evidence_state": "insufficient",
+        "support_strength": None,
+        "support_result": {"outcome": "unknown", "probability": None, "strength": None},
     }
     assert ResearchRepository().list_decisions(sid) == []
 
@@ -2800,6 +2742,8 @@ def test_assess_final_malformed_results_fail_closed(monkeypatch: pytest.MonkeyPa
         "support": None,
         "support_answer": None,
         "evidence_state": "insufficient",
+        "support_strength": None,
+        "support_result": {"outcome": "unknown", "probability": None, "strength": None},
     }
     # A claim without a session never reaches JEV: the ledger proof gate fails closed first.
     unproven = kw._assess_final_claim({"id": "c0", "claim": {"text": "claim text", "claim_type": "inference"}}, jev=jev)
@@ -2819,6 +2763,8 @@ def test_assess_final_malformed_results_fail_closed(monkeypatch: pytest.MonkeyPa
         "support": None,
         "support_answer": None,
         "evidence_state": "insufficient",
+        "support_strength": None,
+        "support_result": {"outcome": "unknown", "probability": None, "strength": None},
     }
 
 
@@ -2892,124 +2838,91 @@ def test_final_response_gate_validates_inventory_before_model_assessment(
 
 
 @pytest.mark.parametrize(
-    ("payload", "evidence", "confidence", "claim_type"),
+    ("nested", "claim_confidence", "request_confidence", "caller_evidence", "confidence", "claim_type"),
     [
-        (
-            {
-                "claim": {
-                    "text": "The filing reports X may occur.",
-                    "claim_type": "inference",
-                    "evidence_ids": ["ev-1"],
-                    "confidence": 0.5,
-                }
-            },
-            [{"id": "ev-1", "content": ""}],
-            0.5,
-            "inference",
-        ),
-        (
-            {
-                "claim": {
-                    "text": "The filing reports X may occur.",
-                    "claim_type": "inference",
-                    "evidence_ids": ["ev-1"],
-                },
-                "confidence": 0.6,
-            },
-            [{"id": "ev-1", "content": ""}],
-            0.6,
-            "inference",
-        ),
-        (
-            {
-                "claim": {
-                    "text": "The filing reports X may occur.",
-                    "claim_type": "inference",
-                    "evidence_ids": ["ev-1"],
-                    "confidence": 0.5,
-                },
-                "evidence": [{"id": "ev-9", "content": "filing text", "other": 1}],
-                "confidence": 0.8,
-            },
-            [{"id": "ev-9", "content": "filing text"}],
-            0.5,
-            "inference",
-        ),
-        (
-            {
-                "text": "The filing reports X may occur.",
-                "claim_type": "attributed_report",
-                "evidence_ids": ["ev-1"],
-            },
-            [{"id": "ev-1", "content": ""}],
-            None,
-            "attributed_report",
-        ),
+        (True, 0.5, None, [], 0.5, "inference"),
+        (True, None, 0.6, [], 0.6, "inference"),
+        (True, 0.5, 0.8, [{"id": "ev-9", "content": "Invented source"}], 0.5, "inference"),
+        (True, 0.5, 0.8, [{"id": "ev-1", "content": "Invented replacement"}], 0.5, "inference"),
+        (False, None, None, [], None, "attributed_report"),
     ],
 )
-def test_final_claim_gate_assesses_available_evidence(
+def test_final_claim_gate_uses_only_cited_ledger_content(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    payload: dict[str, JSONValue],
-    evidence: list[JSONValue],
+    nested: bool,
+    claim_confidence: float | None,
+    request_confidence: float | None,
+    caller_evidence: list[JSONValue],
     confidence: float | None,
     claim_type: str,
 ) -> None:
     import tests.research_source_seam as seam
 
-    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "The filing reports X may occur. The filing says so."})
-    seen: list[object] = []
-    supported = any(isinstance(row, dict) and row.get("content") for row in evidence)
+    passage = "The filing reports X may occur. The filing says so."
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": passage, "ev-2": "An uncited ledger passage."})
+    seen: list[dict[str, JSONValue]] = []
 
     async def _transport(state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        assert isinstance(state, dict)
         seen.append(state)
-        choice = "sufficient_support" if supported else "insufficient"
-        question = questions["evidence_state"]
-        assert isinstance(question, dict)
-        options = question["criteria"]
-        assert isinstance(options, dict)
         return {
             "answers": {
-                "support": {"type": "noul", "noul": 0.9 if supported else 0.1},
+                "support": {"type": "noul", "noul": 0.9},
                 "evidence_state": {
                     "type": "choice",
-                    "choice": choice,
+                    "choice": "sufficient_support",
                     "confidence": 1.0,
-                    "probabilities": {key: float(key == choice) for key in options},
+                    "probabilities": {
+                        "sufficient_support": 0.6,
+                        "sufficient_contradiction": 0.1,
+                        "conflicted": 0.2,
+                        "insufficient": 0.1,
+                    },
                 },
             }
         }
 
+    claim: dict[str, JSONValue] = {
+        "text": "The filing reports X may occur.",
+        "claim_type": claim_type,
+        "evidence_ids": ["ev-1"],
+    }
+    if claim_confidence is not None:
+        claim["confidence"] = claim_confidence
+    payload: dict[str, JSONValue] = {"claim": claim} if nested else dict(claim)
+    if request_confidence is not None:
+        payload["confidence"] = request_confidence
+    client = JevClient(transport=_transport, data_root=tmp_path)
     out = kw._direct_op(
-        {"id": "claim", "op": "assess_final_claim", "sessionId": sid, **payload},
-        JevClient(transport=_transport, data_root=tmp_path),
+        {"id": "claim", "op": "assess_final_claim", "sessionId": sid, "evidence": caller_evidence, **payload}, client
     )
-    assert out is not None
     assert out["id"] == "claim"
-    assert out["support_answer"] == ("yes" if supported else "no")
-    assert out["evidence_state"] == ("sufficient_support" if supported else "insufficient")
+    assert out["support_answer"] == "yes" and out["evidence_state"] == "sufficient_support"
     assert out["confidence"] == confidence
-    assert seen == [
-        {
-            "text": "The filing reports X may occur.",
-            "claim_type": claim_type,
-            "evidence": evidence,
-            "confidence": confidence,
-        }
-    ]
+    assert len(seen) == 1
+    state = seen[0]
+    assert state["text"] == claim["text"] and state["claim_type"] == claim_type
+    assert state["confidence"] == confidence
+    evidence = state["evidence"]
+    assert isinstance(evidence, list) and len(evidence) == 1
+    row = evidence[0]
+    assert isinstance(row, dict) and row["id"] == "ev-1" and row["content"] == passage
     decisions = ResearchRepository().list_decisions(sid)
     assert len(decisions) == 1 and decisions[0].decision_type == "final_claim_assessment"
-    # An uncited inference or an id the ledger never admitted fails the proof gate; JEV never runs.
     id_cases: list[list[JSONValue]] = [[], ["ev-404"]]
     for ids in id_cases:
-        claim: dict[str, JSONValue] = {"text": "X may occur.", "claim_type": "inference", "evidence_ids": ids}
         unproven = kw._direct_op(
-            {"id": "u", "op": "assess_final_claim", "sessionId": sid, "claim": claim},
-            JevClient(transport=_transport, data_root=tmp_path),
+            {
+                "id": "u",
+                "op": "assess_final_claim",
+                "sessionId": sid,
+                "claim": {"text": "X may occur.", "claim_type": "inference", "evidence_ids": ids},
+            },
+            client,
         )
-        assert unproven is not None and str(unproven["error"]).startswith("proof:")
+        assert str(unproven["error"]).startswith("proof:")
     assert len(seen) == 1
-
     missing = kw._assess_final_claim({"id": "c3", "claim": {"text": "X."}})
     assert missing == {
         "id": "c3",
@@ -3017,7 +2930,147 @@ def test_final_claim_gate_assesses_available_evidence(
         "support": None,
         "support_answer": None,
         "evidence_state": "insufficient",
+        "support_strength": None,
+        "support_result": {"outcome": "unknown", "probability": None, "strength": None},
     }
+
+
+@pytest.mark.parametrize(
+    ("support", "answer", "state"), [(0.9, "yes", "sufficient_support"), (0.1, "no", "insufficient")]
+)
+def test_qualitative_paraphrase_requires_jev_after_strict_ledger_proof(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, support: float, answer: str, state: str
+) -> None:
+    import tests.research_source_seam as seam
+    from app.research import service
+    from app.research.agents import parse_grounded_claims
+
+    passage = "NVIDIA supplies accelerated computing systems to customers."
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": passage})
+    store = ResearchRepository()
+    row = store.list_evidence(sid)[0]
+    assert row["proof"] == {} and row["value"] is None
+    provenance = row["provenance"]
+    assert isinstance(provenance, dict) and provenance["kind"] == "sec_source"
+    claim: dict[str, JSONValue] = {
+        "text": "NVIDIA provides customers with accelerated computing systems.",
+        "claim_type": "observed_fact",
+        "evidence_ids": ["ev-1"],
+    }
+    claims = parse_grounded_claims(json.dumps([claim]), frozen=["ev-1"])
+    seen: list[object] = []
+    with pytest.raises(ValueError, match="ERR_STATEMENT_UNVERIFIED"):
+        service.require_verified_claims(ResearchRepository(), sid, claims, "standalone")
+    assert seen == []
+
+    async def _transport(source: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        seen.append(source)
+        assert isinstance(source, dict)
+        evidence = source["evidence"]
+        assert isinstance(evidence, list) and len(evidence) == 1
+        assert isinstance(evidence[0], dict) and evidence[0]["content"] == passage
+        return {
+            "answers": {
+                "support": {"type": "noul", "noul": support},
+                "evidence_state": {
+                    "type": "choice",
+                    "choice": state,
+                    "confidence": 1.0,
+                    "probabilities": {
+                        "sufficient_support": 0.6,
+                        "sufficient_contradiction": 0.1,
+                        "conflicted": 0.2,
+                        "insufficient": 0.1,
+                    }
+                    if state == "sufficient_support"
+                    else {
+                        "sufficient_support": 0.1,
+                        "sufficient_contradiction": 0.1,
+                        "conflicted": 0.1,
+                        "insufficient": 0.7,
+                    },
+                },
+            }
+        }
+
+    out = kw._assess_final_claim(
+        {"id": "paraphrase", "sessionId": sid, "claim": claim},
+        jev=JevClient(transport=_transport, data_root=tmp_path),
+    )
+    assert out["support_answer"] == answer and out["evidence_state"] == state
+    assert len(seen) == 1
+    with pytest.raises(ValueError, match="ERR_STATEMENT_UNVERIFIED"):
+        service.require_verified_claims(ResearchRepository(), sid, claims, "standalone")
+
+
+@pytest.mark.parametrize(
+    ("text", "claim_type", "defect"),
+    [
+        ('NVIDIA said "Demand is guaranteed to double".', "observed_fact", "ERR_QUOTATION_UNVERIFIED"),
+        ("NVIDIA revenue was 999 USD.", "observed_fact", "ERR_DATAPOINT_UNVERIFIED"),
+        ("NVIDIA systems eliminate customer risk.", "inference", "ERR_CLAIM_UNQUALIFIED"),
+        ("Accession 0000320193-25-999999 describes NVIDIA systems.", "observed_fact", "ERR_SOURCE_IDENTITY"),
+    ],
+)
+def test_final_claim_rejects_fabricated_or_unqualified_wording_before_jev(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str, claim_type: str, defect: str
+) -> None:
+    import tests.research_source_seam as seam
+
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "NVIDIA supplies accelerated computing systems."})
+
+    async def _unexpected(state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        pytest.fail("Deterministic proof failures must not reach JEV")
+
+    out = kw._assess_final_claim(
+        {
+            "id": "fabricated",
+            "sessionId": sid,
+            "claim": {"text": text, "claim_type": claim_type, "evidence_ids": ["ev-1"]},
+            "evidence": [{"id": "ev-1", "content": text}],
+        },
+        jev=JevClient(transport=_unexpected, data_root=tmp_path),
+    )
+    assert defect in str(out["error"])
+    assert out["support_answer"] is None and out["evidence_state"] == "insufficient"
+    assert out["support_strength"] is None
+    assert out["support_result"] == {"outcome": "unknown", "probability": None, "strength": None}
+    assert ResearchRepository().list_decisions(sid) == []
+
+
+def test_canonical_numeric_claim_skips_jev_arithmetic_approval(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from app.research.evidence import datapoint_descriptor, evidence_from_dict
+
+    sid = _final_datapoint_session(monkeypatch, tmp_path)
+    record = next(row for row in ResearchRepository().list_evidence(sid) if row["evidence_id"] == "ev-point")
+    point = datapoint_descriptor(evidence_from_dict(record))
+    assert point is not None
+
+    async def _unexpected(state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        pytest.fail("Canonical numeric proof must not require JEV arithmetic approval")
+
+    out = kw._assess_final_claim(
+        {
+            "id": "numeric",
+            "sessionId": sid,
+            "claim": {
+                "text": "NVDA FY2025 revenue was 123 USD.",
+                "claim_type": "observed_fact",
+                "evidence_ids": ["ev-point"],
+                "datapoint_ids": [point["id"]],
+            },
+        },
+        jev=JevClient(transport=_unexpected, data_root=tmp_path),
+    )
+    assert out == {
+        "id": "numeric",
+        "support": 1.0,
+        "support_answer": "yes",
+        "support_strength": "confident",
+        "support_result": {"outcome": "yes", "probability": 1.0, "strength": "confident"},
+        "evidence_state": "sufficient_support",
+    }
+    assert ResearchRepository().list_decisions(sid) == []
 
 
 def test_final_evidence_carries_validated_descriptors() -> None:
@@ -3053,110 +3106,29 @@ def test_final_evidence_carries_validated_descriptors() -> None:
     assert kw._final_claims([claim]) == [claim]
 
 
-def test_jev_kept_keeps_everything_but_an_explicit_reject() -> None:
-    """A reject drops the proposal; a missing or malformed disposition keeps it."""
-    proposals = _props()
-    assert kw._jev_kept(proposals, {"s-q1": {"choice": "reject"}, "s-q2": {"choice": "gather_evidence"}}) == [
-        proposals[1]
-    ]
-    assert kw._jev_kept(proposals, {}) == proposals
-    assert kw._jev_kept(proposals, {"s-q1": "gather_evidence"}) == proposals
-
-
 @pytest.mark.parametrize(
-    ("hints", "queries", "identifiers", "reasoner_calls"),
-    [
-        ({}, ["ORACLE ORCL What is happening with Oracle now"], ["ORCL"], 1),
-        ({"corrected_query": "fixed"}, ["ORACLE ORCL What is happening with Oracle now"], ["ORCL"], 1),
-        ({"tickers": "NVDA"}, ["ORACLE ORCL What is happening with Oracle now"], ["ORCL"], 1),
-        ({"tickers": ["NVDA"]}, ["ORACLE ORCL What is happening with Oracle now"], ["ORCL", "NVDA"], 1),
-        (
-            {"tickers": ["orcl", "ORCL", 7, " ", "nvda", "nvda"], "corrected_query": " fixed "},
-            ["ORACLE ORCL What is happening with Oracle now", "fixed"],
-            ["ORCL", "NVDA"],
-            2,
-        ),
-        (
-            {"tickers": ["NVDA"], "corrected_query": "What is happening with Oracle now"},
-            ["ORACLE ORCL What is happening with Oracle now", "What is happening with Oracle now"],
-            ["ORCL", "NVDA"],
-            2,
-        ),
-        (
-            {"tickers": ["NVDA"], "corrected_query": " "},
-            ["ORACLE ORCL What is happening with Oracle now"],
-            ["ORCL", "NVDA"],
-            2,
-        ),
-    ],
+    "objective",
+    ["What is happening with Oracle now", "news for growth this week", "NVDA and CRWV news?"],
 )
-def test_graph_intake_fetches_only_new_scope(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    hints: dict[str, object],
-    queries: list[str],
-    identifiers: list[str],
-    reasoner_calls: int,
+def test_graph_entry_needs_no_intake_or_decomposition_even_at_spent_setup_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, objective: str
 ) -> None:
-    import app.tools as _tools
-
-    def _resolve(name: str) -> str | None:
-        return {"Oracle": "ORCL", "oracle": "ORCL"}.get(name)
-
-    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
     from app.research import service
 
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     monkeypatch.setattr(sched, "build_registry", list)
 
-    def _no_cik(symbol: str) -> None:
-        return None
+    def _unexpected(*args: object, **kwargs: object) -> object:
+        pytest.fail("The graph entry must not access sources or the reasoner")
 
-    monkeypatch.setattr("app.sec.client.resolve_cik", _no_cik)
-    calls: list[tuple[str, dict[str, object]]] = []
-    prompts: list[str] = []
-
-    async def _attempt(tool: str, args: dict[str, object], *rest: object) -> dict[str, object]:
-        calls.append((tool, args))
-        return {"tool": tool, "arguments": args, "error": "source unavailable"}
-
-    def _decompose(self: object, prompt: str, objective_id: str) -> dict[str, object]:
-        prompts.append(prompt)
-        return {
-            "proposals": [
-                {
-                    "id": f"{objective_id}-q1",
-                    "objectiveId": objective_id,
-                    "question": "Filing risk?",
-                    "dependsOn": [],
-                    "whyItMatters": "w",
-                }
-            ],
-            **(hints if len(prompts) == 1 else {"tickers": ["MSFT"], "corrected_query": "third query"}),
-        }
-
-    monkeypatch.setattr(kw, "_intake_attempt", _attempt)
-    monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", _decompose)
-    objective = "What is happening with Oracle now"
-    sid = kw.run_graph_prompt(objective, jev=_JevDown())
-    assert [args["query"] for tool, args in calls if tool == "search_web"] == queries
-    # Four limit=1 family listings (10-Q, 10-K, 8-K, insider) per fetched ticker.
-    assert [args["identifier"] for tool, args in calls if tool == "list_sec_filings"] == [
-        ident for ident in identifiers for _ in range(4)
-    ]
-    assert len(prompts) == reasoner_calls
-    assert [node.question for node in ResearchRepository().list_nodes(sid)] == ["Filing risk?"]
-    assert ResearchRepository().get_session(sid).objective == objective
-    assert [decision.decision_type for decision in ResearchRepository().list_decisions(sid)] == ["intake_digest"] * len(
-        identifiers
-    )
-
-    calls.clear()
-    prompts.clear()
-    sid = kw.run_graph_prompt("news for growth this week", jev=_JevDown(), setup_deadline=kw.time.perf_counter())
-    assert [tool for tool, _args in calls] == ["search_web"]
-    assert len(prompts) == 1
-    assert ResearchRepository().list_nodes(sid)
+    monkeypatch.setattr(kw, "_intake_attempt", _unexpected)
+    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _unexpected)
+    sid = kw.run_graph_prompt(objective, jev=JevClient())
+    store = ResearchRepository()
+    assert [node.question for node in store.list_nodes(sid)] == [objective]
+    assert store.get_session(sid).objective == objective
+    assert store.list_decisions(sid) == []
+    assert store.list_evidence(sid) == []
     assert service.ready_nodes(sid)
 
 
@@ -3168,40 +3140,14 @@ def test_graph_intake_fetches_only_new_scope(
         ("Should I buy MissingCo?", ["NVDA"]),
     ],
 )
-def test_graph_intake_uses_current_context_only_without_resolved_stock(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, objective: str, expected: list[str]
+def test_intake_ticker_helper_uses_current_context_only_without_resolved_stock(
+    monkeypatch: pytest.MonkeyPatch, objective: str, expected: list[str]
 ) -> None:
     def _resolve(name: str) -> str | None:
         return {"Apple": "AAPL", "NVDA": "NVDA"}.get(name)
 
-    def _no_cik(symbol: str) -> None:
-        return None
-
     monkeypatch.setattr("app.tools._resolve_company_to_ticker", _resolve)
-    monkeypatch.setattr("app.sec.client.resolve_cik", _no_cik)
-    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
-    monkeypatch.setattr(sched, "build_registry", list)
-    identifiers: list[object] = []
-
-    async def _attempt(tool: str, args: dict[str, object], *rest: object) -> dict[str, object]:
-        if tool == "list_sec_filings":
-            identifiers.append(args["identifier"])
-        return {"tool": tool, "arguments": args, "error": "source unavailable"}
-
-    def _decompose(
-        prompt: str, as_of: object, sid: str, digest: str, *rest: object
-    ) -> tuple[list[dict[str, object]], dict[str, object]]:
-        return (
-            [{"id": "q1", "objectiveId": sid, "question": prompt, "dependsOn": [], "whyItMatters": "w"}],
-            {},
-        )
-
-    monkeypatch.setattr(kw, "_intake_attempt", _attempt)
-    monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _decompose)
-    sid = kw.run_graph_prompt(objective, ticker="NVDA", jev=_JevDown(), setup_deadline=kw.time.perf_counter())
-    assert identifiers == [ident for ident in expected for _ in range(4)]  # one listing per filing family
-    assert ResearchRepository().get_session(sid).objective == objective
-    assert [node.question for node in ResearchRepository().list_nodes(sid)] == [objective]
+    assert kw._intake_start_tickers(objective, "NVDA") == expected
 
 
 def test_decompose_empty_proposals_twice_is_type_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3415,10 +3361,7 @@ def test_run_persists_scope_and_uses_injected_authority(
     prompts: list[str] = []
 
     async def _authority(state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
-        assert isinstance(state, dict)
-        assert state["objective"] == {"prompt": "Exact user objective?"}
-        picks = {qid: "reject" if qid.endswith("-q3") else "analyze" for qid in questions}
-        return await _choice_stub(picks, {})(state, questions)
+        pytest.fail("Graph setup must not ask JEV to admit the single root")
 
     jev = JevClient(transport=_authority, data_root=tmp_path)
 
@@ -3466,22 +3409,18 @@ def test_run_persists_scope_and_uses_injected_authority(
     session = ResearchRepository().get_session(sid)
     assert session.ticker == "NVDA"
     assert session.objective == "Exact user objective?"
-    assert seen_dates == [as_of if isinstance(as_of, str) else None]
+    assert seen_dates == []
     if isinstance(as_of, str):
         assert session.as_of is not None and session.as_of.date().isoformat() == as_of
     else:
         assert session.temporal_scope["mode"] == "latest-available"
-    assert len(prompts) == 1
-    assert "Exact user objective?" in prompts[0] and "2026-10-17" in prompts[0]
-    assert [node.question for node in ResearchRepository().list_nodes(sid)] == ["Other angle?", "Exact user objective?"]
+    assert prompts == []
+    assert [node.question for node in ResearchRepository().list_nodes(sid)] == ["Exact user objective?"]
     assert out["unresolved"] == [] and out["escalated"] is False
-    assert [decision.decision_type for decision in ResearchRepository().list_decisions(sid)] == [
-        "intake_digest",
-        "proposal_disposition",
-    ]
+    assert ResearchRepository().list_decisions(sid) == []
 
 
-def test_graph_intake_persists_citable_sources_dedupes_and_settles_jobs(
+def test_standalone_intake_persists_citable_sources_dedupes_and_settles_jobs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from app.research import service
@@ -3496,7 +3435,6 @@ def test_graph_intake_persists_citable_sources_dedupes_and_settles_jobs(
     monkeypatch.setattr(sched, "_objective_subject_ticker", _no_subject)
     monkeypatch.setattr("app.sec.client.resolve_cik", _no_subject)
     attempts: dict[str, str] = {}
-    prompts: list[str] = []
     payloads: dict[str, dict[str, object]] = {
         "list_sec_filings": {
             "filings": [{"form": "10-Q", "accession_no": "0001045810-26-000001", "title": "Revenue filing"}]
@@ -3541,33 +3479,37 @@ def test_graph_intake_persists_citable_sources_dedupes_and_settles_jobs(
         outcome = outcome_from_result(tool, result)
         return sched._success_attempt(tool, args, outcome, result, domain, "fixed intake", job_id)
 
-    def _decompose(self: object, prompt: str, objective_id: str) -> dict[str, object]:
-        prompts.append(prompt)
-        return {
-            "proposals": [
-                {
-                    "id": f"{objective_id}-q1",
-                    "objectiveId": objective_id,
-                    "question": "What does the filing establish?",
-                    "dependsOn": [],
-                    "whyItMatters": "Check the admitted sources.",
-                }
-            ],
-            "tickers": ["MSFT"],
-        }
-
     monkeypatch.setattr(kw, "_intake_attempt", _attempt)
-    monkeypatch.setattr("app.reasoner_client.ReasonerClient.decompose", _decompose)
-    sid = kw.run_graph_prompt("What happened?", jev=_JevDown(), watchlist=["NVDA"])
+    sid = service.create_research(
+        "What happened?", "What happened?", policy={"research_sources": {"mode": "all", "sources": []}}
+    )
+    session = ResearchRepository().get_session(sid).to_dict()
+    kernel = sched._Kernel()
+    scopes: list[tuple[list[str], list[str] | None]] = [([], ["NVDA"]), (["MSFT"], None)]
+    for tickers, watchlist in scopes:
+        rows, raw, stats = asyncio.run(
+            kw._intake_round(
+                "What happened?" if watchlist else None,
+                tickers,
+                sid,
+                session,
+                [],
+                None,
+                kernel,
+                None,
+                watchlist=watchlist,
+            )
+        )
+        kw._log_intake_round(sid, "What happened?", raw, kw._build_digest(rows), {}, stats, kernel)
     repo = ResearchRepository()
     evidence = repo.list_evidence(sid)
     assert len(evidence) == 7  # round 2 admits all four MSFT family listings, three of them empty
     ids = {row["evidence_id"] for row in evidence}
-    # Empty family listings share one record identity, so the digest keeps one; every listed filing reaches the planner.
+    digest = kw._build_digest(evidence)
     empty = {row["evidence_id"] for row in evidence if str(row.get("content", "")).startswith("filings: none")}
-    assert len(empty) == 3 and sum(str(eid) in prompts[-1] for eid in empty) == 1
-    assert len(prompts) == 2 and all(str(eid) in prompts[-1] for eid in ids - empty)
-    assert [node.question for node in repo.list_nodes(sid)] == ["What does the filing establish?"]
+    assert len(empty) == 3 and sum(str(eid) in digest for eid in empty) == 1
+    assert all(str(eid) in digest for eid in ids - empty)
+    assert repo.list_nodes(sid) == []
     decisions = repo.list_decisions(sid)
     assert [decision.decision_type for decision in decisions] == ["intake_digest", "intake_digest"]
     selected = decisions[0].selected
@@ -3891,6 +3833,8 @@ def test_assess_final_claim_nontext_fails_closed() -> None:
         "support": None,
         "support_answer": None,
         "evidence_state": "insufficient",
+        "support_strength": None,
+        "support_result": {"outcome": "unknown", "probability": None, "strength": None},
     }
 
 
@@ -3944,44 +3888,6 @@ def test_route_caller_ticker_reaches_programmatic_hint(monkeypatch: pytest.Monke
     jev = _JevRoute("reasoning_required")
     out = kw._route({"id": "r1", "op": "route", "prompt": "explain diversification", "ticker": "NVDA"}, jev=jev)
     assert out == {"id": "r1", "route": "research_required", "personas": None}
-
-
-def test_jev_admit_all_reject_falls_back_to_exact_objective() -> None:
-    """Total JEV rejection keeps the exact-objective proposal, never a synthesized question."""
-
-    class _RejectAll(JevClient):
-        @override
-        async def decide(self, *a: object, **k: object) -> dict[str, dict[str, JSONValue]]:
-            return {
-                "s-q1": {"choice": "reject", "probabilities": {"reject": 1.0}, "confidence": 0.9},
-                "s-q2": {"choice": "reject", "probabilities": {"reject": 1.0}, "confidence": 0.9},
-            }
-
-    out = kw._jev_admit("s", "Exact user objective?", _props(), jev=_RejectAll())
-    assert out == [_props()[1]]
-
-
-def test_jev_admit_all_reject_synthesizes_session_route_question() -> None:
-    """No exact-objective proposal under total rejection synthesizes the session route question."""
-
-    class _RejectAll(JevClient):
-        @override
-        async def decide(self, *a: object, **k: object) -> dict[str, dict[str, JSONValue]]:
-            return {
-                "s-q1": {"choice": "reject", "probabilities": {"reject": 1.0}, "confidence": 0.9},
-                "s-q2": {"choice": "reject", "probabilities": {"reject": 1.0}, "confidence": 0.9},
-            }
-
-    out = kw._jev_admit("s", "Missing objective?", _props(), jev=_RejectAll())
-    assert out == [
-        {
-            "id": "s-q1",
-            "objectiveId": "s",
-            "question": "Missing objective?",
-            "dependsOn": [],
-            "whyItMatters": "Route question.",
-        }
-    ]
 
 
 def test_decompose_config_wiring_fails_loud(monkeypatch: pytest.MonkeyPatch) -> None:

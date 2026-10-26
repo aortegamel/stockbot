@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { redactArgs, type AgentEvent, type AskContext, type FailureCategory } from "../../../needle-harness/lib/agent/types";
 
 const LIMIT = "The research reached its work limit before it finished.";
-const MODEL = "The model could not produce a checked answer.";
+const MODEL = "The model failed while preparing the answer.";
 const SOURCE = "A data source failed while answering.";
 // Prod failure text: one plain sentence per category. No raw message, stack, or tool name.
 const FAILURE_TEXT: Record<FailureCategory, string> = {
@@ -12,12 +12,16 @@ const FAILURE_TEXT: Record<FailureCategory, string> = {
   tool_output_limit: LIMIT, duplicate_research_action: LIMIT, research_loop_detected: LIMIT,
   policy_denied: "This request is not allowed.", policy_rejection: "This request is not allowed.",
   tool_error: SOURCE, storage_error: SOURCE, freeze_mismatch: SOURCE,
-  model_error: MODEL, model_output_failure: MODEL, provider_error: MODEL, synthesis_failed: MODEL, committee_deadlock: MODEL,
+  model_error: MODEL,
+  model_output_failure: "The model returned an unusable answer.",
+  provider_error: "The model provider failed to complete the request.",
+  synthesis_failed: "The research could not combine the findings into an answer.",
+  committee_deadlock: "The research models could not agree on an answer.",
   no_evidence: "No evidence was found for this question.", no_records: "A data source had no records for this request.",
 };
 
 export function failureText(category: FailureCategory): string {
-  return FAILURE_TEXT[category] ?? MODEL;
+  return FAILURE_TEXT[category] ?? "The research failed before it finished.";
 }
 
 // Prod step text: one plain line per needle catalog tool (.needle-catalog.json). Debug shows the raw name.
@@ -77,7 +81,6 @@ function seenAt(event: AgentEvent): number {
 }
 
 // One live line while the run works, one summary line after it ends; the steps fold out below.
-// The kernel emits one final answer, so no preliminary answer indicator exists here.
 export function WorkRow({ events, debug }: { events: AgentEvent[]; debug: boolean }) {
   const [, tick] = useState(0);
   const terminal = events.find((e) => e.type === "done" || e.type === "error" || e.type === "failed");
@@ -181,6 +184,7 @@ export function AgentEventView({ event, debug = false, onRetry }: { event: Agent
         </div>
       );
     case "answer_delta":
+    case "answer_partial":
       return <span>{event.text}</span>;
     case "done": {
       const m = event.metrics;
@@ -188,6 +192,8 @@ export function AgentEventView({ event, debug = false, onRetry }: { event: Agent
       const timings = debug ? Object.entries(m.timings ?? {}).flatMap(([k, v]) => (v === undefined ? [] : [`${k} ${Math.round(v)}ms`])) : [];
       return (
         <div className="pt-2 text-xs text-zinc-500">
+          <div role="status">{event.status === "completed_with_limitations" ? "Completed with limitations" : event.status === "failed" ? "Failed" : event.status === "cancelled" ? "Cancelled" : "Completed"}</div>
+          {event.limitations && event.limitations.length > 0 && <ul className="list-disc pl-4">{event.limitations.map((limitation, i) => <li key={i}>{limitation}</li>)}</ul>}
           <div>── metrics ──</div>
           <div>
             Needle calls: {m.needle.calls} · Tool calls: {m.tools.calls} · Stockbot calls: {m.muse.calls}
@@ -204,10 +210,10 @@ export function AgentEventView({ event, debug = false, onRetry }: { event: Agent
       );
     }
     case "error":
-      // Transport-level text (request failed, stalled, ended early): bounded client prose, not a stack.
-      return <FailureView text={event.message} onRetry={onRetry} />;
+      // Raw diagnostics remain in debug output.
+      return <FailureView text={debug ? [event.stage, event.code, event.message].filter(Boolean).join(": ") : "The request failed. Please retry."} onRetry={onRetry} />;
     case "failed":
-      return debug ? <div className="text-red-400">✗ {event.category}: {event.message}</div> : <FailureView text={failureText(event.category)} onRetry={onRetry} />;
+      return debug ? <div className="text-red-400">✗ {[event.category, event.stage, event.code, event.message].filter(Boolean).join(": ")}</div> : <FailureView text={failureText(event.category)} onRetry={onRetry} />;
     default:
       return <WorkEventView event={event} />;
   }

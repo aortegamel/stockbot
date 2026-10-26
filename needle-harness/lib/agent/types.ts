@@ -197,17 +197,21 @@ export type AgentEvent =
   | { type: "progress"; stage: string; detail?: Record<string, unknown> }
   | { type: "reasoning_start"; model: string }
   | { type: "answer_delta"; text: string }
-  | { type: "done"; metrics: Metrics }
+  // A checked partial answer: verified claims only, superseded by a later answer_delta.
+  | { type: "answer_partial"; text: string; claims: FinalClaim[] }
+  // A cancelled request ends without an answer.
+  | { type: "cancelled"; message: string }
+  | { type: "done"; metrics: Metrics; status?: "completed" | "completed_with_limitations" | "failed" | "cancelled"; limitations?: string[] }
   // The gated research answer's cited claim inventory; each text is a verbatim answer substring.
   | { type: "claims"; claims: FinalClaim[] }
-  | { type: "error"; message: string }
+  | { type: "error"; message: string; code?: string; stage?: string }
   // A stockbot-only research answer offers the trio over the same session evidence.
   | { type: "offer_trio"; sessionId: string }
   | { type: "tool_failed"; tool: string; category: FailureCategory; preview: string }
-  | { type: "failed"; category: FailureCategory; message: string }
+  | { type: "failed"; category: FailureCategory; message: string; code?: string; stage?: string }
   // A readable progress line for the user, never answer text. Build it with statusEvent.
   | { type: "status"; text: string };
-
+export type Timings = Partial<Record<"routeMs" | "intakeMs" | "reasonerMs" | "admitMs" | "nodesMs" | "personasMs" | "narrativeMs" | "binderMs" | "gatesMs" | "firstTextMs", number>>;
 export type Metrics = {
   totalMs: number;
   needle: { calls: number; totalMs: number; escalations: number };
@@ -225,8 +229,8 @@ export type Metrics = {
   // Phase milliseconds; a phase with no measurement stays absent, never 0.
   timings?: Timings;
 };
-
-export type Timings = Partial<Record<"routeMs" | "intakeMs" | "reasonerMs" | "admitMs" | "nodesMs" | "personasMs" | "narrativeMs" | "binderMs" | "gatesMs" | "firstTextMs", number>>;
+// A terminal report carries its outcome: verified only, verified with unknowns, failure, or cancellation.
+export type TerminalOutcome = "completed" | "completed_with_limitations" | "failed" | "cancelled";
 
 const SENSITIVE_KEY_NORMS: Record<string, true> = {
   accesstoken: true,

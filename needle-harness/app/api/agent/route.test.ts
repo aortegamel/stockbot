@@ -56,7 +56,7 @@ const runCalls: unknown[][] = [];
 const personaCalls: unknown[][] = [];
 // runKernelAgent offers the trio for rs:test when true.
 let emitOffer = false;
-type ReasonCall = { prompt: string; ticker?: string; context?: unknown; evidence: Evidence[]; onDelta?: (t: string) => void };
+type ReasonCall = { prompt: string; ticker?: string; context?: unknown; evidence: Evidence[]; signal?: AbortSignal; deadlineAt?: number };
 const reasonCalls: ReasonCall[] = [];
 type KernelCall = Record<string, unknown>;
 const kernelCalls: KernelCall[] = [];
@@ -160,8 +160,6 @@ mock.module("@/lib/muse/client", () => ({
     reasonCalls.push(opts);
     executionOrder.push("reason");
     if (reasonDown) throw new Error("muse down");
-    // A wired onDelta would see the raw stream, inventory fence included.
-    opts.onDelta?.(`${reasonText}\n\`\`\`json ${JSON.stringify({ claims: reasonClaims })}\`\`\``);
     return { prose: reasonText, usage: reasonUsage, claims: reasonClaims, timings: reasonTimings };
   },
 }));
@@ -300,6 +298,7 @@ describe("agent entry route", () => {
           { type: "answer_delta", text: "Which stock, ETF, sector, or holding do you want advice on? Give a ticker (for example NVDA) or a company name, and I will research it." },
           {
             type: "done",
+            status: "completed",
             metrics: {
               totalMs: 25,
               needle: { calls: 0, totalMs: 0, escalations: 0 },
@@ -329,13 +328,13 @@ describe("agent entry route", () => {
     emitProgress = true;
     emitEvidence = true;
     const metrics = { totalMs: 1, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, providerCalls: 3, totalMs: 1 }, evidence: { count: 1, characters: 1 }, failures: {} };
-    kernelDone = { ...metrics, timings: { intakeMs: 120, nodesMs: 300, narrativeMs: 40, binderMs: 12 } };
+    kernelDone = { ...metrics, timings: { intakeMs: 120, nodesMs: 300, narrativeMs: 40 } };
     const now = spyOn(performance, "now").mockReturnValueOnce(1000).mockReturnValueOnce(1000).mockReturnValueOnce(1015).mockReturnValue(1250);
     try {
       const events = await eventsFor("What drove NVDA revenue?");
       expect(events.map((e) => e.type)).toEqual(["progress", "evidence", "answer_delta", "done"]);
-      // A phase the worker never reported (reasonerMs, admitMs, ...) stays absent.
-      expect(events.at(-1)?.metrics).toEqual({ ...metrics, timings: { intakeMs: 120, nodesMs: 300, narrativeMs: 40, binderMs: 12, routeMs: 15, firstTextMs: 250 } });
+      // A phase the worker never reported (reasonerMs, admitMs, ...) stays absent, and no binder phase is produced.
+      expect(events.at(-1)?.metrics).toEqual({ ...metrics, timings: { intakeMs: 120, nodesMs: 300, narrativeMs: 40, routeMs: 15, firstTextMs: 250 } });
     } finally {
       now.mockRestore();
     }
@@ -368,7 +367,7 @@ describe("agent entry route", () => {
     expect(reasonCalls[0].evidence).toEqual([]);
   });
 
-  test("direct done preserves provider calls without narrative or binder timings", async () => {
+  test("direct done preserves provider calls without narrative timings", async () => {
     reset();
     reasonUsage = { providerCalls: 2, inputTokens: 13, outputTokens: 5 };
     const events = await eventsFor("hello");
@@ -381,6 +380,9 @@ describe("agent entry route", () => {
       failures: {},
       timings: { routeMs: expect.any(Number), firstTextMs: expect.any(Number) },
     });
+    expect(events.at(-1)).toMatchObject({ status: "completed" });
+    const call = reasonCalls[0];
+    if (call?.deadlineAt === undefined) throw new Error("expected a shared request deadline on the direct call");
   });
 
   test("no_session answers direct with the same event shape", async () => {
@@ -420,7 +422,7 @@ describe("agent entry route", () => {
     reset();
     winner = "get_current_time";
     reasonUsage = { providerCalls: 3, inputTokens: 20, outputTokens: 8 };
-    reasonTimings = { narrativeMs: 40, binderMs: 12 };
+    reasonTimings = { narrativeMs: 40 };
     const events = await eventsFor("what time is it?");
     const types = events.map((e) => e.type);
     expect(types).toEqual(["agent_start", "status", "needle_decision", "tool_start", "status", "tool_result", "status", "evidence", "reasoning_start", "answer_delta", "claims", "done"]);
@@ -456,11 +458,15 @@ describe("agent entry route", () => {
     expect(events.find((e) => e.type === "claims")?.claims).toEqual([fact]);
     expect(gateBodies).toHaveLength(1);
     expect(gateBodies[0]).toMatchObject({
-      op: "assess_final_response",
+      op: "assess_final_claim",
       sessionId: "rs:entry",
-      claims: [{ text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:bridge"], datapoint_ids: ["dp:short-interest"] }],
+      claim: { text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:bridge"], datapoint_ids: ["dp:short-interest"] },
     });
     expect(runCalls).toEqual([]);
+    // The single-shot reasoner shares the request deadline and signal.
+    const call = reasonCalls[0];
+    if (call?.deadlineAt === undefined) throw new Error("expected a shared request deadline on the single-shot call");
+    expect(events.at(-1)).toMatchObject({ status: "completed" });
   });
 
   test("a single-tool narrative publishes only gate-kept claims, with no stream callback and no raw fence", async () => {
@@ -471,10 +477,14 @@ describe("agent entry route", () => {
     reasonText = `${kept.text} ${unsupported.text}`;
     reasonClaims = [kept, unsupported];
     // The inventory passes the local check; only the worker gate rejects the unsupported claim.
-    gateScript = (body) => ({ support_answer: body.op === "assess_final_claim" && (body.claim as Record<string, unknown>).text === kept.text ? "yes" : "no" });
+    gateScript = (body) => {
+      const claim = body.claim;
+      const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
+      return { support_answer: text === kept.text ? "yes" : "no" };
+    };
     const events = await eventsFor("short interest?");
-    expect(reasonCalls.map((call) => call.onDelta)).toEqual([undefined]);
-    expect(gateBodies.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_claim", "assess_final_claim"]);
+    expect(reasonCalls.map((call) => "onDelta" in call)).toEqual([false]);
+    expect(gateBodies.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim"]);
     expect(events.filter((e) => e.type === "answer_delta")).toEqual([{ type: "answer_delta", text: kept.text }]);
     expect(events.find((e) => e.type === "claims")?.claims).toEqual([kept]);
     expect(JSON.stringify(events)).not.toContain("```");
@@ -490,9 +500,9 @@ describe("agent entry route", () => {
     reasonClaims = [];
     entryReplies = [{ sessionId: "rs:entry", evidence: [{ ...bridgeEvidence }], content: reasonText }];
     const events = await eventsFor("short interest?");
-    // The binder bound nothing, so the gates keep no prose: explicit refusal, never the number.
+    // No claims means no gate calls and no prose: explicit refusal, never the number.
     expectVerificationRefusal(events);
-    expect(gateBodies.map((g) => g.op)).toEqual(["assess_final_response"]);
+    expect(gateBodies.map((g) => g.op)).toEqual([]);
   });
 
   test("a failed document read refuses before reasoning; an inspected document answers from its row", async () => {
@@ -525,7 +535,7 @@ describe("agent entry route", () => {
     reasonClaims = [docFact];
     const read = await eventsFor("what does NVDA's 10-Q say?");
     expect(reasonCalls[0]?.evidence.map((row) => row.id)).toEqual(["ev:list", "ev:doc"]);
-    expect(gateBodies[0]).toMatchObject({ op: "assess_final_response", sessionId: "rs:entry" });
+    expect(gateBodies[0]).toMatchObject({ op: "assess_final_claim", sessionId: "rs:entry" });
     expect(read.filter((e) => e.type === "answer_delta")).toEqual([{ type: "answer_delta", text: docFact.text }]);
     expect(read.find((e) => e.type === "claims")?.claims).toEqual([docFact]);
   });
@@ -534,7 +544,7 @@ describe("agent entry route", () => {
     reset();
     winner = "query_finra";
     reasonUsage = { providerCalls: 3 };
-    reasonTimings = { narrativeMs: 40, binderMs: 12 };
+    reasonTimings = { narrativeMs: 40 };
     reasonText = "NVDA short interest for 2026-10-15 was 12.5% [ev:bridge].";
     reasonClaims = [{ text: reasonText, claimType: "observed_fact", evidenceIds: ["ev:bridge"], datapointIds: ["dp:short-interest"] }];
     const datapoint = { id: "dp:short-interest", metric: "shortInterest", value: "12.5", entity: "NVDA", period: "2026-10-15", unit: "%", statement: reasonText };
@@ -542,8 +552,8 @@ describe("agent entry route", () => {
     gateReply = { error: "proof: datapoint does not match the archived row" };
     const events = await eventsFor("short interest?");
     expectVerificationRefusal(events);
-    expect(gateBodies.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_claim"]);
-    expect(gateBodies.map((g) => g.sessionId)).toEqual(["rs:entry", "rs:entry"]);
+    expect(gateBodies.map((g) => g.op)).toEqual(["assess_final_claim"]);
+    expect(gateBodies.map((g) => g.sessionId)).toEqual(["rs:entry"]);
     expect(ended).toEqual([]);
     expect(events.at(-1)?.metrics).toMatchObject({
       muse: { calls: 1, ...reasonUsage },
@@ -795,7 +805,7 @@ describe("agent entry route", () => {
     const working = events.find((e) => e.type === "reasoning_start");
     expect(working?.model).toBe("stockbot");
     const terminal = events.find((e) => e.type === "error");
-    expect(String(terminal?.message)).toMatch("Stockbot couldn't complete");
+    expect(String(terminal?.message)).toMatch("Stockbot could not verify");
   });
 
   test("prod mode hides internal tool rows, debug shows them", async () => {
@@ -1040,7 +1050,7 @@ describe("agent entry route", () => {
     reset();
     winner = "get_sec_document";
     await eventsFor("Summarize the latest filings for my watchlist", "aapl", ["NVDA", "QQQ"]);
-    expect(kernelCalls.map((c) => c.op)).toEqual(["route", "arguments", "entry_tool", "assess_entry", "assess_final_response"]);
+    expect(kernelCalls.map((c) => c.op)).toEqual(["route", "arguments", "entry_tool", "assess_entry", "assess_final_claim"]);
     expect(runCalls.length).toBe(0);
   });
 
@@ -1269,7 +1279,7 @@ describe("agent entry route", () => {
     winner = "query_finra";
     endThrows = true;
     const events = await eventsFor("short interest?");
-    expect(kernelCalls.map((call) => call.op)).toEqual(["route", "arguments", "entry_tool", "assess_entry", "assess_final_response"]);
+    expect(kernelCalls.map((call) => call.op)).toEqual(["route", "arguments", "entry_tool", "assess_entry", "assess_final_claim"]);
     expect(ended).toEqual([]);
     expect(sessionsCreated).toBe(0);
     expect(runCalls).toEqual([]);
@@ -1281,7 +1291,7 @@ describe("agent entry route", () => {
     winner = "query_finra";
     reasonDown = true;
     const events = await eventsFor("short interest?");
-    expect(events.at(-1)).toEqual({ type: "error", message: "muse down" });
+    expect(events.at(-1)).toEqual({ type: "error", message: "muse down", code: "MODEL_START_FAILED", stage: "single_tool" });
     expect(events.some((event) => event.type === "done")).toBe(false);
     expect(runCalls).toEqual([]);
   });

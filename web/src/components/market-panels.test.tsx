@@ -424,10 +424,12 @@ describe("AIPanel", () => {
     expect(panel(root).style.overflow).toBe("hidden");
   });
 
-  test("streams reasoning immediately and shows the answer after done", async () => {
-    const root = await mount(<AIPanel events={[{ type: "reasoning_start", model: "research" }, { type: "answer_delta", text: "The filing reports revenue growth." }]} input="Question" setInput={() => { }} onSend={() => { }} sym="AAPL" busy={false} debug={false} />);
+  test("shows checked answer text before done while the request remains busy", async () => {
+    const root = await mount(<AIPanel events={[{ type: "reasoning_start", model: "research" }, { type: "answer_delta", text: "The filing reports revenue growth." }]} input="Question" setInput={() => { }} onSend={() => { }} sym="AAPL" busy={true} debug={false} />);
     expect(root.textContent).toContain("AGENT · viewing AAPL");
-    expect(root.textContent).not.toContain("The filing reports revenue growth.");
+    expect(root.textContent).toContain("The filing reports revenue growth.");
+    expect(root.textContent).toContain("Partial checked answer · research continues");
+    expect(root.querySelector("input")?.disabled).toBe(true);
     expect(root.textContent).not.toContain("DEBUG");
   });
 

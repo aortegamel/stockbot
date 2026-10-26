@@ -493,11 +493,11 @@ describe("runKernelAgent final personas", () => {
   const emptyReply = (id: string): string =>
     `${JSON.stringify({ id, objective: "q", evidence: [], nodes: [], decisions: [], unresolved: [], incomplete_guard: false, toolExecutions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false })}\n`;
   type Outcome = { text?: string; claims?: FinalClaim[]; confidence?: number; usage?: KernelReasonResult["usage"]; timings?: KernelReasonResult["timings"] } | Error;
-  type Call = { pass: number; input: KernelReasonInput };
+  type Call = { pass: number; input: KernelReasonInput & { deadlineAt?: number; signal?: AbortSignal } };
   type GateVerdict = { verdict?: string; support_answer?: string; error?: string };
   // Drives runKernelAgent with a scripted reasoner. Stockbot settles last, so
   // output order never follows completion order. The reasoner input carries no
-  // onDelta, so no raw draft can reach emit. Gate ops (assess_final_*) answer
+  // onDelta, so no raw draft can reach emit. Gate ops (assess_final_claim) answer
   // inline from opts.gate (default yes); run bodies still record in order.
   async function runFinal(opts: {
     reply?: (id: string) => string;
@@ -784,7 +784,7 @@ describe("runKernelAgent final personas", () => {
       }),
     });
     expect(calls.map((c) => c.input.persona)).toEqual(["stockbot"]);
-    expect(gates.some((g) => g.op === "assess_final_response" && g.persona === "stockbot")).toBe(true);
+    expect(gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim", "assess_final_claim", "assess_final_claim"]);
     expect(answers(events)).toHaveLength(1);
     expect(answers(events)[0]).toContain(filed);
     expect(answers(events)[0]).toContain(significance);
@@ -825,15 +825,16 @@ describe("runKernelAgent final personas", () => {
 
   test("trio sums logical calls and per-call provider posts separately", async () => {
     const { events } = await runFinal({
-      decide: () => ({ usage: { providerCalls: 2 }, timings: { narrativeMs: 10, binderMs: 5 } }),
+      decide: () => ({ usage: { providerCalls: 2 }, timings: { narrativeMs: 10 } }),
     });
     const m = doneMetrics(events);
     expect(m.muse.calls).toBe(3);
     expect(m.muse.providerCalls).toBe(6);
-    expect(m.timings).toMatchObject({ narrativeMs: 30, binderMs: 15 });
+    expect(m.timings).toMatchObject({ narrativeMs: 30 });
+    expect(m.timings).not.toHaveProperty("binderMs");
   });
 
-  test("a failed draft retry and an inventory correction add their provider posts", async () => {
+  test("a failed draft retry adds its provider posts", async () => {
     const usage = { inputTokens: 1, providerCalls: 2 };
     const { events: retryEvents } = await runFinal({
       decide: (p, _pass, attempt) =>
@@ -843,16 +844,21 @@ describe("runKernelAgent final personas", () => {
     expect(retry.muse.calls).toBe(4);
     expect(retry.muse.providerCalls).toBe(6);
     expect(retry.muse.inputTokens).toBe(3);
-    const { events: fixEvents } = await runFinal({
+  });
+
+  test("an invalid inventory id drops without retry and fails closed", async () => {
+    const usage = { inputTokens: 1, providerCalls: 2 };
+    const { events, calls, gates } = await runFinal({
       personas: ["bearbot"],
-      decide: (_p, _pass, attempt) =>
-        attempt === 1
-          ? { text: "bearbot p1", claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["rn:x"] }], usage }
-          : { text: "bearbot fixed", claims: [{ text: "bearbot fixed", claimType: "inference", evidenceIds: ["ev:1"] }], usage },
+      decide: () => ({ text: "bearbot p1", claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["rn:x"] }], usage }),
     });
-    const fix = doneMetrics(fixEvents);
-    expect(fix.muse.calls).toBe(2);
-    expect(fix.muse.providerCalls).toBe(4);
+    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
+    expect(gates).toEqual([]);
+    expect(answers(events)).toEqual([]);
+    expect(failedCategory(events)).toBe("provider_error");
+    const m = doneMetrics(events);
+    expect(m.muse.calls).toBe(1);
+    expect(m.muse.providerCalls).toBe(2);
   });
 
   test("provider posts on a failed call still count through the mutable input", async () => {
@@ -961,11 +967,13 @@ describe("runKernelAgent final personas", () => {
       }),
       gate: (body) => {
         if (body.op !== "assess_final_claim") return { support_answer: "no" };
-        return (body.claim as Record<string, unknown>).text === supported ? { support_answer: "yes" } : { support_answer: "no" };
+        const claim = body.claim;
+        const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
+        return text === supported ? { support_answer: "yes" } : { support_answer: "no" };
       },
     });
     expect(runBodies(bodies).length).toBe(1);
-    expect(gates.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_claim", "assess_final_claim"]);
+    expect(gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim"]);
     const out = answers(events);
     expect(out.length).toBe(1);
     expect(out[0]).toContain(supported);
@@ -991,15 +999,15 @@ describe("runKernelAgent final personas", () => {
         return { support_answer: "yes" };
       },
     });
-    expect(gates.map((g) => g.op)).toEqual(["assess_final_response"]);
+    expect(gates.map((g) => g.op)).toEqual(["assess_final_claim"]);
   });
 
-  test("drafts, a failed-draft retry, and stockbot synthesis finish past the research wall with the request signal", async () => {
+  test("drafts, a failed-draft retry, and stockbot synthesis share the request deadline and signal", async () => {
     const deadlineAt = Date.now() + 600_000;
     const signal = new AbortController().signal;
     const seenAt: number[] = [];
     try {
-      const { events, calls } = await runFinal({
+      const { events, calls, gates } = await runFinal({
         deadlineAt,
         signal,
         decide: (p, _pass, attempt) => {
@@ -1017,9 +1025,14 @@ describe("runKernelAgent final personas", () => {
       expect(seenAt.length).toBe(4);
       for (const t of seenAt) expect(t).toBeGreaterThan(deadlineAt);
       for (const c of calls) {
-        expect("deadlineAt" in c.input).toBe(false);
-        expect(c.input.signal).toBe(signal);
+        const input = c.input;
+        if (input.deadlineAt === undefined) throw new Error("expected a shared request deadline");
+        expect(input.deadlineAt).toBe(deadlineAt);
+        expect(input.signal).toBe(signal);
       }
+      // One per-claim gate per claim, judged under the shared deadline.
+      expect(gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim", "assess_final_claim"]);
+      for (const g of gates) expect(g.sessionId).toBe("rs:live");
       expect(answers(events)).toEqual([trioAnswer(1)]);
       expect(events.some((e) => e.type === "failed")).toBe(false);
     } finally {
@@ -1061,32 +1074,33 @@ describe("runKernelAgent final personas", () => {
     expect(answers(events)).toEqual([`${label("stockbot")}\nstockbot results are unknown.\n\n${label("bullbot")}\nbullbot results are unknown.`]);
     expect(events.some((e) => e.type === "failed")).toBe(false);
   });
-  test("whole-response pass gates every persona with one op per persona", async () => {
+  test("independent gates judge every persona claim with one op per claim", async () => {
     const claim = (p: Persona): FinalClaim => ({ text: `${p} p1`, claimType: "inference", evidenceIds: ["ev:1"] });
     const { events, gates } = await runFinal({
       decide: (p) => ({ claims: [claim(p)], confidence: 0.9 }),
     });
-    expect(gates.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_response", "assess_final_response"]);
+    expect(gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim", "assess_final_claim"]);
     for (const g of gates) {
       expect(g.evidence).toEqual([{ id: "ev:1", content: "fact" }]);
-      expect(Array.isArray(g.claims)).toBe(true);
-      expect((g.claims as unknown[])[0]).toMatchObject({ claim_type: "inference", evidence_ids: ["ev:1"] });
+      const claim = g.claim;
+      if (typeof claim !== "object" || claim === null || !("claim_type" in claim)) throw new Error("expected a wire claim");
+      expect(claim).toMatchObject({ claim_type: "inference", evidence_ids: ["ev:1"] });
     }
     expect(answers(events)).toEqual([trioAnswer(1)]);
   });
 
-  test("gate bodies carry the run session id on both ops", async () => {
+  test("gate bodies carry the run session id on every per-claim op", async () => {
     const claim = "bearbot p1";
     const { gates } = await runFinal({
       personas: ["bearbot"],
       reply: sessionGraphReply,
       decide: () => ({ text: `keep ${claim}`, claims: [{ text: claim, claimType: "inference", evidenceIds: ["ev:1"] }] }),
-      gate: (body) => (body.op === "assess_final_response" ? { support_answer: "no" } : { support_answer: "yes" }),
     });
-    expect(gates.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_claim"]);
+    expect(gates.map((g) => g.op)).toEqual(["assess_final_claim"]);
     // The worker keys gates by sessionId; without it, every gate fails closed on the numeric request id.
     for (const g of gates) expect(g.sessionId).toBe("rs:live");
   });
+
 
   test("a gate error rejects a claim, and a reject drops every sentence no supported claim covers", async () => {
     const claim = "bearbot claim here";
@@ -1102,11 +1116,12 @@ describe("runKernelAgent final personas", () => {
         ],
       }),
       gate: (body) => {
-        if (body.op === "assess_final_response") return { support_answer: "no" };
-        return (body.claim as Record<string, unknown>).text === kept ? { support_answer: "yes" } : { error: "unknown session_id: '39'" };
+        const claim = body.claim;
+        const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
+        return text === kept ? { support_answer: "yes" } : { error: "unknown session_id: '39'" };
       },
     });
-    expect(gates.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_claim", "assess_final_claim"]);
+    expect(gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim"]);
     expect(answers(events)).toEqual([`${label("bearbot")}\n${kept}`]);
     expect(events.some((e) => e.type === "failed")).toBe(false);
   });
@@ -1125,7 +1140,7 @@ describe("runKernelAgent final personas", () => {
     expect(failedCategory(events)).toBe("provider_error");
   });
 
-  test("whole-response reject runs per-claim gates and deletes only rejected substrings", async () => {
+  test("independent gates delete only rejected substrings", async () => {
     const kept = "bearbot may keep this.";
     const cut = "bearbot reported this.";
     const { events, gates } = await runFinal({
@@ -1140,16 +1155,12 @@ describe("runKernelAgent final personas", () => {
           }
           : {},
       gate: (body) => {
-        if (body.op === "assess_final_response" && body.persona === "bearbot") return { support_answer: "no" };
-        if (body.op === "assess_final_claim") {
-          const claim = body.claim as Record<string, unknown>;
-          return claim.text === kept ? { support_answer: "yes" } : { support_answer: "no" };
-        }
-        return { support_answer: "yes" };
+        const claim = body.claim;
+        const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
+        return text === kept ? { support_answer: "yes" } : { support_answer: "no" };
       },
     });
-    expect(gates.filter((g) => g.op === "assess_final_response").length).toBe(3);
-    expect(gates.filter((g) => g.op === "assess_final_claim").length).toBe(2);
+    expect(gates.filter((g) => g.op === "assess_final_claim").length).toBe(4);
     const out = answers(events);
     expect(out.length).toBe(1);
     expect(out[0]).toContain(kept);
@@ -1157,128 +1168,95 @@ describe("runKernelAgent final personas", () => {
     expect(out[0]).toContain("bullbot p1");
   });
 
-  test("an rn: inventory citation retries once with the correction and answers supported", async () => {
-    const usage = { inputTokens: 5, outputTokens: 1 };
-    const { events, calls } = await runFinal({
+  test("an invalid inventory id drops that claim and the run fails closed when nothing remains", async () => {
+    const { events, calls, gates } = await runFinal({
       personas: ["bearbot"],
       currentChartTicker: "msft",
-      decide: (_p, _pass, attempt) =>
-        attempt === 1
-          ? { text: "bearbot p1", claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["rn:56c1365b-followup"] }], usage }
-          : { text: "bearbot fixed", claims: [{ text: "bearbot fixed", claimType: "inference", evidenceIds: ["ev:1"] }], usage },
+      decide: () => ({ text: "bearbot p1", claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["rn:56c1365b-followup"] }] }),
     });
-    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bearbot"]);
-    expect(calls.map((c) => c.input.ticker)).toEqual(["MSFT", "MSFT"]);
-    expect(calls[1]?.input.prompt).toContain("CORRECTION");
-    expect(calls[1]?.input.prompt).toContain("ev:1");
-    expect(calls[1]?.input.prompt).toContain("rn:56c1365b-followup");
-    expect(calls[1]?.input.evidence.map((e) => e.id)).toEqual(["ev:1"]);
-    expect(answers(events)).toEqual([`${label("bearbot")}\nbearbot fixed`]);
-    expect(events.some((e) => e.type === "failed")).toBe(false);
-    const m = doneMetrics(events);
-    expect(m.muse.calls).toBe(2);
-    expect(m.muse.inputTokens).toBe(10);
-    expect(m.muse.outputTokens).toBe(2);
+    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
+    expect(calls.map((c) => c.input.ticker)).toEqual(["MSFT"]);
+    expect(gates).toEqual([]);
+    expect(answers(events)).toEqual([]);
+    expect(failedCategory(events)).toBe("provider_error");
   });
 
-  test("a still-invalid correction fails closed with no prose and no second retry", async () => {
-    const { events, calls } = await runFinal({
+  test("an invalid inventory id fails closed with no prose and no gate call", async () => {
+    const { events, calls, gates } = await runFinal({
       personas: ["bearbot"],
       decide: () => ({ claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["ev:9"] }] }),
     });
-    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bearbot"]);
+    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
+    expect(gates).toEqual([]);
     expect(answers(events)).toEqual([]);
     expect(failedCategory(events)).toBe("provider_error");
-    const failed = events.find((e) => e.type === "failed");
-    expect(failed?.type === "failed" ? failed.message : "").toContain("unknown evidence id: ev:9");
-    expect(doneMetrics(events).muse.calls).toBe(2);
+    expect(doneMetrics(events).muse.calls).toBe(1);
   });
 
-  test("a non-verbatim inventory citation retries once with the correction and answers supported", async () => {
-    const { events, calls } = await runFinal({
-      personas: ["bearbot"],
-      decide: (_p, _pass, attempt) =>
-        attempt === 1
-          ? { text: "bearbot p1", claims: [{ text: "bearbot paraphrase", claimType: "inference", evidenceIds: ["ev:1"] }] }
-          : { text: "bearbot fixed", claims: [{ text: "bearbot fixed", claimType: "inference", evidenceIds: ["ev:1"] }] },
-    });
-    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bearbot"]);
-    expect(calls[1]?.input.prompt).toContain("CORRECTION");
-    expect(calls[1]?.input.prompt).toContain("verbatim prose substring");
-    expect(calls[1]?.input.prompt).toContain("bearbot paraphrase");
-    expect(calls[1]?.input.evidence.map((e) => e.id)).toEqual(["ev:1"]);
-    expect(answers(events)).toEqual([`${label("bearbot")}\nbearbot fixed`]);
-    expect(events.some((e) => e.type === "failed")).toBe(false);
-    expect(doneMetrics(events).muse.calls).toBe(2);
-  });
-
-  test("a still-non-verbatim correction fails closed with no prose and no second retry", async () => {
-    const { events, calls } = await runFinal({
+  test("a non-verbatim inventory text fails closed with no prose and no gate call", async () => {
+    const { events, calls, gates } = await runFinal({
       personas: ["bearbot"],
       decide: () => ({ text: "bearbot p1", claims: [{ text: "bearbot paraphrase", claimType: "inference", evidenceIds: ["ev:1"] }] }),
     });
-    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bearbot"]);
+    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
+    expect(gates).toEqual([]);
     expect(answers(events)).toEqual([]);
     expect(failedCategory(events)).toBe("provider_error");
-    const failed = events.find((e) => e.type === "failed");
-    expect(failed?.type === "failed" ? failed.message : "").toContain("not a prose substring");
-    expect(doneMetrics(events).muse.calls).toBe(2);
+    expect(doneMetrics(events).muse.calls).toBe(1);
   });
 
-  test("an uncited inventory defect retries nothing and fails closed", async () => {
-    const { events, calls } = await runFinal({
+  test("an uncited inventory defect answers nothing and fails closed", async () => {
+    const { events, calls, gates } = await runFinal({
       personas: ["bearbot"],
       decide: () => ({ claims: [{ text: "bearbot p1", claimType: "observed_fact", evidenceIds: [] }] }),
     });
     expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
+    expect(gates).toEqual([]);
     expect(answers(events)).toEqual([]);
     expect(failedCategory(events)).toBe("provider_error");
   });
 
-  test("an inventory correction replaces only the affected persona", async () => {
+  test("an invalid inventory id drops that persona while the valid group still gates", async () => {
     const { events, calls } = await runFinal({
       personas: ["stockbot", "bearbot"],
-      decide: (p, _pass, attempt) =>
-        p === "bearbot" && attempt === 1
-          ? { claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["ev:9"] }] }
-          : { text: `${p} fixed`, claims: [{ text: `${p} fixed`, claimType: "inference", evidenceIds: ["ev:1"] }] },
+      decide: (p) => p === "bearbot"
+        ? { claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["ev:9"] }] }
+        : { text: `${p} fixed`, claims: [{ text: `${p} fixed`, claimType: "inference", evidenceIds: ["ev:1"] }] },
     });
-    expect(calls.map((c) => c.input.persona)).toEqual(["stockbot", "bearbot", "bearbot"]);
+    expect(calls.map((c) => c.input.persona)).toEqual(["stockbot", "bearbot"]);
     expect(calls.filter((c) => c.input.persona === "stockbot").length).toBe(1);
-    expect(answers(events)).toEqual([`${label("stockbot")}\nstockbot fixed\n\n${label("bearbot")}\nbearbot fixed`]);
-    expect(events.some((e) => e.type === "failed")).toBe(false);
+    expect(answers(events)).toEqual([]);
+    expect(failedCategory(events)).toBe("provider_error");
   });
 
-  test("a corrected answer still passes the source gates before display", async () => {
-    const kept = "bearbot corrected fact.";
-    const cut = "bearbot corrected guess.";
+  test("the gates see only locally valid claims before display", async () => {
+    const kept = "bearbot valid fact.";
+    const cut = "bearbot valid guess.";
     const { events, calls, gates } = await runFinal({
       personas: ["bearbot"],
-      decide: (_p, _pass, attempt) =>
-        attempt === 1
-          ? { claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["ev:9"] }] }
-          : {
-            text: `${kept} ${cut}`,
-            claims: [
-              { text: kept, claimType: "observed_fact", evidenceIds: ["ev:1"] },
-              { text: cut, claimType: "observed_fact", evidenceIds: ["ev:1"] },
-            ],
-          },
+      decide: () => ({
+        text: `${kept} ${cut} bearbot invalid.`,
+        claims: [
+          { text: kept, claimType: "observed_fact", evidenceIds: ["ev:1"] },
+          { text: cut, claimType: "observed_fact", evidenceIds: ["ev:1"] },
+          { text: "bearbot invalid", claimType: "inference", evidenceIds: ["ev:9"] },
+        ],
+      }),
       gate: (body) => {
-        if (body.op === "assess_final_claim") {
-          return (body.claim as Record<string, unknown>).text === kept ? { support_answer: "yes" } : { support_answer: "no" };
-        }
-        return { support_answer: "no" };
+        const claim = body.claim;
+        const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
+        return text === kept ? { support_answer: "yes" } : { support_answer: "no" };
       },
     });
-    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bearbot"]);
+    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
     const out = answers(events);
     expect(out.length).toBe(1);
     expect(out[0]).toContain(kept);
     expect(out[0]).not.toContain(cut);
     // The claims event carries only the claim the gates kept.
     expect(events.filter((e) => e.type === "claims")).toEqual([{ type: "claims", claims: [{ text: kept, claimType: "observed_fact", evidenceIds: ["ev:1"] }] }]);
-    expect(gates.some((g) => g.op === "assess_final_claim")).toBe(true);
+    expect(gates.every((g) => g.op === "assess_final_claim")).toBe(true);
+    expect(gates).toHaveLength(2);
     expect(events.some((e) => e.type === "failed")).toBe(false);
   });
 
@@ -1294,17 +1272,14 @@ describe("runKernelAgent final personas", () => {
     expect(events.some((e) => e.type === "failed" && e.message === "stockbot: all claims rejected")).toBe(true);
   });
 
-  test("property: a correction attempt cites only known ids or fails closed", async () => {
+  test("property: an invalid inventory id answers nothing while known ids gate per claim", async () => {
     await fc.assert(
       fc.asyncProperty(fc.array(fc.constantFrom("ev:1", "ev:9", "rn:n1"), { minLength: 1, maxLength: 3 }), async (evidenceIds) => {
         const { events, calls } = await runFinal({
           personas: ["bearbot"],
-          decide: (_p, _pass, attempt) =>
-            attempt === 1
-              ? { claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["rn:n1"] }] }
-              : { text: "bearbot fixed", claims: [{ text: "bearbot fixed", claimType: "inference", evidenceIds }] },
+          decide: () => ({ text: "bearbot fixed", claims: [{ text: "bearbot fixed", claimType: "inference", evidenceIds }] }),
         });
-        expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bearbot"]);
+        expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
         if (evidenceIds.every((id) => id === "ev:1")) {
           expect(answers(events)).toEqual([`${label("bearbot")}\nbearbot fixed`]);
         } else {
@@ -1315,6 +1290,7 @@ describe("runKernelAgent final personas", () => {
       { seed: 20261011, numRuns: 20 },
     );
   });
+
 
   const revenuePoint: Datapoint = {
     id: "dp:revenue", metric: "revenue", value: "$35.1B", entity: "NVDA", period: "Q3 FY2025", unit: "USD",
@@ -1405,14 +1381,16 @@ describe("runKernelAgent final personas", () => {
       ...JSON.parse(sessionGraphReply(id)),
       evidence: [{ id: "ev:1", content: "fact", datapoints: [revenuePoint, null, { ...revenuePoint, id: "ev:bad" }] }],
     })}\n`;
-    // The whole-response pass still drops the sentence that has no inventory claim.
+    // The independent gates drop the sentence that has no inventory claim.
     const passed = await runFinal({ personas: ["stockbot"], reply, decide: () => ({ text, claims: [fact, hedge] }) });
     expect(passed.calls[0]?.input.evidence[0]?.datapoints).toEqual([revenuePoint]);
     expect(passed.events.find((e) => e.type === "evidence")).toMatchObject({ evidence: [{ datapoints: [revenuePoint] }] });
-    expect(passed.gates[0]?.claims).toEqual([
-      { text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:1"], datapoint_ids: [revenuePoint.id] },
-      { text: hedge.text, claim_type: "inference", evidence_ids: ["ev:1"] },
-    ]);
+    expect(passed.gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim"]);
+    const firstClaim = passed.gates[0]?.claim;
+    if (typeof firstClaim !== "object" || firstClaim === null) throw new Error("expected first gate claim");
+    expect(firstClaim).toEqual({
+      text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:1"], datapoint_ids: [revenuePoint.id],
+    });
     expect(answers(passed.events)).toEqual([`${label("stockbot")}\n${fact.text} ${hedge.text}`]);
     expect(passed.events.find((e) => e.type === "claims")).toEqual({ type: "claims", claims: [fact, hedge] });
     // A ledger proof failure removes the datapoint claim but keeps the qualified inference.
@@ -1421,18 +1399,20 @@ describe("runKernelAgent final personas", () => {
       reply,
       decide: () => ({ text, claims: [fact, hedge] }),
       gate: (body) => {
-        if (body.op === "assess_final_response") return { error: "proof: datapoint conflicts with ledger" };
-        return (body.claim as Record<string, unknown>).datapoint_ids === undefined ? { support_answer: "yes" } : { error: "proof: datapoint conflicts with ledger" };
+        const claim = body.claim;
+        const ids = typeof claim === "object" && claim !== null && "datapoint_ids" in claim ? claim.datapoint_ids : undefined;
+        return ids === undefined ? { support_answer: "yes" } : { error: "proof: datapoint conflicts with ledger" };
       },
     });
-    expect(proofFailed.gates.find((g) => g.op === "assess_final_claim")?.claim).toEqual({
+    const failedClaim = proofFailed.gates.find((g) => g.op === "assess_final_claim")?.claim;
+    if (typeof failedClaim !== "object" || failedClaim === null) throw new Error("expected failed gate claim");
+    expect(failedClaim).toEqual({
       text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:1"], datapoint_ids: [revenuePoint.id],
     });
     for (const body of [...passed.gates, ...proofFailed.gates]) {
-      const claims = body.op === "assess_final_response" ? body.claims as Record<string, unknown>[] : [body.claim as Record<string, unknown>];
-      for (const claim of claims) {
-        for (const key of ["value", "entity", "period", "unit"]) expect(claim).not.toHaveProperty(key);
-      }
+      const claim = body.claim;
+      if (typeof claim !== "object" || claim === null) throw new Error("expected a gate claim");
+      for (const key of ["value", "entity", "period", "unit"]) expect(claim).not.toHaveProperty(key);
     }
     expect(answers(proofFailed.events)).toEqual([`${label("stockbot")}\n${hedge.text}`]);
   });
@@ -1445,11 +1425,16 @@ describe("runKernelAgent final personas", () => {
       reply: sessionGraphReply,
       // The inventory passes the local check, so only the worker gates can reject the unsupported claim.
       decide: () => ({ text: `${kept.text} ${unsupported.text}`, claims: [kept, unsupported] }),
-      gate: (body) => (body.op === "assess_final_claim" && (body.claim as Record<string, unknown>).text === kept.text ? { support_answer: "yes" } : { support_answer: "no" }),
+      gate: (body) => {
+        if (body.op !== "assess_final_claim") return { support_answer: "no" };
+        const claim = body.claim;
+        const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
+        return text === kept.text ? { support_answer: "yes" } : { support_answer: "no" };
+      },
     });
     // The reasoner gets no stream callback: raw deltas carry the inventory fence.
     for (const c of calls) expect("onDelta" in c.input).toBe(false);
-    expect(gates.map((g) => g.op)).toEqual(["assess_final_response", "assess_final_claim", "assess_final_claim"]);
+    expect(gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim"]);
     expect(answers(events)).toEqual([`${label("stockbot")}\n${kept.text}`]);
     expect(events.filter((e) => e.type === "claims")).toEqual([{ type: "claims", claims: [kept] }]);
     expect(JSON.stringify(events)).not.toContain("```");
@@ -1464,7 +1449,7 @@ describe("runKernelAgent final personas", () => {
       decide: () => ({ text: bound.text, claims: [bound] }),
     });
     expect(answers(passed.events)).toEqual([`${label("stockbot")}\n${bound.text}`]);
-    // The binder bound nothing: the gates pass, but uncovered prose still drops and the run fails closed.
+    // No inventory means no bound prose: the gates pass, but uncovered prose still drops and the run fails closed.
     const unbound = await runFinal({
       personas: ["stockbot"],
       reply: sessionGraphReply,
@@ -1489,10 +1474,12 @@ describe("runKernelAgent final personas", () => {
     const unknown: FinalClaim = { text: "The 10-Q text was not retrieved.", claimType: "unknown", evidenceIds: [] };
     const docFact = (row: string): FinalClaim => ({ text: `The 10-Q reports revenue of $46.7 billion [${row}].`, claimType: "observed_fact", evidenceIds: [row] });
     // Stands in for the worker ledger proof: only the inspected document row backs the document fact.
-    const backed = (c: Record<string, unknown>): boolean => c.claim_type === "unknown" || (c.evidence_ids as string[]).includes("ev:doc");
-    const gate = (body: Record<string, unknown>): GateVerdict => ({
-      support_answer: (body.op === "assess_final_response" ? (body.claims as Record<string, unknown>[]).every(backed) : backed(body.claim as Record<string, unknown>)) ? "yes" : "no",
-    });
+    const gate = (body: Record<string, unknown>): GateVerdict => {
+      const claim = body.claim;
+      if (typeof claim !== "object" || claim === null || !("claim_type" in claim) || !("evidence_ids" in claim)) return { support_answer: "no" };
+      const backed = claim.claim_type === "unknown" || (Array.isArray(claim.evidence_ids) && claim.evidence_ids.includes("ev:doc"));
+      return { support_answer: backed ? "yes" : "no" };
+    };
     const listed = await runFinal({
       personas: ["stockbot"], reply: reply(false), gate,
       decide: () => ({ text: `${docFact("ev:list").text} ${unknown.text}`, claims: [docFact("ev:list"), unknown] }),
@@ -1552,7 +1539,12 @@ describe("runKernelAgent final personas", () => {
           { text: cut, claimType: "observed_fact", evidenceIds: ["ev:1"] },
         ],
       }),
-      gate: (body) => (body.op === "assess_final_claim" && (body.claim as Record<string, unknown>).text === kept ? { support_answer: "yes" } : { support_answer: "no" }),
+      gate: (body) => {
+        if (body.op !== "assess_final_claim") return { support_answer: "no" };
+        const claim = body.claim;
+        const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
+        return text === kept ? { support_answer: "yes" } : { support_answer: "no" };
+      },
     });
     const out = answers(events);
     expect(out.length).toBe(1);
@@ -1564,7 +1556,7 @@ describe("runKernelAgent final personas", () => {
     const { events } = await runFinal({
       personas: ["bearbot"],
       decide: () => ({ text: "bearbot claim here", claims: [{ text: "bearbot claim here", claimType: "inference", evidenceIds: ["ev:1"] }] }),
-      gate: (body) => (body.op === "assess_final_claim" ? { support_answer: "no" } : { support_answer: "no" }),
+      gate: () => ({ support_answer: "no" }),
     });
     expect(answers(events)).toEqual([]);
     expect(failedCategory(events)).toBe("provider_error");
@@ -1801,9 +1793,8 @@ describe("runKernelAgent final personas", () => {
       evidence: ev,
       personaOrder: ["bearbot"],
       gate: async (body) => {
-        if (body.op === "assess_final_response") return { error: "boom" };
         const claim = body.claim;
-        const text = claim && typeof claim === "object" && "text" in claim ? claim.text : undefined;
+        const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
         return text === "KEEP" ? { support_answer: "yes" } : { error: "boom" };
       },
     });
@@ -1812,8 +1803,7 @@ describe("runKernelAgent final personas", () => {
     expect(gated.text).not.toContain("CUT");
   });
 
-  // Scripted gate replies for the parallel-gate tests: each persona's whole
-  // response and each claim (`<persona>-c<j>`) has its own verdict.
+  // Scripted gate replies for the parallel-gate tests: each claim (`<persona>-c<j>`) has its own verdict.
   type GateScript = "yes" | "no" | "error" | "throw";
   const gateEvidence = [{ id: "ev:1", source: "kernel", retrievedAt: "t", content: "fact" }];
   const scriptedReply = async (v: GateScript) => {
@@ -1822,7 +1812,7 @@ describe("runKernelAgent final personas", () => {
   };
   const scriptKey = (body: Record<string, unknown>): string => {
     const claim = body.claim;
-    return claim && typeof claim === "object" && "text" in claim ? String(claim.text) : String(body.persona);
+    return typeof claim === "object" && claim !== null && "text" in claim ? String(claim.text) : String(body.persona);
   };
   const gateResults = (personas: readonly Persona[], claimCounts: readonly number[], defectAt?: number) =>
     personas.map((p, i) => {
@@ -1842,14 +1832,19 @@ describe("runKernelAgent final personas", () => {
       maxInFlight = Math.max(maxInFlight, inFlight);
       await Promise.resolve();
       inFlight -= 1;
-      return scriptedReply(body.op === "assess_final_response" ? "no" : scriptKey(body).endsWith("-c0") ? "yes" : "no");
+      return scriptedReply(scriptKey(body).endsWith("-c0") ? "yes" : "no");
     };
     const personas: Persona[] = ["bearbot", "bullbot", "stockbot"];
     const gated = await applyFinalGates({ results: gateResults(personas, [2, 2, 2]), evidence: gateEvidence, personaOrder: personas, gate });
     // The reject drops each uncovered lead sentence and each rejected claim.
-    expect(gated).toEqual({ text: personas.map((p) => `${label(p)}\n${p}-c0`).join("\n\n") });
-    // Three whole-response checks in flight at once, then all six claim checks.
-    expect(ops.slice(0, 3)).toEqual(["assess_final_response", "assess_final_response", "assess_final_response"]);
+    if (!("text" in gated)) throw new Error("expected gated text");
+    expect(gated).toEqual({
+      text: personas.map((p) => `${label(p)}\n${p}-c0`).join("\n\n"),
+      supported: personas.flatMap((p) => [{ text: `${p}-c0`, claimType: "inference", evidenceIds: ["ev:1"] }]),
+      partial: true,
+    });
+    // All six claim checks run in flight together.
+    expect(ops).toEqual(Array.from({ length: 6 }, () => "assess_final_claim"));
     expect(maxInFlight).toBe(6);
   });
 
@@ -1859,14 +1854,12 @@ describe("runKernelAgent final personas", () => {
       fc.asyncProperty(
         fc.subarray([...FINAL_PERSONAS], { minLength: 1 }),
         fc.array(fc.array(script, { maxLength: 3 }), { minLength: 3, maxLength: 3 }),
-        fc.array(script, { minLength: 3, maxLength: 3 }),
         fc.option(fc.nat(2), { nil: undefined }),
         fc.array(fc.nat(6), { minLength: 16, maxLength: 16 }),
-        async (personas, claimScripts, wholeScripts, defectAt, ticks) => {
+        async (personas, claimScripts, defectAt, ticks) => {
           const verdicts = new Map<string, GateScript>();
-          personas.forEach((p, i) => {
-            verdicts.set(p, wholeScripts[i] ?? "yes");
-            (claimScripts[i] ?? []).forEach((v, j) => verdicts.set(`${p}-c${j}`, v));
+          personas.forEach((p) => {
+            (claimScripts[personas.indexOf(p)] ?? []).forEach((v, j) => verdicts.set(`${p}-c${j}`, v));
           });
           const replyFor = (body: Record<string, unknown>) => scriptedReply(verdicts.get(scriptKey(body)) ?? "yes");
           // Serial reference: one gate call at a time, in issue order.

@@ -100,6 +100,8 @@ function publicEvent(e: AgentEvent): AgentEvent | null {
       return { type: "progress", stage: "working" };
     case "reasoning_start":
       return { type: "reasoning_start", model: "stockbot" };
+    case "answer_partial":
+      return e;
     default:
       return e;
   }
@@ -120,7 +122,7 @@ function streamSender(req: Request, controller: ReadableStreamDefaultController<
   let pending = mkdir(directory, { recursive: true }).then(() => appendFile(logPath, "")).catch(warn);
   const send = (e: AgentEvent): void => {
     if (req.signal.aborted) return;
-    if (e.type === "answer_delta") timings.firstTextMs ??= performance.now() - requestAt;
+    if (e.type === "answer_partial" || e.type === "answer_delta") timings.firstTextMs ??= performance.now() - requestAt;
     if (e.type === "done") e = { ...e, metrics: { ...e.metrics, timings: { ...e.metrics.timings, ...timings } } };
     // Record the full event before production filtering, in emission order.
     if (!logFailed) {
@@ -136,7 +138,9 @@ function streamSender(req: Request, controller: ReadableStreamDefaultController<
     if (!debug && (e.type === "failed" || e.type === "error")) {
       if (terminalSent) return;
       terminalSent = true;
-      out = { type: "error", message: "Stockbot couldn't complete that request. Try again." };
+      out = e.type === "failed"
+        ? { type: "error", message: "Stockbot could not verify part of that request. The checked findings above remain." }
+        : { type: "error", message: e.message };
     }
     try {
       controller.enqueue(enc.encode(`data: ${JSON.stringify(out)}\n\n`));
@@ -235,16 +239,16 @@ export async function POST(req: Request): Promise<Response> {
         send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
         try {
           // No onDelta: the raw stream carries the inventory fence, so the client sees only the kept text.
-          const r = await reason({ prompt, evidence: [], direct: true, ...reasonContext() });
+          const r = await reason({ prompt, evidence: [], direct: true, ...reasonContext(), signal: req.signal, deadlineAt });
           const text = dropUncovered(r.prose, qualifiedEvidenceFree(r.claims));
           if (!text) return false;
           send({ type: "answer_delta", text });
-          send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: performance.now() - t0, ...r.usage }, evidence: { count: 0, characters: 0 }, failures: {}, timings: r.timings } });
+          send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: performance.now() - t0, ...r.usage }, evidence: { count: 0, characters: 0 }, failures: {}, timings: r.timings }, status: "completed" });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           // ponytail: muse-down shape mirrors kernel.ts — failed + error, never a silent close.
-          send({ type: "failed", category: "provider_error", message: msg.slice(0, 160) });
-          send({ type: "error", message: msg });
+          send({ type: "failed", category: "provider_error", message: msg.slice(0, 160), code: "MODEL_START_FAILED", stage: "direct" });
+          send({ type: "error", message: msg, code: "MODEL_START_FAILED", stage: "direct" });
         }
         return true;
       };
@@ -252,7 +256,7 @@ export async function POST(req: Request): Promise<Response> {
       const singleShotEvidence: Evidence[] = [];
       const generateArguments = async (tool: string): Promise<{ args: Record<string, unknown>; confidence: number | null } | null> => {
         try {
-          const gen = await kernelRouter.call({ op: "arguments", tool, objective: prompt, ...tickerField }, { signal: req.signal });
+          const gen = await kernelRouter.call({ op: "arguments", tool, objective: prompt, ...tickerField }, { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) });
           if (typeof gen.error === "string" && gen.error) return null;
           if (gen.tool !== tool || typeof gen.arguments !== "object" || gen.arguments === null) return null;
           return {
@@ -269,7 +273,7 @@ export async function POST(req: Request): Promise<Response> {
         try {
           const assessed = await kernelRouter.call(
             { op: "assess_entry", prompt, tool, arguments: args, result: outcome, ...tickerField },
-            { signal: req.signal },
+            { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) },
           );
           return typeof assessed.verdict === "string" && assessed.verdict ? assessed.verdict : "research_required";
         } catch {
@@ -330,38 +334,36 @@ export async function POST(req: Request): Promise<Response> {
             return { ok: false, error: msg.slice(0, 500), category: "tool_error" };
           }
         };
-        // Only ledger-backed claims may publish. A gate rejection ends this path visibly.
         const answerFromEvidence = async (defect?: string): Promise<boolean> => {
           if (defect || evidence.length === 0) {
             failures.tool_error = (failures.tool_error ?? 0) + 1;
-            send({ type: "failed", category: "tool_error", message: `No verified answer: ${defect ?? "this source has no admissible research evidence."}` });
+            send({ type: "failed", category: "tool_error", message: `No verified answer: ${defect ?? "this source has no admissible research evidence."}`, code: "EVIDENCE_UNAVAILABLE", stage: "single_tool" });
             send({ type: "answer_delta", text: "I could not verify an answer from this source. I withheld its factual claims." });
-            send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures } });
+            send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures }, status: "failed" });
             return true;
           }
           send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
           try {
             const m0 = performance.now();
-            const r = await reason({ prompt, evidence, direct: evidence.length === 0, ...reasonContext() });
+            const r = await reason({ prompt, evidence, direct: evidence.length === 0, ...reasonContext(), signal: req.signal, deadlineAt });
             const gated = await gateAnswer({
               result: { persona: "stockbot", prose: r.prose, claims: r.claims, ...(r.confidence !== undefined ? { confidence: r.confidence } : {}) },
               evidence,
               sessionId,
-              gate: (body, gateOpts) => kernelRouter.call(body, { signal: req.signal, ...gateOpts }),
+              gate: (body, gateOpts) => kernelRouter.call(body, { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1), ...gateOpts }),
             });
             if ("failure" in gated) {
               failures.provider_error = (failures.provider_error ?? 0) + 1;
-              send({ type: "failed", category: "provider_error", message: `No verified answer: ${gated.failure}` });
+              send({ type: "failed", category: "provider_error", message: `No verified answer: ${gated.failure}`, code: "CITATION_INVALID", stage: "single_tool_gate" });
               send({ type: "answer_delta", text: "I could not verify an answer from this source. I withheld its factual claims." });
-              send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures, timings: r.timings } });
+              send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures, timings: r.timings }, status: "failed" });
               return true;
             }
             send({ type: "answer_delta", text: gated.text });
-            const claims = r.claims.filter((c) => gated.text.includes(c.text));
-            if (claims.length > 0) send({ type: "claims", claims });
-            send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures, timings: r.timings } });
+            if (gated.supported.length > 0) send({ type: "claims", claims: gated.supported });
+            send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures, timings: r.timings }, status: "completed" });
           } catch (err) {
-            send({ type: "error", message: err instanceof Error ? err.message : String(err) });
+            send({ type: "error", message: err instanceof Error ? err.message : String(err), code: "MODEL_START_FAILED", stage: "single_tool" });
           }
           return true;
         };
@@ -469,7 +471,7 @@ export async function POST(req: Request): Promise<Response> {
             const t0 = performance.now();
             send({ type: "agent_start", prompt });
             send({ type: "answer_delta", text: "Which stock, ETF, sector, or holding do you want advice on? Give a ticker (for example NVDA) or a company name, and I will research it." });
-            send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures: {} } });
+            send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures: {}, timings: {} }, status: "completed" });
             return true;
           }
           if (winner === "no_session" || winner === "reasoning_required") return await answerDirect();
@@ -491,8 +493,8 @@ export async function POST(req: Request): Promise<Response> {
         const routeError = selected.error;
         // Selection is unknown. The route must not guess personas or a route.
         send({ type: "agent_start", prompt });
-        send({ type: "failed", category: "provider_error", message: routeError.slice(0, 160) });
-        send({ type: "error", message: routeError });
+        send({ type: "failed", category: "provider_error", message: routeError.slice(0, 160), code: "ROUTE_SELECTION_FAILED", stage: "route" });
+        send({ type: "error", message: routeError, code: "ROUTE_SELECTION_FAILED", stage: "route" });
         await flush();
         controller.close();
         return;
@@ -541,7 +543,8 @@ export async function POST(req: Request): Promise<Response> {
         await runKernelAgent(prompt, send, { signal: req.signal, seedEvidence: singleShotEvidence, deadlineAt, ...(personas ? { personas } : {}), ...tickerField, ...(currentChartTicker ? { currentChartTicker } : {}), ...(watchlist ? { watchlist } : {}), ...contextField });
       } catch (err) {
         console.error(`[web] [agent-api] runKernelAgent error: ${err instanceof Error ? err.message : String(err)}`);
-        send({ type: "error", message: err instanceof Error ? err.message : String(err) });
+        if (req.signal.aborted) send({ type: "cancelled", message: "The request was cancelled." });
+        else send({ type: "error", message: err instanceof Error ? err.message : String(err), code: "KERNEL_FAILED", stage: "research" });
       }
       await flush();
       controller.close();

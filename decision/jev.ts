@@ -5,22 +5,30 @@
 // noul = independent propositions: each id gets its own probability, no
 // cross-id winner. score = ordinal judgments.
 // Raw vs policy: parsers return raw probabilities/choices/scores unchanged;
-// classifyProbability is the separate policy step callers apply to noul
-// probabilities (yes/unsure/no), never collapsed inside a parser.
+// normalizeProbability applies the separate noul policy. Parsers keep raw values.
 // Lifecycle vs decision: stage/proposal admission (which nodes exist, which
 // stage they belong to) is lifecycle; disposition/truth/evidenceState/
 // materiality are the semantic decisions JEV owns per node.
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-export type Decision = "yes" | "unsure" | "no";
+export type Decision = "yes" | "no" | "unknown";
+export type NormalizedDecision = {
+  outcome: Decision;
+  probability: number | null;
+  strength: "confident" | "tentative" | null;
+};
 
-// Approved policy: >=.70 yes; >=.50 and <.70 unsure; <.50 no.
-export function classifyProbability(p: number): Decision {
-  if (!Number.isFinite(p) || p < 0 || p > 1) throw new Error("invalid_probability");
-  if (p >= 0.7) return "yes";
-  if (p >= 0.5) return "unsure";
-  return "no";
+// Support at .50 is affirmative. Strength describes affirmative support only.
+export function normalizeProbability(value: unknown): NormalizedDecision {
+  if (!isProb(value)) return { outcome: "unknown", probability: null, strength: null };
+  if (value < 0.5) return { outcome: "no", probability: value, strength: null };
+  return { outcome: "yes", probability: value, strength: value >= 0.7 ? "confident" : "tentative" };
+}
+
+export function classifyProbability(value: unknown): Decision {
+  if (!isProb(value)) return "unknown";
+  return value >= 0.5 ? "yes" : "no";
 }
 
 export type NoulDecision = { kind: "noul"; probability: number };

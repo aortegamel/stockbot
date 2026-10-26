@@ -38,8 +38,8 @@ import os
 import re
 import time as _time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from collections.abc import Callable, Coroutine, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from operator import itemgetter
 from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict
@@ -84,7 +84,7 @@ _TOOL_POOL = _futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="tool
 _REASONER_POOL = _futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="reasoner")
 
 
-async def _sec_thread_call(call: Callable[[], object]) -> object:
+async def _sec_thread_call[T](call: Callable[[], T]) -> T:
     """Sync SEC call on the 4-worker pool; cancel-safe, never blocks loop shutdown."""
     return await asyncio.get_running_loop().run_in_executor(_SEC_POOL, call)
 
@@ -259,11 +259,60 @@ class _Kernel:
     def list_tool_results(self, session_id: str) -> list[dict[str, JSONValue]]:
         return self._store().list_tool_results(session_id)
 
+    def limit_job_deadline(self, job_id: str, deadline_at: float) -> None:
+        """Bind an action to the remaining request budget before it starts."""
+        from app.research import service
+
+        deadline = datetime.now(UTC) + timedelta(seconds=deadline_at - _time.perf_counter())
+        service.limit_job_deadline(job_id, deadline, repo=self._repo)
+
+    def wait_for_nodes(self, session_id: str, node_id: str, dependencies: Sequence[str]) -> None:
+        """Defer the parent until its admitted evidence questions resolve."""
+        from app.research import service
+
+        service.await_node_evidence(session_id, node_id, dependencies, repo=self._repo)
+
+    def node_attempts(self, session_id: str, node_id: str) -> list[dict[str, JSONValue]]:
+        """Read this node's persisted attempts for continued research."""
+        return [
+            dict(decision.selected)
+            for decision in self._store().list_decisions(session_id)
+            if decision.decision_type == "node_attempt"
+            and decision.node_id == node_id
+            and isinstance(decision.selected, dict)
+        ]
+
+    def record_attempt(
+        self, session_id: str, node: object, attempt: Mapping[str, JSONValue], *, event: str = "node_attempt"
+    ) -> None:
+        """Keep navigation and diagnostics in the journal. Do not archive unadmitted document text."""
+        saved = dict(attempt)
+        result = saved.get("result")
+        if isinstance(result, dict) and saved.get("tool") == "get_sec_document":
+            saved["result"] = {key: value for key, value in result.items() if key != "text"}
+        self.record_decision(
+            session_id,
+            event,
+            {},
+            {},
+            saved,
+            node_id=str(_f(node, "node_id", "id")),
+            request={"objective": self.get_session(session_id).get("objective"), "purpose": _f(node, "question")},
+        )
+
     def _intake_observations(self, session_id: str) -> list[dict[str, JSONValue]]:
         """Read document availability from intake decisions. These observations are not citable evidence."""
         observations: list[dict[str, JSONValue]] = []
         for decision in self._store().list_decisions(session_id):
             selected = decision.selected
+            if decision.decision_type == "request_context" and isinstance(selected, dict):
+                observations.append(
+                    {
+                        "tool": "request_context",
+                        "outcome_summary": "User request context only. Not source evidence. " + _compact_json(selected),
+                    }
+                )
+                continue
             if decision.decision_type != "intake_digest" or not isinstance(selected, dict):
                 continue
             stats = selected.get("stats")
@@ -699,6 +748,24 @@ async def _call_reasoner_blocking[T](stage: str, call: Callable[[], T], timeout:
     if timeout is None:
         return await pending
     return await asyncio.wait_for(pending, timeout=timeout)
+
+
+async def _deadline_call[T](stage: str, deadline: float | None, call: Coroutine[object, object, T]) -> T:
+    """Use the original deadline for each stage. Cancel only this call's client operation."""
+    try:
+        if deadline is not None and deadline <= _time.perf_counter():
+            call.close()
+            raise TimeoutError(f"deadline reached during {stage}")
+        async with asyncio.timeout(None if deadline is None else deadline - _time.perf_counter()):
+            return await call
+    except asyncio.CancelledError as exc:
+        if deadline is None or _time.perf_counter() < deadline:
+            raise
+        raise TimeoutError(f"deadline reached during {stage}") from exc
+    except TimeoutError as exc:
+        if str(exc).startswith("deadline reached"):
+            raise
+        raise TimeoutError(f"deadline reached during {stage}") from exc
 
 
 def _reasoner_timeout(deadline_at: float | None) -> float | None:
@@ -3557,6 +3624,9 @@ async def _attempt_tool(
     node_id = str(_f(node, "node_id", "id"))
     domain = source_domain_for_tool(tool_name)
     job_id = _attempt_job(kernel, session_id, domain)
+    deadline = session.get("_deadline_at")
+    if isinstance(deadline, (int, float)) and not isinstance(deadline, bool):
+        kernel.limit_job_deadline(job_id, float(deadline))
     # A section read that fails before injection still records its section, so sibling failures never look identical.
     arguments: Mapping[str, object] = _section_seed_arguments(section)
     needle_reasoning = ""
@@ -3934,15 +4004,16 @@ def _has_trusted_evidence(evidence: Sequence[object], attempts: Sequence[Mapping
     non_chart = [
         item
         for item in evidence
-        if _f(item, "tool", default=None) not in ("set_chart_symbol", "update_watchlist", "intake_digest")
+        if _f(item, "tool", default=None)
+        not in ("set_chart_symbol", "update_watchlist", "intake_digest", "request_context")
     ]
     if non_chart:
         return True
     return any(a.get("evidence_id") and a.get("tool") not in ("set_chart_symbol", "update_watchlist") for a in attempts)
 
 
-def _normalize_expansion_item(item: object) -> dict[str, str] | None:
-    """One reasoner follow-up to question/why; None when uncitable."""
+def _normalize_expansion_item(item: object) -> dict[str, JSONValue] | None:
+    """Keep the reasoner's question identity and declared dependencies."""
     if not isinstance(item, dict):
         return None
     question = item.get("question")
@@ -3950,29 +4021,37 @@ def _normalize_expansion_item(item: object) -> dict[str, str] | None:
         return None
     why = item.get("whyItMatters")
     return {
+        "id": item.get("id") if isinstance(item.get("id"), str) else None,
         "question": question.strip(),
         "whyItMatters": why if isinstance(why, str) and why.strip() else "Route question.",
+        **({"dependsOn": item["dependsOn"]} if isinstance(item.get("dependsOn"), list) else {}),
     }
 
 
-def _expansion_proposals(proposal: Mapping[str, object]) -> list[dict[str, str]]:
-    """Reasoner-discovered follow-ups (non-authoritative until JEV admits)."""
+def _expansion_proposals(proposal: Mapping[str, object]) -> list[dict[str, JSONValue]]:
+    """Prioritize missing-evidence questions. Every candidate still needs explicit JEV admission."""
+    out: list[dict[str, JSONValue]] = []
+    requests = proposal.get("evidenceRequests")
+    for request in requests if isinstance(requests, list) else []:
+        if isinstance(request, dict) and isinstance(request.get("missingEvidence"), str):
+            out.append(
+                {
+                    "question": request["missingEvidence"],
+                    "whyItMatters": "The parent needs this evidence before it can resolve.",
+                    "dependsOn": [],
+                    "evidence_request": True,
+                }
+            )
     raw = proposal.get("proposals")
-    if not isinstance(raw, list):
-        return []
-    out: list[dict[str, str]] = []
-    for item in raw:
+    for item in raw if isinstance(raw, list) else []:
         cand = _normalize_expansion_item(item)
-        if cand is None:
-            continue
-        out.append(cand)
-        if len(out) >= _EXPAND_CAP:
-            break
-    return out
+        if cand is not None and not any(c["question"] == cand["question"] for c in out):
+            out.append(cand)
+    return out[:_EXPAND_CAP]
 
 
 def _expansion_questions(
-    candidates: Sequence[Mapping[str, str]], objective: str
+    candidates: Sequence[Mapping[str, JSONValue]], objective: str
 ) -> tuple[dict[str, JSONValue], dict[str, dict[str, str]]]:
     """One JEV choice per follow-up over admit/reject."""
     criteria = {
@@ -4001,7 +4080,7 @@ async def _expansion_decisions(
     sid: str,
     objective: str,
     node_id: str,
-    candidates: Sequence[Mapping[str, str]],
+    candidates: Sequence[Mapping[str, JSONValue]],
 ) -> dict[str, dict[str, JSONValue]] | None:
     """JEV disposition round over follow-ups; None on outage (fail-closed admission)."""
     try:
@@ -4026,18 +4105,48 @@ def _admit_expansion_nodes(
     kernel: _Kernel,
     sid: str,
     node_id: str,
-    candidates: Sequence[Mapping[str, str]],
+    candidates: Sequence[Mapping[str, JSONValue]],
     decisions: Mapping[str, Mapping[str, JSONValue]],
 ) -> int:
     """Create JEV-admitted follow-ups; a create failure raises."""
     created = 0
-    for i, cand in enumerate(candidates):
-        verdict = decisions.get(f"expand-{i}")
-        choice = verdict.get("choice") if verdict is not None else None
-        if choice == "reject":
-            continue
-        kernel.create_node(sid, cand["question"], cand["whyItMatters"], depends_on=[node_id])
-        created += 1
+    existing = kernel._store().list_nodes(sid)
+    by_id = {node.node_id: node.node_id for node in existing}
+    by_question = {node.question: node.node_id for node in existing}
+    pending = [
+        cand
+        for i, cand in enumerate(candidates)
+        if isinstance(verdict := decisions.get(f"expand-{i}"), Mapping) and verdict.get("choice") == "admit"
+    ]
+    evidence_nodes: list[str] = []
+    while pending:
+        progress = False
+        for cand in list(pending):
+            raw_deps = cand.get("dependsOn", [node_id])
+            deps = [str(dep) for dep in raw_deps] if isinstance(raw_deps, list) else [node_id]
+            if cand.get("evidence_request"):
+                deps = [dep for dep in deps if dep != node_id]
+            if any(dep not in by_id for dep in deps):
+                continue
+            question = str(cand["question"])
+            child_id = by_question.get(question)
+            if child_id is None:
+                child = kernel.create_node(
+                    sid, question, str(cand["whyItMatters"]), depends_on=[by_id[dep] for dep in deps]
+                )
+                child_id = child.node_id
+                by_question[question] = child_id
+                created += 1
+            if isinstance(cand.get("id"), str):
+                by_id[str(cand["id"])] = child_id
+            if cand.get("evidence_request") and child_id != node_id:
+                evidence_nodes.append(child_id)
+            pending.remove(cand)
+            progress = True
+        if not progress:
+            break
+    if evidence_nodes:
+        kernel.wait_for_nodes(sid, node_id, evidence_nodes)
     _record(
         kernel,
         sid,
@@ -4065,7 +4174,7 @@ async def _expand_graph(
     if not candidates:
         return 0
     decisions = await _expansion_decisions(jev, sid, objective, node_id, candidates)
-    if decisions is None:
+    if not isinstance(decisions, Mapping):
         return 0
     return _admit_expansion_nodes(kernel, sid, node_id, candidates, decisions)
 
@@ -4144,6 +4253,8 @@ async def _select_round(
     attempts: Sequence[Mapping[str, JSONValue]],
 ) -> tuple[str, ToolDecision]:
     """One JEV tool-selection round with its decision record; returns (action, decision)."""
+    raw_ticker = session.get("ticker")
+    ticker = raw_ticker if isinstance(raw_ticker, str) and raw_ticker else None
     decision = await jev.select_tool(
         query_with_today_utc(_session_objective(session)),
         node,
@@ -4152,6 +4263,7 @@ async def _select_round(
         [dict(a) for a in attempts],
         session_id=sid,
         job_id=None,
+        ticker=ticker,
     )
     _record(
         kernel,
@@ -4251,24 +4363,38 @@ async def _reason_phase(
     analysis = await _analyze_before_deadline(active_reasoner, session, node, ctx_evidence, attempts, deadline_at)
     if analysis is None:
         return {"done": True, "terminal": None, "decision": decision}
-    verdict = await _adjudicate_analysis(jev, kernel, analysis, node, sid, nid)
+    verdict = await _deadline_call(
+        "reason adjudication", deadline_at, _adjudicate_analysis(jev, kernel, analysis, node, sid, nid)
+    )
     if _selection_action(verdict) == "resolved":
         if _material_read_pending(session, node, attempts, evidence, adjudicated=True):
             attempts.append(_reselect_attempt(_MATERIAL_READ_HOLD))
             return {"done": True, "terminal": None, "decision": verdict}
-        terminal = _resolve_or_reselect(kernel, sid, nid, evidence, attempts, admitted)
-        return {"done": True, "terminal": terminal, "decision": verdict}
+        if _has_trusted_evidence(evidence, attempts):
+            terminal = _resolve_or_reselect(kernel, sid, nid, evidence, attempts, admitted)
+            return {"done": True, "terminal": terminal, "decision": verdict}
+        # Reasoning without evidence is not an answer: keep selecting tools.
+        return {"done": True, "terminal": None, "decision": decision}
     expansion = await _expand_before_deadline(active_reasoner, session, node, analysis, sid, nid, deadline_at, attempts)
     if expansion is None:
         return {"done": True, "terminal": None, "decision": verdict}
-    await _expand_graph(
-        jev,
-        kernel,
-        sid,
-        query_with_today_utc(_session_objective(session)),
-        nid,
-        expansion,
+    created = await _deadline_call(
+        "graph expansion",
+        deadline_at,
+        _expand_graph(jev, kernel, sid, query_with_today_utc(_session_objective(session)), nid, expansion),
     )
+    if created:
+        return {
+            "done": True,
+            "terminal": {
+                "node_id": nid,
+                "status": "gathering",
+                "expanded": created,
+                "admitted": admitted,
+                "attempts": [dict(attempt) for attempt in attempts],
+            },
+            "decision": verdict,
+        }
     tools = _selection_tools(verdict) or _selection_tools(decision)
     if not tools:
         attempts.append(_reselect_attempt("adjudication named no tool; re-selecting"))
@@ -4559,10 +4685,14 @@ def _admittable_candidate(
     ev_state: object,
     kernel: _Kernel,
 ) -> dict[str, object] | None:
-    """Admit a candidate only when JEV permits its state and the kernel can cite its bytes."""
-    if tool in ("set_chart_symbol", "update_watchlist"):
+    """Admit an explicitly relevant candidate only when the kernel can prove its source bytes."""
+    if tool in ("set_chart_symbol", "update_watchlist") or _f(outcome, "error") is not None:
         return None
-    if not (isinstance(ev_state, str) and ev_state in _ADMITTABLE_EVIDENCE_STATES and _f(outcome, "error") is None):
+    if isinstance(ev_state, Mapping):
+        relevance = ev_state.get("topical_relevance_result", ev_state.get("topical_relevance"))
+        if not (isinstance(relevance, Mapping) and relevance.get("outcome") == "yes"):
+            return None
+    elif not (isinstance(ev_state, str) and ev_state in _ADMITTABLE_EVIDENCE_STATES):
         return None
     return _evidence_candidate(tool, _attempt_domain(tool, attempt), attempt.get("result"), outcome, kernel)
 
@@ -4760,6 +4890,7 @@ async def _settle_round(
         settled, _ = _settle_attempt(kernel, attempt, sid, nid)
         if settled is not None:
             attempts.append(settled)
+            kernel.record_attempt(sid, node, settled)
             blocked = _guided_break_result(attempts, attempt, kernel, sid, nid, admitted, progressed)
             if blocked is not None:
                 return blocked
@@ -4872,22 +5003,29 @@ async def _settle_executed(
     """Assess, admit, and record one executed attempt; returns (early signal, progressed, admitted)."""
     outcome = attempt["outcome"]
     tool = str(attempt["tool"])
-    assessment, assess_ms = await _assess_attempt(
-        jev,
-        kernel,
-        node,
-        outcome,
-        evidence,
-        attempts,
-        sid,
-        nid,
-        str(attempt["job_id"]),
-    )
-    ev_state = _f(assessment, "evidence_state", "decision", default=None)
-    evidence_id, made_progress, admit_failure = _admit_attempt_evidence(kernel, sid, tool, attempt, outcome, ev_state)
+    raw_deadline = session.get("_deadline_at") if session is not None else None
+    deadline = float(raw_deadline) if isinstance(raw_deadline, (float, int)) else None
+    try:
+        assessment, assess_ms = await _deadline_call(
+            "result assessment",
+            deadline,
+            _assess_attempt(jev, kernel, node, outcome, evidence, attempts, sid, nid, str(attempt["job_id"])),
+        )
+        ev_state = _f(assessment, "evidence_state", "decision", default=None)
+        evidence_id, made_progress, admit_failure = await _deadline_call(
+            "evidence admission",
+            deadline,
+            _sec_thread_call(
+                functools.partial(_admit_attempt_evidence, kernel, sid, tool, attempt, outcome, assessment)
+            ),
+        )
+    except (asyncio.CancelledError, TimeoutError) as exc:
+        _fail_attempt_job(kernel, str(attempt["job_id"]), str(exc) or "research deadline reached", "timeout")
+        raise
     if admit_failure is not None:
         admit_failure["assess_ms"] = assess_ms
         attempts.append(admit_failure)
+        kernel.record_attempt(sid, node, admit_failure)
         return None, progressed, admitted
     if made_progress:
         admitted += 1
@@ -4899,8 +5037,11 @@ async def _settle_executed(
         successful["evidence_state"] = _scalar(ev_state)
         successful["resolution_support_answer"] = _scalar(assessment.get("resolution_support_answer"))
         successful["continuation"] = _scalar(assessment.get("continuation"))
+        successful["inspected"] = True
+        successful["topical_relevance_result"] = assessment.get("topical_relevance_result")
     _listing_result_ref(successful, tool, attempt, kernel)
     attempts.append(successful)
+    kernel.record_attempt(sid, node, successful)
     if _queue_settled_verdict(verdicts, assessment, index, tool, results, session, node, attempts, continuation):
         return None, progressed, admitted
     signal = _round_continuation(verdicts, kernel, sid, nid, evidence, attempts, admitted, progressed)
@@ -5084,20 +5225,31 @@ async def _invoke_and_settle(
     progress: _Progress | None = None,
 ) -> _RoundOut:
     """Invoke selected tools and settle results; returns step signals."""
-    results = await _invoke_phase(
-        tools,
-        node,
-        session,
-        registry,
-        ctx_evidence,
-        attempts,
-        kernel,
-        executors["needle_generate"],
-        executors["invoke"],
-        executors["to_outcome"],
-        tool_session,
-        as_of_str,
+    results = await _deadline_call(
+        "tool execution",
+        executors["deadline_at"],
+        _invoke_phase(
+            tools,
+            node,
+            session,
+            registry,
+            ctx_evidence,
+            attempts,
+            kernel,
+            executors["needle_generate"],
+            executors["invoke"],
+            executors["to_outcome"],
+            tool_session,
+            as_of_str,
+        ),
     )
+    for attempt in results:
+        if attempt.get("tool") == "get_sec_document":
+            retrieved = _success_attempt_record("get_sec_document", attempt, attempt.get("outcome"), decision, None)
+            retrieved["document_content"] = _sec_text(attempt.get("result"), attempt.get("outcome")) is not None
+            retrieved["inspected"] = False
+            _listing_result_ref(retrieved, "get_sec_document", attempt, kernel)
+            kernel.record_attempt(sid, node, retrieved, event="source_retrieved")
     tickers = [_chart_receipt_ticker(attempt) for attempt in results]
     round_out = await _settle_round(
         results,
@@ -5155,9 +5307,17 @@ async def _run_round(
                 "admitted": admitted,
             }
         resolved_out = _resolve_or_reselect(kernel, sid, nid, evidence, attempts, admitted)
+        if resolved_out is not None:
+            return {
+                "terminal": resolved_out,
+                "continue": False,
+                "decision": decision,
+                "admitted": admitted,
+            }
+        # A resolve vote with no evidence is not an answer: keep selecting tools.
         return {
-            "terminal": resolved_out,
-            "continue": resolved_out is None,
+            "terminal": None,
+            "continue": True,
             "decision": decision,
             "admitted": admitted,
         }
@@ -5499,7 +5659,7 @@ async def _drive_rounds(
     deadline_at = executors["deadline_at"]
     intake_observations = kernel._intake_observations(sid)
     evidence = [*_load_evidence(sid, kernel), *intake_observations]
-    attempts: list[dict[str, JSONValue]] = []
+    attempts = kernel.node_attempts(sid, nid)
     admitted = 0
     select_failures = 0
     stale_rounds = 0
@@ -5516,19 +5676,25 @@ async def _drive_rounds(
         ev_before = len(evidence)
         _sel_t0 = _time.perf_counter()
         try:
-            action, decision = await _call_select_round(
-                executors["select_round"],
-                jev,
-                kernel,
-                sid,
-                nid,
-                session,
-                node,
-                select_registry,
-                sel_ctx,
-                attempts,
+            action, decision = await _deadline_call(
+                "tool selection",
+                deadline_at,
+                _call_select_round(
+                    executors["select_round"],
+                    jev,
+                    kernel,
+                    sid,
+                    nid,
+                    session,
+                    node,
+                    select_registry,
+                    sel_ctx,
+                    attempts,
+                ),
             )
             select_ms = (_time.perf_counter() - _sel_t0) * 1000.0
+        except TimeoutError:
+            raise
         except Exception as exc:
             select_ms = (_time.perf_counter() - _sel_t0) * 1000.0
             select_failures += 1
@@ -5577,8 +5743,19 @@ async def _drive_rounds(
             as_of_str,
             progress=progress,
         )
+        new_admitted = step["admitted"] - admitted
         admitted = step["admitted"]
-        _progress(progress, "tool_done", {"node_id": nid, "admitted": admitted})
+        _progress(
+            progress,
+            "tool_done",
+            {
+                "node_id": nid,
+                "admitted": new_admitted,
+                "total_admitted": admitted,
+                "has_content": any(bool(a.get("outcome_summary")) for a in attempts[n_before:]),
+                "no_new_admission": new_admitted == 0,
+            },
+        )
         _log_round_timing(
             sid,
             nid,
@@ -5843,19 +6020,42 @@ async def _run_node(node: object, session_id: str | None = None, **hooks: object
     kernel = _hook(hooks, "kernel", _Kernel) or _default_kernel(_hook_repo(hooks))
     jev = _hook(hooks, "jev", JevClient) or _default_jev()
     ctx = _node_context(node, session_id, kernel, hooks)
-    return await _drive_rounds(
-        node,
-        ctx["session"],
-        ctx["registry"],
-        kernel,
-        jev,
-        ctx["sid"],
-        ctx["nid"],
-        hooks,
-        ctx["tool_session"],
-        ctx["as_of_str"],
-        _callable_hook(hooks, "progress"),
-    )
+    deadline = _node_hooks(hooks)["deadline_at"]
+    ctx["session"]["_deadline_at"] = deadline
+    try:
+        return await _deadline_call(
+            "node research",
+            deadline,
+            _drive_rounds(
+                node,
+                ctx["session"],
+                ctx["registry"],
+                kernel,
+                jev,
+                ctx["sid"],
+                ctx["nid"],
+                {**hooks, "deadline_at": deadline},
+                ctx["tool_session"],
+                ctx["as_of_str"],
+                _callable_hook(hooks, "progress"),
+            ),
+        )
+    except TimeoutError as exc:
+        reason = str(exc)
+        attempts = kernel.node_attempts(ctx["sid"], ctx["nid"])
+        _block(kernel, ctx["sid"], ctx["nid"], reason)
+        kernel.record_decision(
+            ctx["sid"],
+            "deadline",
+            {},
+            {},
+            {"stage": reason.removeprefix("deadline reached during "), "error": reason},
+            node_id=ctx["nid"],
+            request={"objective": ctx["session"].get("objective"), "purpose": _f(node, "question")},
+        )
+        out = _guard_payload(ctx["nid"], sum(bool(a.get("evidence_id")) for a in attempts), attempts, reason)
+        out["deadline"] = {"stage": reason.removeprefix("deadline reached during "), "error": reason}
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -5938,11 +6138,18 @@ async def _session_rounds(
             guard_reason = f"incomplete: runtime guard ({_MAX_SESSION_ROUNDS} session rounds without convergence)"
             break
         round_results, timed_out = await _gather_round(nodes, session_id, run_hooks, kernel, remaining)
+        node_results.extend(round_results)
         if timed_out:
             guard_reason = "incomplete: run deadline reached during session round"
-            _block_cancelled_round(kernel, session_id, nodes, guard_reason, node_results)
+            settled = {str(result.get("node_id")) for result in round_results}
+            _block_cancelled_round(
+                kernel,
+                session_id,
+                [node for node in nodes if str(_f(node, "node_id", "id")) not in settled],
+                guard_reason,
+                node_results,
+            )
             break
-        node_results.extend(round_results)
         guarded = guarded or _round_guard(round_results)
         if not _round_progressed(round_results):
             return _stalled_or_guarded(session_id, rounds, node_results, guarded, guard_reason)
@@ -5957,16 +6164,14 @@ async def _gather_round(
     remaining: float,
 ) -> tuple[list[dict[str, JSONValue]], bool]:
     """Gather one session round under the remaining deadline; True reports a deadline timeout."""
-    try:
-        return (
-            await asyncio.wait_for(
-                asyncio.gather(*(_run_one_node(node, session_id, run_hooks, kernel) for node in nodes)),
-                timeout=max(remaining, 0.01),
-            ),
-            False,
-        )
-    except TimeoutError:
-        return [], True
+    tasks = [asyncio.create_task(_run_one_node(node, session_id, run_hooks, kernel)) for node in nodes]
+    if not tasks:
+        return [], False
+    _done, pending = await asyncio.wait(tasks, timeout=max(remaining, 0.0))
+    for task in pending:
+        task.cancel()
+    settled = await asyncio.gather(*tasks, return_exceptions=True)
+    return [result for result in settled if isinstance(result, dict)], bool(pending)
 
 
 def _block_cancelled_round(
@@ -5992,7 +6197,7 @@ def _block_cancelled_round(
 
 def _round_progressed(round_results: Sequence[Mapping[str, JSONValue]]) -> bool:
     """True when the round resolved a node or admitted evidence."""
-    return any(r.get("status") == "resolved" or r.get("admitted") for r in round_results)
+    return any(r.get("status") == "resolved" or r.get("admitted") or r.get("expanded") for r in round_results)
 
 
 def _round_guard(round_results: Sequence[Mapping[str, JSONValue]]) -> bool:
