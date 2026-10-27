@@ -1081,7 +1081,7 @@ _NO_COUNT = "TSLA 10-K filings since 2025-01-01 for CIK 0001318605, accession 00
         ("list_sec_filings", _TSLA, {"identifier": "TSLA", "limit": 50}, None, "accepted"),
         ("find_sec_entities_bounded", _TESLA, {"query": "Tesla", "limit": 20}, None, "accepted"),
         # Dates, CIKs, accessions, and 10-K are not counts: the default still grounds.
-        ("list_sec_filings", _NO_COUNT, {"identifier": "TSLA", "limit": 50}, None, "accepted"),
+        ("list_sec_filings", _NO_COUNT, {"identifier": "TSLA", "forms": ["10-K"], "limit": 50}, None, "accepted"),
         # Unknown numbers stay rejected.
         ("list_sec_filings", _TSLA, {"identifier": "TSLA", "limit": 37}, None, "not grounded"),
         ("find_sec_entities_bounded", _TESLA, {"query": "Tesla", "limit": 50}, None, "not grounded"),
@@ -1123,7 +1123,7 @@ _NO_COUNT = "TSLA 10-K filings since 2025-01-01 for CIK 0001318605, accession 00
             "get_sec_document",
             "Summarize risk factors in TSLA latest 2 10-K filings",
             {"accession_no": "0001318605-25-000010", "limit": 12000},
-            {"limit": 12000},
+            {"accession_no": "0001318605-25-000010", "limit": 12000},
             "accepted",
         ),
         # Conflicting counts fail before the engine runs.
@@ -1313,6 +1313,58 @@ def test_handle_passes_raw_request_text_to_complete(monkeypatch: pytest.MonkeyPa
     )
     assert out["arguments"] == {"identifier": "AAPL"}
     assert seen["text"] == "fallback objective"
+
+
+@pytest.mark.parametrize("tool", ["get_sec_filing", "get_sec_document", "list_sec_documents"])
+def test_generate_exposes_grounded_accession_in_user_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tool: str
+) -> None:
+    srv = _load_server(monkeypatch, tmp_path)
+    accession = "0001045810-26-000075"
+    srv.needle.Needle.envelope = {
+        "type": "call",
+        "function_calls": [{"name": tool, "arguments": {"accession_no": accession}}],
+    }
+    req = {
+        "id": "sec",
+        "action": "arguments.generate",
+        "tool": tool,
+        "schema": _production_schema(tool),
+        "objective": "NVDA latest 10-Q risk factors",
+        "context": {"grounded_arguments": {"accession_no": accession}},
+    }
+    assert srv.handle(json.dumps(req))["arguments"] == {"accession_no": accession}
+    texts = [payload[0] for name, payload in srv.needle.Needle.calls if name == "complete"]
+    assert texts == [f"NVDA latest 10-Q risk factors\naccession_no: {accession}"]
+    srv.needle.Needle.envelope["function_calls"] = [
+        {"name": tool, "arguments": {"accession_no": "0001045810-26-000052"}}
+    ]
+    assert "changed grounded accession_no" in srv.handle(json.dumps(req))["error"]
+    req["context"] = {}
+    assert "needs a grounded accession_no" in srv.handle(json.dumps(req))["error"]
+    assert len([name for name, _ in srv.needle.Needle.calls if name == "complete"]) == 2
+
+
+@pytest.mark.parametrize("form", ["10-Q", "10-K", "8-K"])
+def test_generate_exposes_form_and_default_count(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, form: str) -> None:
+    srv = _load_server(monkeypatch, tmp_path)
+    arguments = {"identifier": "NVDA", "forms": [form], "limit": 50}
+    srv.needle.Needle.envelope = {
+        "type": "call",
+        "function_calls": [{"name": "list_sec_filings", "arguments": arguments}],
+    }
+    req = {
+        "id": "forms",
+        "action": "arguments.generate",
+        "tool": "list_sec_filings",
+        "schema": _production_schema("list_sec_filings"),
+        "objective": f"NVDA latest {form} risk factors",
+    }
+    assert srv.handle(json.dumps(req))["arguments"] == arguments
+    texts = [payload[0] for name, payload in srv.needle.Needle.calls if name == "complete"]
+    assert texts == [f"NVDA latest {form} risk factors\nforms: {form}\nlimit: 50"]
+    arguments["limit"] = int(form.split("-")[0])
+    assert "changed grounded limit" in srv.handle(json.dumps(req))["error"]
 
 
 def _run_operation(operation: str) -> object:

@@ -368,6 +368,37 @@ def _request_text(node, objective):
     raise ValueError("arguments.generate needs a node question or objective")
 
 
+def _generation_text(text, objective, context, schema, limit):
+    """Expose execution handles in user text. Form numbers never supply a result count."""
+    properties = schema.get("properties", {})
+    grounded = context.get("grounded_arguments", {}) if isinstance(context, dict) else {}
+    expected = {}
+    if "accession_no" in schema.get("required", []):
+        accession = grounded.get("accession_no") if isinstance(grounded, dict) else None
+        if accession is None:
+            match = re.search(r"\b\d{10}-?\d{2}-?\d{6}\b", f"{objective or ''} {text}")
+            accession = match.group(0) if match else None
+        if not isinstance(accession, str) or not re.fullmatch(r"\d{10}-?\d{2}-?\d{6}", accession):
+            raise ValueError("arguments.generate needs a grounded accession_no from a successful filing listing")
+        expected["accession_no"] = accession
+    if "forms" in properties:
+        forms = sorted(
+            {
+                form.upper()
+                for form in re.findall(r"\b(?:10-[QK]|8-K)(?:/A)?\b", f"{objective or ''} {text}", re.IGNORECASE)
+            }
+        )
+        if forms:
+            expected["forms"] = forms
+            default = properties.get("limit", {}).get("default")
+            if limit is not None or isinstance(default, int):
+                expected["limit"] = limit if limit is not None else default
+    for key, value in expected.items():
+        rendered = ", ".join(value) if isinstance(value, list) else str(value)
+        text += f"\n{key}: {rendered}"
+    return text, expected
+
+
 def _bound_agent(tool, schema, facts):
     """Fresh Needle bound to exactly the JEV-selected tool (docs: one tool per action)."""
     bound_kwargs = dict(kwargs)
@@ -550,6 +581,7 @@ def _handle_generate(req):
     context = req.get("context")
     # Conflicting counts fail here, before the engine runs.
     limit = _requested_limit(objective, node, context, schema)
+    text, expected = _generation_text(text, objective, context, schema, limit)
     bound = _bound_agent(tool, schema, _arguments_facts(objective, node, context, schema, limit))
     _init_ms = (_t.perf_counter() - _gen_t0) * 1000.0
     try:
@@ -559,7 +591,11 @@ def _handle_generate(req):
     _gen_ms = (_t.perf_counter() - _gen_t0) * 1000.0
     sys.stderr.write(f"needle timing tool={tool} init_ms={_init_ms:.1f} generate_ms={_gen_ms:.1f}\n")
     sys.stderr.flush()
-    return _generated_decision(tool, r, limit)
+    decision = _generated_decision(tool, r, limit)
+    for key, value in expected.items():
+        if decision["arguments"].get(key) != value:
+            raise ValueError(f"needle arguments for {tool!r} changed grounded {key}: expected {value!r}")
+    return decision
 
 
 def _handle_extract(req):

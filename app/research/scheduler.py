@@ -2284,7 +2284,10 @@ def _fallback_search_web_args(tool_name: str, node: object) -> dict[str, JSONVal
 
 
 def _revenue_listing_forms(objective: object) -> list[JSONValue] | None:
-    """Keep explicit 10-Q requests separate from latest quarterly or annual revenue."""
+    """Use explicitly named forms before the forms implied by a revenue request."""
+    named = _material_forms(objective)
+    if named:
+        return [form for form in sorted(named)]
     if _latest_revenue_objective(objective):
         return (
             ["10-Q"]
@@ -2493,7 +2496,14 @@ def _seed_listing_forms(filled: dict[str, JSONValue], tool_name: str, objective:
     forms = _revenue_listing_forms(objective)
     if forms is None:
         return
-    if filled.get("forms") and not _TEN_Q_RE.search(str(objective).lower()):
+    selected = filled.get("forms")
+    if (
+        isinstance(selected, list)
+        and selected
+        and all(isinstance(form, str) and form.endswith("/A") and form.removesuffix("/A") in forms for form in selected)
+    ):
+        return
+    if filled.get("forms") and not _material_forms(objective):
         return
     filled["forms"] = forms
     _log_args_stage("args_seed", sid, nid, tool_name, "forms")
@@ -2960,8 +2970,8 @@ async def _generate_tool_arguments(
         return grounded
     persisted = _persisted_arguments(tool_name, objective, session, node, schema, attempts, kernel, sid, nid)
     if persisted is not None:
-        _validate_repaired_args(tool_name, persisted[0], objective, session, node, evidence, attempts, kernel)
-        return persisted
+        _validate_repaired_args(tool_name, persisted, objective, session, node, evidence, attempts, kernel)
+        context["grounded_arguments"] = persisted
     seeded = _seeded_arguments(tool_name, objective, session, node, as_of, schema, scoped, sid, nid)
     if seeded is not None:
         _validate_repaired_args(tool_name, seeded[0], objective, session, node, evidence, attempts, kernel)
@@ -3004,7 +3014,10 @@ async def _generate_tool_arguments(
         session_as_of=session.get("as_of"),
     )
     _validate_repaired_args(tool_name, filled, objective, session, node, evidence, attempts, kernel)
-    filled = _carry_document_read(filled, tool_name, session, node, evidence, attempts, schema, kernel, sid, nid)
+    if persisted is not None:
+        filled.update(persisted)
+    else:
+        filled = _carry_document_read(filled, tool_name, session, node, evidence, attempts, schema, kernel, sid, nid)
     keys, size = _toolflow_args_summary(filled)
     logger.info(
         "toolflow args_ok sid=%s nid=%s tool=%s schema_empty=%s match=exact arg_keys=%s arg_bytes=%s",
@@ -3149,8 +3162,8 @@ def _persisted_arguments(
     kernel: _Kernel,
     sid: str,
     nid: str,
-) -> tuple[dict[str, JSONValue], str, bool] | None:
-    """Persisted-row accession for a carry tool, without Needle. None when no single filing wins."""
+) -> dict[str, JSONValue] | None:
+    """Select grounded execution values from persisted rows. None when no single filing wins."""
     if not attempts:
         return None
     tried = _tried_document_calls(attempts)
@@ -3167,7 +3180,7 @@ def _persisted_arguments(
             session_as_of=session.get("as_of"),
         )
         _log_args_carry(sid, nid, tool_name, filled)
-        return filled, "scheduler advanced to an unread persisted accession without Needle", False
+        return filled
     resolved = _resolve_persisted_accession(tool_name, {}, schema, session, node, attempts, kernel)
     if resolved is None:
         return None
@@ -3182,7 +3195,7 @@ def _persisted_arguments(
         session_as_of=session.get("as_of"),
     )
     _log_args_carry(sid, nid, tool_name, filled)
-    return filled, "scheduler resolved persisted accession without Needle", False
+    return filled
 
 
 def _missing_required_argument(schema: Mapping[str, JSONValue], arguments: Mapping[str, JSONValue]) -> bool:

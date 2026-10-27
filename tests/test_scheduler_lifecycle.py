@@ -1260,8 +1260,12 @@ def test_navigation_attempt_restores_document_route_without_relisting(
         invoked.append((name, dict(args)))
         return {"error": "The test stops after the restored document route."}
 
-    def no_needle(**kwargs: object) -> None:
-        raise AssertionError("Persisted navigation supplies the accession.")
+    def grounded_needle(**kwargs: object) -> dict[str, JSONValue]:
+        context = kwargs["context"]
+        assert isinstance(context, dict)
+        arguments = context["grounded_arguments"]
+        assert isinstance(arguments, dict) and arguments["accession_no"] == _LISTED_8K
+        return {"tool": "get_sec_document", "arguments": arguments}
 
     result = asyncio.run(
         sched.run_node(
@@ -1272,7 +1276,7 @@ def test_navigation_attempt_restores_document_route_without_relisting(
             registry=sched.build_registry(),
             select_round=select,
             invoke=invoke,
-            needle_generate=no_needle,
+            needle_generate=grounded_needle,
             max_rounds=1,
             tool_session=RuntimeToolSession(session_id=f"scheduler:{sid}"),
         )
@@ -3288,7 +3292,7 @@ def test_generated_valid_8k_accession_changes_to_listed_latest_ten_q_before_invo
             as_of=None,
         )
     )
-    assert needle_calls == []
+    assert needle_calls == ["get_sec_document"]
     assert invoked == [("get_sec_document", {"accession_no": accq, "query": "revenue", "limit": 32000})]
     assert out["arguments"] == {
         "accession_no": accq,
@@ -3374,7 +3378,7 @@ def test_latest_quarter_revenue_read_replaces_stale_needle_accession_with_latest
             _Kernel(),
         )
     )
-    assert needle_calls == []
+    assert needle_calls == ["get_sec_document"]
     assert args.get("accession_no") == latest_q
 
 
@@ -7221,7 +7225,7 @@ def test_sched_needle_failure_prefers_structured_10q_and_seeds_query(monkeypatch
         )
     )
     assert args.get("accession_no") == accq and args.get("query") == "revenue"
-    assert reasoning == "scheduler resolved persisted accession without Needle" and withheld is False
+    assert reasoning == "carried accession from packet after needle failure" and withheld is False
 
 
 @pytest.mark.parametrize("tool_name", ["search_sec_filings", "search_sec_filings_bounded"])
@@ -9347,7 +9351,7 @@ def test_all_independent_nodes_start_before_any_finishes() -> None:
 
 
 def test_persisted_listing_resolves_accession_before_needle(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A persisted listing supplies its accession and exact primary document, without prompt grounding."""
+    """A persisted listing supplies the selected accession to Needle as a grounded argument."""
     import app.tools as _tools
 
     monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
@@ -9360,16 +9364,62 @@ def test_persisted_listing_resolves_accession_before_needle(monkeypatch: pytest.
         "outcome_summary": "The catalog is available.",
     }
 
-    async def no_needle(**kwargs: object) -> dict[str, JSONValue]:
-        raise AssertionError("The scheduler must resolve the persisted accession before Needle.")
+    async def grounded_needle(**kwargs: object) -> dict[str, JSONValue]:
+        context = kwargs["context"]
+        assert isinstance(context, dict)
+        assert context["grounded_arguments"] == {"accession_no": _LISTED_8K, "document_name": "nvda-8k.htm"}
+        return {"tool": "get_sec_document", "arguments": context["grounded_arguments"], "reasoning": "grounded handle"}
 
     args, reason, withheld = asyncio.run(
         sched._generate_tool_arguments(
-            no_needle, "get_sec_document", sched.build_registry(), _8K_SESSION, _node(), [], [attempt], None, kernel
+            grounded_needle,
+            "get_sec_document",
+            sched.build_registry(),
+            _8K_SESSION,
+            _node(),
+            [],
+            [attempt],
+            None,
+            kernel,
         )
     )
     assert args == {"accession_no": _LISTED_8K, "document_name": "nvda-8k.htm"}
-    assert reason == "scheduler resolved persisted accession without Needle" and withheld is False
+    assert reason == "grounded handle" and withheld is False
+
+
+def test_risk_factor_read_keeps_selected_execution_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Needle receives the listed accession. The scheduler retains the selected document and risk section."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
+    expected: dict[str, JSONValue] = {
+        "accession_no": _LISTED_10Q,
+        "document_name": "nvda-10q.htm",
+        "section": "Item 1A",
+    }
+
+    async def generate(**kwargs: object) -> dict[str, JSONValue]:
+        context = kwargs["context"]
+        assert isinstance(context, dict) and context["grounded_arguments"] == expected
+        return {
+            "tool": "get_sec_document",
+            "arguments": {"accession_no": _LISTED_10Q, "section": "Item 1"},
+        }
+
+    args, _, _ = asyncio.run(
+        sched._generate_tool_arguments(
+            generate,
+            "get_sec_document",
+            sched.build_registry(),
+            {"session_id": "s1", "objective": "NVDA latest 10-Q risk factors"},
+            _node(),
+            [],
+            [_sec_listing()],
+            None,
+            _Kernel(),
+        )
+    )
+    assert args == expected
 
 
 @pytest.mark.parametrize("invalid", ["issuer", "session", "error", "malformed", "schema"])
@@ -9533,6 +9583,11 @@ def test_material_read_hold_recovers_then_reports_incomplete_guard(form: str, mo
         return next(selected)
 
     async def generate(**kwargs: object) -> dict[str, JSONValue]:
+        if kwargs["tool"] == "get_sec_document":
+            context = kwargs["context"]
+            assert isinstance(context, dict)
+            assert context["grounded_arguments"] == {"accession_no": _LISTED_8K}
+            return {"tool": "get_sec_document", "arguments": context["grounded_arguments"]}
         assert kwargs["tool"] == "list_sec_filings"
         return {"tool": "list_sec_filings", "arguments": {"identifier": "NVDA"}, "reasoning": "r"}
 
@@ -9576,7 +9631,10 @@ def test_material_read_hold_recovers_then_reports_incomplete_guard(form: str, mo
             None,
         )
     )
-    assert invoked == [("list_sec_filings", {"identifier": "NVDA"}), ("get_sec_document", {"accession_no": _LISTED_8K})]
+    assert invoked == [
+        ("list_sec_filings", {"identifier": "NVDA", "forms": [form]}),
+        ("get_sec_document", {"accession_no": _LISTED_8K}),
+    ]
     assert out["status"] == "blocked" and out["incomplete_guard"] is True
     attempts = out["attempts"]
     assert isinstance(attempts, list)
