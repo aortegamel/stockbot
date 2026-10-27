@@ -57,21 +57,6 @@ class _FakeJev:
         return out
 
 
-def _proposals(n: int) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    for i in range(n):
-        rows.append(
-            {
-                "id": f"rs:t-q{i}",
-                "objectiveId": "rs:t",
-                "question": f"q{i}?",
-                "dependsOn": [],
-                "whyItMatters": "Route question.",
-            }
-        )
-    return rows
-
-
 def _needle_hook(**kwargs: object) -> dict[str, object]:
     return {"tool": "t", "arguments": {}}
 
@@ -110,6 +95,9 @@ def _offline_research(monkeypatch: pytest.MonkeyPatch) -> None:
     def _list_jobs(self: ResearchRepository, session_id: str) -> list[Job]:
         return []
 
+    def _list_results(self: ResearchRepository, session_id: str) -> list[dict[str, JSONValue]]:
+        return []
+
     def _no_database(self: ResearchRepository) -> Never:
         raise AssertionError("Persistent worker tests must not access the database")
 
@@ -118,6 +106,7 @@ def _offline_research(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ResearchRepository, "list_nodes", _list_nodes)
     monkeypatch.setattr(ResearchRepository, "list_decisions", _list_decisions)
     monkeypatch.setattr(ResearchRepository, "list_jobs", _list_jobs)
+    monkeypatch.setattr(ResearchRepository, "list_tool_results", _list_results)
     monkeypatch.setattr(ResearchRepository, "_connect", _no_database)
 
 
@@ -143,14 +132,8 @@ def test_two_requests_share_one_jev_identity(monkeypatch: pytest.MonkeyPatch, _o
         out: dict[str, object] = {"status": "complete", "nodes": nodes}
         return out
 
-    def _no_nodes(sid: str, objective: str, admitted: object) -> None:
-        return None
-
     def _noop_node(*args: object, **kwargs: object) -> None:
         return None
-
-    async def _two_intake(*args: object, **kwargs: object) -> list[dict[str, object]]:
-        return _proposals(2)
 
     def _no_hit(*args: object, **kwargs: object) -> list[str]:
         return _empty_strs()
@@ -159,8 +142,6 @@ def test_two_requests_share_one_jev_identity(monkeypatch: pytest.MonkeyPatch, _o
         return "rs:t"
 
     monkeypatch.setattr("app.research.scheduler.run", _fake_run)
-    monkeypatch.setattr(kw, "_create_nodes_topological", _no_nodes)
-    monkeypatch.setattr(kw, "_graph_intake", _two_intake)
     monkeypatch.setattr(kw, "_registry_portfolio_hit", _no_hit)
 
     from app.research import service
@@ -174,7 +155,7 @@ def test_two_requests_share_one_jev_identity(monkeypatch: pytest.MonkeyPatch, _o
     assert out1["sessionId"] == "rs:t"
     assert out2["sessionId"] == "rs:t"
     assert seen == [fake, fake]  # same scheduler-run identity across both requests
-    assert fake.decide_calls == 2  # one entry disposition round per request; nodes follow in scheduler.run
+    assert fake.decide_calls == 0  # Root creation performs no entry disposition.
 
 
 def test_stalled_run_reports_escalated_without_guard(monkeypatch: pytest.MonkeyPatch, _offline_research: None) -> None:
@@ -203,14 +184,10 @@ def test_stalled_run_reports_escalated_without_guard(monkeypatch: pytest.MonkeyP
     def _no_hit(*args: object, **kwargs: object) -> list[str]:
         return _empty_strs()
 
-    async def _empty_intake(*args: object, **kwargs: object) -> list[dict[str, object]]:
-        return []
-
     def _research(*args: object, **kwargs: object) -> str:
         return "rs:stalled"
 
     monkeypatch.setattr("app.research.scheduler.run", _stalled_run)
-    monkeypatch.setattr(kw, "_graph_intake", _empty_intake)
     monkeypatch.setattr(kw, "_registry_portfolio_hit", _no_hit)
 
     from app.research import service
@@ -320,7 +297,7 @@ def test_main_ready_precedes_responses_and_closes_once(monkeypatch: pytest.Monke
     assert fake.closed == 1 and started["needle"] == 1001  # EOF closed once
 
 
-def test_route_served_while_run_in_flight(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_arguments_served_while_run_in_flight(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeJev()
     entered = threading.Event()
     release = threading.Event()
@@ -331,14 +308,14 @@ def test_route_served_while_run_in_flight(monkeypatch: pytest.MonkeyPatch) -> No
         assert release.wait(timeout=10)
         return _response_row("run1", "R")
 
-    def _fast_route(req: object, **kwargs: object) -> dict[str, object]:
+    def _fast_arguments(req: object) -> dict[str, object]:
         assert isinstance(req, dict)
         raw = req.get("id")
-        return {"id": raw if isinstance(raw, str) else "?", "route": "research_required", "personas": None}
+        return {"id": raw if isinstance(raw, str) else "?", "tool": "add_widget", "arguments": {}}
 
     monkeypatch.setattr(kw, "_startup", lambda: fake)
     monkeypatch.setattr(kw, "_run", _blocked_run)
-    monkeypatch.setattr(kw, "_route", _fast_route)
+    monkeypatch.setattr(kw, "_arguments", _fast_arguments)
     monkeypatch.setattr(kw, "_shutdown", lambda: None)
 
     def _no_signal(*args: object, **kwargs: object) -> None:
@@ -348,7 +325,7 @@ def test_route_served_while_run_in_flight(monkeypatch: pytest.MonkeyPatch) -> No
     body = (
         json.dumps({"id": "run1", "op": "run", "prompt": "x"})
         + "\n"
-        + json.dumps({"id": "r1", "op": "route", "prompt": "hi"})
+        + json.dumps({"id": "r1", "op": "arguments", "tool": "add_widget"})
         + "\n"
     )
     monkeypatch.setattr(sys, "stdin", io.StringIO(body))
@@ -362,7 +339,7 @@ def test_route_served_while_run_in_flight(monkeypatch: pytest.MonkeyPatch) -> No
         deadline = time.monotonic() + 5
         while '"r1"' not in buf.getvalue() and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert '"r1"' in buf.getvalue()  # route answered while run still blocked (not 60s)
+        assert '"r1"' in buf.getvalue()  # arguments answered while the run remained blocked
     finally:
         release.set()
         worker.join(timeout=10)
@@ -430,15 +407,14 @@ def test_main_answers_bad_lines_and_direct_ops(monkeypatch: pytest.MonkeyPatch) 
     def _no_signal(signum: int, handler: object) -> None:
         return None
 
-    def _route(req: Mapping[str, JSONValue], jev: object = None) -> dict[str, JSONValue]:
-        assert jev is fake
-        return {"id": kw._request_id(req), "route": "research_required", "personas": None}
+    def _arguments(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        return {"id": kw._request_id(req), "tool": "add_widget", "arguments": {}}
 
     def _boom(req: Mapping[str, JSONValue], jev: object = None) -> dict[str, JSONValue]:
         raise RuntimeError("assess down")
 
     monkeypatch.setattr("signal.signal", _no_signal)
-    monkeypatch.setattr(kw, "_route", _route)
+    monkeypatch.setattr(kw, "_arguments", _arguments)
     monkeypatch.setattr(kw, "_assess_final_response", _boom)
     bad_op = f"op must be one of {', '.join(kw._KERNEL_OPS)}"
     body = "\n".join(
@@ -447,7 +423,7 @@ def test_main_answers_bad_lines_and_direct_ops(monkeypatch: pytest.MonkeyPatch) 
             "{oops",
             "[1, 2]",
             json.dumps({"op": "nope", "id": "n1"}),
-            json.dumps({"id": "r1", "op": "route", "prompt": "hi"}),
+            json.dumps({"id": "r1", "op": "arguments", "tool": "add_widget"}),
             json.dumps({"id": "a1", "op": "assess_final_response", "text": "x"}),
         ]
     )
@@ -465,7 +441,7 @@ def test_main_answers_bad_lines_and_direct_ops(monkeypatch: pytest.MonkeyPatch) 
     assert rows[1]["terminal"] == {"category": "invalid_params", "message": "invalid JSON"}
     assert rows[2]["terminal"] == {"category": "invalid_params", "message": bad_op}
     assert rows[3]["terminal"] == rows[2]["terminal"]
-    assert rows[4] == {"id": "r1", "route": "research_required", "personas": None}
+    assert rows[4] == {"id": "r1", "tool": "add_widget", "arguments": {}}
     assert rows[5]["error"] == "worker failed: assess down"
     assert rows[5]["terminal"] == {"category": "provider_error", "message": "worker failed: assess down"}
 
@@ -583,13 +559,13 @@ def test_background_main_on_real_pipe_starts_no_hangup_watcher(monkeypatch: pyte
     fake = _FakeJev()
     answered = threading.Event()
 
-    def _route(req: Mapping[str, JSONValue], jev: object = None) -> dict[str, JSONValue]:
+    def _arguments(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         answered.set()
-        return {"id": kw._request_id(req), "route": "research_required", "personas": None}
+        return {"id": kw._request_id(req), "tool": "add_widget", "arguments": {}}
 
     monkeypatch.setattr(kw, "_startup", lambda: fake)
     monkeypatch.setattr(kw, "_shutdown", lambda: None)
-    monkeypatch.setattr(kw, "_route", _route)
+    monkeypatch.setattr(kw, "_arguments", _arguments)
     read_fd, write_fd = os.pipe()
     stdin = os.fdopen(read_fd)
     monkeypatch.setattr(sys, "stdin", stdin)
@@ -598,7 +574,7 @@ def test_background_main_on_real_pipe_starts_no_hangup_watcher(monkeypatch: pyte
     worker = threading.Thread(target=kw.main, daemon=True)
     worker.start()
     try:
-        os.write(write_fd, json.dumps({"id": "r1", "op": "route", "prompt": "hi"}).encode() + b"\n")
+        os.write(write_fd, json.dumps({"id": "r1", "op": "arguments", "tool": "add_widget"}).encode() + b"\n")
         assert answered.wait(timeout=10)
         assert set(threading.enumerate()) - before == {worker}  # the writer is open: a watcher would still poll
     finally:

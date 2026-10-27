@@ -6,7 +6,7 @@ scripts/verify_hedgefund_live.py. This script performs real network calls. Invok
   STOCKBOT_E2E=1 venv/bin/python scripts/verify_e2e.py [--base-url URL] [--only ID] [--runs N]
 Without STOCKBOT_E2E=1 it exits 2 with an explicit opt-in message.
 
-expected_route is one route or a list of acceptable routes; `single_tool` names a single-tool route the public stream hides.
+Each case selects chat or research mode. Research requests explicitly set mode in the body.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -38,7 +38,7 @@ class Case(TypedDict):
     id: str
     prompt: str
     chart_ticker: str | None
-    expected_route: str | list[str]
+    mode: Literal["chat", "research"]
     ticker: str | None
     min_citations: int
     max_first_text_ms: int
@@ -51,7 +51,7 @@ class Run:
     first_text_ms: float | None = None
     first_progress_ms: float | None = None  # First readable status line, before any answer text.
     total_ms: float | None = None
-    route: str | None = None
+    mode: Literal["chat", "research"] | None = None
     citation_count: int = 0
     answer: str = ""
     known: list[str] = field(default_factory=list)
@@ -61,25 +61,28 @@ class Run:
     chart_updates: list[str] = field(default_factory=list)
 
 
-def _route(types: list[str], tools: list[str], metrics: object) -> str | None:
-    """Infer the entry route: the public stream has no route field (route.ts tryEntryAnswer)."""
-    # Research emits worker progress; a single-tool fallback to research emits a second agent_start.
-    if "progress" in types or types.count("agent_start") > 1:
-        return "research_required"
+def _mode(types: list[str], metrics: object) -> Literal["chat", "research"] | None:
+    """Infer research from worker progress or chat from a completed, single model call."""
+    if "progress" in types:
+        return "research"
     if "done" not in types or "error" in types or "failed" in types:
         return None
     tool_metrics = metrics.get("tools") if isinstance(metrics, dict) else None
-    if isinstance(tool_metrics, dict) and tool_metrics.get("calls"):
-        return tools[0] if tools else "single_tool"  # tool_start is visible only with STOCKBOT_DEBUG=1.
-    # no_session and reasoning_required share answerDirect; only clarify_subject skips reasoning_start.
-    return "reasoning_required" if "reasoning_start" in types else "clarify_subject"
+    muse_metrics = metrics.get("muse") if isinstance(metrics, dict) else None
+    if (
+        isinstance(tool_metrics, dict)
+        and tool_metrics.get("calls") == 0
+        and isinstance(muse_metrics, dict)
+        and muse_metrics.get("calls") == 1
+    ):
+        return "chat"
+    return None
 
 
 def parse_stream(lines: Iterable[tuple[float, bytes]]) -> Run:
     """Fold timed SSE lines (elapsed ms, raw line) into one run record. No clock, no I/O."""
     run = Run()
     answer: list[str] = []
-    tools: list[str] = []
     known: set[str] = set()
     claims: list[dict[str, object]] = []
     last_ms: float | None = None
@@ -108,8 +111,6 @@ def parse_stream(lines: Iterable[tuple[float, bytes]]) -> Run:
             claims = [c for c in event.get("claims") or [] if isinstance(c, dict)]
         elif kind in ("failed", "error"):
             run.errors.append(f"{kind}: {event.get('message')}")
-        elif kind == "tool_start":
-            tools.append(str(event.get("tool")))
         elif kind == "chart_update":
             run.chart_updates.append(str(event.get("ticker")))
         elif kind == "done":
@@ -125,20 +126,15 @@ def parse_stream(lines: Iterable[tuple[float, bytes]]) -> Run:
     run.citation_count = len(cited)
     run.answer = text
     run.claims = claims
-    run.route = _route(run.events, tools, run.timings)
+    run.mode = _mode(run.events, run.timings)
     return run
-
-
-def _routes(case: Case) -> list[str]:
-    exp = case["expected_route"]
-    return [exp] if isinstance(exp, str) else list(exp)
 
 
 def evaluate(case: Case, run: Run) -> list[str]:
     """Names of the limits this run breaks; empty means pass."""
     fails = []
-    if run.route not in _routes(case):
-        fails.append("route")
+    if run.mode != case["mode"]:
+        fails.append("mode")
     if run.first_text_ms is None or run.first_text_ms > case["max_first_text_ms"]:
         fails.append("first_text_ms")
     if run.total_ms is None or run.total_ms > case["max_total_ms"]:
@@ -154,6 +150,8 @@ def evaluate(case: Case, run: Run) -> list[str]:
 
 def _post(base_url: str, case: Case) -> Run:
     body: dict[str, str] = {"prompt": case["prompt"]}
+    if case["mode"] == "research":
+        body["mode"] = "research"
     if case["chart_ticker"]:
         body["ticker"] = case["chart_ticker"]  # App.tsx sends the selected chart symbol as `ticker`.
     req = urllib.request.Request(
@@ -218,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         for n in range(1, args.runs + 1):
             run = _post(args.base_url, case)
             results.append((case, n, run, evaluate(case, run)))
-    research = [run for case, _, run, _ in results if "research_required" in _routes(case)]
+    research = [run for case, _, run, _ in results if case["mode"] == "research"]
     first = [r.first_text_ms for r in research if r.first_text_ms is not None]
     progress = [r.first_progress_ms for r in research if r.first_progress_ms is not None]
     total = [r.total_ms for r in research if r.total_ms is not None]
@@ -238,13 +236,13 @@ def main(argv: list[str] | None = None) -> int:
     out.write_text(
         json.dumps({"base_url": args.base_url, "runs": rows, "summary": summary}, indent=2) + "\n", encoding="utf-8"
     )
-    print("| id | route | first_progress_ms | first_text_ms | total_ms | citations | pass |")
+    print("| id | mode | first_progress_ms | first_text_ms | total_ms | citations | pass |")
     print("|---|---|---|---|---|---|---|")
     for case, n, run, fails in results:
         label = f"{case['id']}#{n}" if args.runs > 1 else case["id"]
         verdict = "PASS" if not fails else f"FAIL {','.join(fails)}"
         print(
-            f"| {label} | {run.route} | {_ms(run.first_progress_ms)} | {_ms(run.first_text_ms)} | {_ms(run.total_ms)} | {run.citation_count} | {verdict} |"
+            f"| {label} | {run.mode} | {_ms(run.first_progress_ms)} | {_ms(run.first_text_ms)} | {_ms(run.total_ms)} | {run.citation_count} | {verdict} |"
         )
     print(f"\n{passed}/{len(results)} passed; research p50/p90 ms: {json.dumps(summary['research'])}")
     print(f"wrote {out}")

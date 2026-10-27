@@ -69,14 +69,3 @@ export function ActionCards({ events }: { events: AgentEvent[] }) {
   );
 }
 
-export function TrioCard({ onYes, onNo }: { onYes: () => void; onNo: () => void }) {
-  return (
-    <div className={`${CARD} mt-2`} role="group" aria-label="Trio offer">
-      <span>Do you want the trio team (bull + bear views)?</span>{" "}
-      <span className="flex gap-2">
-        <button type="button" onClick={onYes} className={ACTION}>Yes</button>{" "}
-        <button type="button" onClick={onNo} className={ACTION}>No</button>
-      </span>
-    </div>
-  );
-}

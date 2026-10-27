@@ -84,7 +84,7 @@ export type SourceAudit = {
 };
 
 // Immutable legacy repair history shown beside the ledger verdict. Never a verified citation.
-export type SourceRepair = {
+type SourceRepair = {
   repair_id: string;
   status?: string;
   reason?: string;

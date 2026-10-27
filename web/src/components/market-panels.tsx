@@ -230,6 +230,8 @@ export function AIPanel({
   events,
   input,
   setInput,
+  research,
+  setResearch,
   context,
   onClearContext,
   onSend,
@@ -241,6 +243,8 @@ export function AIPanel({
   events: AgentEvent[];
   input: string;
   setInput: (v: string) => void;
+  research: boolean;
+  setResearch: (value: boolean) => void;
   // A feed item attached to the next Send; Send works with an empty input while it is set.
   context?: AskContext | null;
   onClearContext?: () => void;
@@ -263,10 +267,11 @@ export function AIPanel({
           value={input}
           onChange={(event) => setInput(event.target.value)}
           disabled={busy}
-          placeholder={busy ? "Research in progress…" : "Ask about this symbol…"}
+          placeholder={busy ? "Research in progress…" : research ? "Deep research…" : "Ask about this symbol… (/research for deep research)"}
           className="input"
           style={{ flex: 1, minWidth: 0 }}
         />
+        <label className="pill"><input type="checkbox" aria-label="Research mode" checked={research} onChange={(event) => setResearch(event.target.checked)} /> Research</label>
         <button type="submit" disabled={busy || (!input.trim() && !context)} className="btn-primary" style={{ cursor: busy ? "wait" : "pointer" }}>
           {busy ? "Thinking…" : "Send"}
         </button>

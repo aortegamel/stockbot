@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { FINAL_PERSONAS, type AgentEvent, type Evidence, type FinalClaim, type SourceReference } from "../../../needle-harness/lib/agent/types";
+import type { AgentEvent, Evidence, FinalClaim, SourceReference } from "../../../needle-harness/lib/agent/types";
 import { fetchSourceDocument } from "../lib/research-client";
 import { routeHash } from "../lib/route";
 import { originalLink, sourceLabel, type OriginalLink } from "../lib/source-viewer";
-import { ActionCards, TrioCard, type WidgetOutcomes } from "./action-cards";
+import { ActionCards, type WidgetOutcomes } from "./action-cards";
 import { AgentEventView, WorkRow } from "./agent-event";
 import { Toasts } from "./toasts";
 
@@ -94,39 +94,10 @@ function sourceLinks(known: Map<string, Evidence>): { reference: SourceReference
   return [...links.values()];
 }
 
-// One trio follow-up per offered session; null events means the user declined.
-type TrioState = { sessionId: string; events: AgentEvent[] | null } | null;
-
-// ponytail: the kernel buffers the trio answer, so the reply is read whole, not streamed.
-async function fetchTrio(sessionId: string): Promise<AgentEvent[]> {
-  try {
-    const response = await fetch("/api/agent", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ op: "personas", sessionId, personas: FINAL_PERSONAS }),
-    });
-    if (!response.ok) return [{ type: "error", message: `request failed: ${response.status}` }];
-    const events: AgentEvent[] = [];
-    for (const line of (await response.text()).split("\n")) {
-      if (!line.startsWith("data: ")) continue;
-      try {
-        events.push(JSON.parse(line.slice(6)));
-      } catch {
-        // A malformed frame never hides the rest of the answer.
-      }
-    }
-    if (!events.some((e) => e.type === "done" || e.type === "error" || e.type === "failed")) events.push({ type: "error", message: "stream ended without a terminal event" });
-    return events;
-  } catch (error) {
-    return [{ type: "error", message: error instanceof Error ? error.message : String(error) }];
-  }
-}
-
 // Citations open resolved originals. Source cards keep the audit page under a separate provenance action.
 // onRetry reruns the request behind these events; without it failures offer no Try again.
 // widgetOutcomes: what the workspace did with each widget receipt, for the toast text.
 export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes }: { events: AgentEvent[]; reasoning: boolean; debug: boolean; onRetry?: () => void; widgetOutcomes?: WidgetOutcomes }) {
-  const [trio, setTrio] = useState<TrioState>(null);
   const known = evidenceById(events);
   const links = sourceLinks(known);
   const finalAnswer = events.filter((e) => e.type === "answer_delta").map((e) => e.text).join("");
@@ -168,18 +139,11 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
   // Show readable status lines live. Collapse their history when a terminal event arrives.
   const visible = debug ? events : events.filter((e) => e.type === "agent_start" || e.type === "answer_delta" || e.type === "reasoning_start" || e.type === "done" || e.type === "error" || e.type === "failed");
   const head = visible.filter(
-    (e) => e.type !== "answer_delta" && e.type !== "answer_partial" && e.type !== "done" && e.type !== "error" && e.type !== "failed" && e.type !== "reasoning_start" && e.type !== "evidence" && e.type !== "claims" && e.type !== "offer_trio" && e.type !== "status",
+    (e) => e.type !== "answer_delta" && e.type !== "answer_partial" && e.type !== "done" && e.type !== "error" && e.type !== "failed" && e.type !== "reasoning_start" && e.type !== "evidence" && e.type !== "claims" && e.type !== "status",
   );
   const statuses = events.flatMap((e, i) => (e.type === "status" ? [<div key={i}>{e.text}</div>] : []));
   const tail = visible.filter((e) => e.type === "done" || e.type === "error" || e.type === "failed");
   const streaming = reasoning && tail.length === 0;
-  // The offer appears once the run ends; Yes or No answers it once per session.
-  const offer = done ? events.findLast((e) => e.type === "offer_trio") : undefined;
-  const current = offer && trio?.sessionId === offer.sessionId ? trio : null;
-  const askTrio = (sessionId: string): void => {
-    setTrio({ sessionId, events: [{ type: "reasoning_start", model: "stockbot" }] });
-    void fetchTrio(sessionId).then((trioEvents) => setTrio((state) => (state?.sessionId === sessionId ? { sessionId, events: trioEvents } : state)));
-  };
   return (
     <div className="flex-1 space-y-2 overflow-y-auto p-3 text-sm">
       {head.map((e, i) => (
@@ -222,8 +186,6 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
       {tail.map((e, i) => (
         <AgentEventView key={`tail-${i}`} event={e} debug={debug} onRetry={onRetry} />
       ))}
-      {offer && !current && <TrioCard onYes={() => askTrio(offer.sessionId)} onNo={() => setTrio({ sessionId: offer.sessionId, events: null })} />}
-      {current?.events && <AgentConsole events={current.events} reasoning={current.events.some((e) => e.type === "reasoning_start")} debug={debug} onRetry={() => askTrio(current.sessionId)} />}
       <Toasts events={events} onRetry={onRetry} widgetOutcomes={widgetOutcomes} />
     </div>
   );

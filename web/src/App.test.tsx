@@ -315,6 +315,63 @@ describe("App ticker search", () => {
 });
 
 describe("App agent send", () => {
+  test("research prefixes and the persistent toggle set mode without changing default chat", async () => {
+    const requests: Record<string, unknown>[] = [];
+    serve((url, init) => {
+      if (!url.includes("/api/agent")) return undefined;
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(`data: ${JSON.stringify({ type: "done", metrics: metrics() })}\n\n`);
+    });
+    const root = await mount(<App />);
+    const prompt = find<HTMLInputElement>(root, AGENT_PROMPT);
+    const toggle = find<HTMLInputElement>(root, '[aria-label="Research mode"]');
+    const send = async (value: string, mode?: "research") => {
+      const before = requests.length;
+      await type(prompt, value);
+      await click(button(root, "Send"));
+      await until(() => requests.length === before + 1 && findButton(root, "Send") !== null);
+      expect(requests.at(-1)).toEqual({
+        prompt: value.replace(/^\s*\/research\b\s*/i, "").trim(),
+        ticker: "NVDA", currentChartTicker: "NVDA", watchlist: WATCHLIST,
+        ...(mode ? { mode } : {}),
+      });
+    };
+    await send("/research what changed", "research");
+    expect(toggle.checked).toBe(false);
+    await send("hello");
+    await click(toggle);
+    await send("what changed", "research");
+    expect(toggle.checked).toBe(true);
+    await send("explain more", "research");
+    await click(toggle);
+    await send("hello again");
+    const before = requests.length;
+    await type(prompt, " /ReSeArCh ");
+    await click(button(root, "Send"));
+    await settle();
+    expect(requests).toHaveLength(before);
+    expect(prompt.value).toBe(" /ReSeArCh ");
+  });
+
+  test("the palette parses the research prefix", async () => {
+    const { bodies } = serve((url) => {
+      if (url.includes("/api/search")) return json({ hits: [] });
+      if (url.includes("/api/scans")) return new Response(null, { status: 404 });
+      if (url.includes("/api/agent")) return new Response(`data: ${JSON.stringify({ type: "done", metrics: metrics() })}\n\n`);
+      return undefined;
+    });
+    const root = await mount(<App />);
+    const palette = await openPalette(root);
+    await type(palette, " /ReSeArCh what changed");
+    await until(() => options(root).some((option) => option.includes("Ask Stockbot:")));
+    await click(find<HTMLElement>(root, '#cmd-list [role="option"]:last-child'));
+    await until(() => bodies.some((body) => body.includes('"mode":"research"')));
+    expect(JSON.parse(bodies.at(-1) ?? "{}")).toEqual({
+      prompt: "what changed", mode: "research",
+      ticker: "NVDA", currentChartTicker: "NVDA", watchlist: WATCHLIST,
+    });
+  });
+
   test("streams one run and pins the prompt, ticker, and full watchlist scope", async () => {
     const live = liveStream();
     const { urls, bodies } = serve((url) => {
@@ -426,9 +483,13 @@ describe("App agent send", () => {
     expect(root.querySelector('iframe[title="NVDA TradingView chart"]')).not.toBeNull();
   });
 
-  test("reports a stream that ends without a terminal event", async () => {
+  test.each([false, true])("reports a stream that ends without a terminal event (debug=%s)", async (debug) => {
     const live = liveStream();
-    serve((url) => (url.includes("/api/agent") ? new Response(live.stream, { status: 200 }) : undefined));
+    serve((url) => {
+      if (url.includes("/api/health")) return json({ debug });
+      if (url.includes("/api/agent")) return new Response(live.stream, { status: 200 });
+      return undefined;
+    });
     const root = await mount(<App />);
     const prompt = find<HTMLInputElement>(root, AGENT_PROMPT);
     await type(prompt, "partial?");
@@ -439,14 +500,16 @@ describe("App agent send", () => {
       live.send('xt":"half an answer"}\n\n');
       live.close();
     });
-    await until(() => text(root).includes("stream ended without a terminal event"));
+    await until(() => text(root).includes("The request failed. Please retry."));
+    expect(text(root)).not.toContain("stream ended without a terminal event");
     expect(text(root)).toContain("half an answer");
     expect(findButton(root, "Send")).not.toBeNull();
   });
 
-  test("reports a rejected request and a body-less success", async () => {
+  test.each([false, true])("reports a rejected request and a body-less success (debug=%s)", async (debug) => {
     let calls = 0;
     serve((url) => {
+      if (url.includes("/api/health")) return json({ debug });
       if (!url.includes("/api/agent")) return undefined;
       calls += 1;
       return calls === 1 ? json({ error: "kernel down" }, 503) : new Response(null, { status: 200 });
@@ -455,20 +518,29 @@ describe("App agent send", () => {
     const prompt = find<HTMLInputElement>(root, AGENT_PROMPT);
     await type(prompt, "first");
     await click(button(root, "Send"));
-    await until(() => text(root).includes("request failed: 503"));
+    await until(() => text(root).includes("The request failed. Please retry."));
+    expect(text(root)).not.toContain("request failed: 503");
     await until(() => findButton(root, "Send") !== null);
     await type(prompt, "second");
     await click(button(root, "Send"));
-    await until(() => text(root).includes("request failed: 200"));
+    await until(() => text(root).includes("The request failed. Please retry."));
+    await until(() => findButton(root, "Send") !== null);
+    expect(text(root)).not.toContain("request failed: 200");
+    expect(calls).toBe(2);
+    expect(prompt.disabled).toBe(false);
   });
 
-  test("aborts a silent stream after the 120s watchdog and reports the stall", async () => {
+  test.each([false, true])("aborts a silent stream after the 120s watchdog and reports the stall (debug=%s)", async (debug) => {
     jest.useFakeTimers();
     const restore = patchWindowTimers();
     try {
-      const { urls } = serve((url, init) =>
-        url.includes("/api/agent") ? new Response(silentStream(init?.signal ?? null), { status: 200 }) : undefined,
-      );
+      let signal: AbortSignal | null | undefined;
+      const { urls } = serve((url, init) => {
+        if (url.includes("/api/health")) return json({ debug });
+        if (!url.includes("/api/agent")) return undefined;
+        signal = init?.signal;
+        return new Response(silentStream(signal), { status: 200 });
+      });
       const root = await mount(<App />, false);
       await act(async () => {
         jest.advanceTimersByTime(0);
@@ -484,11 +556,15 @@ describe("App agent send", () => {
       });
       await settle();
       expect(text(root)).not.toContain("stream stalled");
+      expect(text(root)).not.toContain("The request failed. Please retry.");
+      expect(signal?.aborted).toBe(false);
       await act(async () => {
         jest.advanceTimersByTime(1);
       });
       await settle();
-      expect(text(root)).toContain("stream stalled: no data for 120s");
+      expect(text(root)).toContain("The request failed. Please retry.");
+      expect(text(root)).not.toContain("stream stalled");
+      expect(signal?.aborted).toBe(true);
       expect(findButton(root, "Send")).not.toBeNull();
       // The strip keeps refreshing on its own minute interval.
       const quotesBefore = urls.filter((url) => url.includes("/api/quote")).length;
@@ -695,7 +771,7 @@ describe("App view switch", () => {
     await until(() => text(root).includes("NVDA100DELAYEDSEC none"));
   });
 
-  test("Feed Ask about this attaches a readable chip, sends the default question with context, and × removes it", async () => {
+  test.each(["", " /research "])("Feed Ask about this sends the default question with context for prefix %j", async (prefix) => {
     dom.window.localStorage.setItem("stockbot.drawer", "closed");
     dom.window.history.replaceState(null, "", "/#/feed");
     const { bodies } = serve((url) => {
@@ -720,11 +796,13 @@ describe("App view switch", () => {
     expect(button(root, "Send").disabled).toBe(true);
 
     await click(button(root, "Ask about this"));
+    await type(find<HTMLInputElement>(root, AGENT_PROMPT), prefix);
     await click(button(root, "Send"));
     await until(() => bodies.some((body) => body.includes("What does this mean")));
     expect(JSON.parse(bodies.find((body) => body.includes("What does this mean")) ?? "{}")).toEqual({
       prompt: "What does this mean for AAPL?", ticker: "NVDA", currentChartTicker: "NVDA", watchlist: WATCHLIST,
       context: { kind: "news", title: "Apple ships", url: "https://n.example/a", source: "wire", sym: "AAPL", at: "2026-10-20T09:00:00Z" },
+      ...(prefix ? { mode: "research" } : {}),
     });
     // Sending clears the prompt chip; the transcript shows the message with the same chip, never a raw blob.
     expect(remove()).toBeNull();

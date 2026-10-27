@@ -333,6 +333,7 @@ class _BoomJev(JevClient):
         *,
         session_id: str,
         job_id: str | None = None,
+        ticker: str | None = None,
     ) -> ToolDecision:
         raise AssertionError("router must not call JEV")
 
@@ -505,29 +506,6 @@ def test_short_family_distinguishes_position_volume_and_float_context(ask: str, 
     assert seen and seen[0][4] == tool
 
 
-def test_advice_cue_needs_an_advice_verb() -> None:
-    from app.research.programmatic_router import programmatic_route
-
-    assert programmatic_route("should AAPL halt trading", ticker="AAPL") == "research_required"
-    assert programmatic_route("should I buy NVDA", ticker="NVDA") == "reasoning_required"
-
-
-def test_research_cue_single_signals_route_research() -> None:
-    from app.research.programmatic_router import programmatic_route
-
-    assert programmatic_route("revenue outlook") == "research_required"
-    assert programmatic_route("funds are betting against it") == "research_required"
-
-
-def test_advice_requires_prompt_subject_but_other_routes_use_caller_ticker() -> None:
-    from app.research.programmatic_router import programmatic_route
-
-    assert programmatic_route("should I buy it") == "clarify_subject"
-    assert programmatic_route("should I buy it", ticker="GME") == "reasoning_required"
-    assert programmatic_route("how is it doing", ticker="GME") == "research_required"
-    assert programmatic_route("how is it doing") is None
-
-
 class _BoundedPick(JevClient):
     @override
     async def select_tool(
@@ -540,6 +518,7 @@ class _BoundedPick(JevClient):
         *,
         session_id: str,
         job_id: str | None = None,
+        ticker: str | None = None,
     ) -> ToolDecision:
         return ToolDecision(
             action="invoke",
@@ -562,6 +541,7 @@ class _FullPick(JevClient):
         *,
         session_id: str,
         job_id: str | None = None,
+        ticker: str | None = None,
     ) -> ToolDecision:
         return ToolDecision(
             action="invoke",
@@ -720,6 +700,7 @@ class _ContextCapture(JevClient):
         *,
         session_id: str,
         job_id: str | None = None,
+        ticker: str | None = None,
     ) -> ToolDecision:
         self.seen["objective"] = objective
         self.seen["node"] = node

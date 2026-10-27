@@ -179,12 +179,6 @@ export function safeSourceUrl(value: string | undefined): string | undefined {
 
 export type ToolResult = { ok: true; evidence: Evidence; chartSelection?: unknown; watchlistUpdate?: unknown; widgetSelection?: unknown } | { ok: false; error: string; category: FailureCategory; retryable: boolean };
 
-export type Tool = {
-  description: string;
-  parameters: JSONSchema;
-  execute(args: Record<string, unknown>, opts: { sessionId: string }): Promise<ToolResult>;
-};
-
 export type AgentEvent =
   | { type: "agent_start"; prompt: string; context?: AskContext }
   | { type: "chart_update"; ticker: string }
@@ -205,8 +199,6 @@ export type AgentEvent =
   // The gated research answer's cited claim inventory; each text is a verbatim answer substring.
   | { type: "claims"; claims: FinalClaim[] }
   | { type: "error"; message: string; code?: string; stage?: string }
-  // A stockbot-only research answer offers the trio over the same session evidence.
-  | { type: "offer_trio"; sessionId: string }
   | { type: "tool_failed"; tool: string; category: FailureCategory; preview: string }
   | { type: "failed"; category: FailureCategory; message: string; code?: string; stage?: string }
   // A readable progress line for the user, never answer text. Build it with statusEvent.
@@ -229,8 +221,6 @@ export type Metrics = {
   // Phase milliseconds; a phase with no measurement stays absent, never 0.
   timings?: Timings;
 };
-// A terminal report carries its outcome: verified only, verified with unknowns, failure, or cancellation.
-export type TerminalOutcome = "completed" | "completed_with_limitations" | "failed" | "cancelled";
 
 const SENSITIVE_KEY_NORMS: Record<string, true> = {
   accesstoken: true,

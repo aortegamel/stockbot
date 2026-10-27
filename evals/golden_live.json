@@ -3,7 +3,7 @@
     "id": "hello",
     "prompt": "hello",
     "chart_ticker": null,
-    "expected_route": "reasoning_required",
+    "mode": "chat",
     "ticker": null,
     "min_citations": 0,
     "max_first_text_ms": 10000,
@@ -13,10 +13,7 @@
     "id": "time",
     "prompt": "What time is it?",
     "chart_ticker": null,
-    "expected_route": [
-      "get_current_time",
-      "single_tool"
-    ],
+    "mode": "research",
     "ticker": null,
     "min_citations": 0,
     "max_first_text_ms": 10000,
@@ -26,7 +23,7 @@
     "id": "clarify_advice",
     "prompt": "can you give me buying advice",
     "chart_ticker": null,
-    "expected_route": "clarify_subject",
+    "mode": "chat",
     "ticker": null,
     "min_citations": 0,
     "max_first_text_ms": 1000,
@@ -36,7 +33,7 @@
     "id": "aapl_buy_now",
     "prompt": "Should I buy now?",
     "chart_ticker": "AAPL",
-    "expected_route": "reasoning_required",
+    "mode": "chat",
     "ticker": "AAPL",
     "min_citations": 0,
     "max_first_text_ms": 10000,
@@ -49,7 +46,7 @@
     "id": "aapl_ceo",
     "prompt": "What do you think about the CEO?",
     "chart_ticker": "AAPL",
-    "expected_route": "research_required",
+    "mode": "research",
     "ticker": "AAPL",
     "min_citations": 1,
     "max_first_text_ms": 10000,
@@ -62,10 +59,7 @@
     "id": "nvda_risk",
     "prompt": "NVDA risk factors?",
     "chart_ticker": null,
-    "expected_route": [
-      "list_sec_filings",
-      "single_tool"
-    ],
+    "mode": "research",
     "ticker": "NVDA",
     "min_citations": 1,
     "max_first_text_ms": 10000,
@@ -79,10 +73,7 @@
     "id": "aapl_insider",
     "prompt": "AAPL insider sales last quarter?",
     "chart_ticker": null,
-    "expected_route": [
-      "get_insider_activity",
-      "single_tool"
-    ],
+    "mode": "research",
     "ticker": "AAPL",
     "min_citations": 1,
     "max_first_text_ms": 10000,
@@ -96,10 +87,7 @@
     "id": "gme_short",
     "prompt": "GME short interest?",
     "chart_ticker": null,
-    "expected_route": [
-      "get_short_interest",
-      "single_tool"
-    ],
+    "mode": "research",
     "ticker": "GME",
     "min_citations": 1,
     "max_first_text_ms": 10000,
@@ -112,10 +100,7 @@
     "id": "msft_revenue",
     "prompt": "MSFT latest quarterly revenue?",
     "chart_ticker": null,
-    "expected_route": [
-      "list_sec_filings",
-      "single_tool"
-    ],
+    "mode": "research",
     "ticker": "MSFT",
     "min_citations": 1,
     "max_first_text_ms": 10000,
@@ -129,7 +114,7 @@
     "id": "nvda_amd_compare",
     "prompt": "Compare NVDA and AMD margins and risks",
     "chart_ticker": null,
-    "expected_route": "research_required",
+    "mode": "research",
     "ticker": null,
     "min_citations": 1,
     "max_first_text_ms": 10000,
@@ -143,7 +128,7 @@
     "id": "tsla_move",
     "prompt": "Why did TSLA move this week?",
     "chart_ticker": null,
-    "expected_route": "research_required",
+    "mode": "research",
     "ticker": "TSLA",
     "min_citations": 1,
     "max_first_text_ms": 10000,
@@ -156,7 +141,7 @@
     "id": "pltr_bull_bear",
     "prompt": "Give me the bull and bear case for PLTR",
     "chart_ticker": null,
-    "expected_route": "research_required",
+    "mode": "research",
     "ticker": "PLTR",
     "min_citations": 1,
     "max_first_text_ms": 10000,
@@ -170,12 +155,10 @@
     "id": "nvda_thesis_create",
     "prompt": "Create a thesis for NVDA: AI datacenter demand will sustain revenue growth through 2027.",
     "chart_ticker": null,
-    "expected_route": "research_required",
+    "mode": "research",
     "ticker": "NVDA",
     "min_citations": 1,
     "max_first_text_ms": 10000,
-    "max_total_ms": 45000,
-    "expected_tool": "thesis_create",
-    "expected_offer": "offer_trio"
+    "max_total_ms": 45000
   }
 ]

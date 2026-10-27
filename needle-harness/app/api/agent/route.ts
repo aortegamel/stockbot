@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { reason } from "@/lib/muse/client";
-import { asksWatchlist, dropUncovered, gateAnswer, kernelRouter, parseTicker, parseWatchlist, qualifiedEvidenceFree, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type KernelResponse } from "@/lib/agent/kernel";
+import { asksWatchlist, kernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent } from "@/lib/agent/kernel";
 import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
-import { ASK_CONTEXT_KINDS, FINAL_PERSONAS, foundStatus, readDatapoints, redactArgs, safeSourceUrl, sourceReferences, statusEvent, toolStatus, WIDGET_TYPES, type AgentEvent, type AskContext, type Evidence, type FailureCategory, type Persona, type Timings } from "@/lib/agent/types";
+import { ASK_CONTEXT_KINDS, FINAL_PERSONAS, safeSourceUrl, sourceReferences, statusEvent, WIDGET_TYPES, type AgentEvent, type AskContext, type Timings } from "@/lib/agent/types";
 
 const ROOT = process.cwd().endsWith("needle-harness") ? join(process.cwd(), "..") : process.cwd();
 
@@ -12,14 +12,6 @@ function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
   return value;
-}
-// Worker output is untrusted: null means no explicit selection; a list must be
-// nonempty, unique, canonical, and in fixed order. Anything else is undefined (invalid).
-function parsePersonas(v: unknown): Persona[] | null | undefined {
-  if (v === null) return null;
-  if (!Array.isArray(v)) return undefined;
-  const canonical = FINAL_PERSONAS.filter((p) => v.includes(p));
-  return v.length > 0 && v.length === canonical.length && canonical.every((p, i) => v[i] === p) ? canonical : undefined;
 }
 const ASK_CONTEXT_KEYS = ["kind", "title", "url", "source", "sym", "at"];
 // Feed-item context beside the verbatim prompt: undefined when absent, null when
@@ -35,30 +27,24 @@ function parseAskContext(v: unknown): AskContext | null | undefined {
   if (sym !== undefined && ticker === undefined) return null;
   return { kind: kind as AskContext["kind"], title, source, at, ...(url !== undefined ? { url } : {}), ...(ticker !== undefined ? { sym: ticker } : {}) };
 }
-// Trio follow-up request: persona and gate stages over an offered session (same id shape as /api/research).
-type PersonasRequest = { op: "personas"; sessionId: string; personas: Persona[] };
-async function readAgentRequest(req: Request): Promise<Response | PersonasRequest | { prompt: string; ticker: unknown; currentChartTicker: unknown; parsedWatchlist: string[] | undefined; context: AskContext | undefined }> {
+// Default chat is one plain model call. mode "research" runs the full pipeline with the trio.
+type AgentRequest = { prompt: string; ticker: unknown; currentChartTicker: unknown; parsedWatchlist: string[] | undefined; context: AskContext | undefined; research: boolean };
+async function readAgentRequest(req: Request): Promise<Response | AgentRequest> {
   let prompt: unknown;
   let ticker: unknown;
   let currentChartTicker: unknown;
   let watchlistRaw: unknown;
-  let op: unknown;
-  let sessionId: unknown;
-  let personasRaw: unknown;
   let contextRaw: unknown;
+  let mode: unknown;
   try {
-    ({ prompt, ticker, currentChartTicker, watchlist: watchlistRaw, op, sessionId, personas: personasRaw, context: contextRaw } = await req.json());
+    ({ prompt, ticker, currentChartTicker, watchlist: watchlistRaw, context: contextRaw, mode } = await req.json());
   } catch {
     console.error("[web] [agent-api] invalid JSON");
     return Response.json({ error: "invalid JSON" }, { status: 400 });
   }
-  if (op === "personas") {
-    const personas = parsePersonas(personasRaw);
-    if (typeof sessionId !== "string" || !/^[A-Za-z0-9:_-]{1,128}$/.test(sessionId) || !personas) {
-      console.error("[web] [agent-api] invalid personas request");
-      return Response.json({ error: "sessionId and personas required" }, { status: 400 });
-    }
-    return { op: "personas", sessionId, personas };
+  if (mode !== undefined && mode !== "research") {
+    console.error("[web] [agent-api] invalid mode");
+    return Response.json({ error: "mode must be research when set" }, { status: 400 });
   }
   if (typeof prompt !== "string" || !prompt.trim()) {
     console.error("[web] [agent-api] prompt required");
@@ -76,7 +62,7 @@ async function readAgentRequest(req: Request): Promise<Response | PersonasReques
     console.error("[web] [agent-api] invalid context");
     return Response.json({ error: "context must be a feed item: kind news|filing|insider|alert, title and source (1-300 chars), at (max 40 chars), optional http(s) url and ticker sym" }, { status: 400 });
   }
-  return { prompt, ticker, currentChartTicker, parsedWatchlist, context };
+  return { prompt, ticker, currentChartTicker, parsedWatchlist, context, research: mode === "research" };
 }
 
 function publicEvent(e: AgentEvent): AgentEvent | null {
@@ -151,59 +137,18 @@ function streamSender(req: Request, controller: ReadableStreamDefaultController<
   return { send, flush: () => pending };
 }
 
-type EntrySelection = { route: string; personas: Persona[] | null; chartTicker?: string; chartError?: string } | { error: string };
-function parseEntrySelection(routed: KernelResponse | undefined): Exclude<EntrySelection, { error: string }> | null {
-  const personas = parsePersonas(routed?.personas);
-  if (!routed || (typeof routed.error === "string" && routed.error) || typeof routed.route !== "string"
-    || routed.route === "set_chart_symbol" || personas === undefined) {
-    return null;
-  }
-  const selection: Exclude<EntrySelection, { error: string }> = { route: routed.route, personas };
-  const chartTicker = parseTicker(routed.chartTicker);
-  if (routed.chartTicker !== undefined) {
-    if (chartTicker === undefined || routed.chartError !== undefined) {
-      selection.chartError = "The chart selection was invalid.";
-    } else {
-      selection.chartTicker = chartTicker;
-    }
-  } else if (routed.chartError !== undefined) {
-    selection.chartError = typeof routed.chartError === "string" && routed.chartError.trim()
-      ? routed.chartError.trim().slice(0, 160)
-      : "The chart selection was invalid.";
-  }
-  return selection;
-}
-async function selectEntry(body: Record<string, unknown>, signal: AbortSignal): Promise<EntrySelection> {
-  let routed: KernelResponse | undefined;
-  let routeError = "route_invalid: malformed route selection";
-  try {
-    routed = await kernelRouter.call(body, { signal });
-    if (typeof routed.error === "string" && routed.error) routeError = routed.error;
-  } catch (err) {
-    routeError = err instanceof Error ? err.message : String(err);
-  }
-  return parseEntrySelection(routed) ?? { error: routeError };
-}
-
 const SSE_HEADERS = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" };
 
-// Trio follow-up: no route round, intake, nodes, or tools; the kernel replays
-// only the persona and final-gate stages over the offered session.
-function personasResponse(req: Request, input: PersonasRequest, requestAt: number): Response {
-  console.log(`[web] [agent-api] POST personas=${input.personas.join(",")}`);
-  const stream = new ReadableStream({
-    async start(controller) {
-      const { send, flush } = streamSender(req, controller, requestAt, {});
-      try {
-        await runPersonaAgent(input.sessionId, input.personas, send, { signal: req.signal });
-      } catch (err) {
-        send({ type: "error", message: err instanceof Error ? err.message : String(err) });
-      }
-      await flush();
-      controller.close();
-    },
-  });
-  return new Response(stream, { headers: SSE_HEADERS });
+// Default chat runs no JEV and no research. Only these deterministic command shapes reach a UI tool.
+const WATCHLIST_COMMAND = /\b(?:add|remove)\b/i;
+const WIDGET_COMMAND = /\badd\b[^.?!]*\bwidgets?\b/i;
+// ponytail: whole-prompt chart commands only ("show AAPL", "open the chart for $nvda"); widen when users ask.
+const CHART_COMMAND = /^\s*(?:show|open|chart|pull up|switch to|go to)\s+(?:me\s+)?(?:the\s+)?(?:chart\s+(?:for|of)\s+)?(\$?[A-Za-z][A-Za-z0-9.-]{0,9})(?:\s+chart)?\s*[.!]?\s*$/i;
+// A chart ticker is a $-prefixed word or an all-caps word, so "show me the chart" never names CHART.
+function chartCommand(prompt: string): string | undefined {
+  const raw = CHART_COMMAND.exec(prompt)?.[1];
+  if (raw === undefined || (!raw.startsWith("$") && raw !== raw.toUpperCase())) return undefined;
+  return parseTicker(raw.slice(raw.startsWith("$") ? 1 : 0));
 }
 
 export async function POST(req: Request): Promise<Response> {
@@ -211,340 +156,150 @@ export async function POST(req: Request): Promise<Response> {
   const requestAt = performance.now();
   const input = await readAgentRequest(req);
   if (input instanceof Response) return input;
-  if ("op" in input) return personasResponse(req, input, requestAt);
-  const { prompt, ticker, currentChartTicker: chartInput, parsedWatchlist, context } = input;
-  // The feed item rides beside the verbatim prompt as labeled untrusted data: the router, the
-  // research planner, and the reasoner see it. The prompt itself never changes.
+  const { prompt, ticker, currentChartTicker: chartInput, parsedWatchlist, context, research } = input;
+  // The feed item rides beside the verbatim prompt as labeled untrusted data. The prompt itself never changes.
   const contextField = context ? { context } : {};
   // Only a prompt that names the watchlist uses its symbols instead of the selected ticker.
   const watchlist = parsedWatchlist !== undefined && asksWatchlist(prompt) ? parsedWatchlist : undefined;
-  const watchlistField = watchlist ? { watchlist } : {};
   // Validated ticker channel beside the verbatim prompt; invalid values drop (prompt never changes).
   const parsedTicker = watchlist ? undefined : parseTicker(ticker);
-  let tickerField = parsedTicker !== undefined ? { ticker: parsedTicker } : {};
-  let currentChartTicker = parseTicker(chartInput) ?? parseTicker(ticker);
-  const reasonContext = (): { ticker?: string; context?: AskContext } => ({ ...(!watchlist && currentChartTicker ? { ticker: currentChartTicker } : {}), ...contextField });
-  console.log(`[web] [agent-api] POST prompt_chars=${prompt.length}${watchlist ? ` watchlist=${watchlist.length}` : ""}`);
+  const tickerField = parsedTicker !== undefined ? { ticker: parsedTicker } : {};
+  const currentChartTicker = parseTicker(chartInput) ?? parseTicker(ticker);
+  console.log(`[web] [agent-api] POST mode=${research ? "research" : "chat"} prompt_chars=${prompt.length}${watchlist ? ` watchlist=${watchlist.length}` : ""}`);
   const stream = new ReadableStream({
     async start(controller) {
       const timings: Timings = {};
       const { send, flush } = streamSender(req, controller, requestAt, timings);
-      // JEV owns the original route independently from the optional chart action.
-      // A direct answer has no evidence, so it is buffered and shows only its explicitly
-      // qualified unknown/assumption claims; nothing left means research answers instead.
-      const answerDirect = async (): Promise<boolean> => {
+      const zeroMetrics = (t0: number, calls: number) => ({ totalMs: performance.now() - t0, needle: { calls, totalMs: 0, escalations: 0 }, tools: { calls, totalMs: 0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures: {} });
+      // One plain model call: no evidence, no inventory, no gates. The text shows as written.
+      const answerPlain = async (): Promise<void> => {
         const t0 = performance.now();
         send({ type: "agent_start", prompt });
         send(statusEvent("Thinking…"));
         send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
         try {
-          // No onDelta: the raw stream carries the inventory fence, so the client sees only the kept text.
-          const r = await reason({ prompt, evidence: [], direct: true, ...reasonContext(), signal: req.signal, deadlineAt });
-          const text = dropUncovered(r.prose, qualifiedEvidenceFree(r.claims));
-          if (!text) return false;
-          send({ type: "answer_delta", text });
-          send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 1, totalMs: performance.now() - t0, ...r.usage }, evidence: { count: 0, characters: 0 }, failures: {}, timings: r.timings }, status: "completed" });
+          // ponytail: no live onDelta — a mid-stream transport retry would repeat text; stream once retries are delta-safe.
+          const r = await reason({ prompt, evidence: [], direct: true, plain: true, ...(currentChartTicker && !watchlist ? { ticker: currentChartTicker } : {}), ...contextField, signal: req.signal, deadlineAt });
+          if (!r.prose) throw new Error("The model returned an empty answer.");
+          send({ type: "answer_delta", text: r.prose });
+          send({ type: "done", metrics: { ...zeroMetrics(t0, 0), muse: { calls: 1, totalMs: performance.now() - t0, ...r.usage } }, status: "completed" });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          // ponytail: muse-down shape mirrors kernel.ts — failed + error, never a silent close.
-          send({ type: "failed", category: "provider_error", message: msg.slice(0, 160), code: "MODEL_START_FAILED", stage: "direct" });
-          send({ type: "error", message: msg, code: "MODEL_START_FAILED", stage: "direct" });
+          send({ type: "failed", category: "provider_error", message: msg.slice(0, 160), code: "MODEL_START_FAILED", stage: "chat" });
+          send({ type: "error", message: msg, code: "MODEL_START_FAILED", stage: "chat" });
         }
-        return true;
       };
-      // ponytail: single-shot evidence must survive research fallback (risk SSE dropped ev:58f5).
-      const singleShotEvidence: Evidence[] = [];
-      const generateArguments = async (tool: string): Promise<{ args: Record<string, unknown>; confidence: number | null } | null> => {
+      const generateArguments = async (tool: string): Promise<Record<string, unknown> | null> => {
         try {
           const gen = await kernelRouter.call({ op: "arguments", tool, objective: prompt, ...tickerField }, { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) });
           if (typeof gen.error === "string" && gen.error) return null;
           if (gen.tool !== tool || typeof gen.arguments !== "object" || gen.arguments === null) return null;
-          return {
-            args: gen.arguments as Record<string, unknown>,
-            confidence: typeof gen.confidence === "number" ? gen.confidence : null,
-          };
-        } catch {
-          // Shared Needle failed. Research supplies the next arguments.
-          return null;
-        }
-      };
-      type ToolOutcome = { ok: boolean; content?: string; error?: string; category?: string };
-      const assessTool = async (tool: string, args: Record<string, unknown>, outcome: ToolOutcome): Promise<string | null> => {
-        try {
-          const assessed = await kernelRouter.call(
-            { op: "assess_entry", prompt, tool, arguments: args, result: outcome, ...tickerField },
-            { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) },
-          );
-          return typeof assessed.verdict === "string" && assessed.verdict ? assessed.verdict : "research_required";
+          return gen.arguments as Record<string, unknown>;
         } catch {
           return null;
         }
       };
-      // ponytail: JEV selects; shared kernel Needle fills args; every post-tool verdict returns to JEV (max 3 rounds).
-      const answerSingleShot = async (toolName: string): Promise<boolean> => {
-        const t0 = performance.now();
-        const toolT0 = performance.now();
-        send({ type: "agent_start", prompt });
-        // No subject yet: the arguments name it at tool start.
-        send(statusEvent(`${toolStatus(toolName, undefined, "Looking up")}…`));
-        const evidence: Evidence[] = [];
-        const failures: Partial<Record<FailureCategory, number>> = {};
-        let needleCalls = 0;
-        let toolCalls = 0;
-        // The worker creates the ledger session before it executes the first tool.
-        let sessionId: string | undefined;
-        const executeTool = async (tool: string, args: Record<string, unknown>): Promise<ToolOutcome> => {
+      const runResearch = async (): Promise<void> => {
+        let reasoningEffort: string | undefined;
+        const configuredEffort = process.env.REASONING_EFFORT?.trim();
+        if (!configuredEffort || configuredEffort === "auto") {
+          const startedAt = performance.now();
           try {
-            const res = await kernelRouter.call(
-              { op: "entry_tool", prompt, tool, arguments: args, ...(sessionId ? { sessionId } : {}) },
-              { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) },
-            );
-            toolCalls += 1;
-            if (typeof res.sessionId !== "string" || !res.sessionId || (sessionId && res.sessionId !== sessionId)) {
-              throw new Error("The source result has no matching research session.");
+            const maxOutputTokens = process.env.MUSE_MAX_OUTPUT_TOKENS?.trim();
+            const answerTokenBudget = process.env.MUSE_ANSWER_TOKEN_BUDGET?.trim();
+            for (const [name, raw] of [["MUSE_MAX_OUTPUT_TOKENS", maxOutputTokens], ["MUSE_ANSWER_TOKEN_BUDGET", answerTokenBudget]] as const) {
+              if (raw && (!Number.isInteger(Number(raw)) || Number(raw) < 16)) throw new Error(`${name} must be an integer >= 16`);
             }
-            sessionId = res.sessionId;
-            if (res.error) throw new Error(res.error);
-            let fresh = 0;
-            for (const row of res.evidence ?? []) {
-              if (evidence.some((e) => e.id === row.id)) continue;
-              const datapoints = readDatapoints(row.datapoints);
-              const ev: Evidence = {
-                id: row.id, source: row.source ?? tool, content: row.content,
-                retrievedAt: row.retrievedAt ?? new Date().toISOString(),
-                ...(row.title !== undefined ? { title: row.title } : {}),
-                ...(row.url !== undefined ? { url: row.url } : {}),
-                sources: sourceReferences(row.sources),
-                ...(datapoints.length > 0 ? { datapoints } : {}),
-              };
-              evidence.push(ev);
-              singleShotEvidence.push(ev);
-              fresh += 1;
+            const selected = await kernelRouter.call({
+              op: "effort", prompt, ...(!watchlist && (parsedTicker ?? currentChartTicker) ? { ticker: parsedTicker ?? currentChartTicker } : {}), ...(watchlist ? { watchlist } : {}), ...contextField, deadlineAt,
+              ...(maxOutputTokens ? { maxOutputTokens: Number(maxOutputTokens) } : {}),
+              ...(answerTokenBudget ? { answerTokenBudget: Number(answerTokenBudget) } : {}),
+            }, { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) });
+            if (selected.error) throw new Error(selected.error);
+            if (typeof selected.effort !== "string" || !["low", "medium", "high", "xhigh"].includes(selected.effort)) {
+              throw new Error("JEV returned an invalid reasoning effort.");
             }
-            const content = res.content ?? "";
-            send({ type: "tool_result", tool, preview: content.slice(0, 160) });
-            send(statusEvent(foundStatus(fresh)));
-            send({ type: "evidence", sessionId, evidence: [...evidence] });
-            return { ok: true, content: content.slice(0, 1500) };
+            reasoningEffort = selected.effort;
+            console.log(`[web] [agent-api] research reasoning_effort=${reasoningEffort}`);
           } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            failures.tool_error = (failures.tool_error ?? 0) + 1;
-            send({ type: "tool_failed", tool, category: "tool_error", preview: msg.slice(0, 160) });
-            send(statusEvent("That source had no usable data"));
-            return { ok: false, error: msg.slice(0, 500), category: "tool_error" };
-          }
-        };
-        const answerFromEvidence = async (defect?: string): Promise<boolean> => {
-          if (defect || evidence.length === 0) {
-            failures.tool_error = (failures.tool_error ?? 0) + 1;
-            send({ type: "failed", category: "tool_error", message: `No verified answer: ${defect ?? "this source has no admissible research evidence."}`, code: "EVIDENCE_UNAVAILABLE", stage: "single_tool" });
-            send({ type: "answer_delta", text: "I could not verify an answer from this source. I withheld its factual claims." });
-            send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures }, status: "failed" });
-            return true;
-          }
-          send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
-          try {
-            const m0 = performance.now();
-            const r = await reason({ prompt, evidence, direct: evidence.length === 0, ...reasonContext(), signal: req.signal, deadlineAt });
-            const gated = await gateAnswer({
-              result: { persona: "stockbot", prose: r.prose, claims: r.claims, ...(r.confidence !== undefined ? { confidence: r.confidence } : {}) },
-              evidence,
-              sessionId,
-              gate: (body, gateOpts) => kernelRouter.call(body, { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1), ...gateOpts }),
-            });
-            if ("failure" in gated) {
-              failures.provider_error = (failures.provider_error ?? 0) + 1;
-              send({ type: "failed", category: "provider_error", message: `No verified answer: ${gated.failure}`, code: "CITATION_INVALID", stage: "single_tool_gate" });
-              send({ type: "answer_delta", text: "I could not verify an answer from this source. I withheld its factual claims." });
-              send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures, timings: r.timings }, status: "failed" });
-              return true;
-            }
-            send({ type: "answer_delta", text: gated.text });
-            if (gated.supported.length > 0) send({ type: "claims", claims: gated.supported });
-            send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: needleCalls, totalMs: 0, escalations: 0 }, tools: { calls: toolCalls, totalMs: performance.now() - toolT0 }, muse: { calls: 1, totalMs: performance.now() - m0, ...r.usage }, evidence: { count: evidence.length, characters: evidence.reduce((n, e) => n + e.content.length, 0) }, failures, timings: r.timings }, status: "completed" });
-          } catch (err) {
-            send({ type: "error", message: err instanceof Error ? err.message : String(err), code: "MODEL_START_FAILED", stage: "single_tool" });
-          }
-          return true;
-        };
-        {
-          let current: string | null = toolName;
-          for (let step = 0; step < 3 && current; step++) {
-            const tool = current;
-            current = null;
-            const generated = await generateArguments(tool);
-            if (!generated) return false;
-            const { args, confidence } = generated;
-            needleCalls += 1;
-            send({ type: "needle_decision", step, tool, arguments: redactArgs(args), confidence });
-            send({ type: "tool_start", tool });
-            send(statusEvent(toolStatus(tool, tool === "search_web" ? (typeof args.query === "string" ? args.query : undefined) : parseTicker(args.ticker))));
-            const outcome = await executeTool(tool, args);
-            if (!outcome.ok) return await answerFromEvidence(outcome.error ?? "The source result failed.");
-            if (outcome.ok && evidence.length === 0) return await answerFromEvidence();
-            const verdict = await assessTool(tool, args, outcome);
-            if (verdict === null) return false;
-            if (verdict === "node_resolved" || verdict === "reasoning_required") return await answerFromEvidence();
-            if (verdict === "research_required" || verdict === "set_chart_symbol" || verdict === "update_watchlist" || verdict === "add_widget") return false;
-            // ponytail: worker output is untrusted — only identifier-shaped tool names chain; anything else researches.
-            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(verdict)) return false;
-            current = verdict;
-          }
-          // The cap answers from the ledger or ends with an explicit verification failure.
-          return await answerFromEvidence();
-        }
-      };
-      // The watchlist action is a UI receipt, never evidence: Needle fills its arguments and only
-      // a validated canonical receipt emits watchlist_update. A failure answers visibly, never researches.
-      const applyWatchlist = async (): Promise<boolean> => {
-        const t0 = performance.now();
-        send({ type: "agent_start", prompt });
-        send(statusEvent("Updating your watchlist…"));
-        const generated = await generateArguments("update_watchlist");
-        let text = "Watchlist update failed: no valid stock and action.";
-        if (generated) {
-          const sessionId = newSessionId();
-          try {
-            const result = await invoke("update_watchlist", generated.args, sessionId, Math.max(deadlineAt - Date.now(), 1));
-            if (!result.ok) throw new Error(result.error);
-            const receipt = result.watchlistUpdate;
-            if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) throw new Error("The watchlist tool returned an invalid receipt.");
-            const { result_type, action, ticker } = receipt as Record<string, unknown>;
-            if (result_type !== "watchlist_update" || (action !== "add" && action !== "remove") || typeof ticker !== "string" || parseTicker(ticker) !== ticker) {
-              throw new Error("The watchlist tool returned an invalid receipt.");
-            }
-            send({ type: "watchlist_update", action, ticker });
-            text = action === "add" ? `Added ${ticker} to your watchlist.` : `Removed ${ticker} from your watchlist.`;
-          } catch (err) {
-            text = `Watchlist update failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 160)}`;
+            const message = err instanceof Error ? err.message : String(err);
+            send({ type: "failed", category: "model_error", message: message.slice(0, 160), code: "EFFORT_SELECTION_FAILED", stage: "effort" });
+            send({ type: "error", message, code: "EFFORT_SELECTION_FAILED", stage: "effort" });
+            return;
           } finally {
-            try {
-              await endSession(sessionId);
-            } catch {
-              // Cleanup does not change an applied watchlist receipt.
-            }
+            timings.routeMs = performance.now() - startedAt;
           }
         }
-        send({ type: "answer_delta", text });
-        send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: generated ? 1 : 0, totalMs: 0, escalations: 0 }, tools: { calls: generated ? 1 : 0, totalMs: 0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures: {} } });
-        return true;
+        await runKernelAgent(prompt, send, { signal: req.signal, deadlineAt, personas: [...FINAL_PERSONAS], ...tickerField, ...(currentChartTicker ? { currentChartTicker } : {}), ...(watchlist ? { watchlist } : {}), ...contextField, ...(reasoningEffort ? { reasoningEffort } : {}) });
       };
-      // The widget action is a UI receipt for the displayed stock's workspace, never evidence.
-      // Only a validated canonical receipt for that stock emits widget_update. A failure answers visibly, never researches.
-      const applyWidget = async (): Promise<boolean> => {
+      // A UI action is a receipt, never evidence. Only a validated canonical receipt emits its update event.
+      // A failure answers visibly and never researches.
+      const applyAction = async (status: string, failure: string, apply: (sessionId: string) => Promise<string>): Promise<void> => {
         const t0 = performance.now();
         send({ type: "agent_start", prompt });
-        send(statusEvent("Adding the widget…"));
-        const generated = await generateArguments("add_widget");
-        let text = "Widget update failed: no valid widget and stock.";
-        if (generated) {
-          const sessionId = newSessionId();
-          try {
-            const result = await invoke("add_widget", generated.args, sessionId, Math.max(deadlineAt - Date.now(), 1));
-            if (!result.ok) throw new Error(result.error);
-            const receipt = result.widgetSelection;
-            if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) throw new Error("The widget tool returned an invalid receipt.");
-            const { result_type, widget_type, ticker } = receipt as Record<string, unknown>;
-            if (result_type !== "widget_selection" || typeof widget_type !== "string" || !WIDGET_TYPES.includes(widget_type) || typeof ticker !== "string" || parseTicker(ticker) !== ticker) {
-              throw new Error("The widget tool returned an invalid receipt.");
-            }
-            if (ticker !== currentChartTicker) throw new Error(`The widget targets ${ticker}, but the displayed stock is ${currentChartTicker ?? "not set"}.`);
-            send({ type: "widget_update", ticker, widgetType: widget_type });
-            text = `Added the ${widget_type} widget to the ${ticker} workspace.`;
-          } catch (err) {
-            text = `Widget update failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 160)}`;
-          } finally {
-            try {
-              await endSession(sessionId);
-            } catch {
-              // Cleanup does not change an applied widget receipt.
-            }
-          }
-        }
-        send({ type: "answer_delta", text });
-        send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: generated ? 1 : 0, totalMs: 0, escalations: 0 }, tools: { calls: generated ? 1 : 0, totalMs: 0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures: {} } });
-        return true;
-      };
-      const tryEntryAnswer = async (winner: string): Promise<boolean> => {
+        send(statusEvent(status));
+        const sessionId = newSessionId();
+        let text: string;
         try {
-          if (winner === "clarify_subject") {
-            const t0 = performance.now();
-            send({ type: "agent_start", prompt });
-            send({ type: "answer_delta", text: "Which stock, ETF, sector, or holding do you want advice on? Give a ticker (for example NVDA) or a company name, and I will research it." });
-            send({ type: "done", metrics: { totalMs: performance.now() - t0, needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 0, totalMs: 0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures: {}, timings: {} }, status: "completed" });
-            return true;
-          }
-          if (winner === "no_session" || winner === "reasoning_required") return await answerDirect();
-          if (winner === "update_watchlist") return await applyWatchlist();
-          if (winner === "add_widget") return await applyWidget();
-          // Only identifier-shaped tool names can enter the single-tool path.
-          if (winner !== "research_required" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(winner)) return await answerSingleShot(winner);
-        } catch {
-          // The direct answer failed to start. Research owns the next attempt.
-        }
-        return false;
-      };
-      // ponytail: JEV-first entry — one route round selects the route and any explicit personas.
-      // The watchlist rides as separate context; JEV's returned route governs dispatch here.
-      const routeAt = performance.now();
-      const selected = await selectEntry({ op: "route", prompt, ...tickerField, ...watchlistField, ...(currentChartTicker ? { currentChartTicker } : {}), ...contextField }, req.signal);
-      timings.routeMs = performance.now() - routeAt;
-      if ("error" in selected) {
-        const routeError = selected.error;
-        // Selection is unknown. The route must not guess personas or a route.
-        send({ type: "agent_start", prompt });
-        send({ type: "failed", category: "provider_error", message: routeError.slice(0, 160), code: "ROUTE_SELECTION_FAILED", stage: "route" });
-        send({ type: "error", message: routeError, code: "ROUTE_SELECTION_FAILED", stage: "route" });
-        await flush();
-        controller.close();
-        return;
-      }
-      const warnChart = (message: string): void => {
-        send({ type: "answer_delta", text: `Chart update failed: ${message} I will continue with your original question.\n\n` });
-      };
-      if (selected.chartError) warnChart(selected.chartError);
-      if (selected.chartTicker) {
-        const focus = selected.chartTicker;
-        let sessionId: string | undefined;
-        try {
-          if (Date.now() >= deadlineAt) throw new Error("The request deadline expired before the chart action.");
-          if (req.signal.aborted) throw new Error("The request was cancelled before the chart action.");
-          sessionId = newSessionId();
-          const result = await invoke("set_chart_symbol", { ticker: focus }, sessionId, Math.max(deadlineAt - Date.now(), 1));
-          if (!result.ok) throw new Error(result.error);
-          const receipt = result.chartSelection;
-          if (!receipt || typeof receipt !== "object" || Array.isArray(receipt) || !("result_type" in receipt) || receipt.result_type !== "chart_selection"
-            || !("ticker" in receipt) || receipt.ticker !== focus) {
-            throw new Error("The chart tool returned an invalid receipt.");
-          }
-          currentChartTicker = focus;
-          if (!watchlist) tickerField = { ticker: focus };
-          send({ type: "chart_update", ticker: focus });
+          text = await apply(sessionId);
         } catch (err) {
-          warnChart(err instanceof Error ? err.message : String(err));
+          text = `${failure}: ${(err instanceof Error ? err.message : String(err)).slice(0, 160)}`;
         } finally {
-          if (sessionId) {
-            try {
-              await endSession(sessionId);
-            } catch {
-              // Cleanup does not change a successful chart selection.
-            }
+          try {
+            await endSession(sessionId);
+          } catch {
+            // Cleanup does not change an applied receipt.
           }
         }
-      }
-      const { personas } = selected;
-      // Explicit personas skip direct and single-tool answers: research owns their evidence lifecycle.
-      if (personas === null && await tryEntryAnswer(selected.route)) {
-        await flush();
-        controller.close();
-        return;
-      }
+        send({ type: "answer_delta", text });
+        send({ type: "done", metrics: zeroMetrics(t0, 1), status: "completed" });
+      };
+      const runTool = async (tool: string, args: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>> => {
+        const result = await invoke(tool, args, sessionId, Math.max(deadlineAt - Date.now(), 1));
+        if (!result.ok) throw new Error(result.error);
+        const receipt = tool === "update_watchlist" ? result.watchlistUpdate : tool === "add_widget" ? result.widgetSelection : result.chartSelection;
+        if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) throw new Error(`The ${tool} tool returned an invalid receipt.`);
+        return receipt as Record<string, unknown>;
+      };
       try {
-        await runKernelAgent(prompt, send, { signal: req.signal, seedEvidence: singleShotEvidence, deadlineAt, ...(personas ? { personas } : {}), ...tickerField, ...(currentChartTicker ? { currentChartTicker } : {}), ...(watchlist ? { watchlist } : {}), ...contextField });
+        if (research) {
+          await runResearch();
+        } else if (WATCHLIST_COMMAND.test(prompt) && asksWatchlist(prompt)) {
+          await applyAction("Updating your watchlist…", "Watchlist update failed", async (sessionId) => {
+            const args = await generateArguments("update_watchlist");
+            if (!args) throw new Error("no valid stock and action.");
+            const { result_type, action, ticker: t } = await runTool("update_watchlist", args, sessionId);
+            if (result_type !== "watchlist_update" || (action !== "add" && action !== "remove") || typeof t !== "string" || parseTicker(t) !== t) throw new Error("The watchlist tool returned an invalid receipt.");
+            send({ type: "watchlist_update", action, ticker: t });
+            return action === "add" ? `Added ${t} to your watchlist.` : `Removed ${t} from your watchlist.`;
+          });
+        } else if (WIDGET_COMMAND.test(prompt)) {
+          await applyAction("Adding the widget…", "Widget update failed", async (sessionId) => {
+            const args = await generateArguments("add_widget");
+            if (!args) throw new Error("no valid widget and stock.");
+            const { result_type, widget_type, ticker: t } = await runTool("add_widget", args, sessionId);
+            if (result_type !== "widget_selection" || typeof widget_type !== "string" || !WIDGET_TYPES.includes(widget_type) || typeof t !== "string" || parseTicker(t) !== t) throw new Error("The widget tool returned an invalid receipt.");
+            if (t !== currentChartTicker) throw new Error(`The widget targets ${t}, but the displayed stock is ${currentChartTicker ?? "not set"}.`);
+            send({ type: "widget_update", ticker: t, widgetType: widget_type });
+            return `Added the ${widget_type} widget to the ${t} workspace.`;
+          });
+        } else {
+          const focus = chartCommand(prompt);
+          if (focus === undefined) {
+            await answerPlain();
+          } else {
+            await applyAction("Updating the chart…", "Chart update failed", async (sessionId) => {
+              const { result_type, ticker: t } = await runTool("set_chart_symbol", { ticker: focus }, sessionId);
+              if (result_type !== "chart_selection" || t !== focus) throw new Error("The chart tool returned an invalid receipt.");
+              send({ type: "chart_update", ticker: focus });
+              return `Showing ${focus} on the chart.`;
+            });
+          }
+        }
       } catch (err) {
-        console.error(`[web] [agent-api] runKernelAgent error: ${err instanceof Error ? err.message : String(err)}`);
+        console.error(`[web] [agent-api] ${research ? "runKernelAgent" : "chat"} error: ${err instanceof Error ? err.message : String(err)}`);
         if (req.signal.aborted) send({ type: "cancelled", message: "The request was cancelled." });
-        else send({ type: "error", message: err instanceof Error ? err.message : String(err), code: "KERNEL_FAILED", stage: "research" });
+        else send({ type: "error", message: err instanceof Error ? err.message : String(err), code: "KERNEL_FAILED", stage: research ? "research" : "chat" });
       }
       await flush();
       controller.close();

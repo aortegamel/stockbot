@@ -6,9 +6,9 @@ starts three services: the Bun API host (`needle-harness/scripts/api.ts`),
 FastAPI (`api.main:app`), and Vite. The Bun host dispatches `POST /api/agent`,
 `GET /api/watchlist`, `GET /api/health`, and `GET /api/research/*` to the existing handlers. Vite
 proxies those paths to Bun and the existing market `/api/*` paths to FastAPI.
-`needle-harness/app/api/agent/route.ts` runs `runKernelAgent`
-(`needle-harness/lib/agent/kernel.ts`, prewarmed by the Bun host): one
-`app/research/kernel_worker.py` call per request, which persists the prompt
+For research requests, `needle-harness/app/api/agent/route.ts` runs `runKernelAgent`
+(`needle-harness/lib/agent/kernel.ts`, prewarmed by the Bun host).
+One `app/research/kernel_worker.py` call per research request persists the prompt
 verbatim as the objective, runs the intake (SEC filing metadata + search
 snippets per resolved ticker plus one exact-text Exa search, settled with
 `continuation=False` so it admits evidence but never resolves), builds a
@@ -81,47 +81,29 @@ It also rejects relative-date words, such as `today` or `last quarter`, and conc
 An ungrounded concept starts JEV selection before the tool runs.
 The scheduler never substitutes a fallback concept.
 
-Entry routing sends one `op:route` call.
-In programmatic mode, exact greetings and acknowledgements return `no_session` with `personas: null` without a JEV call.
-The matcher removes punctuation, ignores case, and collapses whitespace before it compares exact phrases.
-After an exact phrase match, the matcher rejects prompts that contain `$` or a resolved uppercase ticker.
-Resolved ticker tokens such as `$TY`, `TY`, `$HI`, and `HI` continue through research routing.
-A selected caller ticker does not override an exact greeting: `hello` with `ticker="NVDA"` still returns `no_session`.
-`Hello!`, `thanks!!`, and `what's up?` use one short Stockbot reply without research, tools, or a session.
-Mixed requests such as `hello, what drove NVDA revenue last quarter?` still enter research.
-Persona greetings such as `hi bullbot` still reach JEV.
-In programmatic mode, advice without a prompt subject or supplied stock returns `clarify_subject` without JEV.
-The separate `currentChartTicker` supplies the displayed stock when the prompt names no stock.
-The matcher accepts only advice words and filler, so `should I buy bonds` still uses existing routing.
-The harness streams one fixed clarification with no research session, provider call, or tool call.
-For other requests, JEV returns `{route, personas}` with optional `chartTicker` or `chartError`.
-`personas: null` means the request neither selects nor excludes a persona.
-An explicit list is nonempty, unique, and canonical, in the order Stockbot, Bearbot, Bullbot.
-Positive requests retain only requested personas that the user does not exclude.
-Exclusion-only requests select the remaining personas.
-Other programmatic routes become a `route_hint` while JEV selects personas and an independent chart focus.
-Without a hint, the JEV prompt assigns small talk without a company, ticker, or market topic to `reasoning_required`.
-A selector failure returns `{id, error}` without an assumed persona set.
-No remaining persona also fails the request.
+Default chat uses one plain model call.
+It runs no JEV selection, research, evidence inventory, or final gates.
+The server handles three deterministic UI commands in `needle-harness/app/api/agent/route.ts`:
 
-The route request carries `currentChartTicker` separately from the exclusive ticker or watchlist research scope.
-The worker validates this field with the existing ticker validator.
-The chart focus question remains present when a programmatic hint suppresses the normal entry question.
-The entry route and direct-tool assessment exclude `set_chart_symbol` because the independent chart action owns this operation.
-JEV chooses a declared lexical stock label or `no_change` in the same entry call.
-Explicit user stocks take precedence over the displayed stock.
-For several stocks, JEV chooses the chart focus.
-The entry client resolves only this chosen label through EDGAR.
-Existing greeting and advice subject checks retain their separate resolution behavior.
-The entry client validates the resolved ticker before it returns `chartTicker`.
-It omits `chartTicker` when the focus matches the displayed chart.
-Resolution failures return `chartError` without changing the original route or personas.
+- Watchlist commands contain `add` or `remove` plus a watchlist request.
+  Needle generates arguments for the fixed `update_watchlist` tool.
+- Widget commands contain `add` followed by `widget` or `widgets` within the same sentence.
+  Needle generates arguments for the fixed `add_widget` tool.
+- Chart commands match the whole prompt, such as `show AAPL` or `open the chart for $nvda`.
+  The server calls the fixed `set_chart_symbol` tool.
 
-The harness asks Needle only for arguments to the fixed `set_chart_symbol` tool.
-It checks the generated ticker against the chosen focus before canonical execution.
-The harness emits `{type: "chart_update", ticker}` only after canonical success.
-A chart failure produces a visible warning, while the original question continues.
+These commands do not use JEV or research.
+The harness emits `{type: "chart_update", ticker}` only after canonical chart success.
 The chart receipt does not enter factual evidence.
+
+The client recognizes the `/research ` prompt prefix.
+The research toggle also selects research mode.
+Both send `mode: "research"` to `POST /api/agent`.
+The client removes the prefix before it sends the prompt.
+The server rejects other supplied mode values with HTTP 400.
+Research always runs the full pipeline with Bearbot, Bullbot, and Stockbot.
+It uses no entry selection or direct-tool shortcut.
+
 During research, canonical chart success emits progress with `stage: "chart_update"` and `detail: {ticker}`.
 The scheduler validates `result.meta.chart_selection` before it emits this progress.
 It does not parse formatted chart text or infer success from the final execution list.
@@ -131,19 +113,17 @@ Research intake uses the supplied ticker only when the objective names no stock.
 An explicit objective stock takes precedence over this context.
 Deterministic fallback arguments use the same subject precedence as Needle.
 
-Without an explicit selection, direct and single-tool answers use one Stockbot call.
-Research uses all three personas.
-An explicit selection always enters research.
-Partial selections run the selected personas concurrently over the same graph, evidence, decisions, and unresolved items.
-Partial selections use no synthesis or draft retry.
-
-The full trio uses synthesis.
+Research always uses the full trio with synthesis.
 Bearbot and Bullbot draft concurrently over the shared snapshot.
 Stockbot weighs both drafts against that snapshot and writes its response.
-The kernel buffers drafts instead of streaming them.
+The stockbot synthesis starts as soon as both drafts settle.
+At the same time, the final gates check each draft separately.
+Each draft that passes its gates publishes at once: Bearbot first, then Bullbot.
 An empty graph retains the direct prompt without evidence.
 Exactly one failed or empty draft retries once.
-A second draft failure or a failed or empty synthesis fails the report without prose.
+If synthesis fails, times out, or loses every claim to the gates after a draft published, the run ends `completed_with_limitations`.
+The limitations name the unavailable synthesis, and the run emits no `failed` event.
+If no draft passes its gates and synthesis also fails, the run fails without prose.
 
 The kernel runs exactly one worker research run and one persona round.
 An unresolved node, a tripped guard, or an escalation never starts more research.
@@ -156,6 +136,7 @@ A failed retrieval never becomes an evidence row.
 Otherwise, an answer never announces missing evidence: what the run did not find is left out.
 
 Final gates check the claim inventory and the whole response.
+The kernel checks all personas and all of their claims concurrently and processes the results in persona order.
 The gate requests carry the research session id of the run they judge.
 A gate error rejects its claim or response; it never keeps ungraded prose.
 If the whole response fails, the gates check each claim.
@@ -172,19 +153,18 @@ The corrected answer passes the same gates.
 A still-invalid, empty, or failed correction fails without prose or another retry.
 Other inventory defects do not retry.
 Direct answers carry no inventory and never retry.
-A gate failure, an empty persona, or rejection of all claims fails the report without prose.
+In the trio, a gate failure or a fully rejected persona removes only that persona's block.
+A run fails without prose only when no persona block survives.
 The claim inventory is the last `json` fenced block of a response.
 The kernel drops any text after its closing fence.
 An unclosed (cut-off) block never shows raw JSON: the prose ends at the fence.
 
 An unresolved node does not emit `failed` when the final gates pass.
 A research answer with no cited claim ships its gated prose with no warning banner.
-The kernel emits one `answer_delta` with labeled persona sections.
+The trio emits one `answer_delta` per published persona block, each followed by a cumulative `claims` event.
 The reasoner returns narrative prose plus declared claims. The claims stay unproven until the gates keep them.
 The reasoner's raw stream (`onDelta`) is internal diagnostics only, because it carries the inventory fence.
 The kernel and the route pass no stream callback, so the client sees only the gated text and the kept claims.
-The trio emits Bearbot and Bullbot drafts before the Stockbot response.
-Partial selections emit sections in canonical order.
 Metrics count all attempted calls and token usage across retries.
 Metrics also report the final stage duration.
 Runtime model prompts retain persona tasks, required response formats, and untrusted-data protections.
@@ -211,10 +191,14 @@ Under 16 tokens left, the next call fails before any request: the provider rejec
 Unset knobs send no cap. The chat-completions fallback sends no cap.
 The provider counts reasoning tokens inside `max_output_tokens`, so a low cap can return little or no prose.
 
-Reasoning effort: `REASONING_EFFORT` sets the model's reasoning effort on every remote model call: Muse, the Reasoner, and JEV.
-Stockbot sends the value unchanged, so each provider's own levels work. The value must match `^[a-z][a-z0-9_-]{0,31}$`.
-A bad value fails the call before any request. Unset or empty sends no field, so the provider default applies.
-Responses calls send `reasoning: {effort}`. Chat Completions calls, including the Muse fallback, send `reasoning_effort`.
+Reasoning effort: `REASONING_EFFORT` defaults to `auto` when unset or empty.
+In auto mode, JEV chooses `low`, `medium`, `high`, or `xhigh` before each research run.
+The choice uses the prompt, scope, remaining deadline, and answer limits.
+Only the research Muse answers use that choice, including persona drafts, synthesis, retries, and protocol fallbacks.
+JEV, the Reasoner, and default chat send no effort field in auto mode.
+An effort selection error fails the request with `EFFORT_SELECTION_FAILED` at stage `effort`. Stockbot logs the selected effort.
+A concrete value applies unchanged to every remote model call. It must match `^[a-z][a-z0-9_-]{0,31}$`.
+A bad value fails before any request. Responses sends `reasoning: {effort}`. Chat Completions sends `reasoning_effort`.
 The Decisions API documents no reasoning field, so the `decisions` format sends none.
 `decision/reasoning.ts` and `app/config.py` `reasoning_fields` own this mapping.
 
@@ -337,7 +321,12 @@ Needs(prerequisites), and PIT(pitSupport). Compact metadata retains the
 safety restrictions that descriptions once carried. JEV sees every
 registry tool. Needle keeps the full descriptions and parameter schemas.
 
-The argument worker calls native `Needle.complete()` with the raw node question and the SDK native `max_new_tokens=512` generation default.
+The argument worker calls native `Needle.complete()` with the node question and grounded execution handles in user text.
+It keeps the SDK native `max_new_tokens=512` generation default.
+For accession-based tools, the scheduler selects the handle from persisted same-session filing rows with issuer, form, and cutoff checks.
+The worker rejects a missing accession before generation.
+For discovery, a named SEC form enters the user text with the requested count or declared default count.
+Form numbers never supply a record count.
 It binds exactly the tool that JEV selects.
 The catalog preserves the original description and parameter schema.
 Structured extraction keeps its native 512-token default and 1-4096 validation bound.
@@ -374,7 +363,8 @@ A generated limit that differs from the requested count fails, and an omitted li
 SEC `forms` filters must be exact form types from the installed edgartools registries, or a single `/A` suffix on a registered non-amendment form.
 Exact registered amendments such as `N-MFP2/A` pass even without a registered base form. Unregistered doubled `/A` values fail.
 An unknown form, such as a ticker, fails as `invalid_tool_arguments` before any EDGAR call.
-The scheduler passes generated forms through unchanged.
+For named 10-Q, 10-K, or 8-K requests, the scheduler supplies that form filter.
+Other generated form filters remain unchanged.
 
 The process supervisor retains the 120-second startup budget and shared 120-second worker request timeout.
 Argument generation has no separate 10s/20s timeout; the shared worker timeout still bounds each generation call.
@@ -462,7 +452,7 @@ Tests inject fake values.
 ### `chat_completions` format
 
 Use this value for an OpenAI-compatible Chat Completions endpoint, such as `https://<provider-host>/v1/chat/completions`.
-The request body contains `model`, `messages`, and `stream: false`, plus `reasoning_effort` when `REASONING_EFFORT` is set.
+The request contains `model`, `messages`, and `stream: false`, plus `reasoning_effort` for a concrete `REASONING_EFFORT` value.
 One fixed system message carries the answer instructions.
 One user message carries the JSON text of `{state, questions}`.
 The request uses no tools, `response_format`, JSON Schema, or logprobs.

@@ -37,6 +37,8 @@ export type ShellState = {
   events: AgentEvent[];
   input: string;
   setInput: (value: string) => void;
+  research: boolean;
+  setResearch: (value: boolean) => void;
   // A feed item for the next Send. It rides as data beside the prompt; null clears it.
   setAskContext: (context: AskContext | null) => void;
   onSend: () => void;
@@ -153,6 +155,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
   const [seq, setSeq] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
   const [input, setInput] = useState("");
+  const [research, setResearch] = useState(false);
   const [askContext, setAskContext] = useState<AskContext | null>(null);
   const [drawer, setDrawerState] = useState(initialDrawer);
   const [, setClock] = useState("--:--:--");
@@ -286,7 +289,10 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
   // text: a prompt from outside the panel input (the palette Ask row). Only the panel Send uses the feed item.
   async function onSend(text?: string) {
     const context = text === undefined ? askContext : null;
-    const q = (text ?? input).trim() || (context ? `What does this mean${context.sym ? ` for ${context.sym}` : ""}?` : "");
+    const raw = text ?? input;
+    const prefix = /^\s*\/research\b\s*/i;
+    const researchMode = research || prefix.test(raw);
+    const q = raw.replace(prefix, "").trim() || (context ? `What does this mean${context.sym ? ` for ${context.sym}` : ""}?` : "");
     if (!q || busy || abortRef.current) return;
     const prompt = q;
     setBusy(true);
@@ -327,7 +333,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
         method: "POST",
         headers: { "Content-Type": "application/json" },
         // Watchlist rides as separate context; the prompt stays verbatim and the server decides scope.
-        body: JSON.stringify({ prompt, ticker: selected, currentChartTicker: selected, ...(watchlist.length ? { watchlist } : {}), ...(context ? { context } : {}) }),
+        body: JSON.stringify({ prompt, ticker: selected, currentChartTicker: selected, ...(watchlist.length ? { watchlist } : {}), ...(context ? { context } : {}), ...(researchMode ? { mode: "research" } : {}) }),
         signal: ctrl.signal,
       });
       await receiveAgentResponse(response, push, arm);
@@ -353,7 +359,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
     void onSend(text);
   };
   const state: ShellState = {
-    selected, pick, watchlist, onWatchlist, events, input, setInput, setAskContext, onSend: () => void onSend(),
+    selected, pick, watchlist, onWatchlist, events, input, setInput, research, setResearch, setAskContext, onSend: () => void onSend(),
     busy, debug, sessions, sessionId, setSessionId, snapshot, journal, seq, openDrawer: () => setDrawer(true), ask, onWidgetOutcomes,
   };
 
@@ -415,7 +421,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
         {children(route, state)}
         {drawer && (
           <aside className="glass ws-cell drawer" aria-label="Agent drawer">
-            <AIPanel events={events} input={input} setInput={setInput} context={askContext} onClearContext={() => setAskContext(null)} onSend={state.onSend} sym={selected} busy={busy} debug={debug} widgetOutcomes={widgetOutcomes} />
+            <AIPanel events={events} input={input} setInput={setInput} research={research} setResearch={setResearch} context={askContext} onClearContext={() => setAskContext(null)} onSend={state.onSend} sym={selected} busy={busy} debug={debug} widgetOutcomes={widgetOutcomes} />
           </aside>
         )}
       </div>

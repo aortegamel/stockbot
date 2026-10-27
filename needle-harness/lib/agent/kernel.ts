@@ -103,6 +103,7 @@ type KernelGraphNode = {
 
 export type KernelReasonInput = {
   prompt: string;
+  reasoningEffort?: string;
   ticker?: string;
   context?: AskContext;
   evidence: Evidence[];
@@ -148,6 +149,7 @@ export type KernelResponse = {
   confidence?: number | null;
   reasoning?: string;
   verdict?: string;
+  effort?: unknown;
   error?: string;
   content?: string;
   watchlist?: WatchlistRow[];
@@ -316,13 +318,11 @@ async function gateResult(r: FinalPersonaResult, ctx: FinalGateContext): Promise
   const supported: FinalClaim[] = [];
   let failures = 0;
   let failed: string | undefined;
-  for (const c of r.claims) {
-    const localDefect = inventoryDefect(c.text, [c], new Set(ctx.evidence.map((e) => e.id)), points);
-    if (localDefect !== undefined) {
-      failures += 1;
-      continue;
-    }
-    const checked = await checkClaim(ctx, r.persona, c);
+  const checkedClaims = await Promise.all(r.claims.map(async (c) => {
+    const localDefect = inventoryDefect(r.prose, [c], new Set(ctx.evidence.map((e) => e.id)), points);
+    return localDefect === undefined ? checkClaim(ctx, r.persona, c) : { unsupported: true as const };
+  }));
+  for (const checked of checkedClaims) {
     if ("failure" in checked) {
       failed ??= checked.failure;
       failures += 1;
@@ -364,7 +364,7 @@ type GateOptions = {
 async function gatePersonas(results: FinalPersonaResult[], opts: GateOptions): Promise<{ persona: Persona; text: string; supported: FinalClaim[]; partial?: boolean }[] | { failure: string; supported: FinalClaim[]; partial: boolean }> {
   const gated: { persona: Persona; text: string; supported: FinalClaim[]; partial?: boolean }[] = [];
   let failed: string | undefined;
-  for (const r of results) {
+  const checked = await Promise.all(results.map(async (r) => {
     const ctx: FinalGateContext = {
       gate: opts.gate,
       evidence: opts.evidence.map((e) => ({
@@ -387,30 +387,26 @@ async function gatePersonas(results: FinalPersonaResult[], opts: GateOptions): P
       ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
       opts: opts.gateOpts,
     };
-    const outcome = await gateResult(r, ctx);
+    return { persona: r.persona, outcome: await gateResult(r, ctx) };
+  }));
+  for (const { persona, outcome } of checked) {
     if ("failure" in outcome) {
       failed ??= outcome.failure;
-      if (outcome.supported.length > 0) gated.push({ persona: r.persona, text: "", supported: outcome.supported, partial: true });
+      if (outcome.supported.length > 0) gated.push({ persona, text: "", supported: outcome.supported, partial: true });
       continue;
     }
-    gated.push({ persona: r.persona, text: outcome.text, supported: outcome.supported, ...(outcome.partial === true ? { partial: true as const } : {}) });
+    gated.push({ persona, text: outcome.text, supported: outcome.supported, ...(outcome.partial === true ? { partial: true as const } : {}) });
   }
   if (gated.length === 0) return { failure: failed ?? "all claims rejected", supported: [], partial: false };
   return gated;
 }
-export async function applyFinalGates(opts: GateOptions & { results: FinalPersonaResult[]; personaOrder: readonly Persona[] }): Promise<{ text: string; supported: FinalClaim[]; partial: boolean } | { failure: string; supported: FinalClaim[]; partial?: boolean }> {
+type GatedAnswer = { text: string; supported: FinalClaim[]; partial: boolean } | { failure: string; supported: FinalClaim[]; partial?: boolean };
+export async function applyFinalGates(opts: GateOptions & { results: FinalPersonaResult[]; personaOrder: readonly Persona[] }): Promise<GatedAnswer> {
   const gated = await gatePersonas(opts.results, opts);
   if (!Array.isArray(gated)) return gated;
   const ordered = opts.personaOrder.filter((p) => gated.some((g) => g.persona === p));
   const assembled = assembleGated(gated, ordered);
   return "failure" in assembled ? assembled : { text: assembled.text, supported: assembled.supported, partial: assembled.partial };
-}
-// One unlabeled answer through the same independent gates: the route's single-tool answer.
-export async function gateAnswer(opts: GateOptions & { result: FinalPersonaResult }): Promise<{ text: string; supported: FinalClaim[]; partial: boolean } | { failure: string; supported: FinalClaim[]; partial?: boolean }> {
-  const gated = await gatePersonas([opts.result], opts);
-  if (!Array.isArray(gated)) return gated;
-  const first = gated[0];
-  return first === undefined ? { failure: "all claims rejected", supported: [], partial: false } : { text: first.text, supported: first.supported, partial: first.partial === true };
 }
 type RunKernelDeps = {
   spawnFn?: KernelSpawn;
@@ -729,6 +725,7 @@ function graphProjection(input: {
 type KernelRunOptions = {
   signal?: AbortSignal;
   deadlineAt?: number;
+  reasoningEffort?: string;
   deps?: RunKernelDeps;
   seedEvidence?: Evidence[];
   personas?: readonly Persona[];
@@ -752,6 +749,7 @@ type KernelRun = {
   scope: Record<string, unknown>;
   currentChartTicker: string | undefined;
   context: AskContext | undefined;
+  reasoningEffort: string | undefined;
   personas: readonly Persona[];
   isTrio: boolean;
   seed: Evidence[];
@@ -789,6 +787,7 @@ type Pass = {
   results: FinalPersonaResult[] | undefined;
   drafts: Partial<Record<Persona, string>>;
   synthDrafts: { persona: Persona; text: string }[] | undefined;
+  trio?: { text: string; supported: FinalClaim[]; partial: boolean; synthesisFailure?: string };
 };
 // One settled reasoner call: a rejection settles as a value so siblings finish.
 type Settled = { r: KernelReasonResult } | { err: unknown };
@@ -1170,6 +1169,7 @@ function reasonInput(run: KernelRun): ReasonInput {
     : `${run.prompt}\n\n${graphProjection({ objective: run.objective, nodes: run.nodes, decisions: run.records, watchlist: run.watchlist, toolCalls: run.toolCalls })}`;
   return {
     prompt,
+    ...(run.reasoningEffort !== undefined ? { reasoningEffort: run.reasoningEffort } : {}),
     ...(run.scope.watchlist === undefined && run.currentChartTicker !== undefined ? { ticker: run.currentChartTicker } : {}),
     ...(run.context ? { context: run.context } : {}),
     evidence: run.evidence,
@@ -1256,10 +1256,8 @@ async function retryDraft(pass: Pass, input: ReasonInput, persona: Persona): Pro
   return acceptDraft(pass, { persona, outcome: await settle(pass.run, input, persona) });
 }
 
-// Trio synthesis: bear+bull draft concurrently over the shared snapshot, then
-// stockbot judges both drafts against the same snapshot. Exactly one failed or
-// empty draft retries once with the request signal and no time limit; a second
-// failure or a failed or empty synthesis follows the shared fail-closed rule.
+// The trio starts synthesis before draft gates. Gates publish bear before bull.
+// The direct path retains its existing buffered answer.
 async function trioStage(pass: Pass, input: ReasonInput): Promise<void> {
   const draftOrder = pass.run.personas.filter((p) => p !== "stockbot");
   pass.run.museCalls += draftOrder.length;
@@ -1273,7 +1271,44 @@ async function trioStage(pass: Pass, input: ReasonInput): Promise<void> {
   if (pass.failure !== undefined) return;
   pass.run.museCalls += 1;
   pass.synthDrafts = draftOrder.map((persona) => ({ persona, text: pass.drafts[persona] ?? "" }));
-  pass.failure = acceptAnswer(pass, "stockbot", await settle(pass.run, input, "stockbot", pass.synthDrafts));
+  const synthesis = settle(pass.run, input, "stockbot", pass.synthDrafts);
+  if (pass.run.direct) {
+    pass.failure = acceptAnswer(pass, "stockbot", await synthesis);
+    return;
+  }
+  const run = pass.run;
+  pass.trio = { text: "", supported: [], partial: false };
+  const published = pass.trio;
+  const publish = (gated: GatedAnswer): void => {
+    if ("failure" in gated) {
+      published.partial = true;
+      return;
+    }
+    const text = `${published.text ? "\n\n" : ""}${gated.text}`;
+    published.text += text;
+    published.supported.push(...gated.supported);
+    published.partial ||= gated.partial;
+    run.emit({ type: "answer_delta", text });
+    run.emit({ type: "claims", claims: [...published.supported] });
+  };
+  const draftGates = (["bearbot", "bullbot"] as const).map((persona) =>
+    gateFinal(run, (pass.results ?? []).filter((r) => r.persona === persona), [persona]));
+  const synthesisGate = synthesis.then(async (outcome): Promise<GatedAnswer> => {
+    const failure = acceptAnswer(pass, "stockbot", outcome);
+    if (failure !== undefined) return { failure, supported: [] };
+    return gateFinal(run, (pass.results ?? []).filter((r) => r.persona === "stockbot"), ["stockbot"]);
+  });
+  for (const gate of draftGates) publish(await gate);
+  const gated = await synthesisGate;
+  if ("failure" in gated) {
+    pass.failure = gated.failure;
+    if (!published.text) emitPartial(run, dropUncovered((pass.results ?? []).map((r) => r.prose).join("\n\n"), gated.supported), gated.supported);
+  } else publish(gated);
+  if (pass.failure !== undefined && published.text) {
+    pass.trio.synthesisFailure = pass.failure;
+    run.failures.provider_error = (run.failures.provider_error ?? 0) + 1;
+    pass.failure = undefined;
+  }
 }
 
 // A failed stage ends the report as provider_error; the reasoner is the tool.
@@ -1283,9 +1318,37 @@ function endStageFailure(run: KernelRun, pass: Pass): boolean {
   return true;
 }
 
+// Every persona uses the same gates, session, signal, and shared deadline.
+async function gateFinal(run: KernelRun, results: FinalPersonaResult[], personaOrder: readonly Persona[]): Promise<GatedAnswer> {
+  const gatesAt = performance.now();
+  const remaining = Math.max(run.deadlineAt - Date.now(), 1);
+  const gated = await applyFinalGates({
+    results,
+    evidence: run.evidence,
+    personaOrder,
+    ...(run.sessionId ? { sessionId: run.sessionId } : {}),
+    gate: (body, gateOpts) => run.router.call(body, {
+      ...(run.signal ? { signal: run.signal } : {}),
+      timeoutMs: remaining,
+      ...gateOpts,
+    }),
+  });
+  addTiming(run, "gatesMs", performance.now() - gatesAt);
+  return gated;
+}
+
 // A research answer is verified before display; a direct answer keeps only its explicitly
 // qualified evidence-free unknown/assumption claims. Neither announces gaps.
 async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
+  if (pass.trio !== undefined) {
+    const { text, supported, partial, synthesisFailure } = pass.trio;
+    const limitations = [...new Set([...run.unresolved, ...(run.guard ? ["incomplete evidence guard"] : [])])].slice(0, 5);
+    if (synthesisFailure !== undefined) limitations.push(`stockbot synthesis unavailable: ${synthesisFailure}`);
+    const limited = partial || limitations.length > 0;
+    if (limited) emitPartial(run, text, supported);
+    run.emit({ type: "done", metrics: metricsOf(run, run.escalations), status: limited ? "completed_with_limitations" : "completed", ...(limited ? { limitations } : {}) });
+    return;
+  }
   const results = pass.results;
   if (run.direct || results === undefined) {
     // A direct answer has no evidence to cite: no fact in it can be proven, so only qualified unknown/assumption prose shows.
@@ -1299,19 +1362,7 @@ async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
     endReport(run, blocks.join("\n\n"), "completed");
     return;
   }
-  const order: Persona[] = run.isTrio ? ["bearbot", "bullbot", "stockbot"] : [...run.personas];
-  const gatesAt = performance.now();
-  const remaining = Math.max(run.deadlineAt - Date.now(), 1);
-  const gated = await applyFinalGates({
-    results: order.flatMap((p) => results.filter((r) => r.persona === p)),
-    evidence: run.evidence,
-    personaOrder: order,
-    // Gates are judged against this run's session; without it the worker falls
-    // back to the numeric request id and fails every gate closed.
-    ...(typeof run.sessionId === "string" && run.sessionId ? { sessionId: run.sessionId } : {}),
-    gate: (body, gateOpts) => run.router.call(body, { ...(run.signal ? { signal: run.signal } : {}), timeoutMs: remaining, ...gateOpts }),
-  });
-  addTiming(run, "gatesMs", performance.now() - gatesAt);
+  const gated = await gateFinal(run, results, run.personas);
   if ("failure" in gated) {
     // Verified partial claims survive even when the whole answer cannot publish.
     if (gated.supported.length > 0) emitPartial(run, dropUncovered(results.map((r) => r.prose).join("\n\n"), gated.supported), gated.supported);
@@ -1321,51 +1372,9 @@ async function finishAnswer(run: KernelRun, pass: Pass): Promise<void> {
   const limitations = [...new Set([...run.unresolved, ...(run.guard ? ["incomplete evidence guard"] : [])])].slice(0, 5);
   const limited = gated.partial || limitations.length > 0;
   run.emit({ type: "answer_delta", text: gated.text });
-  offerTrio(run);
   if (gated.supported.length > 0) run.emit({ type: "claims", claims: gated.supported });
   if (limited) run.emit({ type: "answer_partial", text: gated.text, claims: gated.supported });
   run.emit({ type: "done", metrics: metricsOf(run, run.escalations), ...(limited ? { status: "completed_with_limitations", limitations } : { status: "completed" }) });
-}
-
-// The research snapshot a trio follow-up answers over: evidence plus the graph projection.
-type TrioSnapshot = Pick<KernelRun, "prompt" | "objective" | "evidence" | "nodes" | "records" | "toolCalls" | "escalated" | "watchlist" | "scope" | "currentChartTicker" | "context">;
-// ponytail: process-local, newest 20 sessions, lost on restart; read evidence from the research store if follow-ups must survive restarts.
-const TRIO_SNAPSHOTS = new Map<string, TrioSnapshot>();
-const TRIO_SNAPSHOT_LIMIT = 20;
-
-// A gated stockbot-only research answer offers the trio over the same snapshot.
-function offerTrio(run: KernelRun): void {
-  const sessionId = run.sessionId;
-  if (run.personas.length !== 1 || run.personas[0] !== "stockbot" || typeof sessionId !== "string" || !sessionId) return;
-  TRIO_SNAPSHOTS.delete(sessionId);
-  TRIO_SNAPSHOTS.set(sessionId, {
-    prompt: run.prompt, objective: run.objective, evidence: [...run.evidence], nodes: run.nodes, records: run.records, toolCalls: run.toolCalls,
-    escalated: run.escalated, watchlist: run.watchlist, scope: run.scope, currentChartTicker: run.currentChartTicker, context: run.context,
-  });
-  const oldest = TRIO_SNAPSHOTS.keys().next().value;
-  if (TRIO_SNAPSHOTS.size > TRIO_SNAPSHOT_LIMIT && oldest !== undefined) TRIO_SNAPSHOTS.delete(oldest);
-  run.emit({ type: "offer_trio", sessionId });
-}
-
-// Trio follow-up: only the persona and final-gate stages, over the offered
-// snapshot. No worker run, so no intake, nodes, or tool calls. The gates judge
-// the same session.
-export async function runPersonaAgent(
-  sessionId: string,
-  personas: readonly Persona[],
-  emit: (e: AgentEvent) => void,
-  opts?: Pick<KernelRunOptions, "signal" | "deps">,
-): Promise<void> {
-  const snap = TRIO_SNAPSHOTS.get(sessionId);
-  const run = openRun(snap?.prompt ?? "", emit, { ...opts, personas });
-  emit({ type: "agent_start", prompt: run.prompt });
-  if (snap === undefined) {
-    endFailed(run, null, "provider_error", "unknown or expired session");
-    return;
-  }
-  Object.assign(run, snap, { evidence: [...snap.evidence], sessionId, direct: false });
-  emitEvidence(run, sessionId);
-  await answerPass(run);
 }
 
 // One answer pass over the current snapshot: the reasoner stages, then the verified answer.
@@ -1381,12 +1390,8 @@ async function answerPass(run: KernelRun): Promise<void> {
   await finishAnswer(run, stage);
 }
 
-// Fail-closed evidence loop: one worker research run, then one answer pass.
-// Partial selections reason concurrently over one shared snapshot; the full
-// trio synthesizes (bear+bull draft concurrently, then stockbot judges both
-// drafts against the same snapshot). Drafts stay buffered. An unresolved node
-// never starts more research: the final gates check the prose and drop
-// unsupported claims. Any failure after the trio's one draft retry fails.
+// One research run precedes one answer pass. The trio publishes gated drafts
+// during synthesis. Unresolved nodes never start additional research.
 export async function runKernelAgent(
   prompt: string,
   emit: (e: AgentEvent) => void,
@@ -1422,6 +1427,7 @@ function openRun(prompt: string, emit: (e: AgentEvent) => void, opts: KernelRunO
     scope: { ...runScope(ticker, requested), ...(opts?.context ? { context: opts.context } : {}) },
     currentChartTicker: requested ? undefined : parseTicker(opts?.currentChartTicker) ?? ticker,
     context: opts?.context,
+    reasoningEffort: opts?.reasoningEffort,
     personas,
     isTrio: isTrioPersonas(personas),
     seed: Array.isArray(opts?.seedEvidence) ? opts.seedEvidence : [],

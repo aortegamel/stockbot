@@ -1001,13 +1001,16 @@ def test_http_decision_uses_configured_native_decisions_contract(
 
 
 @pytest.mark.parametrize("api_format", _FORMATS)
+@pytest.mark.parametrize("effort", [None, "", " ", "auto", " auto "])
 def test_http_decision_format_comes_only_from_setting(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_format: str, effort: str | None
 ) -> None:
     """The native URL path and model name never override the configured format."""
     import urllib.request
 
     client, seen = _http_client(tmp_path, monkeypatch, _body(api_format, _HTTP_ANSWERS), api_format)
+    if effort is not None:
+        monkeypatch.setenv("REASONING_EFFORT", effort)
     monkeypatch.setenv("DECISION_API_URL", _NATIVE_URL)
     monkeypatch.setenv("DECISION_MODEL", _NATIVE_MODEL)
     _http_run(client)
@@ -2852,95 +2855,6 @@ def test_decision_envelope_accepts_utf8_non_ascii_body(api_format: str) -> None:
 # --- registry resolution ------------------------------------------------------------------------
 
 
-def test_auto_registry_prefers_scheduler_manifests(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A non-empty scheduler registry is returned as-is; the degraded build never runs."""
-    import app.decision_client as dc
-
-    manifest: list[dict[str, JSONValue]] = [{"name": "alpha"}]
-
-    def _unused() -> list[dict[str, JSONValue]]:
-        raise AssertionError("fallback ran for a healthy scheduler registry")
-
-    monkeypatch.setattr("app.research.scheduler.build_registry", lambda: manifest)
-    monkeypatch.setattr(dc, "_fallback_registry", _unused)
-
-    assert dc._auto_registry() is manifest
-
-
-def test_auto_registry_falls_back_when_scheduler_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A scheduler that raises, or returns nothing, yields the degraded canonical registry."""
-    import app.decision_client as dc
-    from app.research.scheduler import build_registry
-
-    def _boom() -> list[dict[str, JSONValue]]:
-        raise AttributeError("build_registry is gone")
-
-    monkeypatch.setattr("app.research.scheduler.build_registry", _boom)
-    fallback = dc._auto_registry()
-
-    assert fallback and all(isinstance(entry.get("name"), str) for entry in fallback)
-    assert list(fallback[0]) == list(build_registry()[0])
-
-    monkeypatch.setattr("app.research.scheduler.build_registry", list)
-    assert [entry["name"] for entry in dc._auto_registry()] == [entry["name"] for entry in fallback]
-
-
-def test_fallback_registry_renders_discovery_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A known tool carries its discovery metadata and declared prerequisites; unknown names stay blank."""
-    import app.decision_client as dc
-    import app.tools
-    from app.research.scheduler import _HANDLE_PARAMS
-    from app.tools import TOOL_DISCOVERY_REGISTRY
-
-    known = next(iter(TOOL_DISCOVERY_REGISTRY))
-    handle = next(iter(sorted(_HANDLE_PARAMS)))
-    unknown = "zz_not_a_canonical_tool"
-
-    def _tools(*args: object, **kwargs: object) -> list[object]:
-        return [
-            "not-a-tool",
-            {},
-            {"function": "not-a-mapping"},
-            {"function": {"name": ""}},
-            {"function": {"name": 7}},
-            {"function": {"name": known, "parameters": {"required": [handle, 7]}}},
-            {"function": {"name": unknown, "description": "described", "parameters": "not-a-mapping"}},
-        ]
-
-    monkeypatch.setattr(app.tools, "tools_for_capabilities", _tools)
-    entries = dc._fallback_registry()
-    meta = TOOL_DISCOVERY_REGISTRY[known]
-
-    assert [entry["name"] for entry in entries] == [known, unknown]
-    assert entries[0]["purpose"] == meta.summary
-    assert entries[0]["useWhen"] == "; ".join(meta.choose_when)
-    assert entries[0]["avoidWhen"] == "; ".join(meta.reject_when)
-    assert entries[0]["conflicts"] == ", ".join(meta.conflicts_with)
-    assert entries[0]["nextTools"] == ", ".join(meta.related_tools)
-    assert entries[0]["evidence"] == meta.output_kind
-    assert entries[0]["prerequisites"] == f"needs {handle}"
-    assert entries[0]["parameters"] == {"required": [handle, 7]}
-    assert entries[1]["description"] == "described"
-    assert entries[1]["domain"] == "unknown"
-    assert entries[1]["purpose"] == "" and entries[1]["prerequisites"] == ""
-    assert entries[1]["nextTools"] == "" and entries[1]["keyInputs"] == "req()"
-    assert entries[1]["parameters"] == {}
-
-
-def test_fallback_registry_survives_missing_scheduler_constants(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without the scheduler handle and blind lists the degraded manifest stays conservative."""
-    import app.decision_client as dc
-
-    monkeypatch.delattr("app.research.scheduler._HANDLE_PARAMS")
-    monkeypatch.delattr("app.research.scheduler._PIT_BLIND_TOOLS")
-
-    assert dc._scheduler_metadata() == (frozenset(), frozenset())
-    entries = dc._fallback_registry()
-    assert entries
-    assert all(entry["pitSupport"] == "PIT-scoped" for entry in entries)
-    assert all(entry["prerequisites"] == "" for entry in entries)
-
-
 # --- persistence: domain record plus run recording ----------------------------------------------
 
 
@@ -3225,94 +3139,7 @@ def test_persist_swallows_a_failing_model_call(tmp_path: Path, monkeypatch: pyte
     assert seen == {"domain": 1, "event": 1}
 
 
-# --- post-tool verdict, prompt phases, and logging projections ----------------------------------
-
-_ENTRY_REGISTRY: list[dict[str, JSONValue]] = [{"name": "get_current_time"}]
-
-
-def test_assess_entry_tool_rejects_defective_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A blank prompt, a missing tool name, or a defective registry fails before any decision call."""
-    from app.decision_client import _assess_text
-
-    client, seen = _capturing_client(tmp_path, monkeypatch)
-
-    with pytest.raises(ValueError, match="blank prompt"):
-        asyncio.run(client.assess_entry_tool("   ", "get_current_time"))
-    with pytest.raises(ValueError, match="tool required"):
-        asyncio.run(client.assess_entry_tool("what time is it?", ""))
-    assert seen == []
-    with pytest.raises(ValueError, match="blank prompt"):
-        _assess_text(7, "get_current_time")
-    with pytest.raises(ValueError, match="tool required"):
-        _assess_text("what time is it?", 7)
-
-    monkeypatch.setattr("app.decision_client._auto_registry", list)
-    with pytest.raises(ValueError, match="empty registry"):
-        asyncio.run(client.assess_entry_tool("what time is it?", "get_current_time"))
-
-    cases: list[tuple[list[dict[str, JSONValue]], str]] = [
-        ([{}], "needs a name"),
-        ([{"name": ""}], "needs a name"),
-        ([{"name": REASON_SENTINEL}], "duplicate tool"),
-    ]
-    for registry, error in cases:
-        monkeypatch.setattr("app.decision_client._auto_registry", lambda registry=registry: registry)
-        with pytest.raises(ValueError, match=error):
-            asyncio.run(client.assess_entry_tool("what time is it?", "get_current_time"))
-
-    assert seen == []
-
-
-def test_assess_entry_tool_returns_the_winner_and_shapes_the_outcome(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The post-tool verdict returns a declared winner and shows the clipped outcome in the question."""
-    monkeypatch.setattr("app.decision_client._auto_registry", lambda: _ENTRY_REGISTRY)
-    client, seen = _capturing_client(tmp_path, monkeypatch)
-
-    verdict = asyncio.run(
-        client.assess_entry_tool(
-            "what time is it?",
-            "get_current_time",
-            {"tz": "UTC"},
-            {"ok": True, "content": "x" * 4000, "error": "e" * 900, "category": "time"},
-        )
-    )
-
-    assert verdict == "get_current_time"
-    state, questions = seen[0]
-    assert isinstance(state, dict)
-    assert state["tool"] == "get_current_time" and state["arguments"] == {"tz": "UTC"}
-    outcome = state["outcome"]
-    assert isinstance(outcome, str)
-    assert outcome.startswith("tool get_current_time ok=True category='time'")
-    assert f"content={'x' * 1500!r}" in outcome and f"error={'e' * 500!r}" in outcome
-    assess = questions["assess"]
-    assert isinstance(assess, dict)
-    criteria = assess["criteria"]
-    assert isinstance(criteria, dict)
-    assert set(criteria) == {
-        "get_current_time",
-        REASON_SENTINEL,
-        RESOLVED_SENTINEL,
-        "research_required",
-    }
-    instructions = assess["instructions"]
-    assert isinstance(instructions, str)
-    assert "the one registry tool to run next." in instructions
-    assert "decode relative dates before choosing" in instructions
-
-
-def test_assess_entry_tool_rejects_a_winner_outside_the_options(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A sidecar verdict outside the declared options is a defect, never a guessed tool."""
-    monkeypatch.setattr("app.decision_client._auto_registry", lambda: _ENTRY_REGISTRY)
-    decisions: dict[str, JSONValue] = {"assess": {"kind": "choice", "choice": "nope", "probabilities": {"nope": 1.0}}}
-    client = _sidecar_answering(tmp_path, monkeypatch, {"raw": {}, "decisions": decisions})
-
-    with pytest.raises(ValueError, match="winner 'nope' not in options"):
-        asyncio.run(client.assess_entry_tool("what time is it?", "get_current_time"))
+# --- prompt phases and logging projections ------------------------------------------------------
 
 
 def test_node_dict_reads_dataclasses_to_dict_and_attributes() -> None:
@@ -3515,3 +3342,141 @@ def test_assess_final_response_requires_text_and_bounds_confidence(tmp_path: Pat
     instructions = support["instructions"]
     assert isinstance(instructions, str)
     assert " Declared claims: 0." in instructions and "(types:" not in instructions
+
+
+def test_auto_registry_prefers_scheduler_manifests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-empty scheduler registry is returned as-is; the degraded build never runs."""
+    import app.decision_client as dc
+
+    manifest: list[dict[str, JSONValue]] = [{"name": "alpha"}]
+
+    def _unused() -> list[dict[str, JSONValue]]:
+        raise AssertionError("fallback ran for a healthy scheduler registry")
+
+    monkeypatch.setattr("app.research.scheduler.build_registry", lambda: manifest)
+    monkeypatch.setattr(dc, "_fallback_registry", _unused)
+
+    assert dc._auto_registry() is manifest
+
+
+def test_auto_registry_falls_back_when_scheduler_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A scheduler that raises, or returns nothing, yields the degraded canonical registry."""
+    import app.decision_client as dc
+    from app.research.scheduler import build_registry
+
+    def _boom() -> list[dict[str, JSONValue]]:
+        raise AttributeError("build_registry is gone")
+
+    monkeypatch.setattr("app.research.scheduler.build_registry", _boom)
+    fallback = dc._auto_registry()
+
+    assert fallback and all(isinstance(entry.get("name"), str) for entry in fallback)
+    assert list(fallback[0]) == list(build_registry()[0])
+
+    monkeypatch.setattr("app.research.scheduler.build_registry", list)
+    assert [entry["name"] for entry in dc._auto_registry()] == [entry["name"] for entry in fallback]
+
+
+def test_fallback_registry_renders_discovery_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A known tool carries its discovery metadata and declared prerequisites; unknown names stay blank."""
+    import app.decision_client as dc
+    import app.tools
+    from app.research.scheduler import _HANDLE_PARAMS
+    from app.tools import TOOL_DISCOVERY_REGISTRY
+
+    known = next(iter(TOOL_DISCOVERY_REGISTRY))
+    handle = next(iter(sorted(_HANDLE_PARAMS)))
+    unknown = "zz_not_a_canonical_tool"
+
+    def _tools(*args: object, **kwargs: object) -> list[object]:
+        return [
+            "not-a-tool",
+            {},
+            {"function": "not-a-mapping"},
+            {"function": {"name": ""}},
+            {"function": {"name": 7}},
+            {"function": {"name": known, "parameters": {"required": [handle, 7]}}},
+            {"function": {"name": unknown, "description": "described", "parameters": "not-a-mapping"}},
+        ]
+
+    monkeypatch.setattr(app.tools, "tools_for_capabilities", _tools)
+    entries = dc._fallback_registry()
+    meta = TOOL_DISCOVERY_REGISTRY[known]
+
+    assert [entry["name"] for entry in entries] == [known, unknown]
+    assert entries[0]["purpose"] == meta.summary
+    assert entries[0]["useWhen"] == "; ".join(meta.choose_when)
+    assert entries[0]["avoidWhen"] == "; ".join(meta.reject_when)
+    assert entries[0]["conflicts"] == ", ".join(meta.conflicts_with)
+    assert entries[0]["nextTools"] == ", ".join(meta.related_tools)
+    assert entries[0]["evidence"] == meta.output_kind
+    assert entries[0]["prerequisites"] == f"needs {handle}"
+    assert entries[0]["parameters"] == {"required": [handle, 7]}
+    assert entries[1]["description"] == "described"
+    assert entries[1]["domain"] == "unknown"
+    assert entries[1]["purpose"] == "" and entries[1]["prerequisites"] == ""
+    assert entries[1]["nextTools"] == "" and entries[1]["keyInputs"] == "req()"
+    assert entries[1]["parameters"] == {}
+
+
+def test_fallback_registry_survives_missing_scheduler_constants(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the scheduler handle and blind lists the degraded manifest stays conservative."""
+    import app.decision_client as dc
+
+    monkeypatch.delattr("app.research.scheduler._HANDLE_PARAMS")
+    monkeypatch.delattr("app.research.scheduler._PIT_BLIND_TOOLS")
+
+    assert dc._scheduler_metadata() == (frozenset(), frozenset())
+    entries = dc._fallback_registry()
+    assert entries
+    assert all(entry["pitSupport"] == "PIT-scoped" for entry in entries)
+    assert all(entry["prerequisites"] == "" for entry in entries)
+
+
+@pytest.mark.parametrize("choice", ["low", "medium", "high", "xhigh", "auto", "HIGH", "", "unknown"])
+def test_select_answer_effort_uses_strict_choices(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, choice: str) -> None:
+    seen: list[tuple[object, dict[str, JSONValue]]] = []
+
+    def transport(state: object, questions: dict[str, JSONValue]) -> dict[str, JSONValue]:
+        seen.append((state, questions))
+        probabilities: dict[str, JSONValue] = {
+            label: 1.0 if label == choice else 0.0 for label in ("low", "medium", "high", "xhigh")
+        }
+        return {
+            "answers": {
+                "reasoning_effort": {
+                    "type": "choice",
+                    "choice": choice,
+                    "probabilities": probabilities,
+                    "confidence": 1.0,
+                }
+            }
+        }
+
+    def no_persist(**kwargs: object) -> None:
+        return None
+
+    client = JevClient(transport=transport, data_root=tmp_path)
+    monkeypatch.setattr(client, "_persist", no_persist)
+    limits: dict[str, JSONValue] = {"deadlineMs": 25000, "maxOutputTokens": 2000, "answerTokenBudget": 3000}
+    call = client.select_answer_effort("Explain the filing", "\nTicker: NVDA", session_id="s", limits=limits)
+    if choice in ("low", "medium", "high", "xhigh"):
+        assert asyncio.run(call) == choice
+    else:
+        with pytest.raises(ValueError, match="malformed_decision_answer"):
+            asyncio.run(call)
+    state, questions = seen[0]
+    assert state == {"prompt": "Explain the filing", "scope": "\nTicker: NVDA", "limits": limits}
+    question = questions["reasoning_effort"]
+    assert isinstance(question, dict)
+    criteria = question["criteria"]
+    assert isinstance(criteria, dict) and list(criteria) == ["low", "medium", "high", "xhigh"]
+    assert criteria["low"] == (
+        "Conversation, a factual lookup, or a summary of source passages. "
+        "Preserve output tokens for the answer and its claim inventory."
+    )
+    instructions = question["instructions"]
+    assert isinstance(instructions, str)
+    assert "Explain the filing\nTicker: NVDA" in instructions
+    assert "The supplied limits are shared across persona drafts, synthesis, and inventory repair." in instructions
+    assert "A simple fact lookup or filing explanation normally needs low effort, not high or xhigh." in instructions

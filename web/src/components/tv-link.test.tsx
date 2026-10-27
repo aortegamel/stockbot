@@ -113,7 +113,7 @@ function serve(saved: WorkspaceDoc["widgets"]) {
 
 function Page({ events = [] }: { events?: AgentEvent[] }) {
   return <Workspace selected="NVDA" pick={() => { }} watchlist={["NVDA"]} onWatchlist={() => { }}
-    events={events} input="" setInput={() => { }} setAskContext={() => { }} onSend={() => { }} openDrawer={() => { }} busy={false} debug={false}
+    events={events} input="" setInput={() => { }} research={false} setResearch={() => { }} setAskContext={() => { }} onSend={() => { }} openDrawer={() => { }} busy={false} debug={false}
     sessions={[]} sessionId={null} setSessionId={() => { }} snapshot={null} journal={null} seq={0} />;
 }
 

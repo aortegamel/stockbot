@@ -32,45 +32,12 @@ _TOP_N = 5
 
 _SHORT_TOKS = frozenset({"betting", "short", "shorting", "shorted", "bearish"})
 _INSIDER_TOKS = frozenset({"insider", "executive", "traded", "trading", "bought", "sold"})
-_ADVICE_VERBS = frozenset({"buy", "sell", "hold"})
-_SUBJECT_ADVICE_TOKS = _ADVICE_VERBS | {
-    "advice",
-    "recommend",
-    "recommendation",
-    "buying",
-    "selling",
-    "pick",
-    "picks",
-    "invest",
-    "investing",
-}
-_SUBJECT_FILLER_TOKS = frozenset(
-    {
-        "can",
-        "you",
-        "give",
-        "me",
-        "some",
-        "any",
-        "what",
-        "should",
-        "i",
-        "a",
-        "the",
-        "to",
-        "now",
-        "today",
-        "please",
-        "good",
-    }
-)
 _PLANNED_TOKS = frozenset({"planned", "proposed", "144"})
 _EXECUTED_TOKS = frozenset({"executed", "actual", "actually", "trade", "traded", "sell", "sold", "sale"})
 _READ_TOKS = frozenset({"revenue", "read", "text", "says", "say", "mention", "section", "risk", "document"})
 _TIME_TOKS = frozenset({"what", "time", "is", "it", "current"})
 # Match explicit create commands, not embedded mentions or negative instructions.
 _THESIS_CREATE_RE = re.compile(r"^(?:please |can you |could you )?create (?:an? )?(?:new )?thesi\b")
-_THESIS_REFINE_RE = re.compile(r"^(?:please |can you |could you )?refine (?:my |the |a )?thesi\b")
 # ponytail: process-local, one entry per thesis-create session; concurrent nodes and the pass-2 gap
 # node share the objective, so only the first selection creates. Persist it if workers ever multiply.
 _THESIS_CREATED: set[str] = set()
@@ -97,14 +64,6 @@ _RESEARCH_TOKS = frozenset(
         "8k",
     }
 )
-# ponytail: closed vocabulary per intent anchor; widen a set when a real single-intent phrasing misses.
-_SINGLE_SHOT_FILLER = frozenset({"latest", "last", "recent", "quarter"})
-_SINGLE_SHOT_INTENTS = {
-    "short": frozenset({"short", "interest"}),
-    "insider": frozenset({"insider", "sale", "sell", "sold", "bought", "trading", "traded", "activity"}),
-    "revenue": frozenset({"revenue", "quarterly"}),
-    "risk": frozenset({"risk", "factor"}),
-}
 
 _Registry = list[dict[str, JSONValue]]
 _Attempts = list[dict[str, JSONValue]]
@@ -426,136 +385,6 @@ def _router_pick(
         or _revenue_pick(names, attempts, revenue_quarter, listed_10q, session_id)
         or _general_pick(text, toks, names, ranked)
     )
-
-
-_SMALL_TALK_PHRASES = (
-    "thanks",
-    "thank you",
-    "never mind",
-    "nevermind",
-    "ok",
-    "okay",
-    "got it",
-    "great thanks",
-    "hello",
-    "hi",
-    "hey",
-    "hiya",
-    "yo",
-    "howdy",
-    "greetings",
-    "hello there",
-    "hi there",
-    "hey there",
-    "good morning",
-    "good afternoon",
-    "good evening",
-    "whats up",
-    "sup",
-    "how are you",
-    "thx",
-    "ty",
-    "cool",
-    "bye",
-    "goodbye",
-)
-
-
-def _SMALL_TALK(prompt: str) -> bool:
-    """Exact greetings and acknowledgements create no session after punctuation and space normalization."""
-    text = " ".join("".join(c for c in prompt.lower() if c.isalnum() or c.isspace()).split())
-    if text not in _SMALL_TALK_PHRASES:
-        return False
-    if "$" in prompt:
-        return False
-    from app.research.scheduler import _objective_ticker
-
-    return _objective_ticker(prompt) is None
-
-
-def _advice_cue(norm: str, toks: set[str]) -> bool:
-    """Advice wording: should plus buy/sell/hold, or the good-investment phrase."""
-    return bool("should" in toks and toks & _ADVICE_VERBS) or "good investment" in norm
-
-
-def _research_cue(norm: str, toks: set[str]) -> bool:
-    """Wording that routes to research even when a subject resolves."""
-    return bool(toks & _RESEARCH_TOKS) or "reg sho" in norm or "betting against" in norm
-
-
-def _has_subject(prompt: str, ticker: str | None) -> bool:
-    """Subject present: explicit ticker token, for-company phrase, or the caller's ticker."""
-    from app.research.scheduler import _objective_company, _objective_ticker
-
-    return _objective_ticker(prompt) is not None or _objective_company(prompt) is not None or ticker is not None
-
-
-def needs_subject(prompt: str, ticker: str | None, current_ticker: str | None = None) -> bool:
-    """Clarify subjectless advice only when neither scope nor displayed stock supplies a subject."""
-    _, toks = _signals(prompt)
-    return (
-        bool(toks & _SUBJECT_ADVICE_TOKS)
-        and not toks.difference(_SUBJECT_ADVICE_TOKS, _SUBJECT_FILLER_TOKS)
-        and not _has_subject(prompt, ticker or current_ticker)
-    )
-
-
-def _single_shot_tool(prompt: str, norm: str, toks: set[str], subject: str) -> str | None:
-    """One ticker, one intent anchor, no other words: the tool answerSingleShot runs. None keeps research."""
-    rest = toks - {subject.lower()} - _SINGLE_SHOT_FILLER
-    anchors = rest & _SINGLE_SHOT_INTENTS.keys()
-    if len(anchors) != 1 or not rest <= _SINGLE_SHOT_INTENTS[next(iter(anchors))]:
-        return None
-    from app.research.scheduler import build_registry
-
-    names = _registry_names(build_registry())
-    # Entry lists these filings. Research nodes retain their existing carry/read gates.
-    if anchors & {"revenue", "risk"}:
-        return "list_sec_filings" if "list_sec_filings" in names else None
-    pick = _router_pick(prompt, norm, toks, names, [], [], [])
-    return pick[0] if pick is not None else None
-
-
-def _subject_route(prompt: str, norm: str, toks: set[str], ticker: str | None) -> str | None:
-    """Advice needs a resolved subject and no research token; a single-intent ticker ask runs one tool."""
-    from app.research.scheduler import _objective_company, _objective_ticker
-
-    # Advice yields only to research tokens; "reg sho"/"betting against" phrases do not override it.
-    if _advice_cue(norm, toks) and _has_subject(prompt, ticker) and not (toks & _RESEARCH_TOKS):
-        return "reasoning_required"
-    subject = _objective_ticker(prompt) or ticker
-    if subject is not None:
-        return _single_shot_tool(prompt, norm, toks, subject) or "research_required"
-    if _objective_company(prompt) is not None or ticker is not None or _research_cue(norm, toks):
-        return "research_required"
-    return None
-
-
-def programmatic_route(prompt: object, ticker: str | None = None) -> str | None:
-    """Route exact small talk, clocks, advice, and research signals. JEV decides other prompts."""
-    from app.research.scheduler import _ACCESSION_TOKEN_RE
-
-    if not isinstance(prompt, str) or not prompt.strip():
-        return "research_required"
-    if _SMALL_TALK(prompt):
-        return "no_session"
-    norm, toks = _signals(prompt)
-    # Watchlist mutations need JEV's local UI tool, not the ticker research hint.
-    if re.search(r"\b(?:add|remove)\b", prompt, re.IGNORECASE) and re.search(
-        r"\bwatch[\s-]?lists?\b", prompt, re.IGNORECASE
-    ):
-        return None
-    # Pure clock question wins on the original prompt even with a selected ticker.
-    if _clock_ask(toks):
-        return "get_current_time"
-    # Thesis mutations use research so the stockbot answer can offer the trio.
-    if _THESIS_CREATE_RE.search(norm) or _THESIS_REFINE_RE.search(norm):
-        return "research_required"
-    if needs_subject(prompt, ticker):
-        return "clarify_subject"
-    if _ACCESSION_TOKEN_RE.search(prompt) is not None:
-        return "research_required"
-    return _subject_route(prompt, norm, toks, ticker)
 
 
 def _objective_text(session: Mapping[str, JSONValue]) -> str:

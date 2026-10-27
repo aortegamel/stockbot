@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import override
 
 import pytest
-from hypothesis import given, seed, settings
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from app.decision_client import JevClient
@@ -22,8 +22,6 @@ from app.research.programmatic_router import (
     _router_pick,
     _short_tool,
     _signals,
-    needs_subject,
-    programmatic_route,
     programmatic_select_round,
 )
 
@@ -79,6 +77,7 @@ class _BoomJev(JevClient):
         *,
         session_id: str,
         job_id: str | None = None,
+        ticker: str | None = None,
     ) -> ToolDecision:
         raise AssertionError("router must not call JEV")
 
@@ -101,37 +100,6 @@ def _pick(objective: str) -> tuple[str, str | None]:
     )
     assert kernel.recorded == [("tool_selection", dec.tool_name)]
     return act, dec.tool_name
-
-
-def test_route_fast_path_marks_research():
-    assert programmatic_route("What drove NVDA revenue last quarter?") == "research_required"
-    assert programmatic_route("hello") == "no_session"
-    assert programmatic_route("hello", ticker="NVDA") == "no_session"
-
-
-@pytest.mark.parametrize(
-    "prompt",
-    [
-        "Create a thesis for NVDA: AI datacenter demand stays strong.",
-        "Please create a new thesis for Nvidia: revenue grows through 2027.",
-        "CREATE THESIS: cloud demand remains durable.",
-        "Can you create a thesis for NVDA: AI demand grows?",
-    ],
-)
-def test_thesis_create_enters_research_without_subject_resolution(prompt: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Research keeps the thesis result in the session that offers the trio."""
-
-    def _no_subject(prompt: object) -> None:
-        return None
-
-    monkeypatch.setattr(scheduler, "_objective_ticker", _no_subject)
-    monkeypatch.setattr(scheduler, "_objective_company", _no_subject)
-    assert programmatic_route(prompt) == "research_required"
-
-
-@pytest.mark.parametrize("prompt", ["Refine my thesis", "Please refine thesis t:nvda: margins improve."])
-def test_thesis_refine_keeps_the_research_snapshot(prompt: str) -> None:
-    assert programmatic_route(prompt) == "research_required"
 
 
 def test_thesis_create_selects_once_across_session_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -195,314 +163,6 @@ def test_other_intents_do_not_create_thesis(prompt: str, monkeypatch: pytest.Mon
     from app.research.programmatic_router import _THESIS_CREATE_RE
 
     assert _THESIS_CREATE_RE.search(norm) is None
-    assert programmatic_route(prompt) is None
-
-
-@pytest.mark.parametrize(
-    ("prompt", "expected", "expected_requests"),
-    [
-        ("What drove NVDA revenue last quarter?", "research_required", ["NVDA"]),
-        ("hello", "no_session", []),
-    ],
-)
-def test_route_resolves_only_required_tickers(
-    prompt: str, expected: str, expected_requests: list[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Research resolves its ticker once. Ordinary greetings need no external resolution."""
-    import app.tools as _tools
-
-    requests: list[str] = []
-
-    def _resolve(name: str) -> str | None:
-        requests.append(name)
-        return _resolve_ticker(name)
-
-    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
-    assert programmatic_route(prompt) == expected
-    assert requests == expected_requests
-
-
-def test_route_clock_and_advice_fast_paths(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Clock asks single-shot; pure advice answers direct; mixed advice asks research; single-intent insider single-shots."""
-    import app.tools as _tools
-
-    def _resolve(name: str) -> str | None:
-        return {"NVDA": "NVDA"}.get(name)
-
-    monkeypatch.setattr(
-        _tools,
-        "_resolve_company_to_ticker",
-        _resolve,
-    )
-    assert programmatic_route("what time is it") == "get_current_time"
-    assert programmatic_route("should I buy NVDA") == "reasoning_required"
-    assert programmatic_route("should I buy NVDA after its Q3 revenue") == "research_required"
-    assert programmatic_route("did NVDA insiders sell") == "get_insider_activity"
-
-
-@pytest.mark.parametrize(
-    ("prompt", "expected"),
-    [
-        ("NVDA risk factors?", "list_sec_filings"),
-        ("AAPL insider sales last quarter?", "get_insider_activity"),
-        ("GME short interest?", "get_short_interest"),
-        ("MSFT latest quarterly revenue?", "list_sec_filings"),
-    ],
-)
-def test_single_intent_ticker_prompts_run_single_shot(
-    prompt: str, expected: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """One ticker plus one intent anchor routes to the tool answerSingleShot runs."""
-    import app.tools as _tools
-
-    def _resolve(name: str) -> str | None:
-        return {"NVDA": "NVDA", "AAPL": "AAPL", "GME": "GME", "MSFT": "MSFT"}.get(name)
-
-    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
-    assert programmatic_route(prompt) == expected
-
-
-@pytest.mark.parametrize(
-    "prompt",
-    [
-        "GME short interest and insider sales?",
-        "NVDA and AMD short interest?",
-        "Why is GME short interest rising?",
-        "NVDA risk factors and revenue?",
-        "What drove NVDA revenue last quarter?",
-        "should I buy NVDA after insider sales",
-    ],
-)
-def test_ambiguous_or_multi_intent_prompts_stay_on_research(prompt: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Multiple anchors, extra words, or mixed advice never take the single-shot path."""
-    import app.tools as _tools
-
-    def _resolve(name: str) -> str | None:
-        return {"NVDA": "NVDA", "AAPL": "AAPL", "GME": "GME", "MSFT": "MSFT", "AMD": "AMD"}.get(name)
-
-    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
-    assert programmatic_route(prompt) == "research_required"
-
-
-def test_caller_ticker_grounds_single_intent_short_ask(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A tickerless short ask with a caller ticker still single-shots."""
-    import app.tools as _tools
-
-    def _resolve(_name: str) -> str | None:
-        return None
-
-    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
-    assert programmatic_route("short interest?", ticker="GME") == "get_short_interest"
-
-
-@pytest.mark.parametrize(
-    ("prompt", "ticker", "expected"),
-    [
-        ("can you give me buying advice", None, True),
-        ("can you give me buying advice", "NVDA", False),
-        ("What should I buy now?", None, True),
-        ("Please give me some good recommendations today.", None, True),
-        ("advice", None, True),
-        ("buying advice", "NVDA", False),
-        ("can you give me buying advice on NVDA", None, False),
-        ("can you give me buying advice on NVDA", "NVDA", False),
-        ("can you give me buying advice on bonds", None, False),
-        ("can you give me buying advice after CPI", None, False),
-        ("can you give me buying advice for Nvidia", None, False),
-        ("can you give me buying advice for Nvidia", "NVDA", False),
-        ("what should I do", None, False),
-        ("please", None, False),
-        ("", None, False),
-    ],
-)
-def test_needs_subject_requires_advice_without_other_content(
-    prompt: str, ticker: str | None, expected: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import app.tools as _tools
-
-    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_ticker)
-    assert needs_subject(prompt, ticker) is expected
-    assert (programmatic_route(prompt, ticker) == "clarify_subject") is expected
-
-
-@pytest.mark.parametrize("subject_helper", ["_objective_ticker", "_objective_company"])
-def test_needs_subject_respects_scheduler_subject(subject_helper: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A scheduler subject prevents clarification even when only advice tokens remain."""
-
-    def _no_subject(prompt: object) -> None:
-        return None
-
-    monkeypatch.setattr(scheduler, "_objective_ticker", _no_subject)
-    monkeypatch.setattr(scheduler, "_objective_company", _no_subject)
-    subject = "NVDA" if subject_helper == "_objective_ticker" else ("Nvidia", "NVDA")
-
-    def _resolved_subject(prompt: object) -> str | tuple[str, str]:
-        return subject
-
-    monkeypatch.setattr(scheduler, subject_helper, _resolved_subject)
-    assert not needs_subject("can you give me buying advice", None)
-
-
-@pytest.mark.parametrize("ticker", [None, "NVDA"])
-def test_needs_subject_accepts_separate_current_stock(ticker: str | None) -> None:
-    assert needs_subject("can you give me buying advice", None, current_ticker=ticker) is (ticker is None)
-    assert programmatic_route("should I buy", ticker=ticker) == (
-        "clarify_subject" if ticker is None else "reasoning_required"
-    )
-
-
-@seed(20261018)
-@settings(max_examples=50, deadline=None)
-@given(
-    advice=st.sampled_from(
-        [
-            "buy",
-            "sell",
-            "hold",
-            "advice",
-            "recommend",
-            "recommendation",
-            "buying",
-            "selling",
-            "pick",
-            "picks",
-            "invest",
-            "investing",
-        ]
-    ),
-    filler=st.lists(
-        st.sampled_from(
-            [
-                "can",
-                "you",
-                "give",
-                "me",
-                "some",
-                "any",
-                "what",
-                "should",
-                "i",
-                "a",
-                "the",
-                "to",
-                "now",
-                "today",
-                "please",
-                "good",
-            ]
-        ),
-        max_size=8,
-    ),
-)
-def test_prop_advice_fillers_need_subject_but_content_does_not(advice: str, filler: list[str]) -> None:
-    prompt = " ".join([*filler, advice])
-    assert needs_subject(prompt, None)
-    assert not needs_subject(prompt, None, current_ticker="NVDA")
-    for subject in ("NVDA", "bonds", "CPI", "energy", "portfolio"):
-        assert not needs_subject(f"{prompt} {subject}", None)
-
-
-@pytest.mark.parametrize(
-    "prompt",
-    [
-        "thanks",
-        "thank you",
-        "never mind",
-        "nevermind",
-        "ok",
-        "okay",
-        "got it",
-        "great thanks",
-        "hello",
-        "hi",
-        "hey",
-        "hiya",
-        "yo",
-        "howdy",
-        "greetings",
-        "hello there",
-        "hi there",
-        "hey there",
-        "good morning",
-        "good afternoon",
-        "good evening",
-        "whats up",
-        "sup",
-        "how are you",
-        "thx",
-        "ty",
-        "cool",
-        "bye",
-        "goodbye",
-        "Hello!",
-        "Good morning.",
-        "thanks!!",
-        "what's up?",
-    ],
-)
-def test_small_talk_never_creates_session(prompt: str) -> None:
-    """Exact greetings and acknowledgements route to no_session."""
-    assert programmatic_route(prompt) == "no_session"
-
-
-@pytest.mark.parametrize(
-    ("prompt", "expected"),
-    [
-        ("$TY", "research_required"),
-        ("TY", "research_required"),
-        ("$HI", "research_required"),
-        ("HI", "research_required"),
-        ("hi", "no_session"),
-        ("ty", "no_session"),
-        ("$hi", None),
-    ],
-)
-def test_ticker_tokens_do_not_route_as_small_talk(
-    prompt: str, expected: str | None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Ticker tokens and dollar signs do not become greetings after normalization."""
-    import app.tools as _tools
-
-    def _resolve(name: str) -> str | None:
-        return {"TY": "TY", "HI": "HI"}.get(name)
-
-    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve)
-    assert programmatic_route(prompt) == expected
-
-
-@pytest.mark.parametrize(
-    ("prompt", "expected"),
-    [
-        ("hello, what drove NVDA revenue last quarter?", "research_required"),
-        ("hi bullbot", None),
-    ],
-)
-def test_greeting_with_request_keeps_existing_route(
-    prompt: str, expected: str | None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A greeting prefix does not hide a research request or an explicit persona."""
-    import app.tools as _tools
-
-    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_ticker)
-    assert programmatic_route(prompt) == expected
-
-
-@seed(20261018)
-@settings(max_examples=60, deadline=None)
-@given(
-    phrase=st.sampled_from(["hello", "hi there", "good morning", "whats up", "thanks", "never mind", "got it"]),
-    punctuation=st.text(alphabet="!?.,'_-#@", max_size=6),
-    whitespace=st.text(alphabet=" \t\n", min_size=1, max_size=6),
-    title_case=st.booleans(),
-)
-def test_prop_small_talk_ignores_case_punctuation_and_whitespace(
-    phrase: str, punctuation: str, whitespace: str, title_case: bool
-) -> None:
-    """Normalization preserves an exact phrase despite case, punctuation, and whitespace changes."""
-    text = whitespace.join(punctuation.join(word) for word in phrase.split())
-    if title_case:
-        text = text.title()
-    assert programmatic_route(f"{whitespace}{punctuation}{text}{punctuation}{whitespace}") == "no_session"
 
 
 def test_five_live_questions_first_hop():
@@ -543,6 +203,7 @@ def test_ambiguous_falls_back_to_jev_whole_registry():
             *,
             session_id: str,
             job_id: str | None = None,
+            ticker: str | None = None,
         ) -> ToolDecision:
             seen["n"] = len(registry or [])
             return ToolDecision(action="reason", probabilities={}, confidence=None)
@@ -646,6 +307,7 @@ def test_jev_fallback_rewritten_to_coverage_variant() -> None:
             *,
             session_id: str,
             job_id: str | None = None,
+            ticker: str | None = None,
         ) -> ToolDecision:
             return ToolDecision(
                 action="invoke",
@@ -878,6 +540,7 @@ def test_ten_q_revenue_lists_then_reads_document_without_jev() -> None:
             *,
             session_id: str,
             job_id: str | None = None,
+            ticker: str | None = None,
         ) -> ToolDecision:
             raise AssertionError("router must not call JEV")
 
@@ -952,6 +615,7 @@ def test_ten_q_revenue_listing_without_source_ten_q_lists_again() -> None:
             *,
             session_id: str,
             job_id: str | None = None,
+            ticker: str | None = None,
         ) -> ToolDecision:
             raise AssertionError("router must list filings without calling JEV")
 
@@ -999,6 +663,7 @@ def test_failed_ten_q_document_read_uses_jev_without_direct_retry(carry_only: bo
             *,
             session_id: str,
             job_id: str | None = None,
+            ticker: str | None = None,
         ) -> ToolDecision:
             seen.append((list(registry or []), list(attempts or [])))
             return ToolDecision(action="reason", probabilities={}, confidence=None)
@@ -1031,26 +696,6 @@ def test_failed_ten_q_document_read_uses_jev_without_direct_retry(carry_only: bo
         assert "list_sec_filings" not in names
 
 
-def test_insider_verbs_stay_research_and_advice_stays_direct(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Bare sell/hold tokens route research; should+verb and good-investment route direct."""
-    import app.tools as _tools
-
-    def _resolve(name: str) -> str | None:
-        return {"TSLA": "TSLA", "NVDA": "NVDA"}.get(name)
-
-    monkeypatch.setattr(
-        _tools,
-        "_resolve_company_to_ticker",
-        _resolve,
-    )
-    assert programmatic_route("Did Musk sell TSLA shares") == "research_required"
-    assert programmatic_route("Who holds the most NVDA shares") == "research_required"
-    assert programmatic_route("should I buy NVDA") == "reasoning_required"
-    assert programmatic_route("is NVDA a good investment") == "reasoning_required"
-
-
 def test_tokenizer_merges_form_pairs_only() -> None:
     """(10,k/q) and (8,k) merge; other 10/8 pairs never merge."""
     from app.tools import _normalize_discovery_text as _norm
@@ -1059,24 +704,6 @@ def test_tokenizer_merges_form_pairs_only() -> None:
     assert "8k" in _norm("filed 8-K accession here")
     assert "10k" in _norm("Which 10-K mentions X?")
     assert "10key" not in _norm("10 key facts") and "10" in _norm("10 key facts")
-
-
-def test_prefixed_clock_routes_clock_with_ticker_channel() -> None:
-    """Exact NVDA clock regression: ticker channel never diverts the original clock ask."""
-    assert programmatic_route("What time is it?", ticker="NVDA") == "get_current_time"
-    assert programmatic_route("should I buy NVDA", ticker="NVDA") == "reasoning_required"
-
-
-def test_advice_precedence_ignores_research_phrases_without_research_tokens() -> None:
-    """GME regression: "betting against" never overrides advice; a research token still does."""
-    advice = "Should I sell now that funds are betting against it"
-    assert programmatic_route(f"{advice}?", ticker="GME") == "reasoning_required"
-    assert programmatic_route(f"{advice} after the filing?", ticker="GME") == "research_required"
-
-
-def test_explicit_persona_market_research_keeps_ticker_grounding() -> None:
-    """Explicit-persona market asks still resolve the ticker subject for research."""
-    assert programmatic_route("Bullbot view on ORCL revenue", ticker="ORCL") == "research_required"
 
 
 # --- Rule-level branches: each ordered signal family and its membership gate ---
@@ -1257,17 +884,6 @@ def test_sec_list_rule_needs_resolved_subject(monkeypatch: pytest.MonkeyPatch) -
     assert _rule("what filings were made recently") != ("list_sec_filings", "sec-list")
 
 
-def test_route_blank_accession_and_reg_sho_prompts(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Blank prompts still need research, and accession or Reg SHO prompts never answer direct."""
-    import app.tools as _tools
-
-    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_ticker)
-    assert programmatic_route("") == "research_required"
-    assert programmatic_route(None) == "research_required"
-    assert programmatic_route("read accession 0000320193-25-000079 please") == "research_required"
-    assert programmatic_route("Reg SHO threshold list for AAPL") == "research_required"
-
-
 def test_clock_round_reads_objective_and_skips_non_text_questions() -> None:
     """A blank or non-text node question never blocks a clock ask carried by the objective."""
     reg = scheduler.build_registry()
@@ -1308,6 +924,7 @@ def test_clock_round_defers_when_registry_lacks_the_clock_tool() -> None:
             *,
             session_id: str,
             job_id: str | None = None,
+            ticker: str | None = None,
         ) -> ToolDecision:
             seen["n"] = len(registry or [])
             return ToolDecision(action="reason", probabilities={}, confidence=None)
@@ -1348,6 +965,7 @@ def test_non_text_objective_reads_empty_and_jev_decides() -> None:
             *,
             session_id: str,
             job_id: str | None = None,
+            ticker: str | None = None,
         ) -> ToolDecision:
             seen["n"] = len(registry or [])
             return ToolDecision(action="reason", probabilities={}, confidence=None)
@@ -1388,14 +1006,3 @@ def test_prop_pick_is_deterministic_and_membership_gated(text: str) -> None:
         assert pick == _router_pick(text, norm, toks, names, ranked, [], [])
         assert pick is None or (pick[0] in names and bool(pick[1]))
         assert _router_pick(text, norm, toks, set(), [], [], []) is None
-
-
-@pytest.mark.parametrize(
-    "prompt", ["add AMD to my watchlist", "Remove AAPL from my watch-list", "add Apple to my watch list"]
-)
-def test_watchlist_mutation_keeps_jev_entry_selection(prompt: str) -> None:
-    assert programmatic_route(prompt, ticker="NVDA") is None
-
-
-def test_watchlist_research_keeps_the_ticker_research_hint() -> None:
-    assert programmatic_route("Summarize my watchlist", ticker="NVDA") == "research_required"

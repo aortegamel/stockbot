@@ -154,3 +154,28 @@ def test_fresh_config_import_loads_root_dotenv(tmp_path: Path, monkeypatch: pyte
     assert probe.REPO_ROOT == (tmp_path / "repo").resolve()
     assert os.environ["OPENCODE_MODEL"] == "file-model"
     assert "STOCKBOT_ENVTEST_CWD_ONLY" not in os.environ
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", "auto", " auto "])
+@pytest.mark.parametrize("protocol", ["responses", "chat_completions", "decisions"])
+def test_reasoning_fields_omits_automatic_effort(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, protocol: str
+) -> None:
+    if value is None:
+        monkeypatch.delenv("REASONING_EFFORT", raising=False)
+    else:
+        monkeypatch.setenv("REASONING_EFFORT", value)
+    if protocol == "responses":
+        assert config.reasoning_fields("responses", "test") == {}
+    elif protocol == "chat_completions":
+        assert config.reasoning_fields("chat_completions", "test") == {}
+    else:
+        assert config.reasoning_fields("decisions", "test") == {}
+
+
+@pytest.mark.parametrize("value", ["low", "medium", "high", "xhigh", "provider-level"])
+def test_reasoning_fields_preserves_concrete_effort(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("REASONING_EFFORT", f" {value} ")
+    assert config.reasoning_fields("responses", "test") == {"reasoning": {"effort": value}}
+    assert config.reasoning_fields("chat_completions", "test") == {"reasoning_effort": value}
+    assert config.reasoning_fields("decisions", "test") == {}

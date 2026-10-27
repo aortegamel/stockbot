@@ -398,14 +398,20 @@ describe("AIPanel", () => {
     const sent: string[] = [];
     function Prompt({ busy = false, debug = false }: { busy?: boolean; debug?: boolean }) {
       const [input, setInput] = useState("   ");
-      return <AIPanel events={[]} input={input} setInput={setInput} onSend={() => sent.push(input)} sym="NVDA" busy={busy} debug={debug} />;
+      const [research, setResearch] = useState(false);
+      return <AIPanel events={[]} input={input} setInput={setInput} research={research} setResearch={setResearch} onSend={() => sent.push(input)} sym="NVDA" busy={busy} debug={debug} />;
     }
     const root = await mount(<Prompt />);
     const input = root.querySelector("input")!;
     const send = root.querySelector('button[type="submit"]') as HTMLButtonElement;
     expect(input.getAttribute("aria-label")).toBe("Ask the research agent");
-    expect(input.placeholder).toBe("Ask about this symbol…");
+    expect(input.placeholder).toBe("Ask about this symbol… (/research for deep research)");
     expect(send.disabled).toBe(true);
+    const research = root.querySelector<HTMLInputElement>('[aria-label="Research mode"]')!;
+    expect(research.checked).toBe(false);
+    await click(research);
+    expect(research.checked).toBe(true);
+    expect(input.placeholder).toBe("Deep research…");
     await type(input, "Explain the NVDA filings");
     expect(input.value).toBe("Explain the NVDA filings");
     expect(send.disabled).toBe(false);
@@ -425,7 +431,7 @@ describe("AIPanel", () => {
   });
 
   test("shows checked answer text before done while the request remains busy", async () => {
-    const root = await mount(<AIPanel events={[{ type: "reasoning_start", model: "research" }, { type: "answer_delta", text: "The filing reports revenue growth." }]} input="Question" setInput={() => { }} onSend={() => { }} sym="AAPL" busy={true} debug={false} />);
+    const root = await mount(<AIPanel events={[{ type: "reasoning_start", model: "research" }, { type: "answer_delta", text: "The filing reports revenue growth." }]} input="Question" setInput={() => { }} research={false} setResearch={() => { }} onSend={() => { }} sym="AAPL" busy={true} debug={false} />);
     expect(root.textContent).toContain("AGENT · viewing AAPL");
     expect(root.textContent).toContain("The filing reports revenue growth.");
     expect(root.textContent).toContain("Partial checked answer · research continues");
@@ -438,7 +444,7 @@ describe("AIPanel", () => {
     let sends = 0;
     function Prompt() {
       const [context, setContext] = useState<AskContext | null>({ kind: "news", title, url: "https://stocktwits.com/a", source: "Stocktwits", sym: "NVDA", at: "2026-10-20T09:00:00Z" });
-      return <AIPanel events={[]} input="" setInput={() => { }} context={context} onClearContext={() => setContext(null)} onSend={() => { sends += 1; }} sym="NVDA" busy={false} debug={false} />;
+      return <AIPanel events={[]} input="" setInput={() => { }} research={false} setResearch={() => { }} context={context} onClearContext={() => setContext(null)} onSend={() => { sends += 1; }} sym="NVDA" busy={false} debug={false} />;
     }
     const root = await mount(<Prompt />);
     const chip = root.querySelector<HTMLElement>('[aria-label="Attached feed item"]')!;

@@ -4,6 +4,7 @@ import * as childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
 import { categorizeFailure, closeBridge, endSession, invoke, newSessionId } from "./stockbot";
 import { harvest, reason, splitInventory } from "../muse/client";
+import { reasoningFields } from "../../../decision/reasoning";
 import fc from "fast-check";
 import { FINAL_PERSONAS, sourceReferences, type Evidence, type FinalClaim, type Persona } from "../agent/types";
 
@@ -803,6 +804,19 @@ describe("muse reason personas (fake provider)", () => {
     expect(r.timings?.binderMs).toBeUndefined();
   });
 
+  test("a plain chat call keeps the whole answer, including a json fence, and declares no claims", async () => {
+    const text = "Here is an example:\n```json\n{\"a\": 1}\n```";
+    respond = () => new Response(`data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\ndata: [DONE]\n\n`, { headers: { "Content-Type": "text/event-stream" } });
+    const r = await reason({ prompt: "Show a JSON example", ticker: "NVDA", evidence: [], direct: true, plain: true });
+    expect(r.prose).toBe(text);
+    expect(r.claims).toEqual([]);
+    const [call] = seen;
+    if (!call) throw new Error("expected one provider call");
+    expect(systemOf(call.body)).toStartWith("You are Stockbot, a stock market assistant.");
+    expect(systemOf(call.body)).not.toContain("inventory");
+    expect(systemOf(call.body)).toContain("CURRENT STOCK CONTEXT");
+  });
+
   test("a single-tool call without a persona keeps the evidence prompt", async () => {
     const r = await reason({ ...input, persona: undefined, onDelta: () => { } });
     expect(r.prose).toBe("Stockbot read [E1].");
@@ -980,6 +994,26 @@ describe("muse reason personas (fake provider)", () => {
     expect(seen.length).toBe(4);
   });
 
+  test("auto and empty effort omit fields. An override wins for both protocols", async () => {
+    for (const value of ["auto", ""]) {
+      process.env.REASONING_EFFORT = value;
+      expect(reasoningFields("responses")).toEqual({});
+      expect(reasoningFields("chat_completions")).toEqual({});
+    }
+    process.env.REASONING_EFFORT = "xhigh";
+    expect(reasoningFields("responses", "low")).toEqual({ reasoning: { effort: "low" } });
+    expect(reasoningFields("chat_completions", "low")).toEqual({ reasoning_effort: "low" });
+    expect(reasoningFields("decisions", "low")).toEqual({});
+    expect(() => reasoningFields("responses", "INVALID")).toThrow("REASONING_EFFORT must match");
+    process.env.REASONING_EFFORT = "auto";
+    await reason({ ...input, persona: "bearbot", reasoningEffort: "low" });
+    expect(seen[0]?.body.reasoning).toEqual({ effort: "low" });
+    respond = (path) => path === "/v1/responses" ? new Response("not found", { status: 404 }) : sse("via chat");
+    await reason({ ...input, persona: "bullbot", reasoningEffort: "low" });
+    expect(seen[1]?.body.reasoning).toEqual({ effort: "low" });
+    expect(seen[2]?.body.reasoning_effort).toBe("low");
+  });
+
   test("a capped narrative truncated inside the inventory yields prose without raw JSON", async () => {
     process.env.MUSE_MAX_OUTPUT_TOKENS = "600";
     let calls = 0;
@@ -1049,19 +1083,25 @@ describe("muse reason personas (fake provider)", () => {
 
     test("all explicit personas use the finite default without fallback", async () => {
       const calls = FINAL_PERSONAS.map((persona) => start({ persona }));
-      const rejected = calls.map((c) => expect(c.result).rejects.toThrow());
+      // Bun's rejects matcher waits synchronously. Observe failures before advancing the clock.
+      const rejected = calls.map((c) => c.result.catch((error: unknown) => error));
       await Promise.all(calls.map((c) => c.streaming));
       advance(120_000);
-      await Promise.all(rejected);
+      for (const error of await Promise.all(rejected)) {
+        expect(error).toBeInstanceOf(DOMException);
+        expect(error).toMatchObject({ name: "TimeoutError" });
+      }
       release();
       expect(seen.map((s) => s.path)).toEqual(["/v1/responses", "/v1/responses", "/v1/responses"]);
     });
 
     test("omitted persona keeps the 120s fetch limit without fallback", async () => {
       const call = start({});
+      const rejected = call.result.catch((error: unknown) => error);
       await call.streaming;
       advance(120_000);
-      await expect(call.result).rejects.toThrow();
+      expect(await rejected).toBeInstanceOf(DOMException);
+      expect(await rejected).toMatchObject({ name: "TimeoutError" });
       expect(seen.map((s) => s.path)).toEqual(["/v1/responses"]);
     });
 
@@ -1078,10 +1118,11 @@ describe("muse reason personas (fake provider)", () => {
 
     test("a shared deadline aborts a persona stream without fallback", async () => {
       const call = start({ persona: "bullbot", deadlineAt: Date.now() + 150_000 });
-      const rejected = expect(call.result).rejects.toThrow();
+      const rejected = call.result.catch((error: unknown) => error);
       await call.streaming;
       advance(151_000);
-      await rejected;
+      expect(await rejected).toBeInstanceOf(DOMException);
+      expect(await rejected).toMatchObject({ name: "TimeoutError" });
       release();
       expect(seen.map((s) => s.path)).toEqual(["/v1/responses"]);
     });
@@ -1089,11 +1130,12 @@ describe("muse reason personas (fake provider)", () => {
     test("caller cancellation aborts a persona after the default duration", async () => {
       const ac = new AbortController();
       const call = start({ persona: "bearbot", signal: ac.signal, deadlineAt: Date.now() + 180_000 });
-      const rejected = expect(call.result).rejects.toThrow();
+      const rejected = call.result.catch((error: unknown) => error);
       await call.streaming;
       advance(121_000);
       ac.abort();
-      await rejected;
+      expect(await rejected).toBeInstanceOf(DOMException);
+      expect(await rejected).toMatchObject({ name: "AbortError" });
       release();
       expect(seen.map((s) => s.path)).toEqual(["/v1/responses"]);
     });
@@ -1107,10 +1149,11 @@ describe("muse reason personas (fake provider)", () => {
         return gated(path, body);
       };
       const call = start({ persona: "stockbot" });
-      const rejected = expect(call.result).rejects.toThrow();
+      const rejected = call.result.catch((error: unknown) => error);
       await call.streaming;
       advance(60_000);
-      await rejected;
+      expect(await rejected).toBeInstanceOf(DOMException);
+      expect(await rejected).toMatchObject({ name: "TimeoutError" });
       release();
       expect(seen.map((s) => s.path)).toEqual(["/v1/responses", "/v1/chat/completions"]);
     });

@@ -5,10 +5,8 @@ Request:  {"id", "op": "run", "prompt", "asOf"?, "deadlineAt"? (epoch ms),
            "context"? (a user-attached feed item {kind, title, source, at, url?, sym?}: untrusted data)}
           {"id", "op": "watchlist", "watchlist": [tickers], "deadlineAt"?} -> {"id", "watchlist": [rows]}
           (read-only page-load fan-out: no session, no evidence; same tool handlers and caches as intake)
-          {"id", "op": "route", "prompt", "ticker"?, "watchlist"?, "currentChartTicker"?, "context"?}
-          {"id", "op": "entry_tool", "prompt", "tool", "arguments", "sessionId"?}
-            -> {"id", "sessionId", "evidence": [persisted rows], "content", "error"?}
-          (one fixed-argument call through research admission, with no graph or model planning)
+          {"id", "op": "effort", "prompt", "ticker"?, "watchlist"?, "context"?, "deadlineAt"?,
+           "maxOutputTokens"?, "answerTokenBudget"?, "maxAnswerChars"?} -> {"id", "effort"}
 Response: {"id", "objective", "evidence": [{id, content}],
            "nodes": [{node_id, question, status, depends_on}],
            "decisions": [...persisted JEV records...], "unresolved": [node_ids],
@@ -54,7 +52,6 @@ from app.research.models import (
     JSONValue,
     _baseline_accession,
     _baseline_form,
-    query_with_today_utc,
     utcnow,
 )
 
@@ -148,8 +145,7 @@ def _startup() -> JevClient:
         start_fn = needle_mod.start
         start_fn()
     except Exception as exc:
-        # Needle down: stay live so ready still emits; JEV route/assess_entry
-        # keep serving while arguments/run fail open per-request below.
+        # Needle failures do not stop the worker. JEV final assessments remain available.
         logger.exception("kernel-worker needle start failed")
         print(f"[kernel-worker] needle start failed: {exc}", file=sys.stderr)
     _prewarm()
@@ -1862,79 +1858,6 @@ def _toolflow() -> str:
     return (os.environ.get("STOCKBOT_TOOLFLOW") or "").strip().lower()
 
 
-def _log_route(rid: str, routed: Mapping[str, JSONValue], watchlist: list[str] | None, hint: str | None) -> None:
-    """Route log line: JEV's own route and personas plus the dispatch source."""
-    logger.info(
-        "toolflow route rid=%s route=%s personas=%s watchlist=%s via=%s",
-        rid,
-        routed.get("route"),
-        routed.get("personas"),
-        len(watchlist) if watchlist else 0,
-        "programmatic" if hint is not None else "jev",
-    )
-
-
-def _route(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
-    """Select the entry route and personas without a session or database access.
-
-    Small talk and missing advice subjects bypass JEV. Other hints retain JEV persona selection.
-    Return route/personas with optional chartTicker/chartError, or an error when route selection fails.
-    """
-    rid = _request_id(req)
-    prompt = req.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip():
-        logger.info("toolflow route rid=%s route=research_required reason=blank-prompt", rid)
-        return {"id": rid, "route": "research_required", "personas": None}
-    try:
-        from app.research.models import validate_ticker
-
-        ticker = _request_ticker(req)
-        current_ticker = validate_ticker(req.get("currentChartTicker"), "<worker>: 'currentChartTicker'")
-        # Watchlist scope rides as context: JEV decides the route with it, never a code override.
-        watchlist = _request_watchlist(req)
-        context = _request_context(req)
-    except ValueError as exc:
-        logger.warning("toolflow route_deny rid=%s reason=bad-scope", rid)
-        return {"id": rid, "error": str(exc)[:500] or "bad ticker"}
-    hint: str | None = None
-    if _toolflow() not in ("catalog", "full", "whole", "direct"):
-        from app.research.programmatic_router import programmatic_route
-
-        hint = programmatic_route(prompt.strip(), ticker=ticker or current_ticker)
-    if context is not None:
-        # A question about an attached feed item needs outside evidence: research, decided by code.
-        hint = "research_required"
-    if hint == "no_session":
-        logger.info("toolflow route rid=%s route=no_session reason=small-talk", rid)
-        return {"id": rid, "route": "no_session", "personas": None}
-    if hint == "clarify_subject":
-        logger.info("toolflow route rid=%s route=clarify_subject reason=missing-subject", rid)
-        return {"id": rid, "route": "clarify_subject", "personas": None}
-    try:
-        client = _jev_client(jev)
-        routed = _request_call(
-            req,
-            "route",
-            client.route_entry(
-                query_with_today_utc(prompt.strip()),
-                route_hint=hint,
-                watchlist=watchlist,
-                current_ticker=current_ticker,
-                context=context,
-            ),
-        )
-    except Exception as exc:
-        logger.warning("toolflow route_fail rid=%s err_type=%s", rid, type(exc).__name__, exc_info=True)
-        return {"id": rid, "error": str(exc)[:500] or "route selection failed"}
-    _log_route(rid, routed, watchlist, hint)
-    return {
-        "id": rid,
-        "route": routed.get("route"),
-        "personas": routed.get("personas"),
-        **{key: routed[key] for key in ("chartTicker", "chartError") if key in routed},
-    }
-
-
 def _arguments_session_hint(req: Mapping[str, JSONValue]) -> str | None:
     """Caller-carried session id: arguments.session_id, else node.session_id, else None."""
     for key in ("arguments", "node"):
@@ -2107,140 +2030,6 @@ def _arguments(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
             "toolflow arguments_fail_open rid=%s tool=%s err_type=%s", rid, tool, type(exc).__name__, exc_info=True
         )
         return {"id": rid, "error": str(exc)[:500] or "needle arguments failed"}
-
-
-def _json_mapping(raw: object) -> Mapping[str, JSONValue]:
-    """Narrow a request field to a JSON mapping; a non-mapping field reads as empty."""
-    return raw if isinstance(raw, dict) else {}
-
-
-def _assess_entry(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
-    """Post-tool entry verdict: JEV assesses one tool result without a session.
-
-    Returns {"id", "verdict"} where verdict is node_resolved /
-    reasoning_required / research_required / a registry tool name. Blank input
-    stays research_required; JEV failures propagate.
-    """
-    rid = _request_id(req)
-    prompt = req.get("prompt")
-    tool = req.get("tool")
-    if not isinstance(prompt, str) or not prompt.strip():
-        logger.info("toolflow assess rid=%s verdict=research_required reason=blank-prompt", rid)
-        return {"id": rid, "verdict": "research_required"}
-    if not isinstance(tool, str) or not tool:
-        logger.info("toolflow assess rid=%s verdict=research_required reason=tool-required", rid)
-        return {"id": rid, "verdict": "research_required"}
-    logger.debug("toolflow assess_entry rid=%s tool=%s prompt=%.200s", rid, tool, prompt.strip())
-    args_map = _json_mapping(req.get("arguments"))
-    result_map = _json_mapping(req.get("result"))
-    client = _jev_client(jev)
-    verdict = _request_call(
-        req, "assess_entry", client.assess_entry_tool(query_with_today_utc(prompt.strip()), tool, args_map, result_map)
-    )
-    if not isinstance(verdict, str) or not verdict:
-        logger.warning(
-            "toolflow assess_fail_open rid=%s tool=%s verdict=research_required reason=blank-verdict", rid, tool
-        )
-        return {"id": rid, "verdict": "research_required"}
-    logger.info("toolflow assess rid=%s tool=%s verdict=%s", rid, tool, verdict)
-    return {"id": rid, "verdict": verdict}
-
-
-def _entry_tool(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
-    """Execute one entry tool through the research ledger before the final gates."""
-    from app.research import scheduler, service
-    from app.research.repository import ResearchRepository
-
-    rid = _request_id(req)
-    prompt, tool, arguments = req.get("prompt"), req.get("tool"), req.get("arguments")
-    if (
-        not isinstance(prompt, str)
-        or not prompt.strip()
-        or not isinstance(tool, str)
-        or not isinstance(arguments, dict)
-    ):
-        return _terminal(rid, "invalid_params", "prompt, tool, and arguments required")
-    registry = scheduler.build_registry()
-    if tool not in {entry.get("name") for entry in registry}:
-        return _terminal(rid, "invalid_params", "unknown entry tool")
-    store = ResearchRepository()
-    sid = _final_session(req)
-    if sid is None:
-        sid = service.create_research(
-            prompt, prompt, policy={"research_sources": {"mode": "all", "sources": []}}, repo=store
-        )
-        service.complete_job(store.list_jobs(sid)[0].job_id, repo=store)
-    else:
-        store.get_session(sid)
-    kernel = scheduler._default_kernel()
-    session = scheduler._load_session(sid, kernel)
-    as_of = session.get("as_of")
-    deadline_ms = _deadline_field(req.get("deadlineAt"))
-    if isinstance(tool, str) and isinstance(sid, str) and deadline_ms is not None:
-        _, _, run_deadline = _run_deadlines(req)
-        session["_deadline_at"] = min(run_deadline, time.perf_counter() + deadline_ms / 1000.0 - time.time())
-    record: dict[str, object]
-    try:
-        record = _request_call(
-            req,
-            "entry_tool",
-            _intake_attempt(
-                tool,
-                dict(arguments),
-                sid,
-                session,
-                registry,
-                None,
-                kernel,
-                as_of if isinstance(as_of, str) else None,
-            ),
-        )
-    except TimeoutError as exc:
-        record = {"tool": tool, "arguments": arguments, "error": str(exc), "error_type": "timeout"}
-    outcomes = {"admitted": 0, "duplicate": 0, "not_citable": 0, "error": 0, "timeout": 0}
-    if record.get("error") is not None:
-        record.setdefault("error_type", "tool_error")
-        if isinstance(tool, str) and isinstance(sid, str):
-            _intake_admit_call(kernel, sid, tool, record, outcomes, [])
-        evidence, _ = _run_evidence(store.list_evidence(sid))
-        out: dict[str, JSONValue] = {
-            "id": rid,
-            "sessionId": sid,
-            "evidence": evidence,
-            "content": str(record.get("outcome_summary") or ""),
-            "coverage": _session_coverage(store, sid),
-            "error": str(record.get("error"))[:500],
-        }
-        category = record.get("error_type")
-        out["category"] = category if isinstance(category, str) and category else "tool_error"
-        return out
-
-    async def admit() -> None:
-        assert isinstance(tool, str) and isinstance(sid, str)
-        await scheduler._sec_thread_call(lambda: _intake_admit_call(kernel, sid, tool, record, outcomes, []))
-
-    try:
-        _request_call(req, "evidence admission", admit())
-    except (TimeoutError, ValueError) as exc:
-        if record.get("job_id"):
-            scheduler._fail_attempt_job(
-                kernel, str(record["job_id"]), str(exc), "timeout" if isinstance(exc, TimeoutError) else "tool_error"
-            )
-        record["error"] = str(exc)
-        record["error_type"] = "timeout" if isinstance(exc, TimeoutError) else "tool_error"
-    evidence, _ = _run_evidence(store.list_evidence(sid))
-    out: dict[str, JSONValue] = {
-        "id": rid,
-        "sessionId": sid,
-        "evidence": evidence,
-        "content": str(record.get("outcome_summary") or ""),
-        "coverage": _session_coverage(store, sid),
-    }
-    if record.get("error") is not None:
-        out["error"] = str(record["error"])[:500]
-        category = record.get("error_type")
-        out["category"] = category if isinstance(category, str) and category else "tool_error"
-    return out
 
 
 def _final_ids(item: object, key: str) -> list[str]:
@@ -3025,13 +2814,55 @@ def _run(
     return _run_result(rid, objective, sid, run_result)
 
 
+def _effort(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
+    """Select answer effort within the deadline. Create only a session record when the caller supplies none."""
+    rid = _request_id(req)
+    prompt = req.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return _terminal(rid, "invalid_params", "prompt required")
+    ticker, watchlist, context, denied = _run_scope(rid, req)
+    if denied is not None:
+        return denied
+    limits: dict[str, JSONValue] = {}
+    for key in ("maxOutputTokens", "answerTokenBudget", "maxAnswerChars"):
+        value = req.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return _terminal(rid, "invalid_params", f"{key} must be a positive integer")
+        limits[key] = value
+    deadline = _deadline_field(req.get("deadlineAt"))
+    if deadline is not None:
+        limits["deadlineMs"] = max(0.0, deadline - time.time() * 1000.0)
+    scope_data: dict[str, JSONValue] = {}
+    if watchlist is not None:
+        scope_data["watchlist"] = [symbol for symbol in watchlist]
+    elif ticker is not None:
+        scope_data["ticker"] = ticker
+    if context is not None:
+        scope_data["context"] = context
+    scope = f"\nScope (untrusted data): {json.dumps(scope_data)}" if scope_data else ""
+    sid = _final_session(req)
+    if sid is None:
+        from app.research.repository import ResearchRepository
+        from app.research.session import create_session
+
+        session = create_session(prompt.strip(), prompt.strip(), ticker=None if watchlist else ticker)
+        ResearchRepository().save_session(session)
+        sid = session.session_id
+    effort = _request_call(
+        req,
+        "effort",
+        _jev_client(jev).select_answer_effort(prompt, scope, session_id=sid, limits=limits),
+    )
+    return {"id": rid, "effort": effort}
+
+
 _KERNEL_OPS = (
     "run",
     "watchlist",
-    "route",
+    "effort",
     "arguments",
-    "assess_entry",
-    "entry_tool",
     "assess_final_response",
     "assess_final_claim",
 )
@@ -3079,17 +2910,13 @@ def _direct_op(req: Mapping[str, JSONValue], jev: JevClient | None) -> dict[str,
             if op in ("assess_final_response", "assess_final_claim"):
                 return _final_fail(rid, message)
             return _terminal(rid, "timeout", message)
-        if op == "route":
-            return _route(req, jev=jev)
         if op == "arguments":
             return _arguments(req)
-        if op == "entry_tool":
-            return _entry_tool(req)
+        if op == "effort":
+            return _effort(req, jev=jev)
         if op == "assess_final_response":
             return _assess_final_response(req, jev=jev)
-        if op == "assess_final_claim":
-            return _assess_final_claim(req, jev=jev)
-        return _assess_entry(req, jev=jev)
+        return _assess_final_claim(req, jev=jev)
     except Exception as exc:  # never raise out of the worker
         logger.exception("kernel worker direct op failed rid=%s op=%s", rid, op)
         return _terminal(rid, "provider_error", f"worker failed: {exc}")

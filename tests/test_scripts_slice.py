@@ -3307,6 +3307,8 @@ def _case() -> e2e.Case:
 def test_e2e_golden_set_shape() -> None:
     golden = _golden()
     assert len(golden) == 13 and len({c["id"] for c in golden}) == 13
+    assert {c["id"] for c in golden if c["mode"] == "chat"} == {"hello", "clarify_advice", "aapl_buy_now"}
+    assert all(c["mode"] in ("chat", "research") for c in golden)
 
 
 def test_e2e_parse_research_stream_times_text_and_counts_known_citations() -> None:
@@ -3335,12 +3337,11 @@ def test_e2e_parse_research_stream_times_text_and_counts_known_citations() -> No
         "answer_delta",
         "done",
     ]
-    assert (run.first_progress_ms, run.first_text_ms, run.total_ms, run.route) == (8, 900, 1200, "research_required")
+    assert (run.first_progress_ms, run.first_text_ms, run.total_ms, run.mode) == (8, 900, 1200, "research")
     assert run.citation_count == 1  # ev:a once; ev:zz is not a streamed evidence id.
     assert run.timings == _done(tools=2)["metrics"] and run.errors == []
-    case: e2e.Case = {**_case(), "expected_route": "research_required"}
-    assert e2e.evaluate(case, run) == []
-    strict: e2e.Case = {**_case(), "expected_route": "research_required"}
+    assert e2e.evaluate(_case(), run) == []
+    strict = _case()
     strict["min_citations"], strict["max_first_text_ms"], strict["ticker"] = 2, 800, "AMD"
     assert e2e.evaluate(strict, run) == [
         "first_text_ms",
@@ -3368,23 +3369,72 @@ def test_e2e_parse_counts_claim_citations_with_inline_markers() -> None:
     assert run.citation_count == 2  # ev:a inline, ev:b by claim; ev:c unmatched, ev:zz unknown.
 
 
-def test_e2e_parse_routes_direct_clarify_and_single_tool() -> None:
-    start = (1, {"type": "agent_start", "prompt": "p"})
-    text = (2, {"type": "answer_delta", "text": "hi"})
-    clarify = e2e.parse_stream(_sse(start, text, (3, _done(muse=0))))
-    direct = e2e.parse_stream(_sse(start, (2, {"type": "reasoning_start", "model": "stockbot"}), text, (3, _done())))
-    single = e2e.parse_stream(_sse(start, text, (3, _done(tools=1))))
-    named = e2e.parse_stream(
-        _sse(start, (2, {"type": "tool_start", "tool": "get_current_time"}), text, (3, _done(tools=1)))
+def test_e2e_parse_chat_stream_and_mode_mismatch() -> None:
+    run = e2e.parse_stream(
+        _sse(
+            (1, {"type": "agent_start", "prompt": "hello"}),
+            (2, {"type": "status", "text": "Thinking…"}),
+            (3, {"type": "reasoning_start", "model": "stockbot"}),
+            (4, {"type": "answer_delta", "text": "Hello."}),
+            (5, _done()),
+        )
     )
-    fallback = e2e.parse_stream(_sse(start, start, text, (3, _done(tools=1))))
-    assert [r.route for r in (clarify, direct, single, named, fallback)] == [
-        "clarify_subject",
-        "reasoning_required",
-        "single_tool",
-        "get_current_time",
-        "research_required",
-    ]
+    assert run.mode == "chat"
+    case = next(c for c in _golden() if c["id"] == "hello")
+    assert e2e.evaluate(case, run) == []
+    mismatch: e2e.Case = {**case, "mode": "research"}
+    assert e2e.evaluate(mismatch, run) == ["mode"]
+
+
+@pytest.mark.parametrize(
+    ("events", "metrics"),
+    [
+        ([], _done()["metrics"]),
+        (["done", "error"], _done()["metrics"]),
+        (["failed", "done"], _done()["metrics"]),
+        (["done"], _done(tools=1)["metrics"]),
+        (["done"], _done(muse=0)["metrics"]),
+        (["done"], _done(muse=2)["metrics"]),
+        (["done"], None),
+        (["done"], {}),
+        (["done"], {"tools": {"calls": 0}}),
+        (["done"], {"muse": {"calls": 1}}),
+    ],
+)
+def test_e2e_mode_rejects_incomplete_or_non_chat_streams(events: list[str], metrics: object) -> None:
+    assert e2e._mode(events, metrics) is None
+
+
+def test_e2e_mode_progress_identifies_research_without_done() -> None:
+    assert e2e._mode(["progress"], None) == "research"
+
+
+@pytest.mark.parametrize("case_id", ["hello", "aapl_buy_now", "nvda_risk", "aapl_ceo"])
+def test_e2e_post_sends_mode_only_for_research(monkeypatch: pytest.MonkeyPatch, case_id: str) -> None:
+    from io import BytesIO
+    from urllib.request import Request
+
+    case = next(c for c in _golden() if c["id"] == case_id)
+    requests: list[Request] = []
+
+    def urlopen(req: Request, *, timeout: int) -> BytesIO:
+        requests.append(req)
+        assert timeout == e2e.TIMEOUT_S
+        return BytesIO(f"data: {json.dumps(_done())}\n".encode())
+
+    monkeypatch.setattr(e2e.urllib.request, "urlopen", urlopen)
+    e2e._post("http://localhost:3000/", case)
+    assert len(requests) == 1
+    req = requests[0]
+    assert req.full_url == "http://localhost:3000/api/agent"
+    assert req.get_method() == "POST"
+    assert isinstance(req.data, bytes)
+    expected = {"prompt": case["prompt"]}
+    if case["chart_ticker"]:
+        expected["ticker"] = case["chart_ticker"]
+    if case["mode"] == "research":
+        expected["mode"] = "research"
+    assert json.loads(req.data) == expected
 
 
 def test_e2e_parse_captures_failures_and_stream_end() -> None:
@@ -3398,8 +3448,8 @@ def test_e2e_parse_captures_failures_and_stream_end() -> None:
     )
     assert run.errors[0].startswith("malformed SSE data")
     assert run.errors[1:] == ["failed: jev down", "error: Stockbot couldn't complete that request. Try again."]
-    assert (run.route, run.first_text_ms, run.total_ms) == (None, None, 4)
-    assert e2e.evaluate(_case(), run) == ["route", "first_text_ms", "citations", "terminal"]
+    assert (run.mode, run.first_text_ms, run.total_ms) == (None, None, 4)
+    assert e2e.evaluate(_case(), run) == ["mode", "first_text_ms", "citations", "terminal"]
 
 
 def test_e2e_main_requires_opt_in_then_credentials(

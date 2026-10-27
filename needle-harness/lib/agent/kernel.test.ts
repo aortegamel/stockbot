@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
-import { applyFinalGates, asksWatchlist, datapointRows, dropUncovered, inventoryDefect, KernelRouter, parseTicker, parseWatchlist, qualifiedEvidenceFree, REQUEST_WALL_MS, runKernelAgent, runPersonaAgent, type FinalGateCaller, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
+import { applyFinalGates, asksWatchlist, datapointRows, dropUncovered, inventoryDefect, KernelRouter, parseTicker, parseWatchlist, qualifiedEvidenceFree, REQUEST_WALL_MS, runKernelAgent, type FinalGateCaller, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
 import { FINAL_PERSONAS, readDatapoints, type AgentEvent, type AskContext, type Datapoint, type Evidence, type FinalClaim, type Metrics, type Persona } from "./types";
 
 class FakeChild implements KernelChild {
@@ -501,8 +501,10 @@ describe("runKernelAgent final personas", () => {
   // inline from opts.gate (default yes); run bodies still record in order.
   async function runFinal(opts: {
     reply?: (id: string) => string;
-    decide?: (persona: Persona, pass: number, attempt: number, input: KernelReasonInput) => Outcome;
-    gate?: (body: Record<string, unknown>) => GateVerdict;
+    decide?: (persona: Persona, pass: number, attempt: number, input: KernelReasonInput) => Outcome | Promise<Outcome>;
+    gate?: (body: Record<string, unknown>) => GateVerdict | Promise<GateVerdict>;
+    onEvent?: (event: AgentEvent, events: AgentEvent[]) => void;
+    onGate?: (body: Record<string, unknown>) => void;
     personas?: readonly Persona[];
     deadlineAt?: number;
     signal?: AbortSignal;
@@ -529,8 +531,10 @@ describe("runKernelAgent final personas", () => {
         if (body && typeof body === "object" && "op" in body && typeof body.op === "string" && body.op.startsWith("assess_final")) {
           const rec = body as Record<string, unknown>;
           gates.push(rec);
-          const verdict: GateVerdict = gateFn?.(rec) ?? { support_answer: "yes" };
-          queueMicrotask(() => c.emitStdout(`${JSON.stringify({ id: rec.id, ...verdict })}\n`));
+          void Promise.resolve(gateFn?.(rec) ?? { support_answer: "yes" }).then((verdict) => {
+            c.emitStdout(`${JSON.stringify({ id: rec.id, ...verdict })}\n`);
+            opts.onGate?.(rec);
+          });
         } else {
           bodies.push(body as Record<string, unknown>);
           origWrite.call(c.stdin, data, cb);
@@ -559,6 +563,7 @@ describe("runKernelAgent final personas", () => {
         (e) => {
           if (e.type === "reasoning_start") pass += 1;
           events.push(e);
+          opts.onEvent?.(e, events);
         },
         {
           ...(opts.deadlineAt !== undefined ? { deadlineAt: opts.deadlineAt } : {}),
@@ -581,7 +586,7 @@ describe("runKernelAgent final personas", () => {
               maxInFlight = Math.max(maxInFlight, inFlight);
               for (let i = FINAL_PERSONAS.indexOf(o.persona); i < FINAL_PERSONAS.length; i++) await Promise.resolve();
               inFlight -= 1;
-              const d: Outcome = opts.decide?.(o.persona, pass, attempt, o) ?? {};
+              const d: Outcome = await opts.decide?.(o.persona, pass, attempt, o) ?? {};
               if (d instanceof Error) throw d;
               const text = d.text ?? `${o.persona} p${pass}`;
               // Default answers cite the first evidence row so the citation gate keeps the prose.
@@ -615,8 +620,8 @@ describe("runKernelAgent final personas", () => {
   const runBodies = (bodies: Record<string, unknown>[]): Record<string, unknown>[] => bodies.filter((b) => b.op === "run");
   const label = (p: Persona): string => `── ${p.charAt(0).toUpperCase()}${p.slice(1)} ──`;
   // Trio answer: visible Bear and Bull drafts, then the Stockbot synthesis verdict.
-  const trioAnswer = (pass: number): string =>
-    (["bearbot", "bullbot", "stockbot"] as const).map((p) => `${label(p)}\n${p} p${pass}`).join("\n\n");
+  const trioAnswer = (pass: number): string[] =>
+    (["bearbot", "bullbot", "stockbot"] as const).map((p, i) => `${i ? "\n\n" : ""}${label(p)}\n${p} p${pass}`);
 
   test("trio drafts bear+bull concurrently then synthesizes stockbot with both drafts", async () => {
     const { events, calls, maxInFlight } = await runFinal({});
@@ -637,7 +642,7 @@ describe("runKernelAgent final personas", () => {
       { persona: "bearbot", text: "bearbot p1" },
       { persona: "bullbot", text: "bullbot p1" },
     ]);
-    expect(answers(events)).toEqual([trioAnswer(1)]);
+    expect(answers(events)).toEqual(trioAnswer(1));
     expect(events.filter((e) => e.type === "reasoning_start").length).toBe(1);
     expect(events.some((e) => e.type === "failed")).toBe(false);
     expect(doneMetrics(events).muse.calls).toBe(3);
@@ -655,7 +660,7 @@ describe("runKernelAgent final personas", () => {
       { persona: "bearbot", text: "bearbot p1" },
       { persona: "bullbot", text: "bullbot p1" },
     ]);
-    expect(answers(events)).toEqual([trioAnswer(1)]);
+    expect(answers(events)).toEqual(trioAnswer(1));
     const m = doneMetrics(events);
     expect(m.muse.calls).toBe(4);
     expect(m.muse.inputTokens).toBe(15);
@@ -677,7 +682,7 @@ describe("runKernelAgent final personas", () => {
     }
   });
 
-  test("trio synthesis failure or empty fails closed with no prose", async () => {
+  test("trio synthesis failure or empty preserves gated drafts", async () => {
     for (const synthOutcome of [new Error("muse down"), { text: "  " }]) {
       const { events, calls } = await runFinal({
         decide: (p) => (p === "stockbot" ? synthOutcome : { text: `${p} draft` }),
@@ -687,13 +692,110 @@ describe("runKernelAgent final personas", () => {
         { persona: "bearbot", text: "bearbot draft" },
         { persona: "bullbot", text: "bullbot draft" },
       ]);
+      expect(answers(events)).toEqual([`${label("bearbot")}\nbearbot draft`, `\n\n${label("bullbot")}\nbullbot draft`]);
+      expect(failedCategory(events)).toBeUndefined();
+      expect(events.at(-1)).toMatchObject({
+        status: "completed_with_limitations",
+        limitations: expect.arrayContaining([
+          `stockbot synthesis unavailable: ${synthOutcome instanceof Error ? "stockbot: muse down" : "stockbot: empty response"}`,
+        ]),
+      });
+      expect(doneMetrics(events).failures.provider_error).toBe(1);
+      expect(doneMetrics(events).muse.calls).toBe(3);
+    }
+  });
+
+  test("trio publishes gated drafts while synthesis waits and emits cumulative claims", async () => {
+    const synthesis = Promise.withResolvers<Outcome>();
+    const drafts = Promise.withResolvers<AgentEvent[]>();
+    const running = runFinal({
+      decide: (p) => p === "stockbot" ? synthesis.promise : {},
+      onEvent: (event, events) => {
+        if (event.type === "claims" && event.claims.length === 2) drafts.resolve([...events]);
+      },
+    });
+    try {
+      const early = await drafts.promise;
+      expect(answers(early)).toEqual(trioAnswer(1).slice(0, 2));
+      expect(early.some((e) => e.type === "done")).toBe(false);
+      expect(early.filter((e) => e.type === "claims").map((e) => e.claims.map((c) => c.text))).toEqual([
+        ["bearbot p1"], ["bearbot p1", "bullbot p1"],
+      ]);
+    } finally {
+      synthesis.resolve({});
+    }
+    const { events } = await running;
+    expect(answers(events)).toEqual(trioAnswer(1));
+    expect(events.findLast((e) => e.type === "claims")?.claims.map((c) => c.text)).toEqual(["bearbot p1", "bullbot p1", "stockbot p1"]);
+  });
+
+  test("trio holds bull gates until bear gates settle", async () => {
+    const bear = Promise.withResolvers<GateVerdict>();
+    const bull = Promise.withResolvers<void>();
+    const early: AgentEvent[] = [];
+    const running = runFinal({
+      personas: ["bullbot", "stockbot", "bearbot"],
+      gate: (body) => {
+        if (body.persona === "bearbot") return bear.promise;
+        return { support_answer: "yes" };
+      },
+      onGate: (body) => {
+        if (body.persona === "bullbot") bull.resolve();
+      },
+      onEvent: (event) => early.push(event),
+    });
+    try {
+      await bull.promise;
+      expect(answers(early)).toEqual([]);
+    } finally {
+      bear.resolve({ support_answer: "yes" });
+    }
+    const { events } = await running;
+    expect(answers(events)).toEqual(trioAnswer(1));
+  });
+
+  test("trio synthesis timeout after gated drafts completes with limitations", async () => {
+    const synthesis = Promise.withResolvers<Outcome>();
+    const deadlineAt = Date.now() + 30_000;
+    const { events, calls } = await runFinal({
+      deadlineAt,
+      decide: (p) => p === "stockbot" ? synthesis.promise : {},
+      onEvent: (event) => {
+        if (event.type === "claims" && event.claims.length === 2) synthesis.reject(new DOMException("The operation timed out", "TimeoutError"));
+      },
+    });
+    expect(calls.every((c) => c.input.deadlineAt === deadlineAt)).toBe(true);
+    expect(answers(events)).toEqual(trioAnswer(1).slice(0, 2));
+    expect(events.some((e) => e.type === "failed")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      status: "completed_with_limitations",
+      limitations: expect.arrayContaining(["stockbot synthesis unavailable: stockbot: The operation timed out"]),
+    });
+    expect(doneMetrics(events).failures.provider_error).toBe(1);
+  });
+
+  test("trio rejects all gates or fails synthesis without accepted drafts", async () => {
+    for (const fails of [false, true]) {
+      const { events } = await runFinal({
+        gate: () => ({ support_answer: "no" }),
+        decide: (p) => p === "stockbot" && fails ? new Error("muse down") : {},
+      });
       expect(answers(events)).toEqual([]);
       expect(failedCategory(events)).toBe("provider_error");
-      const failed = events.find((e) => e.type === "failed");
-      expect(failed?.type === "failed" ? failed.message : "").toBe(
-        synthOutcome instanceof Error ? "stockbot: muse down" : "stockbot: empty response",
-      );
-      expect(doneMetrics(events).muse.calls).toBe(3);
+      expect(events.at(-1)).toMatchObject({ status: "failed" });
+    }
+  });
+
+  test("trio retains other personas when a draft or synthesis gate rejects", async () => {
+    for (const rejected of ["bearbot", "bullbot", "stockbot"]) {
+      const { events } = await runFinal({
+        gate: (body) => ({ support_answer: body.persona === rejected ? "no" : "yes" }),
+      });
+      const kept = ["bearbot", "bullbot", "stockbot"].filter((p) => p !== rejected);
+      expect(answers(events).join("")).toBe(kept.map((p) => `${label(p as Persona)}\n${p} p1`).join("\n\n"));
+      expect(events.some((e) => e.type === "failed")).toBe(false);
+      expect(events.at(-1)).toMatchObject({ status: "completed_with_limitations" });
+      expect(events.findLast((e) => e.type === "claims")?.claims.map((c) => c.text)).toEqual(kept.map((p) => `${p} p1`));
     }
   });
 
@@ -733,7 +835,7 @@ describe("runKernelAgent final personas", () => {
       expect(events.filter((e) => e.type === "reasoning_start").length).toBe(1);
       expect(calls.every((c) => c.pass === 1)).toBe(true);
       expect(events.some((e) => e.type === "progress" && e.stage === "evidence_gap")).toBe(false);
-      expect(answers(events)).toEqual([personas.length === 1 ? `${label("stockbot")}\nstockbot p1` : trioAnswer(1)]);
+      expect(answers(events)).toEqual(personas.length === 1 ? [`${label("stockbot")}\nstockbot p1`] : trioAnswer(1));
       expect(events.some((e) => e.type === "failed")).toBe(false);
     }
   });
@@ -762,7 +864,7 @@ describe("runKernelAgent final personas", () => {
       reply: (id) => progress(id, "intake_evidence", { evidence: [{ id: "ev:0", content: "intake fact" }] }) + reply(id),
     });
     expect(events.filter((e) => e.type === "answer_delta").length).toBe(1);
-    expect(events.map((e) => e.type).slice(-3)).toEqual(["offer_trio", "claims", "done"]);
+    expect(events.map((e) => e.type).slice(-2)).toEqual(["claims", "done"]);
   });
 
   test("an explanatory answer keeps facts, qualified significance, unknowns, and numeric descriptors", async () => {
@@ -797,7 +899,7 @@ describe("runKernelAgent final personas", () => {
     const cited: FinalClaim = { text: "stockbot p1", claimType: "observed_fact", evidenceIds: ["ev:1"] };
     const open: FinalClaim = { text: "p1", claimType: "unknown", evidenceIds: [] };
     const { events } = await runFinal({ personas: ["stockbot"], reply: sessionGraphReply, decide: () => ({ claims: [cited, open] }) });
-    expect(events.map((e) => e.type).slice(-3)).toEqual(["offer_trio", "claims", "done"]);
+    expect(events.map((e) => e.type).slice(-2)).toEqual(["claims", "done"]);
     expect(events.filter((e) => e.type === "claims")).toEqual([{ type: "claims", claims: [cited, open] }]);
     // An answer without an inventory emits no claims event.
     const bare = await runFinal({ personas: ["stockbot"], reply: sessionGraphReply, decide: () => ({ claims: [] }) });
@@ -816,7 +918,7 @@ describe("runKernelAgent final personas", () => {
         progress(id, "nodes_done", { ms: 300 }) +
         graphReply(id),
     });
-    expect(answers(events)).toEqual([trioAnswer(1)]);
+    expect(answers(events)).toEqual(trioAnswer(1));
     // routeMs and firstTextMs belong to the route.
     expect(doneMetrics(events).timings).toEqual({
       intakeMs: 120, admitMs: 15, reasonerMs: 40, nodesMs: 300, personasMs: expect.any(Number), gatesMs: expect.any(Number),
@@ -1010,6 +1112,7 @@ describe("runKernelAgent final personas", () => {
       const { events, calls, gates } = await runFinal({
         deadlineAt,
         signal,
+        reply: sessionGraphReply,
         decide: (p, _pass, attempt) => {
           // Research settled under the wall; the clock now sits past it for every persona call.
           setSystemTime(new Date(deadlineAt + 60_000));
@@ -1033,7 +1136,7 @@ describe("runKernelAgent final personas", () => {
       // One per-claim gate per claim, judged under the shared deadline.
       expect(gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim", "assess_final_claim"]);
       for (const g of gates) expect(g.sessionId).toBe("rs:live");
-      expect(answers(events)).toEqual([trioAnswer(1)]);
+      expect(answers(events)).toEqual(trioAnswer(1));
       expect(events.some((e) => e.type === "failed")).toBe(false);
     } finally {
       setSystemTime();
@@ -1086,7 +1189,7 @@ describe("runKernelAgent final personas", () => {
       if (typeof claim !== "object" || claim === null || !("claim_type" in claim)) throw new Error("expected a wire claim");
       expect(claim).toMatchObject({ claim_type: "inference", evidence_ids: ["ev:1"] });
     }
-    expect(answers(events)).toEqual([trioAnswer(1)]);
+    expect(answers(events)).toEqual(trioAnswer(1));
   });
 
   test("gate bodies carry the run session id on every per-claim op", async () => {
@@ -1157,15 +1260,17 @@ describe("runKernelAgent final personas", () => {
       gate: (body) => {
         const claim = body.claim;
         const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
-        return text === kept ? { support_answer: "yes" } : { support_answer: "no" };
+        return text === cut ? { support_answer: "no" } : { support_answer: "yes" };
       },
     });
     expect(gates.filter((g) => g.op === "assess_final_claim").length).toBe(4);
     const out = answers(events);
-    expect(out.length).toBe(1);
-    expect(out[0]).toContain(kept);
-    expect(out[0]).not.toContain(cut);
-    expect(out[0]).toContain("bullbot p1");
+    expect(out).toEqual([
+      `${label("bearbot")}\n${kept}`,
+      `\n\n${label("bullbot")}\nbullbot p1`,
+      `\n\n${label("stockbot")}\nstockbot p1`,
+    ]);
+    expect(out.join("")).not.toContain(cut);
   });
 
   test("an invalid inventory id drops that claim and the run fails closed when nothing remains", async () => {
@@ -1217,7 +1322,7 @@ describe("runKernelAgent final personas", () => {
   });
 
   test("an invalid inventory id drops that persona while the valid group still gates", async () => {
-    const { events, calls } = await runFinal({
+    const { events, calls, gates } = await runFinal({
       personas: ["stockbot", "bearbot"],
       decide: (p) => p === "bearbot"
         ? { claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["ev:9"] }] }
@@ -1225,8 +1330,17 @@ describe("runKernelAgent final personas", () => {
     });
     expect(calls.map((c) => c.input.persona)).toEqual(["stockbot", "bearbot"]);
     expect(calls.filter((c) => c.input.persona === "stockbot").length).toBe(1);
-    expect(answers(events)).toEqual([]);
-    expect(failedCategory(events)).toBe("provider_error");
+    expect(gates).toHaveLength(1);
+    expect(gates[0]).toMatchObject({
+      op: "assess_final_claim",
+      persona: "stockbot",
+      claim: { text: "stockbot fixed", evidence_ids: ["ev:1"] },
+    });
+    expect(answers(events)).toEqual([`${label("stockbot")}\nstockbot fixed`]);
+    expect(events.some((e) => e.type === "failed")).toBe(false);
+    expect(events.findLast((e) => e.type === "claims")).toMatchObject({
+      claims: [{ text: "stockbot fixed", claimType: "inference", evidenceIds: ["ev:1"] }],
+    });
   });
 
   test("the gates see only locally valid claims before display", async () => {
@@ -2087,7 +2201,7 @@ describe("runKernelAgent worker replies", () => {
   });
 });
 
-describe("trio offer and persona follow-up", () => {
+describe("kernel persona selection", () => {
   // One scripted worker per run: op:run answers with a one-row session graph,
   // and every gate passes. Every worker body and reasoner call is recorded.
   function trioDeps(bodies: Record<string, unknown>[], calls: KernelReasonInput[]) {
@@ -2116,65 +2230,23 @@ describe("trio offer and persona follow-up", () => {
     return last.metrics;
   };
 
-  test("a default research run calls stockbot once, then offers the trio for its session", async () => {
+  test("a default research run calls stockbot once", async () => {
     process.env.OPENCODE_MODEL = "test-model";
     const events: AgentEvent[] = [];
     const calls: KernelReasonInput[] = [];
     await runKernelAgent("q", (e) => { events.push(e); }, { deps: trioDeps([], calls) });
     expect(calls.map((c) => c.persona)).toEqual(["stockbot"]);
-    expect(events.slice(-4).map((e) => e.type)).toEqual(["answer_delta", "offer_trio", "claims", "done"]);
-    expect(events.find((e) => e.type === "offer_trio")).toEqual({ type: "offer_trio", sessionId: "rs:trio" });
+    expect(events.slice(-3).map((e) => e.type)).toEqual(["answer_delta", "claims", "done"]);
     expect(doneOf(events).muse.calls).toBe(1);
   });
 
-  test("an explicit bull and bear selection runs the trio and never offers it", async () => {
+  test("an explicit bull and bear selection runs the trio", async () => {
     process.env.OPENCODE_MODEL = "test-model";
     const events: AgentEvent[] = [];
     const calls: KernelReasonInput[] = [];
-    await runKernelAgent("Give me the bull and bear case on NVDA", (e) => { events.push(e); }, { personas: FINAL_PERSONAS, deps: trioDeps([], calls) });
+    await runKernelAgent("Give me the bull and bear case on NVDA", (e) => { events.push(e); }, { personas: FINAL_PERSONAS, reasoningEffort: "low", deps: trioDeps([], calls) });
     expect(calls.map((c) => c.persona)).toEqual(["bearbot", "bullbot", "stockbot"]);
-    expect(events.some((e) => e.type === "offer_trio")).toBe(false);
+    expect(calls.map((c) => c.reasoningEffort)).toEqual(["low", "low", "low"]);
     expect(doneOf(events).muse.calls).toBe(3);
-  });
-
-  test("the trio follow-up reuses the offered evidence with no worker run, intake, or tool call", async () => {
-    process.env.OPENCODE_MODEL = "test-model";
-    await runKernelAgent("q", () => { }, { deps: trioDeps([], []) });
-    const events: AgentEvent[] = [];
-    const bodies: Record<string, unknown>[] = [];
-    const calls: KernelReasonInput[] = [];
-    await runPersonaAgent("rs:trio", FINAL_PERSONAS, (e) => { events.push(e); }, { deps: trioDeps(bodies, calls) });
-    // Only the final gates reach the worker, judged against the offered session.
-    expect(bodies.length).toBeGreaterThan(0);
-    for (const b of bodies) {
-      expect(String(b.op).startsWith("assess_final")).toBe(true);
-      expect(b.sessionId).toBe("rs:trio");
-    }
-    expect(calls.map((c) => c.persona)).toEqual(["bearbot", "bullbot", "stockbot"]);
-    for (const c of calls) {
-      expect(c.evidence.map((e) => e.id)).toEqual(["ev:1"]);
-      expect(c.nodes.map((n) => n.node_id)).toEqual(["n1"]);
-      expect(c.direct).toBe(false);
-    }
-    expect(events[0]).toEqual({ type: "agent_start", prompt: "q" });
-    expect(events.find((e) => e.type === "evidence")).toMatchObject({ sessionId: "rs:trio" });
-    expect(events.some((e) => e.type === "offer_trio" || e.type === "tool_start" || e.type === "progress")).toBe(false);
-    const metrics = doneOf(events);
-    expect(metrics.tools.calls).toBe(0);
-    expect(metrics.needle.calls).toBe(0);
-    expect(metrics.muse.calls).toBe(3);
-    // Worker phases never ran, so they stay absent, never 0.
-    expect(Object.keys(metrics.timings ?? {}).sort()).toEqual(["gatesMs", "personasMs"]);
-  });
-
-  test("an unknown session fails closed with no worker or reasoner call", async () => {
-    process.env.OPENCODE_MODEL = "test-model";
-    const events: AgentEvent[] = [];
-    const bodies: Record<string, unknown>[] = [];
-    const calls: KernelReasonInput[] = [];
-    await runPersonaAgent("rs:unknown", FINAL_PERSONAS, (e) => { events.push(e); }, { deps: trioDeps(bodies, calls) });
-    expect(events.map((e) => e.type)).toEqual(["agent_start", "failed", "done"]);
-    expect(bodies).toEqual([]);
-    expect(calls).toEqual([]);
   });
 });

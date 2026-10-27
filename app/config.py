@@ -146,11 +146,11 @@ def reasoning_fields(
 ) -> dict[str, JSONValue]:
     """REASONING_EFFORT in the protocol's own request field; TS twin: decision/reasoning.ts.
 
-    A set value passes through unchanged, so each provider's own levels work. Unset or
-    empty sends no field: the provider default applies. A bad shape raises before any request.
+    A concrete value passes through unchanged, so each provider's own levels work.
+    Unset, empty, or auto sends no field. A bad shape raises before any request.
     """
     effort = _env_optional("REASONING_EFFORT")
-    if effort is None:
+    if effort is None or effort == "auto":
         return {}
     if not _REASONING_EFFORT_SHAPE.fullmatch(effort):
         raise RuntimeError(f"{error_prefix}: REASONING_EFFORT must match ^[a-z][a-z0-9_-]{{0,31}}$")
