@@ -101,11 +101,12 @@ class _J(JevClient):
         objective: str,
         node: object,
         registry: Sequence[Mapping[str, JSONValue]] | None = None,
-        evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
-        attempts: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+        evidence: Sequence[JSONValue] | None = None,
+        attempts: Sequence[JSONValue] | None = None,
         *,
         session_id: str,
         job_id: str | None = None,
+        ticker: str | None = None,
     ) -> ToolDecision:
         reg = list(registry or [])
         self.calls.append(("tool_selection", len(reg)))
@@ -274,11 +275,12 @@ class _JCapture(JevClient):
         objective: str,
         node: object,
         registry: Sequence[Mapping[str, JSONValue]] | None = None,
-        evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
-        attempts: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+        evidence: Sequence[JSONValue] | None = None,
+        attempts: Sequence[JSONValue] | None = None,
         *,
         session_id: str,
         job_id: str | None = None,
+        ticker: str | None = None,
     ) -> ToolDecision:
         self.selected_registry = list(registry or [])
         return ToolDecision(
@@ -448,11 +450,12 @@ class _CatalogDecideJev(JevClient):
         objective: str,
         node: object,
         registry: Sequence[Mapping[str, JSONValue]] | None = None,
-        evidence: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
-        attempts: Sequence[JSONValue] | Mapping[str, JSONValue] | None = None,
+        evidence: Sequence[JSONValue] | None = None,
+        attempts: Sequence[JSONValue] | None = None,
         *,
         session_id: str,
         job_id: str | None = None,
+        ticker: str | None = None,
     ) -> ToolDecision:
         return ToolDecision(
             action="invoke",

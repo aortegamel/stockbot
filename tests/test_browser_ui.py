@@ -814,7 +814,8 @@ def test_source_calculation_opens_each_input_and_controls_errors(browser: webdri
         browser.switch_to.window((set(browser.window_handles) - before).pop())
         try:
             wait.until(EC.text_to_be_present_in_element((By.CSS_SELECTOR, "h1"), value))
-            assert browser.find_element(By.CSS_SELECTOR, "mark").text == value
+            # The highlight renders after the heading; wait for it instead of racing the render.
+            assert wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "mark"))).text == value
             assert not browser.find_elements(By.PARTIAL_LINK_TEXT, "Original on")
             assert not browser.find_elements(By.CSS_SELECTOR, '[role="alert"]')
         finally:
