@@ -958,7 +958,9 @@ def _promote_observation(
         datapoint={name: _scalar_text(descriptor.get(name)) for name in ("value", "entity", "period", "unit")},
         proof=proof,
     )
-    stored = _persist_finra_web_record(store, session_id, _REPAIR_LINEAGE, found, record, proof_bytes=source_bytes)
+    stored = _persist_finra_web_record(
+        store, session_id, _REPAIR_LINEAGE, found, record, proof_bytes=source_bytes, operator_repair=True
+    )
     return str(stored["evidence_id"])
 
 
@@ -1040,7 +1042,9 @@ def _promote_calculation(
         unit=unit,
         proof=proof,
     )
-    stored = _persist_finra_web_record(store, session_id, _REPAIR_LINEAGE, found, record, proof_bytes=None)
+    stored = _persist_finra_web_record(
+        store, session_id, _REPAIR_LINEAGE, found, record, proof_bytes=None, operator_repair=True
+    )
     return str(stored["evidence_id"])
 
 

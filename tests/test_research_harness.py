@@ -11437,6 +11437,31 @@ def test_rep_promotion_admits_one_verified_row_in_target_and_keeps_frozen_histor
     assert store.get_evidence("EV-EPS") == stored
 
 
+def test_rep_promotion_does_not_exempt_normal_persistence_from_live_job_guard(
+    _rep_store: ResearchRepository,
+) -> None:
+    """Normal persistence still rejects a valid repaired observation without a running job."""
+    from app.research import repair
+    from app.research import service as _svc
+
+    store = _rep_store
+    q1 = {"period_end": "2025-04-27", "period_start": "2025-01-27", "fiscal_period": "Q1", "eps_diluted": 0.76}
+    _rep_result(store, "TR-EPS", "get_fundamentals", {"cik": _REP_CIK, "quarterly_eps": [q1]})
+    _rep_row(store, "EV-EPS", "2025-09-01T00:00:00+00:00", _rep_record("get_fundamentals", q1, "TR-EPS"))
+    target = _svc.create_research("NVDA EPS?", "o", repo=store)
+    [artifact] = repair.repair_evidence(store, "EV-EPS", target)
+    promoted = _rep_promoted(store, artifact)
+    candidate = dataclasses.replace(
+        promoted,
+        evidence_id="ev:normal-without-job",
+        metadata={**promoted.metadata, "identity_key": "normal-without-job"},
+    )
+    before = (store.list_evidence(target), store.get_session(target))
+    with pytest.raises(_svc.ResearchNotFound, match="unknown job_id: 'repair'"):
+        _svc._persist_finra_web_record(store, target, "repair", store.get_session(target), candidate, proof_bytes=None)
+    assert (store.list_evidence(target), store.get_session(target)) == before
+
+
 def test_rep_promotion_admits_calculation_inputs_first_and_recomputes_over_them(
     _rep_store: ResearchRepository,
 ) -> None:

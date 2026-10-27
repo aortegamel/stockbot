@@ -1875,11 +1875,13 @@ def _persist_finra_web_record(
     record: Evidence,
     *,
     proof_bytes: bytes | None,
+    operator_repair: bool = False,
 ) -> dict[str, JSONValue]:
     """PIT-gate + commit a FINRA/WEB replay or calculation row.
 
     A datapoint row archives its exact observation bytes (the persisted tool
     result) first and must verify against them before the commit.
+    Explicit operator repairs require an open session, but no running model job.
     """
     from .evidence import EvidenceLedger
 
@@ -1914,7 +1916,12 @@ def _persist_finra_web_record(
         )
     )
     try:
-        _live_evidence_job(store, session_id, job_id)
+        if operator_repair:
+            current = _require_session(store, session_id)
+            if current.status in _session.TERMINAL_STATUSES:
+                raise ValueError(f"record_evidence: session {session_id!r} status is {current.status!r} (terminal)")
+        else:
+            _live_evidence_job(store, session_id, job_id)
         store.save_evidence_and_session(updated_found, stored)
     except ValueError as exc:
         if "identity_key" not in str(exc):
