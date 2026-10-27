@@ -33,6 +33,10 @@ let chartReceipt: unknown;
 let watchlistReceipt: unknown;
 let widgetReceipt: unknown;
 let sessionsCreated = 0;
+// When set, the reason mock runs these tool calls through the route's runner before answering.
+let chatToolCalls: [string, Record<string, unknown>][] = [];
+const toolOutputs: string[] = [];
+const filingRefs = { record_id: "0001045810-26-000078", uri: "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000078/nvda-20260902.htm", all: [{ record_id: "0001045810-26-000078", uri: "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000078/nvda-20260902.htm" }, { record_id: "x", uri: "javascript:alert(1)" }] };
 const capturedSource = { id: `capture:${"a".repeat(64)}`, title: "Captured filing", url: "https://www.sec.gov/filing" };
 const bridgeEvidence: Evidence = {
   id: "ev:bridge", source: "bridge", retrievedAt: "2026-01-01T00:00:00Z", content: "internal tool output",
@@ -64,6 +68,7 @@ mock.module("@/lib/agent/kernel", () => ({
 mock.module("@/lib/muse/client", () => ({
   reason: async (opts: Parameters<typeof reason>[0]) => {
     reasonCalls.push(opts);
+    for (const [name, args] of chatToolCalls) toolOutputs.push(await opts.runTool!(name, args));
     if (reasonDown) throw new Error("muse down");
     return { prose: reasonText, usage: reasonUsage };
   },
@@ -76,8 +81,10 @@ mock.module("@/lib/tools/stockbot", () => ({
     if (name === "set_chart_symbol") return { ok: true, chartSelection: chartReceipt };
     if (name === "update_watchlist") return { ok: true, watchlistUpdate: watchlistReceipt };
     if (name === "add_widget") return { ok: true, widgetSelection: widgetReceipt };
+    if (name === "get_sec_document") return { ok: true, evidence: { ...bridgeEvidence, content: "FORM 8-K text", sourceRefs: filingRefs } };
     throw new Error(`Unexpected tool: ${name}`);
   },
+  describeTools: async (names: string[]) => names.map((name) => ({ name })),
   newSessionId: () => {
     sessionsCreated += 1;
     return "sess-test";
@@ -91,7 +98,8 @@ mock.module("@/lib/tools/stockbot", () => ({
 let directory: string;
 const savedEnv = { debug: process.env.STOCKBOT_DEBUG, model: process.env.OPENCODE_MODEL, data: process.env.STOCKBOT_DATA_DIR, effort: process.env.REASONING_EFFORT, maxOutputTokens: process.env.MUSE_MAX_OUTPUT_TOKENS, answerTokenBudget: process.env.MUSE_ANSWER_TOKEN_BUDGET };
 beforeEach(async () => {
-  reasonCalls.length = kernelCalls.length = kernelOpts.length = runCalls.length = invoked.length = ended.length = 0;
+  reasonCalls.length = kernelCalls.length = kernelOpts.length = runCalls.length = invoked.length = ended.length = toolOutputs.length = 0;
+  chatToolCalls = [];
   reasonText = "Hello! How can I help?";
   reasonDown = argsDown = toolThrows = endThrows = false;
   reasonUsage = {};
@@ -138,17 +146,41 @@ function expectNoExecution(): void {
 }
 
 describe("plain chat", () => {
-  test("the default prompt makes one plain call and streams its unchanged answer", async () => {
+  test("the default prompt makes one plain call with EDGAR tools and streams its unchanged answer", async () => {
     const events = await eventsFor("hello");
     expect(reasonCalls).toHaveLength(1);
-    expect(reasonCalls[0]).toEqual({ prompt: "hello", evidence: [], direct: true, plain: true, signal: expect.any(AbortSignal), deadlineAt: expect.any(Number) });
+    expect(reasonCalls[0]).toEqual({ prompt: "hello", evidence: [], direct: true, plain: true, tools: expect.any(Array), runTool: expect.any(Function), signal: expect.any(AbortSignal), deadlineAt: expect.any(Number) });
+    expect(reasonCalls[0]?.tools?.map((t) => t.name)).toEqual(["find_sec_entities", "search_sec_filings", "list_sec_filings", "get_sec_filing", "list_sec_documents", "get_sec_document"]);
     expect(kernelCalls).toEqual([]);
     expect(runCalls).toEqual([]);
     expect(invoked).toEqual([]);
-    expect(sessionsCreated).toBe(0);
+    expect(ended).toEqual(["sess-test"]);
     expect(events.map((event) => event.type)).toEqual(["agent_start", "status", "reasoning_start", "answer_delta", "done"]);
     expect(events[3]).toEqual({ type: "answer_delta", text: reasonText });
     expect(events.at(-1)).toMatchObject({ status: "completed", metrics: { needle: { calls: 0 }, tools: { calls: 0 }, muse: { calls: 1 } } });
+  });
+  test("a model tool call reads the filing through the bridge, and the model sees its safe links", async () => {
+    chatToolCalls = [["get_sec_document", { accession_no: "0001045810-26-000078" }]];
+    const events = await eventsFor("what do the latest filings say", { ticker: "NVDA" });
+    expect(invoked).toEqual([["get_sec_document", { accession_no: "0001045810-26-000078" }, "sess-test", expect.any(Number)]]);
+    expect(toolOutputs).toEqual([`FORM 8-K text\n\nLinks:\n0001045810-26-000078: ${filingRefs.uri}`]);
+    expect(events).toContainEqual({ type: "status", text: "Reading the SEC filing" });
+    expect(events.at(-1)).toMatchObject({ status: "completed", metrics: { needle: { calls: 0 }, tools: { calls: 1 }, muse: { calls: 1 } } });
+    expect(ended).toEqual(["sess-test"]);
+  });
+  test("a tool the chat did not offer never reaches the bridge", async () => {
+    chatToolCalls = [["update_watchlist", { action: "add", ticker: "NVDA" }]];
+    const events = await eventsFor("hello");
+    expect(invoked).toEqual([]);
+    expect(toolOutputs).toEqual(["error: update_watchlist is not available in chat"]);
+    expect(events.at(-1)).toMatchObject({ type: "done", status: "completed", metrics: { tools: { calls: 0 } } });
+  });
+  test("a failed model tool call becomes an error the model reads, not a failed chat", async () => {
+    toolFailure = "No data found for NVDA";
+    chatToolCalls = [["list_sec_filings", { identifier: "NVDA" }]];
+    const events = await eventsFor("latest filings for NVDA");
+    expect(toolOutputs).toEqual(["error: No data found for NVDA"]);
+    expect(events.at(-1)).toMatchObject({ type: "done", status: "completed" });
   });
   test("the done event preserves provider usage without route timings", async () => {
     reasonUsage = { providerCalls: 2, inputTokens: 13, outputTokens: 5 };

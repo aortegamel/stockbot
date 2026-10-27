@@ -93,11 +93,13 @@ function directSystem(persona: Persona): string {
   const { name } = PERSONAS[persona];
   return `You are ${name}.` + DIRECT_INVENTORY_RULE;
 }
-// Default chat: one plain answer, no evidence, no inventory, no gates. /research owns sourced answers.
+// Default chat: one plain answer, no inventory, no gates. The model may call SEC EDGAR tools.
 const PLAIN_SYSTEM =
   "You are Stockbot, a stock market assistant. Answer the user directly, briefly, and plainly." +
-  " You have no live data or sources in this mode. Do not present current prices, latest filings, or recent figures as verified." +
-  " When the question needs current or sourced data, say so and suggest the user ask again with /research.";
+  " You can call SEC EDGAR tools. For a question about filings, find the filings and read the relevant document text before you answer." +
+  " Explain what the filings say in plain words. Name each filing you used by form and filing date, and link it with the URL from the tool output." +
+  " Do not state filing content you did not read. If a tool fails or finds nothing, say so." +
+  " You have no live prices, FINRA data, or news in this mode. For those, suggest the user ask again with /research.";
 function isConf(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1;
 }
@@ -200,7 +202,7 @@ function mergeUsage(usage: MuseUsage, raw: unknown): void {
 }
 
 // Exported for tests: a chunk matching both delta shapes appends once.
-export function harvest(ev: unknown, acc: { text: string; usage: MuseUsage }, onDelta: (t: string) => void): void {
+export function harvest(ev: unknown, acc: { text: string; usage: MuseUsage; output?: unknown[] }, onDelta: (t: string) => void): void {
   const rec = objectRecord(ev);
   if (!rec) return;
   const delta = eventDelta(rec);
@@ -209,9 +211,12 @@ export function harvest(ev: unknown, acc: { text: string; usage: MuseUsage }, on
     onDelta(delta);
   }
   mergeUsage(acc.usage, rec.usage ?? objectRecord(rec.response)?.usage);
+  // The completed response lists every output item, including function calls.
+  const output = rec.type === "response.completed" ? objectRecord(rec.response)?.output : undefined;
+  if (Array.isArray(output)) acc.output = output;
 }
 
-function harvestFrame(chunk: string, acc: { text: string; usage: MuseUsage }, onDelta: (t: string) => void): void {
+function harvestFrame(chunk: string, acc: { text: string; usage: MuseUsage; output?: unknown[] }, onDelta: (t: string) => void): void {
   for (const line of chunk.split("\n")) {
     const t = line.trim();
     if (!t.startsWith("data:")) continue;
@@ -228,8 +233,8 @@ function harvestFrame(chunk: string, acc: { text: string; usage: MuseUsage }, on
 async function readSse(
   res: Response,
   onDelta: (t: string) => void,
-  acc: { text: string; usage: MuseUsage },
-): Promise<{ text: string; usage: MuseUsage }> {
+  acc: { text: string; usage: MuseUsage; output?: unknown[] },
+): Promise<{ text: string; usage: MuseUsage; output?: unknown[] }> {
   const reader = res.body!.getReader();
   const dec = new TextDecoder();
   let buf = "";
@@ -259,7 +264,7 @@ async function post(
   onDelta: (t: string) => void,
   signal: AbortSignal,
   usage: MuseUsage,
-): Promise<{ text: string; usage: MuseUsage }> {
+): Promise<{ text: string; usage: MuseUsage; output?: unknown[] }> {
   usage.providerCalls = (usage.providerCalls ?? 0) + 1;
   const res = await fetch(`${base}${path}`, {
     method: "POST",
@@ -273,7 +278,7 @@ async function post(
     signal,
   });
   if (!res.ok) throw new Error(`muse ${path} ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  const raw = { text: "", usage: {} as MuseUsage };
+  const raw: { text: string; usage: MuseUsage; output?: unknown[] } = { text: "", usage: {} };
   try {
     await readSse(res, onDelta, raw);
   } finally {
@@ -283,7 +288,7 @@ async function post(
       cachedTokens: (usage.cachedTokens ?? 0) + (raw.usage.cachedTokens ?? 0) || undefined,
     });
   }
-  return { text: raw.text, usage };
+  return { text: raw.text, usage, ...(raw.output ? { output: raw.output } : {}) };
 }
 
 type ReasonOptions = {
@@ -296,6 +301,9 @@ type ReasonOptions = {
   direct?: boolean;
   // Default chat (with direct): plain prose, no inventory block, no claims.
   plain?: boolean;
+  // Plain chat only: tools the model may call, and the runner for one call. The runner returns the text the model reads.
+  tools?: ChatTool[];
+  runTool?: (name: string, args: Record<string, unknown>) => Promise<string>;
   // Optional graph state (kernel.ts always sends these; direct callers omit them).
   objective?: string;
   nodes?: unknown[];
@@ -337,7 +345,31 @@ function reasonSignal(opts: ReasonOptions): AbortSignal {
   signal.throwIfAborted();
   return signal;
 }
-type StageInput = { role: string; content: string }[];
+// Messages, plus provider output items and tool results in a plain chat tool loop.
+type StageInput = Record<string, unknown>[];
+type ChatTool = { name: string; description?: string; parameters?: unknown };
+// ponytail: fixed round cap; the last round forbids tools so the model must answer.
+const MAX_TOOL_ROUNDS = 8;
+type FunctionCall = { type: "function_call"; call_id: string; name: string; arguments: string };
+function isFunctionCall(item: unknown): item is FunctionCall {
+  const rec = objectRecord(item);
+  return rec?.type === "function_call" && typeof rec.call_id === "string" && typeof rec.name === "string" && typeof rec.arguments === "string";
+}
+// A malformed call or a thrown runner becomes an error the model reads; it never ends the chat.
+async function runCall(runTool: ReasonOptions["runTool"], call: FunctionCall): Promise<string> {
+  let args: unknown;
+  try {
+    args = JSON.parse(call.arguments || "{}");
+  } catch {
+    return "error: arguments are not valid JSON";
+  }
+  if (!runTool || !objectRecord(args)) return "error: arguments must be a JSON object";
+  try {
+    return await runTool(call.name, args as Record<string, unknown>);
+  } catch (err) {
+    return `error: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
 // Direct calls keep their existing prompt. Research calls request prose and claims together.
 function directInput(opts: ReasonOptions): StageInput {
   const persona = opts.persona ?? "stockbot";
@@ -406,8 +438,8 @@ type Stage = {
   onDelta: (text: string) => void;
   usage: MuseUsage;
 };
-async function callStage(stage: Stage, input: StageInput, cap: number | undefined): Promise<{ text: string; usage: MuseUsage }> {
-  const body = { model: stage.model, input, stream: true, ...reasoningFields("responses", stage.reasoningEffort), ...(cap !== undefined ? { max_output_tokens: cap } : {}) };
+async function callStage(stage: Stage, input: StageInput, cap: number | undefined, extra: Record<string, unknown> = {}): Promise<{ text: string; usage: MuseUsage; output?: unknown[] }> {
+  const body = { model: stage.model, input, stream: true, ...extra, ...reasoningFields("responses", stage.reasoningEffort), ...(cap !== undefined ? { max_output_tokens: cap } : {}) };
   try {
     return await post(stage.base, stage.apiKey, stage.session, "/responses", body, stage.onDelta, stage.signal, stage.usage);
   } catch (err) {
@@ -437,7 +469,7 @@ async function callStage(stage: Stage, input: StageInput, cap: number | undefine
       stage.apiKey,
       stage.session,
       "/chat/completions",
-      { model: stage.model, messages: input.map((m) => ({ role: m.role, content: m.content })), stream: true, ...reasoningFields("chat_completions", stage.reasoningEffort) },
+      { model: stage.model, messages: input.filter((m) => typeof m.role === "string").map((m) => ({ role: m.role, content: m.content })), stream: true, ...reasoningFields("chat_completions", stage.reasoningEffort) },
       stage.onDelta,
       stage.signal,
       stage.usage,
@@ -459,9 +491,23 @@ export async function reason(opts: ReasonOptions): Promise<NarrativeResult & { u
   const outputBefore = usage.outputTokens;
   let completed = false;
   try {
+    if (opts.plain) {
+      const input = directInput(opts);
+      const tools = (opts.tools ?? []).map((t) => ({ type: "function", ...t }));
+      for (let round = 1; ; round++) {
+        const extra = tools.length ? { tools, ...(round >= MAX_TOOL_ROUNDS ? { tool_choice: "none" } : {}) } : {};
+        const raw = await callStage(stage, input, cap, extra);
+        const calls = (raw.output ?? []).filter(isFunctionCall);
+        if (!calls.length || round >= MAX_TOOL_ROUNDS) {
+          completed = true;
+          return { prose: raw.text.trim(), claims: [], usage };
+        }
+        input.push(...(raw.output as StageInput));
+        for (const call of calls) input.push({ type: "function_call_output", call_id: call.call_id, output: await runCall(opts.runTool, call) });
+      }
+    }
     const raw = await callStage(stage, opts.direct ? directInput(opts) : narrativeInput(opts), cap);
     completed = true;
-    if (opts.plain) return { prose: raw.text.trim(), claims: [], usage };
     const result = withInventory({ text: raw.text, usage });
     return opts.direct ? result : { ...result, timings };
   } finally {

@@ -15,6 +15,8 @@ type BridgeReply = {
   id?: unknown;
   result?: { content?: unknown; error?: unknown; error_type?: unknown; meta?: BridgeResultMeta };
   error?: unknown;
+  // describe op only: canonical chat-completions tool schemas.
+  tools?: unknown;
 };
 
 type Pending = {
@@ -269,6 +271,29 @@ export async function invoke(name: string, args: Record<string, unknown>, sessio
   }
   const failure = resultFailure(msg.result) ?? envelopeFailure(msg.error);
   return failure === undefined ? succeeded(name, msg.result ?? {}) : failed(failure);
+}
+
+type ToolSchema = { name: string; description?: string; parameters?: unknown };
+let schemas: Promise<ToolSchema[]> | undefined;
+// Canonical bridge schemas for the named tools, fetched once. A missing name fails loudly.
+export async function describeTools(names: readonly string[]): Promise<ToolSchema[]> {
+  schemas ??= bridge.call({ op: "describe" }).then((reply) => {
+    if (!Array.isArray(reply.tools)) throw new Error("stockbot bridge describe returned no tools");
+    return reply.tools.flatMap((t: unknown) => {
+      const fn = t && typeof t === "object" && "function" in t ? t.function : undefined;
+      if (!fn || typeof fn !== "object" || !("name" in fn) || typeof fn.name !== "string") return [];
+      return [{ name: fn.name, description: "description" in fn && typeof fn.description === "string" ? fn.description : undefined, parameters: "parameters" in fn ? fn.parameters : undefined }];
+    });
+  }).catch((err: unknown) => {
+    schemas = undefined;
+    throw err;
+  });
+  const all = await schemas;
+  return names.map((name) => {
+    const found = all.find((t) => t.name === name);
+    if (!found) throw new Error(`stockbot bridge has no tool ${name}`);
+    return found;
+  });
 }
 
 export async function endSession(sessionId: string): Promise<void> {

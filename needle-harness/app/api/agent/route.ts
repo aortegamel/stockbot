@@ -3,8 +3,8 @@ import { appendFile, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { reason } from "@/lib/muse/client";
 import { asksWatchlist, kernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent } from "@/lib/agent/kernel";
-import { endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
-import { ASK_CONTEXT_KINDS, FINAL_PERSONAS, safeSourceUrl, sourceReferences, statusEvent, WIDGET_TYPES, type AgentEvent, type AskContext, type Timings } from "@/lib/agent/types";
+import { describeTools, endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
+import { ASK_CONTEXT_KINDS, FINAL_PERSONAS, safeSourceUrl, sourceReferences, statusEvent, toolStatus, WIDGET_TYPES, type AgentEvent, type AskContext, type Timings } from "@/lib/agent/types";
 
 const ROOT = process.cwd().endsWith("needle-harness") ? join(process.cwd(), "..") : process.cwd();
 
@@ -139,6 +139,17 @@ function streamSender(req: Request, controller: ReadableStreamDefaultController<
 
 const SSE_HEADERS = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" };
 
+// Default chat tools: SEC EDGAR lookup and reading only.
+const CHAT_TOOLS = ["find_sec_entities", "search_sec_filings", "list_sec_filings", "get_sec_filing", "list_sec_documents", "get_sec_document"] as const;
+// "<accession>: <url>" lines from a tool's source refs, so the model can link the filings it names.
+function filingLinks(refs: Record<string, unknown> | undefined): string[] {
+  const rows = Array.isArray(refs?.all) ? refs.all : [refs];
+  return [...new Set(rows.flatMap((row: unknown) => {
+    if (!row || typeof row !== "object" || !("uri" in row) || typeof row.uri !== "string" || safeSourceUrl(row.uri) === undefined) return [];
+    const id = "record_id" in row && typeof row.record_id === "string" ? row.record_id : "filing";
+    return [`${id}: ${row.uri}`];
+  }))];
+}
 // Default chat runs no JEV and no research. Only these deterministic command shapes reach a UI tool.
 const WATCHLIST_COMMAND = /\b(?:add|remove)\b/i;
 const WIDGET_COMMAND = /\badd\b[^.?!]*\bwidgets?\b/i;
@@ -171,22 +182,38 @@ export async function POST(req: Request): Promise<Response> {
       const timings: Timings = {};
       const { send, flush } = streamSender(req, controller, requestAt, timings);
       const zeroMetrics = (t0: number, calls: number) => ({ totalMs: performance.now() - t0, needle: { calls, totalMs: 0, escalations: 0 }, tools: { calls, totalMs: 0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures: {} });
-      // One plain model call: no evidence, no inventory, no gates. The text shows as written.
+      // One plain answer with SEC EDGAR tools: no evidence gates, no inventory. The text shows as written.
       const answerPlain = async (): Promise<void> => {
         const t0 = performance.now();
         send({ type: "agent_start", prompt });
         send(statusEvent("Thinking…"));
         send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
+        const sessionId = newSessionId();
+        const tools = { calls: 0, totalMs: 0 };
+        const runChatTool = async (name: string, args: Record<string, unknown>): Promise<string> => {
+          // Offering schemas does not bind the model: only an offered EDGAR tool reaches the bridge.
+          if (!(CHAT_TOOLS as readonly string[]).includes(name)) return `error: ${name} is not available in chat`;
+          send(statusEvent(toolStatus(name)));
+          const started = performance.now();
+          tools.calls += 1;
+          const result = await invoke(name, args, sessionId, Math.max(deadlineAt - Date.now(), 1));
+          tools.totalMs += performance.now() - started;
+          if (!result.ok) return `error: ${result.error}`;
+          const links = filingLinks(result.evidence.sourceRefs);
+          return links.length ? `${result.evidence.content}\n\nLinks:\n${links.join("\n")}` : result.evidence.content;
+        };
         try {
           // ponytail: no live onDelta — a mid-stream transport retry would repeat text; stream once retries are delta-safe.
-          const r = await reason({ prompt, evidence: [], direct: true, plain: true, ...(currentChartTicker && !watchlist ? { ticker: currentChartTicker } : {}), ...contextField, signal: req.signal, deadlineAt });
+          const r = await reason({ prompt, evidence: [], direct: true, plain: true, tools: await describeTools(CHAT_TOOLS), runTool: runChatTool, ...(currentChartTicker && !watchlist ? { ticker: currentChartTicker } : {}), ...contextField, signal: req.signal, deadlineAt });
           if (!r.prose) throw new Error("The model returned an empty answer.");
           send({ type: "answer_delta", text: r.prose });
-          send({ type: "done", metrics: { ...zeroMetrics(t0, 0), muse: { calls: 1, totalMs: performance.now() - t0, ...r.usage } }, status: "completed" });
+          send({ type: "done", metrics: { ...zeroMetrics(t0, 0), tools, muse: { calls: 1, totalMs: performance.now() - t0, ...r.usage } }, status: "completed" });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           send({ type: "failed", category: "provider_error", message: msg.slice(0, 160), code: "MODEL_START_FAILED", stage: "chat" });
           send({ type: "error", message: msg, code: "MODEL_START_FAILED", stage: "chat" });
+        } finally {
+          await endSession(sessionId).catch(() => undefined);
         }
       };
       const generateArguments = async (tool: string): Promise<Record<string, unknown> | null> => {

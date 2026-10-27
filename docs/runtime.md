@@ -81,8 +81,11 @@ It also rejects relative-date words, such as `today` or `last quarter`, and conc
 An ungrounded concept starts JEV selection before the tool runs.
 The scheduler never substitutes a fallback concept.
 
-Default chat uses one plain model call.
-It runs no JEV selection, research, evidence inventory, or final gates.
+Default chat uses one plain model answer with SEC EDGAR tools.
+The model may call `find_sec_entities`, `search_sec_filings`, `list_sec_filings`, `get_sec_filing`, `list_sec_documents`, and `get_sec_document` through the bridge, for up to 8 rounds.
+Each tool result carries its sec.gov links, so the model can name and link the filings it used.
+A failed tool call returns an error to the model. It does not fail the chat.
+Default chat runs no JEV selection, research, evidence inventory, or final gates. The answer text is not checked against the filings.
 The server handles three deterministic UI commands in `needle-harness/app/api/agent/route.ts`:
 
 - Watchlist commands contain `add` or `remove` plus a watchlist request.

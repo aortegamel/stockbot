@@ -492,7 +492,7 @@ describe("server source metadata", () => {
 
 describe("muse reason personas (fake provider)", () => {
   type Msg = { role: string; content: string };
-  type Body = { model: string; input?: Msg[]; messages?: Msg[]; max_output_tokens?: number; reasoning?: { effort: string }; reasoning_effort?: string };
+  type Body = { model: string; input?: Msg[]; messages?: Msg[]; max_output_tokens?: number; reasoning?: { effort: string }; reasoning_effort?: string; tools?: unknown[]; tool_choice?: string };
   type Seen = { path: string; session: string | null; body: Body };
   const seen: Seen[] = [];
   let respond: (path: string, body: Body) => Response = () => sse("ok");
@@ -815,6 +815,50 @@ describe("muse reason personas (fake provider)", () => {
     expect(systemOf(call.body)).toStartWith("You are Stockbot, a stock market assistant.");
     expect(systemOf(call.body)).not.toContain("inventory");
     expect(systemOf(call.body)).toContain("CURRENT STOCK CONTEXT");
+  });
+
+  describe("plain chat tool loop", () => {
+    const completed = (text: string, output: unknown[]): Response => new Response(
+      `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\ndata: ${JSON.stringify({ type: "response.completed", response: { output } })}\n\ndata: [DONE]\n\n`,
+      { headers: { "Content-Type": "text/event-stream" } },
+    );
+    const listCall = { type: "function_call", call_id: "c1", name: "list_sec_filings", arguments: "{\"identifier\":\"NVDA\"}" };
+
+    test("a tool call runs through the runner and the model answers from its output", async () => {
+      const badCall = { type: "function_call", call_id: "c2", name: "get_sec_document", arguments: "{not json" };
+      respond = () => (seen.length === 1 ? completed("", [listCall, badCall]) : sse("NVDA filed a 10-Q."));
+      const ran: unknown[] = [];
+      const r = await reason({
+        prompt: "latest filings", evidence: [], direct: true, plain: true, tools: [{ name: "list_sec_filings" }],
+        runTool: async (name, args) => { ran.push([name, args]); return "10-Q 2026-08-26"; },
+      });
+      expect(r.prose).toBe("NVDA filed a 10-Q.");
+      expect(ran).toEqual([["list_sec_filings", { identifier: "NVDA" }]]);
+      expect(seen).toHaveLength(2);
+      expect(seen[0]?.body.tools).toEqual([{ type: "function", name: "list_sec_filings" }]);
+      const second = JSON.stringify(seen[1]?.body.input);
+      expect(second).toContain(JSON.stringify(listCall));
+      expect(second).toContain(JSON.stringify({ type: "function_call_output", call_id: "c1", output: "10-Q 2026-08-26" }));
+      expect(second).toContain(JSON.stringify({ type: "function_call_output", call_id: "c2", output: "error: arguments are not valid JSON" }));
+    });
+
+    test("a thrown runner becomes an error the model reads", async () => {
+      respond = () => (seen.length === 1 ? completed("", [listCall]) : sse("The lookup failed."));
+      const r = await reason({ prompt: "q", evidence: [], direct: true, plain: true, tools: [{ name: "list_sec_filings" }], runTool: async () => { throw new Error("bridge down"); } });
+      expect(r.prose).toBe("The lookup failed.");
+      expect(JSON.stringify(seen[1]?.body.input)).toContain("\"output\":\"error: bridge down\"");
+    });
+
+    test("the last round forbids tools, so a model that keeps calling still answers", async () => {
+      respond = () => completed("best effort", [listCall]);
+      let runs = 0;
+      const r = await reason({ prompt: "q", evidence: [], direct: true, plain: true, tools: [{ name: "list_sec_filings" }], runTool: async () => { runs += 1; return "row"; } });
+      expect(r.prose).toBe("best effort");
+      expect(seen).toHaveLength(8);
+      expect(runs).toBe(7);
+      expect(seen[6]?.body.tool_choice).toBeUndefined();
+      expect(seen[7]?.body.tool_choice).toBe("none");
+    });
   });
 
   test("a single-tool call without a persona keeps the evidence prompt", async () => {
