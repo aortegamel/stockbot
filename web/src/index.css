@@ -132,14 +132,13 @@ input.pill{cursor:text}
 .footer-disclaimer summary{cursor:pointer;text-decoration:underline}
 .footer-disclaimer p{position:absolute;right:0;bottom:24px;width:360px;margin:0;padding:10px 12px;white-space:normal;background:#141A30;border:1px solid rgba(255,255,255,0.12);border-radius:var(--r-card)}
 
-/* Body and agent drawer. */
-.shell-body{flex:1;min-height:0;display:flex;position:relative;z-index:1}
-.shell-body > :first-child{flex:1;min-width:0}
-.drawer{width:380px;flex-shrink:0;margin:8px 8px 8px 0}
+/* Body and agent chat: the chat docks under the page (Workspace docks it under the chart instead). */
+.shell-body{flex:1;min-height:0;display:flex;flex-direction:column;position:relative;z-index:1}
+.shell-body > :first-child{flex:1;min-height:0;min-width:0}
+.drawer{flex:0 0 40%;min-height:240px;margin:0 8px 8px}
 .drawer .input,.drawer .btn-primary{height:34px}
-@media (max-width:1023px){.drawer{position:absolute;top:0;right:0;bottom:0;width:min(380px,100%);margin:8px;z-index:5}}
 
-/* Markets table: 28px rows, tabular numbers, sticky 11px headers. Tight padding fits the 1440px column with the agent drawer open. */
+/* Markets table: 28px rows, tabular numbers, sticky 11px headers. Tight padding fits a 1440px column. */
 .home-table{width:100%;border-collapse:separate;border-spacing:0}
 .home-table :is(th,td){height:var(--h-row);padding:0 4px;border-bottom:1px solid var(--hair);white-space:nowrap}
 .home-table th{font-size:var(--fs-xs);font-weight:500;letter-spacing:0.04em;text-transform:uppercase;color:var(--muted)}
@@ -249,16 +248,18 @@ input.pill{cursor:text}
 .ws-tool{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:24px;padding:0 4px;border:0;border-radius:var(--r-ctl);background:transparent;color:var(--muted, #93A0B8);font-size:var(--fs-body);cursor:pointer}
 .ws-tool:hover{background:var(--fill);color:var(--text)}
 select.ws-tool{padding-right:16px;width:auto}
-/* The grid fills the mid column: the chart row takes 3fr (~60%), each later row 2fr; rows scroll only below their minimums. */
-.ws-grid{flex:1;min-height:0;overflow:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:minmax(420px,3fr);grid-auto-rows:minmax(240px,2fr);gap:8px}
-.ws-mid > .skeleton{flex:1;height:auto}
+/* Chart (3fr) over chat (2fr) on the left; every other widget stacks in the 380px right column (the old drawer width). Each column scrolls below its minimums. */
+.ws-grid{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:8px}
+.ws-main,.ws-side{min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:8px}
+.ws-main > .skeleton{flex:1;height:auto}
+.ws-main > .ws-widget{flex:3 1 0;min-height:300px}
+.ws-main > .drawer{flex:2 1 0;min-height:240px;margin:0}
+.ws-side > .ws-widget{flex:1 0 240px}
 .ws-widget{display:flex;flex-direction:column;min-height:0;min-width:0}
-/* The first widget and a lone last widget span the row, so no grid cell stays empty. */
-.ws-widget:first-child,.ws-widget:last-child:nth-child(even){grid-column:1/-1}
-/* Focus mode: one widget takes the whole grid; the others stay mounted but hidden. */
-.ws-grid-focus{grid-template-rows:minmax(0,1fr)}
-.ws-grid-focus > .ws-widget:not(.ws-widget-focus){display:none}
-.ws-widget-focus{grid-column:1/-1}
+/* Focus mode: one widget takes the whole grid; the others and the chat stay mounted but hidden. */
+.ws-grid-focus{grid-template-columns:minmax(0,1fr)}
+.ws-grid-focus > :not(:has(.ws-widget-focus)),.ws-grid-focus .ws-widget:not(.ws-widget-focus),.ws-grid-focus .drawer{display:none}
+.ws-grid .ws-widget-focus{flex:1 1 0}
 .ws-widget-body{overflow:auto;flex:1;padding:var(--sp-3);min-height:0;font-size:var(--fs-body)}
 .ws-widget-body table{border-collapse:collapse}
 .ws-widget-body :is(th,td){height:var(--h-row);padding:0 8px;font-size:var(--fs-body)}
@@ -269,7 +270,7 @@ select.ws-tool{padding-right:16px;width:auto}
 .ws-bottom > .ws-tablist{flex:none;height:36px;padding:0 12px}
 .ws-bottom > [role="tabpanel"]{overflow:auto}
 .ws-alerts{padding:var(--sp-3);font-size:var(--fs-body)}
-@media (max-width:800px){.workspace{grid-template-columns:1fr;overflow:auto}.ws-left{max-height:220px}.ws-mid{overflow:visible}.ws-grid{overflow:visible;grid-template-columns:1fr}.ws-widget{grid-column:1/-1}}
+@media (max-width:800px){.workspace{grid-template-columns:1fr;overflow:auto}.ws-left{max-height:220px}.ws-mid{overflow:visible}.ws-grid{grid-template-columns:1fr}.ws-main,.ws-side{overflow:visible}}
 
 .source-panel .source-control {
   border: 1px solid #52525b;

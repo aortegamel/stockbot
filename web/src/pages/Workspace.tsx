@@ -349,7 +349,7 @@ export default function Workspace(s: ShellState) {
             />
           </div>
         )}
-        {!loaded ? <span className="skeleton" aria-label="Loading workspace" aria-busy="true" /> : <WidgetGrid widgets={widgets} onRemove={removeWidget} onParams={setParams} />}
+        <WidgetGrid widgets={loaded ? widgets : null} chat={s.chat} onRemove={removeWidget} onParams={setParams} />
         <BottomPanel s={s} />
       </div>
     </div>

@@ -213,16 +213,19 @@ export function freeEscape(e: KeyboardEvent): boolean {
     && !(e.target instanceof window.Element && e.target.closest("input,textarea,select,form,[role=combobox],details[open]"));
 }
 
+// The first price-volume widget and the chat fill the main column; every other widget stacks in the side column.
 // Refresh remounts one widget. Expand focuses one widget over the whole grid; Esc restores the grid.
-// Hidden widgets stay mounted, so charts and loads survive a focus round trip.
-export function WidgetGrid({ widgets, onRemove, onParams }: {
-  widgets: WorkspaceWidget[];
+// Hidden widgets stay mounted, so charts and loads survive a focus round trip. widgets null: the workspace is loading.
+export function WidgetGrid({ widgets, chat, onRemove, onParams }: {
+  widgets: WorkspaceWidget[] | null;
+  chat: ReactNode;
   onRemove: (id: string) => void;
   onParams: (id: string, params: Record<string, unknown>) => void;
 }) {
   const [focused, setFocused] = useState<string | null>(null);
   const focus = useCallback((id: string) => setFocused((previous) => previous === id ? null : id), []);
-  const visible = widgets.filter((w) => isWidgetType(w.type));
+  const visible = (widgets ?? []).filter((w) => isWidgetType(w.type));
+  const chart = visible.find((w) => w.type === "price-volume");
   const focusing = focused !== null && visible.some((w) => w.id === focused);
   // Capture phase: Esc leaves focus mode before the bottom panel sees it, and the handled event stays with focus mode.
   useEffect(() => {
@@ -235,10 +238,18 @@ export function WidgetGrid({ widgets, onRemove, onParams }: {
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
   }, [focusing]);
+  const frame = (widget: WorkspaceWidget) => <WidgetFrame key={widget.id} widget={widget} focused={focusing && focused === widget.id} onFocus={focus} onRemove={onRemove} onParams={onParams} />;
   return (
     <div className={`ws-grid${focusing ? " ws-grid-focus" : ""}`}>
-      {visible.length === 0 && <p className="feed-muted">No widgets yet. Choose Add widget or ask for a chart.</p>}
-      {visible.map((widget) => <WidgetFrame key={widget.id} widget={widget} focused={focusing && focused === widget.id} onFocus={focus} onRemove={onRemove} onParams={onParams} />)}
+      <div className="ws-main">
+        {widgets === null && <span className="skeleton" aria-label="Loading workspace" aria-busy="true" />}
+        {chart && frame(chart)}
+        {chat}
+      </div>
+      <div className="ws-side">
+        {widgets !== null && visible.length === 0 && <p className="feed-muted">No widgets yet. Choose Add widget or ask for a chart.</p>}
+        {visible.filter((w) => w !== chart).map(frame)}
+      </div>
     </div>
   );
 }

@@ -69,7 +69,7 @@ function Page({ events = [], onWidgetOutcomes }: { events?: AgentEvent[]; onWidg
   const [watchlist, setWatchlist] = useState(["NVDA", "GME"]);
   return <Workspace selected={selected} pick={(sym) => navigate({ page: "workspace", sym })} watchlist={watchlist} onWatchlist={setWatchlist}
     events={events} input="" setInput={() => { }} research={false} setResearch={() => { }} setAskContext={() => { }} onSend={() => { }} openDrawer={() => { }} busy={false} debug={false} onWidgetOutcomes={onWidgetOutcomes}
-    sessions={[{ session_id: "s1", status: "done", query: "NVDA research" }]} sessionId={null} setSessionId={() => { }} snapshot={null} journal={null} seq={0} />;
+    sessions={[{ session_id: "s1", status: "done", query: "NVDA research" }]} sessionId={null} setSessionId={() => { }} snapshot={null} journal={null} seq={0} chat={null} />;
 }
 
 async function render(node: ReactNode) {

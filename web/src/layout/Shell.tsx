@@ -55,6 +55,8 @@ export type ShellState = {
   snapshot: ResearchSnapshot | null;
   journal: JournalPage | null;
   seq: number;
+  // The agent chat, or null while the drawer is closed. Workspace docks it under the chart; Shell docks it under every other page.
+  chat: ReactNode;
 };
 
 function Strip() {
@@ -358,9 +360,14 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
     setDrawer(true);
     void onSend(text);
   };
+  const chat = drawer ? (
+    <aside className="glass ws-cell drawer" aria-label="Agent drawer">
+      <AIPanel events={events} input={input} setInput={setInput} research={research} setResearch={setResearch} context={askContext} onClearContext={() => setAskContext(null)} onSend={() => void onSend()} sym={selected} busy={busy} debug={debug} widgetOutcomes={widgetOutcomes} />
+    </aside>
+  ) : null;
   const state: ShellState = {
     selected, pick, watchlist, onWatchlist, events, input, setInput, research, setResearch, setAskContext, onSend: () => void onSend(),
-    busy, debug, sessions, sessionId, setSessionId, snapshot, journal, seq, openDrawer: () => setDrawer(true), ask, onWidgetOutcomes,
+    busy, debug, sessions, sessionId, setSessionId, snapshot, journal, seq, openDrawer: () => setDrawer(true), ask, onWidgetOutcomes, chat,
   };
 
   const navLink = (label: string, to: Route) => (
@@ -419,11 +426,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
 
       <div className="shell-body">
         {children(route, state)}
-        {drawer && (
-          <aside className="glass ws-cell drawer" aria-label="Agent drawer">
-            <AIPanel events={events} input={input} setInput={setInput} research={research} setResearch={setResearch} context={askContext} onClearContext={() => setAskContext(null)} onSend={state.onSend} sym={selected} busy={busy} debug={debug} widgetOutcomes={widgetOutcomes} />
-          </aside>
-        )}
+        {route.page !== "workspace" && chat}
       </div>
 
       <footer className="app-footer">

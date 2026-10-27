@@ -882,9 +882,9 @@ def test_add_widget_increases_workspace_grid(browser: webdriver.Chrome) -> None:
     wait = WebDriverWait(browser, 10)
     browser.find_element(By.LINK_TEXT, "Workspaces").click()
     menu = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'select[aria-label="Add widget"]')))
-    before = len(browser.find_elements(By.CSS_SELECTOR, ".ws-grid > section"))
+    before = len(browser.find_elements(By.CSS_SELECTOR, ".ws-grid section"))
     Select(menu).select_by_visible_text("Monthly returns")
-    wait.until(lambda client: len(client.find_elements(By.CSS_SELECTOR, ".ws-grid > section")) == before + 1)
+    wait.until(lambda client: len(client.find_elements(By.CSS_SELECTOR, ".ws-grid section")) == before + 1)
     widget = wait.until(
         EC.visibility_of_element_located((By.CSS_SELECTOR, 'section[aria-label="Monthly returns · NVDA"]'))
     )
