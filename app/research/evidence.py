@@ -539,6 +539,7 @@ _RECORD_LISTS = (
     "records",
     "documents",
     "events",
+    "line_items",
 )
 """Row lists of a persisted structured tool result (the same keys the replay gate cites)."""
 
@@ -639,9 +640,10 @@ def cited_record(result: Mapping[str, object], locator: object) -> Mapping[str, 
     for key in _RECORD_LISTS:
         listed = payload.get(key)
         rows.extend(row for row in (listed if isinstance(listed, list) else []) if isinstance(row, Mapping))
-    metrics = payload.get("metrics")
-    if isinstance(metrics, Mapping):
-        rows.append(metrics)
+    for key in ("metrics", "latest_record"):
+        record = payload.get(key)
+        if isinstance(record, Mapping):
+            rows.append(record)
     hits = [row for row in rows if text == _record_text(row)]
     if hits:
         return hits[0]
@@ -934,9 +936,12 @@ def _record_datapoint(
 def _phrase(text: str) -> re.Pattern[str]:
     """Case-insensitive whole-phrase pattern; whitespace runs match any whitespace.
 
+    Space after a comma is optional, so ``June 27, 2026`` matches a source's ``June 27,2026``.
     A word boundary applies only at an alphanumeric edge, so ``%`` still matches in ``4.2%``.
     """
-    body = r"\s+".join(re.escape(part) for part in text.split())
+    parts = re.sub(r",\s*", ", ", text).split()
+    body = "".join(re.escape(part) + (r"\s*" if part.endswith(",") else r"\s+") for part in parts[:-1])
+    body += re.escape(parts[-1]) if parts else ""
     head = r"(?<![0-9A-Za-z])" if text.strip()[:1].isalnum() else ""
     tail = r"(?![0-9A-Za-z])" if text.strip()[-1:].isalnum() else ""
     return re.compile(f"{head}{body}{tail}", re.IGNORECASE)
@@ -982,6 +987,47 @@ def _unstated(text: str, phrases: Sequence[str | None]) -> str:
     return text
 
 
+def _grouped_period(before: str, wanted: str, column: tuple[int, int]) -> str | None:
+    """Bind a duration group and its date column without borrowing another group's date."""
+    parts = re.fullmatch(r"(.+?\b(?:months?|weeks?|years?)\s+ended)\s+(.+)", wanted, re.IGNORECASE)
+    if parts is None:
+        return None
+    duration, date = (_phrase(part) for part in parts.groups())
+    index, count = column
+    lines = before.split("\n")
+    for at in range(len(lines) - 1, -1, -1):
+        cells = lines[at].split(_ROW_CELL)
+        if len(cells) < count or not any(date.search(cell) for cell in cells):
+            continue
+        dates = cells[-count:]
+        found_date = date.search(dates[index])
+        if found_date is None:
+            raise ValueError(f"period {wanted!r} heads another date column")
+        group_line = next((line for line in reversed(lines[:at]) if _ROW_CELL in line), None)
+        if group_line is None:
+            raise ValueError(f"period {wanted!r} has no duration group header")
+        groups = group_line.split(_ROW_CELL)
+        if not groups or count % len(groups):
+            raise ValueError(f"period {wanted!r} has uneven duration group spans")
+        span = count // len(groups)
+        group = index // span
+        matches = [i for i, cell in enumerate(groups) if duration.search(cell)]
+        if matches != [group] or len(list(duration.finditer(groups[group]))) != 1:
+            raise ValueError(f"period {wanted!r} has an ambiguous or different duration group")
+        if sum(len(list(date.finditer(cell))) for cell in dates[group * span : (group + 1) * span]) != 1:
+            raise ValueError(f"period {wanted!r} repeats within its duration group")
+        found_duration = duration.search(groups[group])
+        assert found_duration is not None
+        return f"{found_duration.group(0)} {found_date.group(0)}"
+    raise ValueError(f"period {wanted!r} has no aligned date header")
+
+
+_SCALE_STATEMENT = re.compile(r"\b(?:thousands?|millions?|billions?|trillions?)\b", re.IGNORECASE)
+"""A scale word in the value's own statement ("$46.7 billion")."""
+_SCALE_HEADING = re.compile(r"\bin\s+(?:thousands?|millions?|billions?)\b", re.IGNORECASE)
+"""A table scale heading before the value ("(In millions, except per share data)")."""
+
+
 def _context_label(
     passage: str, cutoff: int, scope: str, claimed: Mapping[str, str | None], label: str, column: tuple[int, int] | None
 ) -> str | None:
@@ -993,10 +1039,20 @@ def _context_label(
     """
     wanted = claimed[label]
     if wanted is None:
-        if label == "unit":
-            return None
-        raise ValueError(f"datapoint {label} is required")
-    pattern = _phrase(wanted)
+        if label != "unit":
+            raise ValueError(f"datapoint {label} is required")
+        # An omitted unit never drops a scale the source states: "96,221" under "(In millions)" is not 96,221.
+        scale = _SCALE_STATEMENT.search(scope) or _SCALE_HEADING.search(passage[:cutoff])
+        if scale is not None:
+            raise ValueError(f"the source states the scale {scale.group(0)!r}; declare it as the datapoint unit")
+        return None
+    scale_word = re.fullmatch(r"(thousand|million|billion|trillion)s?", wanted.strip(), re.IGNORECASE)
+    # A scale unit binds the source's own spelling: "million" selects "(In millions)"; the stored unit stays "millions".
+    pattern = (
+        re.compile(rf"\b{scale_word.group(1)}s?\b", re.IGNORECASE)
+        if label == "unit" and scale_word
+        else _phrase(wanted)
+    )
     found = pattern.search(scope)
     if found is not None:
         return found.group(0)
@@ -1020,6 +1076,8 @@ def _context_label(
         if [i for i, cell in enumerate(cells) if pattern.search(cell)] != [len(cells) - count + index]:
             raise ValueError(f"{label} {wanted!r} heads another column than value {claimed['value']!r}")
         return found.group(0)
+    if label == "period" and (grouped := _grouped_period(before, wanted, column)) is not None:
+        return grouped
     raise ValueError(f"{label} {wanted!r} is not stated in the value's table row or the context before it")
 
 
@@ -1125,7 +1183,30 @@ def _passage_datapoint(provenance: Mapping[str, object], claimed: Mapping[str, s
     if not isinstance(passage, str) or not passage.strip():
         raise ValueError(f"the located {field_key} is empty")
     value = str(claimed["value"])
-    start, end = _value_span(passage, value, field_key)
+    hits = list(re.finditer(rf"(?<![0-9A-Za-z.,]){re.escape(value)}(?![0-9A-Za-z]|[.,][0-9])", passage))
+    if not hits:
+        raise ValueError(f"value {value!r} is not a whole token of the located {field_key}")
+    bound: list[dict[str, JSONValue]] = []
+    errors: list[ValueError] = []
+    for hit in hits:
+        try:
+            bound.append(_bound_occurrence(passage, hit.span(), claimed, field_key))
+        except ValueError as exc:
+            errors.append(exc)
+    if len(bound) == 1:
+        return bound[0]
+    if bound:
+        raise ValueError(f"value {value!r} binds the claimed labels more than once in the located {field_key}")
+    if len(errors) == 1:
+        raise errors[0]
+    raise ValueError(f"value {value!r} binds at none of its {len(hits)} occurrences: {errors[0]}")
+
+
+def _bound_occurrence(
+    passage: str, span: tuple[int, int], claimed: Mapping[str, str | None], field_key: str
+) -> dict[str, JSONValue]:
+    """Datapoint for one value occurrence; raises when its row or sentence does not bind the claimed labels."""
+    start, end = span
     is_row, scope, statement, cutoff, offset = _statement_span(passage, start, end)
     metric: str | None = None
     column: tuple[int, int] | None = None
@@ -1139,21 +1220,12 @@ def _passage_datapoint(provenance: Mapping[str, object], claimed: Mapping[str, s
     return {
         "metric": metric,
         "field": field_key,
-        "value": value,
+        "value": str(claimed["value"]),
         "entity": identity[0],
         "period": identity[1],
         "unit": identity[2],
         "statement": statement.strip(),
     }
-
-
-def _value_span(passage: str, value: str, field_key: str) -> tuple[int, int]:
-    """(start, end) of the one whole-token value occurrence the located passage states."""
-    hits = list(re.finditer(rf"(?<![0-9A-Za-z.,]){re.escape(value)}(?![0-9A-Za-z]|[.,][0-9])", passage))
-    if len(hits) != 1:
-        reason = "appears more than once in" if hits else "is not a whole token of"
-        raise ValueError(f"value {value!r} {reason} the located {field_key}")
-    return hits[0].span()
 
 
 def _statement_span(passage: str, start: int, end: int) -> tuple[bool, str, str, int, int]:
@@ -1608,6 +1680,15 @@ def _calculation_input_defect(evidence: Evidence, rows: Sequence[Evidence]) -> s
         period_ok = same_period
     if not period_ok:
         return "calculation periods are incompatible"
+    if semantics in ("growth_pct", "growth_ratio", "change"):
+        # A change compares one metric with itself, and its output period names both operand periods.
+        metrics = {str(point.get("metric")).casefold() for row in rows if (point := datapoint_descriptor(row))}
+        if len(metrics) != 1:
+            return "calculation inputs name different metrics"
+        # Spacing and the article "the" never matter: "June 27, 2026" names the input's "June 27,2026".
+        squeezed = [re.sub(r"\bthe\b|\s+", "", period) for period in (*row_periods, output_period)]
+        if not all(period in squeezed[-1] for period in squeezed[:-1]):
+            return "calculation period does not name both input periods"
     if semantics in ("quarter", "ttm"):
         defect = _temporal_input_defect(evidence, rows, semantics)
         if defect:

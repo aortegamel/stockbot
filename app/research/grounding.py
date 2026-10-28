@@ -26,8 +26,8 @@ __all__ = [
 ]
 
 _NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
-_FORM_RE = re.compile(r"\b(?:\d{1,2}-[A-Z]{1,2}|[A-Z]{1,2}-\d{1,2}|13[DFG](?:-HR)?|DEF ?14A|424B\d)(?:/A)?\b")
-"""SEC form identifiers (10-K, 8-K, 20-F, S-1, F-3, 13F-HR, DEF 14A, 424B5, .../A): names, never datapoints."""
+_FORM_RE = re.compile(r"\b(?:\d{1,2}-[A-Z]{1,2}|[A-Z]{1,2}-\d{1,2}|13[DFG](?:-HR)?|DEF ?14A|424B\d)(?:/A)?s?\b")
+"""SEC form identifiers (10-K, 8-K, 20-F, S-1, F-3, 13F-HR, DEF 14A, 424B5, .../A, plural 10-Qs): names, never datapoints."""
 
 
 def numeric_tokens(text: str) -> set[str]:

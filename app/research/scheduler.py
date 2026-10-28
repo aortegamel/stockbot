@@ -491,8 +491,8 @@ def _persisted_shapes(result: object) -> Mapping[str, object]:
 
 
 def _compact_json(value: object) -> str:
-    """One-line JSON for persisted payload text with stable key order."""
-    return " ".join(_json.dumps(value, sort_keys=True, default=str).split())
+    """One-line JSON with stable key order; string contents stay byte-exact so ``cited_record`` replays them."""
+    return _json.dumps(value, sort_keys=True, default=str)
 
 
 def _finra_locator(payload: Mapping[str, object]) -> str | None:
@@ -637,6 +637,7 @@ def _sec_replay_locator(payload: Mapping[str, object]) -> str | None:
         "records",
         "documents",
         "events",
+        "line_items",
     ):
         rows = payload.get(key)
         if isinstance(rows, list):
@@ -1305,13 +1306,16 @@ def _force_open_registry(
     evidence: Sequence[JSONValue],
     admitted: int,
     session: Mapping[str, JSONValue] | None = None,
+    node: object = None,
 ) -> list[dict[str, JSONValue]] | None:
     """Restrict the registry when this node retains a structured accession and admits no evidence."""
     if admitted != 0:
         return None
     session_id = session.get("session_id") if session is not None else None
     objective = _session_objective(session) if session is not None else None
-    issuer = _objective_subject_ticker(objective, session.get("ticker")) if session is not None else None
+    issuer = (
+        _node_subject_ticker(_f(node, "question"), objective, session.get("ticker")) if session is not None else None
+    )
     if session is None:
         payloads = _inline_attempt_payloads(attempts, session_id)
     else:
@@ -1439,10 +1443,10 @@ def _persisted_attempt_payload(
 
 
 def _session_persisted_listings(
-    kernel: _Kernel, session_id: str, objective: object, supplied_ticker: object = None
+    kernel: _Kernel, session_id: str, objective: object, supplied_ticker: object = None, node: object = None
 ) -> list[Mapping[str, object]]:
     """Structured list_sec_filings payloads from session tool results (intake scope), newest first."""
-    issuer = _objective_subject_ticker(objective, supplied_ticker)
+    issuer = _node_subject_ticker(_f(node, "question"), objective, supplied_ticker)
     if issuer is None:
         return []
     want = issuer.strip().upper()
@@ -1602,7 +1606,7 @@ def _carry_forms(objective: object, text: str) -> frozenset[str]:
 
 
 def _listed_filing(
-    session: Mapping[str, JSONValue], attempts: Sequence[Mapping[str, JSONValue]]
+    session: Mapping[str, JSONValue], attempts: Sequence[Mapping[str, JSONValue]], node: object = None
 ) -> tuple[str, Mapping[str, object]] | None:
     """Select an issuer filing within the session cutoff. Revenue scans every successful listing."""
     listings = [
@@ -1614,7 +1618,11 @@ def _listed_filing(
     if not payloads:
         return None
     cik = re.search(r"\bCIK\s*[:#]?\s*(\d{1,10})\b", objective, re.IGNORECASE)
-    issuer = cik.group(1) if cik is not None else _objective_subject_ticker(objective, session.get("ticker"))
+    issuer = (
+        cik.group(1)
+        if cik is not None
+        else _node_subject_ticker(_f(node, "question"), objective, session.get("ticker"))
+    )
     rows = (
         [row for payload in payloads for row in _issuer_filing_rows([payload], issuer)]
         if revenue
@@ -1654,7 +1662,7 @@ def _resolve_persisted_accession(
     listing_present = any(attempt.get("tool") == "list_sec_filings" for attempt, _payload in sources)
     session_listings: list[Mapping[str, object]] = []
     if (revenue or not listing_present) and isinstance(session_id, str) and session_id:
-        session_listings = _session_persisted_listings(kernel, session_id, objective, session.get("ticker"))
+        session_listings = _session_persisted_listings(kernel, session_id, objective, session.get("ticker"), node)
         payloads = [*payloads, *session_listings] if revenue else [*session_listings, *payloads]
     filing_payloads = (
         [payload for attempt, payload in sources if attempt.get("tool") == "list_sec_filings"] + session_listings
@@ -1662,7 +1670,11 @@ def _resolve_persisted_accession(
         else payloads
     )
     cik = re.search(r"\bCIK\s*[:#]?\s*(\d{1,10})\b", objective, re.IGNORECASE)
-    issuer = cik.group(1) if cik is not None else _objective_subject_ticker(objective, session.get("ticker"))
+    issuer = (
+        cik.group(1)
+        if cik is not None
+        else _node_subject_ticker(_f(node, "question"), objective, session.get("ticker"))
+    )
     rows = (
         [row for payload in filing_payloads for row in _issuer_filing_rows([payload], issuer)]
         if revenue
@@ -1744,10 +1756,10 @@ def _next_untried_accession(
     """Next persisted material accession without a tried document read, or None."""
     session_id = session.get("session_id")
     objective = _session_objective(session)
-    issuer = _objective_subject_ticker(objective, session.get("ticker"))
+    issuer = _node_subject_ticker(_f(node, "question"), objective, session.get("ticker"))
     if not isinstance(session_id, str) or not session_id or issuer is None:
         return None
-    payloads = _session_persisted_listings(kernel, session_id, objective, session.get("ticker"))
+    payloads = _session_persisted_listings(kernel, session_id, objective, session.get("ticker"), node)
     rows = _issuer_filing_rows(payloads, issuer)
     text = f"{objective} {_f(node, 'question', default='')}"
     forms = _carry_forms(objective, text)
@@ -2248,6 +2260,35 @@ def _objective_subject_ticker(objective: object, supplied_ticker: object = None)
     return chart
 
 
+_NODE_ONLY_RE = re.compile(r"\(([A-Z][A-Z0-9.\-]{0,9}) only\)\s*$")
+"""A per-company node of a comparison ends with "(AMD only)": that ticker is its subject."""
+
+
+def question_subjects(question: str) -> list[str]:
+    """Distinct tickers a question names, in mention order (acronyms such as AI never count)."""
+    from app.tools import _resolve_company_to_ticker
+
+    tickers = [
+        ticker
+        for candidate in _objective_chart_candidates(question)
+        if candidate.lower() not in _ACRONYM_NON_SUBJECTS
+        and (ticker := _resolve_company_to_ticker(candidate)) is not None
+    ]
+    return list(dict.fromkeys(tickers))
+
+
+def _node_subject_ticker(question: object, objective: object, supplied_ticker: object = None) -> str | None:
+    """Use one explicit node subject, otherwise preserve the session subject."""
+    if isinstance(question, str):
+        only = _NODE_ONLY_RE.search(question)
+        if only is not None:
+            return only.group(1)
+        subjects = question_subjects(question)
+        if len(subjects) == 1:
+            return subjects[0]
+    return _objective_subject_ticker(objective, supplied_ticker)
+
+
 def _fallback_sec_args(
     tool_name: str, objective: object, supplied_ticker: object = None
 ) -> dict[str, JSONValue] | None:
@@ -2443,7 +2484,7 @@ def _repair_tool_arguments(
     ticker_value = filled.get("ticker")
     _seed_objective_company(filled, objective, tool_name, sid, nid)
     _seed_listing_forms(filled, tool_name, objective, sid, nid)
-    _seed_listing_identifier(filled, tool_name, objective, sid, nid)
+    _seed_listing_identifier(filled, tool_name, objective, sid, nid, question)
     _seed_search_arguments(filled, tool_name, objective, sid, nid)
     _repair_org_word_ticker(filled, ticker_value, tool_name, objective, sid, nid)
     _scrub_relative_trade_date(filled, tool_name, sid, nid)
@@ -2510,16 +2551,16 @@ def _seed_listing_forms(filled: dict[str, JSONValue], tool_name: str, objective:
 
 
 def _seed_listing_identifier(
-    filled: dict[str, JSONValue], tool_name: str, objective: object, sid: str, nid: str
+    filled: dict[str, JSONValue], tool_name: str, objective: object, sid: str, nid: str, question: object = None
 ) -> None:
     """Replace a placeholder, date-like, organization or mismatched listing identifier."""
     if tool_name != "list_sec_filings":
         return
-    want = _objective_subject_ticker(objective)
+    want = _node_subject_ticker(question, objective)
     raw = filled["identifier"].strip() if isinstance(filled.get("identifier"), str) else ""
     if not _stale_listing_identifier(raw, want):
         return
-    seeded = _fallback_sec_args(tool_name, objective)
+    seeded = _fallback_sec_identifier(tool_name, objective, want)
     if seeded is None or not isinstance(seeded.get("identifier"), str):
         return
     filled["identifier"] = seeded["identifier"]
@@ -2972,6 +3013,10 @@ async def _generate_tool_arguments(
     if persisted is not None:
         _validate_repaired_args(tool_name, persisted, objective, session, node, evidence, attempts, kernel)
         context["grounded_arguments"] = persisted
+    listing = _listing_arguments(tool_name, objective, session, node, as_of, schema, scoped, sid, nid)
+    if listing is not None:
+        _validate_repaired_args(tool_name, listing[0], objective, session, node, evidence, attempts, kernel)
+        return listing
     seeded = _seeded_arguments(tool_name, objective, session, node, as_of, schema, scoped, sid, nid)
     if seeded is not None:
         _validate_repaired_args(tool_name, seeded[0], objective, session, node, evidence, attempts, kernel)
@@ -3120,6 +3165,47 @@ def _grounded_revenue_arguments(
     if _missing_required_argument(schema, grounded):
         return None
     return grounded, reasoning, False
+
+
+_CALENDAR_BOUND_RE = re.compile(
+    r"\b(?:(?:19|20)\d\d|as\s+of|before|after|since|until|between|yesterday|"
+    r"january|february|march|april|june|july|august|september|october|november|december)\b"
+)
+"""An explicit calendar bound in a node question: a year, a month, or a range word. Form names like 10-K never match."""
+
+
+def _listing_arguments(
+    tool_name: str,
+    objective: object,
+    session: Mapping[str, JSONValue],
+    node: object,
+    as_of: str | None,
+    schema: Mapping[str, JSONValue],
+    scoped: Mapping[str, JSONValue],
+    sid: str,
+    nid: str,
+) -> tuple[dict[str, JSONValue], str, bool] | None:
+    """list_sec_filings from the node question's own subject and named forms; no Needle call.
+
+    Needle truncates or invents form values on long child questions, and a child node
+    names its own company ("AMD total revenue ..."), which the session objective may not.
+    None (Needle generates) when the question states a calendar bound or the session is dated.
+    """
+    if tool_name != "list_sec_filings" or as_of is not None or session.get("as_of") or _scope_has_dates(session):
+        return None
+    question = re.sub(r"^\[Today UTC \d{4}-\d{2}-\d{2}\]\s*", "", str(_f(node, "question", default="") or ""))
+    # A date in the objective or raw scope bounds every node, so the whole request text is checked.
+    if _CALENDAR_BOUND_RE.search(_requested_text(objective, node, _f(session.get("temporal_scope"), "raw")).lower()):
+        return None
+    listed = _fallback_sec_args(tool_name, question, session.get("ticker"))
+    if listed is None:
+        return None
+    # Repair against the node's own question: the session objective's first ticker is not this node's subject.
+    listed = _repair_tool_arguments(tool_name, listed, question, sid, nid, question=question, scope=scoped)
+    if _missing_required_argument(schema, listed):
+        return None
+    _log_args_stage("args_listing", sid, nid, tool_name, ",".join(sorted(listed)))
+    return listed, "scheduler built listing arguments from the node question. No Needle generation needed", False
 
 
 def _seeded_arguments(
@@ -4531,7 +4617,7 @@ def _upfront_section_read(
     return (
         _undated_latest_ten_q(session, node, as_of_str)
         and not any(a.get("tool") == "get_sec_document" for a in attempts)
-        and _listed_filing(session, attempts) is not None
+        and _listed_filing(session, attempts, node) is not None
     )
 
 
@@ -4750,7 +4836,6 @@ def _admit_attempt_evidence(
         if candidate is None:
             return None, False, None
         eid, accepted = _persist_admitted_evidence(kernel, sid, attempt, candidate)
-        return eid, accepted, None
     except Exception as exc:
         logger.warning(
             "toolflow admit_fail sid=%s tool=%s job=%s",
@@ -4761,6 +4846,79 @@ def _admit_attempt_evidence(
         )
         _complete_admit_job(kernel, attempt, tool)
         return None, False, _admit_failure_attempt(tool, attempt, exc)
+    _admit_row_datapoints(kernel, sid, attempt, candidate)
+    return eid, accepted, None
+
+
+_DATAPOINT_FANOUT_CAP = 12
+"""ponytail: the first 12 numeric fields of one cited row; raise it if wider structured rows need every field."""
+_LINE_ITEM_FANOUT_CAP = 60
+"""ponytail: the first 60 statement line-item rows (top line items, every period); raise it for deeper lines."""
+
+
+def _admit_row_datapoints(
+    kernel: _Kernel, sid: str, attempt: Mapping[str, object], candidate: Mapping[str, object]
+) -> None:
+    """Admit one verified datapoint row per numeric field of the cited structured record.
+
+    A FINRA envelope cites its ``latest_record``; a financial statement cites each of its ``line_items``;
+    another SEC structured result cites its record row.
+    Envelope-level numbers (limits, counts) are never rows. A field the proof rejects stays absent,
+    so a claim stating it fails the gate (fail closed). The parent admission is already committed.
+    """
+    from app.research import evidence as ev
+
+    ref = candidate.get("tool_result_id")
+    if not isinstance(ref, str) or "record_identity" not in candidate:
+        return
+    try:
+        payload = _persisted_payload_for_locator(ref, kernel)
+    except KeyError:
+        return  # no persisted bytes to prove a datapoint against
+    latest, listed = payload.get("latest_record"), payload.get("line_items")
+    if isinstance(latest, dict):
+        rows: Sequence[Mapping[str, object]] = [latest]
+    elif isinstance(listed, list):
+        rows = [row for row in listed if isinstance(row, dict)][:_LINE_ITEM_FANOUT_CAP]
+    else:
+        row = ev.cited_record({"result": payload}, candidate["record_identity"])
+        rows = [row] if isinstance(row, Mapping) and row is not payload else []
+    reserved = {
+        ev._norm_key(k)
+        for k in (*ev._ENTITY_KEYS, *ev._PERIOD_KEYS, *ev._UNIT_KEYS, *ev._CONCEPT_KEYS, *ev._VALUE_KEYS)
+    }
+    for row in rows:
+        entity = next((t for k in ev._ENTITY_KEYS if (t := ev._scalar_text(row.get(k))) is not None), None)
+        period = next((t for k in ev._PERIOD_KEYS if (t := ev._scalar_text(row.get(k))) is not None), None)
+        if entity is None or period is None:
+            continue
+        fields = [
+            (str(key), ev._scalar_text(value))
+            for key, value in row.items()
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and ev._norm_key(str(key)) not in reserved
+        ]
+        concept = next((row[k] for k in ev._CONCEPT_KEYS if isinstance(row.get(k), str) and row[k]), None)
+        value = next((t for k in ev._VALUE_KEYS if (t := ev._scalar_text(row.get(k))) is not None), None)
+        if isinstance(concept, str) and value is not None:
+            fields.insert(0, (concept, value))
+        identity = _compact_json(dict(row))
+        for metric, text in fields[:_DATAPOINT_FANOUT_CAP]:
+            item = {
+                **candidate,
+                "record_identity": identity,
+                "matching_passage": identity,
+                "content": f"{metric}: {text} ({entity}, {period})",
+                "metric": metric,
+                "value": text,
+                "entity": entity,
+                "period": period,
+            }
+            try:
+                kernel.admit_evidence(sid, str(attempt["job_id"]), item)
+            except ValueError as exc:
+                logger.info("toolflow datapoint_skip sid=%s metric=%s err=%.200s", sid, metric, exc)
 
 
 def _attempt_domain(tool: str, attempt: Mapping[str, object]) -> str:
@@ -5685,7 +5843,7 @@ async def _drive_rounds(
         # Working state: admitted evidence + recent unadmitted observations, never dropped.
         ctx_evidence, sel_ctx = _round_selection_context(evidence, attempts, select_failures)
         n_before = len(attempts)
-        select_registry = _round_registry(registry, attempts, evidence, admitted, session, sid, nid)
+        select_registry = _round_registry(registry, attempts, evidence, admitted, session, sid, nid, node)
         ev_before = len(evidence)
         _sel_t0 = _time.perf_counter()
         try:
@@ -5897,9 +6055,10 @@ def _round_registry(
     session: Mapping[str, JSONValue],
     sid: str,
     nid: str,
+    node: object = None,
 ) -> list[dict[str, JSONValue]]:
     """Registry for this round: force-open carries, drop a looping tool, then drop a just-rejected tool."""
-    forced = _force_open_round(registry, attempts, evidence, admitted, session, sid, nid)
+    forced = _force_open_round(registry, attempts, evidence, admitted, session, sid, nid, node)
     select_registry: list[dict[str, JSONValue]] = [*registry] if forced is None else forced
     select_registry = _drop_tool(select_registry, _loop_tool(attempts), sid, nid)
     return _drop_tool(select_registry, _rejected_tool(attempts, select_registry), sid, nid)
@@ -5930,6 +6089,7 @@ def _force_open_round(
     session: Mapping[str, JSONValue],
     sid: str,
     nid: str,
+    node: object = None,
 ) -> list[dict[str, JSONValue]] | None:
     """Force-open carry registry, or None to keep the full registry.
 
@@ -5937,8 +6097,8 @@ def _force_open_round(
     nothing) so the filing must open next round. JEV still picks among the
     carry tools; no bypass.
     """
-    forced = _force_open_registry(registry, attempts, evidence, admitted, session)
-    if forced is None or _revenue_read_unlisted(session, attempts):
+    forced = _force_open_registry(registry, attempts, evidence, admitted, session, node)
+    if forced is None or _revenue_read_unlisted(session, attempts, node):
         return None
     if _accession_family_break(attempts) is not None or _same_accession_repeats(attempts) >= 2:
         return None
@@ -5946,7 +6106,9 @@ def _force_open_round(
     return forced
 
 
-def _revenue_read_unlisted(session: Mapping[str, JSONValue], attempts: Sequence[Mapping[str, JSONValue]]) -> bool:
+def _revenue_read_unlisted(
+    session: Mapping[str, JSONValue], attempts: Sequence[Mapping[str, JSONValue]], node: object = None
+) -> bool:
     """True when a revenue question still has no listed document to open."""
     objective = session.get("objective") or session.get("query")
     latest = _latest_revenue_objective(objective)
@@ -5954,7 +6116,7 @@ def _revenue_read_unlisted(session: Mapping[str, JSONValue], attempts: Sequence[
         return False
     if _document_read_failed(attempts):
         return True
-    return _listed_filing(session, attempts) is None
+    return _listed_filing(session, attempts, node) is None
 
 
 def _document_read_failed(attempts: Sequence[Mapping[str, JSONValue]]) -> bool:

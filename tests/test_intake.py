@@ -538,7 +538,7 @@ def test_reasoner_no_retry_on_config_error(monkeypatch: pytest.MonkeyPatch) -> N
 def test_graph_entry_creates_only_root_without_source_or_reasoner_calls(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, objective: str, with_context: bool
 ) -> None:
-    """Every objective starts one root. JEV selects later research and reasoning."""
+    """One root per objective, or one node per company a comparison names. JEV selects later research."""
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     monkeypatch.setattr(sched, "build_registry", list)
 
@@ -553,8 +553,9 @@ def test_graph_entry_creates_only_root_without_source_or_reasoner_calls(
     sid = kw.run_graph_prompt(objective, jev=JevClient(), context=context, watchlist=watchlist)
     store = ResearchRepository()
     nodes = store.list_nodes(sid)
-    assert len(nodes) == 1 and nodes[0].question == objective
-    assert list(nodes[0].depends_on) == []
+    expected = [f"{objective} (AAPL only)", f"{objective} (MSFT only)"] if "MSFT" in objective else [objective]
+    assert sorted(node.question for node in nodes) == expected
+    assert all(list(node.depends_on) == [] for node in nodes)
     assert store.get_session(sid).objective == objective
     assert store.list_evidence(sid) == []
     decisions = store.list_decisions(sid)

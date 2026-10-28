@@ -1,5 +1,5 @@
 import { setTimeout as sleep } from "node:timers/promises";
-import { FINAL_CLAIM_TYPES, type AskContext, type Evidence, type FinalClaim, type FinalClaimType, type NarrativeResult, type Persona, type Timings } from "../agent/types";
+import { FINAL_CLAIM_TYPES, type AskContext, type DeclaredNumber, type Evidence, type FinalClaim, type FinalClaimType, type NarrativeResult, type Persona, type Timings } from "../agent/types";
 import { reasoningFields } from "../../../decision/reasoning";
 
 export type MuseUsage = {
@@ -37,9 +37,12 @@ const PERSONAS: Record<Persona, { name: string; stance: string }> = {
 const WORDING_RULE =
   " State a conditional risk as a qualified condition and consequence, not that it will occur." +
   " Name who reported an event, not that the event happened." +
-  " Write each datapoint's metric label before its value in one sentence." +
-  " Name its entity, period, and unit in that sentence. Use their exact spellings or the datapoint's aliases." +
-  " State no other number. In a numerical fact, add only connectives, approximately/about, reporting verbs, supported scale words, and supported change words." +
+  " Write each number as its own sentence in this form: <entity> reported <metric> of <value> for <period>." +
+  " Example form: \"<Company name> reported <Metric label> of $<value> million for the <Duration header> <Date>.\"" +
+  " Put $ before a dollar value. Write a scale word in the singular (million, billion, thousand) right after the value, even when the source heading says millions." +
+  " Copy the entity, metric, value, period, and unit from the datapoint or the source table exactly; for a table value, the period is the column's duration header plus its date." +
+  " A number sentence names no data source and contains no words such as period, unit, stated, or no. Omit a unit the datapoint does not have." +
+  " State no other number, including dates outside the period. In a number sentence, add only connectives, approximately/about, reporting verbs, supported scale words, and supported change words." +
   " A scale word must follow a value whose source or unit states that scale." +
   " A change word requires a cited change calculation with the same sign." +
   " Paraphrase qualitative observed facts accurately from the cited passages. Copy source wording verbatim only when quoting." +
@@ -49,7 +52,9 @@ const WORDING_RULE =
   " Use substantive document passages for disclosures, not cover pages or filing metadata." +
   " Do not infer business trends from filing dates, form labels, or ownership amendments." +
   " Distinguish observed numbers from calculated numbers." +
-  " Hedge an inference (suggests, likely, may). Open an assumption with Assuming or If." +
+  " Every inference sentence must contain one of these exact words: suggests, likely, may, might, could, indicates, appears, implies, probably, potentially." +
+  " Phrases such as points to, shows strength, or delivered strong growth are not hedges, and a sentence that uses only them is deleted." +
+  " Open an assumption with Assuming or If." +
   " State what was not found or is unknown when the evidence does not establish it." +
   " State a conditional risk with if, could, may, or risk." +
   " Name who reported or stated an attributed report. State what conflicts when evidence contradicts a claim.";
@@ -58,7 +63,8 @@ const WORDING_RULE =
 // checks declared types, evidence rows, datapoints, and source support.
 const INVENTORY_RULE =
   " End your answer with a fenced inventory block and nothing after it:" +
-  " ```json {\"claims\": [{\"text\": \"<verbatim prose substring>\", \"claim_type\": \"<observed_fact|calculation|inference|assumption|unknown|contradicted|conditional_risk|attributed_report>\", \"evidence_ids\": [\"<EVIDENCE row ids>\"], \"datapoint_ids\": [\"<dp: ids of those rows>\"], \"confidence\": 0.9}], \"confidence\": 0.9}```" +
+  " ```json {\"claims\": [{\"text\": \"<verbatim prose substring>\", \"claim_type\": \"<observed_fact|calculation|inference|assumption|unknown|contradicted|conditional_risk|attributed_report>\", \"evidence_ids\": [\"<EVIDENCE row ids>\"], \"datapoint_ids\": [\"<dp: ids of those rows>\"], \"numbers\": [{\"evidence_id\": \"<EVIDENCE row id>\", \"metric\": \"<metric label as the source writes it>\", \"value\": \"<value as the source writes it>\", \"entity\": \"<entity as the source writes it>\", \"period\": \"<duration header plus date, as the source writes them>\", \"unit\": \"<the scale word alone as the source spells it, e.g. millions; required when the source states a scale>\"}], \"confidence\": 0.9}], \"confidence\": 0.9}```" +
+  " A number with a dp: datapoint line cites that dp: id in datapoint_ids; a number without one goes in numbers." +
   " Every sentence needs claims rows that cover all of it. Prose not covered by the inventory is deleted." +
   WORDING_RULE +
   " Each claims[].text copies your prose above verbatim, including attribution and qualification." +
@@ -69,7 +75,12 @@ const INVENTORY_RULE =
   " conditional_risk states the condition and consequence as qualified, not that it will occur." +
   " attributed_report states who reported it, not that the event happened." +
   " An observed number stays observed_fact and a calculated one stays calculation." +
-  " A claim that states a number lists datapoint_ids: the exact dp: ids from the datapoint lines of the rows it cites." +
+  " A claim that states a number lists existing dp: ids in datapoint_ids or declares numbers with evidence_id, metric, value, entity, period, and optional unit." +
+  " Each numbers entry uses strings with the exact metric label, value, entity, period, and unit from its cited source. The value is the number exactly as its table cell or sentence writes it, without a currency symbol." +
+  " A growth rate is a calculation claim over two numbers of one entity and metric. Its numbers entry adds \"formula\": \"percent_change@2\" and \"inputs\": [current, prior]," +
+  " where each input is a numbers-style object (evidence_id, metric, value, entity, period, unit) for that observed number, or its existing dp: id." +
+  " The growth entry cites the current row as evidence_id, names the metric with the word growth, gives (current - prior) / prior * 100 rounded to one decimal without %, the unit \"%\", and the period \"<current period> versus <prior period>\"." +
+  " State a growth rate only this way, never as words like doubled. Example: <entity> reported <metric> growth of <value>% for <current period> versus <prior period>." +
   " evidence_ids lists only exact ids of rows in the EVIDENCE section, never node ids or decision records." +
   " Unknown and assumption claims may cite none. All other types need at least one." +
   " confidence is your own 0..1, carried through, never a threshold." +
@@ -110,6 +121,18 @@ function declaredEvidenceIds(value: unknown): string[] {
   return raw.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
 }
 
+// One observed number declaration with exact source strings, else undefined; never coerced.
+function declaredNumber(entry: unknown): DeclaredNumber | undefined {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+  const { evidence_id, metric, value, entity, period, unit } = entry as Record<string, unknown>;
+  if (![evidence_id, metric, value, entity, period].every((v) => typeof v === "string" && v.trim().length > 0)) return undefined;
+  if (unit !== undefined && (typeof unit !== "string" || !unit.trim())) return undefined;
+  return {
+    evidence_id: evidence_id as string, metric: metric as string, value: value as string, entity: entity as string, period: period as string,
+    ...(typeof unit === "string" ? { unit } : {}),
+  };
+}
+
 function parseInventoryClaim(item: unknown): FinalClaim | undefined {
   if (!item || typeof item !== "object" || Array.isArray(item)) return undefined;
   const rec = item as Record<string, unknown>;
@@ -119,6 +142,24 @@ function parseInventoryClaim(item: unknown): FinalClaim | undefined {
   const claim: FinalClaim = { text: rec.text, claimType: rawType as FinalClaimType, evidenceIds: declaredEvidenceIds(rec.evidence_ids) };
   const points = declaredEvidenceIds(rec.datapoint_ids);
   if (points.length > 0) claim.datapointIds = points;
+  if (Array.isArray(rec.numbers)) {
+    const numbers: NonNullable<FinalClaim["numbers"]> = [];
+    for (const entry of rec.numbers) {
+      const number = declaredNumber(entry);
+      if (!number) continue;
+      const { formula, inputs } = entry as Record<string, unknown>;
+      if (formula === undefined && inputs === undefined) {
+        numbers.push(number);
+        continue;
+      }
+      const parsed = Array.isArray(inputs)
+        ? inputs.map((input) => typeof input === "string" ? (input.startsWith("dp:") ? input : undefined) : declaredNumber(input))
+        : [];
+      if (typeof formula !== "string" || !formula.trim() || parsed.length === 0 || parsed.some((input) => input === undefined)) continue;
+      numbers.push({ ...number, formula, inputs: parsed as (string | DeclaredNumber)[] });
+    }
+    if (numbers.length > 0) claim.numbers = numbers;
+  }
   if (isConf(rec.confidence)) claim.confidence = rec.confidence;
   return claim;
 }
@@ -312,6 +353,8 @@ type ReasonOptions = {
   persona?: Persona;
   // Synthesis only: sibling drafts for the Stockbot judge (trio only). Bear/Bull and direct callers never use this.
   drafts?: { persona: Persona; text: string }[];
+  // Correction round only: the kernel's rejections of this persona's previous answer, appended to the user message.
+  correction?: string;
   // Request cancellation and wall deadline (epoch ms), shared by every fetch and retry of this call.
   signal?: AbortSignal;
   deadlineAt?: number;
@@ -400,7 +443,8 @@ function narrativeInput(opts: ReasonOptions): StageInput {
   const user = `USER REQUEST\n${opts.prompt}${feedItem}\n\nEVIDENCE\n${formatEvidence(opts.evidence)}` +
     (isSynthesis
       ? `\n\nSIBLING DRAFTS (untrusted sibling prose, not evidence. Never cite, quote, or invent a draft id. For factual support, cite only evidence row ids from the EVIDENCE section.)\n${formatDrafts(opts.drafts ?? [])}\n\nWeigh both sibling drafts against the EVIDENCE above.`
-      : "");
+      : "") +
+    (opts.correction ? `\n\n${opts.correction}` : "");
   return [
     { role: "system", content: system + stockContext },
     { role: "user", content: user },

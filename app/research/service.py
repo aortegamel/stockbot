@@ -2264,7 +2264,16 @@ def _record_calculation(
     formula = f"{proof['formulaId']}@{proof['formulaVersion']}"
     args = ", ".join(f"{row.evidence_id}={row.value}" for row in inputs)
     content = f"{formula}({args}) = {datapoint['value']}"
-    identity_key = "|".join(("calculation", formula, ",".join(row.evidence_id for row in inputs), content))
+    labels = (datapoint["metric"], datapoint["entity"], datapoint["period"], datapoint["unit"])
+    identity_key = "|".join(
+        (
+            "calculation",
+            formula,
+            ",".join(row.evidence_id for row in inputs),
+            content,
+            *(label or "" for label in labels),
+        )
+    )
     hit = store.find_evidence_by_identity(session_id, identity_key)
     if hit is not None:
         return {
@@ -2345,9 +2354,9 @@ def record_evidence(
     provenance = observed.provenance if isinstance(observed, MaterializedEvidenceSource) else observed
     identity_key = _evidence_identity(data, claim, subject, provenance)
     if datapoint["value"] is not None:
-        identity_key = "|".join(
-            (identity_key, datapoint["value"], datapoint["period"] or "", datapoint["metric"] or "")
-        )
+        # Every declared label keys the row: a second spelling the source also states is its own datapoint.
+        labels = (datapoint["value"], datapoint["period"], datapoint["metric"], datapoint["entity"], datapoint["unit"])
+        identity_key = "|".join((identity_key, *(label or "" for label in labels)))
     hit = store.find_evidence_by_identity(session_id, identity_key)
     if hit is not None:
         return {
@@ -2363,6 +2372,7 @@ def record_evidence(
         # The row stores the source spelling, so replay rebuilds the same descriptor.
         datapoint = {key: text if isinstance(text := canonical.get(key), str) else None for key in datapoint}
     if isinstance(observed, MaterializedEvidenceSource):
+        metadata["source_handle"] = validate_json_mapping(data.get("source_handle"), "record_evidence: 'source_handle'")
         _apply_materialized_fields(data, observed)
     record = _build_evidence_record(
         data,
@@ -4063,6 +4073,8 @@ _FORMULAS: dict[tuple[str, str], tuple[Callable[[tuple[Decimal, ...]], Decimal],
     ("change", "1"): (lambda xs: _pair(xs)[0] - _pair(xs)[1], "change"),
     ("pct_change", "1"): (lambda xs: (_pair(xs)[1] - _pair(xs)[0]) / _pair(xs)[0] * 100, "growth_pct"),
     ("percent_change", "1"): (lambda xs: (_pair(xs)[0] - _pair(xs)[1]) / _pair(xs)[1] * 100, "growth_pct"),
+    # Rounded to one decimal so a written growth rate ("105.9%") can recompute exactly.
+    ("percent_change", "2"): (lambda xs: round((_pair(xs)[0] - _pair(xs)[1]) / _pair(xs)[1] * 100, 1), "growth_pct"),
     ("pe", "1"): (lambda xs: round(_pair(xs)[0] / _pair(xs)[1], 1), "multiple"),
     ("earnings_yield", "1"): (lambda xs: _pair(xs)[0] / _pair(xs)[1], "multiple"),
     ("short_interest_percent", "1"): (lambda xs: _pair(xs)[0] / _pair(xs)[1] * 100, "percentage"),
@@ -4275,7 +4287,7 @@ _QUALIFIERS: dict[str, re.Pattern[str]] = {
         r"\b(?:unknown|unclear|undisclosed|unavailable"
         r"|not (?:found|located|disclosed|available|reported|stated|established|identified|determined)"
         r"|no (?:[\w-]+ ){0,4}(?:was|were|is|are) (?:found|located|disclosed|reported|identified|available)"
-        r"|(?:did|does|could|can) ?not (?:find|locate|establish|determine|identify|confirm))\b",
+        r"|(?:do|did|does|could|can) ?not (?:find|locate|establish|determine|identify|confirm))\b",
         re.IGNORECASE,
     ),
     "conditional_risk": re.compile(r"\b(?:if|could|may|might|would|risks?|potential\w*|uncertain\w*)\b", re.IGNORECASE),
@@ -4337,9 +4349,9 @@ def _words(text: str) -> list[tuple[str, int, int]]:
 
 
 def _phrase_spans(masked: str, phrase: str) -> list[tuple[int, int]]:
-    """Spans where the phrase's words occur contiguously in the masked text."""
-    needle = [word for word, _, _ in _words(phrase)]
-    hay = _words(masked)
+    """Spans where the phrase's words occur contiguously in the masked text; the article "the" never counts."""
+    needle = [word for word, _, _ in _words(phrase) if word != "the"]
+    hay = [item for item in _words(masked) if item[0] != "the"]
     width = len(needle)
     return [
         (hay[i][1], hay[i + width - 1][2])
@@ -4428,9 +4440,16 @@ def _binding_defect(text: str, points: Sequence[Mapping[str, object]], claim_typ
     """
     masked = _masked(text)
     strict = claim_type in ("observed_fact", "calculation")
-    bounds = (
-        [0, *[match.end() for match in _SENTENCE_END_RE.finditer(masked)], len(masked)] if strict else [0, len(masked)]
-    )
+    # An entity spelled with a trailing period ("Advanced Micro Devices, Inc.") does not end its sentence.
+    abbreviated = {
+        end + 1
+        for point in points
+        for name in _spellings(point, "entity")
+        if name.rstrip().endswith(".")
+        for _, end in _phrase_spans(masked, name)
+    }
+    ends = [match.end() for match in _SENTENCE_END_RE.finditer(masked) if match.end() not in abbreviated]
+    bounds = [0, *ends, len(masked)] if strict else [0, len(masked)]
     numbers = _numbers(masked)
     bound: list[tuple[int, int]] = []
     context: set[str] = set()

@@ -129,14 +129,17 @@ export const FINAL_CLAIM_TYPES = [
 ] as const;
 export type FinalClaimType = (typeof FINAL_CLAIM_TYPES)[number];
 
-// Claims never state value/entity/period/unit themselves: every number they state
-// resolves through datapointIds (snake_case datapoint_ids on the wire) to a kernel
-// descriptor of a cited row, and the Python gate binds the wording to it.
+// Number declarations request source admission. Only datapointIds carry verified proof.
+export type DeclaredNumber = { evidence_id: string; metric: string; value: string; entity: string; period: string; unit?: string };
+
 export type FinalClaim = {
   text: string;
   claimType: FinalClaimType;
   evidenceIds: string[];
   datapointIds?: string[];
+  // formula ("id@version") plus inputs in argument order makes the number a calculation. Each input is a
+  // dp: id or an observed declaration the worker admits first.
+  numbers?: (DeclaredNumber & { formula?: string; inputs?: (string | DeclaredNumber)[] })[];
   confidence?: number;
 };
 

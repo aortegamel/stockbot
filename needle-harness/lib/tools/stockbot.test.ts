@@ -381,6 +381,36 @@ describe("muse inventory fence", () => {
     ]);
   });
 
+  test("number declarations retain exact strings and drop malformed entries", () => {
+    const number = { evidence_id: "E1", metric: "Revenue", value: "46.7", entity: "NVDA", period: "FY2025", unit: "billion" };
+    const growth = { ...number, unit: "%", formula: "percent_change@2", inputs: ["dp:a", { ...number, period: "FY2024" }] };
+    const malformed = [
+      null, [], "number", ...Object.keys(number).map((key) => ({ ...number, [key]: 7 })), { ...number, value: "" },
+      { ...growth, inputs: [] }, { ...growth, inputs: ["ev:1"] }, { ...growth, inputs: [{ ...number, value: 7 }] },
+      { ...growth, formula: "" }, { ...number, inputs: ["dp:a"] },
+    ];
+    const claims = splitInventory(`Revenue.\n\`\`\`json ${JSON.stringify({
+      claims: [{
+        text: "Revenue.", claim_type: "observed_fact", evidence_ids: ["E1"],
+        numbers: [number, ...malformed, { ...number, unit: undefined }, growth]
+      }],
+    })}\`\`\``).claims;
+    const { unit: _unit, ...withoutUnit } = number;
+    expect(claims[0]?.numbers).toEqual([number, withoutUnit, growth]);
+  });
+
+  test("number parsing preserves source strings and never coerces scalar values", () => {
+    const text = fc.string({ minLength: 1 }).filter((value) => value.trim().length > 0);
+    fc.assert(fc.property(text, text, text, text, text, fc.oneof(fc.integer(), fc.boolean(), fc.constant(null)), (evidence_id, metric, value, entity, period, invalid) => {
+      const number = { evidence_id, metric, value, entity, period };
+      const numbers = [number, { ...number, value: invalid }];
+      const result = splitInventory(`Fact.\n\`\`\`json ${JSON.stringify({
+        claims: [{ text: "Fact.", claim_type: "observed_fact", numbers }],
+      })}\`\`\``);
+      expect(result.claims[0]?.numbers).toEqual([number]);
+    }), { seed: 20261027, numRuns: 100 });
+  });
+
   test("an unusable fence is stripped without inventing claims", () => {
     for (const body of ["{not json}", "[1,2]", "5", "null", '{"claims": 5}', '{"claims": [null]}']) {
       const inv = splitInventory(`Prose.\n\`\`\`json ${body}\`\`\``);
@@ -612,7 +642,6 @@ describe("muse reason personas (fake provider)", () => {
       expect(s).toContain("After a fact from EVIDENCE, put its row id in brackets, e.g. [ev:abc123].");
       expect(s).not.toContain("Bind the NARRATIVE");
       expect(s).toContain("metric label");
-      expect(s).toContain("Hedge an inference");
       expect(s).toContain("Name who reported");
       expect(s).toContain("State what was not found or is unknown");
     }
@@ -876,7 +905,6 @@ describe("muse reason personas (fake provider)", () => {
     expect(userOf(narrative.body)).toContain("EVIDENCE\n[E1]\nsource: sec");
     expect(systemOf(narrative.body)).toContain("After a fact from EVIDENCE, put its row id in brackets, e.g. [ev:abc123].");
     expect(systemOf(narrative.body)).toContain("metric label");
-    expect(systemOf(narrative.body)).toContain("Hedge an inference");
     expect(systemOf(narrative.body)).toContain("Name who reported");
     expect(systemOf(narrative.body)).toContain("State what was not found or is unknown");
     expect(userOf(narrative.body)).not.toContain("SIBLING DRAFTS");

@@ -52,6 +52,9 @@ A failed section read returns to the selector.
 The accession-family and repeated-failure breakers distinguish sibling sections.
 For an undated latest 10-Q revenue request, the scheduler uses grounded listing and document arguments without Needle generation.
 Requests with explicit dates, extra required arguments, or summary-only listings keep Needle generation.
+An undated `list_sec_filings` call takes its arguments from the node's own question without Needle: the question's ticker or company, the 10-Q, 10-K, and 8-K names it contains, and the schema default limit.
+A child node therefore lists its own company, not the first ticker of the session objective.
+A calendar bound anywhere in the request (objective, node question, or raw scope: a year, a month name, or as of, before, after, since, until, between), a dated scope, or a cutoff keeps Needle generation.
 Document evidence keeps visible inline XBRL facts and the full bounded canonical passage.
 The document view excludes hidden XBRL resources.
 Attempt summaries stay bounded at 2,000 characters.
@@ -122,11 +125,12 @@ Stockbot weighs both drafts against that snapshot and writes its response.
 The stockbot synthesis starts as soon as both drafts settle.
 At the same time, the final gates check each draft separately.
 Each draft that passes its gates publishes at once: Bearbot first, then Bullbot.
-An empty graph retains the direct prompt without evidence.
+An empty research graph makes no persona or gate call. The fixed line answers, and the limitations name `research retrieved no evidence`.
 Exactly one failed or empty draft retries once.
 If synthesis fails, times out, or loses every claim to the gates after a draft published, the run ends `completed_with_limitations`.
 The limitations name the unavailable synthesis, and the run emits no `failed` event.
-If no draft passes its gates and synthesis also fails, the run fails without prose.
+If no draft passes its gates and synthesis fails with a provider error, the run fails without prose.
+If no draft passes and the gates reject every synthesis claim, the run answers the fixed line described below.
 
 The kernel runs exactly one worker research run and one persona round.
 An unresolved node, a tripped guard, or an escalation never starts more research.
@@ -141,7 +145,13 @@ Otherwise, an answer never announces missing evidence: what the run did not find
 Final gates check the claim inventory and the whole response.
 The kernel checks all personas and all of their claims concurrently and processes the results in persona order.
 The gate requests carry the research session id of the run they judge.
-A gate error rejects its claim or response; it never keeps ungraded prose.
+A gate verdict whose `error` starts with `proof:` is a deterministic rejection of its claim.
+Any other gate error (a JEV transport failure, a deadline) means the gate is unavailable: the claim counts as a gate failure, never as a rejection.
+A `support_answer` of `yes` with `evidence_state: "insufficient"` rejects the claim.
+
+When the gates reject every claim, the kernel publishes one fixed runtime-written line: "I couldn't determine this from the retrieved sources."
+No model text appears in that answer. The run ends `completed_with_limitations`, and the limitations include the rejection message.
+A run still fails without prose when a gate outage, provider error, or timeout leaves nothing to publish.
 If the whole response fails, the gates check each claim.
 The kernel removes each rejected claim substring.
 Other prose stays unchanged, including uncertainty.
@@ -153,11 +163,10 @@ This local check is a pre-filter only. A local pass never counts as proof.
 The correction states valid evidence IDs and requires exact evidence row IDs and verbatim claim text.
 The correction includes rejected prose and inventory as untrusted output.
 The corrected answer passes the same gates.
-A still-invalid, empty, or failed correction fails without prose or another retry.
+A still-invalid, empty, or failed correction gets no further retry. If nothing survives, the fixed line answers.
 Other inventory defects do not retry.
-Direct answers carry no inventory and never retry.
 In the trio, a gate failure or a fully rejected persona removes only that persona's block.
-A run fails without prose only when no persona block survives.
+When no persona block survives, the fixed line answers. A gate outage or provider failure still fails without prose.
 The claim inventory is the last `json` fenced block of a response.
 The kernel drops any text after its closing fence.
 An unclosed (cut-off) block never shows raw JSON: the prose ends at the fence.
@@ -180,9 +189,9 @@ Muse receives all projected evidence without an aggregate character cap.
 Research wall: the 120-second `REQUEST_WALL_MS` deadline applies to the worker research run.
 The run starts its wall at route entry, or at the caller `deadlineAt`.
 Its worker call timeout is the time left on that wall.
-Worst-case research latency is therefore 120 seconds plus unbounded persona time.
-Persona generation, the draft retry, and Stockbot synthesis have no application time limit.
-The kernel waits for them without a deadline, even after the wall passes.
+Persona generation, the draft retry, Stockbot synthesis, and the final gates never receive the wall.
+Each Muse call keeps the client's 120-second per-call fetch limit. Each gate call keeps the worker's 10-minute call timeout.
+A run whose research used most of the wall therefore still writes and gates its answer.
 The caller cancellation signal still reaches every persona call and aborts it.
 
 Output caps (experiment): two optional env knobs cap Muse output tokens.
@@ -393,6 +402,57 @@ credentials (`HEDGEFUND_LIVE=1`, `SEC_EDGAR_IDENTITY`, `FINRA_CLIENT_ID` /
 read-only harness-viewer projection. Without the opt-in flag it exits 2.
 
 The terminal Harness tab renders `HarnessSessionViewer` with the selected session id. It reads the existing session plus snapshot research APIs only. A missing or failed snapshot stays unavailable for that session, never another session. Static `HarnessViewer` with a projection prop remains for untracked preview files; export previews write only the `--out` path.
+
+## Numeric datapoints
+
+A number in a published claim needs a verified datapoint: a ledger row whose proof rebuilds `{metric, value, entity, period, unit}` from the archived source bytes. One row holds at most one datapoint. Two paths create them.
+
+Structured fan-out: after the scheduler admits a FINRA or SEC structured record, it admits one datapoint row per numeric field of the cited row, up to 12 fields.
+A FINRA single-ticker envelope cites its `latest_record`: the newest raw source row, scalar fields only.
+An XBRL fact row binds its concept to its value. Entity and period come from the row's own fields.
+Envelope numbers such as counts and limits never become datapoints. A field the proof rejects stays absent.
+
+Claim-time admission: a persona claim that states a number without an existing `dp:` id declares it in `numbers: [{evidence_id, metric, value, entity, period, unit}]`.
+Before the final gates, the kernel sends each declaration to the worker op `admit_datapoint`, at most four at a time.
+The worker rebuilds the cited row's admission item, admits the datapoint under a new job, and returns the descriptor.
+An SEC document row stores its original `source_handle` (with section and query) in `metadata.source_handle` at admission, so claim-time admission reuses the exact window. Rows admitted before this change carry no handle and fail closed.
+The worker rejects a returned descriptor whose fields differ from the declaration. A failed admission leaves the claim unchanged, and the gate rejects its number.
+Persona prompts write each number as its own sentence: `<entity> reported <metric> of <value> for <period>.` The sentence names no data source and adds no words outside the datapoint fields, because the gate rejects them.
+
+Table periods: a statement table whose duration header (`Three Months Ended | Six Months Ended`) spans groups of value columns binds a period such as `Three Months Ended Jul 26, 2026` to the value in that group and date column. A repeated bare date stays ambiguous and fails closed.
+
+Repeated values: a value that appears more than once in a passage (`Net revenue` and `Total net revenue` rows with the same figures) binds the one occurrence whose row or sentence matches every claimed label. When no occurrence matches, the proof fails. When two or more match, it stays ambiguous and fails closed.
+
+Growth rates: a persona states a growth rate as a `calculation` claim. Its `numbers` entry adds `formula: "percent_change@2"` and `inputs: [current, prior]`, with unit `%` and period `<current period> versus <prior period>`. Each input is an existing `dp:` id or an inline observed declaration, which the worker admits first through the observed guards. The worker then admits a calculation row. The ledger recomputes the value (one decimal). It checks that the inputs share one entity, metric, and unit, name two distinct periods, and that the output period names both input periods. A value that differs from the recompute fails closed. Every declared label keys observed and calculated rows, so a second source spelling becomes its own datapoint and never a mismatched duplicate.
+
+In the gate, an entity spelled with a trailing period (`Advanced Micro Devices, Inc.`) does not end its sentence.
+
+A question that names two or more companies starts one research node per company, `<question> (<TICKER> only)`, instead of one root node. The `(TICKER only)` suffix is that node's issuer. Other nodes resolve the filing issuer from the node question first, then from the session objective.
+
+A datapoint never drops a scale the source states. When the declaration has no unit but the value's statement carries a scale word (`$46.7 billion`) or an earlier heading states one (`(In millions, except per share data)`), the proof fails closed. A declared scale unit may be singular: `million` binds the source's `millions`, and the stored unit keeps the source spelling. Personas write `$<value> million` with the scale word singular after the value. The worker compares the stored descriptor with the declaration without regard to case.
+
+`get_financial_statements` returns the whole statement as `label | <period> ...` rows with whole-number values, never pandas' truncated display. It also returns `line_items`: one `{ticker, period, unit, <label>: value}` row per consolidated line item and period column. Breakdown and abstract rows are dropped. The unit comes from the line item's own XBRL facts: `USD`, `USD/share`, or `shares`. A concept with several units, or another unit, has no unit field. The scheduler fans out a datapoint for each line item, up to 60 rows, so these numbers are provable and a growth rate over two years of one line item recomputes. A claim states the unit: `$215938000000`.
+
+A published answer drops a citation-only fragment (`2026. [ev:1]`) together with the sentence before it, so a rejected sentence never leaves a bare citation behind.
+
+Readable display: the gates check the raw source figure, and the reader sees a rounded one. After every gate, the kernel rewrites displayed answer and claim text the same way, so citations still find their claims. A value followed by a scale word (`$96,221 million`) becomes `$96.2 billion`. A whole number of 7+ digits becomes `$215.9 billion` or `69.4 million` only when it equals a verified datapoint value of the run. A camelCase metric label of a datapoint reads as words (`current short position quantity`). Text inside citation brackets, CIKs, accession numbers, dates, and all other numbers stay verbatim. Values round to one decimal, and a trailing `.0` drops.
+
+A growth claim that also lists its inputs' `dp:` ids drops each input whose value the sentence does not state. A `dp:` id that no row of the run carries (a mistyped id) also leaves the claim, and every stated number still needs a bound datapoint at the gate. The gate ignores the article "the" when it matches an entity or period, so `for the Three Months Ended ...` binds like `for Three Months Ended ...`. A growth period may differ from its inputs' periods in spacing and "the". Plural form names (`10-Qs`) are names, never numbers. An unknown claim may say `do not establish`. The worker ignores inner spacing when it compares a declaration with the stored descriptor, and a padded declaration still differs. The kernel logs each claim it drops before the gates (`[ai] <persona> claim dropped before gates: <reason>`) and each withheld persona answer (`[ai] persona answer withheld: <reason>`).
+
+Claim alignment: the kernel removes only claims that are wrong, not claims written in another spelling. Before any check, a `claims[].text` that is not an exact prose substring maps to the prose span it names. Spacing, quote style, case, citation brackets, and trailing punctuation do not matter. Failing that, the prose sentence that shares most of the claim's words (Jaccard at least 0.6) and exactly its numbers stands in. The gates then judge that published prose text. A claim with no such match names nothing the answer says, and it drops. A claim that cites a real `dp:` id but not its row gains that row, and the gate still proves the datapoint there.
+
+Correction loop: a persona whose gated answer lost anything gets up to 3 correction rounds. Each round lists every rejected claim of the best answer so far with its reason: the local inventory defect, the worker's `proof:` error, or the evidence judge's verdict. It also lists every sentence that no claim covered. Under each rejection the round shows a concrete rewrite the gates accept instead of describing one:
+
+- an unbound number: the exact number sentence built from the datapoint's own fields (`NVIDIA Corporation reported Revenue of $96,221 million for Three Months Ended Jul 26, 2026.`);
+- an unqualified claim: the claim wrapped in its qualifier (`This suggests …`, `The evidence does not establish whether …`, `Assuming …`);
+- an uncovered sentence: the claims row to add, with the sentence and its cited ids;
+- a bad id: the valid EVIDENCE ids.
+
+A rejection kind without a mechanical rewrite (stray numbers, wrong claim kind, the judge's verdict) gets a worked before/after example. The best answer so far rides beside the list as untrusted text. The kernel admits the corrected answer's numbers and gates it again. A corrected answer becomes the best only when it publishes more verified claims, or the same number with fewer rejections. The loop ends when nothing is rejected, when a round does not improve, after 3 rounds, or when a correction call fails. A gate outage never starts the loop. The kernel logs `[ai] <persona> correction round <n>: <before> -> <after> verified claims, <before> -> <after> rejections, kept|discarded`.
+
+A judge rejection names the judge's evidence state: contradicted, conflicted, or too weak for the claim as written. The kernel logs every rejection as `[ai] <persona> claim rejected: <reason> | <claim text>`.
+
+Unknown claims never reach the judge. No evidence can show that something is absent, so a claim declared `unknown` passes once its wording carries the unknown qualifier (`not found`, `unclear`, `does not establish`, ...) and it states no unproven number (a year is allowed).
 
 ## SEC discovery labels
 

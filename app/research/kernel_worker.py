@@ -1764,7 +1764,7 @@ def run_graph_prompt(
     context: Mapping[str, JSONValue] | None = None,
 ) -> str:
     """Create a session and its root objective node. JEV performs all tool and reasoning selection."""
-    from app.research import service
+    from app.research import scheduler, service
 
     hit = _registry_portfolio_hit()
     if hit:
@@ -1784,7 +1784,13 @@ def run_graph_prompt(
                 {"watchlist": watchlist, "context": context},
                 request={"objective": objective},
             )
-        service.create_node(sid, objective, "Route question.")
+        # A comparison researches each named company in its own node, so every company's filings are read.
+        subjects = scheduler.question_subjects(objective)
+        if len(subjects) >= 2:
+            for ticker_ in subjects:
+                service.create_node(sid, f"{objective} ({ticker_} only)", f"Research {ticker_} for this comparison.")
+        else:
+            service.create_node(sid, objective, "Route question.")
         return sid
     except Exception:
         _close_bootstrap_job(sid)
@@ -2284,11 +2290,10 @@ def _assess_final_claim(req: Mapping[str, JSONValue], jev: JevClient | None = No
     if defect is not None:
         logger.info("toolflow assess_final_claim rid=%s reason=proof %.300s", rid, defect)
         return _final_fail(rid, defect)
-    if (
-        ctype.strip() in ("observed_fact", "calculation")
-        and _final_ids(holder, "datapoint_ids")
-        and _final_proof_defect(req, [holder]) is None
-    ):
+    # A proven number needs no judge. Neither does an unknown: its wording already passed the unknown qualifier
+    # and the stray-number check, and no evidence can show that something is absent.
+    proven = ctype.strip() in ("observed_fact", "calculation") and bool(_final_ids(holder, "datapoint_ids"))
+    if (proven or ctype.strip() == "unknown") and _final_proof_defect(req, [holder]) is None:
         return {
             "id": rid,
             "support": 1.0,
@@ -2463,6 +2468,129 @@ def _row_datapoints(rec: Mapping[str, object]) -> list[JSONValue]:
     except ValueError:
         return []
     return [point] if point is not None else []
+
+
+def _admit_datapoint(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+    """Admit one declared number through the existing source and proof guards.
+
+    A declaration with ``formula`` (``id@version``) and ``inputs`` (session dp: ids in
+    formula argument order) is a calculation: the ledger recomputes it from the input rows.
+    """
+    from app.research import service
+    from app.research.evidence import evidence_domain
+    from app.research.repository import ResearchRepository
+
+    rid = _request_id(req)
+    try:
+        sid, eid = req.get("sessionId"), req.get("evidenceId")
+        if not isinstance(sid, str) or not isinstance(eid, str):
+            raise TypeError("sessionId and evidenceId required")
+        store = ResearchRepository()
+        row = store.get_evidence(eid)
+        if row.get("session_id") != sid:
+            raise ValueError("evidence belongs to another session")
+        item: dict[str, object] = {
+            key: row[key] for key in ("content", "claim_text", "subject", "source_type", "source_name") if key in row
+        }
+        for key in ("metric", "value", "entity", "period"):
+            value = req.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{key} must be a non-empty string")
+            # Statement tables put "$" in its own cell; the value token never carries it. Proof still checks the bytes.
+            item[key] = value.removeprefix("$") if key == "value" else value
+        if "unit" in req:
+            unit = req["unit"]
+            if not isinstance(unit, str) or not unit.strip():
+                raise ValueError("unit must be a non-empty string")
+            item["unit"] = unit
+        formula = req.get("formula")
+        prov = row.get("provenance")
+        if not isinstance(prov, dict):
+            raise TypeError("evidence provenance required")
+        if formula is not None:
+            inputs = req.get("inputs")
+            formula_id, _, version = formula.partition("@") if isinstance(formula, str) else ("", "", "")
+            if not formula_id or not version or not isinstance(inputs, list) or not inputs:
+                raise ValueError("a calculation needs formula id@version and a list of inputs")
+            ids: list[str] = []
+            for entry in inputs:
+                if isinstance(entry, dict) and "formula" not in entry:
+                    # An observed input declared inline is admitted first, through the same guards.
+                    sub = _admit_datapoint(
+                        {**entry, "id": rid, "sessionId": sid, "evidenceId": entry.get("evidence_id")}
+                    )
+                    point = sub.get("datapoint")
+                    if not isinstance(point, dict):
+                        raise ValueError(f"input {entry.get('metric')!r} {entry.get('value')!r}: {sub.get('error')}")
+                    ids.append(str(point["id"]))
+                elif isinstance(entry, str):
+                    ids.append(entry)
+                else:
+                    raise ValueError("each input is a dp: id or an observed number declaration")
+            owners = {
+                str(point["id"]): eid
+                for eid, rec in service._session_rows(store, sid).items()
+                for point in _row_datapoints(rec)
+                if isinstance(point, dict)
+            }
+            if missing := [dp for dp in ids if dp not in owners]:
+                raise ValueError(f"inputs {missing} are not datapoints of this session")
+            item = {key: item[key] for key in ("subject", "metric", "value", "entity", "period", "unit") if key in item}
+            item.update(
+                claim_kind="calculation",
+                formula_id=formula_id,
+                formula_version=version,
+                input_evidence_ids=[owners[dp] for dp in ids],
+            )
+        elif prov.get("kind") == "sec_source":
+            metadata = row.get("metadata")
+            handle = metadata.get("source_handle") if isinstance(metadata, dict) else None
+            if not isinstance(handle, dict):
+                raise ValueError("Cannot admit a filtered document view without its stored canonical source_handle")
+            item["source_handle"] = handle
+            item["matching_passage"] = prov.get("passage")
+        elif prov.get("kind") in ("sec_record", "finra_record", "web_source"):
+            item["tool_result_id"] = prov.get("tool_result_id")
+            item["record_identity"] = prov.get("record_identity")
+            item["matching_passage"] = prov.get("record_identity") or prov.get("excerpt")
+            if prov.get("kind") == "web_source":
+                item["source_record_id"] = prov.get("url")
+        else:
+            raise ValueError("unsupported evidence provenance")
+        session = store.get_session(sid)
+        job = service.start_job(
+            sid,
+            source=evidence_domain(prov),
+            wave_id=max(session.current_wave, len(session.freeze_ids) + 1, 1),
+            repo=store,
+        )
+        jid = str(job["job_id"])
+        try:
+            admitted = service.record_evidence(sid, jid, item, repo=store)
+        finally:
+            service.complete_job(jid, repo=store)
+        new_id = admitted.get("evidence_id")
+        if not isinstance(new_id, str):
+            raise TypeError("admission returned no evidence id")
+        points = _row_datapoints(store.get_evidence(new_id))
+        if not points:
+            raise ValueError("admission returned no verified datapoint")
+        point = points[0]
+        # The stored descriptor keeps the source spelling; a dedupe hit with another entity or period still differs.
+        # A scale unit may be declared singular ("million") for the source's "millions". Inner spacing never differs
+        # ("June 27, 2026" declares the source's "June 27,2026"); a padded declaration still does.
+        if not isinstance(point, dict) or any(
+            str(item[key]) != str(item[key]).strip()
+            or "".join(str(point.get(key)).split()).casefold()
+            not in (declared := "".join(str(item[key]).split()).casefold(), f"{declared}s" * (key == "unit"))
+            for key in ("metric", "value", "entity", "period", "unit")
+            if key in item
+        ):
+            raise ValueError("admitted datapoint differs from the declared number")
+        return {"id": rid, "evidence_id": new_id, "datapoint": point}
+    except Exception as exc:  # never raise out of the worker
+        logger.info("datapoint admission failed rid=%s: %s", rid, exc, exc_info=True)
+        return {"id": rid, "error": str(exc)}
 
 
 def _run_evidence(records: Sequence[Mapping[str, JSONValue]]) -> tuple[list[JSONValue], set[str]]:
@@ -2865,6 +2993,7 @@ _KERNEL_OPS = (
     "arguments",
     "assess_final_response",
     "assess_final_claim",
+    "admit_datapoint",
 )
 """Every op this worker accepts, in the order the invalid-op message lists them."""
 
@@ -2914,6 +3043,8 @@ def _direct_op(req: Mapping[str, JSONValue], jev: JevClient | None) -> dict[str,
             return _arguments(req)
         if op == "effort":
             return _effort(req, jev=jev)
+        if op == "admit_datapoint":
+            return _admit_datapoint(req)
         if op == "assess_final_response":
             return _assess_final_response(req, jev=jev)
         return _assess_final_claim(req, jev=jev)

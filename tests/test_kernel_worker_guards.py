@@ -1870,6 +1870,27 @@ def test_final_proof_defect_forwards_datapoints_and_filters_removed_keys(
     assert "ERR_CLAIM_UNQUALIFIED" in str(defect)
 
 
+@pytest.mark.parametrize(
+    ("text", "qualified"),
+    [
+        ("The filings reviewed do not establish termination triggers.", True),
+        ("The filings did not establish termination triggers.", True),
+        ("The filings establish termination triggers.", False),
+    ],
+)
+def test_unknown_qualifier_reads_do_not_establish(text: str, qualified: bool) -> None:
+    from app.research.service import _QUALIFIERS
+
+    assert bool(_QUALIFIERS["unknown"].search(text)) is qualified
+
+
+def test_plural_form_names_are_never_numbers() -> None:
+    """ "their latest 10-Qs" names a form, so its 10 never needs a datapoint."""
+    from app.research.service import _masked, _numbers
+
+    assert _numbers(_masked("Both latest 10-Qs and 8-K/A filings show growth of 12 percent.")) == [("12", 51, 53)]
+
+
 def test_run_evidence_adds_only_canonical_datapoints(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from app.research.evidence import datapoint_descriptor, evidence_from_dict
 
@@ -1885,6 +1906,376 @@ def test_run_evidence_adds_only_canonical_datapoints(monkeypatch: pytest.MonkeyP
     assert by_id["ev-point"]["datapoints"] == [point]
     assert "datapoints" not in by_id["ev-legacy"]
     assert "datapoints" not in by_id["ev-untyped"]
+
+
+def test_admit_datapoint_replays_sec_passage_and_rejects_invalid_requests(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import tests.research_source_seam as seam
+
+    passage = "NVDA FY2025 Revenue was $46.7 billion."
+    sid = seam.proven_session(
+        monkeypatch,
+        tmp_path,
+        {
+            "ev-intro": "A document introduction.",
+            "ev-prose": passage,
+            "ev-end": "A document conclusion.",
+        },
+    )
+    request: dict[str, JSONValue] = {
+        "id": "admit",
+        "op": "admit_datapoint",
+        "sessionId": sid,
+        "evidenceId": "ev-prose",
+        "metric": "Revenue",
+        "value": "46.7",
+        "entity": "NVDA",
+        "period": "FY2025",
+        "unit": "billion",
+    }
+    result = kw._direct_op(request, None)
+    assert "error" not in result, result
+    assert result["id"] == "admit"
+    assert result["evidence_id"] != "ev-prose"
+    new_id = result["evidence_id"]
+    assert isinstance(new_id, str)
+    stored = ResearchRepository().get_evidence(new_id)
+    original = ResearchRepository().get_evidence("ev-prose")
+    for key in ("content", "claim_text", "subject", "source_type", "source_name"):
+        assert stored[key] == original[key]
+    point = result["datapoint"]
+    assert isinstance(point, dict)
+    assert str(point["id"]).startswith("dp:")
+    assert {key: point[key] for key in ("metric", "value", "entity", "period", "unit")} == {
+        "metric": "Revenue",
+        "value": "46.7",
+        "entity": "NVDA",
+        "period": "FY2025",
+        "unit": "billion",
+    }
+    assert (
+        kw._final_proof_defect(
+            {"sessionId": sid},
+            [
+                {
+                    "text": passage,
+                    "claim_type": "observed_fact",
+                    "evidence_ids": [result["evidence_id"]],
+                    "datapoint_ids": [point["id"]],
+                }
+            ],
+        )
+        is None
+    )
+    for change in (
+        {"sessionId": "other"},
+        {"evidenceId": "missing"},
+        {"value": "99.9"},
+        {"entity": "AMD"},
+        {"period": "FY2024"},
+        {"metric": "Profit"},
+        {"unit": 7},
+        {"unit": "million"},
+        *({key: f" {request[key]} "} for key in ("metric", "value", "entity", "period", "unit")),
+    ):
+        rejected = kw._direct_op({**request, **change}, None)
+        assert rejected["id"] == "admit"
+        assert "error" in rejected
+        assert "datapoint" not in rejected
+    assert all(job.status == "completed" for job in ResearchRepository().list_jobs(sid)[1:])
+    expired = kw._direct_op({**request, "deadlineAt": 1}, None)
+    assert "deadline reached" in str(expired["error"])
+
+
+@pytest.mark.parametrize("wave,frozen", [(3, False), (0, True)])
+def test_admit_datapoint_uses_live_wave(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, wave: int, frozen: bool
+) -> None:
+    import tests.research_source_seam as seam
+
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-prose": "NVDA FY2025 Revenue was 46.7."})
+    store = ResearchRepository()
+    session = store.get_session(sid)
+    store.save_session(replace(session, current_wave=wave, freeze_ids=[f"{sid}:1:freeze"] if frozen else []))
+    result = kw._direct_op(
+        {
+            "id": "wave",
+            "op": "admit_datapoint",
+            "sessionId": sid,
+            "evidenceId": "ev-prose",
+            "metric": "Revenue",
+            "value": "46.7",
+            "entity": "NVDA",
+            "period": "FY2025",
+        },
+        None,
+    )
+    assert "error" not in result, result
+    eid = result["evidence_id"]
+    assert isinstance(eid, str)
+    assert store.get_evidence(eid)["wave_id"] == (2 if frozen else wave)
+
+
+def test_admit_datapoint_drops_a_declared_currency_symbol(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A table puts "$" in its own cell: a "$96,221" declaration proves the "96,221" token."""
+    import tests.research_source_seam as seam
+
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-table": "Income statement\nRevenue | $ | 96,221"})
+    result = kw._direct_op(
+        {
+            "id": "usd",
+            "op": "admit_datapoint",
+            "sessionId": sid,
+            "evidenceId": "ev-table",
+            "metric": "Revenue",
+            "value": "$96,221",
+            "entity": "Income statement",
+            "period": "Income statement",
+        },
+        None,
+    )
+    point = result.get("datapoint")
+    assert isinstance(point, dict) and point.get("value") == "96,221", result
+
+
+def test_admit_datapoint_recomputes_a_declared_growth_rate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A growth declaration over two session dp: ids admits only the ledger's own recompute."""
+    import tests.research_source_seam as seam
+    from app.research import service
+
+    table = (
+        "NVIDIA Corporation and Subsidiaries\n(In millions)\nThree Months Ended | Six Months Ended\n"
+        "Jul 26, 2026 | Jul 27, 2025 | Jul 26, 2026 | Jul 27, 2025\n"
+        "Revenue | $ | 96,221 | $ | 46,743 | $ | 177,837 | $ | 90,805\n"
+        "Cost of revenue | $ | 26,000 | $ | 12,000 | $ | 50,000 | $ | 24,000"
+    )
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-table": table})
+    base = {"op": "admit_datapoint", "sessionId": sid, "evidenceId": "ev-table", "metric": "Revenue"}
+    base |= {"entity": "NVIDIA Corporation", "unit": "millions"}
+    ids = []
+    for value, date in (("96,221", "Jul 26, 2026"), ("46,743", "Jul 27, 2025")):
+        result = kw._direct_op({**base, "id": value, "value": value, "period": f"Three Months Ended {date}"}, None)
+        point = result.get("datapoint")
+        assert isinstance(point, dict), result
+        ids.append(point["id"])
+    period = "Three Months Ended Jul 26, 2026 versus Three Months Ended Jul 27, 2025"
+    growth = {**base, "id": "g", "metric": "Revenue growth", "unit": "%", "period": period}
+    growth |= {"formula": "percent_change@2", "inputs": ids}
+    result = kw._direct_op({**growth, "value": "105.9"}, None)
+    point = result.get("datapoint")
+    assert isinstance(point, dict) and point["inputs"] == ids, result
+    claim = f"NVIDIA Corporation reported Revenue growth of 105.9% for {period}."
+    assert service._binding_defect(claim, [point], "calculation") is None
+    assert service._wording_defect(claim, [point]) is None
+    # "the" before each period reads naturally and binds the same periods; a missing prior period still fails.
+    natural = claim.replace("for Three", "for the Three").replace("versus Three", "versus the Three")
+    assert service._binding_defect(natural, [point], "calculation") is None
+    assert service._binding_defect(natural.split(" versus")[0] + ".", [point], "calculation") is not None
+    for bad in ({"value": "105.8"}, {"value": "105.9", "inputs": ids[::-1]}, {"value": "105.9", "inputs": ids[:1]}):
+        assert "error" in kw._direct_op({**growth, **bad}, None), bad
+    assert "not datapoints" in str(
+        kw._direct_op({**growth, "value": "105.9", "inputs": ["dp:x", ids[1]]}, None)["error"]
+    )
+    # Inline observed inputs are admitted first through the observed guards, then feed the same recompute.
+    # Their singular scale ("million") binds the source's "(In millions)".
+    shared = {"evidence_id": "ev-table", "metric": "Revenue", "entity": "NVIDIA Corporation", "unit": "million"}
+    first: dict[str, JSONValue] = {**shared, "value": "96,221", "period": "Three Months Ended Jul 26, 2026"}
+    second: dict[str, JSONValue] = {**shared, "value": "46,743", "period": "Three Months Ended Jul 27, 2025"}
+    inline: list[JSONValue] = [first, second]
+    assert kw._direct_op({**growth, "value": "105.9", "inputs": inline}, None)["datapoint"] == point
+    unproven: list[JSONValue] = [first, {**second, "value": "46,744"}]
+    assert "'46,744'" in str(kw._direct_op({**growth, "value": "105.9", "inputs": unproven}, None)["error"])
+    nested: list[JSONValue] = [first, {**growth, "value": "105.9"}]
+    assert "observed number declaration" in str(
+        kw._direct_op({**growth, "value": "1", "inputs": nested}, None)["error"]
+    )
+    # Operands of another metric, or an output period that names other periods, never publish as growth.
+    cost: list[JSONValue] = [first, {**second, "metric": "Cost of revenue", "value": "12,000"}]
+    mixed = kw._direct_op({**growth, "value": "701.8", "inputs": cost}, None)
+    assert "different metrics" in str(mixed.get("error")), mixed
+    unrelated = kw._direct_op({**growth, "value": "105.9", "period": "FY2031 versus FY2030"}, None)
+    assert "name both input periods" in str(unrelated.get("error")), unrelated
+    # A second entity spelling the source also states is its own datapoint, never a mismatched dedupe hit.
+    longer = {**first, "id": "long", "entity": "NVIDIA Corporation and Subsidiaries", "evidenceId": "ev-table"}
+    longer |= {"op": "admit_datapoint", "sessionId": sid}
+    point_long = kw._direct_op(longer, None).get("datapoint")
+    assert isinstance(point_long, dict) and point_long["entity"] == "NVIDIA Corporation and Subsidiaries", point_long
+    # A declared "Jul 26,2026" admits the source's "Jul 26, 2026"; spacing never makes a declaration differ.
+    tight = {**longer, "id": "tight", "period": "Three Months Ended Jul 26,2026"}
+    point_tight = kw._direct_op(tight, None).get("datapoint")
+    assert isinstance(point_tight, dict) and point_tight["period"] == "Three Months Ended Jul 26, 2026", point_tight
+    # A growth period written with other spacing and "the" still names both input periods.
+    loose = {**growth, "id": "loose", "value": "105.9"}
+    loose["period"] = "the Three Months Ended Jul 26,2026 versus the Three Months Ended Jul 27,2025"
+    assert isinstance(kw._direct_op(loose, None).get("datapoint"), dict)
+
+
+def test_admit_datapoint_reuses_filtered_document_handle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import tests.research_source_seam as seam
+    from app.research import service
+
+    passage = "NVDA FY2025 Revenue was $46.7 billion."
+    prefix = "An unrelated document introduction.\n"
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-prose": prefix + passage})
+    store = ResearchRepository()
+    handle = {
+        **seam.handle_for_registered(passage),
+        "offset": 0,
+        "section": "income",
+        "query": "Revenue",
+    }
+    filtered = seam.fake_sec_document(
+        seam.DEFAULT_ACCESSION,
+        seam.DEFAULT_DOCUMENT,
+        offset=len(prefix),
+        max_chars=len(passage),
+    )
+    with mock.patch("app.sec.documents.get_sec_document", return_value=filtered) as reload:
+        admitted = service.record_evidence(
+            sid,
+            store.list_jobs(sid)[0].job_id,
+            {
+                "content": passage,
+                "source_name": "SEC",
+                "subject": "NVDA",
+                "source_handle": handle,
+                "matching_passage": passage,
+            },
+            repo=store,
+        )
+        request: dict[str, JSONValue] = {
+            "id": "filtered",
+            "op": "admit_datapoint",
+            "sessionId": sid,
+            "evidenceId": admitted["evidence_id"],
+            "metric": "Revenue",
+            "value": "46.7",
+            "entity": "NVDA",
+            "period": "FY2025",
+            "unit": "billion",
+        }
+        result = kw._direct_op(request, None)
+    assert "error" not in result, result
+    assert reload.call_count == 2
+    assert reload.call_args.kwargs["section"] == "income"
+    assert reload.call_args.kwargs["query"] == "Revenue"
+    eid = admitted["evidence_id"]
+    assert isinstance(eid, str)
+    original = store.get_evidence(eid)
+    metadata = original["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["source_handle"] == handle
+    legacy = {**original, "metadata": {key: value for key, value in metadata.items() if key != "source_handle"}}
+    with mock.patch.object(ResearchRepository, "get_evidence", return_value=legacy):
+        rejected = kw._direct_op(request, None)
+    assert "filtered document view" in str(rejected["error"])
+    assert "datapoint" not in rejected
+
+
+@pytest.mark.parametrize("domain,tool", [("SEC", "get_xbrl_facts"), ("FINRA", "query_finra"), ("WEB", "search_web")])
+def test_admit_datapoint_replays_persisted_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, domain: str, tool: str
+) -> None:
+    from app.research import service
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path / "data"))
+    store = ResearchRepository()
+    sid = service.create_research(
+        "Revenue?",
+        "Revenue?",
+        policy={
+            "research_sources": {"mode": "allowlist", "sources": ["SEC", "FINRA", "WEB"]},
+        },
+        repo=store,
+    )
+    job = str(service.start_job(sid, source=domain, repo=store)["job_id"])
+    passage = "NVDA FY2025 Revenue was 46.7."
+    row = {"symbol": "NVDA", "period": "FY2025", "Revenue": "46.7"}
+    locator = passage if domain == "WEB" else json.dumps(row, sort_keys=True)
+    payload = (
+        {
+            "evidence": [
+                {"url": "https://example.com/decoy", "highlight": passage},
+                {"url": "https://example.com/revenue", "highlight": passage},
+            ]
+        }
+        if domain == "WEB"
+        else {"records": [row]}
+    )
+    ref = service.persist_tool_result(sid, job, tool, "revenue", payload, repo=store)["tool_result_id"]
+    original = service.record_evidence(
+        sid,
+        job,
+        {
+            "content": passage,
+            "source_name": domain,
+            "tool_result_id": ref,
+            "matching_passage": locator,
+            "subject": "NVDA",
+            **({"source_record_id": "https://example.com/revenue"} if domain == "WEB" else {}),
+        },
+        repo=store,
+    )["evidence_id"]
+    service.complete_job(job, repo=store)
+    result = kw._direct_op(
+        {
+            "id": "record",
+            "op": "admit_datapoint",
+            "sessionId": sid,
+            "evidenceId": original,
+            "metric": "Revenue",
+            "value": "46.7",
+            "entity": "NVDA",
+            "period": "FY2025",
+        },
+        None,
+    )
+    assert "error" not in result, result
+    assert result["evidence_id"] != original
+    assert isinstance(result["datapoint"], dict)
+    assert result["datapoint"]["value"] == "46.7"
+    if domain == "WEB":
+        eid = result["evidence_id"]
+        assert isinstance(eid, str)
+        provenance = store.get_evidence(eid)["provenance"]
+        assert isinstance(provenance, dict)
+        assert provenance["url"] == "https://example.com/revenue"
+
+
+def test_admit_datapoint_rejects_numbers_absent_from_source_property(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from hypothesis import given, seed, settings
+    from hypothesis import strategies as st
+
+    import tests.research_source_seam as seam
+
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-prose": "NVDA FY2025 Revenue was $46.7 billion."})
+
+    @seed(20261027)
+    @settings(max_examples=15, deadline=None)
+    @given(st.integers(min_value=100, max_value=999))
+    def check(value: int) -> None:
+        result = kw._direct_op(
+            {
+                "id": "property",
+                "op": "admit_datapoint",
+                "sessionId": sid,
+                "evidenceId": "ev-prose",
+                "metric": "Revenue",
+                "value": str(value),
+                "entity": "NVDA",
+                "period": "FY2025",
+            },
+            None,
+        )
+        assert "error" in result
+        assert "datapoint" not in result
+        assert len(ResearchRepository().list_evidence(sid)) == 1
+
+    check()
 
 
 async def _list_result(*a: object, **k: object) -> object:
@@ -2214,6 +2605,35 @@ def test_final_claim_rejects_fabricated_or_unqualified_wording_before_jev(
     assert ResearchRepository().list_decisions(sid) == []
 
 
+@pytest.mark.parametrize(
+    ("text", "passes"),
+    [
+        ("Float, shares outstanding, and borrowing cost were not found in the evidence.", True),
+        ("The filings do not establish termination triggers.", True),
+        ("The evidence leaves the 2027 outlook unclear.", True),  # an unknown may name a year
+        ("Float is unknown, but NVDA shipped 99,999 units.", False),  # a stray number never rides along
+        ("NVDA float is 2.4 billion shares.", False),  # no unknown wording
+    ],
+)
+def test_qualified_unknown_claims_pass_without_jev(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str, passes: bool
+) -> None:
+    """No evidence can show something is absent, so a qualified unknown never waits on the judge."""
+    import tests.research_source_seam as seam
+
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "TSLA short interest record."})
+
+    async def _unexpected(state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        pytest.fail("An unknown claim must not reach JEV")
+
+    out = kw._assess_final_claim(
+        {"id": "unknown", "sessionId": sid, "claim": {"text": text, "claim_type": "unknown", "evidence_ids": []}},
+        jev=JevClient(transport=_unexpected, data_root=tmp_path),
+    )
+    assert (out.get("support_answer") == "yes") is passes, out
+    assert ("error" in out) is not passes
+
+
 def test_canonical_numeric_claim_skips_jev_arithmetic_approval(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from app.research.evidence import datapoint_descriptor, evidence_from_dict
 
@@ -2283,11 +2703,16 @@ def test_final_evidence_carries_validated_descriptors() -> None:
 
 
 @pytest.mark.parametrize(
-    "objective",
-    ["What is happening with Oracle now", "news for growth this week", "NVDA and CRWV news?"],
+    ("objective", "questions"),
+    [
+        ("What is happening with Oracle now", ["What is happening with Oracle now"]),
+        ("news for growth this week", ["news for growth this week"]),
+        # A comparison gets one node per named company, so each company's filings are read.
+        ("NVDA and CRWV news?", ["NVDA and CRWV news? (NVDA only)", "NVDA and CRWV news? (CRWV only)"]),
+    ],
 )
 def test_graph_entry_needs_no_intake_or_decomposition_even_at_spent_setup_deadline(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, objective: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, objective: str, questions: list[str]
 ) -> None:
     from app.research import service
 
@@ -2301,7 +2726,13 @@ def test_graph_entry_needs_no_intake_or_decomposition_even_at_spent_setup_deadli
     monkeypatch.setattr(kw, "_reasoner_decompose_with_retry", _unexpected)
     sid = kw.run_graph_prompt(objective, jev=JevClient())
     store = ResearchRepository()
-    assert [node.question for node in store.list_nodes(sid)] == [objective]
+    nodes = store.list_nodes(sid)
+    assert sorted(node.question for node in nodes) == sorted(questions)
+    assert [sched._node_subject_ticker(n.question, objective) for n in nodes if "only)" in n.question] in (
+        [],
+        ["NVDA", "CRWV"],
+        ["CRWV", "NVDA"],
+    )
     assert store.get_session(sid).objective == objective
     assert store.list_decisions(sid) == []
     assert store.list_evidence(sid) == []

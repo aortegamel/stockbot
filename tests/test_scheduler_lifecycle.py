@@ -360,6 +360,124 @@ def _run_node(kernel: _Kernel, jev: JevClient) -> dict[str, JSONValue]:
     )
 
 
+def test_finra_latest_record_fans_out_verified_datapoints_the_gate_accepts(tmp_path: Path) -> None:
+    """Each numeric latest_record field becomes a verified datapoint row; envelope counts never do."""
+    import json
+
+    from app.research import service
+    from app.research.agents import parse_grounded_claims
+    from app.research.evidence import datapoint_descriptor, evidence_from_dict
+    from app.tool_runtime import outcome_from_result
+
+    store = ResearchRepository(data_root=tmp_path)
+    sid = service.create_research(
+        "TSLA short interest?", policy={"mode": "allowlist", "sources": ["SEC", "FINRA"]}, repo=store
+    )
+    kernel = sched._default_kernel(store)
+    jid = sched._attempt_job(kernel, sid, "FINRA")
+    row: dict[str, JSONValue] = {
+        "symbolCode": "TSLA",
+        "settlementDate": "2026-10-15",
+        "currentShortPositionQuantity": 69350469,
+        "daysToCoverQuantity": 2.22,
+    }
+    payload: dict[str, JSONValue] = {
+        "dataset_id": "otcMarket/consolidatedShortInterest",
+        "query": {"ticker": "TSLA"},
+        "briefing": None,
+        "metrics": {"fields": {}},
+        "latest_record": row,
+        "returned_count": 5,
+    }
+    ref = service.persist_tool_result(sid, jid, "get_short_interest", None, payload, repo=store)["tool_result_id"]
+    result: dict[str, object] = {**payload, "tool_result_id": ref}
+    outcome = outcome_from_result("get_short_interest", result)
+    attempt = {"result": result, "job_id": jid, "outcome_summary": sched._outcome_summary(outcome), "domain": "FINRA"}
+    eid, progressed, failure = sched._admit_attempt_evidence(
+        kernel, sid, "get_short_interest", attempt, outcome, "sufficient_support"
+    )
+    assert eid is not None and progressed and failure is None
+    points = {
+        str(d["metric"]): (e, d)
+        for e in store.list_evidence(sid)
+        if (d := datapoint_descriptor(evidence_from_dict(e))) is not None
+    }
+    assert {m: d["value"] for m, (_, d) in points.items()} == {
+        "currentShortPositionQuantity": "69350469",
+        "daysToCoverQuantity": "2.22",
+    }
+    row_ev, point = points["currentShortPositionQuantity"]
+    claim = {
+        "text": "TSLA reported currentShortPositionQuantity of 69350469 for 2026-10-15.",
+        "claim_type": "observed_fact",
+        "evidence_ids": [row_ev["evidence_id"]],
+        "datapoint_ids": [point["id"]],
+    }
+    claims = parse_grounded_claims(json.dumps([claim]), frozen=[str(row_ev["evidence_id"])])
+    service.require_verified_claims(store, sid, claims, "assess_final")
+
+
+def test_statement_line_items_fan_out_verified_datapoints_the_gate_accepts(tmp_path: Path) -> None:
+    """Every get_financial_statements line item becomes a verified datapoint; a wrong period never verifies."""
+    import json
+
+    from app.research import service
+    from app.research.agents import parse_grounded_claims
+    from app.research.evidence import datapoint_descriptor, evidence_from_dict
+    from app.tool_runtime import outcome_from_result
+
+    store = ResearchRepository(data_root=tmp_path)
+    sid = service.create_research(
+        "NVDA revenue?", policy={"mode": "allowlist", "sources": ["SEC", "FINRA"]}, repo=store
+    )
+    kernel = sched._default_kernel(store)
+    jid = sched._attempt_job(kernel, sid, "SEC")
+    items: list[JSONValue] = [
+        {"ticker": "NVDA", "period": "2026-01-25 (FY)", "Revenue": 215938000000},
+        {"ticker": "NVDA", "period": "2025-01-26 (FY)", "Revenue": 130497000000},
+        {"ticker": "NVDA", "period": "2026-01-25 (FY)", "Basic": 4.93},
+    ]
+    payload: dict[str, JSONValue] = {
+        "ticker": "NVDA",
+        "cik": 1045810,
+        "statement_type": "income_statement",
+        "text": "label | 2026-01-25 (FY) | 2025-01-26 (FY)\nRevenue | 215938000000 | 130497000000",
+        "line_items": items,
+    }
+    ref = service.persist_tool_result(sid, jid, "get_financial_statements", None, payload, repo=store)
+    result: dict[str, object] = {**payload, "tool_result_id": ref["tool_result_id"]}
+    outcome = outcome_from_result("get_financial_statements", result)
+    attempt = {"result": result, "job_id": jid, "outcome_summary": sched._outcome_summary(outcome), "domain": "SEC"}
+    eid, progressed, failure = sched._admit_attempt_evidence(
+        kernel, sid, "get_financial_statements", attempt, outcome, "sufficient_support"
+    )
+    assert eid is not None and progressed and failure is None
+    points = {
+        (str(d["metric"]), str(d["period"])): (e, d)
+        for e in store.list_evidence(sid)
+        if (d := datapoint_descriptor(evidence_from_dict(e))) is not None
+    }
+    assert {key: d["value"] for key, (_, d) in points.items()} == {
+        ("Revenue", "2026-01-25 (FY)"): "215938000000",
+        ("Revenue", "2025-01-26 (FY)"): "130497000000",
+        ("Basic", "2026-01-25 (FY)"): "4.93",
+    }
+    row_ev, point = points["Revenue", "2026-01-25 (FY)"]
+    for period, ok in (("2026-01-25 (FY)", True), ("2025-01-26 (FY)", False)):
+        claim = {
+            "text": f"NVDA reported Revenue of 215938000000 for {period}.",
+            "claim_type": "observed_fact",
+            "evidence_ids": [row_ev["evidence_id"]],
+            "datapoint_ids": [point["id"]],
+        }
+        claims = parse_grounded_claims(json.dumps([claim]), frozen=[str(row_ev["evidence_id"])])
+        if ok:
+            service.require_verified_claims(store, sid, claims, "assess_final")
+        else:
+            with pytest.raises(ValueError, match="ERR_DATAPOINT"):
+                service.require_verified_claims(store, sid, claims, "assess_final")
+
+
 def test_admit_before_complete_with_finra_domain() -> None:
     import json
 
@@ -6053,6 +6171,16 @@ def test_sec_replay_locator_reads_scalar_rows_and_envelope() -> None:
     }
 
 
+def test_replay_locators_keep_padded_strings_exact() -> None:
+    """Padded table text (a get_financial_statements envelope, a FINRA briefing) still replays byte-exact."""
+    from app.research.evidence import cited_record
+
+    statement = {"statement_type": "income_statement", "text": "      concept  ...   value\n0  Revenues  ...  96221"}
+    assert cited_record({"result": statement}, sched._sec_replay_locator(statement)) == statement
+    row = {"briefing": "short   interest", "symbol": "TSLA"}
+    assert cited_record({"result": {"records": [row]}}, sched._finra_locator({"records": [row]})) == row
+
+
 def test_tool_result_ref_reads_handle_and_result_ids() -> None:
     """A source_handle reference wins over the result-level ids; absent everywhere it stays None."""
     assert sched._tool_result_ref({"source_handle": {"tool_result_id": "h1"}}) == "h1"
@@ -6132,6 +6260,110 @@ def test_objective_company_token_reads_possessive_and_insider_forms(monkeypatch:
     assert sched._objective_company_token("What are FINRA short interest figures?") is None
     assert sched._objective_company_token("Growth slowed last quarter") is None
     assert sched._objective_company_token(None) is None
+
+
+def test_listing_args_take_the_node_subject_without_needle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A child node lists its own company's named forms with no Needle call; a calendar bound still generates."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", {"AMD": "AMD", "NVDA": "NVDA"}.get)
+    registry = sched.build_registry()
+    session: dict[str, JSONValue] = {
+        "session_id": "rs:t",
+        "objective": "Compare NVDA and AMD revenue growth",
+        "temporal_scope": {"mode": "latest-available", "as_of": "2026-10-27T00:00:00Z", "start": None, "end": None},
+    }
+    generated: list[str] = []
+
+    async def needle(*_args: object, **_kwargs: object) -> dict[str, JSONValue]:
+        generated.append("called")
+        return {"tool": "list_sec_filings", "arguments": {"identifier": "NVDA", "start_date": "2024-01-01"}}
+
+    def args(question: str) -> dict[str, JSONValue]:
+        node = {"node_id": "n", "question": question}
+        return asyncio.run(
+            sched._generate_tool_arguments(needle, "list_sec_filings", registry, session, node, [], [], None, _Kernel())
+        )[0]
+
+    child = "AMD total revenue for comparable fiscal quarters and years from 10-K, 10-Q, or earnings 8-K exhibits"
+    assert args(child) == {"identifier": "AMD", "forms": ["10-K", "10-Q", "8-K"]}
+    assert generated == []
+    assert args("NVDA 10-Q filings since 2024")["start_date"] == "2024-01-01"
+    assert generated == ["called"]
+    assert args("AMD 10-Q filings since 2024")["identifier"] == "AMD"
+    assert generated == ["called", "called"]
+
+
+@pytest.mark.parametrize(
+    ("objective", "question", "expected"),
+    [
+        ("Compare NVDA and AMD revenue growth", "AMD total revenue from 10-Q filings", "AMD"),
+        ("Compare NVDA and AMD revenue growth", "[Today UTC 2026-10-27] AMD total revenue from 10-Q filings", "AMD"),
+        ("Compare NVDA and AMD revenue growth", "Compare AMD and NVDA revenue", "NVDA"),
+        ("Compare NVDA and AMD revenue growth", "Total revenue from 10-Q filings", "NVDA"),
+        ("NVDA revenue growth", "NVDA total revenue from 10-Q filings", "NVDA"),
+    ],
+)
+@pytest.mark.parametrize("source", ["intake", "node"])
+def test_child_document_uses_its_own_issuer(
+    objective: str, question: str, expected: str, source: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single child subject selects its filing. Ambiguous children preserve the session issuer."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", {"AMD": "AMD", "NVDA": "NVDA"}.get)
+    session: dict[str, JSONValue] = {"session_id": "s1", "objective": objective, "ticker": "NVDA"}
+    node = {"node_id": "n1", "question": question}
+    accessions = {"NVDA": "0001045810-26-000075", "AMD": "0000002488-26-000075"}
+    stored: dict[str, dict[str, JSONValue]] = {
+        ticker: {
+            "session_id": "s1",
+            "tool_name": "list_sec_filings",
+            "result": {
+                "subject": ticker,
+                "filings": [{"accession_no": accession, "form": "10-Q", "filed_at": "2026-08-01"}],
+            },
+        }
+        for ticker, accession in accessions.items()
+    }
+    attempts: list[dict[str, JSONValue]] = (
+        [
+            {"tool": "list_sec_filings", "error": None, "result": stored[ticker]["result"]}
+            for ticker in [*(ticker for ticker in stored if ticker != expected), expected]
+        ]
+        if source == "node"
+        else [{"tool": "list_sec_filings", "error": "listing failed"}]
+    )
+    kernel = _Kernel(stored if source == "intake" else {})
+    registry = sched.build_registry()
+    schema = sched._schema_for("get_sec_document", registry)
+    assert sched._resolve_persisted_accession("get_sec_document", {}, schema, session, node, attempts, kernel) == {
+        "accession_no": accessions[expected]
+    }
+
+    async def needle(*_args: object, **_kwargs: object) -> dict[str, JSONValue]:
+        return {"tool": "get_sec_document", "arguments": {"accession_no": accessions["NVDA"]}}
+
+    args = asyncio.run(
+        sched._generate_tool_arguments(needle, "get_sec_document", registry, session, node, [], attempts, None, kernel)
+    )[0]
+    assert args["accession_no"] == accessions[expected]
+    if source == "node":
+        listed = sched._listed_filing(session, attempts, node)
+        assert listed is not None and listed[0] == accessions[expected]
+        assert sched._force_open_registry(registry, attempts, [], 0, session, node) is not None
+
+
+@settings(max_examples=30, derandomize=True, deadline=None)
+@given(
+    st.lists(st.sampled_from(["AMD", "NVDA"]), min_size=0, max_size=8),
+    st.sampled_from(["", "[Today UTC 2026-10-27] "]),
+)
+def test_prop_node_issuer_requires_one_distinct_subject(labels: list[str], prefix: str) -> None:
+    """Duplicate labels preserve one subject. Distinct subjects preserve the session issuer."""
+    with mock.patch("app.tools._resolve_company_to_ticker", side_effect={"AMD": "AMD", "NVDA": "NVDA"}.get):
+        expected = labels[0] if labels and len(set(labels)) == 1 else "NVDA"
+        assert sched._node_subject_ticker(prefix + " and ".join(labels), "Compare NVDA and AMD", "NVDA") == expected
 
 
 def test_fallback_sec_args_seeds_entities_and_accession(monkeypatch: pytest.MonkeyPatch) -> None:

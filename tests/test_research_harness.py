@@ -4992,10 +4992,11 @@ def test_invariant_raw_document_is_accepted_and_normalized(tmp_path: Path, monke
     repo = ResearchRepository()
     sid, src = _inv_sid(repo)
     eid = f"{sid}:ev:1"
+    item = {**_svc_item(eid), "source_record_id": "000032019325000079"}
     out = _svc.record_evidence(
         sid,
         src,
-        {**_svc_item(eid), "source_record_id": "000032019325000079"},
+        item,
         repo=repo,
     )
     assert out["evidence_id"] == eid
@@ -5010,6 +5011,10 @@ def test_invariant_raw_document_is_accepted_and_normalized(tmp_path: Path, monke
     assert prov.get("text_hash") == sha256(passage.encode("utf-8")).hexdigest()
     assert out.get("record_kind") == "evidence"
     assert out.get("source_record_id") == "0000320193-25-000079"
+    metadata = out["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["source_handle"] == item["source_handle"]
+    assert repo.get_evidence(eid)["metadata"] == metadata
 
 
 def test_invariant_dossier_summary_is_never_observed_fact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
