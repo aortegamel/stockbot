@@ -2056,7 +2056,7 @@ def test_edgar_get_financial_statements_namespace_regression(monkeypatch: pytest
         assert got["text"] == text
         assert got["cache_hit"] is False
         assert legacy_store[f"financial_statements:T:{statement_type}"]["text"] == "STALE"
-        assert legacy_store[f"financial_statements:v2:T:{statement_type}"]["text"] == text
+        assert legacy_store[f"financial_statements:v5:T:{statement_type}"]["text"] == text
 
     def _fempty(t: object) -> _RealCompany:
         return _company(financials=SimpleNamespace())("U")
@@ -2310,6 +2310,49 @@ def test_edgar_statements_arms(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ec._statement_text("RAW") == "RAW"
     with pytest.raises(RuntimeError, match="^x$"):
         ec._statement_text(_stmt_boom)
+
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {
+            "concept": ["us-gaap_Revenues", "us-gaap_GrossProfit"],
+            "label": ["Revenue", "Gross profit"],
+            "2026-01-25 (FY)": [215938000000.0, 1.5],
+            "2025-01-26 (FY)": [130497000000.0, float("nan")],
+            "level": [2, 2],
+        }
+    )
+    _stmt_frame = SimpleNamespace()
+    setattr(_stmt_frame, "to_dataframe", lambda: frame)  # noqa: B010 - test double: setattr keeps the fake invisible to the checker
+    # Every row and period column, whole numbers without float notation, never pandas' "..." truncation.
+    assert ec._statement_text(_stmt_frame) == (
+        "label | 2026-01-25 (FY) | 2025-01-26 (FY)\nRevenue | 215938000000 | 130497000000\nGross profit | 1.5 | "
+    )
+    # One provable row per line item and period: missing cells, abstract and breakdown rows never become rows.
+    breakdown = pd.concat(
+        [frame, pd.DataFrame({"label": ["United States"], "2026-01-25 (FY)": [1.0], "dimension": [True]})]
+    )
+    # Units come from the statement's own XBRL facts; a concept with two units, or an unknown unit, stays unitless.
+    facts = pd.DataFrame(
+        {
+            "concept": ["us-gaap:Revenues", "us-gaap:GrossProfit", "us-gaap:GrossProfit", "x:Other"],
+            "unit_ref": ["usd", "usd", "shares", "pure"],
+        }
+    )
+    query = SimpleNamespace(to_dataframe=lambda: facts)
+    _stmt_breakdown = SimpleNamespace(xbrl=SimpleNamespace(facts=SimpleNamespace(query=lambda: query)))
+    setattr(_stmt_breakdown, "to_dataframe", lambda: breakdown)  # noqa: B010 - test double: setattr keeps the fake invisible to the checker
+    assert ec._statement_line_items(_stmt_breakdown, "T") == [
+        {"ticker": "T", "period": "2026-01-25 (FY)", "Revenue": 215938000000, "unit": "USD"},
+        {"ticker": "T", "period": "2025-01-26 (FY)", "Revenue": 130497000000, "unit": "USD"},
+        {"ticker": "T", "period": "2026-01-25 (FY)", "Gross profit": 1.5},
+    ]
+    assert ec._statement_line_items(_stmt_frame, "T")[0] == {
+        "ticker": "T",
+        "period": "2026-01-25 (FY)",
+        "Revenue": 215938000000,
+    }
+    assert ec._statement_line_items(_stmt_str, "T") == []
 
     def _f1112_110(t: object) -> _RealCompany:
         return _company(financials=fin)("T")

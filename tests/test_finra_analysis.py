@@ -102,6 +102,14 @@ def test_analysis_tools_never_return_raw_records(
         if tool == "get_threshold_securities"
         else [{"symbolCode": "AAPL", "issueName": "RawCo Inc.", "settlementDate": "2026-08-14"}]
     )
+    if tool == "get_reg_sho_volume":
+        rows = [
+            {
+                "securitiesInformationProcessorSymbolIdentifier": "AAPL",
+                "tradeReportDate": "2026-08-14",
+                "issueName": "RawCo Inc.",
+            }
+        ]
     http["post"].side_effect = [_token_response(), _response(rows)]
 
     result = execute_tool(tool, args, model="test", context=LOCAL_CONTEXT)
@@ -113,7 +121,8 @@ def test_analysis_tools_never_return_raw_records(
     assert result["briefing_source"] == "deterministic_only"
     serialized = json.dumps(result)
     assert '"records":' not in serialized
-    assert "RawCo Inc." not in serialized
+    assert "RawCo Inc." not in json.dumps({key: value for key, value in result.items() if key != "latest_record"})
+    assert result["latest_record"] == rows[0]
 
 
 # ---------------------------------------------------------------------------
@@ -765,3 +774,31 @@ def test_finra_schema_dispatch_parity() -> None:
     assert finra_names <= schema_names, "FINRA schema missing from TOOLS"
     assert set(tools_module._FINRA_HANDLERS) == finra_names, "FINRA dispatch registry out of sync with schemas"
     assert all(callable(h) for h in tools_module._FINRA_HANDLERS.values())
+
+
+@pytest.mark.parametrize(
+    "dataset,symbol,date",
+    [
+        ("otcMarket/consolidatedShortInterest", "symbolCode", "settlementDate"),
+        ("otcMarket/regShoDaily", "securitiesInformationProcessorSymbolIdentifier", "tradeReportDate"),
+    ],
+)
+def test_latest_record_uses_newest_date_and_only_scalars(
+    http: dict[str, MagicMock], dataset: str, symbol: str, date: str
+) -> None:
+    rows = [
+        {symbol: "NVDA", date: "2026-08-12", "quantity": 10},
+        {symbol: "NVDA", date: "2026-08-14", "quantity": 30, "nested": {"v": 1}, "array": [1]},
+        {symbol: "NVDA", date: "2026-08-13", "quantity": 20},
+    ]
+    http["post"].side_effect = [_token_response(), _response(rows)]
+    result = finra_client.query_dataset(dataset, ticker="NVDA")
+    assert "error" not in result, result
+    assert result["latest_record"] == {symbol: "NVDA", date: "2026-08-14", "quantity": 30}
+
+
+def test_market_query_does_not_select_one_latest_record(http: dict[str, MagicMock]) -> None:
+    http["post"].side_effect = [_token_response(), _response(_short_interest_rows())]
+    result = finra_client.query_dataset("otcMarket/consolidatedShortInterest")
+    assert "error" not in result, result
+    assert "latest_record" not in result

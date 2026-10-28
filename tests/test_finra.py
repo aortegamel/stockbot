@@ -225,11 +225,14 @@ def test_short_interest_payload(http: dict[str, MagicMock]) -> None:
     assert result["briefing_source"] == "deterministic_only"
     assert result["total_records"] is None
     assert result["pagination_source"] == "estimate"
-    # The main model's tool message must never contain raw records.
+    # The main model's tool message never contains the raw records list; only the newest row rides
+    # as `latest_record`, the citable source of verified datapoints.
     serialized = json.dumps(result)
     assert '"records":' not in serialized
-    assert '"symbolCode": "AAPL"' not in serialized
-    assert '"issueName": "Apple Inc."' not in serialized
+    without_latest = json.dumps({key: value for key, value in result.items() if key != "latest_record"})
+    assert '"symbolCode": "AAPL"' not in without_latest
+    assert '"issueName": "Apple Inc."' not in without_latest
+    assert result["latest_record"] == records[0]
 
     # posts: one token (catalog auth) + one data query.
     assert http["post"].call_count == 2

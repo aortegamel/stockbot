@@ -8,7 +8,9 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import os
+import re
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
@@ -1169,7 +1171,7 @@ def _fetch_diff_risk_factors(ticker: str) -> dict[str, object]:
 def get_financial_statements(ticker: str, statement_type: str) -> dict[str, object]:
     """Return parsed financial statement (income, balance sheet, or cash flow)."""
     _ensure_init()
-    key = f"financial_statements:v2:{ticker}:{statement_type}"
+    key = f"financial_statements:v5:{ticker}:{statement_type}"
     return _cached_or_fetch(key, lambda: _fetch_financial_statements(ticker, statement_type))
 
 
@@ -1190,18 +1192,97 @@ def _select_statement(financials: object, statement_type: str) -> tuple[object |
     return (stmt() if callable(stmt) else stmt), None
 
 
+def _cell(value: object) -> str:
+    """One table cell: whole numbers without float notation, blanks for missing values."""
+    if isinstance(value, float):
+        if math.isnan(value):
+            return ""
+        return str(int(value)) if value.is_integer() else repr(value)
+    return "" if value is None else str(value)
+
+
 def _statement_text(stmt: object) -> str:
-    """Statement rendered as readable text (raw string when converters fail)."""
+    """Whole statement as `label | <period> ...` rows; pandas' display truncation never applies.
+
+    Metadata columns (concept, level, dimension, ...) drop; every line item and every period column stays.
+    The raw string is the fallback when converters fail.
+    """
     try:
         if hasattr(stmt, "to_dataframe"):
+            import pandas as pd
+
             converter = stmt.to_dataframe
-            return str(converter() if callable(converter) else converter)
+            df = converter() if callable(converter) else converter
+            if not isinstance(df, pd.DataFrame) or "label" not in df.columns:
+                return str(df)
+            periods = [c for c in df.columns if re.match(r"\d{4}-\d{2}-\d{2}", str(c))]
+            lines = [" | ".join(["label", *map(str, periods)])]
+            lines += [" | ".join(_cell(row[c]) for c in ["label", *periods]) for _, row in df.iterrows()]
+            return "\n".join(lines)
         if hasattr(stmt, "to_string"):
             converter = stmt.to_string
             return str(converter() if callable(converter) else converter)
         return str(stmt)
     except AttributeError, TypeError, ValueError:
         return str(stmt)
+
+
+_XBRL_UNITS = {"usd": "USD", "usdpershare": "USD/share", "shares": "shares"}
+"""XBRL unit_ref -> the unit a claim states ($, per share, shares); any other unit stays absent and fails closed."""
+
+
+def _statement_units(stmt: object) -> dict[str, str]:
+    """Concept -> unit from the statement's own XBRL facts; a concept with several units maps to none."""
+    import pandas as pd
+
+    query = getattr(getattr(getattr(stmt, "xbrl", None), "facts", None), "query", None)
+    try:
+        converter = getattr(query(), "to_dataframe", None) if callable(query) else None
+        facts = converter() if callable(converter) else None
+    except AttributeError, KeyError, TypeError, ValueError:
+        return {}
+    if not isinstance(facts, pd.DataFrame) or not {"concept", "unit_ref"} <= set(facts.columns):
+        return {}
+    pairs = facts[["concept", "unit_ref"]].dropna().drop_duplicates()
+    units: dict[str, set[str]] = {}
+    for concept, ref in pairs.itertuples(index=False):
+        units.setdefault(str(concept).replace(":", "_", 1), set()).add(str(ref).casefold())
+    return {
+        c: _XBRL_UNITS[next(iter(refs))]
+        for c, refs in units.items()
+        if len(refs) == 1 and next(iter(refs)) in _XBRL_UNITS
+    }
+
+
+def _statement_line_items(stmt: object, ticker: str) -> list[dict[str, object]]:
+    """One provable `{ticker, period, unit, <label>: value}` row per line item and period; breakdown rows drop.
+
+    The unit comes from the line item's XBRL facts; an unknown or mixed unit leaves the row unitless.
+    """
+    import pandas as pd
+
+    try:
+        converter = getattr(stmt, "to_dataframe", None)
+        df = converter() if callable(converter) else converter
+    except AttributeError, TypeError, ValueError:
+        return []
+    if not isinstance(df, pd.DataFrame) or "label" not in df.columns:
+        return []
+    units = _statement_units(stmt)
+    periods = [c for c in df.columns if re.match(r"\d{4}-\d{2}-\d{2}", str(c))]
+    items: list[dict[str, object]] = []
+    for _, row in df.iterrows():
+        # `in (True,)` matches numpy booleans and leaves a missing (NaN) flag false.
+        if row.get("abstract") in (True,) or row.get("dimension") in (True,):
+            continue
+        unit = units.get(str(row.get("concept")))
+        for period in periods:
+            value = row[period]
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isnan(value):
+                number = int(value) if float(value).is_integer() else float(value)
+                item: dict[str, object] = {"ticker": ticker, "period": str(period), str(row["label"]): number}
+                items.append({**item, "unit": unit} if unit else item)
+    return items
 
 
 def _fetch_financial_statements(ticker: str, statement_type: str) -> dict[str, object]:
@@ -1218,6 +1299,7 @@ def _fetch_financial_statements(ticker: str, statement_type: str) -> dict[str, o
             "ticker": ticker,
             "statement_type": statement_type,
             "text": _statement_text(stmt),
+            "line_items": _statement_line_items(stmt, ticker),
             "source": f"SEC EDGAR {statement_type}",
         }
         if _cik is not None:

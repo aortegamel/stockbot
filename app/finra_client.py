@@ -1012,7 +1012,7 @@ def query_dataset(
     """Query a FINRA dataset and return an analyzed briefing.
 
     The main model receives deterministic metrics, trends, warnings, and
-    (when configured) validated prose — never the raw records.
+    a latest scalar record for ticker queries, plus validated prose when configured.
     """
     try:
         entry = _resolve_dataset(dataset)
@@ -1057,7 +1057,7 @@ def query_dataset(
         pagination=pagination,
     )
     provenance = _provenance_observation(spec=spec, payload=payload, records=records, headers=pagination)
-    return _query_result_row(
+    result = _query_result_row(
         spec,
         ticker,
         start_date,
@@ -1073,6 +1073,12 @@ def query_dataset(
         pagination,
         provenance,
     )
+    if ticker and spec.date_field and as_of:
+        latest = next(row for row in records if _norm_date(row.get(spec.date_field)) == as_of)
+        result["latest_record"] = {
+            key: value for key, value in latest.items() if value is None or isinstance(value, (str, int, float, bool))
+        }
+    return result
 
 
 def _datapoints_fetch_plan(
