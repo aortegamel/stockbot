@@ -486,7 +486,8 @@ Both formats feed the same `{answers, model, usage}` result to the existing pars
 The answer IDs must match the question IDs exactly. Each answer must match its question type, labels, and score range.
 Errors use `decision_request_failed`, `malformed_decision_response`, `malformed_decision_answer`, and `decision answers do not match questions`.
 A noul probability outside [0, 1] keeps the `invalid_probability` error.
-The client makes no retry and uses no fallback model.
+The sidecar (`decision/client.ts`) retries once when `fetch` itself throws, such as on a connection reset, under the same 10-second timeout.
+An HTTP error status never retries. The direct Python HTTP fallback makes no retry. No path uses a fallback model.
 Both formats use the same support policy. Fan-out rules and deterministic evidence gates remain separate.
 
 Noul parsers keep the raw probability. Policy normalization adds `{outcome, probability, strength}`:

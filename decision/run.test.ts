@@ -990,7 +990,8 @@ test("both formats redact redirect parsing, cancellation, fetch, and body errors
         return new Response(new ReadableStream({ start(stream) { stream.error(new Error(message)); } }));
       }));
       expect(released).toBe(true);
-      expect(calls).toHaveLength(failure === "location" || failure === "cancel" ? 1 : 2);
+      // A throwing fetch retries once, so the "fetch" case reaches the hop twice.
+      expect(calls).toHaveLength(failure === "location" || failure === "cancel" ? 1 : failure === "fetch" ? 3 : 2);
       if (!("error" in res)) throw new Error("expected decide error");
       expect(res.error).toStartWith("decide: decision_request_failed:");
       expect(res.error).not.toContain(DECISION_ENV.DECISION_API_KEY);
@@ -1099,6 +1100,30 @@ test("decision provider failures are request failures and never echo the key", a
   expect(leaky.error).toStartWith("decide: decision_request_failed: invalid header value ");
   expect(leaky.error).toContain("Bearer [redacted]");
   expect(leaky.error).not.toContain(DECISION_ENV.DECISION_API_KEY);
+});
+
+test("a thrown fetch retries once; a second throw or an HTTP error status fails", async () => {
+  for (const format of ["chat_completions", "decisions"]) {
+    setDecisionEnv({ DECISION_API_FORMAT: format });
+    const body = format === "decisions" ? { answers: GOOD } : completion(JSON.stringify({ answers: GOOD }));
+    const once: FetchCall[] = [];
+    const recovered = await decide(recordingFetch(once, () => {
+      if (once.length === 1) throw new Error("ECONNRESET");
+      return chat(body);
+    }));
+    expect(once).toHaveLength(2);
+    expect(recovered).toHaveProperty("decisions.truth", { kind: "noul", probability: 0.7 });
+    const twice: FetchCall[] = [];
+    const failed = await decide(recordingFetch(twice, () => {
+      throw new Error("ECONNRESET");
+    }));
+    expect(twice).toHaveLength(2);
+    expect(failed).toEqual({ id: "r1", error: "decide: decision_request_failed: ECONNRESET" });
+    const status: FetchCall[] = [];
+    const http = await decide(recordingFetch(status, () => new Response("busy", { status: 503 })));
+    expect(status).toHaveLength(1);
+    expect(http).toEqual({ id: "r1", error: "decide: decision_request_failed: HTTP 503: busy" });
+  }
 });
 
 test("malformed decision responses are rejected", async () => {

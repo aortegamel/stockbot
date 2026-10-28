@@ -95,8 +95,16 @@ export function createSystemOne(fetchImpl: typeof fetch = fetch): SystemOneFn {
           ...reasoning,
         });
       const signal = AbortSignal.timeout(TIMEOUT_MS);
+      // One retry when fetch itself throws (connection reset or refused), under the same timeout.
+      // An HTTP error status is a Response, so it never retries.
+      let retried = false;
+      const send = (): Promise<Response> => fetchImpl(endpoint, { method, headers, body, redirect: "manual", signal });
       for (let redirects = 0; ; redirects++) {
-        res = await fetchImpl(endpoint, { method, headers, body, redirect: "manual", signal });
+        res = await send().catch((e: unknown) => {
+          if (retried || signal.aborted) throw e;
+          retried = true;
+          return send();
+        });
         if (res.status !== 301 && res.status !== 302 && res.status !== 303
           && res.status !== 307 && res.status !== 308) break;
         const location = res.headers.get("Location");
