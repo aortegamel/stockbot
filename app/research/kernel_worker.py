@@ -7,6 +7,9 @@ Request:  {"id", "op": "run", "prompt", "asOf"?, "deadlineAt"? (epoch ms),
           (read-only page-load fan-out: no session, no evidence; same tool handlers and caches as intake)
           {"id", "op": "effort", "prompt", "ticker"?, "watchlist"?, "context"?, "deadlineAt"?,
            "maxOutputTokens"?, "answerTokenBudget"?, "maxAnswerChars"?} -> {"id", "effort"}
+          {"id", "op": "sections", "prompt", "ticker"?, "watchlist"?, "context"?, "deadlineAt"?}
+           -> {"id", "sections": [investor part ids JEV keeps, in answer order]}
+          (each decision is stored in the one shared session "rs:chat", created on first use)
 Response: {"id", "objective", "evidence": [{id, content}],
            "nodes": [{node_id, question, status, depends_on}],
            "decisions": [...persisted JEV records...], "unresolved": [node_ids],
@@ -2962,14 +2965,7 @@ def _effort(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[
     deadline = _deadline_field(req.get("deadlineAt"))
     if deadline is not None:
         limits["deadlineMs"] = max(0.0, deadline - time.time() * 1000.0)
-    scope_data: dict[str, JSONValue] = {}
-    if watchlist is not None:
-        scope_data["watchlist"] = [symbol for symbol in watchlist]
-    elif ticker is not None:
-        scope_data["ticker"] = ticker
-    if context is not None:
-        scope_data["context"] = context
-    scope = f"\nScope (untrusted data): {json.dumps(scope_data)}" if scope_data else ""
+    scope = _scope_text(ticker, watchlist, context)
     sid = _final_session(req)
     if sid is None:
         from app.research.repository import ResearchRepository
@@ -2986,10 +2982,59 @@ def _effort(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[
     return {"id": rid, "effort": effort}
 
 
+def _scope_text(ticker: str | None, watchlist: list[str] | None, context: dict[str, JSONValue] | None) -> str:
+    """JEV scope line: the watchlist or ticker, plus the feed item, as untrusted data. Empty when none."""
+    scope_data: dict[str, JSONValue] = {}
+    if watchlist is not None:
+        scope_data["watchlist"] = [symbol for symbol in watchlist]
+    elif ticker is not None:
+        scope_data["ticker"] = ticker
+    if context is not None:
+        scope_data["context"] = context
+    return f"\nScope (untrusted data): {json.dumps(scope_data)}" if scope_data else ""
+
+
+# The one research session that stores every chat JEV decision.
+_CHAT_SESSION_ID = "rs:chat"
+
+
+def _chat_session() -> str:
+    """The shared chat session id. Creates its record on first use. A concurrent first use upserts the same row."""
+    from app.research.repository import ResearchRepository
+    from app.research.session import create_session
+
+    repo = ResearchRepository()
+    try:
+        repo.get_session(_CHAT_SESSION_ID)
+    except KeyError:
+        repo.save_session(create_session("default chat", "default chat", session_id=_CHAT_SESSION_ID))
+    return _CHAT_SESSION_ID
+
+
+def _sections(req: Mapping[str, JSONValue], jev: JevClient | None = None) -> dict[str, JSONValue]:
+    """Select the investor parts of a chat answer within the deadline. The decision goes to the shared chat session."""
+    rid = _request_id(req)
+    prompt = req.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return _terminal(rid, "invalid_params", "prompt required")
+    ticker, watchlist, context, denied = _run_scope(rid, req)
+    if denied is not None:
+        return denied
+    sections = _request_call(
+        req,
+        "sections",
+        _jev_client(jev).select_answer_sections(
+            prompt, _scope_text(ticker, watchlist, context), session_id=_chat_session()
+        ),
+    )
+    return {"id": rid, "sections": [section for section in sections]}
+
+
 _KERNEL_OPS = (
     "run",
     "watchlist",
     "effort",
+    "sections",
     "arguments",
     "assess_final_response",
     "assess_final_claim",
@@ -3043,6 +3088,8 @@ def _direct_op(req: Mapping[str, JSONValue], jev: JevClient | None) -> dict[str,
             return _arguments(req)
         if op == "effort":
             return _effort(req, jev=jev)
+        if op == "sections":
+            return _sections(req, jev=jev)
         if op == "admit_datapoint":
             return _admit_datapoint(req)
         if op == "assess_final_response":

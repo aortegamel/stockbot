@@ -3759,6 +3759,66 @@ def test_effort_dispatch_uses_scope_limits_and_strict_choice(
     }
 
 
+def test_sections_dispatch_keeps_parts_at_half_probability_in_answer_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Each part is one noul. 0.50 keeps a part, 0.49 drops it, and the declared order wins over answer order.
+
+    Every decision lands in the one shared chat session, created on first use and reused after.
+    """
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "chat.sqlite"))
+    seen: list[tuple[object, Mapping[str, JSONValue]]] = []
+    probability = {
+        "risks": 0.5,
+        "short_term": 0.9,
+        "long_term": 0.49,
+        "analysts": 1.0,
+        "bull_case": 0.0,
+        "bear_case": 0.7,
+    }
+
+    def transport(state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        seen.append((state, questions))
+        return {"answers": {qid: {"type": "noul", "noul": p} for qid, p in probability.items()}}
+
+    client = JevClient(transport=transport, data_root=tmp_path)
+    request: dict[str, JSONValue] = {
+        "id": "sections-1",
+        "op": "sections",
+        "prompt": "What do the filings say?",
+        "ticker": "NVDA",
+    }
+    parsed, error = kw._request_or_response(json.dumps(request))
+    assert parsed == request and error is None
+    assert kw._direct_op(request, client) == {
+        "id": "sections-1",
+        "sections": ["short_term", "analysts", "bear_case", "risks"],
+    }
+    state, questions = seen[0]
+    assert isinstance(state, dict) and json.loads(state["scope"].split(": ", 1)[1]) == {"ticker": "NVDA"}
+    assert set(questions) == set(probability)
+    kw._direct_op({**request, "id": "sections-2"}, client)
+    store = ResearchRepository()
+    assert store.get_session("rs:chat").query == "default chat"
+    assert [d.decision_type for d in store.list_decisions("rs:chat")] == ["answer_sections", "answer_sections"]
+    assert [s["session_id"] for s in store.list_sessions()] == ["rs:chat"]
+
+
+def test_sections_dispatch_rejects_a_missing_prompt_and_a_malformed_answer(tmp_path: Path) -> None:
+    assert kw._direct_op({"id": "s0", "op": "sections", "prompt": " "}, None)["terminal"] == {
+        "category": "invalid_params",
+        "message": "prompt required",
+    }
+
+    def malformed(state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        return {"answers": {"short_term": {"type": "noul", "noul": 2}}}
+
+    client = JevClient(transport=malformed, data_root=tmp_path)
+    out = kw._direct_op({"id": "s1", "op": "sections", "prompt": "q"}, client)
+    terminal = out["terminal"]
+    assert isinstance(terminal, dict) and terminal["category"] == "provider_error"
+
+
 @pytest.mark.parametrize("key", ["maxOutputTokens", "answerTokenBudget", "maxAnswerChars"])
 @pytest.mark.parametrize("value", [0, -1, True, 1.5, "2000"])
 def test_effort_rejects_invalid_limits_before_jev(monkeypatch: pytest.MonkeyPatch, key: str, value: JSONValue) -> None:

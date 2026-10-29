@@ -154,6 +154,8 @@ export type KernelResponse = {
   reasoning?: string;
   verdict?: string;
   effort?: unknown;
+  // sections op only: investor part ids JEV kept. The chat route validates them.
+  sections?: unknown;
   error?: string;
   content?: string;
   watchlist?: WatchlistRow[];

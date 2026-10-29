@@ -126,6 +126,17 @@ def _is_prob(v: object) -> TypeGuard[int | float]:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0
 
 
+# Investor parts a chat answer can include, in answer order. The chat route keeps the same ids.
+ANSWER_SECTIONS: dict[str, str] = {
+    "short_term": "what the facts can mean for the stock in the next weeks to months",
+    "long_term": "what the facts can mean for the business and the stock over several years",
+    "analysts": "what sell-side analysts expect: price targets, ratings, and estimate changes",
+    "bull_case": "the strongest case that the facts are good for the stock",
+    "bear_case": "the strongest case that the facts are bad for the stock",
+    "risks": "the risks and coming events an investor should watch",
+}
+
+
 def _normalize_probability(value: object) -> dict[str, JSONValue]:
     """Separate support outcome from affirmative strength. Invalid probabilities remain unknown."""
     if not _is_prob(value):
@@ -1726,6 +1737,26 @@ class JevClient:
         if not isinstance(choice, str) or choice not in options:
             raise _malformed("select_answer_effort", "reasoning_effort")
         return choice
+
+    async def select_answer_sections(self, prompt: str, scope: str = "", *, session_id: str) -> list[str]:
+        """Investor parts that fit a chat answer: one independent noul per part, kept at >= 0.50, in declared order."""
+        questions: dict[str, JSONValue] = {
+            section: {
+                "type": "noul",
+                "instructions": (
+                    f"Request: {prompt}{scope} Should a stock-market answer to this request include this part: {meaning} "
+                    "Include it for a question about a company or stock when the part helps an investor see all sides. "
+                    "Exclude it for a question that is not about a company or stock, such as the time or a definition."
+                ),
+            }
+            for section, meaning in ANSWER_SECTIONS.items()
+        }
+        decisions = await self.decide(
+            {"prompt": prompt, "scope": scope}, questions, decision_type="answer_sections", session_id=session_id
+        )
+        return [
+            s for s in ANSWER_SECTIONS if _classify_probability((decisions.get(s) or {}).get("probability")) == "yes"
+        ]
 
     async def select_tool(
         self,
