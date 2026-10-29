@@ -3,12 +3,13 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentEvent, Evidence } from "@/lib/agent/types";
-import type { reason } from "@/lib/muse/client";
+import { ANSWER_SECTIONS, type reason } from "@/lib/muse/client";
 // Capture the production validators before mock.module replaces the kernel.
 import { asksWatchlist, parseTicker, parseWatchlist } from "@/lib/agent/kernel";
 const realParseTicker = parseTicker;
 const realParseWatchlist = parseWatchlist;
 const realAsksWatchlist = asksWatchlist;
+const realAnswerSections = ANSWER_SECTIONS;
 
 type Body = Record<string, unknown>;
 type Event = { type: string;[key: string]: unknown };
@@ -18,6 +19,9 @@ const kernelOpts: unknown[] = [];
 const runCalls: unknown[][] = [];
 const invoked: unknown[][] = [];
 const ended: string[] = [];
+// JEV sections calls, kept apart from the UI-command and effort calls in kernelCalls.
+const sectionCalls: Body[] = [];
+let sectionsReply: Body | Error = { sections: ["short_term", "risks"] };
 let reasonText = "Hello! How can I help?";
 let reasonDown = false;
 let reasonUsage = {};
@@ -51,6 +55,11 @@ mock.module("@/lib/agent/kernel", () => ({
   asksWatchlist: realAsksWatchlist,
   kernelRouter: {
     call: async (body: Body, opts: unknown) => {
+      if (body.op === "sections") {
+        sectionCalls.push(body);
+        if (sectionsReply instanceof Error) throw sectionsReply;
+        return sectionsReply;
+      }
       kernelCalls.push(body);
       kernelOpts.push(opts);
       if (argsDown) throw new Error("needle down");
@@ -66,6 +75,7 @@ mock.module("@/lib/agent/kernel", () => ({
   },
 }));
 mock.module("@/lib/muse/client", () => ({
+  ANSWER_SECTIONS: realAnswerSections,
   reason: async (opts: Parameters<typeof reason>[0]) => {
     reasonCalls.push(opts);
     for (const [name, args] of chatToolCalls) toolOutputs.push(await opts.runTool!(name, args));
@@ -82,6 +92,10 @@ mock.module("@/lib/tools/stockbot", () => ({
     if (name === "update_watchlist") return { ok: true, watchlistUpdate: watchlistReceipt };
     if (name === "add_widget") return { ok: true, widgetSelection: widgetReceipt };
     if (name === "get_sec_document") return { ok: true, evidence: { ...bridgeEvidence, content: "FORM 8-K text", sourceRefs: filingRefs } };
+    if (name === "search_web") return { ok: true, evidence: { ...bridgeEvidence, id: "ev:news", title: "search_web", content: "NVDA news text" } };
+    if (name === "list_sec_filings") return { ok: true, evidence: { ...bridgeEvidence, id: "ev:list", title: "list_sec_filings", content: "NVDA filing list" } };
+    if (name === "get_analyst_estimates") return { ok: true, evidence: { ...bridgeEvidence, id: "ev:analysts", title: "get_analyst_estimates", content: "NVDA analyst consensus" } };
+    if (name === "get_valuation_metrics") return { ok: true, evidence: { ...bridgeEvidence, id: "ev:valuation", title: "get_valuation_metrics", content: "NVDA valuation" } };
     throw new Error(`Unexpected tool: ${name}`);
   },
   describeTools: async (names: string[]) => names.map((name) => ({ name })),
@@ -98,7 +112,8 @@ mock.module("@/lib/tools/stockbot", () => ({
 let directory: string;
 const savedEnv = { debug: process.env.STOCKBOT_DEBUG, model: process.env.OPENCODE_MODEL, data: process.env.STOCKBOT_DATA_DIR, effort: process.env.REASONING_EFFORT, maxOutputTokens: process.env.MUSE_MAX_OUTPUT_TOKENS, answerTokenBudget: process.env.MUSE_ANSWER_TOKEN_BUDGET };
 beforeEach(async () => {
-  reasonCalls.length = kernelCalls.length = kernelOpts.length = runCalls.length = invoked.length = ended.length = toolOutputs.length = 0;
+  reasonCalls.length = kernelCalls.length = kernelOpts.length = runCalls.length = invoked.length = ended.length = toolOutputs.length = sectionCalls.length = 0;
+  sectionsReply = { sections: ["short_term", "risks"] };
   chatToolCalls = [];
   reasonText = "Hello! How can I help?";
   reasonDown = argsDown = toolThrows = endThrows = false;
@@ -140,17 +155,22 @@ async function eventsFor(prompt: string, fields: Body = {}): Promise<Event[]> {
 }
 function expectNoExecution(): void {
   expect(kernelCalls).toEqual([]);
+  expect(sectionCalls).toEqual([]);
   expect(runCalls).toEqual([]);
   expect(reasonCalls).toEqual([]);
   expect(invoked).toEqual([]);
 }
 
 describe("plain chat", () => {
-  test("the default prompt makes one plain call with EDGAR tools and streams its unchanged answer", async () => {
+  test("the default prompt makes one plain call with research tools and streams its unchanged answer", async () => {
     const events = await eventsFor("hello");
     expect(reasonCalls).toHaveLength(1);
-    expect(reasonCalls[0]).toEqual({ prompt: "hello", evidence: [], direct: true, plain: true, tools: expect.any(Array), runTool: expect.any(Function), signal: expect.any(AbortSignal), deadlineAt: expect.any(Number) });
-    expect(reasonCalls[0]?.tools?.map((t) => t.name)).toEqual(["find_sec_entities", "search_sec_filings", "list_sec_filings", "get_sec_filing", "list_sec_documents", "get_sec_document"]);
+    expect(reasonCalls[0]).toEqual({ prompt: "hello", evidence: [], direct: true, plain: true, reasoningEffort: "low", tools: expect.any(Array), runTool: expect.any(Function), sections: ["short_term", "risks"], signal: expect.any(AbortSignal), deadlineAt: expect.any(Number) });
+    expect(sectionCalls).toEqual([{ op: "sections", prompt: "hello", deadlineAt: expect.any(Number) }]);
+    expect(reasonCalls[0]?.tools?.map((t) => t.name)).toEqual([
+      "find_sec_entities", "search_sec_filings", "list_sec_filings", "get_sec_filing", "list_sec_documents", "get_sec_document",
+      "search_web", "get_current_time", "get_material_events", "get_financial_statements", "get_analyst_estimates", "get_valuation_metrics", "get_insider_activity", "get_short_interest",
+    ]);
     expect(kernelCalls).toEqual([]);
     expect(runCalls).toEqual([]);
     expect(invoked).toEqual([]);
@@ -159,14 +179,55 @@ describe("plain chat", () => {
     expect(events[3]).toEqual({ type: "answer_delta", text: reasonText });
     expect(events.at(-1)).toMatchObject({ status: "completed", metrics: { needle: { calls: 0 }, tools: { calls: 0 }, muse: { calls: 1 } } });
   });
-  test("a model tool call reads the filing through the bridge, and the model sees its safe links", async () => {
+  test("a stock in view prefetches news, filings, analysts, and valuation, and every tool source is listed before the plain-text answer", async () => {
     chatToolCalls = [["get_sec_document", { accession_no: "0001045810-26-000078" }]];
+    reasonText = "## Filings\n**8-K** filed Sept 3.\n* Deal agreed.\n- Close expected 2027.\nRevenue fell -5%.";
     const events = await eventsFor("what do the latest filings say", { ticker: "NVDA" });
-    expect(invoked).toEqual([["get_sec_document", { accession_no: "0001045810-26-000078" }, "sess-test", expect.any(Number)]]);
-    expect(toolOutputs).toEqual([`FORM 8-K text\n\nLinks:\n0001045810-26-000078: ${filingRefs.uri}`]);
+    expect(invoked).toEqual([
+      ["search_web", { query: "NVDA stock news", category: "news", start_published_date: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/) }, "sess-test", expect.any(Number)],
+      ["list_sec_filings", { identifier: "NVDA", forms: ["8-K", "10-Q", "10-K"], limit: 10 }, "sess-test", expect.any(Number)],
+      ["get_analyst_estimates", { ticker: "NVDA" }, "sess-test", expect.any(Number)],
+      ["get_valuation_metrics", { ticker: "NVDA" }, "sess-test", expect.any(Number)],
+      ["get_sec_document", { accession_no: "0001045810-26-000078", limit: 6000 }, "sess-test", expect.any(Number)],
+    ]);
+    expect(reasonCalls[0]?.evidence.map((row) => row.content)).toEqual(["NVDA news text", "NVDA filing list", "NVDA analyst consensus", "NVDA valuation"]);
+    expect(sectionCalls).toEqual([{ op: "sections", prompt: "what do the latest filings say", ticker: "NVDA", deadlineAt: expect.any(Number) }]);
+    expect(toolOutputs).toEqual(["FORM 8-K text"]);
     expect(events).toContainEqual({ type: "status", text: "Reading the SEC filing" });
-    expect(events.at(-1)).toMatchObject({ status: "completed", metrics: { needle: { calls: 0 }, tools: { calls: 1 }, muse: { calls: 1 } } });
+    const evidence = events.find((event) => event.type === "evidence") as { evidence: Evidence[] } | undefined;
+    expect(evidence?.evidence.map((row) => row.sources)).toEqual(Array(5).fill([capturedSource]));
+    expect(events.findIndex((event) => event.type === "evidence")).toBeLessThan(events.findIndex((event) => event.type === "answer_delta"));
+    expect(events).toContainEqual({ type: "answer_delta", text: "Filings\n8-K filed Sept 3.\nDeal agreed.\nClose expected 2027.\nRevenue fell -5%." });
+    expect(events.at(-1)).toMatchObject({ status: "completed", metrics: { needle: { calls: 0 }, tools: { calls: 5 }, muse: { calls: 1 } } });
     expect(ended).toEqual(["sess-test"]);
+  });
+  test("a model document read is capped at 6000 characters, and a smaller limit stays", async () => {
+    chatToolCalls = [["get_sec_document", { accession_no: "a", limit: 32000, max_chars: 32000 }], ["get_sec_document", { accession_no: "b", limit: 2000 }]];
+    await eventsFor("hello");
+    expect(invoked.map((call) => call[1])).toEqual([{ accession_no: "a", limit: 6000, max_chars: 32000 }, { accession_no: "b", limit: 2000 }]);
+  });
+  test("a failed prefetch leaves its section out and the chat still answers", async () => {
+    toolFailure = "provider down";
+    const events = await eventsFor("How is it doing?", { ticker: "NVDA" });
+    expect(reasonCalls[0]?.evidence).toEqual([]);
+    expect(events.some((event) => event.type === "evidence")).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: "done", status: "completed", metrics: { tools: { calls: 4 } } });
+  });
+  test.each([
+    ["a thrown call", new Error("jev down")],
+    ["a terminal error", { error: "provider_error", terminal: { category: "provider_error" } }],
+    ["an unknown part", { sections: ["short_term", "buy_now"] }],
+    ["a missing list", {}],
+  ])("%s from JEV keeps every investor part and the chat still answers", async (_name, reply) => {
+    sectionsReply = reply;
+    const events = await eventsFor("hello");
+    expect(reasonCalls[0]?.sections).toEqual(["short_term", "long_term", "analysts", "bull_case", "bear_case", "risks"]);
+    expect(events.at(-1)).toMatchObject({ type: "done", status: "completed" });
+  });
+  test("an empty JEV pick sends no investor parts", async () => {
+    sectionsReply = { sections: [] };
+    await eventsFor("what time is it");
+    expect(reasonCalls[0]?.sections).toEqual([]);
   });
   test("a tool the chat did not offer never reaches the bridge", async () => {
     chatToolCalls = [["update_watchlist", { action: "add", ticker: "NVDA" }]];

@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { reason } from "@/lib/muse/client";
+import { ANSWER_SECTIONS, reason } from "@/lib/muse/client";
 import { asksWatchlist, kernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent } from "@/lib/agent/kernel";
 import { describeTools, endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
-import { ASK_CONTEXT_KINDS, FINAL_PERSONAS, safeSourceUrl, sourceReferences, statusEvent, toolStatus, WIDGET_TYPES, type AgentEvent, type AskContext, type Timings } from "@/lib/agent/types";
+import { ASK_CONTEXT_KINDS, FINAL_PERSONAS, safeSourceUrl, sourceReferences, statusEvent, toolStatus, WIDGET_TYPES, type AgentEvent, type AskContext, type Evidence, type Timings, type ToolResult } from "@/lib/agent/types";
 
 const ROOT = process.cwd().endsWith("needle-harness") ? join(process.cwd(), "..") : process.cwd();
 
@@ -139,16 +139,18 @@ function streamSender(req: Request, controller: ReadableStreamDefaultController<
 
 const SSE_HEADERS = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" };
 
-// Default chat tools: SEC EDGAR lookup and reading only.
-const CHAT_TOOLS = ["find_sec_entities", "search_sec_filings", "list_sec_filings", "get_sec_filing", "list_sec_documents", "get_sec_document"] as const;
-// "<accession>: <url>" lines from a tool's source refs, so the model can link the filings it names.
-function filingLinks(refs: Record<string, unknown> | undefined): string[] {
-  const rows = Array.isArray(refs?.all) ? refs.all : [refs];
-  return [...new Set(rows.flatMap((row: unknown) => {
-    if (!row || typeof row !== "object" || !("uri" in row) || typeof row.uri !== "string" || safeSourceUrl(row.uri) === undefined) return [];
-    const id = "record_id" in row && typeof row.record_id === "string" ? row.record_id : "filing";
-    return [`${id}: ${row.uri}`];
-  }))];
+// Default chat tools: curated read-only research tools.
+const CHAT_TOOLS = [
+  "find_sec_entities", "search_sec_filings", "list_sec_filings", "get_sec_filing", "list_sec_documents", "get_sec_document",
+  "search_web", "get_current_time", "get_material_events", "get_financial_statements", "get_analyst_estimates", "get_valuation_metrics", "get_insider_activity", "get_short_interest",
+] as const;
+// Days of news the chat prefetches for the stock in view.
+const NEWS_DAYS = 30;
+// Chat reads at most this many characters per filing document; the tool default is 12000.
+const CHAT_DOCUMENT_CHARS = 6000;
+// Plain chat shows text as written: drop Markdown emphasis, headings, and bullet markers.
+function plainText(text: string): string {
+  return text.replace(/\*\*|__/g, "").replace(/^[ \t]*(?:#{1,6}|[*+-])[ \t]+/gm, "");
 }
 // Default chat runs no JEV and no research. Only these deterministic command shapes reach a UI tool.
 const WATCHLIST_COMMAND = /\b(?:add|remove)\b/i;
@@ -182,7 +184,7 @@ export async function POST(req: Request): Promise<Response> {
       const timings: Timings = {};
       const { send, flush } = streamSender(req, controller, requestAt, timings);
       const zeroMetrics = (t0: number, calls: number) => ({ totalMs: performance.now() - t0, needle: { calls, totalMs: 0, escalations: 0 }, tools: { calls, totalMs: 0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures: {} });
-      // One plain answer with SEC EDGAR tools: no evidence gates, no inventory. The text shows as written.
+      // One plain answer with read-only research tools: no evidence gates, no inventory.
       const answerPlain = async (): Promise<void> => {
         const t0 = performance.now();
         send({ type: "agent_start", prompt });
@@ -190,23 +192,57 @@ export async function POST(req: Request): Promise<Response> {
         send({ type: "reasoning_start", model: requiredEnv("OPENCODE_MODEL") });
         const sessionId = newSessionId();
         const tools = { calls: 0, totalMs: 0 };
-        const runChatTool = async (name: string, args: Record<string, unknown>): Promise<string> => {
-          // Offering schemas does not bind the model: only an offered EDGAR tool reaches the bridge.
-          if (!(CHAT_TOOLS as readonly string[]).includes(name)) return `error: ${name} is not available in chat`;
+        // Every successful tool row: its captured sources become the list below the answer.
+        const used: Evidence[] = [];
+        const callTool = async (name: string, args: Record<string, unknown>): Promise<ToolResult> => {
           send(statusEvent(toolStatus(name)));
           const started = performance.now();
           tools.calls += 1;
           const result = await invoke(name, args, sessionId, Math.max(deadlineAt - Date.now(), 1));
           tools.totalMs += performance.now() - started;
-          if (!result.ok) return `error: ${result.error}`;
-          const links = filingLinks(result.evidence.sourceRefs);
-          return links.length ? `${result.evidence.content}\n\nLinks:\n${links.join("\n")}` : result.evidence.content;
+          if (result.ok) used.push(result.evidence);
+          return result;
+        };
+        const runChatTool = async (name: string, args: Record<string, unknown>): Promise<string> => {
+          // Offering schemas does not bind the model: only an offered tool reaches the bridge.
+          if (!(CHAT_TOOLS as readonly string[]).includes(name)) return `error: ${name} is not available in chat`;
+          // limit overrides max_chars in the tool, so one field caps every document read.
+          const capped = name === "get_sec_document" ? { ...args, limit: Math.min(typeof args.limit === "number" ? args.limit : CHAT_DOCUMENT_CHARS, CHAT_DOCUMENT_CHARS) } : args;
+          const result = await callTool(name, capped);
+          return result.ok ? result.evidence.content : `error: ${result.error}`;
+        };
+        // The code, not the model, fetches news, the filing list, analyst estimates, and valuation for the stock in view. A failed fetch leaves that section out.
+        const newsTicker = context?.sym ?? (watchlist ? undefined : currentChartTicker);
+        const since = new Date(Date.now() - NEWS_DAYS * 86_400_000).toISOString().slice(0, 10);
+        // JEV keeps the investor parts that fit this request. A failed or malformed pick keeps every part.
+        const pickSections = async (): Promise<string[]> => {
+          try {
+            const reply = await kernelRouter.call({ op: "sections", prompt, ...(newsTicker ? { ticker: newsTicker } : {}), ...contextField, deadlineAt }, { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) });
+            if (reply.error) throw new Error(String(reply.error));
+            const picked: unknown = reply.sections;
+            if (!Array.isArray(picked) || !picked.every((id) => typeof id === "string" && Object.hasOwn(ANSWER_SECTIONS, id))) throw new Error("JEV returned invalid sections.");
+            return picked;
+          } catch (err) {
+            console.warn(`[web] [agent-api] chat sections kept all: ${err instanceof Error ? err.message : String(err)}`);
+            return Object.keys(ANSWER_SECTIONS);
+          }
         };
         try {
-          // ponytail: no live onDelta — a mid-stream transport retry would repeat text; stream once retries are delta-safe.
-          const r = await reason({ prompt, evidence: [], direct: true, plain: true, tools: await describeTools(CHAT_TOOLS), runTool: runChatTool, ...(currentChartTicker && !watchlist ? { ticker: currentChartTicker } : {}), ...contextField, signal: req.signal, deadlineAt });
-          if (!r.prose) throw new Error("The model returned an empty answer.");
-          send({ type: "answer_delta", text: r.prose });
+          const [schemas, prefetched, sections] = await Promise.all([
+            describeTools(CHAT_TOOLS),
+            Promise.all(newsTicker ? [
+              callTool("search_web", { query: `${newsTicker} stock news`, category: "news", start_published_date: since }),
+              callTool("list_sec_filings", { identifier: newsTicker, forms: ["8-K", "10-Q", "10-K"], limit: 10 }),
+              callTool("get_analyst_estimates", { ticker: newsTicker }),
+              callTool("get_valuation_metrics", { ticker: newsTicker }),
+            ] : []),
+            pickSections(),
+          ]);
+          const r = await reason({ prompt, evidence: prefetched.flatMap((row) => (row.ok ? [row.evidence] : [])), direct: true, plain: true, reasoningEffort: "low", tools: schemas, runTool: runChatTool, sections, ...(currentChartTicker && !watchlist ? { ticker: currentChartTicker } : {}), ...contextField, signal: req.signal, deadlineAt });
+          const prose = plainText(r.prose);
+          if (!prose) throw new Error("The model returned an empty answer.");
+          if (used.length) send({ type: "evidence", evidence: used });
+          send({ type: "answer_delta", text: prose });
           send({ type: "done", metrics: { ...zeroMetrics(t0, 0), tools, muse: { calls: 1, totalMs: performance.now() - t0, ...r.usage } }, status: "completed" });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
