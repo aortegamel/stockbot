@@ -16,7 +16,7 @@ const panel: React.CSSProperties = {
   overflow: "hidden",
 };
 const h: React.CSSProperties = {
-  fontSize: 12,
+  fontSize: "var(--fs-label)",
   letterSpacing: "0.06em",
   color: "var(--muted, #93A0B8)",
   marginBottom: 8,
@@ -100,7 +100,7 @@ export function WatchlistPanel({ selected, onSelect, symbols }: { selected: stri
     <div style={{ ...panel, height: "100%", overflowY: "auto" }}>
       <div style={h}>WATCHLIST · DELAYED</div>
       {sourceError && (
-        <p role="alert" style={{ fontSize: 14, color: muted, marginBottom: 8 }}>
+        <p role="alert" style={{ fontSize: "var(--fs-body)", color: muted, marginBottom: 8 }}>
           We could not load this data. <button type="button" className="pill" onClick={() => setSourceAttempt((attempt) => attempt + 1)}>Retry</button>
         </p>
       )}
@@ -124,12 +124,12 @@ export function WatchlistPanel({ selected, onSelect, symbols }: { selected: stri
             borderRadius: 4,
             color: "var(--text, #E6ECF5)",
             cursor: "pointer",
-            fontSize: 14,
+            fontSize: "var(--fs-body)",
           }}
         >
           <b style={{ fontWeight: 600 }}>{sym}</b>
           <span className="num">{prices[sym] == null ? "—" : prices[sym]!.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
-          <span style={{ flexBasis: "100%", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", lineHeight: "16px", color: muted, fontSize: 11 }}>
+          <span style={{ flexBasis: "100%", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", lineHeight: "16px", color: muted, fontSize: "var(--fs-xs)" }}>
             DELAYED
             <span aria-label={`${sym} sources`} style={{ marginLeft: 4 }}>
               {sources
@@ -162,16 +162,16 @@ export function FinancialsPanel({ sym }: { sym: string }) {
     <div style={{ height: "100%", minHeight: 0, overflowY: "auto" }}>
       {loading && <span className="skeleton" role="status" aria-label="Loading filings" aria-busy="true" />}
       {error && (
-        <p role="alert" style={{ fontSize: 14, color: muted }}>
+        <p role="alert" style={{ fontSize: "var(--fs-body)", color: muted }}>
           We could not load this data. <button type="button" className="pill" onClick={retry}>Retry</button>
         </p>
       )}
       {!loading && filings.length === 0 && !error && (
-        <p style={{ fontSize: 14, color: muted }}>No filings for {sym}. Try asking: Summarize the latest {sym} disclosures.</p>
+        <p style={{ fontSize: "var(--fs-body)", color: muted }}>No filings for {sym}. Try asking: Summarize the latest {sym} disclosures.</p>
       )}
       {filings.map((f, i) => (
-        <div key={i} style={{ fontSize: 14, marginBottom: 8, lineHeight: 1.4 }}>
-          <span style={{ color: muted, fontSize: 12 }} title={`updated ${f.updated}`}>
+        <div key={i} style={{ fontSize: "var(--fs-body)", marginBottom: 8, lineHeight: 1.4 }}>
+          <span style={{ color: muted, fontSize: "var(--fs-label)" }} title={`updated ${f.updated}`}>
             filed {f.filed}
           </span>
           <div>
@@ -199,13 +199,13 @@ export function NewsPanel({ sym }: { sym: string }) {
     <div style={{ height: "100%", minHeight: 0, overflowY: "auto" }}>
       {loading && <span className="skeleton" role="status" aria-label="Loading news" aria-busy="true" />}
       {error && (
-        <p role="alert" style={{ fontSize: 14, color: muted }}>
+        <p role="alert" style={{ fontSize: "var(--fs-body)", color: muted }}>
           We could not load this data. <button type="button" className="pill" onClick={retry}>Retry</button>
         </p>
       )}
       {items.map((n, i) => (
-        <div key={i} style={{ fontSize: 14, marginBottom: 8, lineHeight: 1.4 }}>
-          <span style={{ color: muted, fontSize: 12 }}>
+        <div key={i} style={{ fontSize: "var(--fs-body)", marginBottom: 8, lineHeight: 1.4 }}>
+          <span style={{ color: muted, fontSize: "var(--fs-label)" }}>
             {(n.published || "").slice(0, 16)} · {n.source}
           </span>
           <div>
@@ -220,7 +220,7 @@ export function NewsPanel({ sym }: { sym: string }) {
         </div>
       ))}
       {!loading && items.length === 0 && !error && (
-        <p style={{ fontSize: 14, color: muted }}>No news for {sym}. Try asking: What moved {sym} today?</p>
+        <p style={{ fontSize: "var(--fs-body)", color: muted }}>No news for {sym}. Try asking: What moved {sym} today?</p>
       )}
     </div>
   );
@@ -300,7 +300,7 @@ export function SessionPanel({
     <div style={panel}>
       <div style={h}>BACKEND STATE</div>
       {sessions.length === 0 && (
-        <div style={{ fontSize: 12, color: "var(--muted, #7A8599)" }}>no research sessions yet</div>
+        <div style={{ fontSize: "var(--fs-label)", color: "var(--muted, #7A8599)" }}>no research sessions yet</div>
       )}
       {sessions.slice(0, 8).map((s) => (
         <button
@@ -317,23 +317,23 @@ export function SessionPanel({
             borderRadius: 4,
             color: "var(--text, #D5DBE5)",
             cursor: "pointer",
-            fontSize: 12,
+            fontSize: "var(--fs-label)",
           }}
         >
-          <div style={{ ...clip, fontSize: 14, fontWeight: 600 }}>
+          <div style={{ ...clip, fontSize: "var(--fs-body)", fontWeight: 600 }}>
             {sessionTitle(s.query ?? "") || (s.session_id ?? "?").slice(0, 8)}
           </div>
-          <div style={{ ...clip, color: "var(--muted, #7A8599)", fontSize: 12 }}>
+          <div style={{ ...clip, color: "var(--muted, #7A8599)", fontSize: "var(--fs-label)" }}>
             {[s.status ?? "?", s.updated_at && ago(s.updated_at, Date.now())].filter(Boolean).join(" · ")}
           </div>
         </button>
       ))}
       {snapshot && !snapshot.error && (
-        <div style={{ fontSize: 12, marginTop: 6, color: "var(--muted, #7A8599)" }}>
+        <div style={{ fontSize: "var(--fs-label)", marginTop: 6, color: "var(--muted, #7A8599)" }}>
           jobs {jobs.length} · open {open.length} · {String(snapshot.session?.status ?? "?")}
         </div>
       )}
-      {snapshot?.error && <div style={{ fontSize: 12, color: down }}>{snapshot.error}</div>}
+      {snapshot?.error && <div style={{ fontSize: "var(--fs-label)", color: down }}>{snapshot.error}</div>}
     </div>
   );
 }
@@ -344,12 +344,12 @@ export function JournalPanel({ journal, seq }: { journal: JournalPage | null; se
   return (
     <div style={panel}>
       <div style={h}>LOGS · seq {seq}</div>
-      {journal?.error && <div style={{ fontSize: 12, color: down }}>{journal.error}</div>}
-      {!journal && <div style={{ fontSize: 12, color: "var(--muted, #7A8599)" }}>select a session for logs</div>}
+      {journal?.error && <div style={{ fontSize: "var(--fs-label)", color: down }}>{journal.error}</div>}
+      {!journal && <div style={{ fontSize: "var(--fs-label)", color: "var(--muted, #7A8599)" }}>select a session for logs</div>}
       {journal && !journal.error && events.length === 0 && (
-        <div style={{ fontSize: 12, color: "var(--muted, #7A8599)" }}>no journal rows yet</div>
+        <div style={{ fontSize: "var(--fs-label)", color: "var(--muted, #7A8599)" }}>no journal rows yet</div>
       )}
-      <div style={{ maxHeight: 220, overflowY: "auto", fontSize: 12 }}>
+      <div style={{ maxHeight: 220, overflowY: "auto", fontSize: "var(--fs-label)" }}>
         {events.slice(-60).map((e) => (
           <div key={e.event_id ?? `${e.sequence}`} style={{ marginBottom: 4 }}>
             <span style={{ color: "var(--muted, #7A8599)" }}>

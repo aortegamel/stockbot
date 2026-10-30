@@ -101,7 +101,7 @@ export function ChartControls({ params, onChange }: { params?: Record<string, un
   );
 }
 
-const alertStyle = { padding: 16, fontSize: 14, color: "rgba(235,235,245,0.72)" } as const;
+const alertStyle = { padding: 16, fontSize: "var(--fs-body)", color: "rgba(235,235,245,0.72)" } as const;
 
 function PlainAlert({ text, action, label }: { text: string; action?: () => void; label?: string }) {
   return (
@@ -110,7 +110,7 @@ function PlainAlert({ text, action, label }: { text: string; action?: () => void
       {action && label && (
         <button
           onClick={action}
-          style={{ fontSize: 14, padding: "3px 12px", cursor: "pointer", color: "#fff", background: "#0A84FF", border: "none", borderRadius: 999 }}
+          style={{ fontSize: "var(--fs-body)", padding: "3px 12px", cursor: "pointer", color: "#fff", background: "#0A84FF", border: "none", borderRadius: 999 }}
         >
           {label}
         </button>

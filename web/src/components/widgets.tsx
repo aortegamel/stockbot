@@ -26,7 +26,7 @@ export const widgetLabel = (type: string): string => LABELS[type] ?? type;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const muted = { color: "var(--muted, #93A0B8)" } as const;
 const cell = { padding: "0 8px", height: 28, textAlign: "right" } as const;
-const head = { ...cell, ...muted, fontSize: 12, fontWeight: 500 } as const;
+const head = { ...cell, ...muted, fontSize: "var(--fs-label)", fontWeight: 500 } as const;
 
 // Month-over-month close returns keyed by UTC year; a second bar in one month (the live bar) replaces the first.
 export function monthlyReturns(candles: Candle[]): Map<number, (number | null)[]> {
@@ -66,7 +66,7 @@ function MonthlyReturns({ sym }: { sym: string }) {
     <>
       <Status error={error ?? data?.error} empty={years.length === 0 ? `No monthly returns for ${sym}. Try asking about its price history.` : null} retry={retry} />
       {years.length > 0 && (
-        <table className="num" aria-label={`${sym} monthly returns`} style={{ fontSize: 14, borderCollapse: "collapse" }}>
+        <table className="num" aria-label={`${sym} monthly returns`} style={{ fontSize: "var(--fs-body)", borderCollapse: "collapse" }}>
           <thead><tr><th />{MONTHS.map((m) => <th key={m} style={head}>{m}</th>)}</tr></thead>
           <tbody>
             {years.map(([year, row]) => (
@@ -95,7 +95,7 @@ function SeriesTable({ type, sym, columns }: { type: string; sym: string; column
     <>
       <Status error={error ?? data?.error} empty={rows.length === 0 ? `No ${widgetLabel(type).toLowerCase()} data for ${sym}. Try asking about its latest activity.` : null} retry={retry} />
       {rows.length > 0 && (
-        <table className="num" style={{ fontSize: 14, borderCollapse: "collapse", width: "100%" }}>
+        <table className="num" style={{ fontSize: "var(--fs-body)", borderCollapse: "collapse", width: "100%" }}>
           <thead><tr>{columns.map(([key, label]) => <th key={key} style={head}>{label}</th>)}</tr></thead>
           <tbody>
             {rows.map((row, i) => (
@@ -120,7 +120,7 @@ function FilingsTimeline({ sym }: { sym: string }) {
     <>
       <Status error={error ?? data?.error} empty={items.length === 0 ? `No filings for ${sym}. Try asking about its latest disclosures.` : null} retry={retry} />
       {items.map((f, i) => (
-        <div key={i} style={{ fontSize: 14, marginBottom: 8 }}>
+        <div key={i} style={{ fontSize: "var(--fs-body)", marginBottom: 8 }}>
           <span className="num" style={muted}>{f.filed}</span>{" "}
           {f.link ? <a href={f.link} target="_blank" rel="noreferrer" style={{ color: "inherit" }}>{f.title}</a> : f.title}
         </div>
@@ -139,7 +139,7 @@ function Multiples({ sym }: { sym: string }) {
     <>
       <Status error={error ?? d?.error} empty={empty ? `No multiples for ${sym}. Try asking about its earnings.` : null} retry={retry} />
       {d && !error && !d.error && !empty && (
-        <table className="num" style={{ fontSize: 14 }}>
+        <table className="num" style={{ fontSize: "var(--fs-body)" }}>
           <tbody>
             <tr><th style={head}>Price</th><td style={cell}>{num(d.price)}</td></tr>
             <tr><th style={head}>TTM EPS</th><td style={cell}>{num(d.ttm_eps)}</td></tr>
@@ -148,7 +148,7 @@ function Multiples({ sym }: { sym: string }) {
           </tbody>
         </table>
       )}
-      <div style={{ ...muted, fontSize: 12 }}>History unavailable: no point-in-time EPS series.</div>
+      <div style={{ ...muted, fontSize: "var(--fs-label)" }}>History unavailable: no point-in-time EPS series.</div>
     </>
   );
 }

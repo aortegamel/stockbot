@@ -23,7 +23,7 @@ const POLL_MS = 60_000;
 const TICKER = /^[A-Za-z]{1,5}$/;
 const muted = "var(--muted, #7A8599)";
 const down = "var(--down, #EF5350)";
-const small = { fontSize: 12 } as const;
+const small = { fontSize: "var(--fs-label)" } as const;
 
 // POSTs carry no body, but the CSRF guard (web/lan-token.ts) requires a JSON content type on every non-GET /api call.
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
@@ -110,7 +110,7 @@ export function ThesisPanel({ onSelectTicker }: { onSelectTicker: (ticker: strin
               color: "var(--text, #D5DBE5)",
               cursor: "pointer",
               lineHeight: "20px",
-              fontSize: 14,
+              fontSize: "var(--fs-body)",
             }}
           >
             <b style={{ fontWeight: 600 }}>{t.scope}</b> <span style={{ ...small, color: muted }}>{t.status}</span>

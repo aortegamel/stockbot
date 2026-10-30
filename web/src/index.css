@@ -1,5 +1,15 @@
 @import "tailwindcss";
 
+/* Tailwind text utilities at 120% of their defaults, matching the type scale below. */
+@theme {
+  --text-xs: 0.9rem;
+  --text-xs--line-height: 1.2rem;
+  --text-sm: 1.05rem;
+  --text-sm--line-height: 1.5rem;
+  --text-base: 1.2rem;
+  --text-base--line-height: 1.8rem;
+}
+
 :root {
   --bg: #0A0E14;
   --panel: #11161F;
@@ -13,12 +23,12 @@
   --hair: rgba(255,255,255,0.08);
   --fill: rgba(255,255,255,0.06);
   --fill-active: rgba(255,255,255,0.10);
-  /* Type scale: the only font sizes in the app (plus the 13px .brand). */
-  --fs-xs: 11px;
-  --fs-label: 12px;
-  --fs-body: 14px;
-  --fs-num: 15px;
-  --fs-title: 20px;
+  /* Type scale: the only font sizes in the app (plus the 16px .brand). 120% of the original 11/12/14/15/20px. */
+  --fs-xs: 13px;
+  --fs-label: 14px;
+  --fs-body: 17px;
+  --fs-num: 18px;
+  --fs-title: 24px;
   --sp-1: 4px;
   --sp-2: 8px;
   --sp-3: 12px;
@@ -103,7 +113,7 @@ input.pill{cursor:text}
 /* Header: brand, nav, flexible space, palette, health, drawer toggle. */
 .app-header{position:relative;z-index:2;height:var(--h-header);flex-shrink:0}
 .app-header-row{display:flex;align-items:center;gap:var(--sp-3);padding:0 var(--sp-3);height:var(--h-header);width:100%}
-.brand{font-size:13px;font-weight:700;letter-spacing:0.14em;white-space:nowrap;color:var(--text, #E6ECF5)}
+.brand{font-size:16px;font-weight:700;letter-spacing:0.14em;white-space:nowrap;color:var(--text, #E6ECF5)}
 .nav{display:inline-flex;align-items:center;gap:var(--sp-1)}
 .nav .pill{background:transparent}
 .nav .pill:hover{background:var(--fill)}
@@ -136,6 +146,8 @@ input.pill{cursor:text}
 .shell-body{flex:1;min-height:0;display:flex;flex-direction:column;position:relative;z-index:1}
 .shell-body > :first-child{flex:1;min-height:0;min-width:0}
 .drawer{flex:0 0 40%;min-height:240px;margin:0 8px 8px}
+/* Chat text: answers (Tailwind text-sm) and the input row at 15px. */
+.drawer{--fs-body:15px;--text-sm:15px;--text-sm--line-height:1.4}
 .drawer .input,.drawer .btn-primary{height:34px}
 
 /* Markets table: 28px rows, tabular numbers, sticky 11px headers. Tight padding fits a 1440px column. */
@@ -276,7 +288,7 @@ select.ws-tool{padding-right:16px;width:auto}
   border: 1px solid #52525b;
   border-radius: 0.375rem;
   padding: 0.25rem 0.5rem;
-  font-size: 0.75rem;
+  font-size: 0.9rem;
   color: #e4e4e7;
 }
 

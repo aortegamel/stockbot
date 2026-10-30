@@ -76,15 +76,15 @@ export function PortfolioPanel({ onSelectTicker }: { onSelectTicker: (ticker: st
         </button>
       </div>
       <div style={{ padding: "8px 12px" }}>
-        <div style={{ fontSize: 12, color: muted, marginBottom: 8 }}>
+        <div style={{ fontSize: "var(--fs-label)", color: muted, marginBottom: 8 }}>
           {view?.synced_at ? `last sync ${view.synced_at}` : "never synced"}
           {view?.total_value != null && ` · total ${money(view.total_value)}`}
         </div>
-        {error && <div style={{ fontSize: 14, color: down, marginBottom: 8 }}>{error}</div>}
+        {error && <div style={{ fontSize: "var(--fs-body)", color: down, marginBottom: 8 }}>{error}</div>}
         {view && view.positions.length > 0 && (
-          <table className="num" style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+          <table className="num" style={{ width: "100%", borderCollapse: "collapse", fontSize: "var(--fs-body)" }}>
             <thead>
-              <tr style={{ color: muted, fontSize: 12, fontWeight: 500 }}>
+              <tr style={{ color: muted, fontSize: "var(--fs-label)", fontWeight: 500 }}>
                 <th style={{ ...cell, textAlign: "left" }}>Ticker</th>
                 <th style={cell}>Qty</th>
                 <th style={cell}>Avg cost</th>
@@ -115,7 +115,7 @@ export function PortfolioPanel({ onSelectTicker }: { onSelectTicker: (ticker: st
             </tbody>
           </table>
         )}
-        {view && view.positions.length === 0 && <div style={{ fontSize: 14, color: muted }}>no holdings in the last sync</div>}
+        {view && view.positions.length === 0 && <div style={{ fontSize: "var(--fs-body)", color: muted }}>no holdings in the last sync</div>}
       </div>
     </div>
   );
