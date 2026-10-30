@@ -140,7 +140,10 @@ input.pill{cursor:text}
 .ticker-delayed{color:var(--muted, #93A0B8);font-size:var(--fs-xs)}
 .footer-disclaimer{position:relative;white-space:nowrap}
 .footer-disclaimer summary{cursor:pointer;text-decoration:underline}
-.footer-disclaimer p{position:absolute;right:0;bottom:24px;width:360px;margin:0;padding:10px 12px;white-space:normal;background:#141A30;border:1px solid rgba(255,255,255,0.12);border-radius:var(--r-card)}
+.footer-disclaimer p,.ws-help p{position:absolute;right:0;bottom:24px;width:360px;margin:0;padding:10px 12px;white-space:normal;background:#141A30;border:1px solid rgba(255,255,255,0.12);border-radius:var(--r-card)}
+.ws-help{position:relative;z-index:1000;margin-left:auto}
+.ws-help p{top:100%;bottom:auto;visibility:hidden;font-size:var(--fs-label);color:var(--text)}
+.ws-help:hover p,.ws-help:focus-within p{visibility:visible}
 
 /* The shell frames the agent chat outside the workspace. Workspace windows supply their own frame. */
 .shell-body{flex:1;min-height:0;display:flex;flex-direction:column;position:relative;z-index:1}
@@ -240,7 +243,6 @@ input.pill{cursor:text}
 .ws-toolbar{flex-shrink:0;flex-wrap:wrap;padding:6px;border-radius:var(--r-card)}
 .ws-name{width:180px}
 .ws-ticker{width:90px}
-.ws-hint{margin:0 4px;color:var(--muted);font-size:var(--fs-xs)}
 .ws-link-form{flex:0 0 auto;max-height:50%;overflow:auto;padding:8px}
 .ws-viewport{flex:1;min-height:0;min-width:0;border:1px solid var(--hair);border-radius:var(--r-card)}
 .ws-desktop{background-image:radial-gradient(var(--hair) 1px,transparent 1px);background-size:20px 20px}

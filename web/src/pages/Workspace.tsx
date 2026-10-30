@@ -148,6 +148,10 @@ function WorkspaceTabs({ draft, activeId, onSelect, onNew }: { draft: WorkspaceD
         </button>)}
       </div>
       <button type="button" className="pill" aria-label="New workspace" title="New workspace" onClick={onNew}>+</button>
+      <div className="ws-help">
+        <button type="button" className="ws-tool" aria-label="Workspace help" aria-describedby="workspace-help">?</button>
+        <p id="workspace-help" role="tooltip">Drag a title to move a window. Drag an edge to resize it. Use the panel menu to replace its contents.</p>
+      </div>
     </div>
   );
 }
@@ -351,7 +355,6 @@ export default function Workspace(s: ShellState) {
         ? <CreatorForm name={name} setName={setName} fromDefault={fromDefault} setFromDefault={setFromDefault} onCreate={create} onCancel={() => setCreating(false)} />
         : <EditorBar current={current} status={draft.status[current.id]} dirty={dirty} saving={saving} ticker={ticker} setTicker={setTicker}
           onName={(next) => update((doc) => ({ ...doc, name: next }))} onAddSelect={choose} onSave={() => void save()} />}
-      <p className="ws-hint">Drag a title to move a window. Drag an edge to resize it. Use the panel menu to replace its contents.</p>
       {linking && <div className="glass ws-link-form"><TvLinkForm onSubmit={(params) => { add("tv-link", params); setLinking(false); }} onCancel={() => setLinking(false)} /></div>}
       {current.widgets.some((widget) => HOME_TYPES.includes(widget.type))
         ? <HomePanels key={current.id} {...s}>{windows}</HomePanels>

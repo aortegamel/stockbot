@@ -892,6 +892,8 @@ The window picker also offers these panels in other workspaces.
 Drag a window title to move it.
 Drag an edge or corner to resize it.
 The panel menu replaces a window's contents without changing its position or size.
+The **?** control beside the workspace tabs shows these instructions on hover or keyboard focus.
+The instructions do not occupy a workspace row.
 Market windows retain independent tickers.
 The ticker beside Add widget applies only to new windows.
 Watchlist, Portfolio, Agent, Theses, Alerts, Sessions, and Journal use the same window controls.
