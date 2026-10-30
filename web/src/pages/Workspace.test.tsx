@@ -79,7 +79,7 @@ function Page({ events = [], onWidgetOutcomes }: { events?: AgentEvent[]; onWidg
   const [workspace, setWorkspace] = useState<WorkspaceDraft | null>(null);
   return <Workspace selected={selected} pick={(sym) => navigate({ page: "workspace", sym })} watchlist={watchlist} onWatchlist={setWatchlist}
     workspace={workspace} setWorkspace={setWorkspace} events={events} input="" setInput={() => { }} research={false} setResearch={() => { }} setAskContext={() => { }} onSend={() => { }} openDrawer={() => { }} busy={false} debug={false} onWidgetOutcomes={onWidgetOutcomes}
-    sessions={[{ session_id: "s1", status: "done", query: "NVDA research" }]} sessionId={null} setSessionId={() => { }} snapshot={null} journal={null} seq={0} chat={null} />;
+    sessions={[{ session_id: "s1", status: "done", query: "NVDA research" }]} sessionId={null} setSessionId={() => { }} snapshot={null} journal={null} seq={0} chat={<p>Agent chat</p>} />;
 }
 
 async function render(node: ReactNode) {
@@ -138,13 +138,13 @@ describe("Named workspace", () => {
     await render(<Page />);
     expect(find<HTMLInputElement>('[aria-label="Workspace name"]').value).toBe("default");
     expect(container().querySelector('[aria-label="Market indexes"]')).not.toBeNull();
-    await click(button("New workspace"));
+    await click(button("+"));
     await type('[aria-label="Workspace name"]', "  Earnings  ");
     await click(button("Create workspace"));
     expect(container().querySelectorAll(".ws-widget")).toHaveLength(0);
     expect(container().querySelector('form[aria-label="TradingView link"]')).toBeNull();
     await add("monthly-returns");
-    await click(button("New workspace"));
+    await click(button("+"));
     await type('[aria-label="Workspace name"]', "Risk");
     await click(button("Create workspace"));
     expect(container().querySelector('[aria-label="Monthly returns · NVDA"]')).toBeNull();
@@ -173,7 +173,7 @@ describe("Named workspace", () => {
     await render(<Page />);
     expect(button("Research")).not.toBeNull();
     await key(find('[aria-label="Move or resize News · AAPL"]'), "ArrowRight");
-    await click(button("New workspace"));
+    await click(button("+"));
     await type('[aria-label="Workspace name"]', "Copy");
     await click(find('input[type="checkbox"]'));
     await click(button("Create workspace"));
@@ -194,7 +194,7 @@ describe("Named workspace", () => {
     await click(button("Save"));
     expect(server.docs[DEFAULT_WORKSPACE_ID].widgets).toHaveLength(2);
     expect(server.docs[DEFAULT_WORKSPACE_ID].widgets.find((w) => w.type === "news")?.geometry.x).toBe(50);
-    await click(button("New workspace"));
+    await click(button("+"));
     expect(find<HTMLInputElement>('input[type="checkbox"]').checked).toBe(false);
     await type('[aria-label="Workspace name"]', "Blank");
     await click(button("Create workspace"));
@@ -370,7 +370,7 @@ describe("Named workspace", () => {
     expect(text()).not.toContain("Old evidence");
     expect(text()).toContain("NVDA research");
     expect(text()).toContain("select a session for logs");
-    expect(text()).toContain("Open agent");
+    expect(find('[data-widget-type="agent"]').textContent).toContain("Agent chat");
     expect(container().querySelectorAll(".ws-widget")).toHaveLength(7);
   });
 

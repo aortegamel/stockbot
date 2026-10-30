@@ -896,7 +896,12 @@ Market windows retain independent tickers.
 The ticker beside Add widget applies only to new windows.
 Watchlist, Portfolio, Agent, Theses, Alerts, Sessions, and Journal use the same window controls.
 
-Create a named workspace with New workspace.
+The default workspace starts with Watchlist, Portfolio, Price & volume, Markets, Company details, Market indexes, News, and Agent.
+Company details starts on its window ticker. A Markets row click switches it to that row.
+The client sizes that starter layout to the browser window once, when it builds the layout.
+The Agent window replaces the agent drawer, so chat moves and resizes like other windows.
+
+Create a named workspace with the **+** button after the workspace tabs.
 New workspaces start empty.
 Select **Start from default** to copy the current default workspace.
 The copy includes unsaved window edits, positions, sizes, tickers, and panel settings.

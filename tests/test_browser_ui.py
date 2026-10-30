@@ -951,23 +951,23 @@ def test_default_workspace_template_copies_current_windows(browser: webdriver.Ch
     browser.find_element(By.XPATH, "//*[@role='tab'][text()='default']").click()
     wait.until(EC.visibility_of_element_located((By.LINK_TEXT, "Workspaces: default")))
     assert not browser.find_elements(By.LINK_TEXT, "Home")
-    assert len(browser.find_elements(By.CSS_SELECTOR, ".ws-widget")) == 7
-    browser.find_element(By.CSS_SELECTOR, 'button[aria-label="Close agent drawer"]').click()
-    title = browser.find_element(By.CSS_SELECTOR, '[data-widget-type="index-tape"] .ws-window-title')
+    assert len(browser.find_elements(By.CSS_SELECTOR, ".ws-widget")) == 8
+    assert not browser.find_elements(By.CSS_SELECTOR, '[aria-label="Agent drawer"]')
+    title = browser.find_element(By.CSS_SELECTOR, '[data-widget-type="watchlist"] .ws-window-title')
     title.send_keys(Keys.ARROW_RIGHT)
-    browser.find_element(By.CSS_SELECTOR, 'button[aria-label="Remove Market briefing"]').click()
-    browser.find_element(By.XPATH, "//button[text()='New workspace']").click()
+    browser.find_element(By.CSS_SELECTOR, 'button[aria-label="Remove Market indexes"]').click()
+    browser.find_element(By.CSS_SELECTOR, 'button[aria-label="New workspace"]').click()
     browser.find_element(By.CSS_SELECTOR, 'input[aria-label="Workspace name"]').send_keys("Default copy")
     browser.find_element(By.CSS_SELECTOR, 'input[type="checkbox"]').click()
     browser.find_element(By.XPATH, "//button[text()='Create workspace']").click()
     wait.until(EC.visibility_of_element_located((By.LINK_TEXT, "Workspaces: Default copy")))
-    assert len(browser.find_elements(By.CSS_SELECTOR, ".ws-widget")) == 6
-    assert not browser.find_elements(By.CSS_SELECTOR, '[data-widget-type="briefing"]')
+    assert len(browser.find_elements(By.CSS_SELECTOR, ".ws-widget")) == 7
+    assert not browser.find_elements(By.CSS_SELECTOR, '[data-widget-type="index-tape"]')
     browser.find_element(By.XPATH, "//button[text()='Save']").click()
     wait.until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='Save']")))
     copied = saves.get(timeout=10)
     assert isinstance(copied["widgets"], list)
-    assert next(widget for widget in copied["widgets"] if widget["type"] == "index-tape")["geometry"]["x"] == 10
+    assert next(widget for widget in copied["widgets"] if widget["type"] == "watchlist")["geometry"]["x"] == 10
     browser.find_element(By.XPATH, "//*[@role='tab'][normalize-space()='default *']").click()
     browser.find_element(By.XPATH, "//button[text()='Save']").click()
     original = saves.get(timeout=10)
@@ -978,7 +978,7 @@ def test_default_workspace_template_copies_current_windows(browser: webdriver.Ch
     assert {widget["type"]: widget["geometry"] for widget in copied["widgets"]} == {
         widget["type"]: widget["geometry"] for widget in original["widgets"]
     }
-    browser.find_element(By.XPATH, "//button[text()='New workspace']").click()
+    browser.find_element(By.CSS_SELECTOR, 'button[aria-label="New workspace"]').click()
     assert not browser.find_element(By.CSS_SELECTOR, 'input[type="checkbox"]').is_selected()
     browser.find_element(By.CSS_SELECTOR, 'input[aria-label="Workspace name"]').send_keys("Empty desk")
     browser.find_element(By.XPATH, "//button[text()='Create workspace']").click()

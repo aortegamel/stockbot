@@ -40,15 +40,36 @@ function windowOf(type: string, ticker: string, index: number): WorkspaceWidget 
   };
 }
 
+// The default tiles the browser window once, at creation. Saved layouts keep their saved pixels.
+// 58 px: workspace padding, viewport border, and the 40 px desktop margin in WidgetGrid. 258 px: shell and toolbar chrome plus that margin.
 function defaultWorkspace(ticker: string): WorkspaceDoc {
+  const g = 8;
+  // Proportions come from the user's saved 2502x1190 layout. 1240 px keeps every window at the server's 280 px minimum width.
+  const w = Math.max(1240, window.innerWidth - 58);
+  const h = Math.max(640, window.innerHeight - 258);
+  const right = Math.round(w * 0.3);
+  const rightX = w - right;
+  const left = Math.max(280, Math.round(w * 0.14));
+  const chartX = left + g;
+  const top = Math.round(h * 0.55);
+  const bottomY = top + g;
+  const bottom = h - bottomY;
+  const portfolio = Math.max(280, Math.round(w * 0.2));
+  const marketsX = portfolio + g;
+  const detail = Math.max(280, Math.round(w * 0.2));
+  const detailX = rightX - g - detail;
+  const tape = 180;
+  const news = Math.round((h - tape - g) * 0.4);
+  const agentY = tape + g + news + g;
   const initial = [
-    ["index-tape", 0, 0, 1364, 180],
-    ["spy-chart", 0, 192, 880, 300],
-    ["briefing", 892, 192, 472, 300],
-    ["scans", 0, 504, 280, 400],
-    ["markets", 292, 504, 700, 400],
-    ["market-detail", 1004, 504, 360, 300],
-    ["portfolio", 1004, 816, 360, 300],
+    ["watchlist", 0, 0, left, top],
+    ["price-volume", chartX, 0, rightX - g - chartX, top],
+    ["portfolio", 0, bottomY, portfolio, bottom],
+    ["markets", marketsX, bottomY, detailX - g - marketsX, bottom],
+    ["market-detail", detailX, bottomY, detail, bottom],
+    ["index-tape", rightX, 0, right, tape],
+    ["news", rightX, tape + g, right, news],
+    ["agent", rightX, agentY, right, h - agentY],
   ] as const;
   return {
     id: DEFAULT_WORKSPACE_ID, name: "default", updated_at: null,
@@ -110,7 +131,7 @@ function extraPanel(s: ShellState, widget: WorkspaceWidget) {
   switch (widget.type) {
     case "watchlist": return <WatchlistChatPanel selected={s.selected} onSelect={s.pick} events={s.events} onChange={s.onWatchlist} symbols={s.watchlist} />;
     case "portfolio": return <PortfolioPanel onSelectTicker={s.pick} />;
-    case "agent": return s.chat ?? <button type="button" className="pill" onClick={s.openDrawer}>Open agent</button>;
+    case "agent": return s.chat;
     case "theses": return <ThesisPanel onSelectTicker={s.pick} />;
     case "alerts": return <AlertsPanel sym={widget.ticker} />;
     case "sessions": return <SessionPanel sessions={s.sessions} sessionId={s.sessionId} onSelect={s.setSessionId} snapshot={s.snapshot} />;
@@ -126,7 +147,7 @@ function WorkspaceTabs({ draft, activeId, onSelect, onNew }: { draft: WorkspaceD
           {doc.name || "Untitled"}{draft.dirty.includes(doc.id) ? " *" : ""}
         </button>)}
       </div>
-      <button type="button" className="pill" onClick={onNew}>New workspace</button>
+      <button type="button" className="pill" aria-label="New workspace" title="New workspace" onClick={onNew}>+</button>
     </div>
   );
 }
@@ -314,8 +335,8 @@ export default function Workspace(s: ShellState) {
     if (value === "tv-link") setLinking(true);
     else if (WORKSPACE_TYPES.includes(value)) add(value);
   };
-  const windows = (renderHome: (type: string) => ReactNode) => (
-    <WidgetGrid key={current.id} widgets={current.widgets} renderExtra={(widget) => renderHome(widget.type) ?? extraPanel(s, widget)}
+  const windows = (renderHome: (type: string, ticker?: string) => ReactNode) => (
+    <WidgetGrid key={current.id} widgets={current.widgets} renderExtra={(widget) => renderHome(widget.type, widget.ticker) ?? extraPanel(s, widget)}
       onChange={(widgets) => update((doc) => ({ ...doc, widgets }))}
       onRemove={(id) => update((doc) => ({ ...doc, widgets: doc.widgets.filter((w) => w.id !== id) }))}
       onParams={(id, params) => update((doc) => ({ ...doc, widgets: doc.widgets.map((w) => w.id === id ? { ...w, params } : w) }))}

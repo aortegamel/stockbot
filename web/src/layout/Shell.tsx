@@ -374,9 +374,8 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
     setDrawer(true);
     void onSend(text);
   };
-  const chat = drawer ? (
-    <AIPanel events={events} input={input} setInput={setInput} research={research} setResearch={setResearch} context={askContext} onClearContext={() => setAskContext(null)} onSend={() => void onSend()} sym={selected} busy={busy} debug={debug} widgetOutcomes={widgetOutcomes} />
-  ) : null;
+  // The chat stays mounted for a windowed Agent. The drawer toggle gates only the docked aside.
+  const chat = <AIPanel events={events} input={input} setInput={setInput} research={research} setResearch={setResearch} context={askContext} onClearContext={() => setAskContext(null)} onSend={() => void onSend()} sym={selected} busy={busy} debug={debug} widgetOutcomes={widgetOutcomes} />;
   const state: ShellState = {
     selected, pick, watchlist, onWatchlist, events, input, setInput, research, setResearch, setAskContext, onSend: () => void onSend(),
     busy, debug, sessions, sessionId, setSessionId, snapshot, journal, seq, openDrawer: () => setDrawer(true), ask, onWidgetOutcomes, chat,
@@ -442,7 +441,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
 
       <div className="shell-body">
         {children(route, state)}
-        {!windowedAgent && chat && <aside className="glass ws-cell drawer" aria-label="Agent drawer">{chat}</aside>}
+        {drawer && !windowedAgent && <aside className="glass ws-cell drawer" aria-label="Agent drawer">{chat}</aside>}
       </div>
 
       <footer className="app-footer">

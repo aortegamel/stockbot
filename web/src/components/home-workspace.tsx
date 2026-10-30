@@ -7,7 +7,7 @@ export const HOME_TYPES = ["index-tape", "spy-chart", "briefing", "scans", "mark
 const MAX_ROWS = 200;
 
 type Props = Pick<ShellState, "watchlist" | "onWatchlist" | "setInput" | "setAskContext" | "openDrawer"> & {
-  children: (render: (type: string) => ReactNode) => ReactNode;
+  children: (render: (type: string, ticker?: string) => ReactNode) => ReactNode;
 };
 
 export default function HomePanels(s: Props) {
@@ -23,8 +23,9 @@ export default function HomePanels(s: Props) {
   const syms = custom && scan.filter.symbols?.length ? scan.filter.symbols : s.watchlist;
   const markets = useLoad(`${scanId}|${syms.join(",")}|${sort}`, (signal) => fetchMarkets(scanId, syms, sort, signal));
   const rows = markets.data?.rows ?? [];
-  const sel = picked ?? rows[0]?.sym;
-  return s.children((type) => {
+  // A Markets row click wins. Otherwise each window shows its own ticker, so a new default shows one company everywhere.
+  return s.children((type, ticker) => {
+    const sel = picked ?? ticker ?? rows[0]?.sym;
     switch (type) {
       case "index-tape": return <IndexTape load={indexes} syms={idxSyms.slice(1)} />;
       case "spy-chart": return <SpyChart load={indexes} />;

@@ -67,11 +67,11 @@ function state(over: Partial<Props> = {}): Props {
   return { watchlist: ["NVDA", "AAPL"], onWatchlist: () => { }, setInput: () => { }, setAskContext: () => { }, openDrawer: () => { }, ...over };
 }
 
-async function mount(s: Props): Promise<HTMLElement> {
+async function mount(s: Props, ticker?: string): Promise<HTMLElement> {
   const container = dom.window.document.getElementById("root");
   if (!container) throw new Error("missing test root");
   mounted = createRoot(container);
-  await act(async () => mounted?.render(<HomePanels {...s}>{(render) => HOME_TYPES.map((type) => <div key={type}>{render(type)}</div>)}</HomePanels>));
+  await act(async () => mounted?.render(<HomePanels {...s}>{(render) => HOME_TYPES.map((type) => <div key={type}>{render(type, ticker)}</div>)}</HomePanels>));
   return container;
 }
 
@@ -168,6 +168,15 @@ describe("Workspace market overview", () => {
     await click(button(root, "Hide summary"));
     expect(text(detail())).not.toContain("Insider buys 90d");
     expect(dom.window.localStorage.getItem("stockbot.home.summary")).toBe("hidden");
+  });
+
+  test("detail starts on the window ticker, not the first row", async () => {
+    serve();
+    const root = await mount(state(), "GME");
+    await until(() => root.querySelector('[aria-label="GME detail"]') !== null);
+    const nvda = [...root.querySelectorAll("tbody tr")].find((tr) => tr.textContent?.includes("NVDA"))!;
+    await click(nvda);
+    expect(root.querySelector('[aria-label="NVDA detail"]')).not.toBeNull();
   });
 
   test("an empty scan shows one line with a suggested prompt", async () => {

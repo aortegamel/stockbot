@@ -238,13 +238,14 @@ describe("App terminal shell", () => {
     expect(findLink(root, "Home")).toBeNull();
     expect(findLink(root, "Workspaces: default")?.getAttribute("aria-current")).toBe("page");
     expect([...root.querySelectorAll(".ws-widget")].map((panel) => panel.getAttribute("data-widget-type")).sort()).toEqual([
-      "briefing", "index-tape", "market-detail", "markets", "portfolio", "scans", "spy-chart",
+      "agent", "index-tape", "market-detail", "markets", "news", "portfolio", "price-volume", "watchlist",
     ]);
     const warning = new dom.window.Event("beforeunload", { cancelable: true });
     dom.window.dispatchEvent(warning);
     expect(warning.defaultPrevented).toBe(false);
-    expect(root.querySelector('[aria-label="Agent drawer"]')).not.toBeNull();
-    await click(button(root, "New workspace"));
+    expect(root.querySelector('[aria-label="Agent drawer"]')).toBeNull();
+    expect(root.querySelector('[data-widget-type="agent"]')).not.toBeNull();
+    await click(button(root, "+"));
     await type(find<HTMLInputElement>(root, 'input[aria-label="Workspace name"]'), "Empty");
     await click(button(root, "Create workspace"));
     expect(root.querySelectorAll(".ws-widget")).toHaveLength(0);
@@ -983,19 +984,21 @@ describe("App command bar", () => {
     await until(() => findButton(root, "Send") !== null);
   });
 
-  test("the drawer toggle persists its state in localStorage", async () => {
+  test("the drawer toggle persists its state and never empties the windowed agent", async () => {
     serve();
     let root = await mount(<App />);
+    await until(() => root.querySelector('[data-widget-type="agent"]') !== null);
     const toggle = find<HTMLButtonElement>(root, '[aria-label="Close agent drawer"]');
     expect(toggle.querySelector("svg")).not.toBeNull();
     await click(toggle);
     expect(dom.window.localStorage.getItem("stockbot.drawer")).toBe("closed");
-    expect(root.querySelector(AGENT_PROMPT)).toBeNull();
+    expect(root.querySelector(`[data-widget-type="agent"] ${AGENT_PROMPT}`)).not.toBeNull();
     await unmount();
     root = await mount(<App />);
-    expect(root.querySelector(AGENT_PROMPT)).toBeNull();
+    await until(() => root.querySelector('[data-widget-type="agent"]') !== null);
+    expect(root.querySelector(`[data-widget-type="agent"] ${AGENT_PROMPT}`)).not.toBeNull();
     await click(find<HTMLButtonElement>(root, '[aria-label="Open agent drawer"]'));
     expect(dom.window.localStorage.getItem("stockbot.drawer")).toBe("open");
-    expect(root.querySelector(AGENT_PROMPT)).not.toBeNull();
+    expect(root.querySelector('[aria-label="Agent drawer"]')).toBeNull();
   });
 });
