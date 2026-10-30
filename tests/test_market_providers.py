@@ -1525,15 +1525,28 @@ def test_scans_reject_invalid_payloads(agg: dict[str, object], payload: dict[str
     assert not (_root(agg) / "scans").exists()
 
 
-def test_workspace_never_saved_reads_empty(agg: dict[str, object]) -> None:
-    res = TestClient(app).get("/api/workspaces/nvda")
-    assert res.status_code == 200
-    assert res.json() == {"sym": "NVDA", "widgets": [], "updated_at": None}
-    assert not (_root(agg) / "workspaces").exists()
+_WORKSPACE_ID = "a16ec102-2e68-49fb-b818-e9671a3d2474"
+_GEOMETRY = {"x": 0, "y": 100, "width": 640, "height": 480}
+
+
+def test_workspace_collection_ignores_legacy_files(agg: dict[str, object]) -> None:
+    legacy = _root(agg) / "workspaces"
+    legacy.mkdir()
+    path = legacy / "NVDA.json"
+    path.write_text("not valid JSON")
+    client = TestClient(app)
+    assert client.get("/api/workspaces").json() == {"workspaces": []}
+    assert client.get("/api/workspaces/NVDA").status_code == 405
+    assert not (_root(agg) / "named-workspaces").exists()
+    assert path.read_text() == "not valid JSON"
 
 
 def test_workspace_put_round_trip(agg: dict[str, object]) -> None:
     client = TestClient(app)
+    legacy = _root(agg) / "workspaces"
+    legacy.mkdir()
+    old = legacy / "NVDA.json"
+    old.write_text('{"widgets": []}')
     tv = {"url": "https://www.tradingview.com/x/8ot166mV/", "label": "NVDA snapshot"}
     widgets = [
         {
@@ -1541,41 +1554,47 @@ def test_workspace_put_round_trip(agg: dict[str, object]) -> None:
             "type": "price-volume",
             "ticker": "nvda",
             "params": {"interval": "1h", "style": "line", "studies": ["MA50"]},
+            "geometry": _GEOMETRY,
         },
-        {"id": "w2", "type": "short-volume", "ticker": "NVDA"},
-        {"id": "tv-link-1", "type": "tv-link", "ticker": "NVDA", "params": tv},
+        {"id": "w2", "type": "short-volume", "ticker": "NVDA", "geometry": _GEOMETRY},
+        {"id": "tv-link-1", "type": "tv-link", "ticker": "NVDA", "params": tv, "geometry": _GEOMETRY},
         {
             "id": "tv-link-2",
             "type": "tv-link",
             "ticker": "NVDA",
             "params": {**tv, "url": "https://tradingview.com/chart/?symbol=NASDAQ%3ANVDA"},
+            "geometry": _GEOMETRY,
         },
     ]
-    res = client.put("/api/workspaces/nvda", json={"widgets": widgets})
+    res = client.put(f"/api/workspaces/{_WORKSPACE_ID}", json={"name": "  Research  ", "widgets": widgets})
     assert res.status_code == 200
     body = res.json()
-    assert body["sym"] == "NVDA"
-    assert body["widgets"] == [
-        {
-            "id": "w1",
-            "type": "price-volume",
-            "ticker": "NVDA",
-            "params": {"interval": "1h", "style": "line", "studies": ["MA50"]},
-        },
-        {"id": "w2", "type": "short-volume", "ticker": "NVDA"},
-        {"id": "tv-link-1", "type": "tv-link", "ticker": "NVDA", "params": tv},
-        {
-            "id": "tv-link-2",
-            "type": "tv-link",
-            "ticker": "NVDA",
-            "params": {**tv, "url": "https://tradingview.com/chart/?symbol=NASDAQ%3ANVDA"},
-        },
-    ]
+    assert body["id"] == _WORKSPACE_ID
+    assert body["name"] == "Research"
+    assert body["widgets"] == [{**widget, "ticker": "NVDA"} for widget in widgets]
     assert isinstance(body["updated_at"], str) and body["updated_at"].endswith("+00:00")
-    assert json.loads((_root(agg) / "workspaces" / "NVDA.json").read_text()) == body
-    assert client.get("/api/workspaces/NVDA").json() == body
-    assert client.put("/api/workspaces/NVDA", json={"widgets": []}).json()["widgets"] == []
-    assert client.get("/api/workspaces/nvda").json()["widgets"] == []
+    assert json.loads((_root(agg) / "named-workspaces" / f"{_WORKSPACE_ID}.json").read_text()) == body
+    assert client.get("/api/workspaces").json() == {"workspaces": [body]}
+    second_id = "375eb936-e12d-4c20-ac9d-9e91ac2f0008"
+    second = client.put(f"/api/workspaces/{second_id}", json={"name": "Other", "widgets": []})
+    assert second.status_code == 200
+    assert {doc["id"] for doc in client.get("/api/workspaces").json()["workspaces"]} == {_WORKSPACE_ID, second_id}
+    updated = client.put(f"/api/workspaces/{_WORKSPACE_ID}", json={"name": "Renamed", "widgets": []})
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "Renamed"
+    assert updated.json()["widgets"] == []
+    assert len(client.get("/api/workspaces").json()["workspaces"]) == 2
+    assert old.read_text() == '{"widgets": []}'
+
+
+@pytest.mark.parametrize("panel_type", ["index-tape", "spy-chart", "briefing", "scans", "markets", "market-detail"])
+def test_workspace_home_panels_round_trip(agg: dict[str, object], panel_type: str) -> None:
+    client = TestClient(app)
+    widget = {"id": "overview", "type": panel_type, "ticker": "NVDA", "geometry": _GEOMETRY}
+    response = client.put(f"/api/workspaces/{_WORKSPACE_ID}", json={"name": "default", "widgets": [widget]})
+    assert response.status_code == 200
+    assert response.json()["widgets"] == [widget]
+    assert client.get("/api/workspaces").json() == {"workspaces": [response.json()]}
 
 
 _TV = "https://www.tradingview.com/x/8ot166mV/"
@@ -1601,11 +1620,11 @@ _TV = "https://www.tradingview.com/x/8ot166mV/"
     ],
 )
 def test_workspace_put_rejects_invalid_tv_link(agg: dict[str, object], params: dict[str, object]) -> None:
-    widget = {"id": "tv-link-1", "type": "tv-link", "ticker": "NVDA", "params": params}
-    res = TestClient(app).put("/api/workspaces/NVDA", json={"widgets": [widget]})
+    widget = {"id": "tv-link-1", "type": "tv-link", "ticker": "NVDA", "params": params, "geometry": _GEOMETRY}
+    res = TestClient(app).put(f"/api/workspaces/{_WORKSPACE_ID}", json={"name": "Research", "widgets": [widget]})
     assert res.status_code == 400
     assert res.json()["detail"].startswith("invalid workspace:")
-    assert not (_root(agg) / "workspaces").exists()
+    assert not (_root(agg) / "named-workspaces").exists()
 
 
 @pytest.mark.parametrize(
@@ -1622,11 +1641,11 @@ def test_workspace_put_rejects_invalid_tv_link(agg: dict[str, object], params: d
     ],
 )
 def test_workspace_put_rejects_invalid_chart_params(agg: dict[str, object], params: dict[str, object]) -> None:
-    widget = {"id": "price-volume", "type": "price-volume", "ticker": "NVDA", "params": params}
-    res = TestClient(app).put("/api/workspaces/NVDA", json={"widgets": [widget]})
+    widget = {"id": "price-volume", "type": "price-volume", "ticker": "NVDA", "params": params, "geometry": _GEOMETRY}
+    res = TestClient(app).put(f"/api/workspaces/{_WORKSPACE_ID}", json={"name": "Research", "widgets": [widget]})
     assert res.status_code == 400
     assert res.json()["detail"].startswith("invalid workspace:")
-    assert not (_root(agg) / "workspaces").exists()
+    assert not (_root(agg) / "named-workspaces").exists()
 
 
 def test_widget_types_match_harness_list() -> None:
@@ -1639,27 +1658,149 @@ def test_widget_types_match_harness_list() -> None:
 
 
 @pytest.mark.parametrize(
-    ("sym", "payload"),
+    "widget",
     [
-        ("NVDA", {"widgets": [{"id": "w1", "type": "candles", "ticker": "NVDA"}]}),
-        ("NVDA", {"widgets": [{"id": "w1", "type": "news", "ticker": "NVDA", "size": 2}]}),
-        ("NVDA", {"widgets": [], "layout": "grid"}),
-        ("NVDA", {"widgets": [{"id": f"w{i}", "type": "news", "ticker": "NVDA"} for i in range(25)]}),
-        ("NVDA", {"widgets": [{"id": "", "type": "news", "ticker": "NVDA"}]}),
-        ("NVDA", {"widgets": [{"id": "w1", "type": "news", "ticker": "A/B"}]}),
-        ("NVDA", {"widgets": [{"id": "w1", "type": "news", "ticker": "NVDA", "params": None}]}),
-        ("NVDA", {"widgets": [{"id": "w" * 65, "type": "news", "ticker": "NVDA"}]}),
-        ("NVDA", []),
-        ("NVDA", {}),
-        ("NVDA", None),
-        ("A/B", {"widgets": []}),
+        {"type": "candles"},
+        {"size": 2},
+        {"id": ""},
+        {"id": " "},
+        {"ticker": "A/B"},
+        {"ticker": ""},
+        {"params": None},
+        {"id": "w" * 65},
+        {"geometry": None},
+        {"geometry": {**_GEOMETRY, "z": 1}},
+        {"geometry": {"x": 0, "width": 640, "height": 480}},
+        *[
+            {"geometry": {**_GEOMETRY, key: value}}
+            for key, value in (
+                ("x", -1),
+                ("x", 20001),
+                ("y", -1),
+                ("y", 20001),
+                ("width", 279),
+                ("width", 4001),
+                ("height", 179),
+                ("height", 4001),
+                ("x", True),
+                ("y", "0"),
+                ("width", 640.0),
+                ("height", 180.5),
+            )
+        ],
     ],
 )
-def test_workspace_put_rejects_invalid(agg: dict[str, object], sym: str, payload: object) -> None:
-    res = TestClient(app).put(f"/api/workspaces/{sym}", json=payload)
+def test_workspace_put_rejects_invalid_widget(agg: dict[str, object], widget: dict[str, object]) -> None:
+    valid = {"id": "w1", "type": "news", "ticker": "NVDA", "geometry": _GEOMETRY}
+    res = TestClient(app).put(
+        f"/api/workspaces/{_WORKSPACE_ID}", json={"name": "Research", "widgets": [{**valid, **widget}]}
+    )
     assert res.status_code == 400
     assert res.json()["detail"].startswith("invalid workspace:")
-    assert not (_root(agg) / "workspaces").exists()
+    assert not (_root(agg) / "named-workspaces").exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        None,
+        {"name": "Research"},
+        {"widgets": []},
+        {"name": "", "widgets": []},
+        {"name": "  ", "widgets": []},
+        {"name": "x" * 61, "widgets": []},
+        {"name": 2, "widgets": []},
+        {"name": "Research", "widgets": [], "layout": "grid"},
+        {
+            "name": "Research",
+            "widgets": [{"id": f"w{i}", "type": "news", "ticker": "NVDA", "geometry": _GEOMETRY} for i in range(25)],
+        },
+        {"name": "Research", "widgets": [{"id": "same", "type": "news", "ticker": "NVDA", "geometry": _GEOMETRY}] * 2},
+    ],
+)
+def test_workspace_put_rejects_invalid(agg: dict[str, object], payload: object) -> None:
+    res = TestClient(app).put(f"/api/workspaces/{_WORKSPACE_ID}", json=payload)
+    assert res.status_code == 400
+    assert res.json()["detail"].startswith("invalid workspace:")
+    assert not (_root(agg) / "named-workspaces").exists()
+
+
+def test_workspace_invalid_save_preserves_saved_document(agg: dict[str, object]) -> None:
+    client = TestClient(app)
+    widgets = [
+        {
+            "id": f"w{i}",
+            "type": "news",
+            "ticker": "NVDA",
+            "geometry": {"x": 20000, "y": 20000, "width": 4000, "height": 4000},
+        }
+        for i in range(24)
+    ]
+    saved = client.put(f"/api/workspaces/{_WORKSPACE_ID}", json={"name": "x" * 60, "widgets": widgets})
+    assert saved.status_code == 200
+    path = _root(agg) / "named-workspaces" / f"{_WORKSPACE_ID}.json"
+    before = path.read_bytes()
+    response = client.put(f"/api/workspaces/{_WORKSPACE_ID}", json={"name": "Invalid", "widgets": widgets + widgets})
+    assert response.status_code == 400
+    assert path.read_bytes() == before
+    assert client.get("/api/workspaces").json() == {"workspaces": [saved.json()]}
+
+
+@pytest.mark.parametrize(
+    "id", ["NVDA", "A/B", _WORKSPACE_ID.upper(), _WORKSPACE_ID.replace("-", ""), "{" + _WORKSPACE_ID + "}"]
+)
+def test_workspace_rejects_noncanonical_id(agg: dict[str, object], id: str) -> None:
+    res = TestClient(app).put(f"/api/workspaces/{id}", json={"name": "Research", "widgets": []})
+    assert res.status_code == 400
+    assert not (_root(agg) / "named-workspaces").exists()
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        "not JSON",
+        "[]",
+        json.dumps({"id": _WORKSPACE_ID, "name": "Research", "widgets": []}),
+        json.dumps({"id": "NVDA", "name": "Research", "widgets": [], "updated_at": None}),
+        json.dumps(
+            {"id": "375eb936-e12d-4c20-ac9d-9e91ac2f0008", "name": "Research", "widgets": [], "updated_at": None}
+        ),
+    ],
+)
+def test_workspace_reports_malformed_saved_files(agg: dict[str, object], stored: str) -> None:
+    directory = _root(agg) / "named-workspaces"
+    directory.mkdir()
+    path = directory / f"{_WORKSPACE_ID}.json"
+    path.write_text(stored)
+    response = TestClient(app).get("/api/workspaces")
+    assert response.status_code == 500
+    assert response.json()["detail"].startswith(f"invalid saved workspace {path.name}:")
+    assert path.read_text() == stored
+
+
+@given(x=st.integers(0, 20000), y=st.integers(0, 20000), width=st.integers(280, 4000), height=st.integers(180, 4000))
+@settings(max_examples=30, derandomize=True)
+def test_workspace_geometry_round_trip(x: int, y: int, width: int, height: int) -> None:
+    from api.workspaces import Workspace
+
+    geometry = {"x": x, "y": y, "width": width, "height": height}
+    payload = {"name": "Research", "widgets": [{"id": "w1", "type": "news", "ticker": "NVDA", "geometry": geometry}]}
+    assert Workspace.model_validate(payload).model_dump(exclude_unset=True) == payload
+
+
+@pytest.mark.parametrize("type", ["watchlist", "portfolio", "agent", "theses", "alerts", "sessions", "journal"])
+def test_workspace_only_types_round_trip(agg: dict[str, object], type: str) -> None:
+    from app.tools import WIDGET_TYPES
+
+    assert type not in WIDGET_TYPES
+    widget = {"id": "w1", "type": type, "ticker": "NVDA", "geometry": _GEOMETRY}
+    client = TestClient(app)
+    response = client.put(f"/api/workspaces/{_WORKSPACE_ID}", json={"name": "Research", "widgets": [widget]})
+    assert response.status_code == 200
+    assert response.json()["widgets"] == [widget]
+    assert client.get("/api/workspaces").json() == {"workspaces": [response.json()]}
 
 
 def test_widget_data_rejects_unknown_type_and_bad_sym(agg: dict[str, object]) -> None:

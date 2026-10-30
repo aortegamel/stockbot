@@ -125,7 +125,7 @@ function conf(c: number | null): string {
 function NeedleDecisionView({ event }: { event: Extract<AgentEvent, { type: "needle_decision" }> }) {
   return (
     <div>
-      <span className="rounded border border-green-900 px-1 text-[11px] text-green-500">NEEDLE/LOCAL</span>{" "}
+      <span className="rounded border border-green-900 px-1 text-[13px] text-green-500">NEEDLE/LOCAL</span>{" "}
       <span style={{ color: "#4ade80" }}>
         ● needle / {event.tool ?? "(escalate)"}
         {event.tool ? ` / confidence ${conf(event.confidence)}` : ""}
@@ -179,7 +179,7 @@ export function AgentEventView({ event, debug = false, onRetry }: { event: Agent
     case "reasoning_start":
       return (
         <div>
-          <span className="rounded border border-violet-900 px-1 text-[11px] text-violet-400">STOCKBOT</span>{" "}
+          <span className="rounded border border-violet-900 px-1 text-[13px] text-violet-400">STOCKBOT</span>{" "}
           <span style={{ color: "#a78bfa" }}>● stockbot / working…</span>
         </div>
       );

@@ -1,22 +1,25 @@
 import { dom } from "../test-dom";
 import { afterEach, describe, expect, test } from "bun:test";
 import fc from "fast-check";
-import { act, useState } from "react";
-import type { ReactNode } from "react";
+import { act, useState, type ReactNode } from "react";
 import type { Root } from "react-dom/client";
 import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
-import Workspace from "./Workspace";
+import Workspace, { DEFAULT_WORKSPACE_ID, type WorkspaceDraft } from "./Workspace";
 import { ActionCards, type WidgetOutcomes } from "../components/action-cards";
 import { monthlyReturns } from "../components/widgets";
-import type { Candle, WorkspaceDoc } from "../lib/market-data";
+import type { Candle, WorkspaceDoc, WorkspaceWidget } from "../lib/market-data";
 import { useHashRoute } from "../lib/route";
 
-// React DOM reads browser globals at import time. The test must install those globals first.
+// React DOM must load after test-dom installs browser globals.
 const { createRoot } = await import("react-dom/client");
 const realFetch = globalThis.fetch;
 let mounted: Root | null = null;
 const container = () => dom.window.document.getElementById("root")!;
 const text = () => container().textContent ?? "";
+const ID = "a16ec102-2e68-49fb-b818-e9671a3d2474";
+const geometry = { x: 40, y: 50, width: 560, height: 360 };
+const widget = (type: string, id = type, ticker = "NVDA"): WorkspaceWidget => ({ id, type, ticker, geometry });
+const bar = (date: string, close: number): Candle => ({ t: Date.parse(date) / 1000, close, open: close, high: close, low: close, vol: 1 });
 
 afterEach(async () => {
   await act(async () => mounted?.unmount());
@@ -26,24 +29,30 @@ afterEach(async () => {
   dom.window.history.replaceState(null, "", "/");
 });
 
-const bar = (date: string, close: number): Candle => ({ t: Date.parse(date) / 1000, close, open: close, high: close, low: close, vol: 1 });
-
-function serve() {
-  const docs: Record<string, WorkspaceDoc> = {};
+function serve(widgets?: WorkspaceWidget[]) {
+  const docs: Record<string, WorkspaceDoc> = widgets ? { [ID]: { id: ID, name: "Research", widgets, updated_at: "2026-10-20T10:00:00Z" } } : {};
+  if (widgets) dom.window.localStorage.setItem("stockbot.workspace", ID);
   const requests: { path: string; method: string }[] = [];
+  const control = { failLoad: false, failSave: false, delaySave: null as (() => Promise<void>) | null };
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), dom.window.location.href);
     requests.push({ path: url.pathname + url.search, method: init?.method ?? "GET" });
-    if (url.pathname.startsWith("/api/workspaces/")) {
-      const sym = url.pathname.split("/").at(-1)!;
-      if (init?.method === "PUT") {
-        docs[sym] = { sym, ...JSON.parse(String(init.body)), updated_at: "2026-10-20T12:00:00+00:00" };
-      }
-      return Response.json(docs[sym] ?? { sym, widgets: [], updated_at: null });
+    if (url.pathname === "/api/workspaces") return control.failLoad ? new Response(null, { status: 503 }) : Response.json({ workspaces: Object.values(docs) });
+    if (url.pathname.startsWith("/api/workspaces/") && init?.method === "PUT") {
+      if (control.failSave) return new Response(null, { status: 503 });
+      const id = url.pathname.split("/").at(-1)!;
+      const body = JSON.parse(String(init.body));
+      if (control.delaySave) await control.delaySave();
+      docs[id] = { id, ...body, updated_at: "2026-10-20T12:00:00+00:00" };
+      return Response.json(docs[id]);
     }
     if (url.pathname === "/api/quote") return Response.json({ price: 100 });
     if (url.pathname === "/api/watchlist") return Response.json({ watchlist: [] });
     if (url.pathname === "/api/portfolio") return new Response(null, { status: 404 });
+    if (url.pathname === "/api/sparklines") return Response.json({ syms: {} });
+    if (url.pathname === "/api/markets") return Response.json({ rows: [], errors: [] });
+    if (url.pathname === "/api/briefing") return Response.json({ items: [], errors: [] });
+    if (url.pathname === "/api/scans") return Response.json({ scans: [] });
     if (url.pathname === "/api/candles") return Response.json({ candles: [bar("2025-12-01", 100), bar("2026-01-01", 110), bar("2026-02-01", 99)] });
     if (url.pathname === "/api/filings") return Response.json({ items: [{ title: "10-K Annual report", filed: "2026-10-19", updated: "", summary: "", link: "https://www.sec.gov/filing" }] });
     if (url.pathname === "/api/news") return Response.json({ items: [{ title: "New chip", published: "2026-10-20", source: "News", link: "https://example.org" }] });
@@ -60,16 +69,17 @@ function serve() {
     });
     throw new Error(`unexpected request ${url.pathname}`);
   }) as typeof fetch;
-  return { docs, requests };
+  return { docs, requests, control, puts: () => requests.filter((r) => r.method === "PUT"), saved: () => Object.values(docs)[0] };
 }
 
 function Page({ events = [], onWidgetOutcomes }: { events?: AgentEvent[]; onWidgetOutcomes?: (outcomes: WidgetOutcomes) => void }) {
   const [route, navigate] = useHashRoute();
   const selected = route?.page === "workspace" ? route.sym : "NVDA";
   const [watchlist, setWatchlist] = useState(["NVDA", "GME"]);
+  const [workspace, setWorkspace] = useState<WorkspaceDraft | null>(null);
   return <Workspace selected={selected} pick={(sym) => navigate({ page: "workspace", sym })} watchlist={watchlist} onWatchlist={setWatchlist}
-    events={events} input="" setInput={() => { }} research={false} setResearch={() => { }} setAskContext={() => { }} onSend={() => { }} openDrawer={() => { }} busy={false} debug={false} onWidgetOutcomes={onWidgetOutcomes}
-    sessions={[{ session_id: "s1", status: "done", query: "NVDA research" }]} sessionId={null} setSessionId={() => { }} snapshot={null} journal={null} seq={0} />;
+    workspace={workspace} setWorkspace={setWorkspace} events={events} input="" setInput={() => { }} research={false} setResearch={() => { }} setAskContext={() => { }} onSend={() => { }} openDrawer={() => { }} busy={false} debug={false} onWidgetOutcomes={onWidgetOutcomes}
+    sessions={[{ session_id: "s1", status: "done", query: "NVDA research" }]} sessionId={null} setSessionId={() => { }} snapshot={null} journal={null} seq={0} chat={null} />;
 }
 
 async function render(node: ReactNode) {
@@ -89,85 +99,117 @@ function find<T extends Element>(selector: string): T {
   if (!el) throw new Error(`missing ${selector}`);
   return el;
 }
-async function add(type: string) {
-  await act(async () => {
-    const select = find<HTMLSelectElement>('select[aria-label="Add widget"]');
-    select.value = type;
-    select.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
-  });
-  await settle();
-}
 function button(label: string): HTMLButtonElement {
   const el = [...container().querySelectorAll("button")].find((b) => b.textContent === label);
   if (!el) throw new Error(`missing ${label}`);
   return el;
 }
-async function typeUrl(url: string) {
+async function change(label: string, value: string) {
   await act(async () => {
-    const input = find<HTMLInputElement>('input[aria-label="TradingView URL"]');
-    Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set?.call(input, url);
+    const select = [...container().querySelectorAll("select")].find((el) => el.getAttribute("aria-label") === label);
+    if (!select) throw new Error(`missing select ${label}`);
+    select.value = value;
+    select.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+  });
+  await settle();
+}
+const add = (type: string) => change("Add widget", type);
+async function type(selector: string, value: string) {
+  await act(async () => {
+    const input = find<HTMLInputElement>(selector);
+    Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set?.call(input, value);
     input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
   });
 }
-// A real keydown starts at the focused element (the body when nothing has focus), bubbles, and is cancelable.
-async function escape(target: Element = dom.window.document.body) {
-  await act(async () => target.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+async function key(target: Element, name: string, shiftKey = false) {
+  await act(async () => target.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: name, shiftKey, bubbles: true, cancelable: true })));
   await settle();
 }
+const escape = (target: Element = dom.window.document.body) => key(target, "Escape");
+async function reload() {
+  await act(async () => mounted!.unmount());
+  mounted = null;
+  await render(<Page />);
+}
 
-describe("Workspace", () => {
-  test("persists open tickers, opens another ticker with the pick flow, and keeps at least one tab", async () => {
-    serve();
+describe("Named workspace", () => {
+  test("creates, renames, switches, and saves named layouts without losing other drafts", async () => {
+    const server = serve();
     await render(<Page />);
-    expect(JSON.parse(dom.window.localStorage.getItem("stockbot.tabs")!)).toEqual(["NVDA"]);
-    await click(find('[aria-label="Open another ticker"]'));
-    const input = find<HTMLInputElement>('[aria-label="Open ticker"]');
-    input.value = "amd";
-    await act(async () => input.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
-    await settle();
-    expect(dom.window.location.hash).toBe("#/workspace/AMD");
-    expect(JSON.parse(dom.window.localStorage.getItem("stockbot.tabs")!)).toEqual(["NVDA", "AMD"]);
-    expect(find<HTMLAnchorElement>('[role="tab"][href="#/workspace/NVDA"]').getAttribute("aria-selected")).toBe("false");
-    await click(find('[aria-label="Close AMD"]'));
-    expect(dom.window.location.hash).toBe("#/workspace/NVDA");
-    expect(container().querySelector('[aria-label="Close NVDA"]')).toBeNull();
-    await act(async () => mounted!.unmount());
-    mounted = null;
-    await render(<Page />);
-    expect(JSON.parse(dom.window.localStorage.getItem("stockbot.tabs")!)).toEqual(["NVDA"]);
-    expect(text()).toContain("GME");
+    expect(find<HTMLInputElement>('[aria-label="Workspace name"]').value).toBe("default");
+    expect(container().querySelector('[aria-label="Market indexes"]')).not.toBeNull();
+    await click(button("New workspace"));
+    await type('[aria-label="Workspace name"]', "  Earnings  ");
+    await click(button("Create workspace"));
+    expect(container().querySelectorAll(".ws-widget")).toHaveLength(0);
+    expect(container().querySelector('form[aria-label="TradingView link"]')).toBeNull();
+    await add("monthly-returns");
+    await click(button("New workspace"));
+    await type('[aria-label="Workspace name"]', "Risk");
+    await click(button("Create workspace"));
+    expect(container().querySelector('[aria-label="Monthly returns · NVDA"]')).toBeNull();
+    expect(server.puts()).toHaveLength(0);
+    await click(button("Earnings *"));
+    expect(find<HTMLInputElement>('[aria-label="Workspace name"]').value).toBe("Earnings");
+    expect(find('[aria-label="Monthly returns · NVDA"]').textContent).toContain("10.0%");
+    await click(button("Save"));
+    expect(server.saved().name).toBe("Earnings");
+    expect(server.saved().widgets.some((w) => w.type === "monthly-returns")).toBe(true);
+    expect(server.saved().id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(button("Risk *")).not.toBeNull();
+    await reload();
+    expect(find<HTMLInputElement>('[aria-label="Workspace name"]').value).toBe("Earnings");
+    expect([...container().querySelectorAll('[role="tab"]')].map((tab) => tab.textContent)).toEqual(["default", "Earnings"]);
   });
 
-  test("adds, refreshes, expands, removes, and saves widgets", async () => {
-    const { docs, requests } = serve();
+  test("copies the current default draft with independent windows and preserves saved workspaces", async () => {
+    const server = serve([]);
+    const source = [
+      widget("news", "source-news", "AAPL"),
+      { ...widget("price-volume", "source-chart", "GME"), params: { interval: "1h", style: "line", studies: ["MA50"] } },
+    ];
+    server.docs[DEFAULT_WORKSPACE_ID] = { id: DEFAULT_WORKSPACE_ID, name: "default", widgets: source, updated_at: "2026-10-20T10:00:00Z" };
+    dom.window.localStorage.setItem("stockbot.workspace", DEFAULT_WORKSPACE_ID);
     await render(<Page />);
-    expect(container().querySelectorAll(".ws-widget")).toHaveLength(3);
-    await add("monthly-returns");
-    expect(text()).toContain("10.0%");
-    expect(text()).toContain("-10.0%");
-    await click(find('[aria-label="Expand Monthly returns · NVDA"]'));
-    expect(find(".ws-grid").classList.contains("ws-grid-focus")).toBe(true);
-    expect(find('[aria-label="Monthly returns · NVDA"]').classList.contains("ws-widget-focus")).toBe(true);
-    expect(container().querySelectorAll(".ws-widget-focus")).toHaveLength(1);
-    await escape();
-    expect(find(".ws-grid").classList.contains("ws-grid-focus")).toBe(false);
-    expect(container().querySelectorAll(".ws-widget-focus")).toHaveLength(0);
-    await click(find('[aria-label="Expand Monthly returns · NVDA"]'));
-    await click(find('[aria-label="Collapse Monthly returns · NVDA"]'));
-    expect(find(".ws-grid").classList.contains("ws-grid-focus")).toBe(false);
-    const before = requests.filter((r) => r.path.startsWith("/api/candles")).length;
-    await click(find('[aria-label="Refresh Monthly returns · NVDA"]'));
-    expect(requests.filter((r) => r.path.startsWith("/api/candles")).length).toBe(before + 1);
-    await click(find('[aria-label="Remove News · NVDA"]'));
-    expect(container().querySelector('[aria-label="News · NVDA"]')).toBeNull();
+    expect(button("Research")).not.toBeNull();
+    await key(find('[aria-label="Move or resize News · AAPL"]'), "ArrowRight");
+    await click(button("New workspace"));
+    await type('[aria-label="Workspace name"]', "Copy");
+    await click(find('input[type="checkbox"]'));
+    await click(button("Create workspace"));
     await click(button("Save"));
-    expect(docs.NVDA.widgets.map((w) => w.type)).toEqual(["price-volume", "financials", "monthly-returns"]);
-    expect(text()).toContain("saved 12:00:00");
+    const copied = Object.values(server.docs).find((doc) => doc.name === "Copy")!;
+    expect(copied.id).not.toBe(DEFAULT_WORKSPACE_ID);
+    expect(copied.widgets.map((w) => w.type).sort()).toEqual(["news", "price-volume"]);
+    const copiedNews = copied.widgets.find((w) => w.type === "news")!;
+    expect(copiedNews.ticker).toBe("AAPL");
+    expect(copiedNews.geometry).toEqual({ ...geometry, x: 50 });
+    expect(copied.widgets.find((w) => w.type === "price-volume")?.params).toEqual(source[1].params);
+    expect(copied.widgets.every((w) => !source.some((original) => original.id === w.id))).toBe(true);
+    await click(find('[aria-label="Remove News · AAPL"]'));
+    await click(button("Save"));
+    expect(server.docs[copied.id].widgets.map((w) => w.type)).toEqual(["price-volume"]);
+    await click(button("default *"));
+    expect(find('[aria-label="News · AAPL"]').textContent).toContain("New chip");
+    await click(button("Save"));
+    expect(server.docs[DEFAULT_WORKSPACE_ID].widgets).toHaveLength(2);
+    expect(server.docs[DEFAULT_WORKSPACE_ID].widgets.find((w) => w.type === "news")?.geometry.x).toBe(50);
+    await click(button("New workspace"));
+    expect(find<HTMLInputElement>('input[type="checkbox"]').checked).toBe(false);
+    await type('[aria-label="Workspace name"]', "Blank");
+    await click(button("Create workspace"));
+    expect(container().querySelectorAll(".ws-widget")).toHaveLength(0);
+    await click(button("Save"));
+    await reload();
+    expect(container().querySelectorAll(".ws-widget")).toHaveLength(0);
+    expect(find<HTMLInputElement>('[aria-label="Workspace name"]').value).toBe("Blank");
+    await click(button("default"));
+    expect(find('[aria-label="News · AAPL"]').textContent).toContain("New chip");
+    expect(server.docs[ID].widgets).toEqual([]);
   });
 
   test("loads a saved empty workspace without restoring defaults", async () => {
-    const { docs } = serve();
-    docs.NVDA = { sym: "NVDA", widgets: [], updated_at: "2026-10-20T10:00:00Z" };
+    serve([]);
     await render(<Page />);
     expect(container().querySelectorAll(".ws-widget")).toHaveLength(0);
     await add("short-interest");
@@ -178,167 +220,209 @@ describe("Workspace", () => {
     expect(text()).toContain("50%");
     expect(text()).toContain("Jane bought 10 sh");
     expect(text()).toContain("P/E50");
-    expect(text()).toContain("History unavailable");
     expect(container().querySelector('a[href="https://www.sec.gov/filing"]')).not.toBeNull();
   });
 
-  test("applies widget_update once to the matching workspace and saves it", async () => {
-    const { docs, requests } = serve();
-    const added: AgentEvent = { type: "widget_update", ticker: "NVDA", widgetType: "short-volume" };
-    const events: AgentEvent[] = [added, added, { type: "widget_update", ticker: "AAPL", widgetType: "insider" }, { type: "widget_update", ticker: "NVDA", widgetType: "bad" }];
-    await render(<Page events={events} />);
-    expect(docs.NVDA.widgets.filter((w) => w.type === "short-volume")).toHaveLength(1);
-    expect(docs.NVDA.widgets.some((w) => w.type === "insider")).toBe(false);
-    await click(find('[aria-label="Remove Short volume · NVDA"]'));
-    await render(<Page events={[...events]} />);
-    expect(container().querySelector('[aria-label="Short volume · NVDA"]')).toBeNull();
-    expect(requests.filter((r) => r.method === "PUT")).toHaveLength(1);
+  test("preserves geometry and ticker when replacing a panel, but removes obsolete chart settings", async () => {
+    const server = serve([{ ...widget("price-volume"), params: { interval: "4h", style: "line" } }]);
+    await render(<Page />);
+    await type('[aria-label^="Ticker for Price"]', "AAPL");
+    await click(button("Set ticker"));
+    await change("Panel type for Price & volume · AAPL", "news");
+    expect(find('[aria-label="News · AAPL"]').textContent).toContain("New chip");
+    expect(server.puts()).toHaveLength(0);
+    await click(button("Save"));
+    expect(server.saved().widgets).toEqual([{ ...widget("news", "price-volume", "AAPL"), geometry }]);
   });
 
-  test("saves chart settings in the ticker workspace and restores them after a reload", async () => {
-    const { docs, requests } = serve();
+  test("keeps an input focused when its window moves to the front", async () => {
+    const server = serve([widget("news", "z-news"), widget("monthly-returns", "a-returns")]);
     await render(<Page />);
-    const change = async (label: string, value: string) => {
-      await act(async () => {
-        const select = find<HTMLSelectElement>(`select[aria-label="${label}"]`);
-        select.value = value;
-        select.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
-      });
-      await settle();
-    };
+    const input = find<HTMLInputElement>('[aria-label="Ticker for News"]');
+    await act(async () => input.focus());
+    await settle();
+    expect(dom.window.document.activeElement).toBe(input);
+    await type('[aria-label="Ticker for News"]', "AAPL");
+    await click(find('[data-widget-type="news"] button[type="submit"]'));
+    await click(button("Save"));
+    expect(server.saved().widgets.at(-1)?.ticker).toBe("AAPL");
+    expect(server.saved().widgets.at(-1)?.type).toBe("news");
+  });
+
+  test("keeps multiple windows of the same type independent", async () => {
+    const server = serve([]);
+    await render(<Page />);
+    await add("news");
+    await type('[aria-label="New window ticker"]', "AAPL");
+    await add("news");
+    expect(container().querySelectorAll(".ws-widget")).toHaveLength(2);
+    await click(button("Save"));
+    expect(server.saved().widgets.map((w) => w.ticker)).toEqual(["NVDA", "AAPL"]);
+    expect(new Set(server.saved().widgets.map((w) => w.id)).size).toBe(2);
+  });
+
+  test("moves and resizes by keyboard, clamps boundaries, and restores saved geometry", async () => {
+    const server = serve([widget("news")]);
+    await render(<Page />);
+    const handle = find('[aria-label="Move or resize News · NVDA"]');
+    await key(handle, "ArrowRight");
+    await key(handle, "ArrowDown", true);
+    await click(button("Save"));
+    expect(server.saved().widgets[0].geometry).toEqual({ ...geometry, x: 50, height: 370 });
+    await reload();
+    await key(find('[aria-label="Move or resize News · NVDA"]'), "ArrowLeft");
+    await click(button("Save"));
+    expect(server.saved().widgets[0].geometry).toEqual({ ...geometry, height: 370 });
+  });
+
+  test("keeps window geometry inside its minimum bounds", async () => {
+    const server = serve([{ ...widget("news"), geometry: { x: 0, y: 0, width: 280, height: 180 } }]);
+    await render(<Page />);
+    const handle = find('[aria-label="Move or resize News · NVDA"]');
+    await key(handle, "ArrowLeft");
+    await key(handle, "ArrowUp");
+    await key(handle, "ArrowLeft", true);
+    await key(handle, "ArrowUp", true);
+    await click(button("Save"));
+    expect(server.saved().widgets[0].geometry).toEqual({ x: 0, y: 0, width: 280, height: 180 });
+  });
+
+  test("refreshes one panel and preserves its sibling while maximizing", async () => {
+    const server = serve([widget("monthly-returns"), widget("news")]);
+    await render(<Page />);
+    const news = find('[aria-label="News · NVDA"]');
+    const reads = () => server.requests.filter((r) => r.path.startsWith("/api/candles")).length;
+    const before = reads();
+    await click(find('[aria-label="Refresh Monthly returns · NVDA"]'));
+    expect(reads()).toBe(before + 1);
+    await click(find('[aria-label="Expand Monthly returns · NVDA"]'));
+    expect(find(".ws-widget-focus").getAttribute("aria-label")).toBe("Monthly returns · NVDA");
+    expect(find('[aria-label="News · NVDA"]')).toBe(news);
+    await escape();
+    expect(container().querySelector(".ws-widget-focus")).toBeNull();
+    await click(find('[aria-label="Remove News · NVDA"]'));
+    expect(container().querySelector('[aria-label="News · NVDA"]')).toBeNull();
+  });
+
+  test("saves chart settings only with Save and restores them after reload", async () => {
+    const server = serve([widget("price-volume")]);
+    await render(<Page />);
     await change("Chart interval", "4h");
     await change("Chart style", "area");
     const rsi = [...container().querySelectorAll("label")].find((label) => label.textContent === "RSI")?.querySelector("input");
     if (!rsi) throw new Error("missing RSI indicator");
     await click(rsi);
-    expect(requests.filter((r) => r.method === "PUT").map((r) => r.path)).toEqual(Array(3).fill("/api/workspaces/NVDA"));
-    expect(docs.NVDA.widgets.find((w) => w.type === "price-volume")?.params).toEqual({ interval: "4h", style: "area", studies: ["Volume", "RSI"] });
-    expect(docs.NVDA.widgets.find((w) => w.type === "financials")?.params).toBeUndefined();
-    expect(text()).toContain("saved 12:00:00");
-
-    await act(async () => mounted!.unmount());
-    mounted = null;
-    await render(<Page />);
+    expect(server.puts()).toHaveLength(0);
+    await click(button("Save"));
+    expect(server.saved().widgets[0].params).toEqual({ interval: "4h", style: "area", studies: ["Volume", "RSI"] });
+    await reload();
     expect(find<HTMLSelectElement>('select[aria-label="Chart interval"]').value).toBe("4h");
-    expect(find<HTMLSelectElement>('select[aria-label="Chart style"]').value).toBe("area");
     const src = new URL(find<HTMLIFrameElement>("iframe").src).searchParams;
     expect([src.get("symbol"), src.get("interval"), src.get("style")]).toEqual(["NVDA", "240", "3"]);
-    expect(JSON.parse(src.get("studies") ?? "[]")).toEqual([{ id: "RSI@tv-basicstudies" }]);
   });
 
-  test("collapses and toggles bottom panels, restores the open tab, and loads only pending alerts scoped to the ticker", async () => {
-    const { requests } = serve();
+  test("keeps new edits unsaved when an earlier save completes", async () => {
+    const server = serve([]);
+    const { promise, resolve: finish } = Promise.withResolvers<void>();
+    server.control.delaySave = () => promise;
     await render(<Page />);
-    const panel = (name: string) => find<HTMLElement>(`[role="tabpanel"][aria-label="${name}"]`);
-    const opened = () => find(".ws-bottom").classList.contains("ws-bottom-open");
-    expect(opened()).toBe(false);
-    expect(["Theses", "Alerts", "Sessions", "Journal"].every((name) => panel(name).hidden)).toBe(true);
-    await click(find('button[role="tab"]:nth-child(2)'));
-    expect(opened()).toBe(true);
-    expect(panel("Alerts").hidden).toBe(false);
-    expect(dom.window.localStorage.getItem("stockbot.bottom")).toBe("Alerts");
+    await type('[aria-label="Workspace name"]', "Earlier");
+    await click(button("Save"));
+    await type('[aria-label="Workspace name"]', "Latest");
+    await act(async () => finish());
+    await settle();
+    expect(server.saved().name).toBe("Earlier");
+    expect(find<HTMLInputElement>('[aria-label="Workspace name"]').value).toBe("Latest");
+    expect(text()).toContain("Unsaved changes");
+  });
+
+  test("reports save failure without discarding edits and supports another Save", async () => {
+    const server = serve([]);
+    await render(<Page />);
+    await add("news");
+    server.control.failSave = true;
+    await click(button("Save"));
+    expect(text()).toContain("Save failed");
+    expect(find('[aria-label="News · NVDA"]')).not.toBeNull();
+    server.control.failSave = false;
+    await click(button("Save"));
+    expect(server.saved().widgets.map((w) => w.type)).toEqual(["news"]);
+    expect(text()).toContain("Saved 12:00:00");
+  });
+
+  test("does not replace an unavailable collection with editable defaults", async () => {
+    const server = serve();
+    server.control.failLoad = true;
+    await render(<Page />);
+    expect(find('[role="alert"]').textContent).toContain("Workspaces unavailable");
+    expect(container().querySelector(".ws-widget")).toBeNull();
+    server.control.failLoad = false;
+    await click(button("Retry"));
+    expect(find<HTMLInputElement>('[aria-label="Workspace name"]').value).toBe("default");
+    expect(container().querySelector('[data-widget-type="markets"]')).not.toBeNull();
+  });
+
+  test("adds all formerly fixed panels as interchangeable windows", async () => {
+    serve([]);
+    await render(<Page />);
+    for (const type of ["watchlist", "portfolio", "agent", "theses", "alerts", "sessions", "journal"]) await add(type);
     expect(text()).toContain("New evidence");
     expect(text()).not.toContain("Old evidence");
-    expect(requests.some((r) => r.path === "/api/theses/t2")).toBe(false);
-    await click(button("Sessions"));
-    expect(panel("Sessions").hidden).toBe(false);
-    expect(panel("Alerts").hidden).toBe(true);
-    await click(button("Sessions"));
-    expect(opened()).toBe(false);
-    expect(panel("Sessions").hidden).toBe(true);
-    expect(dom.window.localStorage.getItem("stockbot.bottom")).toBeNull();
-    await click(button("Journal"));
-    expect(panel("Journal").hidden).toBe(false);
-    await escape();
-    expect(opened()).toBe(false);
-    expect(panel("Journal").hidden).toBe(true);
-    await click(button("Theses"));
-    await act(async () => mounted!.unmount());
-    mounted = null;
-    await render(<Page />);
-    expect(opened()).toBe(true);
-    expect(panel("Theses").hidden).toBe(false);
+    expect(text()).toContain("NVDA research");
+    expect(text()).toContain("select a session for logs");
+    expect(text()).toContain("Open agent");
+    expect(container().querySelectorAll(".ws-widget")).toHaveLength(7);
   });
 
-  test("Esc closes the innermost owner first: the link form, then focus mode, then the bottom panel", async () => {
-    serve();
+  test("applies valid receipts once, keeps their tickers, and never saves automatically", async () => {
+    const server = serve([]);
+    const first: AgentEvent = { type: "widget_update", ticker: "NVDA", widgetType: "short-volume" };
+    const events: AgentEvent[] = [first, first, { type: "widget_update", ticker: "AAPL", widgetType: "insider" }, { type: "widget_update", ticker: "NVDA", widgetType: "bad" }];
+    await render(<Page events={events} />);
+    expect(find('[aria-label="Short volume · NVDA"]')).not.toBeNull();
+    expect(find('[aria-label="Insider timeline · AAPL"]')).not.toBeNull();
+    await click(find('[aria-label="Remove Short volume · NVDA"]'));
+    await render(<Page events={[...events]} />);
+    expect(container().querySelector('[aria-label="Short volume · NVDA"]')).toBeNull();
+    expect(server.puts()).toHaveLength(0);
+  });
+
+  test("enforces the window limit when an agent fills an open link form's last slot", async () => {
+    const server = serve(Array.from({ length: 23 }, (_, i) => widget("news", `news-${i}`)));
     await render(<Page />);
-    const opened = () => find(".ws-bottom").classList.contains("ws-bottom-open");
-    const focusing = () => find(".ws-grid").classList.contains("ws-grid-focus");
-    await click(button("Journal"));
-    await click(find('[aria-label="Expand News · NVDA"]'));
+    await add("tv-link");
+    await type('input[aria-label="TradingView URL"]', "https://www.tradingview.com/x/8ot166mV/");
+    const outcomes: WidgetOutcomes[] = [];
+    const onWidgetOutcomes = (o: WidgetOutcomes) => void outcomes.push(o);
+    const added: AgentEvent = { type: "widget_update", ticker: "NVDA", widgetType: "short-volume" };
+    await render(<Page events={[added]} onWidgetOutcomes={onWidgetOutcomes} />);
+    await click(button("Add link"));
+    const blocked: AgentEvent = { type: "widget_update", ticker: "NVDA", widgetType: "insider" };
+    await render(<Page events={[added, blocked]} onWidgetOutcomes={onWidgetOutcomes} />);
+    expect(container().querySelectorAll(".ws-widget")).toHaveLength(24);
+    expect(find<HTMLSelectElement>('[aria-label="Add widget"]').disabled).toBe(true);
+    expect(text()).toContain("Workspace limit: 24 widgets");
+    expect(server.puts()).toHaveLength(0);
+    expect(outcomes.map((o) => [...o])).toEqual([[[added, "added"]], [[blocked, "blocked"]]]);
+    await click(container().querySelector('[aria-label="Remove News · NVDA"]')!);
+    expect(find<HTMLSelectElement>('[aria-label="Add widget"]').disabled).toBe(false);
+  });
+
+  test("Escape closes a link form or indicator menu before leaving maximize", async () => {
+    serve([widget("price-volume")]);
+    await render(<Page />);
+    await click(find('[aria-label^="Expand Price"]'));
     await add("tv-link");
     await escape(find('input[aria-label="TradingView URL"]'));
     expect(container().querySelector('form[aria-label="TradingView link"]')).toBeNull();
-    expect([focusing(), opened()]).toEqual([true, true]);
-    await escape();
-    expect([focusing(), opened()]).toEqual([false, true]);
-    await escape();
-    expect(opened()).toBe(false);
-  });
-
-  test("in focus mode Esc closes the open Indicators menu first, then exits focus mode", async () => {
-    serve();
-    await render(<Page />);
-    const focusing = () => find(".ws-grid").classList.contains("ws-grid-focus");
-    // jsdom's selector engine rejects "&" inside an attribute value, so match the label prefix.
-    await click(find('[aria-label^="Expand Price"]'));
+    expect(container().querySelector(".ws-widget-focus")).not.toBeNull();
     const menu = find<HTMLDetailsElement>(".ws-widget-focus details");
     menu.open = true;
     await escape(find(".ws-widget-focus summary"));
-    expect([menu.open, focusing()]).toEqual([false, true]);
-    await escape(find(".ws-widget-focus summary"));
-    expect(focusing()).toBe(false);
-  });
-
-  test("at 24 widgets the Add widget menu is disabled with a limit hint", async () => {
-    const { docs } = serve();
-    docs.NVDA = { sym: "NVDA", widgets: Array.from({ length: 24 }, (_, i) => ({ id: `news-${i}`, type: "news", ticker: "NVDA" })), updated_at: "2026-10-20T10:00:00Z" };
-    await render(<Page />);
-    const select = () => find<HTMLSelectElement>('select[aria-label="Add widget"]');
-    expect(select().disabled).toBe(true);
-    expect(text()).toContain("Workspace limit: 24 widgets");
-    await click(container().querySelector('[aria-label="Remove News · NVDA"]')!);
-    expect(select().disabled).toBe(false);
-    expect(text()).not.toContain("Workspace limit");
-  });
-
-  test("adding a TradingView link saves the workspace without Save", async () => {
-    const { docs, requests } = serve();
-    await render(<Page />);
-    await add("tv-link");
-    await typeUrl("https://www.tradingview.com/x/8ot166mV/");
-    await click(button("Add link"));
-    expect(requests.filter((r) => r.method === "PUT").map((r) => r.path)).toEqual(["/api/workspaces/NVDA"]);
-    expect(docs.NVDA.widgets.at(-1)).toEqual({ id: "tv-link-1", type: "tv-link", ticker: "NVDA", params: { url: "https://www.tradingview.com/x/8ot166mV/", label: "TradingView snapshot" } });
-    expect(text()).toContain("saved 12:00:00");
-  });
-
-  test("an open TradingView link form and an agent widget_update add nothing at 24 widgets", async () => {
-    const { docs, requests } = serve();
-    docs.NVDA = { sym: "NVDA", widgets: Array.from({ length: 23 }, (_, i) => ({ id: `news-${i}`, type: "news", ticker: "NVDA" })), updated_at: "2026-10-20T10:00:00Z" };
-    const puts = () => requests.filter((r) => r.method === "PUT").length;
-    const widgets = () => container().querySelectorAll(".ws-widget").length;
-    await render(<Page />);
-    await add("tv-link");
-    await typeUrl("https://www.tradingview.com/x/8ot166mV/");
-    // Below the cap a receipt still adds: 23 -> 24.
-    const outcomes: WidgetOutcomes[] = [];
-    const onWidgetOutcomes = (o: WidgetOutcomes) => void outcomes.push(o);
-    const events: AgentEvent[] = [{ type: "widget_update", ticker: "NVDA", widgetType: "short-volume" }];
-    await render(<Page events={events} onWidgetOutcomes={onWidgetOutcomes} />);
-    expect([widgets(), puts()]).toEqual([24, 1]);
-    expect(text()).toContain("Workspace limit: 24 widgets");
-    await click(button("Add link"));
-    expect([widgets(), puts()]).toEqual([24, 1]);
-    expect(docs.NVDA.widgets.some((w) => w.type === "tv-link")).toBe(false);
-    const blocked: AgentEvent = { type: "widget_update", ticker: "NVDA", widgetType: "insider" };
-    await render(<Page events={[...events, blocked]} onWidgetOutcomes={onWidgetOutcomes} />);
-    expect([widgets(), puts()]).toEqual([24, 1]);
-    expect(container().querySelector('[aria-label="Insider · NVDA"]')).toBeNull();
-    expect(text()).toContain("Workspace limit: 24 widgets");
-    // The console learns the first receipt was added and the second was blocked by the cap.
-    expect(outcomes.map((o) => [...o])).toEqual([[[events[0], "added"]], [[blocked, "blocked"]]]);
+    expect(menu.open).toBe(false);
+    expect(container().querySelector(".ws-widget-focus")).not.toBeNull();
+    await escape();
+    expect(container().querySelector(".ws-widget-focus")).toBeNull();
   });
 
   test("renders one summary card per ticker with the workspace link", async () => {

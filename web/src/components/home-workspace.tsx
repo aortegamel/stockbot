@@ -1,12 +1,16 @@
-import { useState } from "react";
-import { PortfolioPanel } from "../components/portfolio-panel";
-import { Briefing, Detail, IndexTape, indexSyms, MarketsTable, Scans, SpyChart, useLoad, View } from "../components/home-panels";
+import { useState, type ReactNode } from "react";
+import { Briefing, Detail, IndexTape, indexSyms, MarketsTable, Scans, SpyChart, useLoad, View } from "./home-panels";
 import type { ShellState } from "../layout/Shell";
 import { fetchMarkets, fetchSparklines, type MarketSort, type ScanDef } from "../lib/market-data";
 
+export const HOME_TYPES = ["index-tape", "spy-chart", "briefing", "scans", "markets", "market-detail"];
 const MAX_ROWS = 200;
 
-export default function Home(s: Pick<ShellState, "watchlist" | "onWatchlist" | "pick" | "setInput" | "setAskContext" | "openDrawer">) {
+type Props = Pick<ShellState, "watchlist" | "onWatchlist" | "setInput" | "setAskContext" | "openDrawer"> & {
+  children: (render: (type: string) => ReactNode) => ReactNode;
+};
+
+export default function HomePanels(s: Props) {
   const [scan, setScan] = useState<ScanDef | null>(null);
   const [sort, setSort] = useState<MarketSort>("chg_pct");
   const [picked, setPicked] = useState<string | null>(null);
@@ -20,26 +24,18 @@ export default function Home(s: Pick<ShellState, "watchlist" | "onWatchlist" | "
   const markets = useLoad(`${scanId}|${syms.join(",")}|${sort}`, (signal) => fetchMarkets(scanId, syms, sort, signal));
   const rows = markets.data?.rows ?? [];
   const sel = picked ?? rows[0]?.sym;
-  return (
-    <div className="page-scroll home">
-      <IndexTape load={indexes} syms={idxSyms.slice(1)} />
-      <div className="home-mid">
-        <SpyChart load={indexes} />
-        <Briefing watchlist={s.watchlist} />
-      </div>
-      <div className="home-grid">
-        <Scans
-          active={scan?.id ?? "watchlist"}
-          onScan={(next) => {
-            setScan(next);
-            setPicked(null);
-          }}
-          onCreate={() => {
-            s.setInput("scan for ");
-            s.setAskContext(null);
-            s.openDrawer();
-          }}
-        />
+  return s.children((type) => {
+    switch (type) {
+      case "index-tape": return <IndexTape load={indexes} syms={idxSyms.slice(1)} />;
+      case "spy-chart": return <SpyChart load={indexes} />;
+      case "briefing": return <Briefing watchlist={s.watchlist} />;
+      case "scans": return <Scans
+        active={scan?.id ?? "watchlist"}
+        onScan={(next) => { setScan(next); setPicked(null); }}
+        onCreate={() => { s.setInput("scan for "); s.setAskContext(null); s.openDrawer(); }}
+      />;
+      case "market-detail": return sel ? <Detail sym={sel} /> : null;
+      case "markets": return (
         <section className="glass home-card home-markets">
           <header className="card-head">
             <b>Markets · {scan?.name ?? "Watchlist"}</b>
@@ -53,26 +49,17 @@ export default function Home(s: Pick<ShellState, "watchlist" | "onWatchlist" | "
             <View load={markets} empty={(d) => (d.rows.length || d.errors.length ? null : "No rows for this scan. Try: Ask Stockbot: scan for unusual volume")}>
               {(d) => (
                 <MarketsTable
-                  rows={d.rows.slice(0, MAX_ROWS)}
-                  sel={sel}
-                  sort={sort}
-                  watchlist={s.watchlist}
-                  onSort={setSort}
-                  onSelect={setPicked}
-                  onWatchlist={s.onWatchlist}
-                  onRetry={markets.retry}
+                  rows={d.rows.slice(0, MAX_ROWS)} sel={sel} sort={sort} watchlist={s.watchlist}
+                  onSort={setSort} onSelect={setPicked} onWatchlist={s.onWatchlist} onRetry={markets.retry}
                 />
               )}
             </View>
           </div>
-          {/* ponytail: slice at 200 rows; add virtualization if scans grow past that. */}
+          {/* ponytail: slice at 200 rows. Add virtualization if scans exceed that limit. */}
           {rows.length > MAX_ROWS && <footer className="home-foot">showing {MAX_ROWS} of {rows.length}</footer>}
         </section>
-        <div className="home-right">
-          {sel && <Detail sym={sel} />}
-          <PortfolioPanel onSelectTicker={s.pick} />
-        </div>
-      </div>
-    </div>
-  );
+      );
+      default: return null;
+    }
+  });
 }

@@ -6,7 +6,7 @@ import { chartSrc } from "./trading-chart";
 // live: s.tradingview.com/widgetembed (symbol, chart params), s.tradingview.com/embed/<idea id>, s3 snapshot PNGs.
 // blocked (frame-ancestors 'none'): every www.tradingview.com page: /x/, /symbols/, /chart/, idea pages, layouts.
 const SANDBOX = "allow-scripts allow-same-origin allow-popups";
-const muted = { color: "var(--muted, #93A0B8)", fontSize: 12 } as const;
+const muted = { color: "var(--muted, #93A0B8)", fontSize: "var(--fs-label)" } as const;
 const field = { height: 28, padding: "0 8px", border: "1px solid var(--hair)", borderRadius: 6, background: "var(--fill)", color: "inherit", font: "inherit", minWidth: 0 } as const;
 
 function Open({ href }: { href: string }) {
@@ -38,7 +38,7 @@ function TvLinkView({ link, label }: { link: TradingViewLink; label: string }) {
   if (link.kind === "chart-params") return <Frame src={chartSrc(link.symbol, link.interval ? { interval: link.interval } : undefined)} title={`${label} TradingView embed`} />;
   if (link.kind === "idea") return <Frame src={`https://s.tradingview.com/embed/${link.id}/`} title={`${label} TradingView embed`} />;
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: 12, fontSize: 14 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: 12, fontSize: "var(--fs-body)" }}>
       <span>TradingView does not allow saved layouts inside other sites.</span>
       <span style={muted}>To show this chart here, open it, choose the camera icon, then Copy link. Paste that snapshot link with ✎.</span>
       <span><Open href={`https://www.tradingview.com/chart/${link.id}/`} /></span>
@@ -49,7 +49,7 @@ function TvLinkView({ link, label }: { link: TradingViewLink; label: string }) {
 export function TvLinkWidget({ params }: { params?: Record<string, unknown> }) {
   const link = typeof params?.url === "string" ? parseTradingViewLink(params.url) : null;
   const label = typeof params?.label === "string" ? params.label : "TradingView";
-  if (!link) return <p role="alert" style={{ fontSize: 14, padding: 12 }}>This TradingView link is not supported. Choose ✎ to paste another link.</p>;
+  if (!link) return <p role="alert" style={{ fontSize: "var(--fs-body)", padding: 12 }}>This TradingView link is not supported. Choose ✎ to paste another link.</p>;
   return <TvLinkView link={link} label={label} />;
 }
 

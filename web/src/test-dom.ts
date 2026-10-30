@@ -15,3 +15,10 @@ registry.document = dom.window.document;
 registry.navigator = dom.window.navigator;
 registry.requestAnimationFrame = (callback: FrameRequestCallback) => setTimeout(() => callback(0), 0) as unknown as number;
 registry.cancelAnimationFrame = (frame: number) => clearTimeout(frame);
+
+// jsdom does not measure layout. Real browser tests check resize behavior.
+registry.ResizeObserver = class {
+  observe() { }
+  unobserve() { }
+  disconnect() { }
+};

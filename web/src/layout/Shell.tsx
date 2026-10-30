@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
 import { AIPanel, watchlistFor } from "../components/market-panels";
 import type { WidgetOutcomes } from "../components/action-cards";
 import { HealthDot } from "../components/health-dot";
@@ -7,6 +7,7 @@ import { parseRoute, routeHash, TICKER_RE, useHashRoute, type Route } from "../l
 import type { AgentEvent, AskContext } from "../../../needle-harness/lib/agent/types";
 import { fetchJournal, fetchSnapshot, listSessions, type JournalPage, type ResearchSnapshot } from "../lib/research-client";
 import CommandBar from "./CommandBar";
+import { DEFAULT_WORKSPACE_ID, type WorkspaceDraft } from "../pages/Workspace";
 
 // The existing watchdog stops once buffered persona reasoning starts.
 const STALL_TIMEOUT_MS = 120_000;
@@ -55,6 +56,10 @@ export type ShellState = {
   snapshot: ResearchSnapshot | null;
   journal: JournalPage | null;
   seq: number;
+  workspace: WorkspaceDraft | null;
+  setWorkspace: Dispatch<SetStateAction<WorkspaceDraft | null>>;
+  // Shell owns the agent state. The workspace supplies its movable window frame.
+  chat: ReactNode;
 };
 
 function Strip() {
@@ -158,6 +163,17 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
   const [research, setResearch] = useState(false);
   const [askContext, setAskContext] = useState<AskContext | null>(null);
   const [drawer, setDrawerState] = useState(initialDrawer);
+  const [workspace, setWorkspace] = useState<WorkspaceDraft | null>(null);
+
+  useEffect(() => {
+    if (!workspace?.dirty.length) return;
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [workspace?.dirty.length]);
   const [, setClock] = useState("--:--:--");
 
   // Clock ticks on its own interval — no synchronous setState in the effect body.
@@ -358,9 +374,13 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
     setDrawer(true);
     void onSend(text);
   };
+  const chat = drawer ? (
+    <AIPanel events={events} input={input} setInput={setInput} research={research} setResearch={setResearch} context={askContext} onClearContext={() => setAskContext(null)} onSend={() => void onSend()} sym={selected} busy={busy} debug={debug} widgetOutcomes={widgetOutcomes} />
+  ) : null;
   const state: ShellState = {
     selected, pick, watchlist, onWatchlist, events, input, setInput, research, setResearch, setAskContext, onSend: () => void onSend(),
-    busy, debug, sessions, sessionId, setSessionId, snapshot, journal, seq, openDrawer: () => setDrawer(true), ask, onWidgetOutcomes,
+    busy, debug, sessions, sessionId, setSessionId, snapshot, journal, seq, openDrawer: () => setDrawer(true), ask, onWidgetOutcomes, chat,
+    workspace, setWorkspace,
   };
 
   const navLink = (label: string, to: Route) => (
@@ -368,6 +388,8 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
       {label}
     </a>
   );
+  const currentWorkspace = workspace?.docs.find((doc) => doc.id === workspace.activeId);
+  const windowedAgent = route.page === "workspace" && currentWorkspace?.widgets.some((widget) => widget.type === "agent");
 
   return (
     <main className="app">
@@ -382,8 +404,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
         <span className="app-header-row">
           <b className="brand">NEEDLE TERMINAL</b>
           <nav className="nav" aria-label="Pages">
-            {navLink("Home", { page: "home" })}
-            {navLink("Workspaces", { page: "workspace", sym: selected })}
+            {navLink(`Workspaces: ${currentWorkspace?.name ?? "default"}`, { page: "workspace", sym: selected })}
             {navLink("Feed", { page: "feed" })}
             {debug && navLink("Harness", { page: "harness" })}
           </nav>
@@ -391,8 +412,10 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
             watchlist={watchlist}
             sessions={sessions}
             onTicker={goTicker}
-            // ponytail: scans open Home until a scan results view exists.
-            onScan={() => navigate({ page: "home" })}
+            onScan={() => {
+              setWorkspace((draft) => draft ? { ...draft, activeId: DEFAULT_WORKSPACE_ID } : draft);
+              navigate({ page: "workspace", sym: selected });
+            }}
             onSession={(id) => {
               setSessionId(id);
               navigate({ page: "workspace", sym: selected });
@@ -419,11 +442,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
 
       <div className="shell-body">
         {children(route, state)}
-        {drawer && (
-          <aside className="glass ws-cell drawer" aria-label="Agent drawer">
-            <AIPanel events={events} input={input} setInput={setInput} research={research} setResearch={setResearch} context={askContext} onClearContext={() => setAskContext(null)} onSend={state.onSend} sym={selected} busy={busy} debug={debug} widgetOutcomes={widgetOutcomes} />
-          </aside>
-        )}
+        {!windowedAgent && chat && <aside className="glass ws-cell drawer" aria-label="Agent drawer">{chat}</aside>}
       </div>
 
       <footer className="app-footer">
