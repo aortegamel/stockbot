@@ -437,6 +437,112 @@ def test_fundamental_envelope_preserves_selected_fact_identity(
         assert selected[field] == expected[field]
 
 
+def test_normalized_facts_and_derived_q4_preserve_metadata() -> None:
+    metadata: dict[str, object] = {
+        "entity_id": "sec:cik:0001045810",
+        "security_id": "sec:cik:0001045810:common",
+        "cik": NVDA_CIK,
+        "issuer_cik": NVDA_CIK,
+        "unit": "USD/shares",
+        "currency": "USD",
+        "basis": "consolidated",
+        "share_adjustment": "split-adjusted",
+        "dimensions": {"segment": "consolidated"},
+        "content_hash": "companyfacts-hash",
+        "retrieved_at": RETRIEVED_AT,
+        "document_name": "annual-report.htm",
+        "context_id": "fy-context",
+        "unit_id": "usd-per-share",
+        "element_id": "fy-element",
+        "fact_id": "fy-fact",
+        "source_record_id": "fy-record",
+        "source_identity": {"accn": "fy-accession", "val": 4.90},
+        "unknown_metadata": {"nested": ["preserve", 7, None]},
+    }
+    fy_raw: dict[str, object] = {
+        **metadata,
+        "concept": sec_facts.DILUTED_EPS_CONCEPT,
+        "value": 4.90,
+        "period_start": "2025-01-27",
+        "period_end": "2026-01-25",
+        "filed_at": "2026-02-25",
+        "accession": "fy-accession",
+        "known_at": "2026-02-25",
+        "fiscal_year": 2026,
+        "fiscal_period": "FY",
+        "source_url": "https://example.test/fy",
+    }
+    ytd_raw: dict[str, object] = {
+        **fy_raw,
+        "value": 3.14,
+        "period_end": "2025-10-26",
+        "accession": "ytd-accession",
+        "source_identity": {"accn": "ytd-accession", "val": 3.14},
+        "unknown_metadata": {"nested": ["ytd"]},
+    }
+    fy = sec_facts._validated_fact_row(fy_raw)
+    ytd = sec_facts._validated_fact_row(ytd_raw)
+    assert fy == fy_raw
+    assert ytd == ytd_raw
+    assert fy is not None
+    assert ytd is not None
+
+    derived = sec_facts._q4_from_totals(fy, ytd, date(2026, 1, 25))
+    assert derived == {
+        "entity_id": "sec:cik:0001045810",
+        "security_id": "sec:cik:0001045810:common",
+        "cik": NVDA_CIK,
+        "issuer_cik": NVDA_CIK,
+        "unit": "USD/shares",
+        "currency": "USD",
+        "basis": "consolidated",
+        "share_adjustment": "split-adjusted",
+        "dimensions": {"segment": "consolidated"},
+        "content_hash": "companyfacts-hash",
+        "retrieved_at": RETRIEVED_AT,
+        "document_name": "annual-report.htm",
+        "unknown_metadata": {"nested": ["preserve", 7, None]},
+        "unit_id": "usd-per-share",
+        "concept": sec_facts.DILUTED_EPS_CONCEPT,
+        "value": 1.76,
+        "period_start": "2025-10-27",
+        "period_end": "2026-01-25",
+        "filed_at": "2026-02-25",
+        "accession": "",
+        "known_at": "2026-02-25",
+        "fiscal_year": 2026,
+        "fiscal_period": "Q4",
+        "source_url": None,
+        "derived": True,
+        "formulaId": "sec_q4_difference",
+        "formulaVersion": "1",
+        "derivation_inputs": [fy_raw, ytd_raw],
+        "verification": "unverified",
+        "derivation": "fy_minus_ytd",
+    }
+    assert fy == fy_raw
+    assert ytd == ytd_raw
+
+
+def test_validated_fact_row_rejects_mistyped_metadata() -> None:
+    base: dict[str, object] = {
+        "concept": sec_facts.DILUTED_EPS_CONCEPT,
+        "value": 1.0,
+        "period_start": "2025-01-27",
+        "period_end": "2025-04-27",
+        "filed_at": "2025-05-28",
+        "accession": "a1",
+        "known_at": "2025-05-28",
+        "fiscal_year": 2026,
+        "fiscal_period": "Q1",
+        "source_url": "https://example.test/q1",
+    }
+    assert sec_facts._validated_fact_row({**base, "cik": "1045810"}) is None
+    assert sec_facts._validated_fact_row({**base, "unit": 7}) is None
+    preserved = sec_facts._validated_fact_row({**base, "unknown_extra": {"nested": [1]}})
+    assert preserved == {**base, "unknown_extra": {"nested": [1]}}
+
+
 def test_derive_q4_uses_restated_fy_total():
     """A restated FY total (later filed_at, accession tiebreak) drives derived Q4."""
     from datetime import date

@@ -10379,22 +10379,24 @@ def _regweb_cov(**over: object) -> dict[str, object]:
 def _regweb_absence(repo: ResearchRepository, sid: str, job: str, search_id: str, query: str) -> dict[str, object]:
     from app.research import service as _svc
 
-    return _svc.record_evidence(  # type: ignore[no-any-return]
-        sid,
-        job,
-        {
-            "wave_id": 1,
-            "content": f"no web result for {query}",
-            "claim_text": f"not located in searched web scope: {query}",
-            "claim_kind": "absence_observation",
-            "subject": "NVDA",
-            "source_name": "web",
-            "known_at": "2025-06-29T00:00:00+00:00",
-            "search_id": search_id,
-            "query": query,
-            "coverage": _regweb_cov(),
-        },
-        repo=repo,
+    return dict(
+        _svc.record_evidence(
+            sid,
+            job,
+            {
+                "wave_id": 1,
+                "content": f"no web result for {query}",
+                "claim_text": f"not located in searched web scope: {query}",
+                "claim_kind": "absence_observation",
+                "subject": "NVDA",
+                "source_name": "web",
+                "known_at": "2025-06-29T00:00:00+00:00",
+                "search_id": search_id,
+                "query": query,
+                "coverage": _regweb_cov(),
+            },
+            repo=repo,
+        )
     )
 
 

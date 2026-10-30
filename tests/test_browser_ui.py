@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Queue
-from typing import cast, override
+from typing import override
 from urllib.error import URLError
 from urllib.parse import parse_qs, quote, urlsplit
 from urllib.request import urlopen
@@ -1039,18 +1039,22 @@ def test_named_workspace_windows_persist_native_geometry(browser: webdriver.Chro
         )
 
     def geometry() -> dict[str, int]:
-        return cast(
-            dict[str, int],
-            browser.execute_script(
-                """
+        raw: object = browser.execute_script(
+            """
             const panel = document.querySelector('section[aria-label="Financials · ORCL"]');
             const box = panel.closest('.react-draggable').getBoundingClientRect();
             const desktop = document.querySelector('.ws-desktop').getBoundingClientRect();
             return {x: Math.round(box.left - desktop.left), y: Math.round(box.top - desktop.top),
                     width: Math.round(box.width), height: Math.round(box.height)};
             """
-            ),
         )
+        assert isinstance(raw, dict), f"Invalid geometry: {raw!r}"
+        result: dict[str, int] = {}
+        for key in ("x", "y", "width", "height"):
+            value: object = raw.get(key)
+            assert isinstance(value, int) and not isinstance(value, bool), f"Invalid geometry {key}: {value!r}"
+            result[key] = value
+        return result
 
     def select_workspace(name: str) -> None:
         tab = wait.until(

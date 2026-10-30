@@ -19,7 +19,7 @@ import re
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import TypedDict, TypeGuard
 
 from .. import edgar_client
 from ..data_sources import SourceGateway
@@ -52,8 +52,27 @@ _DIVIDEND_CONCEPTS = (DIVIDEND_PER_SHARE_CONCEPT,)
 _METRICS = ("eps", "shares_outstanding", "balance_sheet", "overview", "dividends")
 
 
-class FinancialFactRow(TypedDict):
-    """One normalized financial-fact row (float value)."""
+class _FinancialFactMetadata(TypedDict, total=False):
+    cik: int
+    issuer_cik: int
+    entity_id: str
+    original_concept: str
+    namespace: str
+    taxonomy: str
+    unit: str | None
+    period_instant: str | None
+    dimensions: Mapping[str, object]
+    source_identity: Mapping[str, object]
+    derived: bool
+    derivation: str
+    formulaId: str
+    formulaVersion: str
+    derivation_inputs: list[dict[str, object]]
+    verification: str
+
+
+class FinancialFactRow(_FinancialFactMetadata):
+    """A normalized fact with checked metadata and complete source provenance."""
 
     concept: str
     value: float
@@ -65,22 +84,6 @@ class FinancialFactRow(TypedDict):
     fiscal_year: int | None
     fiscal_period: str | None
     source_url: str | None
-    cik: NotRequired[int]
-    issuer_cik: NotRequired[int]
-    entity_id: NotRequired[str]
-    original_concept: NotRequired[str]
-    namespace: NotRequired[str]
-    taxonomy: NotRequired[str]
-    unit: NotRequired[str]
-    period_instant: NotRequired[str | None]
-    dimensions: NotRequired[object]
-    source_identity: NotRequired[object]
-    derived: NotRequired[bool]
-    derivation: NotRequired[str]
-    formulaId: NotRequired[str]
-    formulaVersion: NotRequired[str]
-    derivation_inputs: NotRequired[list[dict[str, object]]]
-    verification: NotRequired[str]
 
 
 class DividendEventRow(TypedDict):
@@ -170,8 +173,66 @@ def _stored_opt_int(value: object) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def _text_value(value: object) -> bool:
+    """A declared string metadata value."""
+    return isinstance(value, str)
+
+
+def _opt_text_value(value: object) -> bool:
+    """A declared nullable string metadata value."""
+    return value is None or isinstance(value, str)
+
+
+def _int_value(value: object) -> bool:
+    """A declared CIK value; bool never qualifies as an int."""
+    return type(value) is int
+
+
+def _mapping_value(value: object) -> bool:
+    """A declared mapping with string keys."""
+    return isinstance(value, Mapping) and all(isinstance(item, str) for item in value)
+
+
+def _bool_value(value: object) -> bool:
+    """A declared boolean metadata value."""
+    return isinstance(value, bool)
+
+
+_METADATA_CHECKS = {
+    **dict.fromkeys(
+        (
+            "entity_id",
+            "original_concept",
+            "namespace",
+            "taxonomy",
+            "derivation",
+            "formulaId",
+            "formulaVersion",
+            "verification",
+        ),
+        _text_value,
+    ),
+    **dict.fromkeys(("unit", "period_instant"), _opt_text_value),
+    **dict.fromkeys(("cik", "issuer_cik"), _int_value),
+    **dict.fromkeys(("dimensions", "source_identity"), _mapping_value),
+    "derived": _bool_value,
+}
+
+
+def _is_fact_metadata(row: Mapping[str, object]) -> TypeGuard[_FinancialFactMetadata]:
+    """Reject mistyped declared metadata while retaining unknown source fields."""
+    if any(key in row and not check(row[key]) for key, check in _METADATA_CHECKS.items()):
+        return False
+    if "derivation_inputs" not in row:
+        return True
+    inputs = row["derivation_inputs"]
+    return isinstance(inputs, list) and all(
+        isinstance(item, dict) and all(isinstance(item_key, str) for item_key in item) for item in inputs
+    )
+
+
 def _validated_fact_row(row: Mapping[str, object]) -> FinancialFactRow | None:
-    """Narrow one live normalized fact row to a FinancialFactRow; None when unusable."""
+    """Normalize core fields and reject unusable facts or mistyped metadata."""
     concept = row.get("concept")
     period_end = _stored_opt_text(row.get("period_end"))
     value = row.get("value")
@@ -181,22 +242,22 @@ def _validated_fact_row(row: Mapping[str, object]) -> FinancialFactRow | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return cast(
-        FinancialFactRow,
-        {
-            **row,
-            "concept": concept,
-            "value": value,
-            "period_end": period_end,
-            "filed_at": _stored_text(row.get("filed_at")),
-            "accession": _stored_text(row.get("accession")),
-            "known_at": _stored_text(row.get("known_at")),
-            "period_start": _stored_opt_text(row.get("period_start")),
-            "fiscal_year": _stored_opt_int(row.get("fiscal_year")),
-            "fiscal_period": _stored_opt_text(row.get("fiscal_period")),
-            "source_url": _stored_opt_text(row.get("source_url")),
-        },
-    )
+    if not _is_fact_metadata(row):
+        return None
+    result: FinancialFactRow = {
+        **row,
+        "concept": concept,
+        "value": value,
+        "period_end": period_end,
+        "filed_at": _stored_text(row.get("filed_at")),
+        "accession": _stored_text(row.get("accession")),
+        "known_at": _stored_text(row.get("known_at")),
+        "period_start": _stored_opt_text(row.get("period_start")),
+        "fiscal_year": _stored_opt_int(row.get("fiscal_year")),
+        "fiscal_period": _stored_opt_text(row.get("fiscal_period")),
+        "source_url": _stored_opt_text(row.get("source_url")),
+    }
+    return result
 
 
 def _gateway() -> SourceGateway:
@@ -457,8 +518,7 @@ def _q4_from_totals(latest_fy: FinancialFactRow, ytd_q3: FinancialFactRow, fy_en
         if key
         not in ("value", "fact_id", "source_record_id", "source_identity", "document_id", "context_id", "element_id")
     }
-    return cast(
-        FinancialFactRow,
+    return _validated_fact_row(
         {
             **derived,
             **_calculation("sec_q4_difference", [latest_fy, ytd_q3], value),
@@ -468,7 +528,7 @@ def _q4_from_totals(latest_fy: FinancialFactRow, ytd_q3: FinancialFactRow, fy_en
             "accession": "",
             "source_url": None,
             "derivation": "fy_minus_ytd",
-        },
+        }
     )
 
 
