@@ -1877,6 +1877,16 @@ def _resolve_fnqc(
     return finra_client.resolve_finra_official("otcMarket/regShoDaily", row, {}, root=root)
 
 
+@pytest.mark.parametrize("missing", ["Symbol", "Date", "Market"])
+def test_official_file_requires_identity_columns(missing: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    header = "|".join(column for column in _FNQC_HEADER.split("|") if column != missing)
+    monkeypatch.setattr(
+        "app.finra_client.requests.get", MagicMock(return_value=MagicMock(content=(header + "\n").encode()))
+    )
+    with pytest.raises(ValueError, match=rf": no {missing} column$"):
+        finra_client.resolve_finra_official("otcMarket/regShoDaily", _NVDA_FNQC_ROW, {}, root=tmp_path)
+
+
 def test_official_line_skips_earlier_disagreeing_duplicate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Earlier NVDA lines with another value, day, or venue never hide the later line that agrees."""
     earlier = [

@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from scripts import doctor
 
 FULL = {
@@ -65,3 +67,81 @@ def test_api_hosts_follow_enabled_features() -> None:
 
 def test_ports_reject_non_integer() -> None:
     assert doctor.check_ports({"PORT": "abc"})[0] == doctor.FAIL
+
+
+def test_bun_checks_path_dependencies_and_version(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from subprocess import CompletedProcess
+
+    def absent(command: str) -> None:
+        return None
+
+    def installed(command: str) -> str:
+        return "/bin/bun"
+
+    monkeypatch.setattr(doctor, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(doctor.shutil, "which", absent)
+    assert doctor.check_bun({}) == (
+        doctor.FAIL,
+        "bun",
+        "not on PATH. Fix: curl -fsSL https://bun.sh/install | bash",
+    )
+    monkeypatch.setattr(doctor.shutil, "which", installed)
+    assert doctor.check_bun({}) == (
+        doctor.FAIL,
+        "bun",
+        "web, needle-harness dependencies missing. Fix: bun install --cwd web && bun install --cwd needle-harness",
+    )
+    (tmp_path / "web" / "node_modules").mkdir(parents=True)
+    assert doctor.check_bun({}) == (
+        doctor.FAIL,
+        "bun",
+        "needle-harness dependencies missing. Fix: bun install --cwd needle-harness",
+    )
+    (tmp_path / "needle-harness" / "node_modules").mkdir(parents=True)
+
+    def run(command: list[str], **kwargs: object) -> CompletedProcess[str]:
+        assert command == ["/bin/bun", "--version"]
+        assert kwargs == {"capture_output": True, "text": True, "timeout": 30, "check": False}
+        return CompletedProcess(command, 0, stdout="1.3.0\n")
+
+    monkeypatch.setattr(doctor.subprocess, "run", run)
+    assert doctor.check_bun({}) == (
+        doctor.OK,
+        "bun",
+        "bun 1.3.0, web + needle-harness dependencies installed",
+    )
+
+
+def test_main_reports_all_checks_and_failure_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(doctor, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(doctor.os, "environ", {"MARKER": "value"})
+    statuses = [doctor.OK, doctor.WARN, doctor.SKIP]
+
+    def check(env: doctor.Env) -> doctor.Result:
+        assert env == {"MARKER": "value"}
+        return statuses[0], "local", "local detail"
+
+    def reach(label: str, host: str) -> doctor.Result:
+        assert (label, host) == ("fake", "fake.invalid")
+        return statuses[-1], "network fake", "remote detail"
+
+    monkeypatch.setattr(doctor, "CHECKS", (check,))
+
+    def hosts(env: doctor.Env) -> list[tuple[str, str]]:
+        return [("fake", "fake.invalid")]
+
+    monkeypatch.setattr(doctor, "api_hosts", hosts)
+    monkeypatch.setattr(doctor, "check_reach", reach)
+    assert doctor.main() == 0
+    assert capsys.readouterr().out == (
+        f"{doctor.OK} local: local detail\n"
+        f"{doctor.SKIP} network fake: remote detail\n"
+        "doctor: ready, run bun run stockbot\n"
+    )
+    statuses[:] = [doctor.FAIL, doctor.FAIL]
+    assert doctor.main() == 1
+    assert capsys.readouterr().out == (
+        f"{doctor.FAIL} local: local detail\n{doctor.FAIL} network fake: remote detail\ndoctor: 2 failed\n"
+    )

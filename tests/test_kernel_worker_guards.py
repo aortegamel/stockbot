@@ -41,6 +41,179 @@ def _empty_repo(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ResearchRepository, "list_decisions", _decisions_none)
 
 
+@pytest.mark.parametrize("raw", [None, "NVDA", 12, {"NVDA": True}])
+def test_intake_hint_tickers_requires_a_list(raw: object) -> None:
+    assert kw._intake_hint_tickers({"tickers": raw}, []) == []
+
+
+def test_intake_hint_tickers_keeps_new_symbols_in_order() -> None:
+    assert kw._intake_hint_tickers(
+        {"tickers": [None, 7, " nvda ", "NVDA", " msft ", "BRK.B", "bf-b", "invalid name", "", "A123"]},
+        ["MSFT"],
+    ) == ["NVDA", "BRK.B", "BF-B"]
+
+
+def test_create_nodes_topological_maps_dependencies(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from app.research import service
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "nodes.sqlite"))
+    sid = service.create_research("objective", "objective")
+    kw._create_nodes_topological(
+        sid,
+        "objective",
+        [
+            {"id": "end", "question": "conclusion", "dependsOn": ["left", "right"]},
+            {"id": "left", "question": "left", "dependsOn": ["root"]},
+            {"id": "right", "question": "right", "dependsOn": ["root"]},
+            {"id": "root", "dependsOn": None},
+        ],
+    )
+    nodes = {node.question: node for node in ResearchRepository().list_nodes(sid)}
+    assert len(nodes) == 4
+    assert nodes["objective"].why_it_matters == "Route question."
+    assert nodes["left"].depends_on == (nodes["objective"].node_id,)
+    assert nodes["right"].depends_on == (nodes["objective"].node_id,)
+    assert nodes["conclusion"].depends_on == (nodes["left"].node_id, nodes["right"].node_id)
+    fallback = service.create_research("fallback", "fallback")
+    kw._create_nodes_topological(fallback, "fallback", [])
+    assert [node.question for node in ResearchRepository().list_nodes(fallback)] == ["fallback"]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"id": "wrong"},
+        {"metric": ""},
+        {"value": " "},
+        {"entity": None},
+        {"period": 2025},
+        {"statement": "\t"},
+    ],
+)
+def test_final_evidence_rejects_malformed_datapoints(changes: dict[str, JSONValue]) -> None:
+    point: dict[str, JSONValue] = {
+        "id": "dp:one",
+        "metric": "Revenue",
+        "value": "1",
+        "entity": "NVDA",
+        "period": "FY2025",
+        "statement": "Revenue 1",
+    }
+    assert kw._final_evidence(
+        {"evidence": [{"id": "ev:1", "content": "Revenue 1", "datapoints": [None, {**point, **changes}]}]}
+    ) == [{"id": "ev:1", "content": "Revenue 1"}]
+
+
+@pytest.mark.parametrize("unit,inputs", [("USD", ["dp:input", "", None, 5]), (" ", []), (None, "dp:input")])
+def test_final_evidence_keeps_canonical_datapoint_fields(unit: JSONValue, inputs: JSONValue) -> None:
+    point: dict[str, JSONValue] = {
+        "id": "dp:one",
+        "metric": "Revenue",
+        "value": "1",
+        "entity": "NVDA",
+        "period": "FY2025",
+        "statement": "Revenue 1",
+    }
+    expected = dict(point)
+    if unit == "USD":
+        expected.update(unit="USD", inputs=["dp:input"])
+    assert kw._final_evidence(
+        {
+            "evidence": [
+                {"id": "ev:1", "content": "Revenue 1", "datapoints": [{**point, "unit": unit, "inputs": inputs}]}
+            ]
+        }
+    ) == [{"id": "ev:1", "content": "Revenue 1", "datapoints": [expected]}]
+
+
+def test_session_coverage_accumulates_document_navigation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from app.research import service
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "coverage.sqlite"))
+    sid = service.create_research("filings", "filings")
+    store = ResearchRepository()
+    assert kw._session_coverage(store, sid) == {}
+    store.save_tool_result(
+        {
+            "tool_result_id": "listing",
+            "session_id": sid,
+            "job_id": "j",
+            "tool_name": "list_sec_filings",
+            "result": {
+                "filings": [None, {"accession_no": "a"}, {"accession_no": "b", "primary_document": "b.htm"}, {}]
+            },
+        }
+    )
+    store.save_tool_result(
+        {
+            "tool_result_id": "documents",
+            "session_id": sid,
+            "job_id": "j",
+            "tool_name": "list_sec_documents",
+            "result": {"accession_no": "a", "documents": [{"document_name": "a.htm"}]},
+        }
+    )
+    attempts: list[dict[str, JSONValue]] = [
+        {"tool": "search_web"},
+        {"tool": "get_sec_document", "arguments": None, "result": {}},
+        {"tool": "get_sec_document", "arguments": {"accession_no": "b"}, "result": {}, "error": "unavailable"},
+        {
+            "tool": "get_sec_document",
+            "arguments": {"accession_no": "a", "query": "revenue"},
+            "result": {
+                "document_name": "a.htm",
+                "source_handle": {"id": "handle"},
+                "offset": 1,
+                "end_offset": 10,
+                "total_chars": 50,
+                "more_available": True,
+                "warnings": ["window"],
+                "available_sections": ["Item 1"],
+            },
+            "document_content": True,
+            "inspected": True,
+            "evidence_id": "ev:1",
+        },
+        {"tool": "get_sec_document", "arguments": {"accession_no": "c"}, "document_content": True},
+        {"tool": "get_sec_document", "arguments": {"accession_no": "d"}, "document_content": True, "inspected": True},
+    ]
+    service.record_decision(sid, "route", {}, {}, attempts[-1])
+    for attempt in attempts:
+        service.record_decision(sid, "node_attempt", {}, {}, attempt)
+    out = kw._session_coverage(store, sid)
+    sec = out["sec"]
+    assert isinstance(sec, dict)
+    documents = sec["documents"]
+    assert isinstance(documents, list)
+    by_accession = {row["accession_no"]: row for row in documents if isinstance(row, dict)}
+    assert list(by_accession) == ["b", "a", "c", "d"]
+    assert by_accession["a"] == {
+        "accession_no": "a",
+        "document_name": "a.htm",
+        "listed": True,
+        "located": True,
+        "retrieved": True,
+        "inspected": True,
+        "admitted": True,
+        "incomplete": True,
+        "unavailable": False,
+        "offset": 1,
+        "end_offset": 10,
+        "total_chars": 50,
+        "more_available": True,
+        "warnings": ["window"],
+        "available_sections": ["Item 1"],
+    }
+    assert by_accession["b"]["error"] == "unavailable"
+    assert by_accession["b"]["unavailable"] is True
+    assert by_accession["d"]["incomplete"] is False
+    assert sec["limitations"] == [
+        "SEC b/document not located: no document content was retrieved.",
+        "SEC a/a.htm: inspection covered only the returned window, not the complete filing.",
+        "SEC c/document not located: content was retrieved but semantic inspection did not complete.",
+    ]
+
+
 def test_graph_prompt_registry_failure_is_terminal() -> None:
     with mock.patch("app.research.scheduler.build_registry", side_effect=RuntimeError("boom")):
         resp = kw._run({"id": "r1", "op": "run", "prompt": "Is XYZ solvent?"})

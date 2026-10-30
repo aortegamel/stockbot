@@ -3462,3 +3462,104 @@ def test_e2e_main_requires_opt_in_then_credentials(
     monkeypatch.delenv("EXA_API_KEY", raising=False)
     assert e2e.main([]) == 2
     assert "EXA_API_KEY" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("runs", [1, 2])
+@pytest.mark.parametrize("transport_failure", [False, True])
+def test_e2e_main_writes_runs_percentiles_and_verdicts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    runs: int,
+    transport_failure: bool,
+) -> None:
+    from io import BytesIO
+    from urllib.request import Request
+
+    cases: list[e2e.Case] = [
+        {
+            "id": mode,
+            "prompt": mode,
+            "mode": mode,
+            "chart_ticker": None,
+            "ticker": None,
+            "min_citations": 0,
+            "max_first_text_ms": 1000,
+            "max_total_ms": 1000,
+        }
+        for mode in ("chat", "research")
+    ]
+    golden = tmp_path / "golden.json"
+    golden.write_text(json.dumps(cases), encoding="utf-8")
+    monkeypatch.setattr(e2e, "GOLDEN", golden)
+    monkeypatch.setattr(e2e, "REPO_ROOT", tmp_path)
+    monkeypatch.setenv("STOCKBOT_E2E", "1")
+
+    def missing() -> list[str]:
+        return []
+
+    monkeypatch.setattr(e2e, "_missing_env", missing)
+    requests: list[dict[str, str]] = []
+
+    def urlopen(request: Request, *, timeout: int) -> BytesIO:
+        assert timeout == e2e.TIMEOUT_S
+        assert request.full_url == "http://fake.invalid/api/agent"
+        assert isinstance(request.data, bytes)
+        body = json.loads(request.data)
+        requests.append(body)
+        if transport_failure:
+            raise OSError("offline")
+        events: list[dict[str, object]] = [{"type": "status"}]
+        if body.get("mode") == "research":
+            events.append({"type": "progress"})
+        events.extend([{"type": "answer_delta", "text": "Answer."}, _done()])
+        return BytesIO(b"".join(raw for _, raw in _sse(*[(0, event) for event in events])))
+
+    monkeypatch.setattr(e2e.urllib.request, "urlopen", urlopen)
+    ticks = iter(range(100))
+    monkeypatch.setattr(e2e.time, "perf_counter", lambda: next(ticks) / 1000)
+    assert e2e.main(["--base-url", "http://fake.invalid/", "--runs", str(runs)]) == int(transport_failure)
+    assert requests == [{"prompt": "chat"}] * runs + [{"prompt": "research", "mode": "research"}] * runs
+    reports = list((tmp_path / "data" / "verify").glob("*/e2e.json"))
+    assert len(reports) == 1
+    report = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert report["base_url"] == "http://fake.invalid/"
+    assert report["summary"]["runs"] == 2 * runs
+    assert report["summary"]["passed"] == (0 if transport_failure else 2 * runs)
+    assert [(row["id"], row["run"]) for row in report["runs"]] == [
+        (mode, n) for mode in ("chat", "research") for n in range(1, runs + 1)
+    ]
+    for row in report["runs"]:
+        assert row["pass"] is not transport_failure
+        assert row["answer"] == ("" if transport_failure else "Answer.")
+        assert row["failures"] == (["mode", "first_text_ms", "terminal"] if transport_failure else [])
+    metrics = report["summary"]["research"]
+    if transport_failure:
+        assert metrics["first_progress_ms"] == metrics["first_text_ms"] == {"p50": None, "p90": None}
+        assert metrics["total_ms"] == pytest.approx({"p50": 1.0, "p90": 1.0})
+    else:
+        assert metrics["first_progress_ms"] == pytest.approx({"p50": 1.0, "p90": 1.0})
+        assert metrics["first_text_ms"] == pytest.approx({"p50": 3.0, "p90": 3.0})
+        assert metrics["total_ms"] == pytest.approx({"p50": 4.0, "p90": 4.0})
+    output = capsys.readouterr()
+    assert output.err == ""
+    label = "research#1" if runs > 1 else "research"
+    assert f"| {label} |" in output.out
+    assert ("FAIL mode,first_text_ms,terminal" if transport_failure else "PASS") in output.out
+    assert f"wrote {reports[0]}" in output.out
+
+
+def test_e2e_main_rejects_unknown_case_without_network(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    golden = tmp_path / "golden.json"
+    golden.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(e2e, "GOLDEN", golden)
+    monkeypatch.setenv("STOCKBOT_E2E", "1")
+
+    def missing() -> list[str]:
+        return []
+
+    monkeypatch.setattr(e2e, "_missing_env", missing)
+    assert e2e.main(["--only", "absent"]) == 2
+    assert capsys.readouterr().err == "unknown golden id: 'absent'\n"

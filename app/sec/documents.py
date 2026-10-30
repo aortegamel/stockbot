@@ -1594,6 +1594,33 @@ def _number(value: object) -> float | None:
     return number if Decimal(str(number)).is_finite() else None
 
 
+def _fact_concepts(record: Mapping[str, object], concept: object) -> tuple[tuple[str, ...], object] | None:
+    """Select the requested concept and its value, preserving alias precedence."""
+    if isinstance(record.get("original_concept"), str) and isinstance(concept, str):
+        return (concept,), record.get("value")
+    if "eps_diluted" in record:
+        return ("EarningsPerShareDiluted",), record.get("value", record.get("eps_diluted"))
+    if "shares_outstanding" in record:
+        return ("EntityCommonStockSharesOutstanding", "CommonStockSharesOutstanding"), record.get(
+            "value", record.get("shares_outstanding")
+        )
+    if isinstance(concept, str) and concept:
+        return (concept,), record.get("value")
+    return None
+
+
+def _fact_dimensions(raw: object) -> tuple[tuple[str, str], ...] | None:
+    """Validate dimension coordinates before sorting their stable identity."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, Mapping):
+        return None
+    dimensions = dict(raw)
+    if any(not isinstance(key, str) or not isinstance(member, str) for key, member in dimensions.items()):
+        return None
+    return tuple(sorted((str(key), str(member)) for key, member in dimensions.items()))
+
+
 def _fact_spec(record: Mapping[str, object]) -> _FactSpec | None:
     """Retain the requested fact identity without inventing missing context coordinates."""
     if record.get("derived") is True:
@@ -1602,28 +1629,18 @@ def _fact_spec(record: Mapping[str, object]) -> _FactSpec | None:
     start = record.get("period_start")
     start = start[:10] if isinstance(start, str) and start else None
     concept = record.get("original_concept") or record.get("concept")
-    if isinstance(record.get("original_concept"), str) and isinstance(concept, str):
-        concepts, value = (concept,), record.get("value")
-    elif "eps_diluted" in record:
-        concepts, value = ("EarningsPerShareDiluted",), record.get("value", record.get("eps_diluted"))
-    elif "shares_outstanding" in record:
-        concepts = ("EntityCommonStockSharesOutstanding", "CommonStockSharesOutstanding")
-        value = record.get("value", record.get("shares_outstanding"))
-    elif isinstance(concept, str) and concept:
-        concepts, value = (concept,), record.get("value")
-    else:
+    selected = _fact_concepts(record, concept)
+    if selected is None:
         return None
+    concepts, value = selected
     try:
         number = Decimal(str(value))
     except InvalidOperation:
         return None
     if not number.is_finite() or not _ISO_DATE_RE.fullmatch(end):
         return None
-    raw_dimensions = record.get("dimensions")
-    dimensions: dict[object, object] = dict(raw_dimensions) if isinstance(raw_dimensions, Mapping) else {}
-    if not isinstance(raw_dimensions, Mapping) and raw_dimensions is not None:
-        return None
-    if any(not isinstance(key, str) or not isinstance(member, str) for key, member in dimensions.items()):
+    dimensions = _fact_dimensions(record.get("dimensions"))
+    if dimensions is None:
         return None
     locator = record.get("locator")
     coordinates = {**record, **(locator if isinstance(locator, Mapping) else {})}
@@ -1642,7 +1659,7 @@ def _fact_spec(record: Mapping[str, object]) -> _FactSpec | None:
             record.get("unit")
             or ("USD/shares" if "eps_diluted" in record else "shares" if "shares_outstanding" in record else "")
         ),
-        dimensions=tuple(sorted((str(key), str(member)) for key, member in dimensions.items())),
+        dimensions=dimensions,
         **{
             key: str(coordinates.get(key) if coordinates.get(key) is not None else "")
             for key in (
@@ -1764,6 +1781,22 @@ def _continued_inner(source: str, attrs: Mapping[str, str], inner: str) -> str |
     return inner
 
 
+def _fact_context_matches(
+    context: tuple[str | None, str, str, tuple[tuple[str, str], ...]] | None,
+    unit: str | None,
+    spec: _FactSpec,
+) -> bool:
+    """Match the issuer, period, dimensions, and unit of an inline context."""
+    if context is None or spec.cik is None:
+        return False
+    start, end, cik, dimensions = context
+    if end != spec.end or (spec.start is not None and start != spec.start):
+        return False
+    if cik != str(spec.cik) or dimensions != spec.dimensions:
+        return False
+    return unit is not None and (not spec.unit or spec.unit.lower() == unit.lower())
+
+
 def _fact_hits(source: str, spec: _FactSpec) -> list[_FactHit] | None:
     """Keep equivalent occurrences. Reject incomplete identity matches and incompatible candidates."""
 
@@ -1787,16 +1820,11 @@ def _fact_hits(source: str, spec: _FactSpec) -> list[_FactHit] | None:
             continue
         context_id, unit_id = attrs.get("contextref", ""), attrs.get("unitref", "")
         context = contexts.get(context_id)
-        if context is None or spec.cik is None:
-            continue
-        start, end, cik, dimensions = context
-        if end != spec.end or (spec.start is not None and start != spec.start):
-            continue
-        if cik != str(spec.cik) or dimensions != spec.dimensions:
-            continue
         unit = units.get(unit_id)
-        if unit is None or (spec.unit and spec.unit.lower() != unit.lower()):
+        if not _fact_context_matches(context, unit, spec):
             continue
+        assert context is not None
+        start, end, cik, dimensions = context
         coordinates = {
             "context_id": context_id,
             "unit_id": unit_id,
@@ -1873,6 +1901,20 @@ def _marked_quote(source: str, hits: list[_FactHit]) -> tuple[str, str] | None:
     return located[0] if len(located) == 1 else None
 
 
+def _canonical_fact_matches(candidate: Mapping[str, object], record: Mapping[str, object], spec: _FactSpec) -> bool:
+    """Compare a normalized archive fact with every requested filing coordinate."""
+    return (
+        candidate.get("source_identity") == record.get("source_identity")
+        and _fact_spec({**candidate, "original_concept": candidate.get("original_concept") or candidate.get("concept")})
+        == spec
+        and candidate.get("accession") == _record_accession(record)
+        and all(
+            str(candidate.get(key) or "")[:10] == str(record.get(key) or "")[:10] for key in ("filed_at", "known_at")
+        )
+        and all(candidate.get(key) == record.get(key) for key in ("fiscal_year", "fiscal_period"))
+    )
+
+
 def _canonical_fact_page(
     record: Mapping[str, object], spec: _FactSpec, url: str, payload: bytes, root: Path
 ) -> dict[str, object] | None:
@@ -1917,16 +1959,7 @@ def _canonical_fact_page(
     except OSError, ValueError, TypeError, KeyError:
         return None
     matches = [
-        candidate
-        for candidate in datasets["financial_facts"]
-        if candidate.get("source_identity") == identity
-        and _fact_spec({**candidate, "original_concept": candidate.get("original_concept") or candidate.get("concept")})
-        == spec
-        and candidate.get("accession") == _record_accession(record)
-        and all(
-            str(candidate.get(key) or "")[:10] == str(record.get(key) or "")[:10] for key in ("filed_at", "known_at")
-        )
-        and all(candidate.get(key) == record.get(key) for key in ("fiscal_year", "fiscal_period"))
+        candidate for candidate in datasets["financial_facts"] if _canonical_fact_matches(candidate, record, spec)
     ]
     if not matches or any(candidate != matches[0] for candidate in matches[1:]):
         return None
@@ -2090,6 +2123,19 @@ def _search_page(record: Mapping[str, object], accession: str, cik: int, root: P
     return None
 
 
+def _official_primary(record: Mapping[str, object], index_url: str, accession: str, cik: int, root: Path) -> str | None:
+    """Resolve a filing document and enforce its issuer directory."""
+    primary = _primary_url(_official_bytes(index_url, root), accession)
+    document = record.get("document_name") or record.get("document")
+    if isinstance(document, str) and document:
+        if not _DOCUMENT_NAME_RE.fullmatch(document):
+            return None
+        primary = f"{_SEC_WWW}/Archives/edgar/data/{cik}/{accession.replace('-', '')}/{document}"
+    if primary is None or not primary.startswith(f"{_SEC_WWW}/Archives/edgar/data/{cik}/"):
+        return None
+    return primary
+
+
 def resolve_sec_official(
     tool_name: str, row: Mapping[str, object], payload: Mapping[str, object], *, root: Path
 ) -> dict[str, object] | None:
@@ -2120,13 +2166,8 @@ def resolve_sec_official(
     if numeric_fact or tool_name in _OWNERSHIP_TOOLS:
         if numeric_fact and spec is None:
             return None
-        primary = _primary_url(_official_bytes(index_url, root), accession)
-        document = record.get("document_name") or record.get("document")
-        if isinstance(document, str) and document:
-            if not _DOCUMENT_NAME_RE.fullmatch(document):
-                return None
-            primary = f"{_SEC_WWW}/Archives/edgar/data/{cik}/{accession.replace('-', '')}/{document}"
-        if primary is None or not primary.startswith(f"{_SEC_WWW}/Archives/edgar/data/{cik}/"):
+        primary = _official_primary(record, index_url, accession, cik, root)
+        if primary is None:
             return None
         return _fact_page(spec, primary, root, record) if spec is not None else _row_line_page(record, primary, root)
     if tool_name in {

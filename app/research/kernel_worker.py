@@ -2473,6 +2473,71 @@ def _row_datapoints(rec: Mapping[str, object]) -> list[JSONValue]:
     return [point] if point is not None else []
 
 
+def _calculation_declaration(
+    req: Mapping[str, JSONValue],
+    item: dict[str, object],
+    formula: object,
+    rid: str,
+    sid: str,
+    store: ResearchRepository,
+) -> dict[str, object]:
+    """Resolve calculation inputs through the same admission and session ownership guards."""
+    from app.research import service
+
+    inputs = req.get("inputs")
+    formula_id, _, version = formula.partition("@") if isinstance(formula, str) else ("", "", "")
+    if not formula_id or not version or not isinstance(inputs, list) or not inputs:
+        raise ValueError("a calculation needs formula id@version and a list of inputs")
+    ids: list[str] = []
+    for entry in inputs:
+        if isinstance(entry, dict) and "formula" not in entry:
+            # Admit inline observations before the calculation, through the same source guards.
+            sub = _admit_datapoint({**entry, "id": rid, "sessionId": sid, "evidenceId": entry.get("evidence_id")})
+            point = sub.get("datapoint")
+            if not isinstance(point, dict):
+                raise ValueError(f"input {entry.get('metric')!r} {entry.get('value')!r}: {sub.get('error')}")
+            ids.append(str(point["id"]))
+        elif isinstance(entry, str):
+            ids.append(entry)
+        else:
+            raise ValueError("each input is a dp: id or an observed number declaration")
+    owners = {
+        str(point["id"]): eid
+        for eid, rec in service._session_rows(store, sid).items()
+        for point in _row_datapoints(rec)
+        if isinstance(point, dict)
+    }
+    if missing := [dp for dp in ids if dp not in owners]:
+        raise ValueError(f"inputs {missing} are not datapoints of this session")
+    calculation = {key: item[key] for key in ("subject", "metric", "value", "entity", "period", "unit") if key in item}
+    calculation.update(
+        claim_kind="calculation",
+        formula_id=formula_id,
+        formula_version=version,
+        input_evidence_ids=[owners[dp] for dp in ids],
+    )
+    return calculation
+
+
+def _datapoint_source(item: dict[str, object], row: Mapping[str, object], prov: Mapping[str, object]) -> None:
+    """Bind an observed declaration to its stored source, without constructing source identities."""
+    if prov.get("kind") == "sec_source":
+        metadata = row.get("metadata")
+        handle = metadata.get("source_handle") if isinstance(metadata, dict) else None
+        if not isinstance(handle, dict):
+            raise ValueError("Cannot admit a filtered document view without its stored canonical source_handle")
+        item["source_handle"] = handle
+        item["matching_passage"] = prov.get("passage")
+    elif prov.get("kind") in ("sec_record", "finra_record", "web_source"):
+        item["tool_result_id"] = prov.get("tool_result_id")
+        item["record_identity"] = prov.get("record_identity")
+        item["matching_passage"] = prov.get("record_identity") or prov.get("excerpt")
+        if prov.get("kind") == "web_source":
+            item["source_record_id"] = prov.get("url")
+    else:
+        raise ValueError("unsupported evidence provenance")
+
+
 def _admit_datapoint(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
     """Admit one declared number through the existing source and proof guards.
 
@@ -2511,55 +2576,9 @@ def _admit_datapoint(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         if not isinstance(prov, dict):
             raise TypeError("evidence provenance required")
         if formula is not None:
-            inputs = req.get("inputs")
-            formula_id, _, version = formula.partition("@") if isinstance(formula, str) else ("", "", "")
-            if not formula_id or not version or not isinstance(inputs, list) or not inputs:
-                raise ValueError("a calculation needs formula id@version and a list of inputs")
-            ids: list[str] = []
-            for entry in inputs:
-                if isinstance(entry, dict) and "formula" not in entry:
-                    # An observed input declared inline is admitted first, through the same guards.
-                    sub = _admit_datapoint(
-                        {**entry, "id": rid, "sessionId": sid, "evidenceId": entry.get("evidence_id")}
-                    )
-                    point = sub.get("datapoint")
-                    if not isinstance(point, dict):
-                        raise ValueError(f"input {entry.get('metric')!r} {entry.get('value')!r}: {sub.get('error')}")
-                    ids.append(str(point["id"]))
-                elif isinstance(entry, str):
-                    ids.append(entry)
-                else:
-                    raise ValueError("each input is a dp: id or an observed number declaration")
-            owners = {
-                str(point["id"]): eid
-                for eid, rec in service._session_rows(store, sid).items()
-                for point in _row_datapoints(rec)
-                if isinstance(point, dict)
-            }
-            if missing := [dp for dp in ids if dp not in owners]:
-                raise ValueError(f"inputs {missing} are not datapoints of this session")
-            item = {key: item[key] for key in ("subject", "metric", "value", "entity", "period", "unit") if key in item}
-            item.update(
-                claim_kind="calculation",
-                formula_id=formula_id,
-                formula_version=version,
-                input_evidence_ids=[owners[dp] for dp in ids],
-            )
-        elif prov.get("kind") == "sec_source":
-            metadata = row.get("metadata")
-            handle = metadata.get("source_handle") if isinstance(metadata, dict) else None
-            if not isinstance(handle, dict):
-                raise ValueError("Cannot admit a filtered document view without its stored canonical source_handle")
-            item["source_handle"] = handle
-            item["matching_passage"] = prov.get("passage")
-        elif prov.get("kind") in ("sec_record", "finra_record", "web_source"):
-            item["tool_result_id"] = prov.get("tool_result_id")
-            item["record_identity"] = prov.get("record_identity")
-            item["matching_passage"] = prov.get("record_identity") or prov.get("excerpt")
-            if prov.get("kind") == "web_source":
-                item["source_record_id"] = prov.get("url")
+            item = _calculation_declaration(req, item, formula, rid, sid, store)
         else:
-            raise ValueError("unsupported evidence provenance")
+            _datapoint_source(item, row, prov)
         session = store.get_session(sid)
         job = service.start_job(
             sid,
@@ -2619,9 +2638,47 @@ def _run_evidence(records: Sequence[Mapping[str, JSONValue]]) -> tuple[list[JSON
     return evidence, known_ids
 
 
+def _document_attempt_coverage(
+    row: dict[str, JSONValue], attempt: Mapping[str, object], payload: Mapping[str, object], args: Mapping[str, object]
+) -> None:
+    """Project one document attempt onto its accumulated coverage row."""
+    from app.research.models import validate_json_value
+
+    row["located"] = bool(payload.get("source_handle")) or row["located"]
+    row["retrieved"] = row["retrieved"] or attempt.get("document_content") is True
+    row["inspected"] = row["inspected"] or attempt.get("inspected") is True
+    row["admitted"] = row["admitted"] or bool(attempt.get("evidence_id"))
+    row["unavailable"] = attempt.get("error") is not None or not row["retrieved"]
+    row["incomplete"] = (
+        not row["inspected"]
+        or bool(payload.get("more_available") or payload.get("warnings") or payload.get("section"))
+        or bool(args.get("section") or args.get("query") or args.get("offset"))
+    )
+    for key in ("offset", "end_offset", "total_chars", "more_available", "warnings", "available_sections"):
+        if key in payload:
+            row[key] = validate_json_value(payload[key], "<coverage>")
+    if attempt.get("error"):
+        row["error"] = str(attempt["error"])[:300]
+
+
+def _document_coverage_limitations(
+    documents: Mapping[tuple[str, str], Mapping[str, JSONValue]],
+) -> list[JSONValue]:
+    """Describe the most specific coverage gap for each document, in document order."""
+    limitations: list[JSONValue] = []
+    for row in documents.values():
+        identity = f"{row['accession_no']}/{row.get('document_name') or 'document not located'}"
+        if not row["retrieved"]:
+            limitations.append(f"SEC {identity}: no document content was retrieved.")
+        elif not row["inspected"]:
+            limitations.append(f"SEC {identity}: content was retrieved but semantic inspection did not complete.")
+        elif row["incomplete"]:
+            limitations.append(f"SEC {identity}: inspection covered only the returned window, not the complete filing.")
+    return limitations
+
+
 def _session_coverage(store: ResearchRepository, sid: str) -> dict[str, JSONValue]:
     """Project SEC navigation and inspected windows from existing records. Coverage is never citable evidence."""
-    from app.research.models import validate_json_value
     from app.research.scheduler import _persisted_shapes
 
     documents: dict[tuple[str, str], dict[str, JSONValue]] = {}
@@ -2671,21 +2728,7 @@ def _session_coverage(store: ResearchRepository, sid: str) -> dict[str, JSONValu
         row = document(payload.get("accession_no") or args.get("accession_no"), payload.get("document_name"))
         if row is None:
             continue
-        row["located"] = bool(payload.get("source_handle")) or row["located"]
-        row["retrieved"] = row["retrieved"] or attempt.get("document_content") is True
-        row["inspected"] = row["inspected"] or attempt.get("inspected") is True
-        row["admitted"] = row["admitted"] or bool(attempt.get("evidence_id"))
-        row["unavailable"] = attempt.get("error") is not None or not row["retrieved"]
-        row["incomplete"] = (
-            not row["inspected"]
-            or bool(payload.get("more_available") or payload.get("warnings") or payload.get("section"))
-            or bool(args.get("section") or args.get("query") or args.get("offset"))
-        )
-        for key in ("offset", "end_offset", "total_chars", "more_available", "warnings", "available_sections"):
-            if key in payload:
-                row[key] = validate_json_value(payload[key], "<coverage>")
-        if attempt.get("error"):
-            row["error"] = str(attempt["error"])[:300]
+        _document_attempt_coverage(row, attempt, payload, args)
     for evidence in store.list_evidence(sid):
         provenance = evidence.get("provenance")
         if not isinstance(provenance, Mapping) or provenance.get("kind") != "sec_source":
@@ -2693,16 +2736,9 @@ def _session_coverage(store: ResearchRepository, sid: str) -> dict[str, JSONValu
         row = document(provenance.get("accession_no"), provenance.get("document_name"))
         if row is not None:
             row.update({"located": True, "retrieved": True, "admitted": True})
-    limitations: list[JSONValue] = []
-    for row in documents.values():
-        identity = f"{row['accession_no']}/{row.get('document_name') or 'document not located'}"
-        if not row["retrieved"]:
-            limitations.append(f"SEC {identity}: no document content was retrieved.")
-        elif not row["inspected"]:
-            limitations.append(f"SEC {identity}: content was retrieved but semantic inspection did not complete.")
-        elif row["incomplete"]:
-            limitations.append(f"SEC {identity}: inspection covered only the returned window, not the complete filing.")
-    return {"sec": {"documents": list(documents.values()), "limitations": limitations}} if documents else {}
+    if not documents:
+        return {}
+    return {"sec": {"documents": list(documents.values()), "limitations": _document_coverage_limitations(documents)}}
 
 
 def _run_attempt_row(step: int, attempt: Mapping[str, JSONValue]) -> dict[str, JSONValue]:

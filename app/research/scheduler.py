@@ -1484,6 +1484,23 @@ def _row_ciks(row: Mapping[str, object]) -> set[int]:
     return {cik for key in ("filer_cik", "subject_cik") if (cik := _cik_int(row.get(key))) is not None}
 
 
+def _issuer_seed_ciks(payloads: Sequence[Mapping[str, object]], want: str) -> set[int]:
+    """Resolve a trusted issuer CIK only when a listing uses a numeric subject."""
+    if (cik := _cik_int(want)) is not None:
+        return {cik}
+    if want and any(
+        _cik_int(str(payload.get("subject")).strip()) is not None
+        for payload in payloads
+        if isinstance(payload.get("filings"), list)
+    ):
+        from app.sec.client import resolve_cik
+
+        trusted = resolve_cik(want)
+        if trusted is not None and trusted > 0:
+            return {trusted}
+    return set()
+
+
 def _issuer_filing_rows(payloads: Sequence[Mapping[str, object]], ticker: str | None) -> list[Mapping[str, object]]:
     """Filing rows of the objective issuer. Foreign or unverifiable rows drop.
 
@@ -1494,21 +1511,7 @@ def _issuer_filing_rows(payloads: Sequence[Mapping[str, object]], ticker: str | 
     if ticker is None:
         return []
     want = ticker.strip().upper()
-    ciks = {cik} if (cik := _cik_int(want)) is not None else set()
-    if (
-        not ciks
-        and want
-        and any(
-            _cik_int(str(payload.get("subject")).strip()) is not None
-            for payload in payloads
-            if isinstance(payload.get("filings"), list)
-        )
-    ):
-        from app.sec.client import resolve_cik
-
-        trusted = resolve_cik(want)
-        if trusted is not None and trusted > 0:
-            ciks = {trusted}
+    ciks = _issuer_seed_ciks(payloads, want)
     by_ticker: list[Mapping[str, object]] = []
     by_cik: list[tuple[int, Mapping[str, object]]] = []
     singles: list[Mapping[str, object]] = []
@@ -1605,6 +1608,15 @@ def _carry_forms(objective: object, text: str) -> frozenset[str]:
     return frozenset({"10-Q"}) if want_10q else frozenset()
 
 
+def _filing_payload_rows(
+    payloads: Sequence[Mapping[str, object]], issuer: str | None, *, revenue: bool
+) -> list[Mapping[str, object]]:
+    """Keep revenue listings independent so one listing cannot supply another listing's issuer proof."""
+    if revenue:
+        return [row for payload in payloads for row in _issuer_filing_rows([payload], issuer)]
+    return _issuer_filing_rows(payloads, issuer)
+
+
 def _listed_filing(
     session: Mapping[str, JSONValue], attempts: Sequence[Mapping[str, JSONValue]], node: object = None
 ) -> tuple[str, Mapping[str, object]] | None:
@@ -1623,11 +1635,7 @@ def _listed_filing(
         if cik is not None
         else _node_subject_ticker(_f(node, "question"), objective, session.get("ticker"))
     )
-    rows = (
-        [row for payload in payloads for row in _issuer_filing_rows([payload], issuer)]
-        if revenue
-        else _issuer_filing_rows(payloads, issuer)
-    )
+    rows = _filing_payload_rows(payloads, issuer, revenue=revenue)
     as_of = _as_day(session.get("as_of")) or _as_day(_f(session.get("temporal_scope"), "as_of"))
     return _newest_filing(rows, _carry_forms(objective, objective), as_of=as_of, retrieval_tiebreak=revenue)
 
@@ -1675,11 +1683,7 @@ def _resolve_persisted_accession(
         if cik is not None
         else _node_subject_ticker(_f(node, "question"), objective, session.get("ticker"))
     )
-    rows = (
-        [row for payload in filing_payloads for row in _issuer_filing_rows([payload], issuer)]
-        if revenue
-        else _issuer_filing_rows(filing_payloads, issuer)
-    )
+    rows = _filing_payload_rows(filing_payloads, issuer, revenue=revenue)
     text = f"{objective} {_f(node, 'question', default='')}"
     as_of = _as_day(session.get("as_of")) or _as_day(_f(session.get("temporal_scope"), "as_of"))
     newest = _newest_filing(rows, _carry_forms(objective, text), as_of=as_of, retrieval_tiebreak=revenue)
@@ -4856,6 +4860,26 @@ _LINE_ITEM_FANOUT_CAP = 60
 """ponytail: the first 60 statement line-item rows (top line items, every period); raise it for deeper lines."""
 
 
+def _row_numeric_fields(row: Mapping[str, object]) -> list[tuple[str, str | None]]:
+    """Select numeric metrics, with an explicit concept/value pair first and identity fields excluded."""
+    from app.research import evidence as ev
+
+    reserved = {
+        ev._norm_key(k)
+        for k in (*ev._ENTITY_KEYS, *ev._PERIOD_KEYS, *ev._UNIT_KEYS, *ev._CONCEPT_KEYS, *ev._VALUE_KEYS)
+    }
+    fields = [
+        (str(key), ev._scalar_text(value))
+        for key, value in row.items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and ev._norm_key(str(key)) not in reserved
+    ]
+    concept = next((row[k] for k in ev._CONCEPT_KEYS if isinstance(row.get(k), str) and row[k]), None)
+    value = next((t for k in ev._VALUE_KEYS if (t := ev._scalar_text(row.get(k))) is not None), None)
+    if isinstance(concept, str) and value is not None:
+        fields.insert(0, (concept, value))
+    return fields[:_DATAPOINT_FANOUT_CAP]
+
+
 def _admit_row_datapoints(
     kernel: _Kernel, sid: str, attempt: Mapping[str, object], candidate: Mapping[str, object]
 ) -> None:
@@ -4883,28 +4907,13 @@ def _admit_row_datapoints(
     else:
         row = ev.cited_record({"result": payload}, candidate["record_identity"])
         rows = [row] if isinstance(row, Mapping) and row is not payload else []
-    reserved = {
-        ev._norm_key(k)
-        for k in (*ev._ENTITY_KEYS, *ev._PERIOD_KEYS, *ev._UNIT_KEYS, *ev._CONCEPT_KEYS, *ev._VALUE_KEYS)
-    }
     for row in rows:
         entity = next((t for k in ev._ENTITY_KEYS if (t := ev._scalar_text(row.get(k))) is not None), None)
         period = next((t for k in ev._PERIOD_KEYS if (t := ev._scalar_text(row.get(k))) is not None), None)
         if entity is None or period is None:
             continue
-        fields = [
-            (str(key), ev._scalar_text(value))
-            for key, value in row.items()
-            if isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and ev._norm_key(str(key)) not in reserved
-        ]
-        concept = next((row[k] for k in ev._CONCEPT_KEYS if isinstance(row.get(k), str) and row[k]), None)
-        value = next((t for k in ev._VALUE_KEYS if (t := ev._scalar_text(row.get(k))) is not None), None)
-        if isinstance(concept, str) and value is not None:
-            fields.insert(0, (concept, value))
         identity = _compact_json(dict(row))
-        for metric, text in fields[:_DATAPOINT_FANOUT_CAP]:
+        for metric, text in _row_numeric_fields(row):
             item = {
                 **candidate,
                 "record_identity": identity,

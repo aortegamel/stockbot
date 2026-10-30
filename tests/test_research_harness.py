@@ -12420,3 +12420,246 @@ def test_gate_binds_each_shared_value_occurrence_to_its_own_metric() -> None:
     year = {**date, "id": "dp:b", "value": "2025"}
     overlap = _binding_defect("NVDA report date for 2025 likely was 2025-04-27.", [date, year], "inference") or ""
     assert "binds to several datapoints" in overlap
+
+
+@pytest.mark.parametrize(
+    ("key", "raw", "message"),
+    [
+        ("locator", [], "non-empty object"),
+        ("datapoint", {}, "non-empty object"),
+        ("inputProofIds", [], "non-empty list"),
+        ("inputProofIds", ["ok", " "], "non-empty list"),
+        ("inputProofIds", [1], "non-empty list"),
+        ("formulaId", 1, "non-empty string"),
+        ("formulaVersion", " ", "non-empty string"),
+        ("valueHash", "not-a-hash", "sha256 hex digest"),
+        ("sourceId", "other:" + "a" * 64, "sha256:<hex>"),
+        ("sourceId", "sha256:bad", "sha256:<hex>"),
+    ],
+)
+def test_proof_fields_reject_malformed_identity(key: str, raw: object, message: str) -> None:
+    from app.research.evidence import EvidenceIntegrityError, validate_proof, value_hash
+
+    proof: dict[str, object] = {
+        "kind": "calculation",
+        "formulaId": "sum",
+        "formulaVersion": "1",
+        "inputProofIds": ["EV-input"],
+        "valueHash": value_hash("1"),
+    }
+    if key in ("locator", "sourceId"):
+        proof = {
+            "kind": "observation",
+            "sourceId": "sha256:" + "a" * 64,
+            "locator": {"offset": 0},
+            "valueHash": value_hash("1"),
+        }
+    proof[key] = raw
+    with pytest.raises(EvidenceIntegrityError, match=message):
+        validate_proof(proof)
+
+
+@pytest.mark.parametrize(
+    ("formula", "units", "output", "valid"),
+    [
+        ("sum", ("million", "million"), "million", True),
+        ("sum", ("million", "EUR"), "million", False),
+        ("sum", ("million", ""), "million", False),
+        ("ratio", ("USD", "shares"), "usd/shares", True),
+        ("ratio", ("USD", "USD"), "ratio", True),
+        ("ratio", ("USD", "shares"), "ratio", False),
+        ("multiply", ("USD", "shares"), "usd*shares", True),
+        ("multiply", ("ratio", "USD"), "USD", True),
+        ("multiply", ("USD", "x"), "USD", True),
+        ("multiply", ("USD", "shares"), "USD", False),
+        ("valuation_after_tax", ("USD", "ratio"), "USD", True),
+        ("valuation_after_tax", ("USD", "ratio"), "ratio", False),
+        ("valuation_eps_impact", ("USD", "shares"), "USD/share", True),
+        ("valuation_eps_impact", ("USD", "shares"), "USD", False),
+        ("short_interest_percent", ("shares", "shares"), "%", True),
+        ("short_interest_percent", ("shares", "shares"), "ratio", False),
+        ("pe", ("USD", "USD"), "x", True),
+    ],
+)
+def test_calculation_verdict_checks_dimensions(formula: str, units: tuple[str, str], output: str, valid: bool) -> None:
+    from app.research.evidence import ProofVerdict, verify_calculation
+    from app.research.service import _recompute
+
+    base = _observation_row("EV-input", _PROOF_DC, "22,563")
+    rows = [dataclasses.replace(base, evidence_id=f"EV-{i}", unit=unit or None) for i, unit in enumerate(units)]
+    result = _recompute(formula, "1", ("22,563", "22,563"))
+    assert result is not None
+    calc = dataclasses.replace(
+        _calculation_row("EV-output", result, [r.evidence_id for r in rows], formula), unit=output
+    )
+    verdict = verify_calculation(
+        calc, value=result, inputs=[(r, ProofVerdict("verified", "")) for r in rows], recompute=_recompute
+    )
+    if valid:
+        assert verdict.reason == "legacy calculation proof carries no canonical datapoint"
+    else:
+        assert verdict.reason in ("calculation units are missing", "calculation units are incompatible")
+    assert verdict.status == "unverified"
+
+
+@pytest.mark.parametrize(
+    ("semantics", "periods", "output", "message"),
+    [
+        ("quarter", [("2025-01-01", "2025-12-31"), ("2025-01-01", "2025-09-30")], ("2025-10-01", "2025-12-31"), None),
+        ("quarter", [("2025-01-01", "2025-12-31")], ("2025-10-01", "2025-12-31"), "Q4 requires FY and YTD Q3 inputs"),
+        (
+            "quarter",
+            [("2025-01-01", "2025-12-31"), ("2025-02-01", "2025-09-30")],
+            ("2025-10-01", "2025-12-31"),
+            "Q4 requires matching FY and YTD Q3 periods",
+        ),
+        (
+            "quarter",
+            [("2025-12-31", "2025-01-01")],
+            ("2025-10-01", "2025-12-31"),
+            "temporal formulas require valid period_start and period_end",
+        ),
+        (
+            "ttm",
+            [
+                ("2025-01-01", "2025-03-31"),
+                ("2025-04-01", "2025-06-30"),
+                ("2025-07-01", "2025-09-30"),
+                ("2025-10-01", "2025-12-31"),
+            ],
+            ("2025-01-01", "2025-12-31"),
+            None,
+        ),
+        ("ttm", [("2025-01-01", "2025-03-31")], ("2025-01-01", "2025-12-31"), "TTM requires four distinct quarters"),
+        (
+            "ttm",
+            [
+                ("2025-01-01", "2025-03-31"),
+                ("2025-04-02", "2025-06-30"),
+                ("2025-07-01", "2025-09-30"),
+                ("2025-10-01", "2025-12-31"),
+            ],
+            ("2025-01-01", "2025-12-31"),
+            "TTM requires four contiguous quarters in formula argument order",
+        ),
+    ],
+)
+def test_temporal_calculation_verdict_requires_explicit_intervals(
+    semantics: str, periods: list[tuple[str, str]], output: tuple[str, str], message: str | None
+) -> None:
+    from app.research.evidence import ProofVerdict, verify_calculation
+
+    base = _observation_row("EV-input", _PROOF_DC, "22,563")
+    rows = [
+        dataclasses.replace(base, evidence_id=f"EV-{i}", metadata={"period_start": start, "period_end": end})
+        for i, (start, end) in enumerate(periods)
+    ]
+    formula = "sec_q4_difference" if semantics == "quarter" else "sec_eps_ttm"
+    calc = dataclasses.replace(
+        _calculation_row("EV-output", "1", [r.evidence_id for r in rows], formula),
+        metadata={"period_start": output[0], "period_end": output[1]},
+    )
+    verdict = verify_calculation(
+        calc, value="1", inputs=[(r, ProofVerdict("verified", "")) for r in rows], recompute=lambda *_: "1"
+    )
+    assert verdict.reason == (message or "legacy calculation proof carries no canonical datapoint")
+    assert verdict.status == "unverified"
+
+
+def test_calculation_audit_renders_nested_sources_and_ignores_invalid_inputs() -> None:
+    from app.research.synthesis.final import _calculation_lines
+
+    source = {"url": "https://example.test/revenue"}
+    leaf = {
+        "evidence_id": "EV-source",
+        "value": "2",
+        "unit": "USD",
+        "entity": "NVDA",
+        "period": "2025",
+        "as_of": "2026-01-01",
+        "source": source,
+    }
+    calc = {
+        "claim_type": "calculation",
+        "evidence_id": "EV-calc",
+        "metric": "sum",
+        "result": "4",
+        "inputs": [leaf, None],
+        "verification": "verified",
+        "verification_reason": "replayed",
+    }
+    lines = _calculation_lines([calc])
+    assert "Stockbot calculation [EV-calc]: sum = 4" in lines[0]
+    assert any("Verification: verified: replayed" in line for line in lines)
+    assert lines[-1].startswith("  Input 1 [EV-source]: 2 USD.")
+    assert 'Source: {"url": "https://example.test/revenue"}' in lines[-1]
+    assert "Verification: unverified:" in lines[-1]
+    assert _calculation_lines([{**calc, "inputs": None}]) == lines[:-1]
+    assert _calculation_lines([]) == []
+
+
+@pytest.mark.parametrize(
+    ("formula", "detail"),
+    [
+        (("unknown", "1"), "formula 'unknown' v1 is unknown"),
+        (("sum", "1"), "the row retained no calculation inputs"),
+    ],
+)
+def test_repair_calculation_rejects_unknown_formula_and_absent_inputs(
+    _rep_store: ResearchRepository, formula: tuple[str, str], detail: str
+) -> None:
+    from app.research import repair
+
+    run = repair._Run(_rep_store, {}, datetime(2025, 8, 1, tzinfo=UTC))
+    point = repair._Point("total", "revenue", "1", "derived")
+    with pytest.raises(repair._Unresolved) as error:
+        repair._calculation_artifact(run, point, formula, [], "1")
+    assert error.value.reason == "CALCULATION_INVALID"
+    assert error.value.detail == detail
+    assert _rep_store.list_evidence(_REP_SID) == []
+
+
+@pytest.mark.parametrize(
+    ("formula", "output_period", "right_metric", "output_unit", "message"),
+    [
+        ("change", "2024 to 2025", "Data Center revenue", "million", None),
+        ("pct_change", "2024 to 2025", "Data Center revenue", "%", None),
+        ("sec_dividend_growth_1y", "2024 to 2025", "Data Center revenue", "ratio", None),
+        ("change", "2024 to 2025", "total revenue", "million", "calculation inputs name different metrics"),
+        (
+            "change",
+            "comparison",
+            "Data Center revenue",
+            "million",
+            "calculation period does not name both input periods",
+        ),
+        ("change", "2024", "Data Center revenue", "million", "calculation periods are incompatible"),
+    ],
+)
+def test_change_calculation_requires_same_metric_and_both_periods(
+    formula: str, output_period: str, right_metric: str, output_unit: str, message: str | None
+) -> None:
+    from app.research.evidence import ProofVerdict, verify_calculation
+
+    base = _observation_row("EV-left", _PROOF_DC, "22,563")
+    locator = base.proof["locator"]
+    assert isinstance(locator, dict)
+    point = locator["datapoint"]
+    assert isinstance(point, dict)
+    right = dataclasses.replace(
+        base,
+        evidence_id="EV-right",
+        period="2025",
+        proof={**base.proof, "locator": {**locator, "datapoint": {**point, "metric": right_metric}}},
+    )
+    rows = [dataclasses.replace(base, period="2024"), right]
+    calc = dataclasses.replace(
+        _calculation_row("EV-output", "1", [r.evidence_id for r in rows], formula),
+        period=output_period,
+        unit=output_unit,
+    )
+    verdict = verify_calculation(
+        calc, value="1", inputs=[(r, ProofVerdict("verified", "")) for r in rows], recompute=lambda *_: "1"
+    )
+    assert verdict.reason == (message or "legacy calculation proof carries no canonical datapoint")
+    assert verdict.status == "unverified"

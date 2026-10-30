@@ -504,21 +504,21 @@ def _fact_field(row: pd.Series[str], name: str, *alts: str) -> str | None:
 def _copy_fact_meta(r: pd.Series[str]) -> dict[str, object]:
     """Retain fact identity and normalize the SDK's filing aliases."""
     meta: dict[str, object] = {}
-    for _k in ("accession", "accn", "form", "form_type", "filed", "filed_at", "filing_date"):
+    aliases = {
+        "accession": "accession",
+        "accn": "accession",
+        "form": "form",
+        "form_type": "form",
+        "filed": "filed",
+        "filed_at": "filed",
+        "filing_date": "filed",
+    }
+    for _k, _out in aliases.items():
         try:
             _v = r.get(_k)
         except AttributeError, TypeError, ValueError:
             _v = None
         if _v is not None and str(_v) not in ("", "nan", "NaT"):
-            _out = (
-                "accession"
-                if _k in ("accession", "accn")
-                else (
-                    "form"
-                    if _k in ("form", "form_type")
-                    else ("filed" if _k in ("filed", "filed_at", "filing_date") else _k)
-                )
-            )
             meta.setdefault(_out, str(_v))
     if "filed" in meta:
         meta["filed_at"] = meta["filed"]

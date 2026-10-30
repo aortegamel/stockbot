@@ -4429,6 +4429,102 @@ def _bound_value_spans(
     return bound
 
 
+def _identity_value_spans(
+    masked: str,
+    spans: Sequence[tuple[int, int]],
+    bounds: Sequence[int],
+    point: Mapping[str, object],
+) -> list[tuple[int, int]]:
+    """Keep values only in sentences that state their own entity, period, and unit."""
+    kept: list[tuple[int, int]] = []
+    for start, end in spans:
+        at = next(i for i in range(len(bounds) - 1) if bounds[i] <= start < bounds[i + 1])
+        scope = masked[bounds[at] : bounds[at + 1]]
+        unit = point.get("unit")
+        if all(any(_phrase_spans(scope, text) for text in _spellings(point, key)) for key in ("entity", "period")) and (
+            not isinstance(unit, str) or not unit.strip() or _states_unit(scope, unit)
+        ):
+            kept.append((start, end))
+    return kept
+
+
+def _claim_identity_defect(masked: str, point: Mapping[str, object]) -> str | None:
+    """Check claim-wide identity for claim types that do not require sentence-local identity."""
+    pid = point.get("id")
+    for key in ("entity", "period"):
+        if not any(_phrase_spans(masked, text) for text in _spellings(point, key)):
+            return f"ERR_DATAPOINT_UNBOUND (claim does not state datapoint {pid} {key} {point[key]!r})"
+    unit = point.get("unit")
+    if isinstance(unit, str) and unit.strip() and not _states_unit(masked, unit):
+        return f"ERR_DATAPOINT_UNBOUND (claim does not state datapoint {pid} unit {unit!r})"
+    return None
+
+
+def _sentence_identity_defect(
+    masked: str,
+    points: Sequence[Mapping[str, object]],
+    bounds: Sequence[int],
+    owner: Mapping[tuple[int, int], int],
+) -> str | None:
+    """Reject sentences that combine datapoints with different identities."""
+    by_sentence: dict[tuple[int, int], set[int]] = {}
+    for (start, _), index in owner.items():
+        at = next(i for i in range(len(bounds) - 1) if bounds[i] <= start < bounds[i + 1])
+        by_sentence.setdefault((bounds[at], bounds[at + 1]), set()).add(index)
+    for span, members in by_sentence.items():
+        identities = {
+            (
+                str(points[i].get("entity")).casefold(),
+                str(points[i].get("period")).casefold(),
+                str(points[i].get("unit")).casefold() if isinstance(points[i].get("unit"), str) else "",
+            )
+            for i in members
+        }
+        if len(identities) > 1:
+            window = masked[span[0] : span[1]] if span != (-1, -1) else masked
+            return (
+                "ERR_DATAPOINT_UNBOUND (one sentence states several identities:"
+                f" {window.strip()[:120]!r} names {len(members)} datapoints; identify each in its own sentence)"
+            )
+    return None
+
+
+def _shared_value_defect(
+    masked: str, points: Sequence[Mapping[str, object]], by_span: Mapping[tuple[int, int], set[int]]
+) -> str | None:
+    """Reject duplicate references and values that bind to more than one datapoint."""
+    seen: set[str] = set()
+    for point in points:
+        pid = str(point.get("id"))
+        if pid in seen:
+            return (
+                f"ERR_DATAPOINT_UNBOUND (datapoint {pid} is referenced twice; state each value beside its own metric)"
+            )
+        seen.add(pid)
+    for start, end in sorted(by_span):
+        members = {i for (a, b), group in by_span.items() if a < end and start < b for i in group}
+        if len(members) > 1:
+            disputed = sorted(str(points[i].get("id")) for i in members)
+            return (
+                "ERR_DATAPOINT_UNBOUND (one stated number binds to several datapoints:"
+                f" {masked[start:end]!r} matches {disputed}; state each value beside its own metric)"
+            )
+    return None
+
+
+def _binding_sentence_bounds(masked: str, points: Sequence[Mapping[str, object]], *, strict: bool) -> list[int]:
+    """Find sentence boundaries without treating an entity's trailing abbreviation period as a sentence end."""
+    abbreviated = {
+        end + 1
+        for point in points
+        for name in _spellings(point, "entity")
+        if name.rstrip().endswith(".")
+        for _, end in _phrase_spans(masked, name)
+    }
+    ends = [match.end() for match in _SENTENCE_END_RE.finditer(masked) if match.end() not in abbreviated]
+    return [0, *ends, len(masked)] if strict else [0, len(masked)]
+
+
 def _binding_defect(text: str, points: Sequence[Mapping[str, object]], claim_type: str) -> str | None:
     """Bind the claim wording to each referenced datapoint's metric/value/entity/period/unit; no stray number.
 
@@ -4440,16 +4536,7 @@ def _binding_defect(text: str, points: Sequence[Mapping[str, object]], claim_typ
     """
     masked = _masked(text)
     strict = claim_type in ("observed_fact", "calculation")
-    # An entity spelled with a trailing period ("Advanced Micro Devices, Inc.") does not end its sentence.
-    abbreviated = {
-        end + 1
-        for point in points
-        for name in _spellings(point, "entity")
-        if name.rstrip().endswith(".")
-        for _, end in _phrase_spans(masked, name)
-    }
-    ends = [match.end() for match in _SENTENCE_END_RE.finditer(masked) if match.end() not in abbreviated]
-    bounds = [0, *ends, len(masked)] if strict else [0, len(masked)]
+    bounds = _binding_sentence_bounds(masked, points, strict=strict)
     numbers = _numbers(masked)
     bound: list[tuple[int, int]] = []
     context: set[str] = set()
@@ -4462,72 +4549,28 @@ def _binding_defect(text: str, points: Sequence[Mapping[str, object]], claim_typ
             return f"ERR_DATAPOINT_UNVERIFIED (datapoint {pid} lacks {', '.join(missing)})"
         spans = _bound_value_spans(masked, numbers, point, strict=strict)
         if strict:
-            kept: list[tuple[int, int]] = []
-            for start, end in spans:
-                at = next(i for i in range(len(bounds) - 1) if bounds[i] <= start < bounds[i + 1])
-                scope = masked[bounds[at] : bounds[at + 1]]
-                unit = point.get("unit")
-                if all(
-                    any(_phrase_spans(scope, text) for text in _spellings(point, key)) for key in ("entity", "period")
-                ) and (not isinstance(unit, str) or not unit.strip() or _states_unit(scope, unit)):
-                    kept.append((start, end))
-            spans = kept
-        else:
-            unit = None
+            spans = _identity_value_spans(masked, spans, bounds, point)
         if not spans:
             return (
                 f"ERR_DATAPOINT_UNBOUND (claim does not state datapoint {pid} metric {point['metric']!r} "
                 f"directly before its value {point['value']!r})"
             )
         if not strict:
-            scope = masked
-            for key in ("entity", "period"):
-                if not any(_phrase_spans(scope, text) for text in _spellings(point, key)):
-                    return f"ERR_DATAPOINT_UNBOUND (claim does not state datapoint {pid} {key} {point[key]!r})"
-            unit = point.get("unit")
-            if isinstance(unit, str) and unit.strip() and not _states_unit(scope, unit):
-                return f"ERR_DATAPOINT_UNBOUND (claim does not state datapoint {pid} unit {unit!r})"
+            defect = _claim_identity_defect(masked, point)
+            if defect is not None:
+                return defect
         bound.extend(spans)
         context |= numeric_tokens(_point_text(point, ("entity", "period", "unit", "metric")))
         for span in spans:
             owner[span] = index
             by_span.setdefault(span, set()).add(index)
     if strict:
-        by_sentence: dict[tuple[int, int], set[int]] = {}
-        for (start, _), index in owner.items():
-            at = next(i for i in range(len(bounds) - 1) if bounds[i] <= start < bounds[i + 1])
-            by_sentence.setdefault((bounds[at], bounds[at + 1]), set()).add(index)
-        for span, members in by_sentence.items():
-            identities = {
-                (
-                    str(points[i].get("entity")).casefold(),
-                    str(points[i].get("period")).casefold(),
-                    str(points[i].get("unit")).casefold() if isinstance(points[i].get("unit"), str) else "",
-                )
-                for i in members
-            }
-            if len(identities) > 1:
-                window = masked[span[0] : span[1]] if span != (-1, -1) else masked
-                return (
-                    "ERR_DATAPOINT_UNBOUND (one sentence states several identities:"
-                    f" {window.strip()[:120]!r} names {len(members)} datapoints; identify each in its own sentence)"
-                )
-    seen: dict[str, int] = {}
-    for index, point in enumerate(points):
-        pid = str(point.get("id"))
-        if pid in seen:
-            return (
-                f"ERR_DATAPOINT_UNBOUND (datapoint {pid} is referenced twice; state each value beside its own metric)"
-            )
-        seen[pid] = index
-    for start, end in sorted(by_span):
-        members = {i for (a, b), group in by_span.items() if a < end and start < b for i in group}
-        if len(members) > 1:
-            disputed = sorted(str(points[i].get("id")) for i in members)
-            return (
-                "ERR_DATAPOINT_UNBOUND (one stated number binds to several datapoints:"
-                f" {masked[start:end]!r} matches {disputed}; state each value beside its own metric)"
-            )
+        defect = _sentence_identity_defect(masked, points, bounds, owner)
+        if defect is not None:
+            return defect
+    defect = _shared_value_defect(masked, points, by_span)
+    if defect is not None:
+        return defect
     if claim_type == "assumption":
         return None
     stray = sorted(

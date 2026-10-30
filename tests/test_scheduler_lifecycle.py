@@ -10290,3 +10290,53 @@ def test_newest_persisted_filing_is_independent_of_row_order(rows: list[tuple[st
     ]
     actual = sched._newest_filing(filings, frozenset({"8-K"}))
     assert actual is not None and actual[0] == "0001045810-26-000078"
+
+
+@pytest.mark.parametrize(
+    "tool,accession,properties,sections,expected_section",
+    [
+        ("get_sec_filing", _LISTED_8K, {"section": {}}, [], None),
+        ("get_sec_document", _LISTED_8K, {"section": {}}, [], "Item 1"),
+        ("get_sec_document", _LISTED_8K, {"section": {}}, ["Item 1"], "Item 2"),
+        ("get_sec_document", _LISTED_8K, {"section": {}}, ["Item 1", "Item 2"], "Item 1A"),
+        ("get_sec_document", _LISTED_8K, {"section": {}}, ["Item 1", "Item 2", "Item 1A"], None),
+        ("get_sec_document", _LISTED_8K, {}, [], None),
+        ("get_sec_document", None, {"section": {}}, [], None),
+    ],
+)
+def test_document_retry_advances_sections_without_repeating(
+    tool: str,
+    accession: str | None,
+    properties: dict[str, JSONValue],
+    sections: list[str],
+    expected_section: str | None,
+) -> None:
+    """A retry selects the first unread section and retains arguments when no next filing exists."""
+    filled: dict[str, JSONValue] = {"accession_no": accession, "document_name": "filing.htm"}
+    attempts: list[dict[str, JSONValue]] = [
+        {"tool": "get_sec_document", "arguments": {**filled, "section": section}} for section in sections
+    ]
+    result = sched._advance_document_retry(tool, filled, {}, _node(), attempts, _Kernel(), {"properties": properties})
+    assert result == ({**filled, "section": expected_section} if expected_section else filled)
+
+
+def test_document_retry_moves_to_next_persisted_filing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A retry replaces stale identifiers with the next issuer filing and preserves other arguments."""
+    import app.tools as _tools
+
+    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _resolve_nvda)
+    listing = _sec_listing()
+    kernel = _Kernel(
+        {"s1:tr:intake": {"session_id": "s1", "tool_name": "list_sec_filings", "result": listing["result"]}}
+    )
+    filled: dict[str, JSONValue] = {"accession_no": _LISTED_10Q, "document_name": "stale.htm", "max_chars": 100}
+    result = sched._advance_document_retry(
+        "get_sec_document",
+        filled,
+        _8K_SESSION,
+        _node(),
+        [],
+        kernel,
+        {"properties": {"accession_no": {"type": "string"}, "document_name": {"type": "string"}}},
+    )
+    assert result == {"accession_no": _LISTED_8K, "document_name": "nvda-8k.htm", "max_chars": 100}

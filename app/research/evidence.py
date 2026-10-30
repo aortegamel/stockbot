@@ -1651,18 +1651,8 @@ def _temporal_input_defect(evidence: Evidence, rows: Sequence[Evidence], semanti
     return None
 
 
-def _calculation_input_defect(evidence: Evidence, rows: Sequence[Evidence]) -> str | None:
-    """Reject incompatible typed operands before arithmetic or ledger persistence."""
-    from .service import _FORMULAS
-
-    formula = _FORMULAS.get((str(evidence.proof["formulaId"]), str(evidence.proof["formulaVersion"])))
-    if formula is None:
-        return "formula is unknown"
-    semantics = formula[1]
-    if not evidence.entity or any(
-        not row.entity or row.entity.casefold() != evidence.entity.casefold() for row in rows
-    ):
-        return "calculation entities are incompatible"
+def _calculation_period_defect(evidence: Evidence, rows: Sequence[Evidence], semantics: str) -> str | None:
+    """Check period compatibility and the metric identity of changes."""
     if not evidence.period or any(not row.period for row in rows):
         return "calculation periods are missing"
     row_periods = [row.period.casefold() for row in rows if row.period]
@@ -1681,18 +1671,24 @@ def _calculation_input_defect(evidence: Evidence, rows: Sequence[Evidence]) -> s
     if not period_ok:
         return "calculation periods are incompatible"
     if semantics in ("growth_pct", "growth_ratio", "change"):
-        # A change compares one metric with itself, and its output period names both operand periods.
-        metrics = {str(point.get("metric")).casefold() for row in rows if (point := datapoint_descriptor(row))}
-        if len(metrics) != 1:
-            return "calculation inputs name different metrics"
-        # Spacing and the article "the" never matter: "June 27, 2026" names the input's "June 27,2026".
-        squeezed = [re.sub(r"\bthe\b|\s+", "", period) for period in (*row_periods, output_period)]
-        if not all(period in squeezed[-1] for period in squeezed[:-1]):
-            return "calculation period does not name both input periods"
-    if semantics in ("quarter", "ttm"):
-        defect = _temporal_input_defect(evidence, rows, semantics)
-        if defect:
-            return defect
+        return _change_input_defect(rows, row_periods, output_period)
+    return None
+
+
+def _change_input_defect(rows: Sequence[Evidence], row_periods: Sequence[str], output_period: str) -> str | None:
+    """A change compares one metric and names both operand periods."""
+    metrics = {str(point.get("metric")).casefold() for row in rows if (point := datapoint_descriptor(row))}
+    if len(metrics) != 1:
+        return "calculation inputs name different metrics"
+    # Spacing and the article "the" never matter: "June 27, 2026" names the input's "June 27,2026".
+    squeezed = [re.sub(r"\bthe\b|\s+", "", period) for period in (*row_periods, output_period)]
+    if not all(period in squeezed[-1] for period in squeezed[:-1]):
+        return "calculation period does not name both input periods"
+    return None
+
+
+def _calculation_unit_defect(evidence: Evidence, rows: Sequence[Evidence], semantics: str) -> str | None:
+    """Check dimensional compatibility for the formula's operands and result."""
     units = [row.unit.casefold().replace(" ", "") if row.unit else "" for row in rows]
     output_unit = evidence.unit.casefold().replace(" ", "") if evidence.unit else ""
     if not units or not all(units) or not output_unit:
@@ -1709,11 +1705,7 @@ def _calculation_input_defect(evidence: Evidence, rows: Sequence[Evidence]) -> s
         if len(units) == 2:
             valid = valid or output_unit == f"{units[0]}/{units[1]}"
     elif semantics == "product":
-        valid = len(units) == 2 and (
-            output_unit == f"{units[0]}*{units[1]}"
-            or (units[0] in ("ratio", "dimensionless", "multiple", "x", "1") and output_unit == units[1])
-            or (units[1] in ("ratio", "dimensionless", "multiple", "x", "1") and output_unit == units[0])
-        )
+        valid = _product_units_match(units, output_unit)
     elif semantics == "scale":
         valid = len(units) == 2 and output_unit == units[0]
     elif semantics == "per_share":
@@ -1721,6 +1713,37 @@ def _calculation_input_defect(evidence: Evidence, rows: Sequence[Evidence]) -> s
     else:
         valid = False
     return None if valid else "calculation units are incompatible"
+
+
+def _product_units_match(units: Sequence[str], output_unit: str) -> bool:
+    """A product retains explicit dimensions unless one operand is dimensionless."""
+    return len(units) == 2 and (
+        output_unit == f"{units[0]}*{units[1]}"
+        or (units[0] in ("ratio", "dimensionless", "multiple", "x", "1") and output_unit == units[1])
+        or (units[1] in ("ratio", "dimensionless", "multiple", "x", "1") and output_unit == units[0])
+    )
+
+
+def _calculation_input_defect(evidence: Evidence, rows: Sequence[Evidence]) -> str | None:
+    """Reject incompatible typed operands before arithmetic or ledger persistence."""
+    from .service import _FORMULAS
+
+    formula = _FORMULAS.get((str(evidence.proof["formulaId"]), str(evidence.proof["formulaVersion"])))
+    if formula is None:
+        return "formula is unknown"
+    semantics = formula[1]
+    if not evidence.entity or any(
+        not row.entity or row.entity.casefold() != evidence.entity.casefold() for row in rows
+    ):
+        return "calculation entities are incompatible"
+    defect = _calculation_period_defect(evidence, rows, semantics)
+    if defect:
+        return defect
+    if semantics in ("quarter", "ttm"):
+        defect = _temporal_input_defect(evidence, rows, semantics)
+        if defect:
+            return defect
+    return _calculation_unit_defect(evidence, rows, semantics)
 
 
 def verify_calculation(

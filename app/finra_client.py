@@ -646,6 +646,15 @@ class OfficialFileConflict(ValueError):
     """
 
 
+def _official_header(lines: list[str], url: str, required: tuple[str, ...]) -> list[str]:
+    """Read the file header and require the symbol, date, and venue columns."""
+    header = [cell.strip('"') for cell in lines[0].split("|")] if lines else []
+    for column in required:
+        if column not in header:
+            raise ValueError(f"{url}: no {column} column")
+    return header
+
+
 def _official_line(
     text: str,
     url: str,
@@ -664,10 +673,7 @@ def _official_line(
     quoted, so file order never changes the result. Other agreeing duplicates are ambiguous.
     """
     lines = text.splitlines()
-    header: list[str] = [cell.strip('"') for cell in lines[0].split("|")] if lines else []
-    for column in (symbol_column, *identity):
-        if column not in header:
-            raise ValueError(f"{url}: no {column} column")
+    header = _official_header(lines, url, (symbol_column, *identity))
     fields = columns if columns is not None else {h: h for h in header}
     agreeing: list[tuple[str, dict[str, str]]] = []
     conflicts: list[str] = []

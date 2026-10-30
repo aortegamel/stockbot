@@ -79,6 +79,16 @@ def _mode(types: list[str], metrics: object) -> Literal["chat", "research"] | No
     return None
 
 
+def _citation_count(text: str, known: set[str], claims: list[dict[str, object]]) -> int:
+    """Count known evidence cited inline or by claims that appear in the answer."""
+    cited = {i for i in known if f"[{i}]" in text}
+    for claim in claims:
+        ids = claim.get("evidenceIds")
+        if claim.get("text") and str(claim["text"]) in text and isinstance(ids, list):
+            cited |= {str(i) for i in ids if str(i) in known}
+    return len(cited)
+
+
 def parse_stream(lines: Iterable[tuple[float, bytes]]) -> Run:
     """Fold timed SSE lines (elapsed ms, raw line) into one run record. No clock, no I/O."""
     run = Run()
@@ -118,12 +128,7 @@ def parse_stream(lines: Iterable[tuple[float, bytes]]) -> Run:
     if run.total_ms is None:
         run.total_ms = last_ms
     text = "".join(answer)
-    cited = {i for i in known if f"[{i}]" in text}
-    for c in claims:
-        ids = c.get("evidenceIds")
-        if c.get("text") and str(c["text"]) in text and isinstance(ids, list):
-            cited |= {str(i) for i in ids if str(i) in known}
-    run.citation_count = len(cited)
+    run.citation_count = _citation_count(text, known, claims)
     run.answer = text
     run.claims = claims
     run.mode = _mode(run.events, run.timings)

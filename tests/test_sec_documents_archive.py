@@ -802,6 +802,26 @@ def test_official_financial_fact_never_falls_back_to_available_index(
     assert OFF_INDEX in sec_www.calls
 
 
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"derived": True},
+        {"value": "not-a-number"},
+        {"value": "NaN"},
+        {"period_end": "not-a-date"},
+        {"dimensions": []},
+        {"dimensions": {1: "member"}},
+        {"dimensions": {"axis": 1}},
+        {"concept": None},
+    ],
+)
+def test_official_invalid_fact_identity_never_fetches(
+    changes: dict[str, object], tmp_path: Path, sec_www: _FakeSec
+) -> None:
+    assert documents.resolve_sec_official("get_xbrl_facts", _revenue_row(**changes), {}, root=tmp_path) is None
+    assert sec_www.calls == []
+
+
 def test_official_hidden_fact_uses_canonical_case_two(tmp_path: Path, sec_www: _FakeSec) -> None:
     page = documents.resolve_sec_official("get_xbrl_facts", _revenue_row(element_id="f-hidden"), {}, root=tmp_path)
     assert page is not None
