@@ -34,7 +34,7 @@ None
 ## Required arguments
 
 - `answer` (string): Final synthesis prose.
-- `claims` (array): Grounded findings; each claim needs non-empty text and non-empty evidence IDs from the freeze.
+- `claims` (array): Grounded findings; each claim needs non-empty text. observation/calculation/inference/contradicted/conditional_risk/attributed_report need freeze evidence IDs; unknown and value-less assumption may cite none. Every stated number references its kernel datapoint id; each claim passes the publication gate as written.
 - `session_id` (string): Research session ID.
 
 ## Optional arguments
