@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
 import { SessionPanel, JournalPanel } from "../components/market-panels";
 import { WatchlistChatPanel } from "../components/watchlist-chat-panel";
@@ -6,12 +6,14 @@ import { ThesisPanel } from "../components/thesis-panel";
 import { PortfolioPanel } from "../components/portfolio-panel";
 import { EnableNotifications } from "../components/action-cards";
 import { isWidgetType, WidgetGrid, widgetLabel, WORKSPACE_TYPES } from "../components/widgets";
+import HomePanels, { HOME_TYPES } from "../components/home-workspace";
 import { TvLinkForm } from "../components/tv-link";
 import { listWorkspaces, MAX_WIDGETS, saveWorkspace, type WorkspaceDoc, type WorkspaceWidget } from "../lib/market-data";
 import { TICKER_RE } from "../lib/route";
 import type { ShellState } from "../layout/Shell";
 
 const ACTIVE_KEY = "stockbot.workspace";
+export const DEFAULT_WORKSPACE_ID = "00000000-0000-4000-8000-000000000000";
 // Shell retains drafts across page changes. Only Save writes them to the server.
 export type WorkspaceDraft = {
   docs: WorkspaceDoc[];
@@ -38,24 +40,24 @@ function windowOf(type: string, ticker: string, index: number): WorkspaceWidget 
   };
 }
 
-function newWorkspace(name: string, ticker: string): WorkspaceDoc {
-  const height = Math.min(4000, Math.max(460, window.innerHeight - 230));
-  const chartHeight = Math.max(240, Math.floor(height * 0.52));
+function defaultWorkspace(ticker: string): WorkspaceDoc {
   const initial = [
-    ["watchlist", 0, 0, 280, 300],
-    ["portfolio", 0, 312, 280, 380],
-    ["price-volume", 292, 0, 700, chartHeight],
-    ["financials", 1004, 0, 360, 320],
-    ["news", 1004, 332, 360, 360],
-    ["agent", 292, chartHeight + 12, 700, height - chartHeight - 12],
+    ["index-tape", 0, 0, 1364, 180],
+    ["spy-chart", 0, 192, 880, 300],
+    ["briefing", 892, 192, 472, 300],
+    ["scans", 0, 504, 280, 400],
+    ["markets", 292, 504, 700, 400],
+    ["market-detail", 1004, 504, 360, 300],
+    ["portfolio", 1004, 816, 360, 300],
   ] as const;
   return {
-    id: newId(), name, updated_at: null,
+    id: DEFAULT_WORKSPACE_ID, name: "default", updated_at: null,
     widgets: initial.map(([type, x, y, width, height]) => ({
       id: newId(), type, ticker, geometry: { x, y, width, height },
     })),
   };
 }
+
 
 function edit(draft: WorkspaceDraft, doc: WorkspaceDoc): WorkspaceDraft {
   return {
@@ -93,15 +95,16 @@ function applyReceipts(widgets: WorkspaceWidget[], events: AgentEvent[]): { widg
   return { widgets: next, outcomes, changed: next.length !== widgets.length };
 }
 function initialDraft(workspaces: WorkspaceDoc[], selected: string): WorkspaceDraft {
-  const docs = workspaces.length ? workspaces : [newWorkspace("Research", selected)];
-  let activeId = docs[0].id;
+  const docs = workspaces.some((doc) => doc.id === DEFAULT_WORKSPACE_ID)
+    ? workspaces : [defaultWorkspace(selected), ...workspaces];
+  let activeId = DEFAULT_WORKSPACE_ID;
   try {
     const saved = window.localStorage.getItem(ACTIVE_KEY);
     if (docs.some((d) => d.id === saved)) activeId = saved!;
   } catch {
     // Disabled storage does not prevent server-backed workspaces.
   }
-  return { docs, activeId, dirty: workspaces.length ? [] : [activeId], status: {}, saving: false };
+  return { docs, activeId, dirty: [], status: {}, saving: false };
 }
 function extraPanel(s: ShellState, widget: WorkspaceWidget) {
   switch (widget.type) {
@@ -127,11 +130,14 @@ function WorkspaceTabs({ draft, activeId, onSelect, onNew }: { draft: WorkspaceD
     </div>
   );
 }
-function CreatorForm({ name, setName, ticker, onCreate, onCancel }: { name: string; setName: (v: string) => void; ticker: string; onCreate: () => void; onCancel: () => void }) {
+function CreatorForm({ name, setName, fromDefault, setFromDefault, onCreate, onCancel }: {
+  name: string; setName: (v: string) => void; fromDefault: boolean; setFromDefault: (v: boolean) => void; onCreate: () => void; onCancel: () => void;
+}) {
   return (
     <form className="strip ws-actions ws-toolbar" onSubmit={(e) => { e.preventDefault(); onCreate(); }}>
       <input autoFocus className="input" aria-label="Workspace name" placeholder="Workspace name" value={name} maxLength={60} required onChange={(e) => setName(e.target.value)} />
-      <button type="submit" className="btn-primary" disabled={!name.trim() || !TICKER_RE.test(ticker)}>Create workspace</button>
+      <label className="pill"><input type="checkbox" checked={fromDefault} onChange={(e) => setFromDefault(e.target.checked)} /> Start from default</label>
+      <button type="submit" className="btn-primary" disabled={!name.trim()}>Create workspace</button>
       <button type="button" className="pill" onClick={onCancel}>Cancel</button>
     </form>
   );
@@ -142,14 +148,14 @@ function EditorBar({ current, status, dirty, saving, ticker, setTicker, onName, 
 }) {
   return (
     <div className="strip ws-actions ws-toolbar">
-      <input className="input ws-name" aria-label="Workspace name" value={current.name} maxLength={60} required onChange={(e) => onName(e.target.value)} />
+      <input className="input ws-name" aria-label="Workspace name" value={current.name} readOnly={current.id === DEFAULT_WORKSPACE_ID} maxLength={60} required onChange={(e) => onName(e.target.value)} />
       <input className="input ws-ticker" aria-label="New window ticker" value={ticker} maxLength={10} pattern={TICKER_RE.source} title="Ticker for new windows" onChange={(e) => setTicker(e.target.value.trim().toUpperCase())} />
       <select aria-label="Add widget" value="" className="pill" disabled={current.widgets.length >= MAX_WIDGETS || !TICKER_RE.test(ticker)} onChange={(e) => onAddSelect(e.target.value)}>
         <option value="">Add widget</option>
         {WORKSPACE_TYPES.map((type) => <option key={type} value={type}>{widgetLabel(type)}</option>)}
       </select>
       <button type="button" className="btn-primary" disabled={saving || !current.name.trim()} onClick={onSave}>{saving ? "Saving…" : "Save"}</button>
-      <span role="status" className="feed-muted">{status || (dirty ? "Unsaved changes" : "Saved")}</span>
+      <span role="status" className="feed-muted">{status || (dirty ? "Unsaved changes" : current.updated_at ? "Saved" : "Default layout")}</span>
       {current.widgets.length >= MAX_WIDGETS && <span className="feed-muted">Workspace limit: {MAX_WIDGETS} widgets</span>}
     </div>
   );
@@ -209,6 +215,7 @@ export default function Workspace(s: ShellState) {
   const [attempt, setAttempt] = useState(0);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
+  const [fromDefault, setFromDefault] = useState(false);
   const [ticker, setTicker] = useState(s.selected);
   const [linking, setLinking] = useState(false);
   const saving = draft?.saving ?? false;
@@ -281,8 +288,6 @@ export default function Workspace(s: ShellState) {
     });
   }
 
-  const renderExtra = (widget: WorkspaceWidget) => extraPanel(s, widget);
-
   if (!draft || !current) return <div className="workspace">
     {error ? <p role="alert">{error} <button type="button" className="pill" onClick={() => setAttempt((n) => n + 1)}>Retry</button></p>
       : <span className="skeleton" aria-label="Loading workspace" aria-busy="true" />}
@@ -296,7 +301,11 @@ export default function Workspace(s: ShellState) {
   };
   const create = () => {
     if (!name.trim()) return;
-    const doc = newWorkspace(name.trim(), ticker);
+    const template = fromDefault ? draft.docs.find((doc) => doc.id === DEFAULT_WORKSPACE_ID)?.widgets ?? [] : [];
+    const doc: WorkspaceDoc = {
+      id: newId(), name: name.trim(), updated_at: null,
+      widgets: template.map((widget) => ({ ...structuredClone(widget), id: newId() })),
+    };
     s.setWorkspace((d) => d ? { ...d, docs: [...d.docs, doc], activeId: doc.id, dirty: [...d.dirty, doc.id] } : d);
     setCreating(false);
     setLinking(false);
@@ -305,22 +314,27 @@ export default function Workspace(s: ShellState) {
     if (value === "tv-link") setLinking(true);
     else if (WORKSPACE_TYPES.includes(value)) add(value);
   };
+  const windows = (renderHome: (type: string) => ReactNode) => (
+    <WidgetGrid key={current.id} widgets={current.widgets} renderExtra={(widget) => renderHome(widget.type) ?? extraPanel(s, widget)}
+      onChange={(widgets) => update((doc) => ({ ...doc, widgets }))}
+      onRemove={(id) => update((doc) => ({ ...doc, widgets: doc.widgets.filter((w) => w.id !== id) }))}
+      onParams={(id, params) => update((doc) => ({ ...doc, widgets: doc.widgets.map((w) => w.id === id ? { ...w, params } : w) }))}
+      onType={(id, type) => update((doc) => ({ ...doc, widgets: doc.widgets.map((w) => w.id === id ? { id: w.id, ticker: w.ticker, geometry: w.geometry, type } : w) }))}
+      onTicker={(id, next) => update((doc) => ({ ...doc, widgets: doc.widgets.map((w) => w.id === id ? { ...w, ticker: next } : w) }))}
+    />
+  );
   return (
     <div className="workspace">
-      <WorkspaceTabs draft={draft} activeId={current.id} onSelect={select} onNew={() => { setName(""); setCreating(true); }} />
+      <WorkspaceTabs draft={draft} activeId={current.id} onSelect={select} onNew={() => { setName(""); setFromDefault(false); setCreating(true); }} />
       {creating
-        ? <CreatorForm name={name} setName={setName} ticker={ticker} onCreate={create} onCancel={() => setCreating(false)} />
+        ? <CreatorForm name={name} setName={setName} fromDefault={fromDefault} setFromDefault={setFromDefault} onCreate={create} onCancel={() => setCreating(false)} />
         : <EditorBar current={current} status={draft.status[current.id]} dirty={dirty} saving={saving} ticker={ticker} setTicker={setTicker}
           onName={(next) => update((doc) => ({ ...doc, name: next }))} onAddSelect={choose} onSave={() => void save()} />}
       <p className="ws-hint">Drag a title to move a window. Drag an edge to resize it. Use the panel menu to replace its contents.</p>
       {linking && <div className="glass ws-link-form"><TvLinkForm onSubmit={(params) => { add("tv-link", params); setLinking(false); }} onCancel={() => setLinking(false)} /></div>}
-      <WidgetGrid key={current.id} widgets={current.widgets} renderExtra={renderExtra}
-        onChange={(widgets) => update((doc) => ({ ...doc, widgets }))}
-        onRemove={(id) => update((doc) => ({ ...doc, widgets: doc.widgets.filter((w) => w.id !== id) }))}
-        onParams={(id, params) => update((doc) => ({ ...doc, widgets: doc.widgets.map((w) => w.id === id ? { ...w, params } : w) }))}
-        onType={(id, type) => update((doc) => ({ ...doc, widgets: doc.widgets.map((w) => w.id === id ? { id: w.id, ticker: w.ticker, geometry: w.geometry, type } : w) }))}
-        onTicker={(id, next) => update((doc) => ({ ...doc, widgets: doc.widgets.map((w) => w.id === id ? { ...w, ticker: next } : w) }))}
-      />
+      {current.widgets.some((widget) => HOME_TYPES.includes(widget.type))
+        ? <HomePanels key={current.id} {...s}>{windows}</HomePanels>
+        : windows(() => null)}
     </div>
   );
 }

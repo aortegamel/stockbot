@@ -175,8 +175,7 @@ input.pill{cursor:text}
 .page-card{padding:var(--sp-3) var(--sp-4);display:flex;flex-direction:column;gap:8px}
 .page-card a:not(.pill){text-decoration:underline}
 
-/* Home: tape, chart + briefing, scans + markets + detail. Fills the height; each card scrolls inside. */
-.home{display:grid;grid-template-rows:auto minmax(0,1.1fr) minmax(0,1fr);gap:8px;height:100%;overflow:hidden}
+/* Market overview panels share data inside workspace windows. */
 .home-tape{display:flex;overflow-x:auto;overflow-y:hidden}
 .home-tape > [role="status"]{display:flex;gap:8px;padding:2px}
 .home-tape > .home-error{padding:var(--sp-3)}
@@ -187,14 +186,10 @@ input.pill{cursor:text}
 .home-tile-price + span{justify-self:end;font-size:var(--fs-label)}
 .home-tile > .spark{grid-column:1 / -1;width:100%;height:20px}
 .home-tile > .home-muted{grid-column:1 / -1;line-height:20px}
-.home-mid{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:8px;min-height:0}
-.home-grid{display:grid;grid-template-columns:200px minmax(0,1fr) 300px;gap:8px;min-height:0}
 .home-card{display:flex;flex-direction:column;min-width:0;min-height:0;padding:0}
 .home-scroll{flex:1;min-height:0;overflow:auto;padding:8px 12px}
 .home-markets .home-scroll{padding:0}
 .home-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-shrink:0;padding:4px 12px;border-top:1px solid var(--hair);font-size:var(--fs-label);color:var(--muted)}
-.home-right{display:flex;flex-direction:column;gap:8px;min-width:0;min-height:0;overflow-y:auto}
-.home-right > *{flex-shrink:0}
 .home-price{font-size:var(--fs-title);font-weight:600;color:var(--text)}
 .home-note{font-size:var(--fs-label);font-weight:400;letter-spacing:normal;text-transform:none;color:var(--muted)}
 .home-chart{position:relative;flex:1;min-height:0;overflow:hidden;padding:0}
@@ -216,12 +211,6 @@ input.pill{cursor:text}
 .home-bar .num{text-align:right}
 .home-bar-track{height:8px;border-radius:4px;background:rgba(255,255,255,0.08);overflow:hidden}
 .home-bar-fill{display:block;height:100%;background:currentColor}
-@media (max-width:1023px){
-  .home{display:flex;flex-direction:column;height:auto;overflow-y:auto}
-  .home-mid,.home-grid{grid-template-columns:1fr}
-  .home-chart{flex:none;height:200px}
-  .home-right{overflow:visible}
-}
 .skeleton{display:block;height:48px;border-radius:8px;background:rgba(255,255,255,0.06);animation:feed-pulse 1.2s ease-in-out infinite}
 @media (prefers-reduced-motion:reduce){.skeleton{animation:none}}
 .spark{width:100%;height:auto;display:block}
@@ -271,6 +260,8 @@ select.ws-tool{padding-right:16px;width:auto}
 .ws-window-ticker input:invalid{outline:1px solid var(--down)}
 .ws-window-title:focus-visible{outline:2px solid var(--accent)}
 .ws-widget-body{overflow:auto;flex:1;padding:var(--sp-3);min-height:0;font-size:var(--fs-body)}
+.ws-widget-body > .home-card{height:100%;border:0;background:none;box-shadow:none}
+.ws-widget-body > .home-tape{height:100%;align-content:start;flex-wrap:wrap;border:0;background:none;box-shadow:none}
 .ws-widget-body table{border-collapse:collapse}
 .ws-widget-body :is(th,td){height:var(--h-row);padding:0 8px;font-size:var(--fs-body)}
 .ws-widget-body th{font-size:var(--fs-label);font-weight:500;color:var(--muted)}

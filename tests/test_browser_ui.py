@@ -177,7 +177,30 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
     watch: Queue[str] = Queue()
     unknown: Queue[str] = Queue()
     source_reads: Queue[str] = Queue()
-    workspaces: dict[str, dict[str, object]] = {}
+    existing_id = "a16ec102-2e68-49fb-b818-e9671a3d2474"
+    workspaces: dict[str, dict[str, object]] = {
+        existing_id: {
+            "id": existing_id,
+            "name": "Research",
+            "updated_at": "2026-10-20T10:00:00Z",
+            "widgets": [
+                {
+                    "id": panel,
+                    "type": panel,
+                    "ticker": "NVDA",
+                    "geometry": {"x": x, "y": y, "width": width, "height": height},
+                }
+                for panel, x, y, width, height in [
+                    ("watchlist", 0, 0, 280, 300),
+                    ("portfolio", 0, 312, 280, 380),
+                    ("price-volume", 292, 0, 700, 400),
+                    ("financials", 1004, 0, 360, 320),
+                    ("news", 1004, 332, 360, 360),
+                    ("agent", 292, 412, 700, 358),
+                ]
+            ],
+        }
+    }
     workspace_saves: Queue[dict[str, object]] = Queue()
 
     class Provider(BaseHTTPRequestHandler):
@@ -526,6 +549,11 @@ def browser(local_ui: UI) -> Iterator[webdriver.Chrome]:
     with webdriver.Chrome(service=Service(executable_path=driver), options=options) as client:
         client.get(local_ui[0])
         WebDriverWait(client, 20).until(EC.visibility_of_element_located(SEARCH))
+        # Most checks exercise the existing saved workspace.
+        WebDriverWait(client, 20).until(
+            EC.element_to_be_clickable((By.XPATH, "//*[@role='tab'][text()='Research']"))
+        ).click()
+        WebDriverWait(client, 10).until(EC.visibility_of_element_located((By.LINK_TEXT, "Workspaces: Research")))
         yield client
 
 
@@ -667,12 +695,13 @@ def transcript_point(browser: webdriver.Chrome) -> tuple[int, int]:
 
 
 def settle(browser: webdriver.Chrome, element: WebElement) -> None:
-    """Wait until smooth scrolling for the element and its scroll ancestors stops."""
+    """Wait until the element's position, size, and scroll position stop changing."""
     last: list[object] = []
 
     def still(_: object) -> bool:
         now = browser.execute_script(
-            "const box = arguments[0].getBoundingClientRect(); return [box.top, arguments[0].scrollTop];", element
+            "const box = arguments[0].getBoundingClientRect(); return [box.top, box.left, box.width, box.height, arguments[0].scrollTop];",
+            element,
         )
         same = last == [now]
         last[:] = [now]
@@ -696,6 +725,7 @@ def test_agent_transcript_scrolls_inside_panel(
     # Maximize the agent before checking its internal scroll region.
     browser.find_element(By.CSS_SELECTOR, 'button[aria-label="Expand Agent"]').click()
     WebDriverWait(browser, 5).until(EC.visibility_of_element_located((By.CSS_SELECTOR, ".ws-widget-focus")))
+    settle(browser, browser.find_element(By.CSS_SELECTOR, ".ws-widget-focus"))
 
     # Empty introduction: the prompt is reachable and the last intro line is reachable by wheel alone.
     assert_prompt_reachable(browser)
@@ -898,9 +928,8 @@ def test_chat_watchlist_update_shows_amd_without_moving_chart(browser: webdriver
 def test_page_navigation_uses_nav_links(browser: webdriver.Chrome) -> None:
     wait = WebDriverWait(browser, 10)
     for label, route, content in [
-        ("Home", "#/home", ".home-table"),
-        ("Workspaces", "#/workspace/NVDA", 'select[aria-label="Add widget"]'),
         ("Feed", "#/feed", ".feed-row"),
+        ("Workspaces: Research", "#/workspace/NVDA", 'select[aria-label="Add widget"]'),
     ]:
         link = browser.find_element(By.LINK_TEXT, label)
         browser.execute_script(
@@ -912,6 +941,55 @@ def test_page_navigation_uses_nav_links(browser: webdriver.Chrome) -> None:
         wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, content)))
         assert browser.execute_script("return window.navTrusted") is True
         assert browser.find_element(By.LINK_TEXT, label).get_attribute("aria-current") == "page"
+
+
+def test_default_workspace_template_copies_current_windows(browser: webdriver.Chrome, local_ui: UI) -> None:
+    wait = WebDriverWait(browser, 10)
+    saves = local_ui[4]
+    while not saves.empty():
+        saves.get_nowait()
+    browser.find_element(By.XPATH, "//*[@role='tab'][text()='default']").click()
+    wait.until(EC.visibility_of_element_located((By.LINK_TEXT, "Workspaces: default")))
+    assert not browser.find_elements(By.LINK_TEXT, "Home")
+    assert len(browser.find_elements(By.CSS_SELECTOR, ".ws-widget")) == 7
+    browser.find_element(By.CSS_SELECTOR, 'button[aria-label="Close agent drawer"]').click()
+    title = browser.find_element(By.CSS_SELECTOR, '[data-widget-type="index-tape"] .ws-window-title')
+    title.send_keys(Keys.ARROW_RIGHT)
+    browser.find_element(By.CSS_SELECTOR, 'button[aria-label="Remove Market briefing"]').click()
+    browser.find_element(By.XPATH, "//button[text()='New workspace']").click()
+    browser.find_element(By.CSS_SELECTOR, 'input[aria-label="Workspace name"]').send_keys("Default copy")
+    browser.find_element(By.CSS_SELECTOR, 'input[type="checkbox"]').click()
+    browser.find_element(By.XPATH, "//button[text()='Create workspace']").click()
+    wait.until(EC.visibility_of_element_located((By.LINK_TEXT, "Workspaces: Default copy")))
+    assert len(browser.find_elements(By.CSS_SELECTOR, ".ws-widget")) == 6
+    assert not browser.find_elements(By.CSS_SELECTOR, '[data-widget-type="briefing"]')
+    browser.find_element(By.XPATH, "//button[text()='Save']").click()
+    wait.until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='Save']")))
+    copied = saves.get(timeout=10)
+    assert isinstance(copied["widgets"], list)
+    assert next(widget for widget in copied["widgets"] if widget["type"] == "index-tape")["geometry"]["x"] == 10
+    browser.find_element(By.XPATH, "//*[@role='tab'][normalize-space()='default *']").click()
+    browser.find_element(By.XPATH, "//button[text()='Save']").click()
+    original = saves.get(timeout=10)
+    wait.until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='Save']")))
+    assert isinstance(original["widgets"], list)
+    assert copied["id"] != original["id"]
+    assert not {widget["id"] for widget in copied["widgets"]} & {widget["id"] for widget in original["widgets"]}
+    assert {widget["type"]: widget["geometry"] for widget in copied["widgets"]} == {
+        widget["type"]: widget["geometry"] for widget in original["widgets"]
+    }
+    browser.find_element(By.XPATH, "//button[text()='New workspace']").click()
+    assert not browser.find_element(By.CSS_SELECTOR, 'input[type="checkbox"]').is_selected()
+    browser.find_element(By.CSS_SELECTOR, 'input[aria-label="Workspace name"]').send_keys("Empty desk")
+    browser.find_element(By.XPATH, "//button[text()='Create workspace']").click()
+    wait.until(EC.visibility_of_element_located((By.LINK_TEXT, "Workspaces: Empty desk")))
+    assert not browser.find_elements(By.CSS_SELECTOR, ".ws-widget")
+    browser.find_element(By.XPATH, "//button[text()='Save']").click()
+    assert saves.get(timeout=10)["widgets"] == []
+    wait.until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='Save']")))
+    browser.refresh()
+    wait.until(EC.visibility_of_element_located((By.LINK_TEXT, "Workspaces: Empty desk")))
+    assert not browser.find_elements(By.CSS_SELECTOR, ".ws-widget")
 
 
 def test_palette_keyboard_opens_ticker_workspace(browser: webdriver.Chrome) -> None:
@@ -929,7 +1007,7 @@ def test_palette_keyboard_opens_ticker_workspace(browser: webdriver.Chrome) -> N
     assert agent_input.get_attribute("value") == "/"
     assert not browser.find_elements(By.CSS_SELECTOR, 'input[role="combobox"]')
     agent_input.clear()
-    browser.find_element(By.LINK_TEXT, "Home").click()
+    browser.find_element(By.LINK_TEXT, "Workspaces: Research").click()
     ActionChains(browser).send_keys("/").perform()
     palette = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 'input[role="combobox"]')))
     palette.send_keys(Keys.ESCAPE)
@@ -941,7 +1019,7 @@ def test_named_workspace_windows_persist_native_geometry(browser: webdriver.Chro
     saves = local_ui[4]
     while not saves.empty():
         saves.get_nowait()
-    browser.find_element(By.LINK_TEXT, "Workspaces").click()
+    browser.find_element(By.LINK_TEXT, "Workspaces: Research").click()
     wait.until(EC.url_contains("#/workspace/NVDA"))
 
     def create(name: str) -> None:
@@ -1050,9 +1128,13 @@ def test_named_workspace_windows_persist_native_geometry(browser: webdriver.Chro
     # Maximize changes the visible size, not the saved geometry.
     browser.find_element(By.CSS_SELECTOR, 'button[aria-label="Expand Financials · ORCL"]').click()
     wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Collapse Financials · ORCL"]')))
+    settle(browser, browser.find_element(By.CSS_SELECTOR, ".ws-widget-focus"))
     maximized = browser.find_element(By.CSS_SELECTOR, 'section[aria-label="Financials · ORCL"]').rect
-    assert maximized["width"] > resized["width"]
-    assert maximized["height"] > resized["height"]
+    viewport = browser.execute_script(
+        "const viewport = document.querySelector('.ws-viewport'); return {width: viewport.clientWidth, height: viewport.clientHeight};"
+    )
+    assert maximized["width"] == viewport["width"]
+    assert maximized["height"] == viewport["height"]
     ActionChains(browser).send_keys(Keys.ESCAPE).perform()
     wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Expand Financials · ORCL"]')))
     assert geometry() == resized
@@ -1107,7 +1189,7 @@ def test_offline_alert_receipt_renders_card(browser: webdriver.Chrome, local_ui:
 
 def test_markets_rows_support_arrow_navigation(browser: webdriver.Chrome) -> None:
     wait = WebDriverWait(browser, 10)
-    browser.find_element(By.LINK_TEXT, "Home").click()
+    browser.find_element(By.XPATH, "//*[@role='tab'][text()='default']").click()
     first = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, ".home-table tbody tr[tabindex='0']")))
     assert "NVDA" in first.text
     ActionChains(browser).click(first).send_keys(Keys.ARROW_DOWN).perform()

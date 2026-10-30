@@ -7,8 +7,9 @@ import { FinancialsPanel, NewsPanel } from "./market-panels";
 import TradingChart, { ChartControls } from "./trading-chart";
 import { useLoad } from "./home-panels";
 import { TvLinkForm, TvLinkWidget } from "./tv-link";
+import { HOME_TYPES } from "./home-workspace";
 
-export const WORKSPACE_TYPES = [...WIDGET_TYPES, "watchlist", "portfolio", "agent", "theses", "alerts", "sessions", "journal"];
+export const WORKSPACE_TYPES = [...WIDGET_TYPES, "watchlist", "portfolio", "agent", "theses", "alerts", "sessions", "journal", ...HOME_TYPES];
 const LABELS: Record<string, string> = {
   "price-volume": "Price & volume",
   financials: "Financials",
@@ -27,6 +28,12 @@ const LABELS: Record<string, string> = {
   alerts: "Alerts",
   sessions: "Sessions",
   journal: "Journal",
+  "index-tape": "Market indexes",
+  "spy-chart": "SPY chart",
+  briefing: "Market briefing",
+  scans: "Scans",
+  markets: "Markets",
+  "market-detail": "Company details",
 };
 
 export const isWidgetType = (type: unknown): type is string => typeof type === "string" && WIDGET_TYPES.includes(type);
@@ -342,12 +349,15 @@ export function WidgetGrid({ widgets, renderExtra, onChange, onRemove, onParams,
   }
   const width = Math.max(1200, viewport.width, ...visible.map((widget) => widget.geometry.x + widget.geometry.width + 40));
   const height = Math.max(800, viewport.height, ...visible.map((widget) => widget.geometry.y + widget.geometry.height + 40));
+  // Keep browser nodes stable. Moving a focused node cancels native clicks and keyboard focus.
+  const windows = visible.map((widget, order) => ({ widget, order }))
+    .sort((a, b) => a.widget.id.localeCompare(b.widget.id));
   return (
     <div ref={viewportRef} className="ws-viewport" style={{ overflow: focusing ? "hidden" : "auto", position: "relative" }}>
       <div className="ws-desktop" style={{ position: "relative", width, height }}>
         {widgets === null && <span className="skeleton" aria-label="Loading workspace" aria-busy="true" />}
         {widgets !== null && visible.length === 0 && <p className="feed-muted">No widgets yet. Choose Add widget or ask for a chart.</p>}
-        {visible.map((widget, order) => (
+        {windows.map(({ widget, order }) => (
           <WidgetFrame key={widget.id} widget={widget} focused={focusing && focused === widget.id} hidden={focusing && focused !== widget.id} viewport={viewport} order={order} onFocus={focus} onRaise={raise} onGeometry={changeGeometry} onRemove={onRemove} onParams={onParams} onType={onType} onTicker={onTicker} renderExtra={renderExtra} />
         ))}
       </div>

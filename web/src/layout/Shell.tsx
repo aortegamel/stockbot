@@ -7,7 +7,7 @@ import { parseRoute, routeHash, TICKER_RE, useHashRoute, type Route } from "../l
 import type { AgentEvent, AskContext } from "../../../needle-harness/lib/agent/types";
 import { fetchJournal, fetchSnapshot, listSessions, type JournalPage, type ResearchSnapshot } from "../lib/research-client";
 import CommandBar from "./CommandBar";
-import type { WorkspaceDraft } from "../pages/Workspace";
+import { DEFAULT_WORKSPACE_ID, type WorkspaceDraft } from "../pages/Workspace";
 
 // The existing watchdog stops once buffered persona reasoning starts.
 const STALL_TIMEOUT_MS = 120_000;
@@ -388,6 +388,8 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
       {label}
     </a>
   );
+  const currentWorkspace = workspace?.docs.find((doc) => doc.id === workspace.activeId);
+  const windowedAgent = route.page === "workspace" && currentWorkspace?.widgets.some((widget) => widget.type === "agent");
 
   return (
     <main className="app">
@@ -402,8 +404,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
         <span className="app-header-row">
           <b className="brand">NEEDLE TERMINAL</b>
           <nav className="nav" aria-label="Pages">
-            {navLink("Home", { page: "home" })}
-            {navLink("Workspaces", { page: "workspace", sym: selected })}
+            {navLink(`Workspaces: ${currentWorkspace?.name ?? "default"}`, { page: "workspace", sym: selected })}
             {navLink("Feed", { page: "feed" })}
             {debug && navLink("Harness", { page: "harness" })}
           </nav>
@@ -411,8 +412,10 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
             watchlist={watchlist}
             sessions={sessions}
             onTicker={goTicker}
-            // ponytail: scans open Home until a scan results view exists.
-            onScan={() => navigate({ page: "home" })}
+            onScan={() => {
+              setWorkspace((draft) => draft ? { ...draft, activeId: DEFAULT_WORKSPACE_ID } : draft);
+              navigate({ page: "workspace", sym: selected });
+            }}
             onSession={(id) => {
               setSessionId(id);
               navigate({ page: "workspace", sym: selected });
@@ -439,7 +442,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
 
       <div className="shell-body">
         {children(route, state)}
-        {route.page !== "workspace" && chat && <aside className="glass ws-cell drawer" aria-label="Agent drawer">{chat}</aside>}
+        {!windowedAgent && chat && <aside className="glass ws-cell drawer" aria-label="Agent drawer">{chat}</aside>}
       </div>
 
       <footer className="app-footer">

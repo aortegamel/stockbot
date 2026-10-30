@@ -1,7 +1,7 @@
 {
   "name": "Stockbot",
   "short_name": "Stockbot",
-  "start_url": "/#/home",
+  "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "background_color": "#101528",

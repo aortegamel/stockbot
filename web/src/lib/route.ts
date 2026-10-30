@@ -4,7 +4,7 @@ import { SOURCE_ID_RE } from "../../../needle-harness/lib/agent/types";
 // Match the validated ticker channel in the kernel.
 export const TICKER_RE = /^[A-Z][A-Z0-9.\-]{0,9}$/;
 
-export type Route = { page: "home" } | { page: "workspace"; sym: string } | { page: "feed" } | { page: "harness" } | { page: "source"; id: string };
+export type Route = { page: "workspace"; sym: string } | { page: "feed" } | { page: "harness" } | { page: "source"; id: string };
 
 function decoded(raw: string | undefined): string | null {
   try {
@@ -27,7 +27,7 @@ export function parseRoute(hash: string): Route | null {
     return SOURCE_ID_RE.test(id) ? { page, id } : null;
   }
   if (raw !== undefined) return null;
-  return page === "home" || page === "feed" || page === "harness" ? { page } : null;
+  return page === "feed" || page === "harness" ? { page } : null;
 }
 
 export function routeHash(route: Route): string {

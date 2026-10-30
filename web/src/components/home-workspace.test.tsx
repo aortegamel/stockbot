@@ -3,7 +3,7 @@ import { dom } from "../test-dom";
 import { afterEach, describe, expect, test } from "bun:test";
 import { act } from "react";
 import type { Root } from "react-dom/client";
-import Home from "./Home";
+import HomePanels, { HOME_TYPES } from "./home-workspace";
 
 // react-dom reads canUseDOM once at module load, so it must load after the jsdom globals exist.
 const { createRoot } = await import("react-dom/client");
@@ -61,17 +61,17 @@ function serve(over: Record<string, Handler> = {}): URL[] {
   return urls;
 }
 
-type Props = Parameters<typeof Home>[0];
+type Props = Omit<Parameters<typeof HomePanels>[0], "children">;
 
 function state(over: Partial<Props> = {}): Props {
-  return { pick: () => { }, watchlist: ["NVDA", "AAPL"], onWatchlist: () => { }, setInput: () => { }, setAskContext: () => { }, openDrawer: () => { }, ...over };
+  return { watchlist: ["NVDA", "AAPL"], onWatchlist: () => { }, setInput: () => { }, setAskContext: () => { }, openDrawer: () => { }, ...over };
 }
 
 async function mount(s: Props): Promise<HTMLElement> {
   const container = dom.window.document.getElementById("root");
   if (!container) throw new Error("missing test root");
   mounted = createRoot(container);
-  await act(async () => mounted?.render(<Home {...s} />));
+  await act(async () => mounted?.render(<HomePanels {...s}>{(render) => HOME_TYPES.map((type) => <div key={type}>{render(type)}</div>)}</HomePanels>));
   return container;
 }
 
@@ -96,7 +96,7 @@ function button(root: HTMLElement, label: string): HTMLButtonElement {
 
 const text = (root: Element) => root.textContent ?? "";
 
-describe("Home", () => {
+describe("Workspace market overview", () => {
   test("index band draws one sparkline point per close, SPY first plus 3 watchlist extras", async () => {
     const urls = serve();
     const root = await mount(state({ watchlist: ["NVDA", "SPY", "AAPL", "MSFT", "TSLA"] }));

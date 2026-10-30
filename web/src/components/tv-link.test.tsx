@@ -3,11 +3,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { act, useState } from "react";
 import type { ReactNode } from "react";
 import type { Root } from "react-dom/client";
-import { WIDGET_TYPES, type AgentEvent } from "../../../needle-harness/lib/agent/types";
+import { type AgentEvent } from "../../../needle-harness/lib/agent/types";
 import Workspace, { type WorkspaceDraft } from "../pages/Workspace";
 import type { WorkspaceDoc } from "../lib/market-data";
 import { TvLinkWidget } from "./tv-link";
-import { widgetLabel } from "./widgets";
 
 // React DOM reads browser globals at import time. The test must install those globals first.
 const { createRoot } = await import("react-dom/client");
@@ -92,6 +91,7 @@ describe("TvLinkWidget", () => {
 function serve(saved: WorkspaceDoc["widgets"]) {
   const id = "a16ec102-2e68-49fb-b818-e9671a3d2474";
   const docs: Record<string, WorkspaceDoc> = { [id]: { id, name: "Links", widgets: saved, updated_at: "2026-10-20T10:00:00Z" } };
+  dom.window.localStorage.setItem("stockbot.workspace", id);
   const puts: WorkspaceDoc["widgets"][] = [];
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), dom.window.location.href);
@@ -127,12 +127,6 @@ async function chooseTvLink() {
 }
 
 describe("Workspace TradingView links", () => {
-  test("every widget type has a menu label", async () => {
-    serve([]);
-    await render(<Page />);
-    for (const type of WIDGET_TYPES) expect(widgetLabel(type)).not.toBe(type);
-  });
-
   test("adds several links through the form with preview, saves unique ids, and edits with ✎", async () => {
     const { saved, puts } = serve([]);
     await render(<Page />);

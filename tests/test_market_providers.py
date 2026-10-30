@@ -1587,6 +1587,16 @@ def test_workspace_put_round_trip(agg: dict[str, object]) -> None:
     assert old.read_text() == '{"widgets": []}'
 
 
+@pytest.mark.parametrize("panel_type", ["index-tape", "spy-chart", "briefing", "scans", "markets", "market-detail"])
+def test_workspace_home_panels_round_trip(agg: dict[str, object], panel_type: str) -> None:
+    client = TestClient(app)
+    widget = {"id": "overview", "type": panel_type, "ticker": "NVDA", "geometry": _GEOMETRY}
+    response = client.put(f"/api/workspaces/{_WORKSPACE_ID}", json={"name": "default", "widgets": [widget]})
+    assert response.status_code == 200
+    assert response.json()["widgets"] == [widget]
+    assert client.get("/api/workspaces").json() == {"workspaces": [response.json()]}
+
+
 _TV = "https://www.tradingview.com/x/8ot166mV/"
 
 

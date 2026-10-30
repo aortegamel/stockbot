@@ -4,7 +4,7 @@ import fc from "fast-check";
 import { act, useState, type ReactNode } from "react";
 import type { Root } from "react-dom/client";
 import type { AgentEvent } from "../../../needle-harness/lib/agent/types";
-import Workspace, { type WorkspaceDraft } from "./Workspace";
+import Workspace, { DEFAULT_WORKSPACE_ID, type WorkspaceDraft } from "./Workspace";
 import { ActionCards, type WidgetOutcomes } from "../components/action-cards";
 import { monthlyReturns } from "../components/widgets";
 import type { Candle, WorkspaceDoc, WorkspaceWidget } from "../lib/market-data";
@@ -31,6 +31,7 @@ afterEach(async () => {
 
 function serve(widgets?: WorkspaceWidget[]) {
   const docs: Record<string, WorkspaceDoc> = widgets ? { [ID]: { id: ID, name: "Research", widgets, updated_at: "2026-10-20T10:00:00Z" } } : {};
+  if (widgets) dom.window.localStorage.setItem("stockbot.workspace", ID);
   const requests: { path: string; method: string }[] = [];
   const control = { failLoad: false, failSave: false, delaySave: null as (() => Promise<void>) | null };
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -48,6 +49,10 @@ function serve(widgets?: WorkspaceWidget[]) {
     if (url.pathname === "/api/quote") return Response.json({ price: 100 });
     if (url.pathname === "/api/watchlist") return Response.json({ watchlist: [] });
     if (url.pathname === "/api/portfolio") return new Response(null, { status: 404 });
+    if (url.pathname === "/api/sparklines") return Response.json({ syms: {} });
+    if (url.pathname === "/api/markets") return Response.json({ rows: [], errors: [] });
+    if (url.pathname === "/api/briefing") return Response.json({ items: [], errors: [] });
+    if (url.pathname === "/api/scans") return Response.json({ scans: [] });
     if (url.pathname === "/api/candles") return Response.json({ candles: [bar("2025-12-01", 100), bar("2026-01-01", 110), bar("2026-02-01", 99)] });
     if (url.pathname === "/api/filings") return Response.json({ items: [{ title: "10-K Annual report", filed: "2026-10-19", updated: "", summary: "", link: "https://www.sec.gov/filing" }] });
     if (url.pathname === "/api/news") return Response.json({ items: [{ title: "New chip", published: "2026-10-20", source: "News", link: "https://example.org" }] });
@@ -131,8 +136,13 @@ describe("Named workspace", () => {
   test("creates, renames, switches, and saves named layouts without losing other drafts", async () => {
     const server = serve();
     await render(<Page />);
-    expect(container().querySelectorAll(".ws-widget")).toHaveLength(6);
-    await type('[aria-label="Workspace name"]', "Earnings");
+    expect(find<HTMLInputElement>('[aria-label="Workspace name"]').value).toBe("default");
+    expect(container().querySelector('[aria-label="Market indexes"]')).not.toBeNull();
+    await click(button("New workspace"));
+    await type('[aria-label="Workspace name"]', "  Earnings  ");
+    await click(button("Create workspace"));
+    expect(container().querySelectorAll(".ws-widget")).toHaveLength(0);
+    expect(container().querySelector('form[aria-label="TradingView link"]')).toBeNull();
     await add("monthly-returns");
     await click(button("New workspace"));
     await type('[aria-label="Workspace name"]', "Risk");
@@ -149,7 +159,53 @@ describe("Named workspace", () => {
     expect(button("Risk *")).not.toBeNull();
     await reload();
     expect(find<HTMLInputElement>('[aria-label="Workspace name"]').value).toBe("Earnings");
-    expect(container().querySelectorAll('[role="tab"]')).toHaveLength(1);
+    expect([...container().querySelectorAll('[role="tab"]')].map((tab) => tab.textContent)).toEqual(["default", "Earnings"]);
+  });
+
+  test("copies the current default draft with independent windows and preserves saved workspaces", async () => {
+    const server = serve([]);
+    const source = [
+      widget("news", "source-news", "AAPL"),
+      { ...widget("price-volume", "source-chart", "GME"), params: { interval: "1h", style: "line", studies: ["MA50"] } },
+    ];
+    server.docs[DEFAULT_WORKSPACE_ID] = { id: DEFAULT_WORKSPACE_ID, name: "default", widgets: source, updated_at: "2026-10-20T10:00:00Z" };
+    dom.window.localStorage.setItem("stockbot.workspace", DEFAULT_WORKSPACE_ID);
+    await render(<Page />);
+    expect(button("Research")).not.toBeNull();
+    await key(find('[aria-label="Move or resize News · AAPL"]'), "ArrowRight");
+    await click(button("New workspace"));
+    await type('[aria-label="Workspace name"]', "Copy");
+    await click(find('input[type="checkbox"]'));
+    await click(button("Create workspace"));
+    await click(button("Save"));
+    const copied = Object.values(server.docs).find((doc) => doc.name === "Copy")!;
+    expect(copied.id).not.toBe(DEFAULT_WORKSPACE_ID);
+    expect(copied.widgets.map((w) => w.type).sort()).toEqual(["news", "price-volume"]);
+    const copiedNews = copied.widgets.find((w) => w.type === "news")!;
+    expect(copiedNews.ticker).toBe("AAPL");
+    expect(copiedNews.geometry).toEqual({ ...geometry, x: 50 });
+    expect(copied.widgets.find((w) => w.type === "price-volume")?.params).toEqual(source[1].params);
+    expect(copied.widgets.every((w) => !source.some((original) => original.id === w.id))).toBe(true);
+    await click(find('[aria-label="Remove News · AAPL"]'));
+    await click(button("Save"));
+    expect(server.docs[copied.id].widgets.map((w) => w.type)).toEqual(["price-volume"]);
+    await click(button("default *"));
+    expect(find('[aria-label="News · AAPL"]').textContent).toContain("New chip");
+    await click(button("Save"));
+    expect(server.docs[DEFAULT_WORKSPACE_ID].widgets).toHaveLength(2);
+    expect(server.docs[DEFAULT_WORKSPACE_ID].widgets.find((w) => w.type === "news")?.geometry.x).toBe(50);
+    await click(button("New workspace"));
+    expect(find<HTMLInputElement>('input[type="checkbox"]').checked).toBe(false);
+    await type('[aria-label="Workspace name"]', "Blank");
+    await click(button("Create workspace"));
+    expect(container().querySelectorAll(".ws-widget")).toHaveLength(0);
+    await click(button("Save"));
+    await reload();
+    expect(container().querySelectorAll(".ws-widget")).toHaveLength(0);
+    expect(find<HTMLInputElement>('[aria-label="Workspace name"]').value).toBe("Blank");
+    await click(button("default"));
+    expect(find('[aria-label="News · AAPL"]').textContent).toContain("New chip");
+    expect(server.docs[ID].widgets).toEqual([]);
   });
 
   test("loads a saved empty workspace without restoring defaults", async () => {
@@ -177,6 +233,20 @@ describe("Named workspace", () => {
     expect(server.puts()).toHaveLength(0);
     await click(button("Save"));
     expect(server.saved().widgets).toEqual([{ ...widget("news", "price-volume", "AAPL"), geometry }]);
+  });
+
+  test("keeps an input focused when its window moves to the front", async () => {
+    const server = serve([widget("news", "z-news"), widget("monthly-returns", "a-returns")]);
+    await render(<Page />);
+    const input = find<HTMLInputElement>('[aria-label="Ticker for News"]');
+    await act(async () => input.focus());
+    await settle();
+    expect(dom.window.document.activeElement).toBe(input);
+    await type('[aria-label="Ticker for News"]', "AAPL");
+    await click(find('[data-widget-type="news"] button[type="submit"]'));
+    await click(button("Save"));
+    expect(server.saved().widgets.at(-1)?.ticker).toBe("AAPL");
+    expect(server.saved().widgets.at(-1)?.type).toBe("news");
   });
 
   test("keeps multiple windows of the same type independent", async () => {
@@ -288,7 +358,8 @@ describe("Named workspace", () => {
     expect(container().querySelector(".ws-widget")).toBeNull();
     server.control.failLoad = false;
     await click(button("Retry"));
-    expect(container().querySelectorAll(".ws-widget")).toHaveLength(6);
+    expect(find<HTMLInputElement>('[aria-label="Workspace name"]').value).toBe("default");
+    expect(container().querySelector('[data-widget-type="markets"]')).not.toBeNull();
   });
 
   test("adds all formerly fixed panels as interchangeable windows", async () => {

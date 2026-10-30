@@ -811,6 +811,13 @@ request (`web/lan-token.ts`). See the README "LAN access" section.
 ## Named workspaces
 
 The Workspaces page contains freeform windows through `react-rnd`.
+The former Home page is the `default` workspace.
+The header shows `Workspaces: <name>` for the selected workspace.
+Market indexes, the SPY chart, briefing, scans, markets, company details, and portfolio each occupy a movable window.
+Scans and markets retain their shared selection.
+The company details window follows the selected market row.
+The window picker also offers these panels in other workspaces.
+
 Drag a window title to move it.
 Drag an edge or corner to resize it.
 The panel menu replaces a window's contents without changing its position or size.
@@ -819,7 +826,14 @@ The ticker beside Add widget applies only to new windows.
 Watchlist, Portfolio, Agent, Theses, Alerts, Sessions, and Journal use the same window controls.
 
 Create a named workspace with New workspace.
-Edit its name in the toolbar.
+New workspaces start empty.
+Select **Start from default** to copy the current default workspace.
+The copy includes unsaved window edits, positions, sizes, tickers, and panel settings.
+Each copy receives independent window IDs.
+Changes to a copy do not change the default workspace.
+
+Edit a custom workspace's name in the toolbar.
+The default workspace keeps its name.
 Workspace tabs retain unsaved drafts during page and workspace changes.
 Only Save writes names, window order, geometry, tickers, and panel settings to the server.
 Agent receipts also remain unsaved until Save.
@@ -839,4 +853,8 @@ Each widget includes `{id, type, ticker, params?, geometry: {x, y, width, height
 The server validates names, UUIDs, unique widget IDs, widget types, tickers, geometry, and chart/link settings.
 Each workspace supports at most 24 windows.
 The server stores named documents in `data/named-workspaces/<uuid>.json`.
+The default workspace uses UUID `00000000-0000-4000-8000-000000000000`.
+The client supplies its starter layout when no saved default document exists.
+Only Save stores edits to that layout.
+The client preserves existing saved workspaces and the remembered workspace selection.
 It does not read, import, modify, or delete legacy `data/workspaces/` files.

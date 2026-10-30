@@ -41,7 +41,10 @@ function json(body: unknown, status = 200): Response {
 function serve(extra: Handler = () => undefined): { urls: string[]; bodies: string[] } {
   const urls: string[] = [];
   const bodies: string[] = [];
+  const workspaceId = "a16ec102-2e68-49fb-b818-e9671a3d2474";
+  dom.window.localStorage.setItem("stockbot.workspace", workspaceId);
   globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+    // Most shell checks exercise an existing saved workspace.
     const url = String(input);
     urls.push(url);
     if (typeof init?.body === "string") bodies.push(init.body);
@@ -60,7 +63,18 @@ function serve(extra: Handler = () => undefined): { urls: string[]; bodies: stri
     if (url.includes("/api/research/sessions")) return Promise.resolve(json({ sessions: [] }));
     if (url.includes("/api/theses")) return Promise.resolve(json([]));
     if (url.includes("/api/portfolio")) return Promise.resolve(new Response(null, { status: 404 }));
-    if (url === "/api/workspaces") return Promise.resolve(json({ workspaces: [] }));
+    if (url === "/api/workspaces") return Promise.resolve(json({
+      workspaces: [{
+        id: workspaceId, name: "Research", updated_at: "2026-10-20T10:00:00Z",
+        widgets: ["watchlist", "portfolio", "price-volume", "financials", "news", "agent"].map((type, index) => ({
+          id: type, type, ticker: "NVDA", geometry: { x: index * 20, y: index * 20, width: 560, height: 360 },
+        })),
+      }]
+    }));
+    if (url.includes("/api/sparklines")) return Promise.resolve(json({ syms: {} }));
+    if (url.includes("/api/markets")) return Promise.resolve(json({ rows: [], errors: [] }));
+    if (url.includes("/api/briefing")) return Promise.resolve(json({ items: [], errors: [] }));
+    if (url.includes("/api/scans")) return Promise.resolve(json({ scans: [] }));
     return Promise.reject(new Error(`unexpected request: ${url}`));
   }) as unknown as typeof fetch;
   return { urls, bodies };
@@ -213,6 +227,37 @@ async function addPanel(root: HTMLElement, type: string) {
 }
 
 describe("App terminal shell", () => {
+  test("opens the former homepage as default and creates an empty workspace", async () => {
+    serve((url) => {
+      if (url === "/api/workspaces") return json({ workspaces: [] });
+      if (url.includes("/api/scans")) return json({ scans: [{ id: "most-shorted", name: "Most shorted", kind: "preset", filter: {}, created_at: null }] });
+      return undefined;
+    });
+    const root = await mount(<App />, false);
+    await until(() => root.querySelector('[data-widget-type="markets"]') !== null);
+    expect(findLink(root, "Home")).toBeNull();
+    expect(findLink(root, "Workspaces: default")?.getAttribute("aria-current")).toBe("page");
+    expect([...root.querySelectorAll(".ws-widget")].map((panel) => panel.getAttribute("data-widget-type")).sort()).toEqual([
+      "briefing", "index-tape", "market-detail", "markets", "portfolio", "scans", "spy-chart",
+    ]);
+    const warning = new dom.window.Event("beforeunload", { cancelable: true });
+    dom.window.dispatchEvent(warning);
+    expect(warning.defaultPrevented).toBe(false);
+    expect(root.querySelector('[aria-label="Agent drawer"]')).not.toBeNull();
+    await click(button(root, "New workspace"));
+    await type(find<HTMLInputElement>(root, 'input[aria-label="Workspace name"]'), "Empty");
+    await click(button(root, "Create workspace"));
+    expect(root.querySelectorAll(".ws-widget")).toHaveLength(0);
+    expect(findLink(root, "Workspaces: Empty")?.getAttribute("aria-current")).toBe("page");
+    const palette = await openPalette(root);
+    await type(palette, "Most shorted");
+    await until(() => options(root).includes("Most shorted"));
+    await press(palette, "Enter");
+    await until(() => root.querySelector('[data-widget-type="markets"]') !== null);
+    expect(button(root, "Empty *")).not.toBeNull();
+    expect(root.querySelector('[data-widget-type="markets"]')).not.toBeNull();
+    expect(findLink(root, "Workspaces: default")?.getAttribute("aria-current")).toBe("page");
+  });
   test("renders the watchlist, strip, and backend state on load", async () => {
     serve();
     const root = await mount(<App />);
@@ -794,7 +839,7 @@ describe("App view switch", () => {
     const warning = new dom.window.Event("beforeunload", { cancelable: true });
     dom.window.dispatchEvent(warning);
     expect(warning.defaultPrevented).toBe(true);
-    await click(findLink(root, "Workspaces")!);
+    await click(findLink(root, "Workspaces: Draft research")!);
     await until(() => text(root).includes("WATCHLIST · DELAYED"));
     expect(find<HTMLInputElement>(root, 'input[aria-label="Workspace name"]').value).toBe("Draft research");
     expect(button(root, "Saving…").disabled).toBe(true);
@@ -810,16 +855,16 @@ describe("App view switch", () => {
     serve((url) => (url.includes("/api/health") ? json({ debug: true }) : undefined));
     const root = await mount(<App />);
     await until(() => findLink(root, "Harness") !== null);
-    expect(findLink(root, "Workspaces")?.getAttribute("aria-current")).toBe("page");
-    expect(findLink(root, "Workspaces")?.getAttribute("href")).toBe("#/workspace/NVDA");
+    expect(findLink(root, "Workspaces: Research")?.getAttribute("aria-current")).toBe("page");
+    expect(findLink(root, "Workspaces: Research")?.getAttribute("href")).toBe("#/workspace/NVDA");
     await click(findLink(root, "Harness")!);
     await until(() => text(root).includes("No trace persisted for this session"));
     expect(findLink(root, "Harness")?.getAttribute("aria-current")).toBe("page");
-    expect(findLink(root, "Workspaces")?.hasAttribute("aria-current")).toBe(false);
+    expect(findLink(root, "Workspaces: Research")?.hasAttribute("aria-current")).toBe(false);
     expect(text(root)).not.toContain("WATCHLIST · DELAYED");
     // The agent drawer stays on every page.
     expect(text(root)).toContain("AGENT · viewing NVDA");
-    await click(findLink(root, "Workspaces")!);
+    await click(findLink(root, "Workspaces: Research")!);
     await until(() => text(root).includes("WATCHLIST · DELAYED"));
     await until(() => text(root).includes("NVDA100DELAYEDSEC none"));
   });

@@ -95,7 +95,22 @@ class Widget(BaseModel):
     def _known_type(cls, value: str) -> str:
         from app.tools import WIDGET_TYPES
 
-        types = (*WIDGET_TYPES, "watchlist", "portfolio", "agent", "theses", "alerts", "sessions", "journal")
+        types = (
+            *WIDGET_TYPES,
+            "watchlist",
+            "portfolio",
+            "agent",
+            "theses",
+            "alerts",
+            "sessions",
+            "journal",
+            "index-tape",
+            "spy-chart",
+            "briefing",
+            "scans",
+            "markets",
+            "market-detail",
+        )
         if value not in types:
             raise ValueError(f"must be one of {', '.join(types)}")
         return value
