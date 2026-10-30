@@ -58,6 +58,7 @@ export function PortfolioPanel({ onSelectTicker }: { onSelectTicker: (ticker: st
   };
   if (view === null || (view === undefined && !error)) return null;
   const cell: React.CSSProperties = { padding: "0 8px", height: 28, textAlign: "right" };
+  const syncAppearance = busy ? { label: "Syncing…", cursor: "wait" } : { label: "Sync", cursor: "pointer" };
   return (
     <div
       style={{
@@ -71,8 +72,8 @@ export function PortfolioPanel({ onSelectTicker }: { onSelectTicker: (ticker: st
     >
       <div className="card-head">
         PORTFOLIO
-        <button type="button" onClick={sync} disabled={busy} className="ghost" style={{ cursor: busy ? "wait" : "pointer" }}>
-          {busy ? "Syncing…" : "Sync"}
+        <button type="button" onClick={sync} disabled={busy} className="ghost" style={{ cursor: syncAppearance.cursor }}>
+          {syncAppearance.label}
         </button>
       </div>
       <div style={{ padding: "8px 12px" }}>
@@ -81,7 +82,7 @@ export function PortfolioPanel({ onSelectTicker }: { onSelectTicker: (ticker: st
           {view?.total_value != null && ` · total ${money(view.total_value)}`}
         </div>
         {error && <div style={{ fontSize: "var(--fs-body)", color: down, marginBottom: 8 }}>{error}</div>}
-        {view && view.positions.length > 0 && (
+        {Boolean(view?.positions.length) && (
           <table className="num" style={{ width: "100%", borderCollapse: "collapse", fontSize: "var(--fs-body)" }}>
             <thead>
               <tr style={{ color: muted, fontSize: "var(--fs-label)", fontWeight: 500 }}>
@@ -93,7 +94,7 @@ export function PortfolioPanel({ onSelectTicker }: { onSelectTicker: (ticker: st
               </tr>
             </thead>
             <tbody>
-              {view.positions.map((p, i) => {
+              {view?.positions.map((p, i) => {
                 const gain = p.unrealized_gain === null ? null : Number(p.unrealized_gain);
                 return (
                   <tr key={i} onClick={() => onSelectTicker(p.ticker)} style={{ cursor: "pointer" }}>
@@ -115,7 +116,7 @@ export function PortfolioPanel({ onSelectTicker }: { onSelectTicker: (ticker: st
             </tbody>
           </table>
         )}
-        {view && view.positions.length === 0 && <div style={{ fontSize: "var(--fs-body)", color: muted }}>no holdings in the last sync</div>}
+        {view?.positions.length === 0 && <div style={{ fontSize: "var(--fs-body)", color: muted }}>no holdings in the last sync</div>}
       </div>
     </div>
   );

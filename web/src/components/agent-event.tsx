@@ -4,6 +4,13 @@ import { redactArgs, type AgentEvent, type AskContext, type FailureCategory } fr
 const LIMIT = "The research reached its work limit before it finished.";
 const MODEL = "The model failed while preparing the answer.";
 const SOURCE = "A data source failed while answering.";
+const COMPLETION_LABELS = {
+  completed: "Completed",
+  completed_with_limitations: "Completed with limitations",
+  failed: "Failed",
+  cancelled: "Cancelled",
+};
+
 // Prod failure text: one plain sentence per category. No raw message, stack, or tool name.
 const FAILURE_TEXT: Record<FailureCategory, string> = {
   timeout: "The research took too long and stopped.", deadline_exceeded: "The research took too long and stopped.",
@@ -172,48 +179,85 @@ export function AskContextChip({ context, onRemove }: { context: AskContext; onR
   );
 }
 
+type RendererProps<T extends AgentEvent["type"]> = { event: Extract<AgentEvent, { type: T }>; debug: boolean; onRetry?: () => void };
+type Renderers = { [T in AgentEvent["type"]]?: (props: RendererProps<T>) => React.ReactNode };
+
+function AgentStartRow({ event }: { event: Extract<AgentEvent, { type: "agent_start" }> }) {
+  return <div className="text-zinc-100">&gt; {event.prompt}{event.context && <AskContextChip context={event.context} />}</div>;
+}
+
+function ReasoningRow() {
+  return (
+    <div>
+      <span className="rounded border border-violet-900 px-1 text-[13px] text-violet-400">STOCKBOT</span>{" "}
+      <span style={{ color: "#a78bfa" }}>● stockbot / working…</span>
+    </div>
+  );
+}
+
+function AnswerRow({ event }: { event: Extract<AgentEvent, { type: "answer_delta" | "answer_partial" }> }) {
+  return <span>{event.text}</span>;
+}
+
+function DoneRow({ event, debug }: { event: Extract<AgentEvent, { type: "done" }>; debug: boolean }) {
+  const m = event.metrics;
+  // Phase timings are debug output (.env STOCKBOT_DEBUG=1); an absent phase never renders.
+  const timings = debug ? Object.entries(m.timings ?? {}).flatMap(([k, v]) => (v === undefined ? [] : [`${k} ${Math.round(v)}ms`])) : [];
+  return (
+    <div className="pt-2 text-xs text-zinc-500">
+      <div role="status">{COMPLETION_LABELS[event.status ?? "completed"]}</div>
+      {(event.limitations?.length ?? 0) > 0 && <ul className="list-disc pl-4">{event.limitations?.map((limitation, i) => <li key={i}>{limitation}</li>)}</ul>}
+      <div>── metrics ──</div>
+      <div>
+        Needle calls: {m.needle.calls} · Tool calls: {m.tools.calls} · Stockbot calls: {m.muse.calls}
+        {m.muse.providerCalls !== undefined && <> · Provider calls: {m.muse.providerCalls}</>} · Evidence:{" "}
+        {m.evidence.count} · Evidence chars: {m.evidence.characters} · Stockbot input: {m.muse.inputTokens ?? "n/a"}{" "}
+        · Stockbot output: {m.muse.outputTokens ?? "n/a"}
+      </div>
+      <div>
+        Needle: {Math.round(m.needle.totalMs)}ms · Tools: {Math.round(m.tools.totalMs)}ms · Stockbot:{" "}
+        {Math.round(m.muse.totalMs)}ms · Total: {Math.round(m.totalMs)}ms
+      </div>
+      {timings.length > 0 && <div>Timings: {timings.join(" · ")}</div>}
+    </div>
+  );
+}
+
+function ErrorRow({ event, debug, onRetry }: { event: Extract<AgentEvent, { type: "error" }>; debug: boolean; onRetry?: () => void }) {
+  // Raw diagnostics remain in debug output.
+  return <FailureView text={debug ? [event.stage, event.code, event.message].filter(Boolean).join(": ") : "The request failed. Please retry."} onRetry={onRetry} />;
+}
+
+function FailedRow({ event, debug, onRetry }: { event: Extract<AgentEvent, { type: "failed" }>; debug: boolean; onRetry?: () => void }) {
+  return debug ? <div className="text-red-400">✗ {[event.category, event.stage, event.code, event.message].filter(Boolean).join(": ")}</div> : <FailureView text={failureText(event.category)} onRetry={onRetry} />;
+}
+
+const EVENT_RENDERERS: Renderers = {
+  agent_start: ({ event }) => <AgentStartRow event={event} />,
+  reasoning_start: () => <ReasoningRow />,
+  answer_delta: ({ event }) => <AnswerRow event={event} />,
+  answer_partial: ({ event }) => <AnswerRow event={event} />,
+  done: ({ event, debug }) => <DoneRow event={event} debug={debug} />,
+  error: ({ event, debug, onRetry }) => <ErrorRow event={event} debug={debug} onRetry={onRetry} />,
+  failed: ({ event, debug, onRetry }) => <FailedRow event={event} debug={debug} onRetry={onRetry} />,
+};
+
 export function AgentEventView({ event, debug = false, onRetry }: { event: AgentEvent; debug?: boolean; onRetry?: () => void }) {
   switch (event.type) {
     case "agent_start":
-      return <div className="text-zinc-100">&gt; {event.prompt}{event.context && <AskContextChip context={event.context} />}</div>;
+      return EVENT_RENDERERS.agent_start?.({ event, debug, onRetry }) ?? null;
     case "reasoning_start":
-      return (
-        <div>
-          <span className="rounded border border-violet-900 px-1 text-[13px] text-violet-400">STOCKBOT</span>{" "}
-          <span style={{ color: "#a78bfa" }}>● stockbot / working…</span>
-        </div>
-      );
+      return EVENT_RENDERERS.reasoning_start?.({ event, debug, onRetry }) ?? null;
     case "answer_delta":
+      return EVENT_RENDERERS.answer_delta?.({ event, debug, onRetry }) ?? null;
     case "answer_partial":
-      return <span>{event.text}</span>;
-    case "done": {
-      const m = event.metrics;
-      // Phase timings are debug output (.env STOCKBOT_DEBUG=1); an absent phase never renders.
-      const timings = debug ? Object.entries(m.timings ?? {}).flatMap(([k, v]) => (v === undefined ? [] : [`${k} ${Math.round(v)}ms`])) : [];
-      return (
-        <div className="pt-2 text-xs text-zinc-500">
-          <div role="status">{event.status === "completed_with_limitations" ? "Completed with limitations" : event.status === "failed" ? "Failed" : event.status === "cancelled" ? "Cancelled" : "Completed"}</div>
-          {event.limitations && event.limitations.length > 0 && <ul className="list-disc pl-4">{event.limitations.map((limitation, i) => <li key={i}>{limitation}</li>)}</ul>}
-          <div>── metrics ──</div>
-          <div>
-            Needle calls: {m.needle.calls} · Tool calls: {m.tools.calls} · Stockbot calls: {m.muse.calls}
-            {m.muse.providerCalls !== undefined && <> · Provider calls: {m.muse.providerCalls}</>} · Evidence:{" "}
-            {m.evidence.count} · Evidence chars: {m.evidence.characters} · Stockbot input: {m.muse.inputTokens ?? "n/a"}{" "}
-            · Stockbot output: {m.muse.outputTokens ?? "n/a"}
-          </div>
-          <div>
-            Needle: {Math.round(m.needle.totalMs)}ms · Tools: {Math.round(m.tools.totalMs)}ms · Stockbot:{" "}
-            {Math.round(m.muse.totalMs)}ms · Total: {Math.round(m.totalMs)}ms
-          </div>
-          {timings.length > 0 && <div>Timings: {timings.join(" · ")}</div>}
-        </div>
-      );
-    }
+      return EVENT_RENDERERS.answer_partial?.({ event, debug, onRetry }) ?? null;
+    case "done":
+      return EVENT_RENDERERS.done?.({ event, debug, onRetry }) ?? null;
     case "error":
-      // Raw diagnostics remain in debug output.
-      return <FailureView text={debug ? [event.stage, event.code, event.message].filter(Boolean).join(": ") : "The request failed. Please retry."} onRetry={onRetry} />;
+      return EVENT_RENDERERS.error?.({ event, debug, onRetry }) ?? null;
     case "failed":
-      return debug ? <div className="text-red-400">✗ {[event.category, event.stage, event.code, event.message].filter(Boolean).join(": ")}</div> : <FailureView text={failureText(event.category)} onRetry={onRetry} />;
+      return EVENT_RENDERERS.failed?.({ event, debug, onRetry }) ?? null;
     default:
       return <WorkEventView event={event} />;
   }
