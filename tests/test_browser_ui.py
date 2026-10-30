@@ -11,10 +11,11 @@ from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Queue
-from typing import override
+from typing import cast, override
 from urllib.error import URLError
 from urllib.parse import parse_qs, quote, urlsplit
 from urllib.request import urlopen
+from uuid import UUID
 
 import pytest
 from selenium import webdriver
@@ -34,7 +35,7 @@ SEARCH = (By.CSS_SELECTOR, "header button.cmd-trigger")
 PALETTE = (By.CSS_SELECTOR, 'input[role="combobox"]')
 FIRST_HIT = (By.XPATH, "//*[@id='cmd-list']//*[@role='option'][b='ORCL']")
 AGENT_INPUT = (By.CSS_SELECTOR, 'input[aria-label="Ask the research agent"]')
-SEND = (By.CSS_SELECTOR, 'button[type="submit"]')
+SEND = (By.XPATH, "//form[input[@aria-label='Ask the research agent']]/button[@type='submit']")
 # Real capture ids are sha256 hex; the #/source/<id> route rejects any other shape.
 SOURCE_ID = "capture:" + "a" * 64
 SOURCE: dict[str, object] = {
@@ -167,7 +168,7 @@ def watchlist_rows(symbols: list[str]) -> list[dict[str, object]]:
     return rows
 
 
-UI = tuple[str, Queue[object], Queue[str], Queue[str]]
+UI = tuple[str, Queue[object], Queue[str], Queue[str], Queue[dict[str, object]]]
 
 
 @pytest.fixture(scope="module")
@@ -176,6 +177,8 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
     watch: Queue[str] = Queue()
     unknown: Queue[str] = Queue()
     source_reads: Queue[str] = Queue()
+    workspaces: dict[str, dict[str, object]] = {}
+    workspace_saves: Queue[dict[str, object]] = Queue()
 
     class Provider(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -193,6 +196,7 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
             bodies: dict[str, object] = {
                 "/api/health": {"debug": False},
                 "/api/research/sessions": {"sessions": []},
+                "/api/workspaces": {"workspaces": list(workspaces.values())},
                 "/api/search": {
                     "query": query.get("q", [""])[0],
                     "hits": [
@@ -288,8 +292,6 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
                 },
             }
             port = server.server_port
-            if url.path.startswith("/api/workspaces/"):
-                bodies[url.path] = {"sym": url.path.rsplit("/", 1)[-1], "widgets": [], "updated_at": None}
             if url.path == f"/api/research/sources/{quote(SOURCE_ID, safe='')}":
                 fixture = f"http://127.0.0.1:{port}{FIXTURE_SOURCE_PATH}"
                 bodies[url.path] = {
@@ -339,6 +341,49 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
                 self.send_error(500, "The browser test has no fixture for this route.")
                 return
             body = json.dumps(bodies[url.path]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_PUT(self) -> None:
+            path = urlsplit(self.path).path
+            if not path.startswith("/api/workspaces/"):
+                unknown.put(self.path)
+                self.send_error(500, "The browser test has no fixture for this route.")
+                return
+            workspace_id = path.removeprefix("/api/workspaces/")
+            assert str(UUID(workspace_id)) == workspace_id
+            assert self.headers.get("Content-Type") == "application/json"
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            assert set(payload) == {"name", "widgets"}
+            assert isinstance(payload["name"], str) and 1 <= len(payload["name"].strip()) <= 60
+            widgets = payload["widgets"]
+            assert isinstance(widgets, list) and len(widgets) <= 24
+            assert len({widget["id"] for widget in widgets}) == len(widgets)
+            for widget in widgets:
+                assert isinstance(widget["id"], str) and widget["id"]
+                assert isinstance(widget["type"], str) and widget["type"]
+                assert isinstance(widget["ticker"], str) and widget["ticker"]
+                geometry = widget["geometry"]
+                assert set(geometry) == {"x", "y", "width", "height"}
+                for key, minimum, maximum in [
+                    ("x", 0, 20000),
+                    ("y", 0, 20000),
+                    ("width", 280, 4000),
+                    ("height", 180, 4000),
+                ]:
+                    assert type(geometry[key]) is int and minimum <= geometry[key] <= maximum
+            doc: dict[str, object] = {
+                "id": workspace_id,
+                "name": payload["name"].strip(),
+                "widgets": widgets,
+                "updated_at": "2026-10-29T12:00:00Z",
+            }
+            workspaces[workspace_id] = doc
+            workspace_saves.put(doc)
+            body = json.dumps(doc).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -448,7 +493,7 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
                         time.sleep(0.05)
                 else:
                     pytest.fail(f"Vite did not start. {log.read_text()}")
-                yield url, requests, watch, source_reads
+                yield url, requests, watch, source_reads, workspace_saves
             finally:
                 process.terminate()
                 try:
@@ -647,6 +692,10 @@ def test_agent_transcript_scrolls_inside_panel(
     WebDriverWait(browser, 5).until(
         lambda client: client.execute_script("return [innerWidth, innerHeight]") == [width, height]
     )
+    # Freeform windows retain their geometry after a viewport resize.
+    # Maximize the agent before checking its internal scroll region.
+    browser.find_element(By.CSS_SELECTOR, 'button[aria-label="Expand Agent"]').click()
+    WebDriverWait(browser, 5).until(EC.visibility_of_element_located((By.CSS_SELECTOR, ".ws-widget-focus")))
 
     # Empty introduction: the prompt is reachable and the last intro line is reachable by wheel alone.
     assert_prompt_reachable(browser)
@@ -705,6 +754,10 @@ def test_agent_transcript_scrolls_inside_panel(
 def test_filings_panel_shows_fund_filing_date_and_provider_error(browser: webdriver.Chrome) -> None:
     wait = WebDriverWait(browser, 10)
     browser.find_element(By.XPATH, "//button[b='SPY']").click()
+    financials = browser.find_element(By.CSS_SELECTOR, 'section[aria-label="Financials · NVDA"]')
+    ticker = financials.find_element(By.CSS_SELECTOR, 'input[aria-label="Ticker for Financials"]')
+    ticker.send_keys(Keys.CONTROL, "a", Keys.NULL, "SPY")
+    financials.find_element(By.CSS_SELECTOR, 'button[type="submit"]').click()
     spy = (By.XPATH, "//section[@aria-label='Financials · SPY']")
     wait.until(EC.text_to_be_present_in_element(spy, "filed 2026-03-13"))
     shown = browser.find_element(*spy).text
@@ -712,6 +765,11 @@ def test_filings_panel_shows_fund_filing_date_and_provider_error(browser: webdri
     assert "2026-03-12" not in shown
 
     search_orcl(browser).click()
+    # Selecting a ticker no longer retargets independently configured windows.
+    financials = browser.find_element(*spy)
+    ticker = financials.find_element(By.CSS_SELECTOR, 'input[aria-label="Ticker for Financials"]')
+    ticker.send_keys(Keys.CONTROL, "a", Keys.NULL, "ORCL")
+    financials.find_element(By.CSS_SELECTOR, 'button[type="submit"]').click()
     orcl = (By.XPATH, "//section[@aria-label='Financials · ORCL']")
     wait.until(EC.text_to_be_present_in_element(orcl, "We could not load this data."))
     panel = browser.find_element(*orcl)
@@ -841,7 +899,7 @@ def test_page_navigation_uses_nav_links(browser: webdriver.Chrome) -> None:
     wait = WebDriverWait(browser, 10)
     for label, route, content in [
         ("Home", "#/home", ".home-table"),
-        ("Workspaces", "#/workspace/NVDA", ".ws-grid"),
+        ("Workspaces", "#/workspace/NVDA", 'select[aria-label="Add widget"]'),
         ("Feed", "#/feed", ".feed-row"),
     ]:
         link = browser.find_element(By.LINK_TEXT, label)
@@ -878,17 +936,163 @@ def test_palette_keyboard_opens_ticker_workspace(browser: webdriver.Chrome) -> N
     wait.until(EC.invisibility_of_element_located((By.CSS_SELECTOR, 'input[role="combobox"]')))
 
 
-def test_add_widget_increases_workspace_grid(browser: webdriver.Chrome) -> None:
+def test_named_workspace_windows_persist_native_geometry(browser: webdriver.Chrome, local_ui: UI) -> None:
     wait = WebDriverWait(browser, 10)
+    saves = local_ui[4]
+    while not saves.empty():
+        saves.get_nowait()
     browser.find_element(By.LINK_TEXT, "Workspaces").click()
+    wait.until(EC.url_contains("#/workspace/NVDA"))
+
+    def create(name: str) -> None:
+        browser.find_element(
+            By.XPATH, "//button[@aria-label='New workspace' or normalize-space()='New workspace']"
+        ).click()
+        field = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[aria-label="Workspace name"]')))
+        field.send_keys(name)
+        browser.find_element(By.XPATH, "//button[normalize-space()='Create workspace']").click()
+        wait.until(
+            EC.presence_of_element_located(
+                (
+                    By.XPATH,
+                    f"//*[@role='tablist'][@aria-label='Workspaces']//*[@role='tab'][normalize-space()='{name} *']",
+                )
+            )
+        )
+
+    def geometry() -> dict[str, int]:
+        return cast(
+            dict[str, int],
+            browser.execute_script(
+                """
+            const panel = document.querySelector('section[aria-label="Financials · ORCL"]');
+            const box = panel.closest('.react-draggable').getBoundingClientRect();
+            const desktop = document.querySelector('.ws-desktop').getBoundingClientRect();
+            return {x: Math.round(box.left - desktop.left), y: Math.round(box.top - desktop.top),
+                    width: Math.round(box.width), height: Math.round(box.height)};
+            """
+            ),
+        )
+
+    def select_workspace(name: str) -> None:
+        tab = wait.until(
+            EC.element_to_be_clickable(
+                (
+                    By.XPATH,
+                    f"//*[@role='tablist'][@aria-label='Workspaces']//*[@role='tab'][normalize-space()='{name}']",
+                )
+            )
+        )
+        tab.click()
+        wait.until(lambda _: tab.get_attribute("aria-selected") == "true")
+
+    create("Browser draft")
+    name = browser.find_element(By.CSS_SELECTOR, 'input[aria-label="Workspace name"]')
+    name.send_keys(Keys.CONTROL, "a", Keys.NULL, "Browser research")
     menu = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'select[aria-label="Add widget"]')))
-    before = len(browser.find_elements(By.CSS_SELECTOR, ".ws-grid section"))
+    before = len(browser.find_elements(By.CSS_SELECTOR, ".ws-desktop section.ws-widget"))
     Select(menu).select_by_visible_text("Monthly returns")
-    wait.until(lambda client: len(client.find_elements(By.CSS_SELECTOR, ".ws-grid section")) == before + 1)
+    wait.until(lambda client: len(client.find_elements(By.CSS_SELECTOR, ".ws-desktop section.ws-widget")) == before + 1)
     widget = wait.until(
         EC.visibility_of_element_located((By.CSS_SELECTOR, 'section[aria-label="Monthly returns · NVDA"]'))
     )
-    assert widget.find_element(By.CSS_SELECTOR, 'table[aria-label="NVDA monthly returns"]')
+    browser.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", widget)
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'table[aria-label="NVDA monthly returns"]')))
+    ticker = widget.find_element(By.CSS_SELECTOR, 'input[aria-label="Ticker for Monthly returns"]')
+    ticker.send_keys(Keys.CONTROL, "a", Keys.NULL, "ORCL")
+    widget.find_element(By.CSS_SELECTOR, 'button[type="submit"]').click()
+    replacement = wait.until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, 'select[aria-label="Panel type for Monthly returns · ORCL"]'))
+    )
+    Select(replacement).select_by_visible_text("Financials")
+    panel = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 'section[aria-label="Financials · ORCL"]')))
+
+    # The toolbar ticker affects only subsequently added windows.
+    new_ticker = browser.find_element(By.CSS_SELECTOR, 'input[aria-label="New window ticker"]')
+    new_ticker.clear()
+    new_ticker.send_keys("AAPL")
+    assert browser.find_element(By.CSS_SELECTOR, 'section[aria-label="Financials · ORCL"]')
+    browser.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", panel)
+    initial = geometry()
+    title = panel.find_element(By.CSS_SELECTOR, ".ws-window-title")
+    ActionChains(browser).move_to_element(title).click_and_hold().move_by_offset(90, 70).release().perform()
+    wait.until(lambda _: geometry()["x"] > initial["x"] + 80)
+    moved = geometry()
+    assert moved["x"] == pytest.approx(initial["x"] + 90, abs=2)
+    assert moved["y"] == pytest.approx(initial["y"] + 70, abs=2)
+    assert (moved["width"], moved["height"]) == (initial["width"], initial["height"])
+
+    handle = panel.find_element(By.XPATH, "..").find_element(By.CSS_SELECTOR, '[data-workspace-resize="bottom-right"]')
+    ActionChains(browser).move_to_element(handle).click_and_hold().move_by_offset(80, 60).release().perform()
+    wait.until(lambda _: geometry()["width"] > moved["width"] + 70)
+    resized = geometry()
+    assert resized["width"] == pytest.approx(moved["width"] + 80, abs=2)
+    assert resized["height"] == pytest.approx(moved["height"] + 60, abs=2)
+    assert (resized["x"], resized["y"]) == (moved["x"], moved["y"])
+    assert saves.empty(), "Creation, renaming, panel edits, dragging, and resizing must not save automatically."
+
+    browser.find_element(By.XPATH, "//button[normalize-space()='Save']").click()
+    first = saves.get(timeout=10)
+    assert first["name"] == "Browser research"
+    assert str(UUID(str(first["id"]))) == first["id"]
+    assert isinstance(first["widgets"], list)
+    saved_widget = next(
+        widget for widget in first["widgets"] if widget["type"] == "financials" and widget["ticker"] == "ORCL"
+    )
+    assert saved_widget["geometry"] == resized
+    browser.refresh()
+    wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 'section[aria-label="Financials · ORCL"]')))
+    name = browser.find_element(By.CSS_SELECTOR, 'input[aria-label="Workspace name"]')
+    assert name.get_attribute("value") == "Browser research"
+    assert geometry() == resized
+    assert browser.current_url.endswith("#/workspace/NVDA")
+
+    # Maximize changes the visible size, not the saved geometry.
+    browser.find_element(By.CSS_SELECTOR, 'button[aria-label="Expand Financials · ORCL"]').click()
+    wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Collapse Financials · ORCL"]')))
+    maximized = browser.find_element(By.CSS_SELECTOR, 'section[aria-label="Financials · ORCL"]').rect
+    assert maximized["width"] > resized["width"]
+    assert maximized["height"] > resized["height"]
+    ActionChains(browser).send_keys(Keys.ESCAPE).perform()
+    wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Expand Financials · ORCL"]')))
+    assert geometry() == resized
+    assert saves.empty(), "Maximize and Escape must not write a workspace."
+
+    create("Browser comparison")
+    toolbar_ticker = browser.find_element(By.CSS_SELECTOR, 'input[aria-label="New window ticker"]')
+    toolbar_ticker.send_keys(Keys.CONTROL, "a", Keys.NULL, "AAPL")
+    Select(browser.find_element(By.CSS_SELECTOR, 'select[aria-label="Add widget"]')).select_by_visible_text(
+        "Monthly returns"
+    )
+    wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 'section[aria-label="Monthly returns · AAPL"]')))
+    assert not browser.find_elements(By.CSS_SELECTOR, 'section[aria-label="Financials · ORCL"]')
+    assert saves.empty(), "A second workspace must also require an explicit Save."
+    browser.find_element(By.XPATH, "//button[normalize-space()='Save']").click()
+    second = saves.get(timeout=10)
+    assert second["id"] != first["id"]
+    assert second["name"] == "Browser comparison"
+    assert isinstance(second["widgets"], list)
+    assert any(widget["type"] == "monthly-returns" and widget["ticker"] == "AAPL" for widget in second["widgets"])
+    wait.until(
+        lambda client: (
+            client.find_element(By.CSS_SELECTOR, '[role="tab"][aria-selected="true"]').text == "Browser comparison"
+        )
+    )
+    select_workspace("Browser research")
+    wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 'section[aria-label="Financials · ORCL"]')))
+    assert geometry() == resized
+    assert not browser.find_elements(By.CSS_SELECTOR, 'section[aria-label="Monthly returns · AAPL"]')
+    select_workspace("Browser comparison")
+    wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 'section[aria-label="Monthly returns · AAPL"]')))
+    assert not browser.find_elements(By.CSS_SELECTOR, 'section[aria-label="Financials · ORCL"]')
+    browser.refresh()
+    wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 'section[aria-label="Monthly returns · AAPL"]')))
+    name = browser.find_element(By.CSS_SELECTOR, 'input[aria-label="Workspace name"]')
+    assert name.get_attribute("value") == "Browser comparison"
+    select_workspace("Browser research")
+    wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 'section[aria-label="Financials · ORCL"]')))
+    assert geometry() == resized
+    assert saves.empty(), "Switching and refreshing must not write either workspace."
 
 
 def test_offline_alert_receipt_renders_card(browser: webdriver.Chrome, local_ui: UI) -> None:

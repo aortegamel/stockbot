@@ -5,13 +5,11 @@ import {
   fetchQuote,
   fetchViewerContext,
   fetchWatchlistSources,
-  fetchCandles,
-  fetchWorkspace,
-  fetchWidgetData,
+  listWorkspaces,
   saveWorkspace,
   searchTickers,
 } from "./market-data";
-import type { SourceRow } from "./market-data";
+import type { SourceRow, WorkspaceDoc } from "./market-data";
 
 const realFetch = globalThis.fetch;
 
@@ -97,29 +95,54 @@ describe("market data requests", () => {
     expect((failure as DOMException).name).toBe("AbortError");
   });
 
-  test("fetches workspace widgets and candles, and saves the workspace with PUT", async () => {
-    const signal = new AbortController().signal;
-    const calls: { url: string; init?: RequestInit }[] = [];
-    const doc = { sym: "BRK.B", widgets: [{ id: "news", type: "news", ticker: "BRK.B" }], updated_at: "2026-10-20" };
+  test("lists named workspaces and saves the selected document without changing other documents", async () => {
+    const id = "a16ec102-2e68-49fb-b818-e9671a3d2474";
+    const otherId = "375eb936-e12d-4c20-ac9d-9e91ac2f0008";
+    const widgets: WorkspaceDoc["widgets"] = [{ id: "news", type: "news", ticker: "BRK.B", geometry: { x: 120, y: 40, width: 640, height: 480 } }];
+    const stored: WorkspaceDoc[] = [
+      { id, name: "Original", widgets: [], updated_at: null },
+      { id: otherId, name: "Other", widgets: [], updated_at: null },
+    ];
+    let writes = 0;
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      calls.push({ url: String(input), init });
-      return Response.json(doc);
+      if (String(input) === "/api/workspaces" && !init?.method) return Response.json({ workspaces: stored });
+      if (String(input) === `/api/workspaces/${id}` && init?.method === "PUT") {
+        if (init.headers && new Headers(init.headers).get("Content-Type") === "application/json") {
+          const body = JSON.parse(String(init.body));
+          if (body.name === "Research" && JSON.stringify(body.widgets) === JSON.stringify(widgets)) {
+            writes += 1;
+            stored[0] = { id, name: "Research", widgets, updated_at: "2026-10-29T12:00:00Z" };
+            return Response.json(stored[0]);
+          }
+        }
+        return new Response(null, { status: 400 });
+      }
+      return new Response(null, { status: 404 });
     }) as typeof fetch;
-    expect(await fetchWorkspace("BRK.B", signal)).toEqual(doc);
-    await fetchCandles("BRK.B", "5y", "1mo", signal);
-    await fetchWidgetData("short-interest", "BRK.B", signal);
-    expect(await saveWorkspace("BRK.B", doc.widgets)).toEqual(doc);
-    expect(calls.map((c) => c.url)).toEqual([
-      "/api/workspaces/BRK.B",
-      "/api/candles?sym=BRK.B&range=5y&interval=1mo",
-      "/api/widget-data?type=short-interest&sym=BRK.B",
-      "/api/workspaces/BRK.B",
-    ]);
-    expect(calls.slice(0, 3).every((c) => c.init?.signal === signal)).toBe(true);
-    expect(calls[3].init).toEqual({
-      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ widgets: doc.widgets }),
-    });
+    expect((await listWorkspaces()).workspaces.map((doc) => doc.name)).toEqual(["Original", "Other"]);
+    expect(writes).toBe(0);
+    const saved = await saveWorkspace(id, "Research", widgets);
+    expect(saved.name).toBe("Research");
+    expect(saved.updated_at).toBe("2026-10-29T12:00:00Z");
+    expect(saved.widgets[0]?.geometry).toEqual(widgets[0]?.geometry);
+    expect((await listWorkspaces()).workspaces.map((doc) => doc.name)).toEqual(["Research", "Other"]);
+    expect(writes).toBe(1);
+  });
+  test("reports workspace failures and preserves cancellation", async () => {
     globalThis.fetch = (async () => new Response(null, { status: 503 })) as unknown as typeof fetch;
-    await expect(saveWorkspace("BRK.B", [])).rejects.toThrow("request failed: 503");
+    await expect(listWorkspaces()).rejects.toThrow("request failed: 503");
+    await expect(saveWorkspace("workspace", "Research", [])).rejects.toThrow("request failed: 503");
+    globalThis.fetch = (async () => new Response("invalid JSON")) as unknown as typeof fetch;
+    await expect(listWorkspaces()).rejects.toBeInstanceOf(SyntaxError);
+    await expect(saveWorkspace("workspace", "Research", [])).rejects.toBeInstanceOf(SyntaxError);
+    const controller = new AbortController();
+    controller.abort();
+    globalThis.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
+      init?.signal?.throwIfAborted();
+      return Promise.resolve(Response.json({ workspaces: [] }));
+    }) as typeof fetch;
+    const failure = await listWorkspaces(controller.signal).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(DOMException);
+    expect((failure as DOMException).name).toBe("AbortError");
   });
 });

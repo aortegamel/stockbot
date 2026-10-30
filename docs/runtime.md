@@ -807,3 +807,36 @@ The Bun API and the market service always bind `127.0.0.1`
 The Vite listener binds `0.0.0.0` by default (`STOCKBOT_LAN=0` keeps
 `127.0.0.1`); `STOCKBOT_LAN_TOKEN`, when set, is required on every `/api/*`
 request (`web/lan-token.ts`). See the README "LAN access" section.
+
+## Named workspaces
+
+The Workspaces page contains freeform windows through `react-rnd`.
+Drag a window title to move it.
+Drag an edge or corner to resize it.
+The panel menu replaces a window's contents without changing its position or size.
+Market windows retain independent tickers.
+The ticker beside Add widget applies only to new windows.
+Watchlist, Portfolio, Agent, Theses, Alerts, Sessions, and Journal use the same window controls.
+
+Create a named workspace with New workspace.
+Edit its name in the toolbar.
+Workspace tabs retain unsaved drafts during page and workspace changes.
+Only Save writes names, window order, geometry, tickers, and panel settings to the server.
+Agent receipts also remain unsaved until Save.
+A failed save retains the draft.
+The browser warns before a reload or close discards unsaved drafts.
+
+Expand fills the visible workspace area.
+Escape restores the original window geometry.
+Forms and menus handle Escape before the window.
+Focus a window title to use arrow keys for 10-pixel moves.
+Shift with an arrow key resizes the window by 10 pixels.
+The desktop scrolls when saved windows exceed the visible area.
+
+`GET /api/workspaces` lists named documents.
+`PUT /api/workspaces/<uuid>` saves `{name, widgets}`.
+Each widget includes `{id, type, ticker, params?, geometry: {x, y, width, height}}`.
+The server validates names, UUIDs, unique widget IDs, widget types, tickers, geometry, and chart/link settings.
+Each workspace supports at most 24 windows.
+The server stores named documents in `data/named-workspaces/<uuid>.json`.
+It does not read, import, modify, or delete legacy `data/workspaces/` files.

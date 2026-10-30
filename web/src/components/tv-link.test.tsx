@@ -1,10 +1,10 @@
 import { dom } from "../test-dom";
 import { afterEach, describe, expect, test } from "bun:test";
-import { act } from "react";
+import { act, useState } from "react";
 import type { ReactNode } from "react";
 import type { Root } from "react-dom/client";
 import { WIDGET_TYPES, type AgentEvent } from "../../../needle-harness/lib/agent/types";
-import Workspace from "../pages/Workspace";
+import Workspace, { type WorkspaceDraft } from "../pages/Workspace";
 import type { WorkspaceDoc } from "../lib/market-data";
 import { TvLinkWidget } from "./tv-link";
 import { widgetLabel } from "./widgets";
@@ -90,31 +90,32 @@ describe("TvLinkWidget", () => {
 });
 
 function serve(saved: WorkspaceDoc["widgets"]) {
-  const docs: Record<string, WorkspaceDoc> = { NVDA: { sym: "NVDA", widgets: saved, updated_at: "2026-10-20T10:00:00Z" } };
+  const id = "a16ec102-2e68-49fb-b818-e9671a3d2474";
+  const docs: Record<string, WorkspaceDoc> = { [id]: { id, name: "Links", widgets: saved, updated_at: "2026-10-20T10:00:00Z" } };
   const puts: WorkspaceDoc["widgets"][] = [];
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), dom.window.location.href);
-    if (url.pathname.startsWith("/api/workspaces/")) {
-      const sym = url.pathname.split("/").at(-1)!;
-      if (init?.method === "PUT") {
-        const body = JSON.parse(String(init.body)) as { widgets: WorkspaceDoc["widgets"] };
-        puts.push(body.widgets);
-        docs[sym] = { sym, widgets: body.widgets, updated_at: "2026-10-20T12:00:00+00:00" };
-      }
-      return Response.json(docs[sym] ?? { sym, widgets: [], updated_at: null });
+    if (url.pathname === "/api/workspaces") return Response.json({ workspaces: Object.values(docs) });
+    if (url.pathname.startsWith("/api/workspaces/") && init?.method === "PUT") {
+      const id = url.pathname.split("/").at(-1)!;
+      const body = JSON.parse(String(init.body)) as { name: string; widgets: WorkspaceDoc["widgets"] };
+      puts.push(body.widgets);
+      docs[id] = { id, ...body, updated_at: "2026-10-20T12:00:00+00:00" };
+      return Response.json(docs[id]);
     }
     if (url.pathname === "/api/portfolio") return new Response(null, { status: 404 });
     if (url.pathname === "/api/theses") return Response.json([]);
     if (url.pathname === "/api/watchlist") return Response.json({ watchlist: [] });
     return Response.json({});
   }) as typeof fetch;
-  return { docs, puts };
+  return { saved: () => docs[id], puts };
 }
 
 function Page({ events = [] }: { events?: AgentEvent[] }) {
+  const [workspace, setWorkspace] = useState<WorkspaceDraft | null>(null);
   return <Workspace selected="NVDA" pick={() => { }} watchlist={["NVDA"]} onWatchlist={() => { }}
     events={events} input="" setInput={() => { }} research={false} setResearch={() => { }} setAskContext={() => { }} onSend={() => { }} openDrawer={() => { }} busy={false} debug={false}
-    sessions={[]} sessionId={null} setSessionId={() => { }} snapshot={null} journal={null} seq={0} chat={null} />;
+    workspace={workspace} setWorkspace={setWorkspace} sessions={[]} sessionId={null} setSessionId={() => { }} snapshot={null} journal={null} seq={0} chat={null} />;
 }
 
 async function chooseTvLink() {
@@ -126,12 +127,14 @@ async function chooseTvLink() {
 }
 
 describe("Workspace TradingView links", () => {
-  test("every widget type has a menu label", () => {
+  test("every widget type has a menu label", async () => {
+    serve([]);
+    await render(<Page />);
     for (const type of WIDGET_TYPES) expect(widgetLabel(type)).not.toBe(type);
   });
 
   test("adds several links through the form with preview, saves unique ids, and edits with ✎", async () => {
-    const { docs, puts } = serve([]);
+    const { saved, puts } = serve([]);
     await render(<Page />);
     await chooseTvLink();
     await type(find('input[aria-label="TradingView URL"]'), "http://www.tradingview.com/x/8ot166mV/");
@@ -150,15 +153,18 @@ describe("Workspace TradingView links", () => {
     expect(find('[aria-label="Setup · NVDA"] img')).not.toBeNull();
     expectSafeFrame(find('[aria-label="TradingView NASDAQ:NVDA · NVDA"] iframe'), "https://s.tradingview.com/widgetembed/?symbol=NASDAQ%3ANVDA&interval=D&theme=dark&style=1&locale=en&timezone=exchange");
     await click(button("Save"));
-    expect(docs.NVDA.widgets).toEqual([
-      { id: "tv-link-1", type: "tv-link", ticker: "NVDA", params: { url: "https://www.tradingview.com/x/8ot166mV/?utm_source=evil", label: "Setup" } },
-      { id: "tv-link-2", type: "tv-link", ticker: "NVDA", params: { url: SYMBOL, label: "TradingView NASDAQ:NVDA" } },
+    expect(saved().widgets.map(({ type, ticker, params }) => ({ type, ticker, params }))).toEqual([
+      { type: "tv-link", ticker: "NVDA", params: { url: "https://www.tradingview.com/x/8ot166mV/?utm_source=evil", label: "Setup" } },
+      { type: "tv-link", ticker: "NVDA", params: { url: SYMBOL, label: "TradingView NASDAQ:NVDA" } },
     ]);
+    expect(new Set(saved().widgets.map((w) => w.id)).size).toBe(2);
     await click(find('[aria-label="Edit Setup · NVDA"]'));
     expect(find<HTMLInputElement>('[aria-label="Setup · NVDA"] input[aria-label="TradingView URL"]').value).toBe("https://www.tradingview.com/x/8ot166mV/?utm_source=evil");
     await type(find('[aria-label="Setup · NVDA"] input[aria-label="TradingView URL"]'), "https://www.tradingview.com/chart/AbCd1234/");
     await click(button("Save link"));
-    expect(puts.at(-1)?.[0]).toEqual({ id: "tv-link-1", type: "tv-link", ticker: "NVDA", params: { url: "https://www.tradingview.com/chart/AbCd1234/", label: "Setup" } });
+    expect(puts).toHaveLength(1);
+    await click(button("Save"));
+    expect(puts.at(-1)?.find((w) => w.params?.label === "Setup")?.params).toEqual({ url: "https://www.tradingview.com/chart/AbCd1234/", label: "Setup" });
     expect(find('[aria-label="Setup · NVDA"]').textContent).toContain("Copy link");
   });
 

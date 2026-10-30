@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
 import { AIPanel, watchlistFor } from "../components/market-panels";
 import type { WidgetOutcomes } from "../components/action-cards";
 import { HealthDot } from "../components/health-dot";
@@ -7,6 +7,7 @@ import { parseRoute, routeHash, TICKER_RE, useHashRoute, type Route } from "../l
 import type { AgentEvent, AskContext } from "../../../needle-harness/lib/agent/types";
 import { fetchJournal, fetchSnapshot, listSessions, type JournalPage, type ResearchSnapshot } from "../lib/research-client";
 import CommandBar from "./CommandBar";
+import type { WorkspaceDraft } from "../pages/Workspace";
 
 // The existing watchdog stops once buffered persona reasoning starts.
 const STALL_TIMEOUT_MS = 120_000;
@@ -55,7 +56,9 @@ export type ShellState = {
   snapshot: ResearchSnapshot | null;
   journal: JournalPage | null;
   seq: number;
-  // The agent chat, or null while the drawer is closed. Workspace docks it under the chart; Shell docks it under every other page.
+  workspace: WorkspaceDraft | null;
+  setWorkspace: Dispatch<SetStateAction<WorkspaceDraft | null>>;
+  // Shell owns the agent state. The workspace supplies its movable window frame.
   chat: ReactNode;
 };
 
@@ -160,6 +163,17 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
   const [research, setResearch] = useState(false);
   const [askContext, setAskContext] = useState<AskContext | null>(null);
   const [drawer, setDrawerState] = useState(initialDrawer);
+  const [workspace, setWorkspace] = useState<WorkspaceDraft | null>(null);
+
+  useEffect(() => {
+    if (!workspace?.dirty.length) return;
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [workspace?.dirty.length]);
   const [, setClock] = useState("--:--:--");
 
   // Clock ticks on its own interval — no synchronous setState in the effect body.
@@ -361,13 +375,12 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
     void onSend(text);
   };
   const chat = drawer ? (
-    <aside className="glass ws-cell drawer" aria-label="Agent drawer">
-      <AIPanel events={events} input={input} setInput={setInput} research={research} setResearch={setResearch} context={askContext} onClearContext={() => setAskContext(null)} onSend={() => void onSend()} sym={selected} busy={busy} debug={debug} widgetOutcomes={widgetOutcomes} />
-    </aside>
+    <AIPanel events={events} input={input} setInput={setInput} research={research} setResearch={setResearch} context={askContext} onClearContext={() => setAskContext(null)} onSend={() => void onSend()} sym={selected} busy={busy} debug={debug} widgetOutcomes={widgetOutcomes} />
   ) : null;
   const state: ShellState = {
     selected, pick, watchlist, onWatchlist, events, input, setInput, research, setResearch, setAskContext, onSend: () => void onSend(),
     busy, debug, sessions, sessionId, setSessionId, snapshot, journal, seq, openDrawer: () => setDrawer(true), ask, onWidgetOutcomes, chat,
+    workspace, setWorkspace,
   };
 
   const navLink = (label: string, to: Route) => (
@@ -426,7 +439,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
 
       <div className="shell-body">
         {children(route, state)}
-        {route.page !== "workspace" && chat}
+        {route.page !== "workspace" && chat && <aside className="glass ws-cell drawer" aria-label="Agent drawer">{chat}</aside>}
       </div>
 
       <footer className="app-footer">

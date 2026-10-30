@@ -195,20 +195,26 @@ export function fetchCandles(sym: string, range: string, interval: string, signa
 // Mirrors Workspace.widgets max_length in api/workspaces.py; the server rejects a save above it.
 export const MAX_WIDGETS = 24;
 
-// One saved widget in a per-ticker workspace. updated_at null: the workspace was never saved.
-export type WorkspaceWidget = { id: string; type: string; ticker: string; params?: Record<string, unknown> };
-export type WorkspaceDoc = { sym: string; widgets: WorkspaceWidget[]; updated_at: string | null };
+// Each named workspace contains independently positioned windows.
+export type WorkspaceWidget = {
+  id: string;
+  type: string;
+  ticker: string;
+  params?: Record<string, unknown>;
+  geometry: { x: number; y: number; width: number; height: number };
+};
+export type WorkspaceDoc = { id: string; name: string; widgets: WorkspaceWidget[]; updated_at: string | null };
 
-export function fetchWorkspace(sym: string, signal?: AbortSignal) {
-  return getJSON<WorkspaceDoc>(`/api/workspaces/${encodeURIComponent(sym)}`, signal);
+export function listWorkspaces(signal?: AbortSignal) {
+  return getJSON<{ workspaces: WorkspaceDoc[] }>("/api/workspaces", signal);
 }
 
-export async function saveWorkspace(sym: string, widgets: WorkspaceWidget[]): Promise<WorkspaceDoc> {
+export async function saveWorkspace(id: string, name: string, widgets: WorkspaceWidget[]): Promise<WorkspaceDoc> {
   const base = (import.meta.env.VITE_API_URL as string | undefined) ?? API;
-  const res = await fetch(`${base}/api/workspaces/${encodeURIComponent(sym)}`, {
+  const res = await fetch(`${base}/api/workspaces/${encodeURIComponent(id)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ widgets }),
+    body: JSON.stringify({ name, widgets }),
   });
   if (!res.ok) throw new Error(`request failed: ${res.status}`);
   return (await res.json()) as WorkspaceDoc;

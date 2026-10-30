@@ -1,12 +1,14 @@
-import { memo, useCallback, useEffect, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
+import { Rnd } from "react-rnd";
 import { WIDGET_TYPES } from "../../../needle-harness/lib/agent/types";
 import { fetchCandles, fetchFilings, fetchWidgetData, type Candle, type FilingItem, type WidgetData, type WorkspaceWidget } from "../lib/market-data";
+import { TICKER_RE } from "../lib/route";
 import { FinancialsPanel, NewsPanel } from "./market-panels";
 import TradingChart, { ChartControls } from "./trading-chart";
 import { useLoad } from "./home-panels";
 import { TvLinkForm, TvLinkWidget } from "./tv-link";
 
-// Menu labels for the fixed widget set; WIDGET_TYPES (the saved widget kinds) sets the order.
+export const WORKSPACE_TYPES = [...WIDGET_TYPES, "watchlist", "portfolio", "agent", "theses", "alerts", "sessions", "journal"];
 const LABELS: Record<string, string> = {
   "price-volume": "Price & volume",
   financials: "Financials",
@@ -18,6 +20,13 @@ const LABELS: Record<string, string> = {
   filings: "Filings timeline",
   multiples: "Multiples",
   "tv-link": "TradingView link",
+  watchlist: "Watchlist",
+  portfolio: "Portfolio",
+  agent: "Agent",
+  theses: "Theses",
+  alerts: "Alerts",
+  sessions: "Sessions",
+  journal: "Journal",
 };
 
 export const isWidgetType = (type: unknown): type is string => typeof type === "string" && WIDGET_TYPES.includes(type);
@@ -166,68 +175,148 @@ const WIDGETS: Record<string, (w: WorkspaceWidget) => ReactNode> = {
   "tv-link": (w) => <TvLinkWidget params={w.params} />,
 };
 
-function WidgetBody({ widget }: { widget: WorkspaceWidget }) {
-  return (WIDGETS[widget.type]?.(widget) as ReactNode) ?? null;
+function WidgetBody({ widget, renderExtra }: { widget: WorkspaceWidget; renderExtra: (widget: WorkspaceWidget) => ReactNode }) {
+  return WIDGETS[widget.type] ? WIDGETS[widget.type](widget) : renderExtra(widget);
 }
 
 function Tool({ label, onClick, children }: { label: string; onClick: () => void; children: ReactNode }) {
   return <button type="button" aria-label={label} title={label} onClick={onClick} className="ws-tool">{children}</button>;
 }
 
-const WidgetFrame = memo(function WidgetFrame({ widget, focused, onFocus, onRemove, onParams }: {
+type Geometry = WorkspaceWidget["geometry"];
+
+function boundedGeometry(geometry: Geometry): Geometry {
+  return {
+    x: Math.max(0, Math.min(20000, Math.round(geometry.x))),
+    y: Math.max(0, Math.min(20000, Math.round(geometry.y))),
+    width: Math.max(280, Math.min(4000, Math.round(geometry.width))),
+    height: Math.max(180, Math.min(4000, Math.round(geometry.height))),
+  };
+}
+
+function keyTarget(key: string, shift: boolean): { field: keyof Geometry; delta: number } | null {
+  const left = key === "ArrowLeft" ? -10 : key === "ArrowRight" ? 10 : null;
+  if (left !== null) return { field: shift ? "width" : "x", delta: left };
+  const vertical = key === "ArrowUp" ? -10 : key === "ArrowDown" ? 10 : null;
+  if (vertical !== null) return { field: shift ? "height" : "y", delta: vertical };
+  return null;
+}
+const WidgetFrame = memo(function WidgetFrame({ widget, focused, hidden, viewport, order, onFocus, onRaise, onGeometry, onRemove, onParams, onType, onTicker, renderExtra }: {
   widget: WorkspaceWidget;
   focused: boolean;
+  hidden: boolean;
+  viewport: Geometry;
+  order: number;
   onFocus: (id: string) => void;
+  onRaise: (id: string) => void;
+  onGeometry: (id: string, geometry: Geometry) => void;
   onRemove: (id: string) => void;
   onParams: (id: string, params: Record<string, unknown>) => void;
+  onType: (id: string, type: string) => void;
+  onTicker: (id: string, ticker: string) => void;
+  renderExtra: (widget: WorkspaceWidget) => ReactNode;
 }) {
   const [rev, setRev] = useState(0);
   const [editing, setEditing] = useState(false);
+  const [ticker, setTicker] = useState(widget.ticker);
+  const instructions = useId();
+  useEffect(() => setTicker(widget.ticker), [widget.ticker]);
+  useEffect(() => setEditing(false), [widget.type]);
   const tvLink = widget.type === "tv-link";
+  const market = isWidgetType(widget.type) || widget.type === "alerts";
   const title = tvLink && typeof widget.params?.label === "string" ? widget.params.label : widgetLabel(widget.type);
-  const label = `${title} · ${widget.ticker}`;
+  const label = market ? `${title} · ${widget.ticker}` : title;
+  const geometry = focused ? viewport : widget.geometry;
+  function keyGeometry(e: ReactKeyboardEvent<HTMLElement>): void {
+    if (e.target !== e.currentTarget || focused || e.altKey || e.ctrlKey || e.metaKey) return;
+    const target = keyTarget(e.key, e.shiftKey);
+    if (!target) return;
+    e.preventDefault();
+    onGeometry(widget.id, boundedGeometry({ ...widget.geometry, [target.field]: widget.geometry[target.field] + target.delta }));
+  }
   return (
-    <section aria-label={label} className={`glass ws-widget${focused ? " ws-widget-focus" : ""}`}>
-      <header className="card-head">
-        <span>{label}</span>
-        <span className="card-head-actions">
-          {widget.type === "price-volume" && <ChartControls params={widget.params} onChange={(next) => onParams(widget.id, next)} />}
-          {tvLink && <Tool label={`Edit ${label}`} onClick={() => setEditing((on) => !on)}>✎</Tool>}
-          <Tool label={`Refresh ${label}`} onClick={() => setRev((n) => n + 1)}>↻</Tool>
-          <Tool label={`${focused ? "Collapse" : "Expand"} ${label}`} onClick={() => onFocus(widget.id)}>⤢</Tool>
-          <Tool label={`Remove ${label}`} onClick={() => onRemove(widget.id)}>×</Tool>
-        </span>
-      </header>
-      <div className="ws-widget-body">
-        {editing
-          ? <TvLinkForm initial={widget.params} onSubmit={(params) => { setEditing(false); onParams(widget.id, params); }} onCancel={() => setEditing(false)} />
-          : <WidgetBody key={rev} widget={widget} />}
-      </div>
-    </section>
+    <Rnd
+      position={{ x: geometry.x, y: geometry.y }}
+      size={{ width: geometry.width, height: geometry.height }}
+      bounds="parent"
+      dragHandleClassName="ws-window-header"
+      cancel="input,textarea,button,select,form,a,[role=combobox]"
+      minWidth={focused ? viewport.width : 280}
+      minHeight={focused ? viewport.height : 180}
+      maxWidth={focused ? viewport.width : 4000}
+      maxHeight={focused ? viewport.height : 4000}
+      disableDragging={focused}
+      enableResizing={!focused}
+      resizeHandleComponent={{ bottomRight: <span data-workspace-resize="bottom-right" aria-label={`Resize ${label}`} style={{ display: "block", width: "100%", height: "100%" }} /> }}
+      onDragStart={() => onRaise(widget.id)}
+      onResizeStart={() => onRaise(widget.id)}
+      onDragStop={(_, data) => onGeometry(widget.id, boundedGeometry({ ...widget.geometry, x: data.x, y: data.y }))}
+      onResizeStop={(_, __, element, ___, position) => onGeometry(widget.id, boundedGeometry({ ...position, width: element.offsetWidth, height: element.offsetHeight }))}
+      style={{ zIndex: focused ? 100 : order, visibility: hidden ? "hidden" : undefined }}
+    >
+      <section aria-label={label} data-widget-type={widget.type} className={`glass ws-widget${focused ? " ws-widget-focus" : ""}`} onPointerDownCapture={() => onRaise(widget.id)} onFocusCapture={() => onRaise(widget.id)} style={{ width: "100%", height: "100%" }}>
+        <header className="card-head ws-window-header">
+          <span className="ws-window-title" tabIndex={0} role="group" aria-label={`Move or resize ${label}`} aria-describedby={instructions} onKeyDown={keyGeometry}>{label}</span>
+          <span id={instructions} hidden>Use arrow keys to move 10 pixels. Use Shift and arrow keys to resize 10 pixels.</span>
+          <span className="card-head-actions">
+            <select aria-label={`Panel type for ${label}`} value={widget.type} onChange={(e) => onType(widget.id, e.target.value)}>
+              {WORKSPACE_TYPES.filter((type) => type !== "tv-link" || tvLink).map((type) => <option key={type} value={type}>{widgetLabel(type)}</option>)}
+            </select>
+            {widget.type === "price-volume" && <ChartControls params={widget.params} onChange={(next) => onParams(widget.id, next)} />}
+            {tvLink && <Tool label={`Edit ${label}`} onClick={() => setEditing((on) => !on)}>✎</Tool>}
+            <Tool label={`Refresh ${label}`} onClick={() => setRev((n) => n + 1)}>↻</Tool>
+            <Tool label={`${focused ? "Collapse" : "Expand"} ${label}`} onClick={() => onFocus(widget.id)}>⤢</Tool>
+            <Tool label={`Remove ${label}`} onClick={() => onRemove(widget.id)}>×</Tool>
+          </span>
+        </header>
+        {market && (
+          <form className="ws-window-ticker" onSubmit={(e) => { e.preventDefault(); if (TICKER_RE.test(ticker) && ticker !== widget.ticker) onTicker(widget.id, ticker); }} onKeyDown={(e) => { if (e.key === "Escape") { e.preventDefault(); setTicker(widget.ticker); } }}>
+            <input aria-label={`Ticker for ${title}`} value={ticker} pattern={TICKER_RE.source} required maxLength={10} onChange={(e) => setTicker(e.target.value.toUpperCase())} />
+            <button type="submit" className="pill">Set ticker</button>
+          </form>
+        )}
+        <div className="ws-widget-body">
+          {editing
+            ? <TvLinkForm initial={widget.params} onSubmit={(params) => { setEditing(false); onParams(widget.id, params); }} onCancel={() => setEditing(false)} />
+            : <WidgetBody key={rev} widget={widget} renderExtra={renderExtra} />}
+        </div>
+      </section>
+    </Rnd>
   );
 });
 
 // A window Esc belongs to the innermost owner: a field, a form, an open menu, or the palette handles its own Esc first.
-export function freeEscape(e: KeyboardEvent): boolean {
+function freeEscape(e: KeyboardEvent): boolean {
   return e.key === "Escape" && !e.defaultPrevented
     && !(e.target instanceof window.Element && e.target.closest("input,textarea,select,form,[role=combobox],details[open]"));
 }
 
-// The first price-volume widget and the chat fill the main column; every other widget stacks in the side column.
-// Refresh remounts one widget. Expand focuses one widget over the whole grid; Esc restores the grid.
-// Hidden widgets stay mounted, so charts and loads survive a focus round trip. widgets null: the workspace is loading.
-export function WidgetGrid({ widgets, chat, onRemove, onParams }: {
+// Geometry and stacking change only through onChange. Focus does not change saved geometry.
+export function WidgetGrid({ widgets, renderExtra, onChange, onRemove, onParams, onType, onTicker }: {
   widgets: WorkspaceWidget[] | null;
-  chat: ReactNode;
+  renderExtra: (widget: WorkspaceWidget) => ReactNode;
+  onChange: (widgets: WorkspaceWidget[]) => void;
   onRemove: (id: string) => void;
   onParams: (id: string, params: Record<string, unknown>) => void;
+  onType: (id: string, type: string) => void;
+  onTicker: (id: string, ticker: string) => void;
 }) {
   const [focused, setFocused] = useState<string | null>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const [viewport, setViewport] = useState<Geometry>({ x: 0, y: 0, width: 1200, height: 800 });
   const focus = useCallback((id: string) => setFocused((previous) => previous === id ? null : id), []);
-  const visible = (widgets ?? []).filter((w) => isWidgetType(w.type));
-  const chart = visible.find((w) => w.type === "price-volume");
+  const visible = widgets ?? [];
   const focusing = focused !== null && visible.some((w) => w.id === focused);
-  // Capture phase: Esc leaves focus mode before the bottom panel sees it, and the handled event stays with focus mode.
+  useEffect(() => {
+    const element = viewportRef.current;
+    if (!element) return;
+    const measure = () => setViewport({ x: element.scrollLeft, y: element.scrollTop, width: element.clientWidth, height: element.clientHeight });
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    element.addEventListener("scroll", measure);
+    return () => { observer.disconnect(); element.removeEventListener("scroll", measure); };
+  }, []);
   useEffect(() => {
     if (!focusing) return;
     const onKey = (e: KeyboardEvent) => {
@@ -235,20 +324,32 @@ export function WidgetGrid({ widgets, chat, onRemove, onParams }: {
       e.preventDefault();
       setFocused(null);
     };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, [focusing]);
-  const frame = (widget: WorkspaceWidget) => <WidgetFrame key={widget.id} widget={widget} focused={focusing && focused === widget.id} onFocus={focus} onRemove={onRemove} onParams={onParams} />;
+  function raise(id: string) {
+    if (!widgets || widgets.at(-1)?.id === id) return;
+    const widget = widgets.find((item) => item.id === id);
+    if (widget) onChange([...widgets.filter((item) => item.id !== id), widget]);
+  }
+  function changeGeometry(id: string, geometry: Geometry) {
+    if (!widgets) return;
+    const widget = widgets.find((item) => item.id === id);
+    if (!widget) return;
+    const same = Object.keys(geometry).every((key) => geometry[key as keyof Geometry] === widget.geometry[key as keyof Geometry]);
+    if (same && widgets.at(-1)?.id === id) return;
+    onChange([...widgets.filter((item) => item.id !== id), { ...widget, geometry }]);
+  }
+  const width = Math.max(1200, viewport.width, ...visible.map((widget) => widget.geometry.x + widget.geometry.width + 40));
+  const height = Math.max(800, viewport.height, ...visible.map((widget) => widget.geometry.y + widget.geometry.height + 40));
   return (
-    <div className={`ws-grid${focusing ? " ws-grid-focus" : ""}`}>
-      <div className="ws-main">
+    <div ref={viewportRef} className="ws-viewport" style={{ overflow: focusing ? "hidden" : "auto", position: "relative" }}>
+      <div className="ws-desktop" style={{ position: "relative", width, height }}>
         {widgets === null && <span className="skeleton" aria-label="Loading workspace" aria-busy="true" />}
-        {chart && frame(chart)}
-        {chat}
-      </div>
-      <div className="ws-side">
         {widgets !== null && visible.length === 0 && <p className="feed-muted">No widgets yet. Choose Add widget or ask for a chart.</p>}
-        {visible.filter((w) => w !== chart).map(frame)}
+        {visible.map((widget, order) => (
+          <WidgetFrame key={widget.id} widget={widget} focused={focusing && focused === widget.id} hidden={focusing && focused !== widget.id} viewport={viewport} order={order} onFocus={focus} onRaise={raise} onGeometry={changeGeometry} onRemove={onRemove} onParams={onParams} onType={onType} onTicker={onTicker} renderExtra={renderExtra} />
+        ))}
       </div>
     </div>
   );

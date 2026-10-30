@@ -3,7 +3,8 @@
     "dompurify": "^3.4.16",
     "pdfjs-dist": "^6.4.299",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-rnd": "^10.5.3"
   },
   "devDependencies": {
     "@tailwindcss/vite": "4.3.3",

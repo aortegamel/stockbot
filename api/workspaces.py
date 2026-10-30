@@ -1,18 +1,17 @@
-"""Per-ticker workspaces stored as data/workspaces/<SYM>.json, plus server-backed widget data.
+"""Named workspaces stored separately in data/named-workspaces/<uuid>.json.
 
-- GET /api/workspaces/<sym> — {sym, widgets, updated_at}; never saved is widgets [] and updated_at null.
-- PUT /api/workspaces/<sym> — {widgets: [{id, type, ticker, params?}]} (max 24); unknown keys are 400.
-  price-volume params allow only known interval/style/studies. tv-link params are exactly
-  {url: https tradingview.com link ≤300 chars, label: 1-60 chars}. A violation is 400.
+- GET /api/workspaces — all saved named documents. Invalid saved files return an error.
+- PUT /api/workspaces/<uuid> — explicit save of {name, widgets}, with bounded pixel geometry.
+  Chart and TradingView parameters retain strict validation.
 - GET /api/widget-data?type=&sym= — short-interest | short-volume | insider | multiples rows.
   Best-effort: source failures come back as an "error" string, never a 500.
 """
 
-import json
 import math
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Self, cast
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -66,6 +65,15 @@ def _tv_link_params(params: dict[str, object]) -> None:
         raise ValueError("tv-link url must be an https tradingview.com link")
 
 
+class Geometry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    x: int = Field(strict=True, ge=0, le=20000)
+    y: int = Field(strict=True, ge=0, le=20000)
+    width: int = Field(strict=True, ge=280, le=4000)
+    height: int = Field(strict=True, ge=180, le=4000)
+
+
 class Widget(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -73,14 +81,23 @@ class Widget(BaseModel):
     type: str
     ticker: str
     params: dict[str, object] = Field(default_factory=dict)
+    geometry: Geometry
+
+    @field_validator("id")
+    @classmethod
+    def _valid_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("widget id must not be blank")
+        return value
 
     @field_validator("type")
     @classmethod
     def _known_type(cls, value: str) -> str:
         from app.tools import WIDGET_TYPES
 
-        if value not in WIDGET_TYPES:
-            raise ValueError(f"must be one of {', '.join(WIDGET_TYPES)}")
+        types = (*WIDGET_TYPES, "watchlist", "portfolio", "agent", "theses", "alerts", "sessions", "journal")
+        if value not in types:
+            raise ValueError(f"must be one of {', '.join(types)}")
         return value
 
     @field_validator("ticker", mode="before")
@@ -101,7 +118,38 @@ _PARAM_CHECKS = {"price-volume": _chart_params, "tv-link": _tv_link_params}
 class Workspace(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    name: str
     widgets: list[Widget] = Field(max_length=24)
+
+    @field_validator("name")
+    @classmethod
+    def _valid_name(cls, value: str) -> str:
+        value = value.strip()
+        if not 1 <= len(value) <= 60:
+            raise ValueError("name must contain 1-60 characters")
+        return value
+
+    @model_validator(mode="after")
+    def _unique_widgets(self) -> Self:
+        if len({widget.id for widget in self.widgets}) != len(self.widgets):
+            raise ValueError("widget ids must be unique")
+        return self
+
+
+def _workspace_id(value: str) -> str:
+    if str(UUID(value)) != value:
+        raise ValueError("workspace id must be a canonical lowercase UUID")
+    return value
+
+
+class WorkspaceDoc(Workspace):
+    id: str
+    updated_at: str | None
+
+    @field_validator("id")
+    @classmethod
+    def _valid_workspace_id(cls, value: str) -> str:
+        return _workspace_id(value)
 
 
 def _sym(raw: str, what: str) -> str:
@@ -111,30 +159,39 @@ def _sym(raw: str, what: str) -> str:
         raise HTTPException(400, f"invalid {what}: {exc}") from exc
 
 
-@router.get("/api/workspaces/{sym:path}")
-def get_workspace(sym: str) -> dict[str, object]:
-    ticker = _sym(sym, "workspace")
-    path = get_data_root() / "workspaces" / f"{ticker}.json"
-    if not path.is_file():
-        return {"sym": ticker, "widgets": [], "updated_at": None}
-    stored: dict[str, object] = json.loads(path.read_text(encoding="utf-8"))
-    return stored
+@router.get("/api/workspaces")
+def list_workspaces() -> dict[str, object]:
+    workspaces: list[dict[str, object]] = []
+    for path in sorted((get_data_root() / "named-workspaces").glob("*.json")):
+        try:
+            document = WorkspaceDoc.model_validate_json(path.read_text(encoding="utf-8"))
+            if path.stem != document.id:
+                raise ValueError("workspace id does not match its filename")
+        except (OSError, ValueError) as exc:
+            raise HTTPException(500, f"invalid saved workspace {path.name}: {exc}") from exc
+        workspaces.append(document.model_dump(exclude_unset=True))
+    return {"workspaces": workspaces}
 
 
-@router.put("/api/workspaces/{sym:path}")
-def put_workspace(sym: str, payload: Annotated[object, Body()] = None) -> dict[str, object]:
-    ticker = _sym(sym, "workspace")
+@router.put("/api/workspaces/{id:path}")
+def put_workspace(id: str, payload: Annotated[object, Body()] = None) -> dict[str, object]:
     try:
+        _workspace_id(id)
         workspace = Workspace.model_validate(payload)
-    except ValidationError as exc:
-        detail = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
+    except ValueError as exc:
+        detail = (
+            "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
+            if isinstance(exc, ValidationError)
+            else str(exc)
+        )
         raise HTTPException(400, f"invalid workspace: {detail}") from exc
     body: dict[str, object] = {
-        "sym": ticker,
+        "id": id,
+        "name": workspace.name,
         "widgets": [w.model_dump(exclude_unset=True) for w in workspace.widgets],
         "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
-    atomic_write_json(f"workspaces/{ticker}.json", cast("dict[str, JSONValue]", body), get_data_root())
+    atomic_write_json(f"named-workspaces/{id}.json", cast("dict[str, JSONValue]", body), get_data_root())
     return body
 
 

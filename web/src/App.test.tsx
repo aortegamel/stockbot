@@ -60,6 +60,7 @@ function serve(extra: Handler = () => undefined): { urls: string[]; bodies: stri
     if (url.includes("/api/research/sessions")) return Promise.resolve(json({ sessions: [] }));
     if (url.includes("/api/theses")) return Promise.resolve(json([]));
     if (url.includes("/api/portfolio")) return Promise.resolve(new Response(null, { status: 404 }));
+    if (url === "/api/workspaces") return Promise.resolve(json({ workspaces: [] }));
     return Promise.reject(new Error(`unexpected request: ${url}`));
   }) as unknown as typeof fetch;
   return { urls, bodies };
@@ -202,10 +203,21 @@ function text(root: HTMLElement): string {
   return root.textContent ?? "";
 }
 
+async function addPanel(root: HTMLElement, type: string) {
+  await act(async () => {
+    const select = find<HTMLSelectElement>(root, 'select[aria-label="Add widget"]');
+    select.value = type;
+    select.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+  });
+  await settle();
+}
+
 describe("App terminal shell", () => {
   test("renders the watchlist, strip, and backend state on load", async () => {
     serve();
     const root = await mount(<App />);
+    await addPanel(root, "sessions");
+    await addPanel(root, "journal");
     await until(() => text(root).includes("no research sessions yet"));
     expect(text(root)).toContain("NEEDLE TERMINAL");
     expect(text(root)).toContain("WATCHLIST · DELAYED");
@@ -235,6 +247,7 @@ describe("App terminal shell", () => {
   test("reports an empty session list when the sessions request fails", async () => {
     serve((url) => (url.includes("/api/research/sessions") ? json({ error: "db locked" }, 500) : undefined));
     const root = await mount(<App />);
+    await addPanel(root, "sessions");
     await until(() => text(root).includes("no research sessions yet"));
   });
 
@@ -430,8 +443,9 @@ describe("App agent send", () => {
     const selected = ticker.trim().toUpperCase();
     await until(() => root.querySelector("footer")?.lastElementChild?.textContent === selected);
     expect(text(root)).toContain(`AGENT · viewing ${selected}`);
-    expect(text(root)).toContain(`Financials · ${selected}`);
-    expect(text(root)).toContain(`News · ${selected}`);
+    expect(root.querySelector('iframe[title="NVDA TradingView chart"]')).not.toBeNull();
+    expect(text(root)).toContain("Financials · NVDA");
+    expect(text(root)).toContain("News · NVDA");
     expect(root.querySelector(`[role="region"][aria-label="${selected} price chart"]`)).not.toBeNull();
     const chart = find<HTMLIFrameElement>(root, `iframe[title="${selected} TradingView chart"]`);
     expect(text(root)).toContain("The comparison continues.");
@@ -648,6 +662,8 @@ describe("App research session polling", () => {
       });
       await until(() => text(root).includes("NVDA100DELAYEDSEC none"));
       await settle();
+      await addPanel(root, "sessions");
+      await addPanel(root, "journal");
       await click(button(root, "nvda researchrunning"));
       await settle();
       expect(text(root)).toContain("jobs 2 · open 1 · running");
@@ -704,6 +720,8 @@ describe("App research session polling", () => {
       });
       await until(() => text(root).includes("NVDA100DELAYEDSEC none"));
       await settle();
+      await addPanel(root, "sessions");
+      await addPanel(root, "journal");
       await click(button(root, "s-9done"));
       await settle();
       expect(text(root)).toContain("unnamed");
@@ -742,6 +760,8 @@ describe("App research session polling", () => {
       return undefined;
     });
     const root = await mount(<App />);
+    await addPanel(root, "sessions");
+    await addPanel(root, "journal");
     await until(() => findButton(root, "s-1running") !== null);
     selected = true;
     await click(button(root, "s-1running"));
@@ -753,6 +773,39 @@ describe("App research session polling", () => {
 });
 
 describe("App view switch", () => {
+  test("retains drafts and an in-flight Save across page changes", async () => {
+    const { promise, resolve } = Promise.withResolvers<Response>();
+    let saved: object = {};
+    let writes = 0;
+    serve((url, init) => {
+      if (url.includes("/api/health")) return json({ debug: true });
+      if (url.startsWith("/api/workspaces/") && init?.method === "PUT") {
+        writes += 1;
+        saved = { id: url.split("/").at(-1), ...JSON.parse(String(init.body)), updated_at: "2026-10-29T12:00:00Z" };
+        return promise;
+      }
+      return undefined;
+    });
+    const root = await mount(<App />);
+    await type(find<HTMLInputElement>(root, 'input[aria-label="Workspace name"]'), "Draft research");
+    await click(button(root, "Save"));
+    await click(findLink(root, "Harness")!);
+    await until(() => text(root).includes("No trace persisted for this session"));
+    const warning = new dom.window.Event("beforeunload", { cancelable: true });
+    dom.window.dispatchEvent(warning);
+    expect(warning.defaultPrevented).toBe(true);
+    await click(findLink(root, "Workspaces")!);
+    await until(() => text(root).includes("WATCHLIST · DELAYED"));
+    expect(find<HTMLInputElement>(root, 'input[aria-label="Workspace name"]').value).toBe("Draft research");
+    expect(button(root, "Saving…").disabled).toBe(true);
+    expect(writes).toBe(1);
+    await act(async () => resolve(json(saved)));
+    await until(() => findButton(root, "Save") !== null);
+    const clean = new dom.window.Event("beforeunload", { cancelable: true });
+    dom.window.dispatchEvent(clean);
+    expect(clean.defaultPrevented).toBe(false);
+  });
+
   test("nav links switch pages and the Harness link shows only in debug", async () => {
     serve((url) => (url.includes("/api/health") ? json({ debug: true }) : undefined));
     const root = await mount(<App />);
