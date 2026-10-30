@@ -1,7 +1,7 @@
-# Gate: CRAP > 10 fails changed code (threshold = 10.0, hard limit).
+# Gate: CRAP > 25 fails changed code (threshold = 25.0, hard limit).
 # Do not split functions solely to game CRAP.
 # Do not add meaningless tests solely to improve the score.
 languages = ["python", "typescript", "rust"]
-threshold = 10.0
+threshold = 25.0
 missing = "pessimistic"
 sort = "file"

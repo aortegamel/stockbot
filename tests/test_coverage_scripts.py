@@ -145,7 +145,7 @@ def test_typescript_coverage_produces_three_distinct_root_relative_reports(types
         assert "stale" not in raw
     calls = [json.loads(line) for line in (typescript_root / "calls.jsonl").read_text().splitlines()]
     assert [workspace for workspace, _ in calls] == [".", "needle-harness", "web"]
-    assert calls[0][1][:2] == ["test", "decision/"]
+    assert calls[0][1][:2] == ["test", "./decision/"]
     for _, args in calls[1:]:
         assert args[:3] == ["test", "--coverage", "--coverage-reporter=lcov"]
 
