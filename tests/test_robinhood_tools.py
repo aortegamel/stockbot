@@ -80,6 +80,14 @@ def test_market_snapshot_uses_compact_observed_fields(monkeypatch: pytest.Monkey
     assert f"(local {expected_local})" in rendered
 
 
+def test_equity_quote_prices_batch_one_call_for_all_tickers(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeRobinhood()
+    monkeypatch.setattr(tools, "_robinhood_client", _client_for(fake))
+    prices = tools.get_equity_quote_prices(["wing", "MISSING"])
+    assert prices == {"WING": 116.84}
+    assert fake.calls == [("get_equity_quotes", {"symbols": ["WING", "MISSING"]})]
+
+
 def test_option_chain_is_normalized_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeRobinhood()
     monkeypatch.setattr(tools, "_robinhood_client", _client_for(fake))

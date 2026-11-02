@@ -83,44 +83,33 @@ function expectScrollable(root: HTMLElement): void {
 }
 
 describe("WatchlistChatPanel", () => {
-  test("applies add/remove once, preserves the chart, and reports the actual list", async () => {
+  test("uses the server list and reflects edits without selecting the chart", async () => {
     globalThis.fetch = (async (input: RequestInfo | URL) => String(input).startsWith("/api/watchlist")
       ? Response.json({ watchlist: [] }) : Response.json({ price: null })) as unknown as typeof fetch;
-    let actual: string[] = [];
-    const onChange = (symbols: string[]) => { actual = symbols; };
     const onSelect = () => { throw new Error("A watchlist update must not select the chart."); };
-    const add: AgentEvent = { type: "watchlist_update", action: "add", ticker: "AMD" };
-    const remove: AgentEvent = { type: "watchlist_update", action: "remove", ticker: "AAPL" };
-    const root = await mount(<WatchlistChatPanel selected="NVDA" onSelect={onSelect} events={[add, remove]} onChange={onChange} />);
-    await until(() => actual.includes("AMD") && !actual.includes("AAPL"));
-    expect(root.querySelectorAll("b").length).toBe(9);
+    const root = await mount(<WatchlistChatPanel selected="NVDA" onSelect={onSelect} symbols={["AAPL", "AMD"]} />);
+    expect([...root.querySelectorAll("button b")].map((el) => el.textContent)).toEqual(["NVDA", "AAPL", "AMD"]);
     expect(root.textContent).toContain("A dash means unavailable");
-    const removeAmd: AgentEvent = { type: "watchlist_update", action: "remove", ticker: "AMD" };
-    await rerender(<WatchlistChatPanel selected="NVDA" onSelect={onSelect} events={[add, remove, removeAmd]} onChange={onChange} />);
-    await until(() => !actual.includes("AMD"));
-    await rerender(<WatchlistChatPanel selected="NVDA" onSelect={onSelect} events={[add]} onChange={onChange} />);
-    expect(actual).not.toContain("AMD");
-    await rerender(<WatchlistChatPanel selected="ORCL" onSelect={onSelect} events={[]} onChange={onChange} />);
-    await until(() => actual[0] === "ORCL");
-    expect(actual).not.toContain("AAPL");
+    await rerender(<WatchlistChatPanel selected="NVDA" onSelect={onSelect} symbols={["AMD"]} />);
+    expect([...root.querySelectorAll("button b")].map((el) => el.textContent)).toEqual(["NVDA", "AMD"]);
+    await rerender(<WatchlistChatPanel selected="ORCL" onSelect={onSelect} symbols={["AMD"]} />);
+    expect([...root.querySelectorAll("button b")].map((el) => el.textContent)).toEqual(["ORCL", "AMD"]);
   });
 
-  test("seeds from the app-wide watchlist and still adds the open ticker", async () => {
+  test("keeps the selected symbol visible with an empty saved list", async () => {
     globalThis.fetch = (async (input: RequestInfo | URL) => String(input).startsWith("/api/watchlist")
       ? Response.json({ watchlist: [] }) : Response.json({ price: null })) as unknown as typeof fetch;
-    let actual: string[] = [];
-    await mount(<WatchlistChatPanel selected="NVDA" onSelect={() => { }} events={[]} onChange={(symbols) => { actual = symbols; }} symbols={["GME", "AMC"]} />);
-    await until(() => actual[0] === "NVDA");
-    expect(actual).toEqual(["NVDA", "GME", "AMC"]);
+    const root = await mount(<WatchlistChatPanel selected="NVDA" onSelect={() => { }} symbols={[]} />);
+    expect([...root.querySelectorAll("button b")].map((el) => el.textContent)).toEqual(["NVDA"]);
   });
 });
 
 describe("WatchlistPanel", () => {
-  test("keeps default order, adds only an extra selection, and renders quote and source outcomes", async () => {
+  test("keeps saved order, adds only an extra selection, and renders quote and source outcomes", async () => {
     const defaults = ["NVDA", "AAPL", "MSFT", "TSLA", "SPY", "QQQ", "AMZN", "META", "GOOG"];
-    expect(watchlistFor("")).toEqual(defaults);
-    expect(watchlistFor("AAPL")).toEqual(defaults);
-    expect(watchlistFor("BRK/B")).toEqual(["BRK/B", ...defaults]);
+    expect(watchlistFor("", defaults)).toEqual(defaults);
+    expect(watchlistFor("AAPL", defaults)).toEqual(defaults);
+    expect(watchlistFor("BRK/B", defaults)).toEqual(["BRK/B", ...defaults]);
     const requests: string[] = [];
     const signals: AbortSignal[] = [];
     const sources = [
@@ -140,7 +129,7 @@ describe("WatchlistPanel", () => {
       return Response.json({ sym, price: sym === "AAPL" ? "123" : 1234.567 });
     }) as unknown as typeof fetch;
     const selected: string[] = [];
-    const root = await mount(<WatchlistPanel selected="BRK/B" onSelect={(sym) => selected.push(sym)} />);
+    const root = await mount(<WatchlistPanel selected="BRK/B" onSelect={(sym) => selected.push(sym)} symbols={defaults} />);
     await until(() => root.querySelector('[aria-label="BRK/B sources"]')?.textContent?.includes("THR timeout") ?? false);
     const buttons = [...root.querySelectorAll("button")];
     expect(buttons.map((button) => button.querySelector("b")?.textContent)).toEqual(["BRK/B", ...defaults]);
@@ -183,7 +172,7 @@ describe("WatchlistPanel", () => {
     await until(() => root.querySelector('[role="alert"]') !== null);
     expect(root.textContent).toContain("We could not load this data.");
     expect(root.textContent).not.toContain("source service offline");
-    expect(root.querySelectorAll("button b")).toHaveLength(9);
+    expect(root.querySelectorAll("button b")).toHaveLength(1);
     expect(root.querySelector("button b")?.parentElement?.textContent).toContain("—");
     expect(root.firstElementChild?.firstElementChild?.getAttribute("style")).toContain("font-size: var(--fs-label)");
     const retry = root.querySelector('[role="alert"] button');
@@ -192,7 +181,7 @@ describe("WatchlistPanel", () => {
     await until(() => root.querySelector('[aria-label="NVDA sources"]')?.textContent === "SEC ok ");
     expect(root.querySelector('[role="alert"]')).toBeNull();
     expect(sourceCalls).toBe(2);
-    expect(quoteCalls).toBe(9);
+    expect(quoteCalls).toBe(1);
     expect(sourceSignals[0]?.aborted).toBe(true);
   });
 
@@ -202,7 +191,7 @@ describe("WatchlistPanel", () => {
     const oldSignals: AbortSignal[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input), "https://example.com");
-      const obsolete = url.searchParams.get("sym") === "OLD" || url.searchParams.get("symbols")?.startsWith("OLD,");
+      const obsolete = url.searchParams.get("sym") === "OLD" || url.searchParams.get("symbols") === "OLD";
       if (obsolete) {
         if (init?.signal) oldSignals.push(init.signal);
         return url.pathname === "/api/watchlist" ? oldSources.promise : oldQuote.promise;

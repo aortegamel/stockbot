@@ -1,4 +1,5 @@
-export type QuoteState = { price: number | null; retrieved_at?: string; error?: string };
+export type Freshness = { as_of?: string | null; stale?: boolean };
+export type QuoteState = Freshness & { price: number | null; retrieved_at?: string; error?: string };
 
 export type NewsItem = { title: string; link: string; published: string; source: string };
 
@@ -30,19 +31,23 @@ async function getJSON<T>(path: string, signal?: AbortSignal): Promise<T> {
   return (await res.json()) as T;
 }
 
+// Quote reads hit the local store, which the collector refreshes every 5 s (Robinhood) or 60 s (Yahoo).
+// Polling at the fastest source interval shows each new price within one tick.
+export const QUOTE_POLL_MS = 5_000;
+
 export function fetchQuote(sym: string, signal?: AbortSignal) {
   return getJSON<QuoteState & { sym: string }>(`/api/quote?sym=${encodeURIComponent(sym)}`, signal);
 }
 
 export function fetchNews(sym: string, signal?: AbortSignal) {
-  return getJSON<{ sym: string; items: NewsItem[]; error?: string }>(
+  return getJSON<Freshness & { sym: string; items: NewsItem[]; error?: string }>(
     `/api/news?sym=${encodeURIComponent(sym)}`,
     signal,
   );
 }
 
 export function fetchFilings(sym: string, signal?: AbortSignal) {
-  return getJSON<{ sym: string; cik: number | null; items: FilingItem[]; error?: string }>(
+  return getJSON<Freshness & { sym: string; cik: number | null; items: FilingItem[]; error?: string }>(
     `/api/filings?sym=${encodeURIComponent(sym)}`,
     signal,
   );
@@ -50,6 +55,38 @@ export function fetchFilings(sym: string, signal?: AbortSignal) {
 
 export function searchTickers(q: string, signal?: AbortSignal) {
   return getJSON<{ query: string; hits: SearchHit[] }>(`/api/search?q=${encodeURIComponent(q)}`, signal);
+}
+
+export type MarketStatus = { running: boolean; last_cycle_at: number | null; oldest_as_of: number | null };
+
+export function fetchMarketWatchlist(signal?: AbortSignal) {
+  return getJSON<{ symbols: string[] }>("/api/market/watchlist", signal);
+}
+
+export async function saveMarketWatchlist(symbols: string[]) {
+  const base = (import.meta.env.VITE_API_URL as string | undefined) ?? API;
+  const res = await fetch(`${base}/api/market/watchlist`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ symbols }),
+  });
+  if (!res.ok) throw new Error(`request failed: ${res.status}`);
+  return (await res.json()) as { symbols: string[] };
+}
+
+export function fetchMarketStatus(signal?: AbortSignal) {
+  return getJSON<MarketStatus>("/api/market/status", signal);
+}
+
+export async function refreshMarket() {
+  const base = (import.meta.env.VITE_API_URL as string | undefined) ?? API;
+  // The LAN CSRF guard (web/lan-token.ts) rejects non-JSON state-changing /api requests.
+  const res = await fetch(`${base}/api/market/refresh`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  if (!res.ok) throw new Error(`request failed: ${res.status}`);
 }
 
 // Page-load fan-out for the whole watchlist: SEC filings + three FINRA datasets per symbol.
@@ -189,7 +226,7 @@ export type Candle = { t: number; open: number; high: number; low: number; close
 
 export function fetchCandles(sym: string, range: string, interval: string, signal?: AbortSignal) {
   const q = `sym=${encodeURIComponent(sym)}&range=${encodeURIComponent(range)}&interval=${encodeURIComponent(interval)}`;
-  return getJSON<{ candles?: Candle[]; error?: string }>(`/api/candles?${q}`, signal);
+  return getJSON<Freshness & { candles?: Candle[]; error?: string }>(`/api/candles?${q}`, signal);
 }
 
 // Mirrors Workspace.widgets max_length in api/workspaces.py; the server rejects a save above it.

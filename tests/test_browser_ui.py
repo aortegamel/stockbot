@@ -177,6 +177,7 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
     watch: Queue[str] = Queue()
     unknown: Queue[str] = Queue()
     source_reads: Queue[str] = Queue()
+    market_watchlist = WATCH_DEFAULTS.copy()
     existing_id = "a16ec102-2e68-49fb-b818-e9671a3d2474"
     workspaces: dict[str, dict[str, object]] = {
         existing_id: {
@@ -218,6 +219,12 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
             sym = query.get("sym", ["NVDA"])[0]
             bodies: dict[str, object] = {
                 "/api/health": {"debug": False},
+                "/api/market/watchlist": {"symbols": market_watchlist},
+                "/api/market/status": {
+                    "running": False,
+                    "last_cycle_at": 1793350000,
+                    "oldest_as_of": 1793350000,
+                },
                 "/api/research/sessions": {"sessions": []},
                 "/api/workspaces": {"workspaces": list(workspaces.values())},
                 "/api/search": {
@@ -372,6 +379,20 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
 
         def do_PUT(self) -> None:
             path = urlsplit(self.path).path
+            if path == "/api/market/watchlist":
+                assert self.headers.get("Content-Type") == "application/json"
+                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                assert set(payload) == {"symbols"}
+                assert isinstance(payload["symbols"], list)
+                assert all(isinstance(symbol, str) for symbol in payload["symbols"])
+                market_watchlist[:] = payload["symbols"]
+                body = json.dumps({"symbols": market_watchlist}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if not path.startswith("/api/workspaces/"):
                 unknown.put(self.path)
                 self.send_error(500, "The browser test has no fixture for this route.")
@@ -414,6 +435,11 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
             self.wfile.write(body)
 
         def do_POST(self) -> None:
+            if urlsplit(self.path).path == "/api/market/refresh":
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             assert self.headers.get("Content-Type") == "application/json"
             if self.path != "/api/agent":
                 unknown.put(self.path)
@@ -922,6 +948,16 @@ def test_chat_watchlist_update_shows_amd_without_moving_chart(browser: webdriver
     send_chat(browser, local_ui, WATCHLIST_PROMPT)
     wait.until(lambda b: "AMD" in b.find_element(By.XPATH, "//div[normalize-space()='WATCHLIST · DELAYED']/..").text)
     assert browser.find_element(By.XPATH, "//button[b='AMD']")
+    wait.until(EC.text_to_be_present_in_element((By.CSS_SELECTOR, "footer > span:last-child"), "NVDA"))
+
+    # The receipt survives a reload because the UI saved it through PUT.
+    def saved(_: webdriver.Chrome) -> bool:
+        with urlopen(f"{local_ui[0]}/api/market/watchlist", timeout=5) as response:
+            return bool("AMD" in json.load(response)["symbols"])
+
+    wait.until(saved)
+    browser.refresh()
+    wait.until(EC.presence_of_element_located((By.XPATH, "//button[b='AMD']")))
     wait.until(EC.text_to_be_present_in_element((By.CSS_SELECTOR, "footer > span:last-child"), "NVDA"))
 
 

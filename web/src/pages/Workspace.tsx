@@ -129,7 +129,9 @@ function initialDraft(workspaces: WorkspaceDoc[], selected: string): WorkspaceDr
 }
 function extraPanel(s: ShellState, widget: WorkspaceWidget) {
   switch (widget.type) {
-    case "watchlist": return <WatchlistChatPanel selected={s.selected} onSelect={s.pick} events={s.events} onChange={s.onWatchlist} symbols={s.watchlist} />;
+    case "watchlist": return s.watchlistLoading
+      ? <span className="skeleton" aria-label="Loading watchlist" aria-busy="true" />
+      : <WatchlistChatPanel selected={s.selected} onSelect={s.pick} symbols={s.watchlist} />;
     case "portfolio": return <PortfolioPanel onSelectTicker={s.pick} />;
     case "agent": return s.chat;
     case "theses": return <ThesisPanel onSelectTicker={s.pick} />;

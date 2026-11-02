@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useState, type ReactNode } from "react";
+import { createContext, memo, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import {
   fetchBriefing, fetchIdentity, fetchPositioning, fetchScans, fetchSparklines,
   type MarketRow, type MarketSort, type ScanDef, type Sparkline as SparkData,
@@ -11,12 +11,15 @@ const SORTS: [MarketSort, string][] = [["chg_pct", "Chg %"], ["volume", "Volume"
 
 type Load<T> = { data?: T; error?: string; retry: () => void };
 
+export const MarketRefreshContext = createContext(0);
+
 // One request per key. A new key, a retry, or unmount aborts the previous request,
 // so a stale response never lands. attempt > 0 marks a user retry.
 export function useLoad<T>(key: string, fn: (signal: AbortSignal, attempt: number) => Promise<T>): Load<T> {
+  const refresh = useContext(MarketRefreshContext);
   const [attempt, setAttempt] = useState(0);
   const [got, setGot] = useState<{ at: string; data?: T; error?: string }>({ at: "" });
-  const at = `${key}#${attempt}`;
+  const at = `${key}#${attempt}#${refresh}`;
   useEffect(() => {
     const ctrl = new AbortController();
     fn(ctrl.signal, attempt).then(

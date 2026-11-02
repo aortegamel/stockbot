@@ -11,6 +11,7 @@ const proxy = {
   "/api/watchlist": to(api),
   "/api/research": to(api),
   "/api/health": to(api),
+  "/api/market/": to(market),
   "/api/candles": to(market),
   "/api/quote": to(market),
   "/api/search": to(market),

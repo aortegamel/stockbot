@@ -59,6 +59,7 @@
     "typescript": "^5"
   },
   "overrides": {
+    "minimatch": "11.0.4",
     "qs": "6.16.1"
   }
 }

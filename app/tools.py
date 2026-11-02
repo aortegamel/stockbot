@@ -2538,6 +2538,12 @@ def get_market_snapshot(ticker: str) -> dict[str, object]:
     }
 
 
+def get_equity_quote_prices(tickers: list[str]) -> dict[str, float]:
+    """Last prices for many tickers in one Robinhood call; tickers without a price are omitted."""
+    quotes = RobinhoodPortfolioProvider(_robinhood_client()).get_equity_quotes(tickers)
+    return {ticker: float(quote.last) for ticker, quote in quotes.items() if quote.last is not None}
+
+
 _PORTFOLIO_TOP_POSITIONS = 15
 _PORTFOLIO_TOP_LARGEST = 5
 

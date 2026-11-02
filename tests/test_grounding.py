@@ -597,3 +597,40 @@ def test_reasoner_analyze_filters_only_envelope_items() -> None:
     assert client.analyze("prompt") == {"analyses": [analysis], "evidenceRequests": [request]}
     body.update(analyses=None, evidenceRequests={})
     assert client.analyze("prompt") == {"analyses": [], "evidenceRequests": []}
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"relevant": 1},
+        {"headline": "x" * 91},
+        {"bottom_line": "word " * 31},
+        {"key_points": ["only one"]},
+        {"key_points": ["word " * 26, "fact"]},
+        {"sentiment": "positive"},
+        {"sentiment": []},
+        {"impact": "huge"},
+        {"impact": None},
+        {"watch": 123},
+        {"limits": ""},
+        {"extra": "field"},
+    ],
+)
+def test_reasoner_story_validation_rejects_malformed_fields(changes: dict[str, object]) -> None:
+    candidate = {
+        "relevant": True,
+        "headline": "Guidance rises",
+        "bottom_line": "Revenue guidance increased.",
+        "key_points": ["Revenue increased 10%.", "Guidance reached $10 billion."],
+        "watch": None,
+        "sentiment": "bullish",
+        "impact": "medium",
+        "limits": None,
+        **changes,
+    }
+
+    def post(prompt: str, model: str) -> dict[str, object]:
+        return {"output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(candidate)}]}]}
+
+    with pytest.raises(ValueError, match="^summarize_story"):
+        ReasonerClient(model="m", url="u", post=post).summarize_story("AMD", "Title", "Article")

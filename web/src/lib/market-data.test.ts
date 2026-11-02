@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  fetchCandles,
+  fetchMarketStatus,
+  fetchMarketWatchlist,
+  refreshMarket,
+  saveMarketWatchlist,
   fetchFilings,
   fetchNews,
   fetchQuote,
@@ -18,6 +23,69 @@ afterEach(() => {
 });
 
 describe("market data requests", () => {
+  test("loads and saves the server watchlist without using the Bun source route", async () => {
+    let symbols = ["GME", "AMC"];
+    const signal = new AbortController().signal;
+    const calls: RequestInit[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("/api/market/watchlist");
+      calls.push(init ?? {});
+      if (init?.method === "PUT") {
+        expect(new Headers(init.headers).get("Content-Type")).toBe("application/json");
+        symbols = JSON.parse(String(init.body)).symbols;
+      }
+      return Response.json({ symbols });
+    }) as typeof fetch;
+    expect(await fetchMarketWatchlist(signal)).toEqual({ symbols: ["GME", "AMC"] });
+    expect(calls[0]?.signal).toBe(signal);
+    expect(await saveMarketWatchlist(["AMD"])).toEqual({ symbols: ["AMD"] });
+    expect(await fetchMarketWatchlist()).toEqual({ symbols: ["AMD"] });
+    expect(await saveMarketWatchlist([])).toEqual({ symbols: [] });
+    expect(calls.filter((call) => call.method === "PUT")).toHaveLength(2);
+  });
+
+  test("reads collector timestamps and accepts an empty 202 refresh response", async () => {
+    const status = { running: true, last_cycle_at: 1793350000, oldest_as_of: 1793340000 };
+    const signal = new AbortController().signal;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/api/market/status") {
+        expect(init?.signal).toBe(signal);
+        return Response.json(status);
+      }
+      expect(String(input)).toBe("/api/market/refresh");
+      expect(init?.method).toBe("POST");
+      // lan-token.ts csrfGuard returns 403 for a state-changing /api request without a JSON content type.
+      expect(new Headers(init?.headers).get("Content-Type")).toBe("application/json");
+      return new Response(null, { status: 202 });
+    }) as typeof fetch;
+    expect(await fetchMarketStatus(signal)).toEqual(status);
+    expect(await refreshMarket()).toBeUndefined();
+  });
+
+  test("preserves stored stale data and as_of for quotes, candles, news, and filings", async () => {
+    const freshness = { stale: true, as_of: "2026-10-29T12:00:00Z" };
+    const signal = new AbortController().signal;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(init?.signal).toBe(signal);
+      return Response.json({ ...freshness, price: 10, candles: [], items: [] });
+    }) as typeof fetch;
+    for (const result of [
+      await fetchQuote("AMD", signal), await fetchNews("AMD", signal),
+      await fetchFilings("AMD", signal), await fetchCandles("AMD", "1mo", "1d", signal),
+    ]) {
+      expect(result.stale).toBe(true);
+      expect(result.as_of).toBe(freshness.as_of);
+    }
+  });
+
+  test("reports failures for watchlist reads, writes, collector status, and refresh requests", async () => {
+    globalThis.fetch = (async () => new Response(null, { status: 503 })) as unknown as typeof fetch;
+    for (const request of [
+      () => fetchMarketWatchlist(), () => saveMarketWatchlist(["AMD"]),
+      () => fetchMarketStatus(), () => refreshMarket(),
+    ]) await expect(request()).rejects.toThrow("request failed: 503");
+  });
+
   test("encodes symbols and queries, forwards cancellation, and preserves response fields", async () => {
     const signal = new AbortController().signal;
     const symbol = "BRK/B & Co";

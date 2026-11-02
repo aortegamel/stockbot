@@ -10,13 +10,17 @@ research evidence, never canonical financial records.
 from __future__ import annotations
 
 import logging
+import math
+import os
 import re
+import sqlite3
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 import requests
 
 from . import config
+from .storage import market
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +29,12 @@ EXA_HIGHLIGHT_MAX_CHARS = 600
 EXA_SEARCH_TEXT_MAX_CHARS = 12_000
 EXA_DEFAULT_LIMIT = 5
 EXA_MAX_LIMIT = 25
+# USD estimates from https://exa.ai/pricing. Search includes text and highlights.
+EXA_SEARCH_COST = 0.007
+EXA_SEARCH_CONTENT_COST = 0.002
+EXA_TEXT_PAGE_COST = 0.001
+EXA_MONTHLY_LIMIT = 9.0
+EXA_COLLECTOR_MONTHLY_LIMIT = 3.0
 _APPROVED_SEARCH_TYPES = frozenset({"auto", "fast", "deep-lite"})
 _APPROVED_CATEGORIES = frozenset({"news", "company", "publication", "financial report"})
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -186,19 +196,19 @@ def _parse_search_results(
     return evidence, max(0, len(raw_results) - len(evidence))
 
 
-def _request_search(payload: dict[str, object]) -> object:
-    """POST the payload; returns response or an error dict."""
+def _request(payload: dict[str, object], endpoint: str) -> object:
+    """Post a payload. Return an error envelope when no response arrives."""
     try:
         return _ensure_session().post(
-            f"{config.EXA_API_BASE}/search",
+            f"{config.EXA_API_BASE}/{endpoint}",
             headers={"x-api-key": config.get_exa_api_key()},
             json=payload,
             timeout=EXA_TIMEOUT_SECONDS,
         )
     except requests.Timeout:
-        return _error("Exa search timed out")
+        return _error(f"Exa {endpoint} timed out")
     except requests.RequestException:
-        return _error("Exa search unavailable")
+        return _error(f"Exa {endpoint} unavailable")
 
 
 def _response_status(response: object) -> int | None:
@@ -224,15 +234,42 @@ def _results_list(body: object) -> list[object] | None:
     return raw_results if isinstance(raw_results, list) else None
 
 
-def _extract_raw_results(response: object) -> tuple[dict[str, object] | None, list[object] | None]:
-    """Map response to (error, raw_results); error is None on success."""
+def _raw_results(response: object, what: str = "search") -> list[object] | dict[str, object]:
+    """Decoded results list, or the error envelope to return to the caller."""
     status_code = _response_status(response)
     if status_code != 200:
-        return _error(f"Exa search failed: HTTP {status_code}"), None
+        return _error(f"Exa search failed: HTTP {status_code}")
     results = _results_list(_response_body(response))
-    if results is None:
-        return _error("Exa search returned an invalid response"), None
-    return None, results
+    return results if results is not None else _error(f"Exa {what} returned an invalid response")
+
+
+def _cost_total(body: object) -> float | None:
+    """Validated dollar cost from a decoded response body, or None."""
+    cost = body.get("costDollars") if isinstance(body, dict) else None
+    total = cost.get("total") if isinstance(cost, dict) else None
+    if isinstance(total, (int, float)) and not isinstance(total, bool) and math.isfinite(total) and total >= 0:
+        return float(total)
+    return None
+
+
+def _budgeted_request(payload: dict[str, object], endpoint: str, caller: str, estimate: float) -> object:
+    """Reserve before HTTP. Keep the estimate when the response omits a valid cost."""
+    period = datetime.now(UTC).strftime("%Y-%m")
+    caps = {"exa": float(os.getenv("EXA_MONTHLY_LIMIT", str(EXA_MONTHLY_LIMIT)))}
+    if caller == "collector":
+        caps["exa:collector"] = float(os.getenv("EXA_COLLECTOR_MONTHLY_LIMIT", str(EXA_COLLECTOR_MONTHLY_LIMIT)))
+    if any(not 0 <= cap < math.inf for cap in caps.values()):
+        return _error("Exa monthly budget limits must be finite nonnegative dollars")
+    if not market.reserve(caps, period, estimate):
+        return _error("Exa monthly budget exhausted")
+    response = _request(payload, endpoint)
+    if isinstance(response, dict):
+        market.settle(caps, period, -estimate)
+        return response
+    total = _cost_total(_response_body(response))
+    if total is not None:
+        market.settle(caps, period, total - estimate)
+    return response
 
 
 def search(
@@ -245,6 +282,7 @@ def search(
     end_published_date: str | None = None,
     search_type: str = "auto",
     limit: object = EXA_DEFAULT_LIMIT,
+    caller: str = "agent",
 ) -> dict[str, object]:
     """Search the web via Exa, returning bounded highlight-based evidence.
 
@@ -269,12 +307,17 @@ def search(
         normalized_limit,
     )
     retrieved_at = datetime.now(UTC).isoformat()
-    response = _request_search(payload)
+    try:
+        response = _budgeted_request(
+            payload, "search", caller, EXA_SEARCH_COST + EXA_SEARCH_CONTENT_COST * normalized_limit
+        )
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        return _error(f"Exa budget unavailable: {exc}")
     if isinstance(response, dict):
         return response
-    raw_error, raw_results = _extract_raw_results(response)
-    if raw_error or raw_results is None:
-        return raw_error or _error("Exa search returned an invalid response")
+    raw_results = _raw_results(response)
+    if isinstance(raw_results, dict):
+        return raw_results
     evidence, omitted_count = _parse_search_results(raw_results, category, retrieved_at)
     return {
         "result_type": "web_search",
@@ -286,3 +329,32 @@ def search(
         "source": "exa",
         "retrieved_at": retrieved_at,
     }
+
+
+def is_http_url(url: object) -> bool:
+    """Accept absolute HTTP(S) URLs for article requests and links."""
+    if not isinstance(url, str):
+        return False
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def contents(urls: list[str], *, caller: str) -> dict[str, object]:
+    """Fetch bounded article text through the same monthly dollar ledger."""
+    if _search_unavailable():
+        return _error("Exa contents unavailable")
+    if not isinstance(urls, list) or not urls or any(not is_http_url(url) for url in urls):
+        return _error("Exa contents requires nonempty HTTP(S) URLs")
+    payload: dict[str, object] = {"urls": urls, "text": {"maxCharacters": EXA_SEARCH_TEXT_MAX_CHARS}}
+    try:
+        response = _budgeted_request(payload, "contents", caller, EXA_TEXT_PAGE_COST * len(urls))
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        return _error(f"Exa budget unavailable: {exc}")
+    if isinstance(response, dict):
+        return response
+    results = _raw_results(response, "contents")
+    if isinstance(results, dict):
+        return results
+    retrieved_at = datetime.now(UTC).isoformat()
+    evidence, omitted = _parse_search_results(results, None, retrieved_at)
+    return {"source": "exa", "evidence": evidence, "omitted_count": omitted, "row_count": len(evidence)}

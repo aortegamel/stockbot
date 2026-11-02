@@ -1,31 +1,8 @@
-"""Free market-data providers behind the real-data UI slice.
+"""Market providers with persistent history and store-first UI reads.
 
-Every source here is keyless:
-- Yahoo chart v8: OHLCV candles for any US ticker (delayed ~15min).
-  Reuses the analyst_client session (cookies) + cache.db TTL store —
-  no second Yahoo session, no second crumb, no in-process dict.
-- Yahoo search v1: ticker validation / search-as-you-type (same session).
-- SEC company_tickers via data_sources.SourceGateway: full ticker -> CIK
-  universe (10k+ entries) with the repo's own normalization + PIT archive.
-- News: multi-source RSS merge — Google News per-ticker search, Yahoo
-  Finance per-ticker headlines, Seeking Alpha per-ticker feed, CNBC top
-  news + MarketWatch top stories (topic-level, ticker-filtered), plus an
-  optional newsquant enrichment pass (quality_score/dedup/full-text, slow,
-  gated behind STOCKBOT_NEWSQUANT=1). Feed URLs mirror the fin-news
-  (PyPI fin-news 0.1.2) maps; all fetches use this module's own
-  ``_http_bytes`` transport — never fin-news' parser/fake-useragent stack
-  (its UA bootstrap 403s). Items merge under one cache key, newest-first.
-- SEC EDGAR Atom: per-company filings (needs CIK + contact User-Agent). Funds
-  missing from company_tickers resolve via edgartools' SEC fund registry.
-- Quote via valuation.get_live_quote: Yahoo quoteSummary with its own
-  5-minute price TTL in cache.db.
-
-All fetches are best-effort: transport failure returns a structured
-``{"error": ...}`` envelope, never raises into the request handler.
-Yahoo 429s back off (Retry-After honored, 60s negative cache) instead of
-hammering — first paint during a throttle shows "unavailable", never mocks.
-Exa stays out of this module: it remains the optional paid agent research
-path (app/exa_client.search, EXA_ENABLED + key), never the keyless UI feed.
+Yahoo throttles use the shared negative cache. Stale reads never fetch.
+Only cold reads and explicit collector refreshes fetch market data.
+Connected Robinhood quotes stay on the read path and never enter history.
 """
 
 from __future__ import annotations
@@ -44,10 +21,10 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 
 from app import cache
-from app import valuation as _valuation
 from app.analyst_client import REQUEST_TIMEOUT_SECONDS
 from app.analyst_client import _ensure_session as _yahoo_session
 from app.config import YAHOO_QUERY_BASE
+from app.storage import market
 
 if TYPE_CHECKING:
     from app.thesis.models import JSONValue
@@ -233,30 +210,93 @@ def _parse_candles(ticker: str, payload: Mapping[str, object], range_: str, inte
     }
 
 
-def get_candles(sym: str, range_: str = "6mo", interval: str = "1d") -> dict[str, object]:
-    """OHLCV bars from Yahoo chart v8; error envelope when Yahoo has no data."""
-    ticker = sym.strip().upper()
-    if not ticker:
-        return {"error": "empty symbol"}
+def _range_start(range_: str, now: float) -> float:
+    """Map a Yahoo range to its requested UTC start, independent of available bars."""
+    if range_ == "max":
+        return 0.0
+    moment = datetime.fromtimestamp(now, UTC)
+    if range_ == "ytd":
+        return moment.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+    if range_ in ("1d", "5d"):
+        return now - int(range_[:-1]) * 86400
+    import calendar
+
+    months = {"1mo": 1, "3mo": 3, "6mo": 6, "1y": 12, "2y": 24, "5y": 60, "10y": 120}
+    offset = months[range_]
+    year, month = divmod(moment.year * 12 + moment.month - 1 - offset, 12)
+    month += 1
+    return moment.replace(year=year, month=month, day=min(moment.day, calendar.monthrange(year, month)[1])).timestamp()
+
+
+def _freshness(kind: str, ticker: str, ttl: float, now: float, params: str = "") -> dict[str, object]:
+    state = market.refresh_state(kind, ticker, params) or {}
+    ok = state.get("last_ok_at")
+    failed = state.get("last_error_at")
+    recent_error = isinstance(failed, (int, float)) and (not isinstance(ok, (int, float)) or failed >= ok)
+    out: dict[str, object] = {
+        "as_of": _iso(float(ok)) if isinstance(ok, (int, float)) else None,
+        "stale": not isinstance(ok, (int, float)) or now - ok >= ttl or recent_error,
+    }
+    if recent_error:
+        out["error"] = state.get("last_error")
+    return out
+
+
+def refresh_candles(ticker: str, interval: str, range_: str, *, now: float) -> None:
+    """Fetch Yahoo bars and preserve the requested coverage after a successful write."""
+    ticker = ticker.strip().upper()
     key = f"candles:{ticker}:{range_}:{interval}"
-    hit = cache.get(key, ttl=_TTL_CANDLES)
-    if isinstance(hit, dict):
-        return hit
-    neg = _neg_hit(key)
-    if neg is not None:
-        return dict(neg, sym=ticker)
     try:
+        neg = _neg_hit(key)
+        if neg:
+            raise _Throttle(str(neg["error"]))
         qs = urllib.parse.urlencode({"range": range_, "interval": interval})
         raw = _http_bytes(f"{YAHOO_QUERY_BASE}/v8/finance/chart/{ticker}?{qs}")
         out = _parse_candles(ticker, json.loads(raw), range_, interval)
-        cache.set(key, out)
-        return out
-    except _Throttle as e:
-        logger.warning("candles throttled for %s: %s", ticker, e)
-        return _neg(key, f"candles unavailable for {ticker}: {e}")
-    except Exception as e:  # noqa: BLE001 - best-effort boundary, envelope not tracebacks
-        logger.warning("candles failed for %s: %s", ticker, e)
-        return {"error": f"candles unavailable for {ticker}: {e}"}
+        market.save_bars(ticker, interval, _bar_rows(out))
+        market.mark_ok("candles", ticker, interval, now=now, covered_from=_range_start(range_, now))
+    except Exception as exc:
+        message = str(exc) if str(exc).startswith("candles unavailable") else f"candles unavailable for {ticker}: {exc}"
+        if isinstance(exc, _Throttle):
+            _neg(key, message)
+        market.mark_error("candles", ticker, interval, now=now, error=message)
+        raise RuntimeError(message) from exc
+
+
+def _needs_backfill(state: Mapping[str, object], since: float) -> bool:
+    """Refresh only when successful coverage does not include the requested start."""
+    covered = state.get("covered_from")
+    return state.get("last_ok_at") is None or not isinstance(covered, (int, float)) or since < covered
+
+
+def get_candles(sym: str, range_: str = "6mo", interval: str = "1d", *, now: float | None = None) -> dict[str, object]:
+    """Return stored bars. Fetch only missing coverage, never expired coverage."""
+    ticker = sym.strip().upper()
+    if not ticker:
+        return {"error": "empty symbol"}
+    now = time.time() if now is None else now
+    try:
+        since = _range_start(range_, now)
+    except KeyError:
+        return {"error": f"unsupported range: {range_}"}
+    state = market.refresh_state("candles", ticker, interval) or {}
+    if _needs_backfill(state, since):
+        try:
+            refresh_candles(ticker, interval, range_, now=now)
+        except RuntimeError as exc:
+            if not market.read_bars(ticker, interval, None):
+                return {"sym": ticker, "error": str(exc)}
+    rows = market.read_bars(ticker, interval, since)
+    quote = _best_quote(ticker)
+    return {
+        "sym": ticker,
+        "range": range_,
+        "interval": interval,
+        "price": quote[0] if quote else rows[-1]["close"] if rows else None,
+        "delayed": True,
+        "candles": rows,
+        **_freshness("candles", ticker, _TTL_CANDLES, now, interval),
+    }
 
 
 def search_tickers(query: str, limit: int = 10) -> dict[str, object]:
@@ -393,13 +433,13 @@ def _mentions_ticker(title: str, ticker: str) -> bool:
     return any(re.search(rf"\b{re.escape(name)}\b", hay) for name in names)
 
 
-def _fetch_feed(url: str, source: str) -> list[dict[str, object]]:
-    """One RSS fetch -> items; transport failure yields [] (merge continues)."""
+def _fetch_feed(url: str, source: str) -> list[dict[str, object]] | None:
+    """Return feed rows, or None when transport fails."""
     try:
         return _rss_items(_http_bytes(url), source)
     except Exception as e:  # noqa: BLE001 - best-effort boundary, one feed never kills the merge
         logger.warning("news feed %s failed: %s", source, e)
-        return []
+        return None
 
 
 def _newsquant_items(ticker: str) -> list[dict[str, object]]:
@@ -455,12 +495,18 @@ def _merge_feeds(ticker: str) -> list[dict[str, object]]:
         (_MARKETWATCH_TOP_URL, "MarketWatch", True),
     ]
     merged: list[dict[str, object]] = []
+    succeeded = False
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(feeds)) as pool:
         results = pool.map(_fetch_feed, [u for u, _s, _t in feeds], [s for _u, s, _t in feeds])
         for (_url, _source, topic_level), items in zip(feeds, results):
+            if items is None:
+                continue
+            succeeded = True
             if topic_level:
                 items = [i for i in items if _mentions_ticker(str(i.get("title", "")), ticker)]
             merged.extend(items)
+    if not succeeded:
+        raise RuntimeError("all news feeds failed")
     return merged
 
 
@@ -477,35 +523,59 @@ def _dedup_by_link(items: list[dict[str, object]]) -> list[dict[str, object]]:
     return unique
 
 
-def get_news(sym: str, limit: int = 12) -> dict[str, object]:
-    """Per-ticker headlines merged newest-first: Google + Yahoo + SA + CNBC/MW + newsquant.
+def refresh_news(ticker: str, *, now: float) -> None:
+    """Merge RSS headlines and store every item, independent of the reader's limit."""
+    ticker = ticker.strip().upper()
+    try:
+        merged = _merge_feeds(ticker)
+        merged.extend(_newsquant_items(ticker))
+        unique = _dedup_by_link(merged)
+        market.save_news(
+            ticker,
+            [
+                {
+                    "title": item["title"],
+                    "url": item.get("link"),
+                    "source": item.get("source"),
+                    "published_at": _news_sort_key(item) or None,
+                }
+                for item in unique
+            ],
+            now=now,
+        )
+        market.mark_ok("news", ticker, now=now)
+    except Exception as exc:
+        market.mark_error("news", ticker, now=now, error=f"news unavailable: {exc}")
+        raise
 
-    Headline rows only (title/link/published/source): no article body is fetched
-    here, so a headline never proves a full-page read. Per-ticker heads (Google
-    search, Yahoo ?s=SYM, Seeking Alpha ticker feed) merge with ticker-filtered
-    topic tails (CNBC top news, MarketWatch top stories). Dedup by link,
-    newest-first sort, single ``news:{ticker}`` cache key. newsquant enrichment
-    appends only when STOCKBOT_NEWSQUANT=1 (else the keyless merge stands alone).
-    Exa is intentionally absent here — paid research path only (app/exa_client.search).
-    """
+
+def get_news(sym: str, limit: int = 12, *, now: float | None = None) -> dict[str, object]:
+    """Return stored headlines with their last successful collection time."""
     ticker = sym.strip().upper()
     if not ticker:
         return {"sym": "", "items": []}
-    key = f"news:{ticker}"
-    hit = cache.get(key, ttl=_TTL_NEWS)
-    if isinstance(hit, dict):
-        items = hit.get("items")
-        if isinstance(items, list):
-            return dict(hit, items=items[:limit])
-        return hit
-    merged = _merge_feeds(ticker)
-    merged.extend(_newsquant_items(ticker))
-    unique = _dedup_by_link(merged)
-    # Feed order is relevance/pub-ranked, not chronological — newest first.
-    unique.sort(key=_news_sort_key, reverse=True)
-    out: dict[str, object] = {"sym": ticker, "items": unique[:limit]}
-    cache.set(key, out)
-    return out
+    now = time.time() if now is None else now
+    state = market.refresh_state("news", ticker) or {}
+    if state.get("last_ok_at") is None:
+        try:
+            refresh_news(ticker, now=now)
+        except Exception as exc:  # noqa: BLE001 - stored data remains readable after failure
+            logger.warning("news failed for %s: %s", ticker, exc)
+    items = market.read_news(ticker, max(0, limit))
+    return {
+        "sym": ticker,
+        "items": [
+            {
+                "title": item["title"],
+                "link": item["url"],
+                "source": item["source"],
+                "published": _iso(float(stamp)) if isinstance(stamp := item["published_at"], (int, float)) else "",
+                "summary_path": item["summary_path"],
+            }
+            for item in items
+        ],
+        **_freshness("news", ticker, _TTL_NEWS, now),
+    }
 
 
 def _atom_filings(raw: bytes) -> list[dict[str, object]]:
@@ -530,53 +600,198 @@ def _atom_filings(raw: bytes) -> list[dict[str, object]]:
     return items
 
 
-def get_filings(sym: str, limit: int = 10) -> dict[str, object]:
-    """Per-company SEC filings from the EDGAR Atom feed (needs CIK lookup).
+def refresh_filings(ticker: str, *, now: float) -> None:
+    """Fetch the full SEC filing page and store its CIK with the result."""
+    ticker = ticker.strip().upper()
+    try:
+        try:
+            cik = market.get_cik(ticker)
+            if cik is None:
+                cik = cik_for_ticker(ticker)
+        except Exception as exc:
+            raise RuntimeError(f"CIK lookup failed: {exc}") from exc
+        if cik is None:
+            raise ValueError(f"no SEC CIK for {ticker}")
+        market.save_cik(ticker, cik)
+        raw = _http_bytes(
+            _SEC_ATOM_URL.format(cik=f"{cik:010d}", n=_FILINGS_PAGE),
+            headers={"Accept": "application/atom+xml"},
+        )
+        market.save_filings(ticker, cik, _atom_filings(raw))
+        market.mark_ok("filings", ticker, now=now)
+    except Exception as exc:
+        message = str(exc) if str(exc).startswith("no SEC CIK") else f"filings unavailable: {exc}"
+        market.mark_error("filings", ticker, now=now, error=message)
+        raise RuntimeError(message) from exc
 
-    Items carry ``filed`` (official SEC filing date, content ``filing-date``)
-    apart from ``updated`` (Atom ``<updated>`` verbatim, acceptance clock with
-    its own offset). One cold fetch always pulls the full 40-entry page, so a
-    small first request never truncates a later larger one.
-    """
+
+def get_filings(sym: str, limit: int = 10, *, now: float | None = None) -> dict[str, object]:
+    """Return saved SEC filings without resolving a saved ticker over the network."""
     ticker = sym.strip().upper()
-    try:
-        cik = cik_for_ticker(ticker)
-    except Exception as e:  # noqa: BLE001 - best-effort boundary
-        logger.warning("filings CIK lookup failed for %s: %s", ticker, e)
-        return {"sym": ticker, "cik": None, "items": [], "error": f"filings unavailable: CIK lookup failed: {e}"}
-    if cik is None:
-        return {"sym": ticker, "cik": None, "items": [], "error": f"no SEC CIK for {ticker}"}
-    # v2: filed/updated item schema + full-page count; pre-v2 `filings:{cik}` rows stay untouched.
-    key = f"filings:v2:{cik}"
-    hit = cache.get(key, ttl=_TTL_FILINGS)
-    if isinstance(hit, dict):
-        items = hit.get("items")
-        if isinstance(items, list):
-            return dict(hit, sym=ticker, items=items[:limit])
-        return dict(hit, sym=ticker)
-    try:
-        url = _SEC_ATOM_URL.format(cik=f"{cik:010d}", n=_FILINGS_PAGE)
-        raw = _http_bytes(url, headers={"Accept": "application/atom+xml"})
-        items: list[dict[str, object]] = _atom_filings(raw)
-        out: dict[str, object] = {"sym": ticker, "cik": cik, "items": items}
-        cache.set(key, out)
-        return dict(out, items=items[:limit])
-    except Exception as e:  # noqa: BLE001 - best-effort boundary
-        logger.warning("filings failed for %s: %s", ticker, e)
-        return {"sym": ticker, "cik": cik, "items": [], "error": f"filings unavailable: {e}"}
+    now = time.time() if now is None else now
+    state = market.refresh_state("filings", ticker) or {}
+    if state.get("last_ok_at") is None:
+        try:
+            refresh_filings(ticker, now=now)
+        except RuntimeError:
+            pass
+    cik = market.get_cik(ticker)
+    return {
+        "sym": ticker,
+        "cik": cik,
+        "items": market.read_filings(cik, max(0, limit)) if cik is not None else [],
+        **_freshness("filings", ticker, _TTL_FILINGS, now),
+    }
 
 
-def get_quote(sym: str) -> dict[str, object]:
-    """Latest quote via valuation.get_live_quote (own 5-min TTL in cache.db)."""
+# Quote polling intervals. Neither provider publishes a limit, so these sit well below observed ceilings.
+# Robinhood MCP: about 4 calls/s sustained, throttling near 8/s (measured by
+# github.com/kevin1chun/robinhood-for-agents, docs/official-mcp-tools.md). One batched get_equity_quotes
+# call covers the whole watchlist, so 5 s is 0.2 calls/s and leaves room for agent tool calls.
+# Yahoo quoteSummary: one call per symbol, about 2,000 requests/hour/IP is the commonly reported
+# ceiling. 60 s for a 9-symbol watchlist is 540/hour, leaving room for candles, news, and the agent.
+BROKER_QUOTE_INTERVAL = 5
+YAHOO_QUOTE_INTERVAL = 60
+_QUOTE_SOURCES = {"robinhood": ("broker_quote", BROKER_QUOTE_INTERVAL), "yahoo": ("quote", YAHOO_QUOTE_INTERVAL)}
+
+
+def refresh_quote(ticker: str, *, now: float) -> None:
+    """Collect the public Yahoo quote directly, bypassing valuation's 5-minute price cache."""
+    from app import analyst_client
+
+    ticker = ticker.strip().upper()
+    try:
+        quote = analyst_client.get_quote_price(ticker)
+        price = quote.get("price")
+        if not isinstance(price, (int, float)) or isinstance(price, bool):
+            raise TypeError("no price")
+        market.save_quote(ticker, float(price), _epoch(quote.get("retrieved_at")) or now)
+        market.mark_ok("quote", ticker, now=now)
+    except Exception as exc:
+        market.mark_error("quote", ticker, now=now, error=f"quote unavailable: {exc}")
+        raise
+
+
+def refresh_broker_quotes(tickers: list[str], *, now: float) -> None:
+    """Collect Robinhood quotes for many tickers in one call. Only call this when the broker is connected."""
+    from app.tools import get_equity_quote_prices
+
+    symbols = list(dict.fromkeys(t.strip().upper() for t in tickers if t.strip()))
+    try:
+        prices = get_equity_quote_prices(symbols)
+    except Exception as exc:
+        for symbol in symbols:
+            market.mark_error("broker_quote", symbol, now=now, error=f"broker quote unavailable: {exc}")
+        raise
+    for symbol in symbols:
+        if symbol in prices:
+            market.save_quote(symbol, prices[symbol], now, source="robinhood")
+            market.mark_ok("broker_quote", symbol, now=now)
+        else:
+            market.mark_error("broker_quote", symbol, now=now, error="broker quote unavailable: no price")
+
+
+def refresh_options(ticker: str, *, now: float) -> None:
+    """Snapshot both Robinhood option chains for the ticker under today's UTC date."""
+    from app.tools import get_option_chain
+
+    ticker = ticker.strip().upper()
+    try:
+        chains = {}
+        for kind in ("call", "put"):
+            chain = get_option_chain(ticker, kind, limit=30)
+            if chain.get("error"):
+                raise RuntimeError(str(chain["error"]))
+            chains[kind] = chain
+        day = datetime.fromtimestamp(now, UTC).date().isoformat()
+        market.save_snapshot("rh_options", ticker, day, chains)
+        market.mark_ok("rh_options", ticker, now=now)
+    except Exception as exc:
+        market.mark_error("rh_options", ticker, now=now, error=f"options unavailable: {exc}")
+        raise
+
+
+def _broker_connected(now: float) -> bool:
+    from app.config import broker_enabled, get_robinhood_mcp_url
+
+    if not broker_enabled():
+        return False
+    from app.robinhood.auth import DEFAULT_TOKEN_PATH, OAuthConfig, has_valid_tokens
+
+    oauth = OAuthConfig(get_robinhood_mcp_url())
+    return has_valid_tokens(oauth.server_origin, DEFAULT_TOKEN_PATH, now=datetime.fromtimestamp(now, UTC))
+
+
+def _best_quote(ticker: str) -> tuple[float, float, str] | None:
+    """(price, row_ts, source) from the source whose last successful poll is newest.
+
+    A change-only save leaves an old row while the price holds, so confirmation time (refresh_log
+    last_ok_at, else the row time) picks the winner, not the newest row.
+    """
+    best: tuple[float, float, str, float] | None = None
+    for source, (kind, _interval) in _QUOTE_SOURCES.items():
+        row = market.latest_quote(ticker, source)
+        if row is None:
+            continue
+        ok = (market.refresh_state(kind, ticker) or {}).get("last_ok_at")
+        confirmed = max(row[1], float(ok)) if isinstance(ok, (int, float)) else row[1]
+        if best is None or confirmed > best[3]:
+            best = (row[0], row[1], source, confirmed)
+    return best[:3] if best else None
+
+
+def _attempted_within(kind: str, ticker: str, interval: int, now: float) -> bool:
+    """True when this source was polled, successfully or not, within its interval."""
+    state = market.refresh_state(kind, ticker) or {}
+    attempts = [v for v in (state.get("last_ok_at"), state.get("last_error_at")) if isinstance(v, (int, float))]
+    return bool(attempts) and now - max(attempts) < interval
+
+
+def _cold_fetch_quote(ticker: str, *, connected: bool, now: float) -> None:
+    """Fill an empty store: Robinhood first when connected, then Yahoo for symbols Robinhood does not quote.
+
+    Each source is tried at most once per its interval, so 5-second UI polls of an unquotable
+    symbol (indexes, futures) never hammer a provider.
+    """
+    for source, fetch in (
+        ("robinhood", lambda: refresh_broker_quotes([ticker], now=now)),
+        ("yahoo", lambda: refresh_quote(ticker, now=now)),
+    ):
+        kind, interval = _QUOTE_SOURCES[source]
+        if (source == "robinhood" and not connected) or _attempted_within(kind, ticker, interval, now):
+            continue
+        try:
+            fetch()
+        except Exception as exc:  # noqa: BLE001 - an empty store stays readable after a failed cold fetch
+            logger.warning("quote failed for %s: %s", ticker, exc)
+        if market.latest_quote_any(ticker) is not None:
+            return
+
+
+def get_quote(sym: str, *, now: float | None = None) -> dict[str, object]:
+    """Return the latest saved quote from Robinhood or Yahoo, whichever was confirmed most recently.
+
+    Reads call a provider only when nothing is saved yet (see _cold_fetch_quote). After the first
+    read, the collector keeps the symbol fresh. stale means the chosen source missed two of its
+    polling intervals or its last poll failed.
+    """
     ticker = sym.strip().upper()
     if not ticker:
         return {"sym": "", "price": None, "retrieved_at": None}
-    try:
-        quote = _valuation.get_live_quote(ticker)
-        return {"sym": ticker, "price": quote.get("price"), "retrieved_at": quote.get("retrieved_at")}
-    except Exception as e:  # noqa: BLE001 - best-effort boundary
-        logger.warning("quote failed for %s: %s", ticker, e)
-        return {"sym": ticker, "price": None, "retrieved_at": None, "error": f"quote unavailable: {e}"}
+    now = time.time() if now is None else now
+    connected = _broker_connected(now)
+    if market.latest_quote_any(ticker) is None:
+        _cold_fetch_quote(ticker, connected=connected, now=now)
+    best = _best_quote(ticker)
+    source = best[2] if best else ("robinhood" if connected else "yahoo")
+    kind, interval = _QUOTE_SOURCES[source]
+    return {
+        "sym": ticker,
+        "price": best[0] if best else None,
+        "retrieved_at": _iso(best[1]) if best else None,
+        "source": source,
+        **_freshness(kind, ticker, 2 * interval, now),
+    }
 
 
 def _candle_window(candles: Mapping[str, object]) -> dict[str, object]:
@@ -628,7 +843,7 @@ def get_viewer_context(sym: str) -> dict[str, object]:
         "filings": filing_items,
         "cik": filings.get("cik"),
         "sources": {
-            "quote": "valuation.get_live_quote (Yahoo quoteSummary)",
+            "quote": quote.get("source", "yahoo"),
             "candles": "Yahoo chart v8, delayed",
             "news": "Google News + Yahoo Finance + Seeking Alpha + CNBC/MarketWatch RSS (newsquant when STOCKBOT_NEWSQUANT=1)",
             "filings": "SEC EDGAR Atom",
