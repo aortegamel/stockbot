@@ -59,7 +59,7 @@ Keep provider choices behind interfaces so they can change without rewriting the
 - Dense embeddings: configurable provider, initially an OpenAI embedding model.
 - Lexical retrieval: Qdrant sparse vectors/BM25 or a separate full-text index.
 - Background ingestion: a scheduler plus idempotent worker jobs.
-- Research agent loop: needle harness → kernel scheduler (`needle-harness/scripts/needle.ts` → `runKernelAgent` → `app/research/kernel_worker.py` → `app/research/scheduler.py run_node` → `app/tool_runtime.py` → canonical `app/tools.py`).
+- Research agent loop: needle harness → native tool loop (`needle-harness/scripts/needle.ts` → `runKernelAgent` → `app/research/kernel_worker.py` → `app/research/tool_runner.py` → `app/tool_runtime.py` → canonical `app/tools.py`).
 
 ### Why Qdrant plus embeddings
 

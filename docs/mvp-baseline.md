@@ -1,5 +1,9 @@
 # MVP baseline (Phase 1.4)
 
+This document records historical measurements of the retired research pipeline.
+Its rounds, persona calls, and routing behavior do not describe the current runtime.
+See [runtime.md](runtime.md) for the native research sequence and deterministic proof gates.
+
 Measured 2026-10-20 UTC, commits through `ae89fbb` (Phase 1.1 timings),
 harness `bun run stockbot` on 127.0.0.1:3000, `TIMEOUT_S=400`.
 Raw runs: `data/verify/20261020T014846Z/e2e.json`,
