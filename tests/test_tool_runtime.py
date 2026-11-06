@@ -328,25 +328,42 @@ def test_persistable_staged_result_requires_replayable_tool_and_ids(
     from app.tool_runtime import _StagedContext
 
     repo, sid, jid = _staged_session(tmp_path, monkeypatch)
-    assert rt._can_persist_staged_result("search_web", _StagedContext(sid, jid, False, None)) is False
-    assert rt._can_persist_staged_result("search_tools", _StagedContext(sid, jid, False, repo)) is False
-    assert rt._can_persist_staged_result("search_web", _StagedContext(None, jid, False, repo)) is False
-    assert rt._can_persist_staged_result("search_web", _StagedContext("", jid, False, repo)) is False
-    assert rt._can_persist_staged_result("search_web", _StagedContext(sid, None, False, repo)) is False
-    assert rt._can_persist_staged_result("search_web", _StagedContext(sid, "", False, repo)) is False
-    assert rt._can_persist_staged_result("search_web", _StagedContext(sid, jid, False, repo)) is True
+    assert rt._can_persist_staged_result("search_web", _StagedContext(sid, jid, None)) is False
+    assert rt._can_persist_staged_result("search_tools", _StagedContext(sid, jid, repo)) is False
+    assert rt._can_persist_staged_result("search_web", _StagedContext(None, jid, repo)) is False
+    assert rt._can_persist_staged_result("search_web", _StagedContext("", jid, repo)) is False
+    assert rt._can_persist_staged_result("search_web", _StagedContext(sid, None, repo)) is False
+    assert rt._can_persist_staged_result("search_web", _StagedContext(sid, "", repo)) is False
+    assert rt._can_persist_staged_result("search_web", _StagedContext(sid, jid, repo)) is True
     assert (
-        rt._persist_staged_tool_result(
-            "search_web", {"content": "x"}, _StagedContext(sid, jid, False, None), "tc-0", {}
-        )
+        rt._persist_staged_tool_result("search_web", {"content": "x"}, _StagedContext(sid, jid, None), "tc-0", {})
         is None
     )
     assert (
-        rt._persist_staged_tool_result(
-            "search_tools", {"content": "x"}, _StagedContext(sid, jid, False, repo), "tc-0", {}
-        )
+        rt._persist_staged_tool_result("search_tools", {"content": "x"}, _StagedContext(sid, jid, repo), "tc-0", {})
         is None
     )
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        "get_trend_evidence",
+        "find_alternative_signals",
+        "investigate_social_arbitrage_candidate",
+        "get_macro_context",
+        "diff_risk_factors",
+    ],
+)
+def test_replayable_set_covers_alt_macro_and_sec_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool: str
+) -> None:
+    """A successful alt/macro/diff call persists the bytes its evidence lane replays."""
+    from app.tool_runtime import _REPLAYABLE_TOOL_RESULTS, _StagedContext
+
+    repo, sid, jid = _staged_session(tmp_path, monkeypatch)
+    assert tool in _REPLAYABLE_TOOL_RESULTS
+    assert rt._can_persist_staged_result(tool, _StagedContext(sid, jid, repo)) is True
 
 
 def test_persist_staged_result_records_id_and_absorbs_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -354,7 +371,7 @@ def test_persist_staged_result_records_id_and_absorbs_failures(tmp_path: Path, m
     from app.tool_runtime import _StagedContext
 
     repo, sid, jid = _staged_session(tmp_path, monkeypatch)
-    staged = _StagedContext(sid, jid, False, repo)
+    staged = _StagedContext(sid, jid, repo)
     calls: list[tuple[object, ...]] = []
 
     def _persist(
@@ -520,13 +537,13 @@ def test_dispatch_budget_requires_both_staged_ids_then_consumes(
     from app.tool_runtime import _StagedContext
 
     repo, sid, jid = _staged_session(tmp_path, monkeypatch)
-    assert rt._consume_dispatch_budget("search_web", _StagedContext(sid, jid, False, None), {}) == (False, None)
-    assert rt._consume_dispatch_budget("search_tools", _StagedContext(sid, jid, False, repo), {}) == (False, None)
-    assert rt._consume_dispatch_budget("search_web", _StagedContext(sid, None, False, repo), {}) == (
+    assert rt._consume_dispatch_budget("search_web", _StagedContext(sid, jid, None), {}) == (False, None)
+    assert rt._consume_dispatch_budget("search_tools", _StagedContext(sid, jid, repo), {}) == (False, None)
+    assert rt._consume_dispatch_budget("search_web", _StagedContext(sid, None, repo), {}) == (
         False,
         {"error": "Active research job is required for tool 'search_web'", "error_type": "invalid_research_context"},
     )
-    assert rt._consume_dispatch_budget("search_web", _StagedContext(None, jid, False, repo), {}) == (
+    assert rt._consume_dispatch_budget("search_web", _StagedContext(None, jid, repo), {}) == (
         False,
         {
             "error": "Active research session is required for tool 'search_web'",
@@ -538,7 +555,7 @@ def test_dispatch_budget_requires_both_staged_ids_then_consumes(
         raise KeyError("no such job")
 
     monkeypatch.setattr(service, "authorize_and_consume_dispatch", _key_error)
-    assert rt._consume_dispatch_budget("search_web", _StagedContext(sid, jid, False, repo), {}) == (
+    assert rt._consume_dispatch_budget("search_web", _StagedContext(sid, jid, repo), {}) == (
         False,
         {"error": "'no such job'", "error_type": "invalid_research_context"},
     )
@@ -547,13 +564,13 @@ def test_dispatch_budget_requires_both_staged_ids_then_consumes(
         raise ValueError("tool_budget exhausted")
 
     monkeypatch.setattr(service, "authorize_and_consume_dispatch", _value_error)
-    assert rt._consume_dispatch_budget("search_web", _StagedContext(sid, jid, False, repo), {}) == (
+    assert rt._consume_dispatch_budget("search_web", _StagedContext(sid, jid, repo), {}) == (
         False,
         {"error": "tool_budget exhausted"},
     )
 
     monkeypatch.setattr(service, "authorize_and_consume_dispatch", _ignore)
-    assert rt._consume_dispatch_budget("search_web", _StagedContext(sid, jid, False, repo), {"query": "x"}) == (
+    assert rt._consume_dispatch_budget("search_web", _StagedContext(sid, jid, repo), {"query": "x"}) == (
         True,
         None,
     )

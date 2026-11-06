@@ -508,7 +508,6 @@ class _StagedContext:
 
     session_id: str | None = None
     job_id: str | None = None
-    sid_from_explicit: bool = False
     store: ResearchRepository | None = None
 
 
@@ -678,9 +677,7 @@ def _resolve_staged_context(
         from app.research.repository import ResearchRepository as _RR
 
         store = _RR(data_root=_override_context(data_root, as_of).data_root)
-    return _StagedContext(
-        session_id=resolved_sid, job_id=resolved_jid, sid_from_explicit=explicit_sid is not None, store=store
-    )
+    return _StagedContext(session_id=resolved_sid, job_id=resolved_jid, store=store)
 
 
 def _check_staged_session(name: str, staged: _StagedContext) -> dict[str, object] | None:
@@ -692,10 +689,8 @@ def _check_staged_session(name: str, staged: _StagedContext) -> dict[str, object
     try:
         found: object | None = staged.store.get_session(sid)
     except KeyError:
-        if not staged.sid_from_explicit:
-            logger.warning("toolflow deny sid=%s tool=%s gate=stage reason=unknown-session", sid, name)
-            return {"error": f"Unknown research session '{sid}'", "error_type": "invalid_research_context"}
-        return None
+        logger.warning("toolflow deny sid=%s tool=%s gate=stage reason=unknown-session", sid, name)
+        return {"error": f"Unknown research session '{sid}'", "error_type": "invalid_research_context"}
     if name not in DISCOVERY_TOOLS:
         stage = stage_for_session(found, staged.store.list_jobs(sid))
         try:
@@ -848,6 +843,11 @@ _REPLAYABLE_TOOL_RESULTS: frozenset[str] = frozenset(
         "get_recent_ownership_filings",
         "get_material_events",
         "search_sec_filings",
+        "diff_risk_factors",
+        "get_trend_evidence",
+        "find_alternative_signals",
+        "investigate_social_arbitrage_candidate",
+        "get_macro_context",
     }
 )
 """Staged tools whose success payloads persist for kernel evidence replay."""
