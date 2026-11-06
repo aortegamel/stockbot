@@ -180,6 +180,7 @@ TOOLS: list[dict[str, object]] = [
                     },
                     "limit": {
                         "type": "integer",
+                        "default": 20,
                         "description": "Bounded lookups return at most this many candidates (default 20); exhaustive lookups return every candidate found across routes (local source cap 50) and limit only bounds the display packet.",
                     },
                 },
@@ -6675,17 +6676,27 @@ def _known_sec_form(value: object) -> bool:
     return value.endswith("/A") and not base.endswith("/A") and base in forms
 
 
+# Period words a model writes for a filing kind; each maps to its one SEC form before validation.
+_PERIOD_FORMS = {"quarterly": "10-Q", "quarterly report": "10-Q", "annual": "10-K", "annual report": "10-K"}
+
+
 def _filing_forms_arg(
     raw: object, tool: str
 ) -> tuple[str | list[str] | tuple[str, ...] | None, dict[str, object] | None]:
-    """Coerced forms or an invalid_tool_arguments error when any value is not a known SEC form."""
+    """Coerced forms or an invalid_tool_arguments error when any value is not a known SEC form.
+
+    Period words (quarterly, annual) map to 10-Q/10-K first; every other value must match exactly.
+    """
     forms = _filing_forms(raw)
     if forms is None:
         return None, None
     values = [forms] if isinstance(forms, str) else list(forms)
-    if not all(_known_sec_form(v) for v in values):
+    mapped = [_PERIOD_FORMS.get(v.strip().casefold(), v) for v in values]
+    if not all(_known_sec_form(v) for v in mapped):
         return None, _invalid_args_error(tool, f"tool '{tool}': invalid forms {raw!r}; {_FILING_FORMS_HINT}")
-    return forms, None
+    if mapped == values:
+        return forms, None
+    return (mapped[0] if isinstance(forms, str) and len(mapped) == 1 else tuple(mapped)), None
 
 
 def _search_forms_arg(raw: object, tool: str) -> tuple[tuple[str, ...] | None, dict[str, object] | None]:
@@ -7685,6 +7696,21 @@ def _unknown_tool_error(name: str) -> dict[str, object]:
         "error_type": "unknown_tool",
         "tool": name,
         "hint": "call browse_tools with no arguments, then call_tool with an exact catalog name",
+    }
+
+
+_UNKNOWN_THESIS_PREFIX = "unknown thesis: "
+
+
+def _unknown_thesis_error(name: str, exc: KeyError) -> dict[str, object] | None:
+    """The thesis repository's unknown-id KeyError as its own error; None for any other key."""
+    message = exc.args[0] if exc.args and isinstance(exc.args[0], str) else ""
+    if not message.startswith(_UNKNOWN_THESIS_PREFIX):
+        return None
+    return {
+        "error": f"Unknown thesis {message.removeprefix(_UNKNOWN_THESIS_PREFIX)} for tool '{name}'",
+        "error_type": "invalid_tool_arguments",
+        "tool": name,
     }
 
 
@@ -8774,6 +8800,9 @@ def execute_tool(
             return _invalid_args_error(name, invalid)
         return _dispatch_tool(name, arguments, model, context)
     except KeyError as e:
+        unknown_thesis = _unknown_thesis_error(name, e)
+        if unknown_thesis is not None:
+            return unknown_thesis
         return {"error": f"Missing required argument {e} for tool '{name}'"}
     except RobinhoodAuthRequired:
         logger.info("Robinhood tool '%s' not authorized; soft failure", name)

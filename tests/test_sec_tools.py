@@ -2847,6 +2847,31 @@ def test_sec_tools_reject_non_forms_before_provider(
     assert invalid_form in str(result["error"])
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (["quarterly"], ("10-Q",)),
+        (["Annual", "quarterly"], ("10-K", "10-Q")),
+        (["annual report", "10-Q"], ("10-K", "10-Q")),
+        ("quarterly report", "10-Q"),
+        (["10-Q", "8-K"], ("10-Q", "8-K")),
+    ],
+)
+def test_list_sec_filings_maps_period_words_to_forms(
+    monkeypatch: pytest.MonkeyPatch, raw: object, expected: object
+) -> None:
+    """A model's quarterly/annual reaches the provider as 10-Q/10-K; real forms pass unchanged."""
+    seen: dict[str, object] = {}
+
+    def _list(identifier: str, **kwargs: object) -> dict[str, object]:
+        seen["forms"] = kwargs["forms"]
+        return {"filings": []}
+
+    monkeypatch.setattr(tools.sec, "list_sec_filings", _list)
+    tools.execute_tool("list_sec_filings", {"identifier": "NVDA", "forms": raw}, "test", context=_research_context())
+    assert seen["forms"] == expected
+
+
 _VALID_FORMS = [
     # Stock: annual, quarterly, current, proxy, foreign.
     "10-K",
