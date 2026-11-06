@@ -67,12 +67,14 @@ _THESIS_TOOLS: frozenset[str] = frozenset(
 )
 
 # Data dispatches: everything research-capable except discovery, thesis
-# actions, and local research controls.
+# actions, and local research controls. Thesis actions are local store writes,
+# so they run in SOURCE_RESEARCH without consuming a dispatch slot.
 DISPATCH_TOOLS: frozenset[str] = frozenset(RESEARCH_TOOL_NAMES - DISCOVERY_TOOLS - CONTROL_TOOLS - _THESIS_TOOLS)
 
 STAGE_ALLOW: dict[Stage, frozenset[str]] = {
     "SOURCE_RESEARCH": DISCOVERY_TOOLS
     | DISPATCH_TOOLS
+    | _THESIS_TOOLS
     | frozenset(
         {
             "research_resume",
