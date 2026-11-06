@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { ANSWER_SECTIONS, reason } from "@/lib/muse/client";
-import { asksWatchlist, kernelRouter, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent } from "@/lib/agent/kernel";
+import { asksWatchlist, kernelRouter, outOfScopeAnswer, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent } from "@/lib/agent/kernel";
 import { describeTools, endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
-import { ASK_CONTEXT_KINDS, FINAL_PERSONAS, safeSourceUrl, sourceReferences, statusEvent, toolStatus, WIDGET_TYPES, type AgentEvent, type AskContext, type Evidence, type Timings, type ToolResult } from "@/lib/agent/types";
+import { ASK_CONTEXT_KINDS, safeSourceUrl, sourceReferences, statusEvent, toolStatus, WIDGET_TYPES, type AgentEvent, type AskContext, type Evidence, type Timings, type ToolResult } from "@/lib/agent/types";
 
 const ROOT = process.cwd().endsWith("needle-harness") ? join(process.cwd(), "..") : process.cwd();
 
@@ -27,8 +27,8 @@ function parseAskContext(v: unknown): AskContext | null | undefined {
   if (sym !== undefined && ticker === undefined) return null;
   return { kind: kind as AskContext["kind"], title, source, at, ...(url !== undefined ? { url } : {}), ...(ticker !== undefined ? { sym: ticker } : {}) };
 }
-// Default chat is one plain model call. mode "research" runs the full pipeline with the trio.
-type AgentRequest = { prompt: string; ticker: unknown; currentChartTicker: unknown; parsedWatchlist: string[] | undefined; context: AskContext | undefined; research: boolean };
+// Default chat is one plain model call. mode "research" runs the native research loop.
+type AgentRequest = { prompt: string; ticker: unknown; currentChartTicker: unknown; parsedWatchlist: string[] | undefined; context: AskContext | undefined; research: boolean; asOf: string | undefined };
 async function readAgentRequest(req: Request): Promise<Response | AgentRequest> {
   let prompt: unknown;
   let ticker: unknown;
@@ -36,8 +36,9 @@ async function readAgentRequest(req: Request): Promise<Response | AgentRequest> 
   let watchlistRaw: unknown;
   let contextRaw: unknown;
   let mode: unknown;
+  let asOf: unknown;
   try {
-    ({ prompt, ticker, currentChartTicker, watchlist: watchlistRaw, context: contextRaw, mode } = await req.json());
+    ({ prompt, ticker, currentChartTicker, watchlist: watchlistRaw, context: contextRaw, mode, asOf } = await req.json());
   } catch {
     console.error("[web] [agent-api] invalid JSON");
     return Response.json({ error: "invalid JSON" }, { status: 400 });
@@ -45,6 +46,12 @@ async function readAgentRequest(req: Request): Promise<Response | AgentRequest> 
   if (mode !== undefined && mode !== "research") {
     console.error("[web] [agent-api] invalid mode");
     return Response.json({ error: "mode must be research when set" }, { status: 400 });
+  }
+  if (asOf !== undefined && (typeof asOf !== "string"
+    || !/^(?!0000)\d{4}-\d{2}-\d{2}(?:T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)?)?$/.test(asOf)
+    || !Number.isFinite(Date.parse(asOf))
+    || new Date(`${asOf.slice(0, 10)}T00:00:00Z`).toISOString().slice(0, 10) !== asOf.slice(0, 10))) {
+    return Response.json({ error: "asOf must be an ISO-8601 date or timestamp" }, { status: 400 });
   }
   if (typeof prompt !== "string" || !prompt.trim()) {
     console.error("[web] [agent-api] prompt required");
@@ -62,7 +69,7 @@ async function readAgentRequest(req: Request): Promise<Response | AgentRequest> 
     console.error("[web] [agent-api] invalid context");
     return Response.json({ error: "context must be a feed item: kind news|filing|insider|alert, title and source (1-300 chars), at (max 40 chars), optional http(s) url and ticker sym" }, { status: 400 });
   }
-  return { prompt, ticker, currentChartTicker, parsedWatchlist, context, research: mode === "research" };
+  return { prompt, ticker, currentChartTicker, parsedWatchlist, context, research: mode === "research", asOf };
 }
 
 function publicEvent(e: AgentEvent): AgentEvent | null {
@@ -169,7 +176,7 @@ export async function POST(req: Request): Promise<Response> {
   const requestAt = performance.now();
   const input = await readAgentRequest(req);
   if (input instanceof Response) return input;
-  const { prompt, ticker, currentChartTicker: chartInput, parsedWatchlist, context, research } = input;
+  const { prompt, ticker, currentChartTicker: chartInput, parsedWatchlist, context, research, asOf } = input;
   // The feed item rides beside the verbatim prompt as labeled untrusted data. The prompt itself never changes.
   const contextField = context ? { context } : {};
   // Only a prompt that names the watchlist uses its symbols instead of the selected ticker.
@@ -265,35 +272,56 @@ export async function POST(req: Request): Promise<Response> {
       const runResearch = async (): Promise<void> => {
         let reasoningEffort: string | undefined;
         const configuredEffort = process.env.REASONING_EFFORT?.trim();
+        const maxOutputTokens = process.env.MUSE_MAX_OUTPUT_TOKENS?.trim();
+        const answerTokenBudget = process.env.MUSE_ANSWER_TOKEN_BUDGET?.trim();
+        // A bad limit is a deployment error, not a provider hiccup: it still fails the request.
+        for (const [name, raw] of [["MUSE_MAX_OUTPUT_TOKENS", maxOutputTokens], ["MUSE_ANSWER_TOKEN_BUDGET", answerTokenBudget]] as const) {
+          if (raw && (!Number.isInteger(Number(raw)) || Number(raw) < 16)) {
+            const message = `${name} must be an integer >= 16`;
+            send({ type: "failed", category: "model_error", message, code: "EFFORT_SELECTION_FAILED", stage: "effort" });
+            send({ type: "error", message, code: "EFFORT_SELECTION_FAILED", stage: "effort" });
+            return;
+          }
+        }
         if (!configuredEffort || configuredEffort === "auto") {
           const startedAt = performance.now();
           try {
-            const maxOutputTokens = process.env.MUSE_MAX_OUTPUT_TOKENS?.trim();
-            const answerTokenBudget = process.env.MUSE_ANSWER_TOKEN_BUDGET?.trim();
-            for (const [name, raw] of [["MUSE_MAX_OUTPUT_TOKENS", maxOutputTokens], ["MUSE_ANSWER_TOKEN_BUDGET", answerTokenBudget]] as const) {
-              if (raw && (!Number.isInteger(Number(raw)) || Number(raw) < 16)) throw new Error(`${name} must be an integer >= 16`);
-            }
             const selected = await kernelRouter.call({
               op: "effort", prompt, ...(!watchlist && (parsedTicker ?? currentChartTicker) ? { ticker: parsedTicker ?? currentChartTicker } : {}), ...(watchlist ? { watchlist } : {}), ...contextField, deadlineAt,
               ...(maxOutputTokens ? { maxOutputTokens: Number(maxOutputTokens) } : {}),
               ...(answerTokenBudget ? { answerTokenBudget: Number(answerTokenBudget) } : {}),
             }, { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) });
-            if (selected.error) throw new Error(selected.error);
+            if (selected.error) throw new Error(String(selected.error));
             if (typeof selected.effort !== "string" || !["low", "medium", "high", "xhigh"].includes(selected.effort)) {
               throw new Error("JEV returned an invalid reasoning effort.");
             }
             reasoningEffort = selected.effort;
             console.log(`[web] [agent-api] research reasoning_effort=${reasoningEffort}`);
           } catch (err) {
+            // Effort is tuning, not a gate: a slow or malformed selector must never end the request.
             const message = err instanceof Error ? err.message : String(err);
-            send({ type: "failed", category: "model_error", message: message.slice(0, 160), code: "EFFORT_SELECTION_FAILED", stage: "effort" });
-            send({ type: "error", message, code: "EFFORT_SELECTION_FAILED", stage: "effort" });
-            return;
+            console.warn(`[web] [agent-api] research effort default kept: ${message}`);
           } finally {
             timings.routeMs = performance.now() - startedAt;
           }
         }
-        await runKernelAgent(prompt, send, { signal: req.signal, deadlineAt, personas: [...FINAL_PERSONAS], ...tickerField, ...(currentChartTicker ? { currentChartTicker } : {}), ...(watchlist ? { watchlist } : {}), ...contextField, ...(reasoningEffort ? { reasoningEffort } : {}) });
+        // Conversational scope gate: an out-of-scope request gets the runtime's fixed answer and
+        // runs no tool. A gate outage keeps research.
+        try {
+          const verdict = await kernelRouter.call({ op: "scope", prompt, deadlineAt }, { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) });
+          if (typeof verdict.error === "string" && verdict.error) throw new Error(verdict.error);
+          const outOfScope = outOfScopeAnswer(verdict);
+          if (outOfScope !== undefined) {
+            send({ type: "agent_start", prompt });
+            send(statusEvent("Checking the request scope"));
+            send({ type: "answer_delta", text: outOfScope });
+            send({ type: "done", metrics: zeroMetrics(requestAt, 0), status: "completed_with_limitations", limitations: ["Request outside the scope of stock research."] });
+            return;
+          }
+        } catch (err) {
+          console.warn(`[web] [agent-api] research scope kept: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        await runKernelAgent(prompt, send, { signal: req.signal, deadlineAt, ...tickerField, ...(asOf !== undefined ? { asOf } : {}), ...(currentChartTicker ? { currentChartTicker } : {}), ...(watchlist ? { watchlist } : {}), ...contextField, ...(reasoningEffort ? { reasoningEffort } : {}) });
       };
       // A UI action is a receipt, never evidence. Only a validated canonical receipt emits its update event.
       // A failure answers visibly and never researches.

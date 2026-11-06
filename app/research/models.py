@@ -353,8 +353,9 @@ _TEMPORAL_LAST_QUARTER_RE = re.compile(r"\blast\s+quarter\b", re.IGNORECASE)
 _TEMPORAL_QUARTER_RE = re.compile(r"\bthis\s+quarter\b", re.IGNORECASE)
 _TEMPORAL_THIS_WEEK_RE = re.compile(r"\bthis\s+week\b", re.IGNORECASE)
 _TEMPORAL_LAST_WEEK_RE = re.compile(r"\blast\s+week\b", re.IGNORECASE)
-_TEMPORAL_LATEST_RE = re.compile(r"\blatest[\s-]*available\b", re.IGNORECASE)
-_TEMPORAL_NOW_RE = re.compile(r"\b(today|right\s+now|as\s+of\s+now|most\s+recent|current|latest)\b", re.IGNORECASE)
+# latest / most recent / current name the newest data, not a date limit: same mode as no date wording.
+_TEMPORAL_LATEST_RE = re.compile(r"\b(latest([\s-]*available)?|most\s+recent|current)\b", re.IGNORECASE)
+_TEMPORAL_NOW_RE = re.compile(r"\b(today|right\s+now|as\s+of\s+now)\b", re.IGNORECASE)
 
 
 def _temporal_day(text: str, where: str) -> str:
@@ -548,6 +549,29 @@ def validate_temporal_scope(value: object, where: str = "<dict>") -> dict[str, J
         raise ValueError(f"{where}: 'temporal_scope.raw' must be a string or null, got {type(raw).__name__}")
     out["raw"] = raw
     return out
+
+
+def request_cutoff(as_of: object, temporal_scope: object, created_at: object) -> str | None:
+    """PIT cutoff the request itself names, or None when the request names no historical date.
+
+    The session ``as_of`` wins. Otherwise a temporal_scope ``as_of`` counts only in
+    mode 'as_of' and only when it predates session creation: that date came from
+    the request. 'now'/'current'/'latest'/'most recent' wording also parses to
+    mode 'as_of', but pins the cutoff to the request moment. That cutoff excludes
+    nothing, so it never gates a current-evidence read.
+    """
+    cut = _coerce_time(as_of, "as_of", "<session>")
+    if cut is not None:
+        return cut.isoformat()
+    scope: Mapping[str, object] = temporal_scope if isinstance(temporal_scope, Mapping) else {}
+    mode = scope.get("mode")
+    if not isinstance(mode, str) or mode.strip().lower() != "as_of":
+        return None
+    scope_cut = _coerce_time(scope.get("as_of"), "temporal_scope.as_of", "<session>")
+    made = _coerce_time(created_at, "created_at", "<session>")
+    if scope_cut is None or made is None or scope_cut >= made:
+        return None
+    return scope_cut.isoformat()
 
 
 def _baseline_pit(filing: object) -> tuple[str | None, str | None]:
@@ -1278,7 +1302,6 @@ class ResearchNodeStatus(StrEnum):
 
 
 NODE_STATUS_VALUES = frozenset(e.value for e in ResearchNodeStatus)
-TOOL_DECISION_ACTIONS = frozenset({"invoke", "reason", "resolved"})
 
 
 def _opt_tuple_str(v: object, key: str, where: str) -> tuple[str, ...]:
@@ -1287,16 +1310,6 @@ def _opt_tuple_str(v: object, key: str, where: str) -> tuple[str, ...]:
     if not isinstance(v, (list, tuple)) or any(not isinstance(x, str) for x in v):
         raise ValueError(f"{where}: '{key}' must be a list of strings or null")
     return tuple(v)
-
-
-def _tool_names_from(d: Mapping[str, object], where: str) -> tuple[str, ...]:
-    """tool_names list; single-tool compat: bare tool_name implies a one-tool set on invoke."""
-    names = _opt_tuple_str(d.get("tool_names", []), "tool_names", where)
-    if not names and d.get("action") == "invoke":
-        single = d.get("tool_name")
-        if isinstance(single, str) and single:
-            return (single,)
-    return names
 
 
 def _opt_confidence(v: object, key: str, where: str) -> float | None:
@@ -1435,64 +1448,6 @@ class DecisionRecord:
             selected=validate_json_value(d.get("selected"), f"{where}: 'selected'"),
             confidence=_opt_confidence(d.get("confidence"), "confidence", where),
             created_at=_req_time(d, "created_at", where),
-        )
-        out.validate(where)
-        return out
-
-
-@dataclass(frozen=True)
-class ToolDecision:
-    """JEV tool disposition: one tool, a parallel set, reasoning escalation, or node-resolved."""
-
-    action: str
-    tool_name: str | None = None
-    tool_names: tuple[str, ...] = ()
-    probabilities: dict[str, JSONValue] = field(default_factory=dict)
-    confidence: float | None = None
-
-    def validate(self, where: str = "<tool_decision>") -> None:
-        """Raise ValueError on any contract violation."""
-        _coerce_enum(TOOL_DECISION_ACTIONS, self.action, "action", where)
-        if self.action == "invoke":
-            if not self.tool_names:
-                raise ValueError(f"{where}: 'tool_names' must be non-empty when action is 'invoke'")
-            if self.tool_name is not None and self.tool_name not in self.tool_names:
-                raise ValueError(f"{where}: 'tool_name' must be a member of 'tool_names'")
-        else:
-            if self.tool_names:
-                raise ValueError(f"{where}: 'tool_names' must be empty unless action is 'invoke'")
-            if self.tool_name is not None:
-                raise ValueError(f"{where}: 'tool_name' must be null unless action is 'invoke'")
-
-    @property
-    def selected_tools(self) -> tuple[str, ...]:
-        """Effective parallel set (tool_names; single-tool compat falls back to tool_name)."""
-        if self.tool_names:
-            return self.tool_names
-        return (self.tool_name,) if self.tool_name else ()
-
-    def to_dict(self) -> dict[str, JSONValue]:
-        """Serialize (tuples as lists)."""
-        return {
-            "action": self.action,
-            "tool_name": self.tool_name,
-            "tool_names": _json_str_list(list(self.tool_names)),
-            "probabilities": validate_json_mapping(self.probabilities, "<tool_decision>: 'probabilities'"),
-            "confidence": self.confidence,
-        }
-
-    @classmethod
-    def from_dict(cls, d: Mapping[str, object], _path: str = "<dict>") -> ToolDecision:
-        """Parse and validate; raises ValueError on malformed input."""
-        if not isinstance(d, dict):
-            raise ValueError(f"{_path}: tool decision must be a mapping, got {type(d).__name__}")  # noqa: TRY004 - public error contract pins ValueError, tests are oracle
-        where = f"{_path}: tool decision"
-        out = cls(
-            action=_coerce_enum(TOOL_DECISION_ACTIONS, d.get("action"), "action", where),
-            tool_name=_opt_str(d.get("tool_name"), "tool_name", where),
-            tool_names=_tool_names_from(d, where),
-            probabilities=validate_json_mapping(d.get("probabilities", {}), f"{where}: 'probabilities'"),
-            confidence=_opt_confidence(d.get("confidence"), "confidence", where),
         )
         out.validate(where)
         return out

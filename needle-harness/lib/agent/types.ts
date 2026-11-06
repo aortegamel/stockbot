@@ -148,12 +148,6 @@ export type FinalClaim = {
 // kept text. Nothing here is ledger proof.
 export type NarrativeResult = { prose: string; claims: FinalClaim[]; confidence?: number };
 
-export type FinalPersonaResult = NarrativeResult & { persona: Persona };
-
-// Final-answer personas in fixed output order; each runs as its own Muse call.
-export const FINAL_PERSONAS = ["stockbot", "bearbot", "bullbot"] as const;
-export type Persona = (typeof FINAL_PERSONAS)[number];
-
 // Saved workspace widget kinds in fixed order; must match WIDGET_TYPES in app/tools.py.
 // The add_widget tool accepts every kind except tv-link (it needs a user-pasted URL).
 export const WIDGET_TYPES: readonly string[] = ["price-volume", "financials", "news", "monthly-returns", "short-interest", "short-volume", "insider", "filings", "multiples", "tv-link"];
@@ -194,7 +188,7 @@ export type AgentEvent =
   | { type: "progress"; stage: string; detail?: Record<string, unknown> }
   | { type: "reasoning_start"; model: string }
   | { type: "answer_delta"; text: string }
-  // A checked partial answer: verified claims only, superseded by a later answer_delta.
+  // A checked snapshot replaces all streamed draft text.
   | { type: "answer_partial"; text: string; claims: FinalClaim[] }
   // A cancelled request ends without an answer.
   | { type: "cancelled"; message: string }
@@ -206,7 +200,7 @@ export type AgentEvent =
   | { type: "failed"; category: FailureCategory; message: string; code?: string; stage?: string }
   // A readable progress line for the user, never answer text. Build it with statusEvent.
   | { type: "status"; text: string };
-export type Timings = Partial<Record<"routeMs" | "intakeMs" | "reasonerMs" | "admitMs" | "nodesMs" | "personasMs" | "narrativeMs" | "binderMs" | "gatesMs" | "firstTextMs", number>>;
+export type Timings = Partial<Record<"routeMs" | "intakeMs" | "reasonerMs" | "admitMs" | "nodesMs" | "narrativeMs" | "binderMs" | "gatesMs" | "firstTextMs", number>>;
 export type Metrics = {
   totalMs: number;
   needle: { calls: number; totalMs: number; escalations: number };

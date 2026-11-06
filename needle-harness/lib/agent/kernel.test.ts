@@ -1,10 +1,10 @@
-import { describe, expect, jest, setSystemTime, test } from "bun:test";
+import { describe, expect, jest, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
-import { alignClaimText, applyFinalGates, asksWatchlist, datapointRows, dropUncovered, inventoryDefect, KernelRouter, parseTicker, parseWatchlist, readableNumbers, REQUEST_WALL_MS, runKernelAgent, type FinalGateCaller, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
-import { FINAL_PERSONAS, readDatapoints, type AgentEvent, type AskContext, type Datapoint, type Evidence, type FinalClaim, type Metrics, type Persona } from "./types";
+import { alignClaimText, asksWatchlist, datapointRows, dropUncovered, inventoryDefect, KernelRouter, outOfScopeAnswer, parseTicker, parseWatchlist, readableNumbers, REQUEST_WALL_MS, runKernelAgent, type KernelChild, type KernelReasonInput, type KernelReasonResult, type KernelSpawn } from "./kernel";
+import { readDatapoints, type AgentEvent, type AskContext, type Datapoint, type Evidence, type FinalClaim, type Metrics } from "./types";
 
 class FakeChild implements KernelChild {
   exitCode: number | null = null;
@@ -158,8 +158,8 @@ describe("KernelRouter", () => {
   test("two sequential calls share one spawn with distinct correlated IDs", async () => {
     const { router, children } = setup();
     try {
-      const r1 = await router.call({ op: "run" }, { timeoutMs: 1000 });
-      const r2 = await router.call({ op: "run" }, { timeoutMs: 1000 });
+      const r1 = await router.call({ op: "scope" }, { timeoutMs: 1000 });
+      const r2 = await router.call({ op: "scope" }, { timeoutMs: 1000 });
       const first = children[0];
       if (!first) throw new Error("expected one spawned child");
       expect(children.length).toBe(1);
@@ -177,11 +177,11 @@ describe("KernelRouter", () => {
   test("dead child fails over to a fresh spawn", async () => {
     const { router, children } = setup();
     try {
-      await router.call({ op: "run" }, { timeoutMs: 1000 });
+      await router.call({ op: "scope" }, { timeoutMs: 1000 });
       const first = children[0];
       if (!first) throw new Error("expected one spawned child");
       first.emitExit();
-      const r = await router.call({ op: "run" }, { timeoutMs: 1000 });
+      const r = await router.call({ op: "scope" }, { timeoutMs: 1000 });
       expect(children.length).toBe(2);
       expect(r.id).toBe("2");
       expect(markerOf(r)).toBe("res-2");
@@ -194,7 +194,7 @@ describe("KernelRouter", () => {
     const { router, children } = setup();
     try {
       const controller = new AbortController();
-      const pending = router.call({ op: "run" }, { signal: controller.signal, timeoutMs: 20 });
+      const pending = router.call({ op: "scope" }, { signal: controller.signal, timeoutMs: 20 });
       controller.abort();
       let err: unknown;
       try {
@@ -210,7 +210,7 @@ describe("KernelRouter", () => {
       if (!first) throw new Error("expected one spawned child");
       expect(first.killCalls).toBe(0);
       expect(children.length).toBe(1);
-      const r = await router.call({ op: "run" }, { timeoutMs: 1000 });
+      const r = await router.call({ op: "scope" }, { timeoutMs: 1000 });
       expect(children.length).toBe(1);
       expect(first.killCalls).toBe(0);
       expect(r.id).toBe("2");
@@ -223,8 +223,8 @@ describe("KernelRouter", () => {
     const { router, children } = setup();
     try {
       // Real 20ms timer: the timeout firing is the behavior under test, fake clocks cannot drive it.
-      const slow = router.call({ op: "run", hold: true }, { timeoutMs: 20 });
-      const fast = router.call({ op: "run", hold: true }, { timeoutMs: 1000 });
+      const slow = router.call({ op: "scope", hold: true }, { timeoutMs: 20 });
+      const fast = router.call({ op: "scope", hold: true }, { timeoutMs: 1000 });
       // Observe both upfront so the sibling rejection (old failAll bug) cannot go unhandled.
       const slowSettled = slow.then((): null => null, (e: unknown): unknown => e);
       const fastSettled = fast.then(
@@ -355,7 +355,7 @@ describe("KernelRouter", () => {
     const { router, children } = setup();
     try {
       const seen: Array<{ stage: string; detail?: Record<string, unknown> }> = [];
-      const pending = router.call({ op: "run", hold: true }, { timeoutMs: 1000, onProgress: (stage, detail) => seen.push(detail !== undefined ? { stage, detail } : { stage }) });
+      const pending = router.call({ op: "scope", hold: true }, { timeoutMs: 1000, onProgress: (stage, detail) => seen.push(detail !== undefined ? { stage, detail } : { stage }) });
       const first = children[0];
       if (!first) throw new Error("expected one spawned child");
       await Promise.resolve();
@@ -374,7 +374,7 @@ describe("KernelRouter", () => {
   test("a throwing progress listener never fails the pending call", async () => {
     const { router, children } = setup();
     try {
-      const pending = router.call({ op: "run", hold: true }, {
+      const pending = router.call({ op: "scope", hold: true }, {
         timeoutMs: 1000,
         onProgress: () => {
           throw new Error("listener down");
@@ -395,7 +395,7 @@ describe("KernelRouter", () => {
   test("bridge noise, non-object lines, and unknown ids never settle a call", async () => {
     const { router, children } = setup();
     try {
-      const pending = router.call({ op: "run", hold: true }, { timeoutMs: 1000 });
+      const pending = router.call({ op: "scope", hold: true }, { timeoutMs: 1000 });
       const first = children[0];
       if (!first) throw new Error("expected one spawned child");
       await Promise.resolve();
@@ -409,999 +409,8 @@ describe("KernelRouter", () => {
   });
 });
 
-describe("runKernelAgent final personas", () => {
-  const graphReply = (id: string): string =>
-    `${JSON.stringify({ id, objective: "q", evidence: [{ id: "ev:1", content: "fact" }], nodes: [{ node_id: "n1", question: "q", status: "blocked", depends_on: [] }], decisions: [], unresolved: ["n1"], incomplete_guard: true, toolExecutions: [], toolCalls: [], failures: {}, escalations: 1, escalated: true })}\n`;
-  // Same shape with the session id a current worker reports: the gates need it.
-  const sessionGraphReply = (id: string, unresolved: string[] = []): string =>
-    `${JSON.stringify({ id, objective: "q", sessionId: "rs:live", evidence: [{ id: "ev:1", content: "fact" }], nodes: [], decisions: [], unresolved, incomplete_guard: false, toolExecutions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false })}\n`;
-  test("seed and research evidence retain captures before the gated answer without changing model content", async () => {
-    process.env.OPENCODE_MODEL = "test-model";
-    const events: AgentEvent[] = [];
-    const firstSource = { id: `capture:${"a".repeat(64)}` };
-    const kernelSource = { id: "evidence:rs:test:ev:1" };
-    const secondSource = { id: "evidence:rs:test:ev:2" };
-    const seed: Evidence = { id: "ev:1", source: "seed", retrievedAt: "2026-01-01Z", content: "seed fact", sources: [firstSource] };
-    const seen: string[][] = [];
-    const spawnFn = (): KernelChild => {
-      const child = new FakeChild();
-      child.reply = (id) => {
-        const body = JSON.parse(child.written.at(-1) ?? "{}") as { op?: string };
-        if (body.op?.startsWith("assess_final")) return `${JSON.stringify({ id, support_answer: "yes" })}\n`;
-        return `${JSON.stringify({
-          id, sessionId: "rs:test",
-          evidence: [
-            { id: "ev:1", content: "kernel fact", sources: [kernelSource] },
-            { id: "ev:bad", content: "uncaptured", sources: [{ id: "/raw/path" }] },
-            { id: "ev:2", content: "second fact", title: "Second filing", url: "https://www.sec.gov/filing", sources: [secondSource] },
-            { id: "ev:2", content: "duplicate", sources: [] },
-          ],
-          nodes: [], decisions: [], unresolved: ["n1"], needleDecisions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false,
-        })}\n`;
-      };
-      queueMicrotask(() => child.emitStdout('{"type":"ready"}\n'));
-      return child;
-    };
-    await runKernelAgent("q", (e) => { events.push(e); }, {
-      seedEvidence: [seed],
-      personas: ["stockbot"],
-      deps: {
-        python: "py", workerPath: "w", spawnFn, reason: async (o) => {
-          seen.push(o.evidence.map((e) => e.content));
-          return { prose: "answer 1", usage: {}, claims: [{ text: "answer 1", claimType: "inference", evidenceIds: ["ev:2"] }] };
-        }
-      },
-    });
-    const delivered = events.filter((e): e is Extract<AgentEvent, { type: "evidence" }> => e.type === "evidence");
-    expect(delivered).toHaveLength(2);
-    const seedDelivered = delivered[0];
-    const researchDelivered = delivered[1];
-    if (!seedDelivered || !researchDelivered) throw new Error("expected two evidence events");
-    expect(seedDelivered.evidence[0]?.sources).toEqual([firstSource]);
-    expect(researchDelivered.sessionId).toBe("rs:test");
-    expect(researchDelivered.evidence.map((e) => e.id)).toEqual(["ev:1", "ev:bad", "ev:2"]);
-    expect(researchDelivered.evidence[0]?.content).toBe("seed fact");
-    expect(researchDelivered.evidence[0]?.sources).toEqual([firstSource, kernelSource]);
-    expect(researchDelivered.evidence[1]?.sources).toEqual([]);
-    expect(researchDelivered.evidence[2]).toMatchObject({ content: "second fact", sources: [secondSource], title: "Second filing", url: "https://www.sec.gov/filing" });
-    expect(seen).toEqual([["seed fact", "uncaptured", "second fact"]]);
-    expect(events.filter((e) => e.type === "evidence" || e.type === "answer_delta").map((e) => e.type)).toEqual(["evidence", "evidence", "answer_delta"]);
-    expect(events.flatMap((e) => e.type === "answer_delta" ? [e.text] : [])).toEqual(["── Stockbot ──\nanswer 1"]);
-  });
 
-  test("an empty research graph answers the fixed line without a model call", async () => {
-    process.env.OPENCODE_MODEL = "test-model";
-    const events: AgentEvent[] = [];
-    const spawnFn = (): KernelChild => {
-      const child = new FakeChild();
-      child.reply = (id) => `${JSON.stringify({ id, evidence: [], nodes: [], unresolved: [], toolCalls: [], needleDecisions: [] })}\n`;
-      queueMicrotask(() => child.emitStdout('{"type":"ready"}\n'));
-      return child;
-    };
-    await runKernelAgent("hello", (e) => { events.push(e); }, {
-      personas: ["stockbot"],
-      deps: {
-        python: "py", workerPath: "w", spawnFn, reason: async () => {
-          throw new Error("an empty graph must not call the reasoner");
-        },
-      }
-    });
-    expect(events.map((e) => e.type)).toEqual(["agent_start", "status", "answer_delta", "done"]);
-    expect(events.flatMap((e) => e.type === "answer_delta" ? [e.text] : [])).toEqual(["I couldn't determine this from the retrieved sources."]);
-  });
-  const emptyReply = (id: string): string =>
-    `${JSON.stringify({ id, objective: "q", evidence: [], nodes: [], decisions: [], unresolved: [], incomplete_guard: false, toolExecutions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false })}\n`;
-  type Outcome = { text?: string; claims?: FinalClaim[]; confidence?: number; usage?: KernelReasonResult["usage"]; timings?: KernelReasonResult["timings"] } | Error;
-  type Call = { pass: number; input: KernelReasonInput & { deadlineAt?: number; signal?: AbortSignal } };
-  type GateVerdict = { verdict?: string; support_answer?: string; error?: string };
-  // Drives runKernelAgent with a scripted reasoner. Stockbot settles last, so
-  // output order never follows completion order. The reasoner input carries no
-  // onDelta, so no raw draft can reach emit. Gate ops (assess_final_claim) answer
-  // inline from opts.gate (default yes); run bodies still record in order.
-  async function runFinal(opts: {
-    reply?: (id: string) => string;
-    decide?: (persona: Persona, pass: number, attempt: number, input: KernelReasonInput) => Outcome | Promise<Outcome>;
-    gate?: (body: Record<string, unknown>) => GateVerdict | Promise<GateVerdict>;
-    admit?: (body: Record<string, unknown>) => Record<string, unknown> | Promise<Record<string, unknown>>;
-    onEvent?: (event: AgentEvent, events: AgentEvent[]) => void;
-    onGate?: (body: Record<string, unknown>) => void;
-    personas?: readonly Persona[];
-    deadlineAt?: number;
-    signal?: AbortSignal;
-    ticker?: string;
-    currentChartTicker?: string;
-    watchlist?: readonly string[];
-    context?: AskContext;
-    // Injects only spawnFn+reason so the router falls back to its default python/worker path.
-    spawnOnly?: boolean;
-    // Correction-round answers; unscripted correction calls fail, so the first gated answer stands.
-    correct?: (persona: Persona, input: KernelReasonInput) => Outcome | Promise<Outcome>;
-  }): Promise<{ events: AgentEvent[]; calls: Call[]; corrections: KernelReasonInput[]; bodies: Record<string, unknown>[]; gates: Record<string, unknown>[]; maxInFlight: number; runTimeouts: (number | undefined)[]; spawns: { cmd: string; args: string[] }[] }> {
-    process.env.OPENCODE_MODEL = "test-model";
-    const bodies: Record<string, unknown>[] = [];
-    const gates: Record<string, unknown>[] = [];
-    const gateFn = opts.gate;
-    const spawns: { cmd: string; args: string[] }[] = [];
-    const spawn: KernelSpawn = (cmd, args): KernelChild => {
-      spawns.push({ cmd, args });
-      const c = new FakeChild();
-      const innerReply = opts.reply ?? graphReply;
-      c.reply = (id: string): string => innerReply(id);
-      const origWrite = c.stdin.write;
-      c.stdin.write = (data: string, cb?: (err?: Error | null) => void): void => {
-        const body: unknown = JSON.parse(data);
-        if (body && typeof body === "object" && "op" in body && body.op === "admit_datapoint") {
-          const rec = body as Record<string, unknown>;
-          bodies.push(rec);
-          void Promise.resolve(opts.admit?.(rec) ?? { error: "admission failed" }).then((result) => {
-            c.emitStdout(`${JSON.stringify({ id: rec.id, ...result })}\n`);
-          });
-          cb?.(null);
-          return;
-        }
-        if (body && typeof body === "object" && "op" in body && typeof body.op === "string" && body.op.startsWith("assess_final")) {
-          const rec = body as Record<string, unknown>;
-          gates.push(rec);
-          void Promise.resolve(gateFn?.(rec) ?? { support_answer: "yes" }).then((verdict) => {
-            c.emitStdout(`${JSON.stringify({ id: rec.id, ...verdict })}\n`);
-            opts.onGate?.(rec);
-          });
-        } else {
-          bodies.push(body as Record<string, unknown>);
-          origWrite.call(c.stdin, data, cb);
-        }
-        cb?.(null);
-      };
-      queueMicrotask(() => c.emitStdout('{"type":"ready"}\n'));
-      return c;
-    };
-    const events: AgentEvent[] = [];
-    const calls: Call[] = [];
-    const corrections: KernelReasonInput[] = [];
-    let pass = 0;
-    let inFlight = 0;
-    let maxInFlight = 0;
-    const attempts: Record<string, number> = {};
-    // Records the worker timeout of each research run; the call itself stays real.
-    const runTimeouts: (number | undefined)[] = [];
-    const realCall = KernelRouter.prototype.call;
-    KernelRouter.prototype.call = function(this: KernelRouter, body, callOpts) {
-      if (body.op === "run") runTimeouts.push(callOpts?.timeoutMs);
-      return realCall.call(this, body, callOpts);
-    };
-    try {
-      await runKernelAgent(
-        "q",
-        (e) => {
-          if (e.type === "reasoning_start") pass += 1;
-          events.push(e);
-          opts.onEvent?.(e, events);
-        },
-        {
-          ...(opts.deadlineAt !== undefined ? { deadlineAt: opts.deadlineAt } : {}),
-          // The kernel default is stockbot alone; this block drives the trio unless a test names its personas.
-          personas: opts.personas ?? FINAL_PERSONAS,
-          ...(opts.signal ? { signal: opts.signal } : {}),
-          ...(opts.ticker !== undefined ? { ticker: opts.ticker } : {}),
-          ...(opts.currentChartTicker !== undefined ? { currentChartTicker: opts.currentChartTicker } : {}),
-          ...(opts.watchlist !== undefined ? { watchlist: opts.watchlist } : {}),
-          ...(opts.context !== undefined ? { context: opts.context } : {}),
-          deps: {
-            ...(opts.spawnOnly ? {} : { python: "py", workerPath: "w" }),
-            spawnFn: spawn,
-            reason: async (o) => {
-              if (o.correction !== undefined) corrections.push(o);
-              const key = `${pass}:${o.persona}`;
-              const attempt = (attempts[key] ?? 0) + 1;
-              if (o.correction === undefined) attempts[key] = attempt;
-              if (o.correction === undefined) calls.push({ pass, input: o });
-              inFlight += 1;
-              maxInFlight = Math.max(maxInFlight, inFlight);
-              for (let i = FINAL_PERSONAS.indexOf(o.persona); i < FINAL_PERSONAS.length; i++) await Promise.resolve();
-              inFlight -= 1;
-              const d: Outcome = o.correction !== undefined
-                ? (opts.correct ? await opts.correct(o.persona, o) : new Error("no correction scripted"))
-                : await opts.decide?.(o.persona, pass, attempt, o) ?? {};
-              if (d instanceof Error) throw d;
-              const text = d.text ?? `${o.persona} p${pass}`;
-              // Default answers cite the first evidence row so the citation gate keeps the prose.
-              const cite = o.evidence[0]?.id;
-              return {
-                prose: text,
-                usage: d.usage ?? {},
-                ...(d.timings !== undefined ? { timings: d.timings } : {}),
-                claims: d.claims ?? (cite ? [{ text, claimType: "inference", evidenceIds: [cite] }] : []),
-                ...(d.confidence !== undefined ? { confidence: d.confidence } : {}),
-              };
-            },
-          },
-        },
-      );
-    } finally {
-      KernelRouter.prototype.call = realCall;
-    }
-    return { events, calls, corrections, bodies, gates, maxInFlight, runTimeouts, spawns };
-  }
-  const answers = (events: AgentEvent[]): string[] => events.flatMap((e) => (e.type === "answer_delta" ? [e.text] : []));
-  const doneMetrics = (events: AgentEvent[]): Metrics => {
-    const last = events.at(-1);
-    if (last?.type !== "done") throw new Error("expected done last");
-    return last.metrics;
-  };
-  const failedCategory = (events: AgentEvent[]): string | undefined => {
-    const f = events.find((e) => e.type === "failed");
-    return f?.type === "failed" ? f.category : undefined;
-  };
-  // Every claim lost its gates: the runtime's fixed line is the only text, and the run completes limited.
-  const UNDETERMINED = "I couldn't determine this from the retrieved sources.";
-  const expectUndetermined = (events: AgentEvent[], failure = "all claims rejected"): void => {
-    expect(answers(events)).toEqual([UNDETERMINED]);
-    expect(failedCategory(events)).toBeUndefined();
-    expect(events.at(-1)).toMatchObject({ type: "done", status: "completed_with_limitations", limitations: expect.arrayContaining([expect.stringContaining(failure)]) });
-  };
-  const runBodies = (bodies: Record<string, unknown>[]): Record<string, unknown>[] => bodies.filter((b) => b.op === "run");
-  const label = (p: Persona): string => `── ${p.charAt(0).toUpperCase()}${p.slice(1)} ──`;
-  // Trio answer: visible Bear and Bull drafts, then the Stockbot synthesis verdict.
-  const trioAnswer = (pass: number): string[] =>
-    (["bearbot", "bullbot", "stockbot"] as const).map((p, i) => `${i ? "\n\n" : ""}${label(p)}\n${p} p${pass}`);
-
-  test("trio drafts bear+bull concurrently then synthesizes stockbot with both drafts", async () => {
-    const { events, calls, maxInFlight } = await runFinal({});
-    // Drafts first (concurrent), synthesis last with both drafts attached.
-    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bullbot", "stockbot"]);
-    expect(maxInFlight).toBe(2);
-    const first = calls[0]?.input;
-    if (!first) throw new Error("expected reasoner calls");
-    for (const c of calls) {
-      expect(c.input.evidence).toBe(first.evidence);
-      expect(c.input.prompt).toBe(first.prompt);
-      expect(c.input.nodes).toBe(first.nodes);
-      expect(c.input.decisions).toBe(first.decisions);
-    }
-    expect(first.prompt).toContain("OBJECTIVE");
-    const synth = calls.at(-1)?.input;
-    expect(synth?.drafts).toEqual([
-      { persona: "bearbot", text: "bearbot p1" },
-      { persona: "bullbot", text: "bullbot p1" },
-    ]);
-    expect(answers(events)).toEqual(trioAnswer(1));
-    expect(events.filter((e) => e.type === "reasoning_start").length).toBe(1);
-    expect(events.some((e) => e.type === "failed")).toBe(false);
-    expect(doneMetrics(events).muse.calls).toBe(3);
-  });
-
-  test("trio retries exactly one failed draft once, then synthesizes with both drafts", async () => {
-    const usage = { inputTokens: 5, outputTokens: 1 };
-    const { events, calls } = await runFinal({
-      currentChartTicker: "aapl",
-      decide: (p, _pass, attempt) => (p === "bearbot" && attempt === 1 ? new Error("muse down") : { usage }),
-    });
-    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bullbot", "bearbot", "stockbot"]);
-    expect(calls.map((c) => c.input.ticker)).toEqual(["AAPL", "AAPL", "AAPL", "AAPL"]);
-    expect(calls.at(-1)?.input.drafts).toEqual([
-      { persona: "bearbot", text: "bearbot p1" },
-      { persona: "bullbot", text: "bullbot p1" },
-    ]);
-    expect(answers(events)).toEqual(trioAnswer(1));
-    const m = doneMetrics(events);
-    expect(m.muse.calls).toBe(4);
-    expect(m.muse.inputTokens).toBe(15);
-    expect(m.muse.outputTokens).toBe(3);
-  });
-
-  test("trio retry exhausted fails closed with no prose", async () => {
-    for (const blank of [false, true]) {
-      const { events, calls } = await runFinal({
-        decide: (p) => (p === "bullbot" ? (blank ? { text: "  \n " } : new Error("muse down")) : {}),
-      });
-      // Two drafts plus one retry, no synthesis call.
-      expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bullbot", "bullbot"]);
-      expect(answers(events)).toEqual([]);
-      expect(failedCategory(events)).toBe("provider_error");
-      const failed = events.find((e) => e.type === "failed");
-      expect(failed?.type === "failed" ? failed.message : "").toBe(blank ? "bullbot: empty response" : "bullbot: muse down");
-      expect(doneMetrics(events).muse.calls).toBe(3);
-    }
-  });
-
-  test("trio synthesis failure or empty preserves gated drafts", async () => {
-    for (const synthOutcome of [new Error("muse down"), { text: "  " }]) {
-      const { events, calls } = await runFinal({
-        decide: (p) => (p === "stockbot" ? synthOutcome : { text: `${p} draft` }),
-      });
-      expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bullbot", "stockbot"]);
-      expect(calls.at(-1)?.input.drafts).toEqual([
-        { persona: "bearbot", text: "bearbot draft" },
-        { persona: "bullbot", text: "bullbot draft" },
-      ]);
-      expect(answers(events)).toEqual([`${label("bearbot")}\nbearbot draft`, `\n\n${label("bullbot")}\nbullbot draft`]);
-      expect(failedCategory(events)).toBeUndefined();
-      expect(events.at(-1)).toMatchObject({
-        status: "completed_with_limitations",
-        limitations: expect.arrayContaining([
-          `stockbot synthesis unavailable: ${synthOutcome instanceof Error ? "stockbot: muse down" : "stockbot: empty response"}`,
-        ]),
-      });
-      expect(doneMetrics(events).failures.provider_error).toBe(1);
-      expect(doneMetrics(events).muse.calls).toBe(3);
-    }
-  });
-
-  test("trio publishes gated drafts while synthesis waits and emits cumulative claims", async () => {
-    const synthesis = Promise.withResolvers<Outcome>();
-    const drafts = Promise.withResolvers<AgentEvent[]>();
-    const running = runFinal({
-      decide: (p) => p === "stockbot" ? synthesis.promise : {},
-      onEvent: (event, events) => {
-        if (event.type === "claims" && event.claims.length === 2) drafts.resolve([...events]);
-      },
-    });
-    try {
-      const early = await drafts.promise;
-      expect(answers(early)).toEqual(trioAnswer(1).slice(0, 2));
-      expect(early.some((e) => e.type === "done")).toBe(false);
-      expect(early.filter((e) => e.type === "claims").map((e) => e.claims.map((c) => c.text))).toEqual([
-        ["bearbot p1"], ["bearbot p1", "bullbot p1"],
-      ]);
-    } finally {
-      synthesis.resolve({});
-    }
-    const { events } = await running;
-    expect(answers(events)).toEqual(trioAnswer(1));
-    expect(events.findLast((e) => e.type === "claims")?.claims.map((c) => c.text)).toEqual(["bearbot p1", "bullbot p1", "stockbot p1"]);
-  });
-
-  test("trio holds bull gates until bear gates settle", async () => {
-    const bear = Promise.withResolvers<GateVerdict>();
-    const bull = Promise.withResolvers<void>();
-    const early: AgentEvent[] = [];
-    const running = runFinal({
-      personas: ["bullbot", "stockbot", "bearbot"],
-      gate: (body) => {
-        if (body.persona === "bearbot") return bear.promise;
-        return { support_answer: "yes" };
-      },
-      onGate: (body) => {
-        if (body.persona === "bullbot") bull.resolve();
-      },
-      onEvent: (event) => early.push(event),
-    });
-    try {
-      await bull.promise;
-      expect(answers(early)).toEqual([]);
-    } finally {
-      bear.resolve({ support_answer: "yes" });
-    }
-    const { events } = await running;
-    expect(answers(events)).toEqual(trioAnswer(1));
-  });
-
-  test("trio synthesis timeout after gated drafts completes with limitations", async () => {
-    const synthesis = Promise.withResolvers<Outcome>();
-    const deadlineAt = Date.now() + 30_000;
-    const { events, calls } = await runFinal({
-      deadlineAt,
-      decide: (p) => p === "stockbot" ? synthesis.promise : {},
-      onEvent: (event) => {
-        if (event.type === "claims" && event.claims.length === 2) synthesis.reject(new DOMException("The operation timed out", "TimeoutError"));
-      },
-    });
-    expect(calls.every((c) => c.input.deadlineAt === undefined)).toBe(true);
-    expect(answers(events)).toEqual(trioAnswer(1).slice(0, 2));
-    expect(events.some((e) => e.type === "failed")).toBe(false);
-    expect(events.at(-1)).toMatchObject({
-      status: "completed_with_limitations",
-      limitations: expect.arrayContaining(["stockbot synthesis unavailable: stockbot: The operation timed out"]),
-    });
-    expect(doneMetrics(events).failures.provider_error).toBe(1);
-  });
-
-  test("trio: all gates rejected answers the fixed line; a failed synthesis without accepted drafts still fails", async () => {
-    const rejected = await runFinal({ gate: () => ({ support_answer: "no" }), decide: () => ({}) });
-    expectUndetermined(rejected.events, "stockbot: all claims rejected");
-    const down = await runFinal({
-      gate: () => ({ support_answer: "no" }),
-      decide: (p) => p === "stockbot" ? new Error("muse down") : {},
-    });
-    expect(answers(down.events)).toEqual([]);
-    expect(failedCategory(down.events)).toBe("provider_error");
-    expect(down.events.at(-1)).toMatchObject({ status: "failed" });
-  });
-
-  test("trio retains other personas when a draft or synthesis gate rejects", async () => {
-    for (const rejected of ["bearbot", "bullbot", "stockbot"]) {
-      const { events } = await runFinal({
-        gate: (body) => ({ support_answer: body.persona === rejected ? "no" : "yes" }),
-      });
-      const kept = ["bearbot", "bullbot", "stockbot"].filter((p) => p !== rejected);
-      expect(answers(events).join("")).toBe(kept.map((p) => `${label(p as Persona)}\n${p} p1`).join("\n\n"));
-      expect(events.some((e) => e.type === "failed")).toBe(false);
-      expect(events.at(-1)).toMatchObject({ status: "completed_with_limitations" });
-      expect(events.findLast((e) => e.type === "claims")?.claims.map((c) => c.text)).toEqual(kept.map((p) => `${p} p1`));
-    }
-  });
-
-  test("partial subsets never retry a failed persona", async () => {
-    for (let mask = 1; mask < (1 << FINAL_PERSONAS.length) - 1; mask++) {
-      const subset = FINAL_PERSONAS.filter((_, i) => (mask >> i) & 1);
-      const first = subset[0];
-      if (!first) continue;
-      const { events, calls } = await runFinal({
-        personas: subset,
-        decide: (p) => (p === first ? new Error("muse down") : {}),
-      });
-      expect(calls.map((c) => c.input.persona)).toEqual(subset);
-      for (const c of calls) expect(c.input.drafts).toBeUndefined();
-      expect(answers(events)).toEqual([]);
-      expect(doneMetrics(events).muse.calls).toBe(subset.length);
-    }
-  });
-
-  test("every partial subset calls only its personas with no synthesis and no retry", async () => {
-    for (let mask = 1; mask < 1 << FINAL_PERSONAS.length; mask++) {
-      const subset = FINAL_PERSONAS.filter((_, i) => (mask >> i) & 1);
-      if (subset.length === FINAL_PERSONAS.length) continue;
-      const { events, calls } = await runFinal({ personas: subset });
-      expect(calls.map((c) => c.input.persona)).toEqual(subset);
-      for (const c of calls) expect(c.input.drafts).toBeUndefined();
-      expect(answers(events)).toEqual([subset.map((p) => `${label(p)}\n${p} p1`).join("\n\n")]);
-      expect(doneMetrics(events).muse.calls).toBe(subset.length);
-    }
-  });
-
-  test("an unresolved node or tripped guard never starts a second worker run", async () => {
-    for (const personas of [["stockbot"], FINAL_PERSONAS] as const) {
-      // graphReply: one blocked node left unresolved, guard tripped, escalated.
-      const { events, bodies, calls } = await runFinal({ personas });
-      expect(runBodies(bodies).length).toBe(1);
-      expect(events.filter((e) => e.type === "reasoning_start").length).toBe(1);
-      expect(calls.every((c) => c.pass === 1)).toBe(true);
-      expect(events.some((e) => e.type === "progress" && e.stage === "evidence_gap")).toBe(false);
-      expect(answers(events)).toEqual(personas.length === 1 ? [`${label("stockbot")}\nstockbot p1`] : trioAnswer(1));
-      expect(events.some((e) => e.type === "failed")).toBe(false);
-    }
-  });
-
-  test("intake evidence shows progress and emits only the final gated answer", async () => {
-    const progress = (id: string, stage: string, detail: Record<string, unknown>): string => `${JSON.stringify({ type: "progress", id, stage, detail })}\n`;
-    const { events, calls } = await runFinal({
-      personas: ["stockbot"],
-      reply: (id) =>
-        progress(id, "intake_evidence", { evidence: [{ id: "ev:0", content: "intake fact" }] }) +
-        sessionGraphReply(id),
-    });
-    expect(calls.every((c) => c.pass === 1)).toBe(true);
-    expect(calls.map((c) => c.input.persona)).toEqual(["stockbot"]);
-    expect(calls[0]?.input.evidence.map((e) => e.id)).toEqual(["ev:1"]);
-    const deltas = answers(events);
-    expect(deltas).toEqual([`${label("stockbot")}\nstockbot p1`]);
-  });
-
-  test("research emits progress, then one gated answer and done without showing research text early", async () => {
-    const progress = (id: string, stage: string, detail: Record<string, unknown>): string => `${JSON.stringify({ type: "progress", id, stage, detail })}\n`;
-    const reply = (id: string): string =>
-      `${JSON.stringify({ id, objective: "q", sessionId: "s1", evidence: [{ id: "ev:0", content: "intake fact" }], nodes: [], decisions: [], unresolved: [], incomplete_guard: false, toolExecutions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false })}\n`;
-    const { events } = await runFinal({
-      personas: ["stockbot"],
-      reply: (id) => progress(id, "intake_evidence", { evidence: [{ id: "ev:0", content: "intake fact" }] }) + reply(id),
-    });
-    expect(events.filter((e) => e.type === "answer_delta").length).toBe(1);
-    expect(events.map((e) => e.type).slice(-2)).toEqual(["claims", "done"]);
-  });
-
-  test("an explanatory answer keeps facts, qualified significance, unknowns, and numeric descriptors", async () => {
-    const filed = "The 10-Q reports NVDA revenue rose year over year [ev:1].";
-    const significance = "This may matter because rising revenue can support continued profitability [ev:1].";
-    const terminology = "Gross margin means revenue left after direct product costs [ev:1].";
-    const unknown = "The filing does not identify next-quarter results.";
-    const { events, calls, gates } = await runFinal({
-      personas: ["stockbot"],
-      reply: sessionGraphReply,
-      decide: () => ({
-        text: [filed, significance, terminology, unknown].join(" "),
-        claims: [
-          { text: filed, claimType: "inference", evidenceIds: ["ev:1"] },
-          { text: significance, claimType: "inference", evidenceIds: ["ev:1"] },
-          { text: terminology, claimType: "inference", evidenceIds: ["ev:1"] },
-          { text: unknown, claimType: "unknown", evidenceIds: [] },
-        ],
-      }),
-    });
-    expect(calls.map((c) => c.input.persona)).toEqual(["stockbot"]);
-    expect(gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim", "assess_final_claim", "assess_final_claim"]);
-    expect(answers(events)).toHaveLength(1);
-    expect(answers(events)[0]).toContain(filed);
-    expect(answers(events)[0]).toContain(significance);
-    expect(answers(events)[0]).toContain(terminology);
-    expect(answers(events)[0]).toContain(unknown);
-    expect(answers(events)[0]).not.toMatch(/^── Full answer ──\n/);
-  });
-
-  test("a gated research answer emits its kept claims once, right before done", async () => {
-    const cited: FinalClaim = { text: "stockbot p1", claimType: "observed_fact", evidenceIds: ["ev:1"] };
-    const open: FinalClaim = { text: "p1", claimType: "unknown", evidenceIds: [] };
-    const { events } = await runFinal({ personas: ["stockbot"], reply: sessionGraphReply, decide: () => ({ claims: [cited, open] }) });
-    expect(events.map((e) => e.type).slice(-2)).toEqual(["claims", "done"]);
-    expect(events.filter((e) => e.type === "claims")).toEqual([{ type: "claims", claims: [cited, open] }]);
-    // An answer without an inventory emits no claims event.
-    const bare = await runFinal({ personas: ["stockbot"], reply: sessionGraphReply, decide: () => ({ claims: [] }) });
-    expect(bare.events.at(-1)?.type).toBe("done");
-    expect(bare.events.some((e) => e.type === "claims")).toBe(false);
-  });
-
-  test("done timings sum worker progress phases, skip malformed values, and omit unmeasured phases", async () => {
-    const progress = (id: string, stage: string, detail: Record<string, unknown>): string => `${JSON.stringify({ type: "progress", id, stage, detail })}\n`;
-    const { events } = await runFinal({
-      reply: (id) =>
-        progress(id, "intake_done", { wall_ms: 100, settle_ms: 10 }) +
-        progress(id, "reasoner_done", { proposals: 2, ms: 40 }) +
-        progress(id, "intake_done", { wall_ms: 20, settle_ms: 5 }) +
-        progress(id, "intake_done", { wall_ms: "7", settle_ms: null }) +
-        progress(id, "nodes_done", { ms: 300 }) +
-        graphReply(id),
-    });
-    expect(answers(events)).toEqual(trioAnswer(1));
-    // routeMs and firstTextMs belong to the route.
-    expect(doneMetrics(events).timings).toEqual({
-      intakeMs: 120, admitMs: 15, reasonerMs: 40, nodesMs: 300, personasMs: expect.any(Number), gatesMs: expect.any(Number),
-    });
-  });
-
-  test("trio sums logical calls and per-call provider posts separately", async () => {
-    const { events } = await runFinal({
-      decide: () => ({ usage: { providerCalls: 2 }, timings: { narrativeMs: 10 } }),
-    });
-    const m = doneMetrics(events);
-    expect(m.muse.calls).toBe(3);
-    expect(m.muse.providerCalls).toBe(6);
-    expect(m.timings).toMatchObject({ narrativeMs: 30 });
-    expect(m.timings).not.toHaveProperty("binderMs");
-  });
-
-  test("a failed draft retry adds its provider posts", async () => {
-    const usage = { inputTokens: 1, providerCalls: 2 };
-    const { events: retryEvents } = await runFinal({
-      decide: (p, _pass, attempt) =>
-        p === "bearbot" && attempt === 1 ? new Error("muse down") : { usage },
-    });
-    const retry = doneMetrics(retryEvents);
-    expect(retry.muse.calls).toBe(4);
-    expect(retry.muse.providerCalls).toBe(6);
-    expect(retry.muse.inputTokens).toBe(3);
-  });
-
-  test("an invalid inventory id feeds one correction round and answers the fixed line when it fails", async () => {
-    const usage = { inputTokens: 1, providerCalls: 2 };
-    const { events, calls, corrections, gates } = await runFinal({
-      personas: ["bearbot"],
-      decide: () => ({ text: "bearbot p1", claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["rn:x"] }], usage }),
-    });
-    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
-    expect(corrections.map((c) => c.persona)).toEqual(["bearbot"]);
-    expect(corrections[0]?.correction).toContain("inventory cites unknown evidence id: rn:x");
-    expect(corrections[0]?.correction).toContain("Previous answer:\nbearbot p1");
-    expect(gates).toEqual([]);
-    expectUndetermined(events);
-    const m = doneMetrics(events);
-    expect(m.muse.calls).toBe(2);
-    expect(m.muse.providerCalls).toBe(2);
-  });
-
-  test("a corrected answer replaces a rejected one and its claims gate", async () => {
-    const { events, corrections, gates } = await runFinal({
-      personas: ["bearbot"],
-      decide: () => ({ text: "bearbot p1", claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["rn:x"] }] }),
-      correct: () => ({ text: "Demand may hold [ev:1].", claims: [{ text: "Demand may hold", claimType: "inference", evidenceIds: ["ev:1"] }] }),
-    });
-    expect(corrections).toHaveLength(1);
-    expect(gates).toHaveLength(1);
-    expect(gates[0]).toMatchObject({ claim: { text: "Demand may hold" } });
-    expect(answers(events).join("")).toContain("Demand may hold [ev:1].");
-  });
-
-  test("a gate rejection reason reaches the correction, and a worse correction is discarded", async () => {
-    const { events, corrections } = await runFinal({
-      personas: ["bearbot"],
-      decide: () => ({
-        text: "Demand holds [ev:1]. Margins may rise [ev:1].", claims: [
-          { text: "Demand holds", claimType: "inference", evidenceIds: ["ev:1"] },
-          { text: "Margins may rise", claimType: "inference", evidenceIds: ["ev:1"] },
-        ]
-      }),
-      gate: (body) => JSON.stringify(body.claim).includes('"text":"Demand holds"') ? { error: "proof: ERR_CLAIM_UNQUALIFIED (no qualifier)" } : { support_answer: "yes" },
-      correct: () => ({ text: "Nothing [ev:9].", claims: [{ text: "Nothing", claimType: "inference", evidenceIds: ["ev:9"] }] }),
-    });
-    expect(corrections[0]?.correction).toContain("ERR_CLAIM_UNQUALIFIED");
-    expect(corrections[0]?.correction).toContain('Write instead: "This suggests demand holds."');
-    // A round that publishes fewer verified claims ends the loop: no second round.
-    expect(corrections).toHaveLength(1);
-    expect(answers(events).join("")).toContain("Margins may rise [ev:1].");
-  });
-
-  test("the judge's evidence state names the rejection in the correction", async () => {
-    const { corrections } = await runFinal({
-      personas: ["bearbot"],
-      decide: () => ({
-        text: "Margins may rise [ev:1]. Demand may hold [ev:1].", claims: [
-          { text: "Margins may rise", claimType: "inference", evidenceIds: ["ev:1"] },
-          { text: "Demand may hold", claimType: "inference", evidenceIds: ["ev:1"] },
-        ]
-      }),
-      gate: (body) => JSON.stringify(body.claim).includes("Demand") ? { support_answer: "no", evidence_state: "sufficient_contradiction" } : { support_answer: "yes" },
-    });
-    expect(corrections[0]?.correction).toContain("contradicts this claim");
-    expect(corrections[0]?.correction).toContain("Examples of accepted rewrites:\n- Before:");
-  });
-
-  test("a correction shows the exact number sentence from the datapoint and the missing claims row", async () => {
-    const point: Datapoint = { ...revenuePoint, value: "96,221", unit: "millions", entity: "NVIDIA Corporation", metric: "Revenue", period: "Three Months Ended Jul 26, 2026" };
-    const reply = (id: string): string =>
-      `${JSON.stringify({ ...JSON.parse(sessionGraphReply(id)), evidence: [{ id: "ev:1", content: "fact", datapoints: [point] }] })}\n`;
-    const { corrections } = await runFinal({
-      personas: ["bearbot"], reply,
-      decide: () => ({
-        text: "Revenue hit $96,221 million [ev:1]. Demand may hold [ev:1].", claims: [
-          { text: "Revenue hit $96,221 million", claimType: "observed_fact", evidenceIds: ["ev:1"], datapointIds: [point.id] },
-        ]
-      }),
-      gate: () => ({ error: `proof: assess_final: ERR_DATAPOINT_UNBOUND (claim does not state datapoint ${point.id} metric 'Revenue' directly before its value '96,221')` }),
-    });
-    expect(corrections[0]?.correction).toContain('Write instead: "NVIDIA Corporation reported Revenue of $96,221 million for Three Months Ended Jul 26, 2026."');
-    expect(corrections[0]?.correction).toContain('Write instead: the claims row {"text":"Demand may hold","claim_type":"inference","evidence_ids":["ev:1"]}');
-  });
-
-  test("correction rounds loop on the best answer until nothing is rejected", async () => {
-    const claim = (text: string): FinalClaim => ({ text, claimType: "inference", evidenceIds: ["ev:1"] });
-    const rounds = [
-      { text: "Margins may rise [ev:1]. Demand holds [ev:1]. Costs fall [ev:1].", claims: [claim("Margins may rise"), claim("Demand holds"), claim("Costs fall")] },
-      { text: "Margins may rise [ev:1]. Demand may hold [ev:1]. Costs fall [ev:1].", claims: [claim("Margins may rise"), claim("Demand may hold"), claim("Costs fall")] },
-      { text: "Margins may rise [ev:1]. Demand may hold [ev:1]. Costs could fall [ev:1].", claims: [claim("Margins may rise"), claim("Demand may hold"), claim("Costs could fall")] },
-    ];
-    let round = 0;
-    const { events, corrections } = await runFinal({
-      personas: ["bearbot"],
-      decide: () => rounds[0] ?? {},
-      correct: (_p, input) => {
-        round += 1;
-        // Each round corrects the previous kept answer.
-        expect(input.correction).toContain(`Previous answer:\n${rounds[round - 1]?.text ?? ""}`);
-        return rounds[round] ?? {};
-      },
-      gate: (body) => /"text":"(?:Demand holds|Costs fall)"/.test(JSON.stringify(body.claim)) ? { error: "proof: ERR_CLAIM_UNQUALIFIED (no qualifier)" } : { support_answer: "yes" },
-    });
-    expect(corrections).toHaveLength(2);
-    expect(answers(events).join("")).toContain("Margins may rise [ev:1]. Demand may hold [ev:1]. Costs could fall [ev:1].");
-  });
-
-  test("provider posts on a failed call still count through the mutable input", async () => {
-    const { events, calls } = await runFinal({
-      personas: ["bearbot"],
-      decide: (_p, _pass, _attempt, input) => {
-        input.usage!.providerCalls = 3;
-        input.timings!.narrativeMs = 7;
-        throw new Error("muse down");
-      },
-    });
-    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
-    const m = doneMetrics(events);
-    expect(m.muse.calls).toBe(1);
-    expect(m.muse.providerCalls).toBe(3);
-    expect(m.timings).toMatchObject({ narrativeMs: 7 });
-  });
-
-  test("partial personas without provider telemetry omit the provider count", async () => {
-    const { events } = await runFinal({ personas: ["bearbot", "bullbot"] });
-    const m = doneMetrics(events);
-    expect(m.muse.calls).toBe(2);
-    expect(m.muse.providerCalls).toBeUndefined();
-  });
-
-  test("research opens with a status line and turns worker stages into readable counts before any tool result", async () => {
-    const progress = (id: string, stage: string, detail: Record<string, unknown>): string => `${JSON.stringify({ type: "progress", id, stage, detail })}\n`;
-    const { events } = await runFinal({
-      reply: (id) =>
-        progress(id, "session", { session_id: "s1" }) +
-        progress(id, "intake_start", { calls: 3 }) +
-        progress(id, "intake_done", { admitted: 5 }) +
-        progress(id, "reasoner_done", { proposals: 1.5 }) +
-        progress(id, "reasoner_done", { proposals: 3 }) +
-        progress(id, "tool_start", { node_id: "n1", action: "invoke", tools: ["get_short_interest"] }) +
-        progress(id, "tool_done", { node_id: "n1", admitted: -1 }) +
-        progress(id, "tool_start", { node_id: "n1", action: "reason", tools: [] }) +
-        progress(id, "tool_done", { node_id: "n1", admitted: 0 }) +
-        progress(id, "nodes_done", { ms: 10 }) +
-        // One replayed tool call: its tool_result follows every live status line.
-        graphReply(id).replace('"toolCalls":[]', '"toolCalls":[{"tool":"get_short_interest","ok":true,"evidenceId":"ev:1"}]'),
-    });
-    expect(events[1]).toEqual({ type: "status", text: "Researching: q" });
-    // A malformed worker count stays silent; the session stage has no line.
-    expect(events.flatMap((e) => (e.type === "status" ? [e.text] : []))).toEqual([
-      "Researching: q", "Checking 3 sources", "Found 5 sources", "Planned 3 questions",
-      "Checking FINRA short interest", "Weighing the evidence", "Found nothing new", "Writing the answer",
-    ]);
-    const firstResult = events.findIndex((e) => e.type === "tool_result");
-    expect(firstResult).toBeGreaterThan(events.findLastIndex((e) => e.type === "status"));
-  });
-
-  test("a failed persona fails the report with no prose", async () => {
-    const { events, bodies } = await runFinal({ decide: (p) => (p === "bearbot" ? new Error("muse down") : {}) });
-    expect(answers(events)).toEqual([]);
-    expect(failedCategory(events)).toBe("provider_error");
-    const failed = events.find((e) => e.type === "failed");
-    expect(failed?.type === "failed" ? failed.message : "").toBe("bearbot: muse down");
-    expect(runBodies(bodies).length).toBe(1);
-    const m = doneMetrics(events);
-    // Bear draft, bull draft, one bear retry; no synthesis.
-    expect(m.muse.calls).toBe(3);
-    expect(m.failures.provider_error).toBe(1);
-  });
-
-  test("an empty or whitespace persona draft fails the report with no prose, usage kept", async () => {
-    const usage = { inputTokens: 5, outputTokens: 1 };
-    for (const blank of ["", "  \n\t "]) {
-      const { events, bodies } = await runFinal({
-        personas: ["stockbot", "bearbot"],
-        decide: (p) => (p === "bearbot" ? { text: blank, usage } : { usage }),
-      });
-      expect(answers(events)).toEqual([]);
-      expect(failedCategory(events)).toBe("provider_error");
-      const failed = events.find((e) => e.type === "failed");
-      expect(failed?.type === "failed" ? failed.message : "").toBe("bearbot: empty response");
-      expect(runBodies(bodies).length).toBe(1);
-      const m = doneMetrics(events);
-      expect(m.muse.calls).toBe(2);
-      expect(m.muse.inputTokens).toBe(10);
-      expect(m.muse.outputTokens).toBe(2);
-      expect(m.failures.provider_error).toBe(1);
-    }
-  });
-
-  test("the source gates keep supported facts and drop unsupported claims", async () => {
-    const supported = "NVDA Q3 FY2025 revenue was $10M USD.";
-    const unsupported = "NVDA Q3 FY2025 margin was 40%.";
-    const { events, bodies, gates } = await runFinal({
-      personas: ["bearbot"],
-      reply: (id) => `${JSON.stringify({
-        ...JSON.parse(graphReply(id)),
-        evidence: [{
-          id: "ev:1", content: "fact", datapoints: [
-            { id: "dp:revenue", metric: "revenue", value: "$10M", entity: "NVDA", period: "Q3 FY2025", unit: "USD", statement: supported },
-            { id: "dp:margin", metric: "margin", value: "40%", entity: "NVDA", period: "Q3 FY2025", unit: "%", statement: unsupported },
-          ],
-        }],
-      })}\n`,
-      decide: () => ({
-        text: `${supported} ${unsupported}`,
-        claims: [
-          { text: supported, claimType: "observed_fact", evidenceIds: ["ev:1"], datapointIds: ["dp:revenue"] },
-          { text: unsupported, claimType: "observed_fact", evidenceIds: ["ev:1"], datapointIds: ["dp:margin"] },
-        ],
-      }),
-      gate: (body) => {
-        if (body.op !== "assess_final_claim") return { support_answer: "no" };
-        const claim = body.claim;
-        const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
-        return text === supported ? { support_answer: "yes" } : { support_answer: "no" };
-      },
-    });
-    expect(runBodies(bodies).length).toBe(1);
-    expect(gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim"]);
-    const out = answers(events);
-    expect(out.length).toBe(1);
-    expect(out[0]).toContain(supported);
-    expect(out[0]).not.toContain(unsupported);
-    expect(events.some((e) => e.type === "failed")).toBe(false);
-  });
-
-  test("gate evidence carries datapoint descriptors alongside claim wire ids", async () => {
-    const supported = "NVDA Q3 FY2025 revenue was $10M USD.";
-    const point = { id: "dp:revenue", metric: "revenue", value: "$10M", entity: "NVDA", period: "Q3 FY2025", unit: "USD", statement: supported };
-    const { gates } = await runFinal({
-      personas: ["bearbot"],
-      reply: (id) => `${JSON.stringify({
-        ...JSON.parse(graphReply(id)),
-        evidence: [{ id: "ev:1", content: "fact", datapoints: [point] }],
-      })}\n`,
-      decide: () => ({
-        text: supported,
-        claims: [{ text: supported, claimType: "observed_fact", evidenceIds: ["ev:1"], datapointIds: ["dp:revenue"] }],
-      }),
-      gate: (body) => {
-        expect(body.evidence).toEqual([{ id: "ev:1", content: "fact", datapoints: [point] }]);
-        return { support_answer: "yes" };
-      },
-    });
-    expect(gates.map((g) => g.op)).toEqual(["assess_final_claim"]);
-  });
-
-  test("drafts, a failed-draft retry, and stockbot synthesis share the signal and never inherit the research wall", async () => {
-    const deadlineAt = Date.now() + 600_000;
-    const signal = new AbortController().signal;
-    const seenAt: number[] = [];
-    try {
-      const { events, calls, gates } = await runFinal({
-        deadlineAt,
-        signal,
-        reply: sessionGraphReply,
-        decide: (p, _pass, attempt) => {
-          // Research settled under the wall; the clock now sits past it for every persona call.
-          setSystemTime(new Date(deadlineAt + 60_000));
-          seenAt.push(Date.now());
-          return p === "bearbot" && attempt === 1 ? new Error("muse down") : {};
-        },
-      });
-      expect(calls.map((c) => c.input.persona)).toEqual(["bearbot", "bullbot", "bearbot", "stockbot"]);
-      expect(calls.at(-1)?.input.drafts).toEqual([
-        { persona: "bearbot", text: "bearbot p1" },
-        { persona: "bullbot", text: "bullbot p1" },
-      ]);
-      expect(seenAt.length).toBe(4);
-      for (const t of seenAt) expect(t).toBeGreaterThan(deadlineAt);
-      for (const c of calls) {
-        const input = c.input;
-        expect(input.deadlineAt).toBeUndefined();
-        expect(input.signal).toBe(signal);
-      }
-      // One per-claim gate per claim, judged under the shared deadline.
-      expect(gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim", "assess_final_claim"]);
-      for (const g of gates) expect(g.sessionId).toBe("rs:live");
-      expect(answers(events)).toEqual(trioAnswer(1));
-      expect(events.some((e) => e.type === "failed")).toBe(false);
-    } finally {
-      setSystemTime();
-    }
-  });
-
-  test("the one research run carries the request wall", async () => {
-    const deadlineAt = Date.now() + 600_000;
-    const { bodies } = await runFinal({ deadlineAt });
-    const runs = runBodies(bodies);
-    expect(runs.length).toBe(1);
-    expect(runs[0]?.deadlineAt).toBe(deadlineAt);
-    expect("deadlineMs" in (runs[0] ?? {})).toBe(false);
-  });
-
-  test("an empty graph makes no persona or gate call and answers the fixed line", async () => {
-    const { events, calls, gates } = await runFinal({
-      reply: emptyReply, personas: ["stockbot", "bullbot"],
-      decide: (p) => ({ text: `${p} results are unknown.`, claims: [{ text: `${p} results are unknown.`, claimType: "unknown", evidenceIds: [] }] }),
-      gate: () => ({ error: "gate down" }),
-    });
-    expect(calls).toEqual([]);
-    expect(gates).toEqual([]);
-    expectUndetermined(events, "research retrieved no evidence");
-    expect(doneMetrics(events).muse.calls).toBe(0);
-  });
-  test("independent gates judge every persona claim with one op per claim", async () => {
-    const claim = (p: Persona): FinalClaim => ({ text: `${p} p1`, claimType: "inference", evidenceIds: ["ev:1"] });
-    const { events, gates } = await runFinal({
-      decide: (p) => ({ claims: [claim(p)], confidence: 0.9 }),
-    });
-    expect(gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim", "assess_final_claim"]);
-    for (const g of gates) {
-      expect(g.evidence).toEqual([{ id: "ev:1", content: "fact" }]);
-      const claim = g.claim;
-      if (typeof claim !== "object" || claim === null || !("claim_type" in claim)) throw new Error("expected a wire claim");
-      expect(claim).toMatchObject({ claim_type: "inference", evidence_ids: ["ev:1"] });
-    }
-    expect(answers(events)).toEqual(trioAnswer(1));
-  });
-
-  test("gate bodies carry the run session id on every per-claim op", async () => {
-    const claim = "bearbot p1";
-    const { gates } = await runFinal({
-      personas: ["bearbot"],
-      reply: sessionGraphReply,
-      decide: () => ({ text: `keep ${claim}`, claims: [{ text: claim, claimType: "inference", evidenceIds: ["ev:1"] }] }),
-    });
-    expect(gates.map((g) => g.op)).toEqual(["assess_final_claim"]);
-    // The worker keys gates by sessionId; without it, every gate fails closed on the numeric request id.
-    for (const g of gates) expect(g.sessionId).toBe("rs:live");
-  });
-
-
-  test("a gate error rejects a claim, and a reject drops every sentence no supported claim covers", async () => {
-    const claim = "bearbot claim here";
-    const kept = "Bearbot kept sentence.";
-    const { events, gates } = await runFinal({
-      personas: ["bearbot"],
-      reply: sessionGraphReply,
-      decide: () => ({
-        text: `${kept} Preamble ${claim} tail. Uncovered remark.`,
-        claims: [
-          { text: kept, claimType: "inference", evidenceIds: ["ev:1"] },
-          { text: claim, claimType: "inference", evidenceIds: ["ev:1"] },
-        ],
-      }),
-      gate: (body) => {
-        const claim = body.claim;
-        const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
-        return text === kept ? { support_answer: "yes" } : { error: "unknown session_id: '39'" };
-      },
-    });
-    expect(gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim"]);
-    expect(answers(events)).toEqual([`${label("bearbot")}\n${kept}`]);
-    expect(events.some((e) => e.type === "failed")).toBe(false);
-  });
-
-  test("a gate error that leaves no prose fails closed as provider_error", async () => {
-    const { events } = await runFinal({
-      personas: ["bearbot"],
-      reply: sessionGraphReply,
-      decide: () => ({
-        text: "bearbot claim here",
-        claims: [{ text: "bearbot claim here", claimType: "inference", evidenceIds: ["ev:1"] }],
-      }),
-      gate: () => ({ error: "unknown session_id: '39'" }),
-    });
-    expect(answers(events)).toEqual([]);
-    expect(failedCategory(events)).toBe("provider_error");
-  });
-
-  test("independent gates delete only rejected substrings", async () => {
-    const kept = "bearbot may keep this.";
-    const cut = "bearbot reported this.";
-    const { events, gates } = await runFinal({
-      decide: (p) =>
-        p === "bearbot"
-          ? {
-            text: `${kept} ${cut}`,
-            claims: [
-              { text: kept, claimType: "conditional_risk", evidenceIds: ["ev:1"] },
-              { text: cut, claimType: "attributed_report", evidenceIds: ["ev:1"] },
-            ],
-          }
-          : {},
-      gate: (body) => {
-        const claim = body.claim;
-        const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
-        return text === cut ? { support_answer: "no" } : { support_answer: "yes" };
-      },
-    });
-    expect(gates.filter((g) => g.op === "assess_final_claim").length).toBe(4);
-    const out = answers(events);
-    expect(out).toEqual([
-      `${label("bearbot")}\n${kept}`,
-      `\n\n${label("bullbot")}\nbullbot p1`,
-      `\n\n${label("stockbot")}\nstockbot p1`,
-    ]);
-    expect(out.join("")).not.toContain(cut);
-  });
-
-  test("an invalid inventory id drops that claim and the fixed line answers when nothing remains", async () => {
-    const { events, calls, gates } = await runFinal({
-      personas: ["bearbot"],
-      currentChartTicker: "msft",
-      decide: () => ({ text: "bearbot p1", claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["rn:56c1365b-followup"] }] }),
-    });
-    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
-    expect(calls.map((c) => c.input.ticker)).toEqual(["MSFT"]);
-    expect(gates).toEqual([]);
-    expectUndetermined(events);
-  });
-
-  test("an invalid inventory id answers only the fixed line with no gate call", async () => {
-    const { events, calls, gates } = await runFinal({
-      personas: ["bearbot"],
-      decide: () => ({ claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["ev:9"] }] }),
-    });
-    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
-    expect(gates).toEqual([]);
-    expectUndetermined(events);
-    expect(doneMetrics(events).muse.calls).toBe(2);
-  });
-
-  test("a claim text naming nothing the prose says answers only the fixed line with no gate call", async () => {
-    const { events, calls, gates } = await runFinal({
-      personas: ["bearbot"],
-      decide: () => ({ text: "bearbot p1", claims: [{ text: "bearbot paraphrase", claimType: "inference", evidenceIds: ["ev:1"] }] }),
-    });
-    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
-    expect(gates).toEqual([]);
-    expectUndetermined(events);
-    expect(doneMetrics(events).muse.calls).toBe(2);
-  });
-
+describe("proof helpers", () => {
   test("alignClaimText maps a differently spelled claim to its exact prose, never to different numbers", () => {
     const prose = "NVIDIA reported Revenue of $96,221 million for Q3 [ev:1]. Margins \u201cmay\u201d  rise if demand holds [ev:2].";
     expect(alignClaimText(prose, "NVIDIA reported Revenue of $96,221 million for Q3")).toBe("NVIDIA reported Revenue of $96,221 million for Q3");
@@ -1410,99 +419,6 @@ describe("runKernelAgent final personas", () => {
     expect(alignClaimText(prose, "NVIDIA reported Revenue of $96,222 million for Q3")).toBeUndefined();
     expect(alignClaimText(prose, "Gaming collapsed")).toBeUndefined();
   });
-
-  test("a real datapoint whose row the claim forgot to cite gains that row before the gates", async () => {
-    const reply = (id: string): string =>
-      `${JSON.stringify({ ...JSON.parse(sessionGraphReply(id)), evidence: [{ id: "ev:1", content: "fact", datapoints: [revenuePoint] }, { id: "ev:2", content: "other" }] })}\n`;
-    const { gates } = await runFinal({
-      personas: ["stockbot"], reply,
-      decide: () => ({ text: revenuePoint.statement, claims: [{ text: revenuePoint.statement, claimType: "observed_fact", evidenceIds: ["ev:2"], datapointIds: [revenuePoint.id] }] }),
-    });
-    expect(gates[0]).toMatchObject({ claim: { evidence_ids: ["ev:2", "ev:1"], datapoint_ids: [revenuePoint.id] } });
-  });
-
-  test("an uncited inventory defect answers only the fixed line", async () => {
-    const { events, calls, gates } = await runFinal({
-      personas: ["bearbot"],
-      decide: () => ({ claims: [{ text: "bearbot p1", claimType: "observed_fact", evidenceIds: [] }] }),
-    });
-    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
-    expect(gates).toEqual([]);
-    expectUndetermined(events);
-  });
-
-  test("an invalid inventory id drops that persona while the valid group still gates", async () => {
-    const { events, calls, gates } = await runFinal({
-      personas: ["stockbot", "bearbot"],
-      decide: (p) => p === "bearbot"
-        ? { claims: [{ text: "bearbot p1", claimType: "inference", evidenceIds: ["ev:9"] }] }
-        : { text: `${p} fixed`, claims: [{ text: `${p} fixed`, claimType: "inference", evidenceIds: ["ev:1"] }] },
-    });
-    expect(calls.map((c) => c.input.persona)).toEqual(["stockbot", "bearbot"]);
-    expect(calls.filter((c) => c.input.persona === "stockbot").length).toBe(1);
-    expect(gates).toHaveLength(1);
-    expect(gates[0]).toMatchObject({
-      op: "assess_final_claim",
-      persona: "stockbot",
-      claim: { text: "stockbot fixed", evidence_ids: ["ev:1"] },
-    });
-    expect(answers(events)).toEqual([`${label("stockbot")}\nstockbot fixed`]);
-    expect(events.some((e) => e.type === "failed")).toBe(false);
-    expect(events.findLast((e) => e.type === "claims")).toMatchObject({
-      claims: [{ text: "stockbot fixed", claimType: "inference", evidenceIds: ["ev:1"] }],
-    });
-  });
-
-  test("the gates see only locally valid claims before display", async () => {
-    const kept = "bearbot valid fact.";
-    const cut = "bearbot valid guess.";
-    const { events, calls, gates } = await runFinal({
-      personas: ["bearbot"],
-      decide: () => ({
-        text: `${kept} ${cut} bearbot invalid.`,
-        claims: [
-          { text: kept, claimType: "observed_fact", evidenceIds: ["ev:1"] },
-          { text: cut, claimType: "observed_fact", evidenceIds: ["ev:1"] },
-          { text: "bearbot invalid", claimType: "inference", evidenceIds: ["ev:9"] },
-        ],
-      }),
-      gate: (body) => {
-        const claim = body.claim;
-        const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
-        return text === kept ? { support_answer: "yes" } : { support_answer: "no" };
-      },
-    });
-    expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
-    const out = answers(events);
-    expect(out.length).toBe(1);
-    expect(out[0]).toContain(kept);
-    expect(out[0]).not.toContain(cut);
-    // The claims event carries only the claim the gates kept.
-    expect(events.filter((e) => e.type === "claims")).toEqual([{ type: "claims", claims: [{ text: kept, claimType: "observed_fact", evidenceIds: ["ev:1"] }] }]);
-    expect(gates.every((g) => g.op === "assess_final_claim")).toBe(true);
-    expect(gates).toHaveLength(2);
-    expect(events.some((e) => e.type === "failed")).toBe(false);
-  });
-
-  test("property: an invalid inventory id answers only the fixed line while known ids gate per claim", async () => {
-    await fc.assert(
-      fc.asyncProperty(fc.array(fc.constantFrom("ev:1", "ev:9", "rn:n1"), { minLength: 1, maxLength: 3 }), async (evidenceIds) => {
-        const { events, calls } = await runFinal({
-          personas: ["bearbot"],
-          decide: () => ({ text: "bearbot fixed", claims: [{ text: "bearbot fixed", claimType: "inference", evidenceIds }] }),
-        });
-        expect(calls.map((c) => c.input.persona)).toEqual(["bearbot"]);
-        if (evidenceIds.every((id) => id === "ev:1")) {
-          expect(answers(events)).toEqual([`${label("bearbot")}\nbearbot fixed`]);
-        } else {
-          expectUndetermined(events);
-        }
-      }),
-      { seed: 20261011, numRuns: 20 },
-    );
-  });
-
-
   const revenuePoint: Datapoint = {
     id: "dp:revenue", metric: "revenue", value: "$35.1B", entity: "NVDA", period: "Q3 FY2025", unit: "USD",
     statement: "NVDA Q3 FY2025 revenue was $35.1B USD.",
@@ -1589,843 +505,196 @@ describe("runKernelAgent final personas", () => {
     ]);
   });
 
-  test("number admission adds verified rows before final gates and failures remain unproven", async () => {
-    const number = { evidence_id: "ev:1", metric: revenuePoint.metric, value: revenuePoint.value, entity: revenuePoint.entity, period: revenuePoint.period, unit: revenuePoint.unit };
-    const makeClaim = (): FinalClaim => ({
-      text: revenuePoint.statement, claimType: "observed_fact", evidenceIds: ["ev:1"], numbers: [number],
-    });
-    const passed = await runFinal({
-      personas: ["stockbot"], reply: sessionGraphReply,
-      decide: () => ({ text: revenuePoint.statement, claims: [makeClaim()] }),
-      admit: () => ({ evidence_id: "ev:new", datapoint: revenuePoint }),
-    });
-    expect(passed.bodies.find((body) => body.op === "admit_datapoint")).toMatchObject({
-      op: "admit_datapoint", sessionId: "rs:live", evidenceId: "ev:1", metric: number.metric, value: number.value,
-    });
-    expect(passed.bodies.find((body) => body.op === "admit_datapoint")).not.toHaveProperty("deadlineAt");
-    expect(passed.gates[0]?.claim).toMatchObject({ evidence_ids: ["ev:1", "ev:new"], datapoint_ids: [revenuePoint.id] });
-    expect(passed.gates[0]?.evidence).toContainEqual(expect.objectContaining({ id: "ev:new", datapoints: [revenuePoint] }));
-    expect(answers(passed.events).join("")).toContain(revenuePoint.statement);
-    const failed = await runFinal({
-      personas: ["stockbot"], reply: sessionGraphReply,
-      decide: () => ({ text: revenuePoint.statement, claims: [makeClaim()] }),
-      admit: () => ({ error: "value absent from source" }),
-      gate: () => ({ error: "proof: ERR_DATAPOINT_UNVERIFIED" }),
-    });
-    expect(failed.gates[0]?.claim).not.toHaveProperty("datapoint_ids");
-    expect(failed.gates[0]?.evidence).not.toContainEqual(expect.objectContaining({ id: "ev:new" }));
-    expect(answers(failed.events).join("")).not.toContain(revenuePoint.statement);
+});
+describe("outOfScopeAnswer", () => {
+  const FIXED = "This request is outside the scope of stock research. I can only research markets, companies, securities, and investing, so this request is unsupported.";
+  test("an out-of-scope verdict carries the runtime's fixed answer", () => {
+    expect(outOfScopeAnswer({ in_scope: false, answer: FIXED })).toBe(FIXED);
+    expect(outOfScopeAnswer({ in_scope: false, answer: `  ${FIXED}\n` })).toBe(FIXED);
   });
-
-  test("a growth claim drops its inputs' dp: ids unless the sentence states the input value", async () => {
-    const growthPoint: Datapoint = {
-      id: "dp:growth", metric: "revenue growth", value: "12.5", entity: "NVDA", period: "Q3 FY2025 versus Q3 FY2024", unit: "%",
-      statement: "revenue growth = percent_change@2(...) = 12.5", inputs: [revenuePoint.id],
-    };
-    const growth = { evidence_id: "ev:1", metric: growthPoint.metric, value: "12.5", entity: "NVDA", period: growthPoint.period, unit: "%" };
-    const input = { evidence_id: "ev:1", metric: revenuePoint.metric, value: revenuePoint.value, entity: "NVDA", period: revenuePoint.period };
-    const run = (text: string) => runFinal({
-      personas: ["stockbot"], reply: sessionGraphReply,
-      decide: () => ({ text, claims: [{ text, claimType: "calculation", evidenceIds: ["ev:1"], datapointIds: [revenuePoint.id, "dp:mistyped"], numbers: [input, growth] }] }),
-      admit: (body) => body.metric === growthPoint.metric ? { evidence_id: "ev:g", datapoint: growthPoint } : { evidence_id: "ev:in", datapoint: revenuePoint },
-    });
-    const growthOnly = await run("NVDA reported revenue growth of 12.5% for Q3 FY2025 versus Q3 FY2024.");
-    expect(growthOnly.gates[0]?.claim).toMatchObject({ datapoint_ids: [growthPoint.id] });
-    const stated = await run("NVDA revenue of $35.1B grew 12.5% for Q3 FY2025 versus Q3 FY2024.");
-    expect(stated.gates[0]?.claim).toMatchObject({ datapoint_ids: expect.arrayContaining([revenuePoint.id, growthPoint.id]) });
-  });
-
-  test("number admissions use at most four concurrent calls", async () => {
-    let inFlight = 0;
-    let maximum = 0;
-    const number = { evidence_id: "ev:1", metric: revenuePoint.metric, value: revenuePoint.value, entity: revenuePoint.entity, period: revenuePoint.period };
-    const result = await runFinal({
-      personas: ["stockbot"], reply: sessionGraphReply,
-      decide: () => ({
-        text: revenuePoint.statement, claims: [{
-          text: revenuePoint.statement, claimType: "observed_fact", evidenceIds: ["ev:1"],
-          numbers: Array.from({ length: 9 }, () => number),
-        }]
-      }),
-      admit: async () => {
-        inFlight += 1;
-        maximum = Math.max(maximum, inFlight);
-        await Promise.resolve();
-        inFlight -= 1;
-        return { evidence_id: "ev:new", datapoint: revenuePoint };
-      },
-    });
-    expect(result.bodies.filter((body) => body.op === "admit_datapoint")).toHaveLength(9);
-    expect(maximum).toBe(4);
-    expect(result.gates[0]?.claim).toMatchObject({ evidence_ids: ["ev:1", "ev:new"], datapoint_ids: [revenuePoint.id] });
-  });
-
-  test("a fabricated or unproven number never shows and datapoint ids enter the gate wire", async () => {
-    const fact: FinalClaim = { text: "NVDA Q3 FY2025 revenue was $35.1B USD [ev:1].", claimType: "observed_fact", evidenceIds: ["ev:1"], datapointIds: [revenuePoint.id] };
-    const hedge: FinalClaim = { text: "Margins may compress if demand slows.", claimType: "inference", evidenceIds: ["ev:1"] };
-    const text = `${fact.text} ${hedge.text} Margin hit 99%.`;
-    const reply = (id: string): string => `${JSON.stringify({
-      ...JSON.parse(sessionGraphReply(id)),
-      evidence: [{ id: "ev:1", content: "fact", datapoints: [revenuePoint, null, { ...revenuePoint, id: "ev:bad" }] }],
-    })}\n`;
-    // The independent gates drop the sentence that has no inventory claim.
-    const passed = await runFinal({ personas: ["stockbot"], reply, decide: () => ({ text, claims: [fact, hedge] }) });
-    expect(passed.calls[0]?.input.evidence[0]?.datapoints).toEqual([revenuePoint]);
-    expect(passed.events.find((e) => e.type === "evidence")).toMatchObject({ evidence: [{ datapoints: [revenuePoint] }] });
-    expect(passed.gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim"]);
-    const firstClaim = passed.gates[0]?.claim;
-    if (typeof firstClaim !== "object" || firstClaim === null) throw new Error("expected first gate claim");
-    expect(firstClaim).toEqual({
-      text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:1"], datapoint_ids: [revenuePoint.id],
-    });
-    expect(answers(passed.events)).toEqual([`${label("stockbot")}\n${fact.text} ${hedge.text}`]);
-    expect(passed.events.find((e) => e.type === "claims")).toEqual({ type: "claims", claims: [fact, hedge] });
-    // A ledger proof failure removes the datapoint claim but keeps the qualified inference.
-    const proofFailed = await runFinal({
-      personas: ["stockbot"],
-      reply,
-      decide: () => ({ text, claims: [fact, hedge] }),
-      gate: (body) => {
-        const claim = body.claim;
-        const ids = typeof claim === "object" && claim !== null && "datapoint_ids" in claim ? claim.datapoint_ids : undefined;
-        return ids === undefined ? { support_answer: "yes" } : { error: "proof: datapoint conflicts with ledger" };
-      },
-    });
-    const failedClaim = proofFailed.gates.find((g) => g.op === "assess_final_claim")?.claim;
-    if (typeof failedClaim !== "object" || failedClaim === null) throw new Error("expected failed gate claim");
-    expect(failedClaim).toEqual({
-      text: fact.text, claim_type: "observed_fact", evidence_ids: ["ev:1"], datapoint_ids: [revenuePoint.id],
-    });
-    for (const body of [...passed.gates, ...proofFailed.gates]) {
-      const claim = body.claim;
-      if (typeof claim !== "object" || claim === null) throw new Error("expected a gate claim");
-      for (const key of ["value", "entity", "period", "unit"]) expect(claim).not.toHaveProperty(key);
-    }
-    expect(answers(proofFailed.events)).toEqual([`${label("stockbot")}\n${hedge.text}`]);
-  });
-
-  test("narrative claims stay unproven until the gates keep them: one gated delta, kept claims, no raw stream", async () => {
-    const kept: FinalClaim = { text: "Demand may rise [ev:1].", claimType: "inference", evidenceIds: ["ev:1"] };
-    const unsupported: FinalClaim = { text: "Revenue doubled [ev:1].", claimType: "observed_fact", evidenceIds: ["ev:1"] };
-    const { events, calls, gates } = await runFinal({
-      personas: ["stockbot"],
-      reply: sessionGraphReply,
-      // The inventory passes the local check, so only the worker gates can reject the unsupported claim.
-      decide: () => ({ text: `${kept.text} ${unsupported.text}`, claims: [kept, unsupported] }),
-      gate: (body) => {
-        if (body.op !== "assess_final_claim") return { support_answer: "no" };
-        const claim = body.claim;
-        const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
-        return text === kept.text ? { support_answer: "yes" } : { support_answer: "no" };
-      },
-    });
-    // The reasoner gets no stream callback: raw deltas carry the inventory fence.
-    for (const c of calls) expect("onDelta" in c.input).toBe(false);
-    expect(gates.map((g) => g.op)).toEqual(["assess_final_claim", "assess_final_claim"]);
-    expect(answers(events)).toEqual([`${label("stockbot")}\n${kept.text}`]);
-    expect(events.filter((e) => e.type === "claims")).toEqual([{ type: "claims", claims: [kept] }]);
-    expect(JSON.stringify(events)).not.toContain("```");
-    expect(JSON.stringify(events)).not.toContain("Revenue doubled");
-  });
-
-  test("a bound grounded explanation passes; an unbound narrative answers the fixed line", async () => {
-    const bound: FinalClaim = { text: "Demand may rise [ev:1].", claimType: "inference", evidenceIds: ["ev:1"] };
-    const passed = await runFinal({
-      personas: ["stockbot"],
-      reply: sessionGraphReply,
-      decide: () => ({ text: bound.text, claims: [bound] }),
-    });
-    expect(answers(passed.events)).toEqual([`${label("stockbot")}\n${bound.text}`]);
-    // No inventory means no bound prose: the gates pass, but uncovered prose still drops and only the fixed line shows.
-    const unbound = await runFinal({
-      personas: ["stockbot"],
-      reply: sessionGraphReply,
-      decide: () => ({ text: "Revenue doubled [ev:1].", claims: [] }),
-    });
-    expectUndetermined(unbound.events);
-  });
-
-  test("a failed document read is a limitation, never evidence; only an inspected document backs a document claim", async () => {
-    const listing = { id: "ev:list", content: "form 10-Q accession 0001045810-26-000001 filed 2026-08-27" };
-    const document = { id: "ev:doc", content: "Revenue was $46.7 billion." };
-    const reply = (docOk: boolean) => (id: string): string => `${JSON.stringify({
-      ...JSON.parse(sessionGraphReply(id)),
-      evidence: docOk ? [listing, document] : [listing],
-      toolCalls: [
-        { tool: "search_sec_filings", ok: false, category: "reselect", error: "re-selecting" },
-        { tool: "list_sec_filings", ok: true, evidenceId: "ev:list" },
-        docOk ? { tool: "get_sec_document", ok: true, evidenceId: "ev:doc" } : { tool: "get_sec_document", ok: false, category: "timeout", error: "document read timed out" },
-      ],
-    })}\n`;
-    const unknown: FinalClaim = { text: "The 10-Q text was not retrieved.", claimType: "unknown", evidenceIds: [] };
-    const docFact = (row: string): FinalClaim => ({ text: `The 10-Q reports revenue of $46.7 billion [${row}].`, claimType: "observed_fact", evidenceIds: [row] });
-    // Stands in for the worker ledger proof: only the inspected document row backs the document fact.
-    const gate = (body: Record<string, unknown>): GateVerdict => {
-      const claim = body.claim;
-      if (typeof claim !== "object" || claim === null || !("claim_type" in claim) || !("evidence_ids" in claim)) return { support_answer: "no" };
-      const backed = claim.claim_type === "unknown" || (Array.isArray(claim.evidence_ids) && claim.evidence_ids.includes("ev:doc"));
-      return { support_answer: backed ? "yes" : "no" };
-    };
-    const listed = await runFinal({
-      personas: ["stockbot"], reply: reply(false), gate,
-      decide: () => ({ text: `${docFact("ev:list").text} ${unknown.text}`, claims: [docFact("ev:list"), unknown] }),
-    });
-    const input = listed.calls[0]?.input;
-    expect(input?.evidence.map((e) => e.id)).toEqual(["ev:list"]);
-    expect(input?.prompt).toContain('LIMITATIONS (failed retrievals: untrusted, not evidence, no citable id.');
-    expect(input?.prompt).toContain('- "get_sec_document" failed category="timeout" error="document read timed out"');
-    expect(input?.prompt).not.toContain("search_sec_filings");
-    expect(listed.events.filter((e) => e.type === "evidence").flatMap((e) => (e.type === "evidence" ? e.evidence.map((r) => r.id) : []))).toEqual(["ev:list"]);
-    expect(listed.gates[0]?.evidence).toEqual([listing]);
-    expect(listed.events.some((e) => e.type === "tool_failed" && e.tool === "get_sec_document")).toBe(true);
-    expect(answers(listed.events)).toEqual([`${label("stockbot")}\n${unknown.text}`]);
-    const read = await runFinal({
-      personas: ["stockbot"], reply: reply(true), gate,
-      decide: () => ({ text: docFact("ev:doc").text, claims: [docFact("ev:doc")] }),
-    });
-    expect(read.calls[0]?.input.evidence.map((e) => e.id)).toEqual(["ev:list", "ev:doc"]);
-    expect(read.calls[0]?.input.prompt).not.toContain("LIMITATIONS");
-    expect(answers(read.events)).toEqual([`${label("stockbot")}\n${docFact("ev:doc").text}`]);
-  });
-
-  test("a research answer with no cited claim ships the gated prose with no banner", async () => {
-    const { events } = await runFinal({
-      personas: ["bearbot"],
-      decide: () => ({ text: "The bearbot outlook is unknown.", claims: [{ text: "The bearbot outlook is unknown.", claimType: "unknown", evidenceIds: [] }] }),
-    });
-    expect(answers(events)).toEqual([`${label("bearbot")}\nThe bearbot outlook is unknown.`]);
-    expect(events.some((e) => e.type === "failed")).toBe(false);
-  });
-
-  test("a cited claim the gates delete leaves only the kept prose, with no banner", async () => {
-    const kept = "The bearbot outlook is unknown.";
-    const cut = "bearbot cited fact.";
-    const { events } = await runFinal({
-      personas: ["bearbot"],
-      decide: () => ({
-        text: `${kept} ${cut}`,
-        claims: [
-          { text: kept, claimType: "unknown", evidenceIds: [] },
-          { text: cut, claimType: "observed_fact", evidenceIds: ["ev:1"] },
-        ],
-      }),
-      gate: (body) => {
-        if (body.op !== "assess_final_claim") return { support_answer: "no" };
-        const claim = body.claim;
-        const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
-        return text === kept ? { support_answer: "yes" } : { support_answer: "no" };
-      },
-    });
-    const out = answers(events);
-    expect(out.length).toBe(1);
-    expect(out[0]).toStartWith(`${label("bearbot")}\n${kept}`);
-    expect(out[0]).not.toContain(cut);
-  });
-
-  test("all claims rejected answers only the runtime's fixed line, never model prose", async () => {
-    const { events } = await runFinal({
-      personas: ["bearbot"],
-      decide: () => ({ text: "bearbot claim here", claims: [{ text: "bearbot claim here", claimType: "inference", evidenceIds: ["ev:1"] }] }),
-      gate: () => ({ support_answer: "no" }),
-    });
-    expectUndetermined(events, "bearbot: all claims rejected");
-  });
-
-  test("support yes on insufficient evidence rejects the claim", async () => {
-    const { events } = await runFinal({
-      personas: ["bearbot"],
-      decide: () => ({ text: "bearbot claim here", claims: [{ text: "bearbot claim here", claimType: "inference", evidenceIds: ["ev:1"] }] }),
-      gate: () => ({ support_answer: "yes", evidence_state: "insufficient" }),
-    });
-    expectUndetermined(events, "bearbot: all claims rejected");
-  });
-
-  test("a non-proof gate error fails loud instead of reading as a rejection", async () => {
-    const { events } = await runFinal({
-      personas: ["bearbot"],
-      decide: () => ({ text: "bearbot claim here", claims: [{ text: "bearbot claim here", claimType: "inference", evidenceIds: ["ev:1"] }] }),
-      gate: () => ({ error: "decide: decision_request_failed: ECONNRESET" }),
-    });
-    expect(answers(events)).toEqual([]);
-    expect(events.find((e) => e.type === "failed")).toMatchObject({ message: expect.stringContaining("final gate unavailable") });
-  });
-
-  test("selected ticker rides every run body with the prompt verbatim", async () => {
-    const { bodies } = await runFinal({ ticker: "nvda" });
-    const runs = runBodies(bodies);
-    expect(runs.length).toBe(1);
-    expect(runs[0]?.prompt).toBe("q");
-    expect(runs[0]?.ticker).toBe("NVDA");
-  });
-
-  test("invalid ticker drops from the run body", async () => {
-    const { bodies } = await runFinal({ ticker: "SEC" });
-    const runs = runBodies(bodies);
-    expect(runs.length).toBe(1);
-    expect(runs[0]?.prompt).toBe("q");
-    expect("ticker" in (runs[0] ?? {})).toBe(false);
-  });
-
-  test("absent or invalid ticker never rides the run body", async () => {
-    for (const ticker of [undefined, "SEC", "1AB"]) {
-      const { bodies } = await runFinal(ticker !== undefined ? { ticker } : {});
-      const runs = runBodies(bodies);
-      expect(runs.length).toBe(1);
-      expect(runs[0]?.prompt).toBe("q");
-      expect("ticker" in (runs[0] ?? {})).toBe(false);
+  test("an in-scope, absent, or malformed verdict never substitutes an answer", () => {
+    for (const reply of [{ in_scope: true, answer: FIXED }, {}, { in_scope: false }, { in_scope: false, answer: "   " }, { in_scope: false, answer: 7 }, { in_scope: "false", answer: FIXED }]) {
+      expect(outOfScopeAnswer(reply)).toBeUndefined();
     }
   });
 
-  test("the run body keeps op, prompt, and deadline beside the ticker", async () => {
-    const { bodies } = await runFinal({ ticker: " brk.b " });
-    const runs = runBodies(bodies);
-    expect(runs.length).toBe(1);
-    expect(runs[0]?.op).toBe("run");
-    expect(runs[0]?.prompt).toBe("q");
-    expect(typeof runs[0]?.deadlineAt).toBe("number");
-    expect(runs[0]?.ticker).toBe("BRK.B");
-  });
-
-  test("limitations name an unresolved node by its question and the guard in words, never by internal id", async () => {
-    const { events } = await runFinal({ personas: ["stockbot"], reply: graphReply });
-    const done = events.at(-1);
-    expect(done).toMatchObject({ type: "done", status: "completed_with_limitations", limitations: ["Not fully answered: q", "Research stopped at its round limit."] });
-  });
-
-  test("watchlist rides the run body and replaces the selected ticker", async () => {
-    const { bodies } = await runFinal({ ticker: "nvda", watchlist: ["NVDA", "QQQ"] });
-    const runs = runBodies(bodies);
-    expect(runs.length).toBe(1);
-    expect(runs[0]?.watchlist).toEqual(["NVDA", "QQQ"]);
-    expect("ticker" in (runs[0] ?? {})).toBe(false);
-    expect(runs[0]?.prompt).toBe("q");
-  });
-
-  test("watchlist coverage reaches every persona prompt, failures disclosed, and an all-failed list never answers direct", async () => {
-    const rows = [
-      { symbol: "NVDA", source: "sec_filings", tool: "list_sec_filings", status: "ok", as_of: "2026-10-08", evidence_id: "ev:nvda" },
-      { symbol: "QQQ", source: "finra_threshold_list", tool: "get_threshold_securities", status: "no_records", error: "No data found for QQQ: thresholdList" },
-      { symbol: "AAPL", source: "finra_short_sale_volume", tool: "get_reg_sho_volume", status: "timeout", error: "intake_timeout" },
-      { symbol: 7, source: "junk", status: "ok" },
-    ];
-    const { calls } = await runFinal({
-      watchlist: ["NVDA", "QQQ", "AAPL"],
-      personas: ["stockbot"],
-      reply: (id) => `${JSON.stringify({ id, evidence: [], nodes: [], unresolved: [], toolCalls: [], needleDecisions: [], watchlist: rows })}\n`,
-    });
-    const prompt = calls[0]?.input.prompt ?? "";
-    expect(calls[0]?.input.direct).toBe(false);
-    expect(prompt).toContain("WATCHLIST COVERAGE");
-    expect(prompt).toContain("NVDA sec_filings ok as_of=2026-10-08 evidence=ev:nvda");
-    expect(prompt).toContain('QQQ finra_threshold_list no_records error="No data found for QQQ: thresholdList"');
-    expect(prompt).toContain('AAPL finra_short_sale_volume timeout error="intake_timeout"');
-    expect(prompt).not.toContain("junk");
-  });
-
-  test("default deadline sits one research wall in the future", async () => {
-    const before = Date.now();
-    const { bodies, runTimeouts } = await runFinal({});
-    const after = Date.now();
-    const first = Number(runBodies(bodies)[0]?.deadlineAt);
-    expect(first).toBeGreaterThanOrEqual(before + REQUEST_WALL_MS);
-    expect(first).toBeLessThanOrEqual(after + REQUEST_WALL_MS);
-    expect(runTimeouts[0]).toBeGreaterThan(REQUEST_WALL_MS - 5_000);
-  });
-
-  test("injected python and worker path reach the spawner", async () => {
-    const { spawns } = await runFinal({});
-    expect(spawns.length).toBe(1);
-    expect(spawns[0]).toEqual({ cmd: "py", args: ["w"] });
-  });
-
-  test("spawner-only deps use the injected spawner with the real repo worker", async () => {
-    const { spawns, bodies } = await runFinal({ spawnOnly: true });
-    expect(spawns.length).toBe(1);
-    expect(runBodies(bodies).length).toBe(1);
-    const worker = spawns[0]?.args[0] ?? "";
-    expect(worker.endsWith(join("app", "research", "kernel_worker.py"))).toBe(true);
-    expect(existsSync(worker)).toBe(true);
-    const python = spawns[0]?.cmd ?? "";
-    expect(python).toBe(join(worker, "..", "..", "..", "venv", "bin", "python"));
-  });
-
-  test("worker progress reaches the stream with detail only when the worker sent one", async () => {
-    const progressLines = (id: string): string =>
-      `${JSON.stringify({ type: "progress", id, stage: "p_bare" })}\n${JSON.stringify({ type: "progress", id, stage: "p_detail", detail: { calls: 3 } })}\n`;
-    const { events } = await runFinal({
-      reply: (id) => progressLines(id) + graphReply(id),
-    });
-    const progress = events.filter((e) => e.type === "progress" && (e.stage === "p_bare" || e.stage === "p_detail"));
-    expect(progress.length).toBe(2);
-    for (const e of progress) {
-      if (e.type !== "progress") throw new Error("expected progress");
-      if (e.stage === "p_bare") expect("detail" in e).toBe(false);
-      else expect(e.detail).toEqual({ calls: 3 });
-    }
-  });
-
-  test("validated chart context reaches the reasoner without changing research scope", async () => {
-    for (const [ticker, currentChartTicker, expected] of [
-      ["nvda", " brk.b ", "BRK.B"],
-      ["nvda", undefined, "NVDA"],
-      ["nvda", "SEC", "NVDA"],
-      [undefined, "msft", "MSFT"],
-      [undefined, "not a ticker", undefined],
-      [undefined, undefined, undefined],
-    ] as const) {
-      const { calls, bodies } = await runFinal({ ticker, currentChartTicker, personas: ["stockbot"], reply: sessionGraphReply });
-      expect(calls).toHaveLength(1);
-      expect(calls[0]?.input.ticker).toBe(expected);
-      if (expected === undefined) expect(calls[0]?.input).not.toHaveProperty("ticker");
-      const runs = runBodies(bodies);
-      expect(runs[0]?.ticker).toBe(ticker?.toUpperCase());
-      expect(runs[0]).not.toHaveProperty("currentChartTicker");
-    }
-  });
-
-  test("a feed context reaches every reasoner call and every worker run body", async () => {
-    const context: AskContext = { kind: "news", title: "NVDA jumps", source: "Stocktwits", sym: "NVDA", at: "2026-10-20T09:00:00Z" };
-    const { calls, bodies } = await runFinal({ ticker: "nvda", context, reply: (id) => sessionGraphReply(id, ["n1"]) });
-    expect(calls.length).toBeGreaterThan(0);
-    for (const call of calls) expect(call.input.context).toEqual(context);
-    expect(runBodies(bodies).length).toBeGreaterThan(0);
-    for (const body of runBodies(bodies)) expect(body).toMatchObject({ prompt: expect.not.stringContaining("NVDA jumps"), ticker: "NVDA", context });
-    const { calls: bare, bodies: bareBodies } = await runFinal({ ticker: "nvda", personas: ["stockbot"], reply: emptyReply });
-    expect(bare[0]?.input).not.toHaveProperty("context");
-    for (const body of runBodies(bareBodies)) expect(body).not.toHaveProperty("context");
-  });
-
-  test("chart progress updates every trio call after the research run without changing research scope", async () => {
-    const { events, calls, bodies } = await runFinal({
-      ticker: "nvda",
-      currentChartTicker: "aapl",
-      reply: (id) => `${JSON.stringify({ type: "progress", id, stage: "chart_update", detail: { ticker: " msft " } })}\n${sessionGraphReply(id, ["n1"])}`,
-    });
-    expect(events.filter((e) => e.type === "chart_update")).toEqual([{ type: "chart_update", ticker: "MSFT" }]);
-    expect(events.some((e) => e.type === "progress" && e.stage === "chart_update")).toBe(false);
-    expect(calls.map((c) => [c.input.persona, c.input.ticker])).toEqual([["bearbot", "MSFT"], ["bullbot", "MSFT"], ["stockbot", "MSFT"]]);
-    const runs = runBodies(bodies);
-    expect(runs).toHaveLength(1);
-    expect(runs[0]?.ticker).toBe("NVDA");
-    expect(events.some((e) => e.type === "failed")).toBe(false);
-  });
-
-  test("malformed chart progress and prose never replace the current chart context", async () => {
-    const details: unknown[] = [
-      undefined, null, [], "TSLA", 7, {}, { ticker: null }, { ticker: ["TSLA"] },
-      { ticker: 7 }, { ticker: "" }, { ticker: "SEC" }, { ticker: "1AB" },
-      { ticker: "switch to TSLA" }, { preview: '{"ticker":"TSLA"}' },
-    ];
-    const { events, calls } = await runFinal({
-      ticker: "nvda",
-      currentChartTicker: "aapl",
-      reply: (id) => details.map((detail) => `${JSON.stringify({ type: "progress", id, stage: "chart_update", detail })}\n`).join("")
-        + `${JSON.stringify({ type: "progress", id, stage: "tool_done", detail: { preview: '{"ticker":"TSLA"}' } })}\n`
-        + `${JSON.stringify({ id, chartTicker: "TSLA", evidence: [{ id: "ev:1", content: 'Chart updated to TSLA. {"ticker":"TSLA"}' }], toolCalls: [] })}\n`,
-    });
-    expect(events.filter((e) => e.type === "chart_update")).toEqual([]);
-    expect(events.filter((e) => e.type === "progress")).toEqual([
-      { type: "progress", stage: "tool_done", detail: { preview: '{"ticker":"TSLA"}' } },
-    ]);
-    expect(calls.map((c) => c.input.ticker)).toEqual(["AAPL", "AAPL", "AAPL"]);
-  });
-
-  test("widget progress relays only a canonical ticker and known widget type without changing chart context", async () => {
-    const details: unknown[] = [
-      { ticker: "AAPL", widgetType: "short-volume" },
-      undefined, null, [], "AAPL", 7, {},
-      { ticker: "AAPL" }, { widgetType: "short-volume" },
-      { ticker: "aapl", widgetType: "short-volume" },
-      { ticker: " AAPL ", widgetType: "short-volume" },
-      { ticker: "SEC", widgetType: "short-volume" },
-      { ticker: ["AAPL"], widgetType: "short-volume" },
-      { ticker: "AAPL", widgetType: "unknown" },
-      { ticker: "AAPL", widgetType: ["short-volume"] },
-      { ticker: "AAPL", widgetType: null },
-    ];
-    const { events, calls, bodies } = await runFinal({
-      ticker: "nvda",
-      currentChartTicker: "aapl",
-      reply: (id) => details.map((detail) => `${JSON.stringify({ type: "progress", id, stage: "widget_update", detail })}\n`).join("")
-        + `${sessionGraphReply(id)}`,
-    });
-    expect(events.filter((e) => e.type === "widget_update")).toEqual([
-      { type: "widget_update", ticker: "AAPL", widgetType: "short-volume" },
-    ]);
-    expect(events.some((e) => e.type === "progress" && e.stage === "widget_update")).toBe(false);
-    expect(calls.map((c) => c.input.ticker)).toEqual(["AAPL", "AAPL", "AAPL"]);
-    expect(runBodies(bodies)[0]?.ticker).toBe("NVDA");
-    expect(events.some((e) => e.type === "failed")).toBe(false);
-  });
-
-  test("watchlist answers omit chart context through chart updates and trio retries", async () => {
-    const { events, calls, bodies } = await runFinal({
-      ticker: "nvda",
-      currentChartTicker: "aapl",
-      watchlist: ["NVDA", "QQQ"],
-      reply: (id) => `${JSON.stringify({ type: "progress", id, stage: "chart_update", detail: { ticker: "msft" } })}\n${sessionGraphReply(id, ["n1"])}`,
-      decide: (persona, _pass, attempt) => (persona === "bearbot" && attempt === 1 ? new Error("retry draft") : {}),
-    });
-    expect(events.filter((e) => e.type === "chart_update")).toEqual([{ type: "chart_update", ticker: "MSFT" }]);
-    // Bear draft fails once and retries, then the synthesis: four calls.
-    expect(calls).toHaveLength(4);
-    for (const call of calls) expect(call.input).not.toHaveProperty("ticker");
-    const runs = runBodies(bodies);
-    expect(runs).toHaveLength(1);
-    for (const run of runs) {
-      expect(run.watchlist).toEqual(["NVDA", "QQQ"]);
-      expect(run).not.toHaveProperty("ticker");
-    }
-    expect(events.some((e) => e.type === "failed")).toBe(false);
-  });
-
-  test("applyFinalGates treats worker error as reject and deletes surgically", async () => {
-    const ev = [{ id: "ev:1", source: "kernel", retrievedAt: "t", content: "fact" }];
-    const gated = await applyFinalGates({
-      results: [{ persona: "bearbot", prose: "KEEP. CUT. Uncovered.", claims: [{ text: "KEEP", claimType: "inference", evidenceIds: ["ev:1"] }, { text: "CUT", claimType: "inference", evidenceIds: ["ev:1"] }] }],
-      evidence: ev,
-      personaOrder: ["bearbot"],
-      gate: async (body) => {
-        const claim = body.claim;
-        const text = typeof claim === "object" && claim !== null && "text" in claim ? claim.text : undefined;
-        return text === "KEEP" ? { support_answer: "yes" } : { error: "boom" };
-      },
-    });
-    if (!("text" in gated)) throw new Error("expected gated text");
-    expect(gated.text).toContain("KEEP");
-    expect(gated.text).not.toContain("CUT");
-  });
-
-  // Scripted gate replies for the parallel-gate tests: each claim (`<persona>-c<j>`) has its own verdict.
-  type GateScript = "yes" | "no" | "error" | "throw";
-  const gateEvidence = [{ id: "ev:1", source: "kernel", retrievedAt: "t", content: "fact" }];
-  const scriptedReply = async (v: GateScript) => {
-    if (v === "throw") throw new Error("down");
-    return v === "error" ? { error: "boom" } : { support_answer: v };
-  };
-  const scriptKey = (body: Record<string, unknown>): string => {
-    const claim = body.claim;
-    return typeof claim === "object" && claim !== null && "text" in claim ? String(claim.text) : String(body.persona);
-  };
-  const gateResults = (personas: readonly Persona[], claimCounts: readonly number[], defectAt?: number) =>
-    personas.map((p, i) => {
-      const claims: FinalClaim[] = Array.from({ length: claimCounts[i] ?? 0 }, (_, j) => ({
-        text: `${p}-c${j}`, claimType: "inference", evidenceIds: [defectAt === i && j === 0 ? "ev:9" : "ev:1"],
-      }));
-      return { persona: p, prose: `${p} lead.\n${claims.map((c) => c.text).join("\n")}`, claims };
-    });
-
-  test("applyFinalGates checks every persona and every rejected claim concurrently", async () => {
-    let inFlight = 0;
-    let maxInFlight = 0;
-    const ops: string[] = [];
-    const gate: FinalGateCaller = async (body) => {
-      ops.push(String(body.op));
-      inFlight += 1;
-      maxInFlight = Math.max(maxInFlight, inFlight);
-      await Promise.resolve();
-      inFlight -= 1;
-      return scriptedReply(scriptKey(body).endsWith("-c0") ? "yes" : "no");
-    };
-    const personas: Persona[] = ["bearbot", "bullbot", "stockbot"];
-    const gated = await applyFinalGates({ results: gateResults(personas, [2, 2, 2]), evidence: gateEvidence, personaOrder: personas, gate });
-    // The reject drops each uncovered lead sentence and each rejected claim.
-    if (!("text" in gated)) throw new Error("expected gated text");
-    expect(gated).toEqual({
-      text: personas.map((p) => `${label(p)}\n${p}-c0`).join("\n\n"),
-      supported: personas.flatMap((p) => [{ text: `${p}-c0`, claimType: "inference", evidenceIds: ["ev:1"] }]),
-      partial: true,
-    });
-    // All six claim checks run in flight together.
-    expect(ops).toEqual(Array.from({ length: 6 }, () => "assess_final_claim"));
-    expect(maxInFlight).toBe(6);
-  });
-
-  test("property: parallel final gates give the serial verdict under any completion order", async () => {
-    const script = fc.constantFrom<GateScript>("yes", "no", "error", "throw");
-    await fc.assert(
-      fc.asyncProperty(
-        fc.subarray([...FINAL_PERSONAS], { minLength: 1 }),
-        fc.array(fc.array(script, { maxLength: 3 }), { minLength: 3, maxLength: 3 }),
-        fc.option(fc.nat(2), { nil: undefined }),
-        fc.array(fc.nat(6), { minLength: 16, maxLength: 16 }),
-        async (personas, claimScripts, defectAt, ticks) => {
-          const verdicts = new Map<string, GateScript>();
-          personas.forEach((p) => {
-            (claimScripts[personas.indexOf(p)] ?? []).forEach((v, j) => verdicts.set(`${p}-c${j}`, v));
-          });
-          const replyFor = (body: Record<string, unknown>) => scriptedReply(verdicts.get(scriptKey(body)) ?? "yes");
-          // Serial reference: one gate call at a time, in issue order.
-          let chain: Promise<unknown> = Promise.resolve();
-          const serial: FinalGateCaller = (body) => {
-            const next = chain.then(() => replyFor(body));
-            chain = next.catch(() => undefined);
-            return next;
-          };
-          // Shuffled completion: each call settles after a scripted number of microtask ticks.
-          let n = 0;
-          const shuffled: FinalGateCaller = async (body) => {
-            const wait = ticks[n++ % ticks.length] ?? 0;
-            for (let t = 0; t < wait; t++) await Promise.resolve();
-            return replyFor(body);
-          };
-          const results = gateResults(personas, claimScripts.map((c) => c.length), defectAt);
-          const run = (gate: FinalGateCaller) => applyFinalGates({ results, evidence: gateEvidence, personaOrder: personas, gate });
-          expect(await run(shuffled)).toEqual(await run(serial));
-        },
-      ),
-      { seed: 20261019, numRuns: 200 },
-    );
-  });
 });
 
-describe("runKernelAgent worker replies", () => {
-  // Deterministic reasoner: no test in this block may reach a provider.
-  async function runAgent(
-    events: AgentEvent[],
-    spawnFn: KernelSpawn,
-    personas?: readonly Persona[],
-  ): Promise<void> {
-    process.env.OPENCODE_MODEL = "test-model";
-    await runKernelAgent("q", (e) => { events.push(e); }, {
-      ...(personas ? { personas } : {}),
-      deps: {
-        python: "py",
-        workerPath: "w",
-        spawnFn,
-        reason: async (o: KernelReasonInput): Promise<KernelReasonResult> => ({ prose: `${o.persona} answer`, usage: {}, claims: [{ text: `${o.persona} answer`, claimType: "inference", evidenceIds: o.evidence.map((e) => e.id) }] }),
-      },
-    });
-  }
-  // Gate ops pass (the reasoner answers carry no datapoints); every other op gets the scripted reply.
-  function scriptedWorker(reply: (id: string) => string): KernelSpawn {
-    return (): KernelChild => {
-      const child = new FakeChild();
-      child.reply = (id) => {
-        const body = JSON.parse(child.written.at(-1) ?? "{}") as { op?: string };
-        return body.op?.startsWith("assess_final") ? `${JSON.stringify({ id, support_answer: "yes" })}\n` : reply(id);
-      };
-      queueMicrotask(() => child.emitStdout('{"type":"ready"}\n'));
-      return child;
+const source: Evidence = { id: "ev:1", source: "sec", retrievedAt: "2026-11-05", content: "Demand held. Costs rose." };
+const fact = (text: string): FinalClaim => ({ text, claimType: "observed_fact", evidenceIds: [source.id] });
+async function research(options: {
+  asOf?: string;
+  prose?: string;
+  claims?: FinalClaim[];
+  evidence?: Evidence;
+  proof?: unknown;
+  toolError?: boolean;
+  reasonError?: boolean;
+  schemaFailure?: "missing" | "unavailable";
+} = {}) {
+  const events: AgentEvent[] = [];
+  const bodies: Record<string, unknown>[] = [];
+  const calls: KernelReasonInput[] = [];
+  const spawnFn: KernelSpawn = () => {
+    const child = new FakeChild();
+    child.reply = (id) => {
+      const body = JSON.parse(child.written.at(-1)!);
+      bodies.push(body);
+      const reply = body.op === "open_research" ? { sessionId: "rs:1", tools: ["search_web", "get_sec_document"] }
+        : body.op === "research_tool" ? { ok: !options.toolError, summary: "[ev:1] Demand held. Costs rose.", evidence: [options.evidence ?? source], ...(options.toolError ? { error: "Source unavailable." } : {}) }
+          : body.op === "prove_claims" ? options.proof ?? { verdicts: body.claims.map((claim: Record<string, unknown>) => ({ claim_type: claim.claim_type, support_answer: "yes", support: 1 })) }
+            : { error: "Unexpected op." };
+      return JSON.stringify({ id, ...reply }) + "\n";
     };
-  }
-  function doneOf(events: AgentEvent[]): Metrics {
-    const last = events.at(-1);
-    if (last?.type !== "done") throw new Error("expected done last");
-    return last.metrics;
-  }
-  function toolFailedOf(events: AgentEvent[]): [string, string] {
-    const e = events.find((x) => x.type === "tool_failed");
-    return e?.type === "tool_failed" ? [e.tool, e.category] : ["(none)", "(none)"];
-  }
-
-  test("a worker that dies before ready ends at done with the needle failure shape", async () => {
-    const events: AgentEvent[] = [];
-    const spawnFn = (): KernelChild => {
-      const child = new FakeChild();
-      queueMicrotask(() => child.emitExit());
-      return child;
-    };
-    await runAgent(events, spawnFn);
-    expect(events.map((e) => e.type)).toEqual(["agent_start", "status", "tool_failed", "failed", "done"]);
-    expect(toolFailedOf(events)).toEqual(["needle", "provider_error"]);
-    const failed = events.find((e) => e.type === "failed");
-    expect(failed?.type === "failed" ? failed.category : "").toBe("provider_error");
-    expect(failed?.type === "failed" ? failed.message : "").toContain("kernel worker exited");
-    const metrics = doneOf(events);
-    expect(metrics.failures).toEqual({ provider_error: 1 });
-    expect(metrics.needle).toEqual({ calls: 0, totalMs: 0, escalations: 1 });
-    expect(metrics.tools).toEqual({ calls: 0, totalMs: 0 });
-    expect(metrics.muse).toEqual({ calls: 0, totalMs: 0 });
-    expect(metrics.evidence).toEqual({ count: 0, characters: 0 });
-  });
-
-  test("a worker-level error ends the report with merged evidence and worker tallies", async () => {
-    const events: AgentEvent[] = [];
-    const reply = (id: string): string => `${JSON.stringify({
-      id,
-      sessionId: "rs:err",
-      objective: "q",
-      error: "unknown session",
-      evidence: [{ id: "ev:1", content: "fact" }, { id: "ev:1", content: "fact again" }],
-      nodes: [],
-      decisions: [],
-      unresolved: [],
-      toolExecutions: [{ step: 1, tool: "list_sec_filings", arguments: {}, confidence: null }],
-      toolCalls: [{ tool: "list_sec_filings", ok: true, evidenceId: "ev:1" }],
-      failures: { tool_error: 2 },
-      escalations: 3,
-      escalated: false,
-    })}\n`;
-    await runAgent(events, scriptedWorker(reply));
-    // The error ends the report before any tool replay, and the duplicate evidence
-    // row contributes one row and one character budget.
-    expect(events.map((e) => e.type)).toEqual(["agent_start", "status", "evidence", "tool_failed", "failed", "done"]);
-    const evidence = events[2];
-    expect(evidence?.type === "evidence" ? evidence.evidence.map((e) => e.content) : []).toEqual(["fact"]);
-    expect(evidence?.type === "evidence" ? evidence.sessionId : undefined).toBe("rs:err");
-    const metrics = doneOf(events);
-    expect(metrics.evidence).toEqual({ count: 1, characters: 4 });
-    expect(metrics.needle).toEqual({ calls: 1, totalMs: 0, escalations: 4 });
-    expect(metrics.tools.calls).toBe(1);
-    expect(metrics.muse.calls).toBe(0);
-    expect(metrics.failures).toEqual({ tool_error: 2, provider_error: 1 });
-  });
-
-  test("a terminal result ends the report once and never repeats a disclosed tool failure", async () => {
-    const cases = [
-      {
-        calls: [{ tool: "list_sec_filings", ok: false, category: "tool_error", error: "boom" }],
-        terminal: { category: "timeout", message: "research deadline passed" },
-        flow: ["agent_start", "status", "evidence", "tool_start", "tool_result", "tool_failed", "failed", "done"],
-        disclosed: ["list_sec_filings", "tool_error"],
+    queueMicrotask(() => child.emitStdout('{"type":"ready"}\n'));
+    return child;
+  };
+  await runKernelAgent("Explain NVDA", (event) => events.push(event), {
+    ticker: "NVDA", asOf: options.asOf, deps: {
+      spawnFn, describeTools: async () => {
+        if (options.schemaFailure === "unavailable") throw new Error("Schema bridge unavailable.");
+        if (options.schemaFailure === "missing") return [{ name: "get_sec_document" }];
+        return [{ name: "get_sec_document" }, { name: "call_tool" }, { name: "search_web" }];
       },
-      {
-        calls: [],
-        terminal: { category: "policy_denied", message: "denied by policy" },
-        flow: ["agent_start", "status", "evidence", "tool_failed", "failed", "done"],
-        disclosed: ["worker", "policy_denied"],
+      reason: async (input) => {
+        calls.push(input);
+        expect(await input.runTool!("not_offered", {})).toContain("not available");
+        expect(await input.runTool!("call_tool", {})).toBe("error: call_tool is not available in research");
+        const text = await input.runTool!("get_sec_document", { limit: 999999, accession: "x" });
+        expect(text).toContain(options.toolError ? "Source unavailable" : "ev:1");
+        if (options.reasonError) { input.usage!.providerCalls = 3; throw new Error("Provider unavailable."); }
+        const prose = options.prose ?? "Demand held. Costs rose.";
+        input.onDelta?.(prose);
+        return { prose, claims: options.claims ?? [fact("Demand held."), fact("Costs rose.")], usage: { providerCalls: 2 } };
       },
-    ] as const;
-    for (const c of cases) {
-      const events: AgentEvent[] = [];
-      const reply = (id: string): string => `${JSON.stringify({
-        id,
-        sessionId: "rs:terminal",
-        objective: "q",
-        evidence: [{ id: "ev:1", content: "fact" }],
-        nodes: [],
-        decisions: [],
-        unresolved: [],
-        toolExecutions: [],
-        toolCalls: c.calls,
-        failures: {},
-        escalations: 0,
-        escalated: false,
-        terminal: c.terminal,
-      })}\n`;
-      await runAgent(events, scriptedWorker(reply));
-      expect(events.map((e) => e.type)).toEqual([...c.flow]);
-      expect(toolFailedOf(events)).toEqual([...c.disclosed]);
-      const failed = events.find((e) => e.type === "failed");
-      expect(failed?.type === "failed" ? [failed.category, failed.message] : []).toEqual([c.terminal.category, c.terminal.message]);
-      const metrics = doneOf(events);
-      expect(metrics.failures[c.terminal.category]).toBe(1);
-      expect(metrics.tools.calls).toBe(c.calls.length);
-      expect(metrics.evidence.count).toBe(1);
     }
   });
-
-  test("call replay shows evidence previews, re-selections, disclosed failures, and redacted arguments", async () => {
-    const events: AgentEvent[] = [];
-    const long = "x".repeat(2500);
-    const reply = (id: string): string => `${JSON.stringify({
-      id,
-      sessionId: "rs:calls",
-      objective: "q",
-      evidence: [{ id: "ev:1", content: "filing text" }],
-      nodes: [],
-      decisions: [],
-      unresolved: [],
-      incomplete_guard: false,
-      toolExecutions: [
-        { step: 7, tool: "list_sec_filings", arguments: { api_key: "sk-secret", symbol: "NVDA", nested: { token: "t" }, list: ["a"], long, scalar: 3, nothing: null, flag: true }, confidence: 0.5 },
-        { tool: "get_quote", arguments: {} },
-        { tool: "get_news", arguments: {} },
+  return { events, bodies, calls };
+}
+describe("native research and deterministic proof", () => {
+  test("the research cutoff reaches open_research unchanged and stays absent by default", async () => {
+    const asOf = "2026-01-03T00:00:00+00:00";
+    expect((await research({ asOf })).bodies[0]).toMatchObject({ op: "open_research", asOf });
+    expect((await research()).bodies[0]).not.toHaveProperty("asOf");
+  });
+  test("one session and one worker op per offered tool call", async () => {
+    const { events, bodies, calls } = await research();
+    expect(bodies.map((body) => body.op)).toEqual(["open_research", "research_tool", "prove_claims"]);
+    expect(bodies[1]).toMatchObject({ sessionId: "rs:1", tool: "get_sec_document", arguments: { limit: 12000, accession: "x" } });
+    expect(calls).toHaveLength(1);
+    expect(events.find((event) => event.type === "evidence")).toMatchObject({ evidence: [source], sessionId: "rs:1" });
+    expect(events.at(-1)).toMatchObject({ status: "completed", metrics: { needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 1 }, muse: { calls: 1, providerCalls: 2 } } });
+    expect(bodies[2]).toMatchObject({ claims: [{ text: "Demand held.", claim_type: "observed_fact", evidence_ids: ["ev:1"] }, { text: "Costs rose.", claim_type: "observed_fact", evidence_ids: ["ev:1"] }] });
+  });
+  test("offered schemas exactly follow the worker's loop-safe names and order", async () => {
+    const { calls, bodies } = await research();
+    expect(calls[0]?.tools).toEqual([{ name: "search_web" }, { name: "get_sec_document" }]);
+    expect(bodies.filter((body) => body.op === "research_tool").map((body) => body.tool)).toEqual(["get_sec_document"]);
+  });
+  test("missing schemas and schema outages fail without starting the model", async () => {
+    for (const schemaFailure of ["missing", "unavailable"] as const) {
+      const { calls, bodies, events } = await research({ schemaFailure });
+      expect(calls).toEqual([]);
+      expect(bodies.map((body) => body.op)).toEqual(["open_research"]);
+      expect(events.find((event) => event.type === "failed")).toMatchObject({ category: "provider_error" });
+      expect(events.at(-1)).toMatchObject({ status: "failed" });
+    }
+  });
+  test("a claim that states a cited row's own datapoint value binds that datapoint", async () => {
+    const filing: Evidence = {
+      id: "ev:2", source: "sec", retrievedAt: "2026-11-05", content: "filed_at: 2026-11-03 (Apple Inc.)",
+      datapoints: [{ id: "dp:filed", metric: "filed_at", value: "2026-11-03", entity: "Apple Inc.", period: "2026-11-03", statement: "filed_at: 2026-11-03" }],
+    };
+    const claim: FinalClaim = { text: "Apple Inc. filed_at 2026-11-03.", claimType: "observed_fact", evidenceIds: ["ev:2"] };
+    const { bodies } = await research({ evidence: filing, prose: claim.text, claims: [claim] });
+    const proof = bodies.find((body) => body.op === "prove_claims");
+    expect(proof?.claims).toMatchObject([{ datapoint_ids: ["dp:filed"] }]);
+  });
+  test("a cited row never binds a value the claim does not state", async () => {
+    const filing: Evidence = {
+      id: "ev:2", source: "sec", retrievedAt: "2026-11-05", content: "Revenue 96,221 for the quarter.",
+      datapoints: [{ id: "dp:rev", metric: "Revenue", value: "96,221", entity: "NVDA", period: "Q3", statement: "Revenue 96,221" }],
+    };
+    const claim: FinalClaim = { text: "Demand held.", claimType: "observed_fact", evidenceIds: ["ev:2"] };
+    const { bodies } = await research({ evidence: filing, prose: claim.text, claims: [claim] });
+    const proof = bodies.find((body) => body.op === "prove_claims");
+    expect(proof?.claims).not.toMatchObject([{ datapoint_ids: expect.anything() }]);
+  });
+  test("two datapoints sharing a stated value keep the one the sentence names", async () => {
+    // A filing date and a period can carry the same value. The proof rejects a number bound to several
+    // datapoints, so the claim keeps the one its metric word names and drops the other.
+    const filing: Evidence = {
+      id: "ev:2", source: "sec", retrievedAt: "2026-11-05", content: "10-K filed 2026-11-03.",
+      datapoints: [
+        { id: "dp:filed", metric: "filed_at", value: "2026-11-03", entity: "Apple Inc.", period: "2026-11-03", statement: "filed_at: 2026-11-03" },
+        { id: "dp:period", metric: "report_period", value: "2026-11-03", entity: "Apple Inc.", period: "2026-11-03", statement: "report_period: 2026-11-03" },
       ],
-      toolCalls: [
-        { tool: "list_sec_filings", ok: true, evidenceId: "ev:1" },
-        { tool: "get_quote", ok: false, category: "reselect", error: "unknown symbol" },
-        { tool: "get_news", ok: false, category: "timeout", error: "slow" },
-      ],
-      failures: {},
-      escalations: 0,
-      escalated: false,
-    })}\n`;
-    await runAgent(events, scriptedWorker(reply), ["stockbot"]);
-    const flow = events
-      .filter((e) => e.type === "needle_decision" || e.type === "tool_start" || e.type === "tool_result" || e.type === "tool_failed")
-      .map((e) => e.type);
-    expect(flow).toEqual([
-      "needle_decision", "tool_start", "tool_result",
-      "needle_decision", "tool_start", "tool_result",
-      "needle_decision", "tool_start", "tool_result", "tool_failed",
-    ]);
-    const decisions = events.filter((e) => e.type === "needle_decision");
-    const first = decisions[0];
-    if (first?.type !== "needle_decision") throw new Error("expected a decision event");
-    expect(first.step).toBe(7);
-    expect(first.confidence).toBe(0.5);
-    // Secrets redact by key norm, nested and array values survive, and a long
-    // string argument truncates at the argument budget.
-    expect(first.arguments).toEqual({
-      api_key: "[REDACTED]",
-      symbol: "NVDA",
-      nested: { token: "[REDACTED]" },
-      list: ["a"],
-      long: "x".repeat(2000),
-      scalar: 3,
-      nothing: null,
-      flag: true,
+    };
+    const claim: FinalClaim = {
+      text: "Apple Inc. filed_at 2026-11-03.", claimType: "observed_fact", evidenceIds: ["ev:2"],
+      datapointIds: ["dp:filed", "dp:period"],
+    };
+    const { bodies } = await research({ evidence: filing, prose: claim.text, claims: [claim] });
+    const proof = bodies.find((body) => body.op === "prove_claims");
+    expect(proof?.claims).toMatchObject([{ datapoint_ids: ["dp:filed"] }]);
+  });
+  test("proof rejection removes its sentence and replaces the streamed draft", async () => {
+    const { events } = await research({
+      proof: {
+        verdicts: [
+          { claim_type: "observed_fact", support_answer: "yes", support: 1 },
+          { claim_type: "observed_fact", support_answer: "no", support: 0, error: "proof: unsupported" },
+        ]
+      }
     });
-    expect(decisions[1]?.type === "needle_decision" ? decisions[1].step : -1).toBe(1);
-    expect(decisions[2]?.type === "needle_decision" ? decisions[2].confidence : "unset").toBeNull();
-    const results = events.filter((e) => e.type === "tool_result");
-    expect(results[0]?.type === "tool_result" ? [results[0].evidenceId, results[0].preview] : []).toEqual(["ev:1", "filing text"]);
-    expect(results[1]?.type === "tool_result" ? results[1].preview : "").toBe("unknown symbol");
-    expect(results[1]?.type === "tool_result" ? "evidenceId" in results[1] : true).toBe(false);
-    expect(results[2]?.type === "tool_result" ? results[2].preview : "").toBe("slow");
-    expect(toolFailedOf(events)).toEqual(["get_news", "timeout"]);
-    expect(events.some((e) => e.type === "failed")).toBe(false);
+    expect(events.findLast((event) => event.type === "answer_partial")).toMatchObject({ text: "Demand held.", claims: [fact("Demand held.")] });
+    expect(events.at(-1)).toMatchObject({ status: "completed_with_limitations" });
   });
-});
-
-describe("kernel persona selection", () => {
-  // One scripted worker per run: op:run answers with a one-row session graph,
-  // and every gate passes. Every worker body and reasoner call is recorded.
-  function trioDeps(bodies: Record<string, unknown>[], calls: KernelReasonInput[]) {
-    const spawnFn: KernelSpawn = (): KernelChild => {
-      const child = new FakeChild();
-      child.reply = (id) => {
-        const body = JSON.parse(child.written.at(-1) ?? "{}") as Record<string, unknown>;
-        bodies.push(body);
-        if (typeof body.op === "string" && body.op.startsWith("assess_final")) return `${JSON.stringify({ id, support_answer: "yes" })}\n`;
-        return `${JSON.stringify({ id, objective: "q", sessionId: "rs:trio", evidence: [{ id: "ev:1", content: "fact" }], nodes: [{ node_id: "n1", question: "q", status: "resolved", depends_on: [] }], decisions: [], unresolved: [], incomplete_guard: false, toolExecutions: [], toolCalls: [], failures: {}, escalations: 0, escalated: false })}\n`;
-      };
-      queueMicrotask(() => child.emitStdout('{"type":"ready"}\n'));
-      return child;
-    };
-    return {
-      python: "py", workerPath: "w", spawnFn,
-      reason: async (o: KernelReasonInput): Promise<KernelReasonResult> => {
-        calls.push(o);
-        return { prose: `${o.persona} view`, usage: {}, claims: [{ text: `${o.persona} view`, claimType: "inference", evidenceIds: ["ev:1"] }] };
-      },
-    };
-  }
-  const doneOf = (events: AgentEvent[]): Metrics => {
-    const last = events.at(-1);
-    if (last?.type !== "done") throw new Error("expected done last");
-    return last.metrics;
-  };
-
-  test("a default research run calls stockbot once", async () => {
-    process.env.OPENCODE_MODEL = "test-model";
-    const events: AgentEvent[] = [];
-    const calls: KernelReasonInput[] = [];
-    await runKernelAgent("q", (e) => { events.push(e); }, { deps: trioDeps([], calls) });
-    expect(calls.map((c) => c.persona)).toEqual(["stockbot"]);
-    expect(events.slice(-3).map((e) => e.type)).toEqual(["answer_delta", "claims", "done"]);
-    expect(doneOf(events).muse.calls).toBe(1);
+  test("uncovered prose cannot ride beside supported claims", async () => {
+    const { events } = await research({ claims: [fact("Demand held.")] });
+    expect(events.findLast((event) => event.type === "answer_partial")).toMatchObject({ text: "Demand held." });
   });
-
-  test("an explicit bull and bear selection runs the trio", async () => {
-    process.env.OPENCODE_MODEL = "test-model";
-    const events: AgentEvent[] = [];
-    const calls: KernelReasonInput[] = [];
-    await runKernelAgent("Give me the bull and bear case on NVDA", (e) => { events.push(e); }, { personas: FINAL_PERSONAS, reasoningEffort: "low", deps: trioDeps([], calls) });
-    expect(calls.map((c) => c.persona)).toEqual(["bearbot", "bullbot", "stockbot"]);
-    expect(calls.map((c) => c.reasoningEffort)).toEqual(["low", "low", "low"]);
-    expect(doneOf(events).muse.calls).toBe(3);
+  test("all rejections replace the draft with the fixed unknown answer", async () => {
+    const { events } = await research({ claims: [fact("Demand held.")], proof: { verdicts: [{ claim_type: "observed_fact", support_answer: "no", error: "proof: unsupported" }] } });
+    expect(events.findLast((event) => event.type === "answer_partial")).toMatchObject({ text: "I couldn't determine this from the retrieved sources.", claims: [] });
+    expect(events.at(-1)).toMatchObject({ status: "completed_with_limitations" });
+  });
+  test("malformed proof replies and proof outages fail closed", async () => {
+    for (const proof of [{}, { verdicts: [] }, { verdicts: [null, null] }, { verdicts: [{ support_answer: "yes" }, {}] }, { verdicts: [{ claim_type: "observed_fact", support_answer: "yes", error: "database unavailable" }, {}] }]) {
+      const { events } = await research({ proof });
+      expect(events.some((event) => event.type === "claims")).toBe(false);
+      expect(events.at(-1)).toMatchObject({ status: "failed" });
+    }
+  });
+  test("provider failure retains usage and the failure shape", async () => {
+    const { events } = await research({ reasonError: true });
+    expect(events.find((event) => event.type === "failed")).toMatchObject({ category: "provider_error", message: "Provider unavailable." });
+    expect(events.at(-1)).toMatchObject({ metrics: { muse: { providerCalls: 3 } }, status: "failed" });
+  });
+  test("tool limitations publish a checked snapshot", async () => {
+    const { events } = await research({ toolError: true });
+    expect(events.findLast((event) => event.type === "answer_partial")).toMatchObject({ text: "Demand held. Costs rose." });
+    expect(events.at(-1)).toMatchObject({ status: "completed_with_limitations", limitations: expect.arrayContaining(["Source unavailable."]) });
+  });
+  test("section labels survive when their bodies contain supported claims", async () => {
+    const prose = "── Bearbot ──\nCosts rose.\n\n── Bullbot ──\nDemand held.\n\n── Stockbot ──\nDemand held.";
+    const { events } = await research({ prose });
+    const final = events.findLast((event) => event.type === "answer_partial");
+    if (final?.type === "answer_partial") expect(final.text).toBe(prose);
+    expect(events.at(-1)).toMatchObject({ status: "completed" });
+  });
+  test("property: unknown evidence ids never enter proof", () => {
+    fc.assert(fc.property(fc.array(fc.constantFrom("ev:1", "ev:missing"), { minLength: 1 }), (evidenceIds) => {
+      const defect = inventoryDefect("Demand held.", [{ ...fact("Demand held."), evidenceIds }], new Set(["ev:1"]), new Map());
+      expect(defect === undefined).toBe(evidenceIds.every((id) => id === "ev:1"));
+    }), { seed: 20261105 });
+  });
+  test("property: uncovered sentences never publish", () => {
+    fc.assert(fc.property(fc.array(fc.boolean(), { minLength: 1, maxLength: 12 }), (keep) => {
+      const sentences = keep.map((_, index) => `Fact ${index}.`);
+      const kept = sentences.filter((_, index) => keep[index]).map(fact);
+      const shown = dropUncovered(sentences.join("\n"), kept);
+      for (const [index, sentence] of sentences.entries()) expect(shown.includes(sentence)).toBe(keep[index]!);
+    }), { seed: 20261105 });
   });
 });

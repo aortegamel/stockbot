@@ -1,9 +1,8 @@
 """Retired live-research loop (deterministic test helper only).
 
-Production research runs the kernel scheduler path: needle harness +
-runKernelAgent + kernel_worker + scheduler.run_node (see
-scripts/verify_agent_scenarios.py). This module's sequential
-in-process loop (source job -> fetch -> freeze -> trio -> gate) stays only
+Production research runs the native tool loop: needle harness +
+runKernelAgent + kernel_worker + tool_runner. This module's sequential
+in-process loop (source job -> fetch -> freeze -> gate) stays only
 because deterministic unit tests pin its step behavior; it must not gain new
 production callers.
 Records built here with record_kind=='evidence' are candidate/materialized
@@ -2935,8 +2934,8 @@ def run_live(
 ) -> dict[str, object]:
     """Retired production entrypoint (deterministic test helper only).
 
-    Live evals run the production kernel path (kernel scheduler + JEV +
-    Needle + tool runtime; see scripts/verify_agent_scenarios.py). This in-process
+    Live evals run the native research loop (kernel worker + JEV + Needle +
+    tool runtime). This in-process
     loop must not gain new callers. Waves run sequentially while
     ``decide_next_wave`` authorizes them; ``interrupt_after`` stops early at a
     named boundary.

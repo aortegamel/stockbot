@@ -1,20 +1,25 @@
 """Bounded kernel research runs over a thesis trigger (stdlib + PyYAML only).
 
-Automated monitoring runs the shared graph fan-out per pending trigger
-(app/research/kernel_worker.py run_graph_prompt + scheduler.run): the runner
-only selects the trigger, builds a small bounded prompt, runs the shared
-helper in-process, and acknowledges the stable trigger ID only once a
-durable trigger-linked journal entry exists. A failed run (or a run with no
-such journal) leaves the trigger pending with valid partial tool writes
-intact (at-least-once retry; no rollback).
+Automated monitoring calls the agent API's native research loop per pending trigger.
+The runner acknowledges the stable trigger ID only after the stream reports done
+and a durable trigger-linked journal entry exists. A failed run leaves the trigger
+pending with valid partial tool writes intact (at-least-once retry, no rollback).
 """
 
 from __future__ import annotations
 
 import json
+import math
+import os
+import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from http.client import HTTPConnection, HTTPException, HTTPSConnection
+from socket import SHUT_RDWR, socket
+from threading import Timer
+from urllib.parse import urlsplit
 
 from app.policy import Capability
 from app.storage.ids import run_id as new_run_id
@@ -211,15 +216,64 @@ def _fail(run_id: str, exc: Exception) -> None:
         pass
 
 
-def _default_run_kernel(prompt: str, *, as_of: str | None) -> None:
-    """Run the shared graph fan-out for a trigger prompt (same path as the worker)."""
-    import asyncio
+def _stop_research_stream(sock: socket) -> None:
+    """Interrupt a stalled read when the total research deadline expires."""
+    with suppress(OSError):
+        sock.shutdown(SHUT_RDWR)
 
-    from app.research import scheduler
-    from app.research.kernel_worker import run_graph_prompt
 
-    sid = run_graph_prompt(prompt, as_of)
-    asyncio.run(scheduler.run(sid))
+def _default_run_kernel(
+    prompt: str,
+    *,
+    as_of: str | None,
+    transport: Callable[..., HTTPConnection] | None = None,
+) -> None:
+    """Wait for the native research loop. Failed or incomplete streams raise."""
+    base = os.environ.get("STOCKBOT_AGENT_API_URL", f"http://127.0.0.1:{os.environ.get('STOCKBOT_API_PORT') or '3001'}")
+    timeout = float(os.environ.get("STOCKBOT_THESIS_RESEARCH_TIMEOUT_SECONDS", "300"))
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("STOCKBOT_THESIS_RESEARCH_TIMEOUT_SECONDS must be finite and positive")
+    payload = {"prompt": prompt, "mode": "research", **({"asOf": as_of} if as_of else {})}
+    url = urlsplit(f"{base.rstrip('/')}/api/agent")
+    if url.scheme not in {"http", "https"} or not url.hostname:
+        raise ValueError("STOCKBOT_AGENT_API_URL must be an HTTP(S) URL")
+    connect = transport or (HTTPSConnection if url.scheme == "https" else HTTPConnection)
+    connection = connect(url.hostname, url.port, timeout=timeout)
+    deadline = time.monotonic() + timeout
+    timer: Timer | None = None
+    try:
+        connection.connect()
+        if connection.sock is None:
+            raise RuntimeError("Research API connection has no socket")
+        timer = Timer(max(0, deadline - time.monotonic()), _stop_research_stream, (connection.sock,))
+        timer.daemon = True
+        timer.start()
+        connection.request(
+            "POST",
+            url.path,
+            body=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        )
+        with connection.getresponse() as response:
+            if response.status != 200:
+                raise RuntimeError(f"Research API returned HTTP {response.status}")
+            for line in response:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Research API timed out")
+                if not line.startswith(b"data:"):
+                    continue
+                event = json.loads(line[5:])
+                if event.get("type") in {"failed", "error"}:
+                    raise RuntimeError(str(event.get("message") or "Research failed"))
+                if event.get("type") == "done":
+                    return
+    except (OSError, HTTPException) as exc:
+        raise RuntimeError(f"Research API failed: {exc}") from exc
+    finally:
+        if timer is not None:
+            timer.cancel()
+        connection.close()
+    raise RuntimeError("Research API stream ended without done")
 
 
 _RUN_KERNEL: Callable[..., None] | None = None

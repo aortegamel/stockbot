@@ -84,7 +84,8 @@ export function createSystemOne(fetchImpl: typeof fetch = fetch): SystemOneFn {
       let method = "POST";
       let headers: Record<string, string> = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
       let body: string | undefined = JSON.stringify(native
-        ? { model, state: req.state, questions: req.questions, ...reasoning }
+        // Respan rejects an object state; every Decisions model accepts the JSON string.
+        ? { model, state: JSON.stringify(req.state), questions: req.questions, ...reasoning }
         : {
           model,
           messages: [

@@ -1,6 +1,8 @@
 """Reasoner transport over the existing OpenCode Responses logic.
 
 Reasoner proposes, never authorizes — output always goes back through JEV.
+One exception, for now: decide answers the tool-step decision questions
+(selection, adjudication, result assessment, expansion) in place of JEV.
 This module makes no JEV calls and no authorization decisions; it only posts
 prompts built by the caller (decision/prompts.ts builders) to the OpenCode
 Responses endpoint and validates the typed candidate shapes (proposals /
@@ -360,10 +362,12 @@ def _parse_opencode_output(
 PostFn = Callable[[str, str], dict[str, object]]
 
 
-def _default_post(url: str, api_key: str, model: str, prompt: str, timeout_s: float = 120.0) -> dict[str, object]:
-    body = json.dumps(
-        {"model": model, "input": prompt, **reasoning_fields("responses", "opencode_unavailable")}
-    ).encode()
+def _default_post(
+    url: str, api_key: str, model: str, prompt: str, timeout_s: float = 120.0, effort: str | None = None
+) -> dict[str, object]:
+    """POST one Responses request; an explicit effort replaces the REASONING_EFFORT env setting."""
+    reasoning = {"reasoning": {"effort": effort}} if effort else reasoning_fields("responses", "opencode_unavailable")
+    body = json.dumps({"model": model, "input": prompt, **reasoning}).encode()
     req = _urlrequest.Request(
         url,
         data=body,
@@ -399,7 +403,8 @@ class ReasonerClient:
 
     decompose/analyze/expand take caller-built prompt text (from
     decision/prompts.ts builders), post it, and return validated candidate
-    dicts. Every return value needs JEV admission before it means anything.
+    dicts. Every return value needs JEV admission before it means anything,
+    except decide, which answers tool-step decision questions in place of JEV.
     analyze returns envelope-checked lists; apply check_analyses /
     check_evidence_requests caller-side with the admitted proposal and
     evidence id sets (mirrors run.ts staging).
@@ -410,6 +415,7 @@ class ReasonerClient:
     api_key: str = ""
     post: PostFn | None = None
     timeout_s: float = 120.0
+    effort: str | None = None  # None keeps REASONING_EFFORT; tool-step decisions set "medium"
 
     def _call(self, stage: str, prompt: str, keys: list[str], optional: list[str] | None = None) -> dict[str, object]:
         if not prompt:
@@ -422,8 +428,9 @@ class ReasonerClient:
             raise RuntimeError("opencode_unavailable: missing OPENCODE_API_KEY")
         if not self.url.strip():
             raise RuntimeError("opencode_unavailable: missing OPENCODE_URL")
+        extra = {"effort": self.effort} if self.effort else {}
         return _parse_opencode_output(
-            stage, _default_post(self.url, self.api_key, self.model, prompt, self.timeout_s), keys, optional
+            stage, _default_post(self.url, self.api_key, self.model, prompt, self.timeout_s, **extra), keys, optional
         )
 
     def decompose(self, prompt: str, objective_id: str) -> dict[str, object]:
@@ -454,6 +461,10 @@ class ReasonerClient:
         raw_requests: list[object] = out["evidenceRequests"] if isinstance(out["evidenceRequests"], list) else []
         checked: list[object] = [r for r in raw_requests if isinstance(r, dict)]
         return {"proposals": list(proposals), "evidenceRequests": checked}
+
+    def decide(self, prompt: str) -> dict[str, object]:
+        """Decision answer envelope {"answers": ...}; the caller validates it with parse_decisions."""
+        return self._call("decide", prompt, ["answers"])
 
 
 Stage = Literal["decompose", "analyze", "expand"]

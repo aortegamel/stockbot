@@ -364,8 +364,29 @@ def test_tool_slug_status_uses_canonical_id(tmp_path: Path) -> None:
         assert result == {"thesis_id": t.thesis_id, "slug": t.slug, "status": status, "action": action}
         assert r.load_thesis(t.thesis_id).status == status
     result = execute_tool("thesis_status", {"id": "absent-slug", "action": "pause"}, "m", context=context)
-    assert "unknown thesis" in str(result["error"])
+    assert result["error"] == "Unknown thesis 'absent-slug' for tool 'thesis_status'"
+    assert result["error_type"] == "invalid_tool_arguments"
     assert r.load_thesis(t.thesis_id).status == "closed"
+
+
+def test_tool_unknown_thesis_reports_its_own_error(tmp_path: Path) -> None:
+    """A bad thesis id reads as unknown thesis, not a missing argument; a real missing key keeps its message."""
+    from app.policy import Capability, RequestContext
+    from app.tools import execute_tool
+
+    r = ThesisRepository(tmp_path / "thesis")
+    t = r.create_thesis("NVDA thesis", scope="NVDA", claims=["c"])
+    context = RequestContext("test", frozenset({Capability.RESEARCH}), data_root=tmp_path)
+    for tool in ("thesis_show", "thesis_watch"):
+        assert execute_tool(tool, {"id": "thesis:NVDA"}, "m", context=context) == {
+            "error": f"Unknown thesis 'thesis:NVDA' for tool '{tool}'",
+            "error_type": "invalid_tool_arguments",
+            "tool": tool,
+        }
+    missing = execute_tool("thesis_show", {}, "m", context=context)
+    assert missing["error_type"] == "invalid_tool_arguments"
+    assert "Missing required argument(s)" in str(missing["error"])
+    assert r.load_thesis(t.thesis_id).status == "active"
 
 
 def test_quarantine_lists_corrupt_child_while_healthy_ids_proceed(tmp_path: Path) -> None:

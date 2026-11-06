@@ -1,41 +1,24 @@
 """Grounded hypothetical reasoning: refs, numbers, assumptions, prompt bytes."""
 
 import json
-from collections.abc import Callable, Mapping, Sequence
-from types import SimpleNamespace
-from typing import override
+from collections.abc import Callable
 
 import pytest
 from hypothesis import given, seed, settings
 from hypothesis import strategies as st
 
-from app.decision_client import JevClient
 from app.reasoner_client import ReasonerClient, check_analyses, check_evidence_requests
 from app.research import grounding
-from app.research.grounding import (
-    check_grounded_analysis,
-    compute_scenario_impact,
-    format_grounded_block,
-    split_grounded_context,
-)
-from app.research.models import DecisionRecord, JSONValue, ToolDecision
-from app.research.scheduler import _analyze_prompt
+from app.research.grounding import check_grounded_analysis, compute_scenario_impact, split_grounded_context
+from app.research.models import JSONValue
 
 # Exact tool bytes the live run must reason on (verbatim, never summarized).
 NVDA_EXPOSURE = "NVDA OpenAI exposure 12.5% per 10-K accession 0001045810-26-000001"
 ASSUMPTION_TEXT = "OpenAI IPO does terrible: apply 30% haircut to OpenAI-linked exposure"
 
 
-def _node():
-    return SimpleNamespace(node_id="n1", session_id="s1", question="q?", why_it_matters="w")
-
-
 def _evidence() -> list[JSONValue]:
     return [{"evidence_id": "ev-nvda-10k", "content": NVDA_EXPOSURE, "content_hash": "h1", "provenance": "SEC"}]
-
-
-def _session() -> dict[str, JSONValue]:
-    return {"session_id": "s1", "objective": "If OpenAI IPO does terrible, how does NVDA move?"}
 
 
 def test_bad_evidence_ref_rejected():
@@ -119,100 +102,6 @@ def test_attach_scenario_impact_exact_and_fail_open():
     assert attach_scenario_impact(unparseable) is unparseable
 
 
-def test_reason_path_attaches_impact_and_persists_refs():
-    """Offline reason path: kept analysis carries computed_impact; drop gate + adjudication refs persist."""
-    import asyncio
-
-    from app.research import scheduler as sched
-
-    recorded: list[dict[str, object]] = []
-
-    class _K(sched._Kernel):
-        @override
-        def record_decision(
-            self,
-            session_id: str,
-            decision_type: str,
-            candidates: Mapping[str, object],
-            probabilities: Mapping[str, object],
-            selected: object,
-            *,
-            node_id: str | None = None,
-            job_id: str | None = None,
-            confidence: float | None = None,
-            request: object = None,
-            response: object = None,
-        ) -> DecisionRecord:
-            recorded.append({"dtype": decision_type, "selected": selected})
-            return DecisionRecord(
-                decision_id="dec-test",
-                session_id=session_id,
-                node_id=node_id,
-                job_id=job_id,
-                decision_type=decision_type,
-                candidates={},
-                probabilities={},
-                selected={},
-            )
-
-    good: dict[str, object] = {
-        "nodeId": "n1",
-        "objectiveId": "s1",
-        "interpretation": "NVDA 12.5% exposure x 30% haircut; formula in words, code computes",
-        "evidenceRefs": ["ev-nvda-10k"],
-        "numbers": [{"value": "12.5%", "evidenceId": "ev-nvda-10k", "quote": NVDA_EXPOSURE}],
-        "assumptions": [{"assumptionId": "openai-ipo-terrible", "text": ASSUMPTION_TEXT}],
-    }
-    bad: dict[str, object] = {
-        "nodeId": "n1",
-        "objectiveId": "s1",
-        "interpretation": "paraphrased number with no bytes",
-        "evidenceRefs": ["ev-nvda-10k"],
-        "numbers": [{"value": "9%", "evidenceId": "ev-nvda-10k", "quote": "nine percent somewhere"}],
-    }
-
-    class _R(ReasonerClient):
-        @override
-        def analyze(self, prompt: str) -> dict[str, list[dict[str, object]]]:
-            assert NVDA_EXPOSURE in prompt  # exact bytes in, not a summary
-            return {"analyses": [bad, good], "evidenceRequests": []}
-
-    class _J(JevClient):
-        @override
-        async def adjudicate(
-            self,
-            proposal: object,
-            node: object,
-            *,
-            session_id: str,
-            job_id: str | None = None,
-            registry: Sequence[Mapping[str, JSONValue]] | None = None,
-        ) -> ToolDecision:
-            assert isinstance(proposal, dict)
-            kept = proposal["analyses"]
-            assert len(kept) == 1 and kept[0]["evidenceRefs"] == ["ev-nvda-10k"]
-            assert kept[0]["computed_impact"]["impact_pct"] == 3.75
-            return ToolDecision(
-                action="invoke",
-                tool_name="query_finra",
-                tool_names=("query_finra",),
-                probabilities={},
-                confidence=1.0,
-            )
-
-    out = asyncio.run(sched._reasoner_analyze(_R(model="m", url="u"), _session(), _node(), _evidence(), []))
-    assert len(out["analyses"]) == 1  # paraphrase dropped before adjudication
-    verdict = asyncio.run(sched._adjudicate_analysis(_J(), _K(), out, _node(), "s1", "n1"))
-    assert verdict.tool_name == "query_finra"
-    assert recorded and recorded[0]["dtype"] == "reason_adjudication"
-    selected = recorded[0]["selected"]
-    assert isinstance(selected, dict)
-    assert selected["evidence_refs"] == ["ev-nvda-10k"]
-    assert selected["computed_impact"]["impact_pct"] == 3.75
-    assert selected["computed_impact"]["exposure_evidence"] == "ev-nvda-10k"
-    assert selected["computed_impact"]["assumption_id"] == "openai-ipo-terrible"
-
-
 def test_assumption_hypothetical_needs_no_evidence_ref():
     """Invented assumptions carry assumptionId; the assumption itself needs no evidence."""
     no_refs: list[str] = []
@@ -242,59 +131,6 @@ def test_compute_scenario_impact_exact():
             compute_untyped(bad, 30.0)
         with pytest.raises(ValueError):
             compute_untyped(12.5, bad)
-
-
-def test_analyze_prompt_grounded_assumptions_sections():
-    """Prompt carries GROUNDED exact bytes + ASSUMPTIONS + numbers/assumptions shape."""
-    attempts = [{"job_id": "job-0", "assumption": ASSUMPTION_TEXT}]
-    prompt = _analyze_prompt(_session(), _node(), _evidence(), attempts)
-    assert "GROUNDED" in prompt
-    assert "ASSUMPTIONS" in prompt
-    assert "numbers" in prompt
-    assert "assumptions" in prompt
-    assert "assumptionId" in prompt
-    assert "evidenceRefs" in prompt
-
-
-def test_verbatim_bytes_in_prompt_context():
-    """Exact evidence content appears verbatim in the prompt context (not a summary)."""
-    prompt = _analyze_prompt(_session(), _node(), _evidence(), [])
-    assert NVDA_EXPOSURE in prompt
-    assert NVDA_EXPOSURE in format_grounded_block(_evidence()[0])
-    split = split_grounded_context(_evidence(), [])
-    assert split["grounded"] == _evidence()
-    # End-to-end: fake reasoner cites the exact bytes -> check path accepts.
-    grounded_ids = {str(r.get("evidence_id")) for r in split["grounded"] if isinstance(r, dict)}
-    fake: dict[str, object] = {
-        "nodeId": "n1",
-        "objectiveId": "s1",
-        "interpretation": "NVDA 12.5% exposure x 30% haircut; formula in words, code computes",
-        "evidenceRefs": ["ev-nvda-10k"],
-        "numbers": [{"value": "12.5%", "evidenceId": "ev-nvda-10k", "quote": NVDA_EXPOSURE}],
-        "assumptions": [{"assumptionId": "openai-ipo-terrible", "text": ASSUMPTION_TEXT}],
-    }
-    assert grounding.check_grounded_analysis(fake, grounded_ids, split["grounded"]) is fake
-    out = check_analyses("analyze", [fake], "s1", {"n1"}, grounded_ids)
-    assert out[0]["evidenceRefs"] == ["ev-nvda-10k"]
-
-
-def test_grounded_block_keeps_content_past_2000_chars_for_citation():
-    """GROUNDED prompt entries carry full stored bytes, so a value cited near the end still validates."""
-    tail = "Total OpenAI-linked revenue: 12.5%\u00a0of FY26 — see Note 9."
-    content = "Item 7.  MD&A\n\t" + "segment detail; " * 200 + tail
-    assert len(content) > 2000
-    record: JSONValue = {"evidence_id": "ev-long", "content": content, "content_hash": "h2", "provenance": "SEC"}
-    prompt = _analyze_prompt(_session(), _node(), [record], [])
-    ctx = json.loads(prompt.split("\nCONTEXT: ", 1)[1])
-    block = ctx["GROUNDED"][0]
-    assert block.endswith(f"content={content}")
-    # The model cites what the GROUNDED block shows; that quote must match stored bytes.
-    quote = block[block.index("Total OpenAI") :]
-    cited: dict[str, object] = {
-        "evidenceRefs": ["ev-long"],
-        "numbers": [{"value": "12.5%", "evidenceId": "ev-long", "quote": quote}],
-    }
-    assert check_grounded_analysis(cited, {"ev-long"}, [record]) is cited
 
 
 def test_fabricated_identifier_and_quote_rejected() -> None:

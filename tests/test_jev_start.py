@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import io
 import json
 import math
@@ -23,7 +22,7 @@ import pytest
 from hypothesis import given, seed, settings
 from hypothesis import strategies as st
 
-from app.decision_client import REASON_SENTINEL, RESOLVED_SENTINEL, JevClient
+from app.decision_client import JevClient
 from app.research.models import JSONValue
 
 
@@ -164,67 +163,6 @@ def test_runtime_ping_over_bun() -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=10)
-
-
-def test_tool_options_prompt_keeps_last_three_failures() -> None:
-    from app.decision_client import _tool_options_prompt
-
-    reg: list[dict[str, JSONValue]] = [{"name": "a", "description": "A tool"}]
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
-    attempts: list[JSONValue] = [{"tool": f"t{i}", "error": f"err{i}"} for i in range(10)]
-    _, prompt = _tool_options_prompt(reg, node, [], attempts)
-    assert prompt.count("Prior attempt") == 3
-    assert "t7" in prompt and "t8" in prompt and "t9" in prompt
-    assert "t0" not in prompt and "t6" not in prompt
-    assert "Today UTC is" in prompt and "decode relative dates before choosing" in prompt
-    assert "[Today UTC " in prompt and "q?" in prompt
-
-
-def test_tool_options_prompt_stamp_idempotent() -> None:
-    from app.decision_client import _tool_options_prompt
-    from app.research.models import query_with_today_utc
-
-    reg: list[dict[str, JSONValue]] = [{"name": "a", "description": "A tool"}]
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
-    _, prompt = _tool_options_prompt(reg, node, [], [])
-    assert "[Today UTC " in prompt
-    stamped = query_with_today_utc("q?")
-    node2: dict[str, JSONValue] = {"node_id": "n1", "question": stamped}
-    _, prompt2 = _tool_options_prompt(reg, node2, [], [])
-    assert prompt2.count("[Today UTC ") == 1
-    assert query_with_today_utc("") == "" and query_with_today_utc("   ") == "   "
-    assert query_with_today_utc(stamped) == stamped
-
-
-def test_outcome_dict_truncates_64k_content_keeps_error() -> None:
-    from app.decision_client import _outcome_dict
-
-    big = "x" * 65536
-    err = "e" * 5000
-    out = _outcome_dict({"tool": "t", "content": big, "error": err, "error_type": "boom"})
-    assert isinstance(out["content"], str) and len(out["content"]) <= 2000
-    assert out["error"] == err
-    assert out["error_type"] == "boom"
-    assert "candidate" not in out
-
-
-def test_outcome_dict_excludes_candidate_records() -> None:
-    from app.decision_client import _outcome_dict
-
-    content = "x" * 65536
-    candidate: dict[str, JSONValue] = {
-        "source_handle": {"accession_no": "a"},
-        "content": "y" * 32000,
-        "matching_passage": "y" * 32000,
-    }
-    out = _outcome_dict({"tool": "get_sec_document", "content": content, "candidate": candidate})
-    assert out == {
-        "tool": "get_sec_document",
-        "content": content[:2000],
-        "error": None,
-        "error_type": None,
-        "tool_result_id": None,
-    }
 
 
 class _HungStdout(io.StringIO):
@@ -786,7 +724,11 @@ def test_http_decision_follows_secure_redirect_with_native_request_semantics(
         state = {"source": "test evidence"}
         if api_format == "decisions":
             assert first.full_url == _NATIVE_URL
-            assert body == {"model": _NATIVE_MODEL, "state": state, "questions": _HTTP_QUESTIONS}
+            assert body == {
+                "model": _NATIVE_MODEL,
+                "state": json.dumps(state, separators=(",", ":")),
+                "questions": _HTTP_QUESTIONS,
+            }
         else:
             assert first.full_url == _DECISION_URL
             assert set(body) == {"model", "messages", "stream"}
@@ -986,7 +928,11 @@ def test_http_decision_uses_configured_native_decisions_contract(
     assert req.get_header("Authorization") == f"Bearer {_DECISION_KEY}"
     assert req.get_header("Content-type") == "application/json"
     assert isinstance(req.data, bytes)
-    assert json.loads(req.data) == {"model": _NATIVE_MODEL, "state": state, "questions": _NATIVE_QUESTIONS}
+    assert json.loads(req.data) == {
+        "model": _NATIVE_MODEL,
+        "state": json.dumps(state, separators=(",", ":")),
+        "questions": _NATIVE_QUESTIONS,
+    }
     persisted = seen["persist"]
     assert isinstance(persisted, dict)
     assert persisted["via"] == "http"
@@ -1392,6 +1338,53 @@ def test_injected_transport_needs_no_live_settings(tmp_path: Path, monkeypatch: 
     assert _http_run(client, {"q": {"type": "noul"}}) == {"q": {"kind": "noul", "probability": 0.5}}
 
 
+def _reasoner(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record any reasoner request; the returned list stays empty when none is made."""
+    import io
+    from urllib.request import Request
+
+    from app import reasoner_client as rc
+
+    prompts: list[str] = []
+
+    def urlopen(request: Request, timeout: float) -> io.BytesIO:
+        prompts.append(str(request.data))
+        return io.BytesIO(b'{"output": []}')
+
+    monkeypatch.setattr(rc._urlrequest, "urlopen", urlopen)
+    return prompts
+
+
+def _routing_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[JevClient, dict[str, object], list[str]]:
+    """Real JevClient (no injected transport); JEV roundtrips are recorded, never sent."""
+    client = JevClient(data_root=tmp_path)
+    persisted: dict[str, object] = {}
+    jev_calls: list[str] = []
+
+    def _persist(**kwargs: object) -> None:
+        persisted.update(kwargs)
+
+    async def _jev(*_args: object, **_kwargs: object) -> tuple[dict[str, dict[str, JSONValue]], JSONValue, str]:
+        jev_calls.append("jev")
+        return {"q": {"kind": "noul", "probability": 0.1}}, {}, "sidecar"
+
+    monkeypatch.setattr(client, "_persist", _persist)
+    monkeypatch.setattr(client, "_await_roundtrip", _jev)
+    return client, persisted, jev_calls
+
+
+_NOUL_Q: dict[str, JSONValue] = {"q": {"type": "noul", "instructions": "Is the filing relevant?"}}
+
+
+@pytest.mark.parametrize("decision_type", ["reasoning_effort", "request_scope"])
+def test_non_tool_decisions_stay_on_jev(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision_type: str) -> None:
+    prompts = _reasoner(monkeypatch)
+    client, _, jev_calls = _routing_client(tmp_path, monkeypatch)
+    out = asyncio.run(client.decide({"s": 1}, _NOUL_Q, decision_type=decision_type, session_id="s1"))
+    assert out == {"q": {"kind": "noul", "probability": 0.1}}
+    assert (jev_calls, prompts) == (["jev"], [])
+
+
 def _answers(questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
     """Stub decision answers: first sorted option wins each choice. Noul 0.5."""
     out: dict[str, JSONValue] = {}
@@ -1428,744 +1421,6 @@ def _capturing_client(
 
     monkeypatch.setattr(client, "_persist", _noop)
     return client, seen
-
-
-_MARKERS = (
-    "RAW_CONTENT_MARKER",
-    "PROVENANCE_MARKER",
-    "META_MARKER",
-    "REASONING_MARKER",
-    "INTAKE_MARKER",
-)
-_GUIDANCE_LINE = "Do not repeat a tool call with identical arguments to an earlier attempt."
-
-
-def _raw_context() -> tuple[list[JSONValue], list[JSONValue]]:
-    """Scheduler-shaped ctx (non-record, admitted row, 12 observations, guidance) plus one attempt with raw payload."""
-    admitted: dict[str, JSONValue] = {
-        "evidence_id": "ev-1",
-        "session_id": "s",
-        "wave_id": 1,
-        "source_name": "SEC",
-        "subject": "AAPL",
-        "claim_text": "c" * 201,
-        "content": "RAW_CONTENT_MARKER " * 400,
-        "provenance": {"kind": "sec_source", "accession_no": "PROVENANCE_MARKER"},
-        "metadata": {"identity_key": "META_MARKER"},
-        "job_id": "j-admit",
-    }
-    observations: list[JSONValue] = [
-        {
-            "tool": f"t{i}",
-            "job_id": f"j{i}",
-            "outcome_summary": "s" * 2000,
-            "error": "e" * 500 if i == 11 else None,
-            "error_type": "tool_error" if i == 11 else None,
-            "tool_result_ref": f"r{i}",
-        }
-        for i in range(12)
-    ]
-    guidance: dict[str, JSONValue] = {
-        "type": "selection_guidance",
-        "intake_evidence": ["ev-1: INTAKE_MARKER"],
-        "instruction": _GUIDANCE_LINE,
-        "prior_calls": [f"p{i}" for i in range(12)],
-    }
-    attempts: list[JSONValue] = [
-        {
-            "tool": "a",
-            "arguments": {"q": "x"},
-            "outcome_summary": "o" * 200,
-            "error": "f" * 201,
-            "error_type": "tool_error",
-            "reasoning": "REASONING_MARKER",
-            "confidence": 0.9,
-            "job_id": "j9",
-            "evidence_id": "ev-9",
-            "tool_result_ref": "r9",
-            "generate_ms": 1.0,
-            "tool_ms": 2.0,
-            "assess_ms": 3.0,
-        }
-    ]
-    return ["NOT_A_RECORD", admitted, *observations, guidance], attempts
-
-
-def _compact_evidence_expected(with_guidance: bool) -> list[JSONValue]:
-    observed: list[JSONValue] = [
-        {
-            "tool": f"t{i}",
-            "job_id": f"j{i}",
-            "tool_result_ref": f"r{i}",
-            "outcome_summary": "s" * 200,
-            "error": "e" * 200 if i == 11 else None,
-            "error_type": "tool_error" if i == 11 else None,
-        }
-        for i in range(2, 12)
-    ]
-    guidance: list[JSONValue] = [
-        {
-            "type": "selection_guidance",
-            "instruction": _GUIDANCE_LINE,
-            "prior_calls": [f"p{i}" for i in range(2, 12)],
-        }
-    ]
-    admitted: JSONValue = {
-        "evidence_id": "ev-1",
-        "source_name": "SEC",
-        "subject": "AAPL",
-        "claim_text": "c" * 200,
-    }
-    return [admitted, *observed, *(guidance if with_guidance else [])]
-
-
-def test_select_tool_sends_only_compact_state_and_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """JEV select request: 4-field evidence, bounded observations, compact attempts, compact options."""
-    client, seen = _capturing_client(tmp_path, monkeypatch)
-    registry: list[dict[str, JSONValue]] = [
-        {
-            "name": "a",
-            "description": "DESCRIPTION_MARKER " * 50,
-            "domain": "SEC",
-            "purpose": "Read  filings",
-            "intent": "INTENT_MARKER",
-            "keyInputs": "req(x)",
-            "outputKind": "rows",
-            "useWhen": "need text",
-            "avoidWhen": "no accession",
-            "prerequisites": "needs search_id",
-            "pitSupport": "PIT-scoped",
-            "conflicts": "b",
-            "nextTools": "c",
-            "parameters": {"type": "object"},
-        }
-    ]
-    evidence, attempts = _raw_context()
-    before = copy.deepcopy((registry, evidence, attempts))
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
-
-    decision = asyncio.run(client.select_tool("obj", node, registry, evidence, attempts, session_id="s"))
-
-    assert decision.tool_name == "a"
-    assert (registry, evidence, attempts) == before
-    state, questions = seen[0]
-    assert isinstance(state, dict)
-    assert state["evidence"] == _compact_evidence_expected(with_guidance=True)
-    assert state["attempts"] == [
-        {
-            "tool": "a",
-            "arguments": {"q": "x"},
-            "job_id": "j9",
-            "evidence_id": "ev-9",
-            "tool_result_ref": "r9",
-            "outcome_summary": "o" * 200,
-            "error": "f" * 200,
-            "error_type": "tool_error",
-        }
-    ]
-    wire = json.dumps({"state": state, "questions": questions})
-    for marker in (*_MARKERS, "DESCRIPTION_MARKER", "INTENT_MARKER"):
-        assert marker not in wire
-    sel = questions["tool_selection"]
-    assert isinstance(sel, dict)
-    criteria = sel["criteria"]
-    assert isinstance(criteria, dict)
-    assert (
-        criteria["a"]
-        == "a Purpose: Read filings. Use: need text. Avoid: no accession. Needs: needs search_id. PIT: PIT-scoped."
-    )
-    assert {"reasoning_required", "node_resolved"} <= set(criteria)
-    prompt = sel["instructions"]
-    assert isinstance(prompt, str)
-    assert "Evidence on hand: 15 item(s) [ev-1,j0," in prompt
-    assert f"Observed t3 ref=r3: {'s' * 200}." in prompt
-    assert f"Prior attempt a failed: {'f' * 200}." in prompt
-
-
-def test_select_tool_compacts_tuple_evidence_and_attempts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Tuple inputs (valid Sequence) reach JEV compacted, never dropped."""
-    client, seen = _capturing_client(tmp_path, monkeypatch)
-    evidence, attempts = _raw_context()
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
-    registry: list[dict[str, JSONValue]] = [{"name": "a"}]
-
-    asyncio.run(client.select_tool("obj", node, registry, tuple(evidence), tuple(attempts), session_id="s"))
-
-    state, _questions = seen[0]
-    assert isinstance(state, dict)
-    assert state["evidence"] == _compact_evidence_expected(with_guidance=True)
-    tool_attempts = state["attempts"]
-    assert isinstance(tool_attempts, list) and len(tool_attempts) == 1
-    assert isinstance(tool_attempts[0], dict) and tool_attempts[0]["arguments"] == {"q": "x"}
-
-
-@pytest.mark.parametrize("field", ["evidence", "attempts"])
-def test_records_rejects_mapping(field: str) -> None:
-    """A dict for evidence/attempts is a caller defect: TypeError before select_tool/assess_result request JEV."""
-    from app.decision_client import _records
-
-    with pytest.raises(TypeError, match=f"jev {field} must be a sequence of records, not a mapping"):
-        _records({"evidence_id": "ev-1"}, field)
-
-
-def test_select_tool_none_context_sends_empty_lists(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    client, seen = _capturing_client(tmp_path, monkeypatch)
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
-    asyncio.run(client.select_tool("obj", node, [{"name": "a"}], None, None, session_id="s"))
-    state, _questions = seen[0]
-    assert isinstance(state, dict) and state["evidence"] == [] and state["attempts"] == []
-
-
-@pytest.mark.parametrize("prior_calls", [None, "p1"])
-def test_select_tool_invalid_prior_calls_send_empty_list(
-    prior_calls: JSONValue, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    client, seen = _capturing_client(tmp_path, monkeypatch)
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
-    guidance: list[JSONValue] = [
-        {
-            "type": "selection_guidance",
-            "instruction": _GUIDANCE_LINE,
-            "prior_calls": prior_calls,
-        }
-    ]
-    asyncio.run(client.select_tool("obj", node, [{"name": "a"}], guidance, None, session_id="s"))
-    state, _questions = seen[0]
-    assert isinstance(state, dict)
-    assert state["evidence"] == [{"type": "selection_guidance", "instruction": _GUIDANCE_LINE, "prior_calls": []}]
-
-
-def test_manifest_line_needs_no_description() -> None:
-    from app.decision_client import _manifest_line
-
-    assert _manifest_line({"name": "bare"}) == "bare"
-    assert _manifest_line({"name": "t", "useWhen": "  ", "pitSupport": "PIT-blind"}) == "t PIT: PIT-blind."
-
-
-def test_assess_result_keeps_raw_outcome_and_compacts_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """JEV assess request: raw current outcome capped at 2000, evidence compacted, caller untouched."""
-    client, seen = _capturing_client(tmp_path, monkeypatch)
-    evidence, _ = _raw_context()
-    ctx = evidence[:-1]  # scheduler passes no guidance to assessment
-    before = copy.deepcopy(ctx)
-    outcome: dict[str, JSONValue] = {
-        "tool_name": "a",
-        "content": "x" * 5000,
-        "error": None,
-        "tool_result_id": "r1",
-    }
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
-
-    out = asyncio.run(client.assess_result(node, outcome, ctx, session_id="s", job_id="j1"))
-
-    assert out["continuation"] == "continue_research"
-    assert ctx == before
-    state, _questions = seen[0]
-    assert isinstance(state, dict)
-    assert state["outcome"] == {
-        "tool": "a",
-        "content": "x" * 2000,
-        "error": None,
-        "error_type": None,
-        "tool_result_id": "r1",
-    }
-    assert state["evidence"] == _compact_evidence_expected(with_guidance=False)
-    wire = json.dumps(state)
-    for marker in _MARKERS:
-        assert marker not in wire
-
-
-def test_assess_result_contradictory_resolve_continues() -> None:
-    """A resolve verdict without supported yes evidence means more evidence, never resolution."""
-    from app.decision_client import _continuation_for_assessment
-
-    assert _continuation_for_assessment("resolve_node", "insufficient", "no") == "continue_research"
-    assert _continuation_for_assessment("resolve_node", "conflicted", "yes") == "continue_research"
-    assert _continuation_for_assessment("resolve_node", "sufficient_support", "unknown") == "continue_research"
-    assert _continuation_for_assessment("resolve_node", "sufficient_contradiction", "yes") == "continue_research"
-    assert _continuation_for_assessment("resolve_node", "sufficient_support", "yes") == "resolve_node"
-    assert _continuation_for_assessment("continue_research", "sufficient_support", "yes") == "continue_research"
-
-
-def test_filing_assessment_requires_substantive_passages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    client, seen = _capturing_client(tmp_path, monkeypatch)
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "What do the latest filings say?"}
-    asyncio.run(client.assess_result(node, {"content": "Cover page"}, [], session_id="s"))
-    _state, questions = seen[0]
-    assert isinstance(questions, dict)
-    support = questions["resolution_support"]
-    assert isinstance(support, dict)
-    instructions = str(support["instructions"])
-    assert "cover page" in instructions
-    assert "not how many documents" in instructions
-    assert "Failed reads cannot support conclusions" in instructions
-    assert "section or offset reads" in instructions
-    assert "only a filing list" in instructions
-
-
-def test_selection_preserves_document_navigation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    client, seen = _capturing_client(tmp_path, monkeypatch)
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "What do the latest filings say?"}
-    views: list[JSONValue] = [
-        {"available_sections": ["Item 2"], "next_cursor": 12000, "more_available": True, "warnings": ["partial"]}
-    ]
-    guidance: dict[str, JSONValue] = {
-        "type": "selection_guidance",
-        "instruction": "Read unanswered disclosure passages.",
-        "prior_calls": [],
-        "document_views": views,
-    }
-    asyncio.run(client.select_tool("obj", node, [{"name": "get_sec_document"}], [guidance], [], session_id="s"))
-    state, _questions = seen[0]
-    assert isinstance(state, dict)
-    assert state["evidence"] == [guidance]
-
-
-_RAW_KEYS = st.sampled_from(["content", "reasoning", "provenance", "metadata", "generate_ms", "outcome"])
-
-
-@settings(max_examples=200, derandomize=True)
-@given(
-    st.text(max_size=400),
-    st.text(max_size=400),
-    st.dictionaries(_RAW_KEYS, st.text(max_size=50), max_size=6),
-)
-def test_prop_compact_projection_clips_text_and_drops_raw(text: str, other: str, raw: dict[str, str]) -> None:
-    """Projection keeps exactly the approved fields. Text fields equal their first 200 chars."""
-    from app.decision_client import _compact_attempts, _compact_context
-
-    admitted: dict[str, JSONValue] = {
-        **raw,
-        "evidence_id": "ev",
-        "source_name": "S",
-        "subject": "X",
-        "claim_text": text,
-    }
-    observed: dict[str, JSONValue] = {
-        **raw,
-        "tool": "t",
-        "outcome_summary": text,
-        "error": other,
-    }
-    attempt: dict[str, JSONValue] = {
-        **raw,
-        "tool": "t",
-        "arguments": {"k": "v"},
-        "outcome_summary": text,
-        "error": other,
-    }
-    assert _compact_context([admitted, observed]) == [
-        {
-            "evidence_id": "ev",
-            "source_name": "S",
-            "subject": "X",
-            "claim_text": text[:200],
-        },
-        {
-            "tool": "t",
-            "job_id": None,
-            "tool_result_ref": None,
-            "outcome_summary": text[:200],
-            "error": other[:200],
-            "error_type": None,
-        },
-    ]
-    assert _compact_attempts([attempt]) == [
-        {
-            "tool": "t",
-            "arguments": {"k": "v"},
-            "job_id": None,
-            "evidence_id": None,
-            "tool_result_ref": None,
-            "outcome_summary": text[:200],
-            "error": other[:200],
-            "error_type": None,
-        }
-    ]
-
-
-@pytest.mark.parametrize(
-    ("probability", "outcome", "strength"),
-    [
-        (0, "no", None),
-        (0.42, "no", None),
-        (0.4999, "no", None),
-        (0.5, "yes", "tentative"),
-        (0.6, "yes", "tentative"),
-        (0.6999, "yes", "tentative"),
-        (0.7, "yes", "confident"),
-        (1, "yes", "confident"),
-    ],
-)
-def test_support_normalization_boundaries(probability: float, outcome: str, strength: str | None) -> None:
-    from app.decision_client import _classify_probability, _normalize_probability
-
-    assert _normalize_probability(probability) == {"outcome": outcome, "probability": probability, "strength": strength}
-    assert _classify_probability(probability) == outcome
-
-
-@pytest.mark.parametrize("value", [None, "0.6", True, {}, [], -0.1, 1.1, math.nan, math.inf, -math.inf])
-def test_support_normalization_unknown(value: object) -> None:
-    from app.decision_client import _classify_probability, _normalize_probability, _support_verdict
-
-    assert _normalize_probability(value) == {"outcome": "unknown", "probability": None, "strength": None}
-    assert _classify_probability(value) == "unknown"
-    verdict = _support_verdict({}, None)
-    assert verdict["support_answer"] == "unknown"
-    assert verdict["support_result"] == {"outcome": "unknown", "probability": None, "strength": None}
-
-
-@seed(20261025)
-@settings(max_examples=100, derandomize=True)
-@given(st.floats(min_value=0, max_value=1, allow_nan=False, allow_infinity=False))
-def test_support_normalization_preserves_probability(probability: float) -> None:
-    from app.decision_client import _classify_probability, _normalize_probability
-
-    result = _normalize_probability(probability)
-    assert result["probability"] == probability
-    assert (result["outcome"] == "yes") == (probability >= 0.5)
-    assert (result["strength"] == "confident") == (probability >= 0.7)
-    assert (result["strength"] == "tentative") == (0.5 <= probability < 0.7)
-    assert _classify_probability(probability) == result["outcome"]
-
-
-def test_support_normalization_python_typescript_parity() -> None:
-    from app.decision_client import _normalize_probability
-
-    bun = shutil.which("bun")
-    assert bun is not None, "Support policy parity requires Bun."
-    root = Path(__file__).resolve().parent.parent
-    cases: list[JSONValue] = [
-        0,
-        0.42,
-        0.4999,
-        0.5,
-        0.6,
-        0.6999,
-        0.7,
-        1,
-        None,
-        "0.6",
-        True,
-        {},
-        [],
-        -0.1,
-        1.1,
-    ]
-    result = subprocess.run(
-        [
-            bun,
-            "-e",
-            (
-                'import { normalizeProbability } from "./decision/jev.ts"; '
-                "const cases = JSON.parse(await Bun.stdin.text()); "
-                "console.log(JSON.stringify(cases.map(normalizeProbability)));"
-            ),
-        ],
-        input=json.dumps(cases),
-        text=True,
-        capture_output=True,
-        cwd=root,
-        check=True,
-        timeout=30,
-    )
-    assert json.loads(result.stdout) == [_normalize_probability(value) for value in cases]
-
-
-@pytest.mark.parametrize("probability", [0.5, 0.6, 0.6999, 0.7])
-def test_assess_result_carries_affirmative_strength(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probability: float
-) -> None:
-    def transport(state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
-        answers: dict[str, JSONValue] = {}
-        for qid, question in questions.items():
-            assert isinstance(question, dict)
-            if question["type"] == "noul":
-                answers[qid] = {"type": "noul", "noul": probability}
-            else:
-                criteria = question["criteria"]
-                assert isinstance(criteria, dict)
-                winner = "sufficient_support" if qid == "evidence_state" else "resolve_node"
-                answers[qid] = {
-                    "type": "choice",
-                    "choice": winner,
-                    "probabilities": {label: float(label == winner) for label in criteria},
-                    "confidence": 0.9,
-                }
-        return {"answers": answers}
-
-    client = JevClient(data_root=tmp_path, transport=transport)
-    monkeypatch.setattr(client, "_persist", _noop_persist)
-    out = asyncio.run(client.assess_result({"question": "Does the filing support X?"}, {}, [], session_id="s1"))
-    strength = "confident" if probability >= 0.7 else "tentative"
-    for name in ("resolution_support", "topical_relevance"):
-        assert out[name] == probability
-        assert out[f"{name}_answer"] == "yes"
-        assert out[f"{name}_strength"] == strength
-        assert out[f"{name}_result"] == {"outcome": "yes", "probability": probability, "strength": strength}
-    assert out["continuation"] == "resolve_node"
-
-
-def _final_stub(prob: float, state: str) -> Callable[[object, Mapping[str, JSONValue]], dict[str, JSONValue]]:
-    def _run(state_arg: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
-        assert sorted(questions.keys()) == ["evidence_state", "support"]
-        return {
-            "answers": {
-                "support": {"type": "noul", "noul": prob},
-                "evidence_state": {
-                    "type": "choice",
-                    "choice": state,
-                    "probabilities": {
-                        "sufficient_support": 0.8 if state == "sufficient_support" else 0.05,
-                        "sufficient_contradiction": 0.8 if state == "sufficient_contradiction" else 0.05,
-                        "conflicted": 0.8 if state == "conflicted" else 0.05,
-                        "insufficient": 0.8 if state == "insufficient" else 0.05,
-                    },
-                    "confidence": 0.9,
-                },
-            }
-        }
-
-    return _run
-
-
-class _FinalJev(JevClient):
-    def __init__(self, tmp_path: Path, prob: float, state: str) -> None:
-        root = Path(__file__).resolve().parent.parent
-        super().__init__(
-            data_root=tmp_path,
-            runtime_path=root / "decision" / "runtime.ts",
-            transport=_final_stub(prob, state),
-        )
-        self.decide_types: list[tuple[str, dict[str, JSONValue]]] = []
-
-    @override
-    def _persist(self, **kwargs: object) -> None:
-        return None
-
-    @override
-    async def decide(
-        self,
-        state: object,
-        questions: Mapping[str, JSONValue],
-        *,
-        decision_type: str,
-        session_id: str,
-        node_id: str | None = None,
-        job_id: str | None = None,
-        choice_options: Mapping[str, Mapping[str, str]] | None = None,
-    ) -> dict[str, dict[str, JSONValue]]:
-        self.decide_types.append((decision_type, dict(questions)))
-        return await super().decide(
-            state,
-            questions,
-            decision_type=decision_type,
-            session_id=session_id,
-            node_id=node_id,
-            job_id=job_id,
-            choice_options=choice_options,
-        )
-
-
-def _final_client(tmp_path: Path, prob: float, state: str) -> _FinalJev:
-    return _FinalJev(tmp_path, prob, state)
-
-
-@pytest.mark.parametrize("probability", [0.42, 0.5, 0.6, 0.6999, 0.7])
-def test_final_assessments_carry_normalized_support(tmp_path: Path, probability: float) -> None:
-    client = _final_client(tmp_path, probability, "sufficient_support")
-    response = asyncio.run(client.assess_final_response("The filing supports X.", [], session_id="s1"))
-    claim = asyncio.run(client.assess_final_claim("The filing supports X.", "inference", [], session_id="s1"))
-    outcome = "yes" if probability >= 0.5 else "no"
-    strength = "confident" if probability >= 0.7 else "tentative" if probability >= 0.5 else None
-    for assessment in (response, claim):
-        assert assessment["support"] == probability
-        assert assessment["support_answer"] == outcome
-        assert assessment["support_strength"] == strength
-        assert assessment["support_result"] == {"outcome": outcome, "probability": probability, "strength": strength}
-
-
-@pytest.mark.parametrize("probability", [math.nan, math.inf, -0.1, 1.1])
-def test_final_assessments_preserve_malformed_probability_errors(tmp_path: Path, probability: float) -> None:
-    client = _final_client(tmp_path, probability, "sufficient_support")
-    with pytest.raises(ValueError, match="malformed_decision_answer"):
-        asyncio.run(client.assess_final_response("The filing supports X.", [], session_id="s1"))
-    with pytest.raises(ValueError, match="malformed_decision_answer"):
-        asyncio.run(client.assess_final_claim("The filing supports X.", "inference", [], session_id="s1"))
-
-
-def test_assess_final_response_supported(tmp_path: Path) -> None:
-    client = _final_client(tmp_path, 0.85, "sufficient_support")
-    out = asyncio.run(
-        client.assess_final_response(
-            "Revenue grew per the filing.",
-            [{"id": "ev-1", "content": "10-Q shows revenue grew."}],
-            session_id="s1",
-            confidence=0.7,
-        )
-    )
-    assert out["support"] == 0.85 and out["support_answer"] == "yes"
-    assert out["evidence_state"] == "sufficient_support" and out["confidence"] == 0.7
-    assert client.decide_types[0][0] == "final_response_assessment"
-    support = client.decide_types[0][1]["support"]
-    assert isinstance(support, dict)
-    instructions = support["instructions"]
-    assert isinstance(instructions, str)
-    assert "lacks inventory or cited support" in instructions
-
-
-def test_assess_final_response_conflicted(tmp_path: Path) -> None:
-    client = _final_client(tmp_path, 0.55, "conflicted")
-    out = asyncio.run(client.assess_final_response("Growth maybe.", [], session_id="s1"))
-    assert out["support_answer"] == "yes" and out["evidence_state"] == "conflicted"
-    assert out["support_strength"] == "tentative"
-    assert out["confidence"] is None
-
-
-def test_assess_final_claim_attributed(tmp_path: Path) -> None:
-    client = _final_client(tmp_path, 0.9, "sufficient_support")
-    out = asyncio.run(
-        client.assess_final_claim(
-            "WSJ reported the CEO resigned.",
-            "attributed_report",
-            [{"id": "ev-2", "content": "WSJ: CEO resigned."}],
-            session_id="s1",
-        )
-    )
-    assert out["support_answer"] == "yes" and out["evidence_state"] == "sufficient_support"
-    assert client.decide_types[0][0] == "final_claim_assessment"
-
-
-def test_assess_final_claim_conditional_and_missing(tmp_path: Path) -> None:
-    client = _final_client(tmp_path, 0.2, "insufficient")
-    out = asyncio.run(
-        client.assess_final_claim(
-            "If tariffs rise, margins may fall.",
-            "conditional_risk",
-            [],
-            session_id="s1",
-        )
-    )
-    assert out["support_answer"] == "no" and out["evidence_state"] == "insufficient"
-    with pytest.raises(ValueError):
-        asyncio.run(client.assess_final_claim("  ", "inference", [], session_id="s1"))
-    with pytest.raises(ValueError):
-        asyncio.run(client.assess_final_claim("x", "  ", [], session_id="s1"))
-
-
-def test_assess_final_ops_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import app.research.kernel_worker as kw
-    import tests.research_source_seam as seam
-
-    blank = kw._assess_final_response({"id": "r1", "op": "assess_final_response", "text": "  "})
-    assert blank["support"] is None and blank["support_answer"] is None and blank["evidence_state"] == "insufficient"
-    assert blank["error"] == "text required"
-    noclaim = kw._assess_final_claim({"id": "c1", "op": "assess_final_claim", "claim": {"text": "x"}})
-    assert noclaim["support"] is None and noclaim["evidence_state"] == "insufficient"
-
-    class _Boom(JevClient):
-        @override
-        async def assess_final_response(
-            self,
-            text: str,
-            evidence: Mapping[str, JSONValue] | Sequence[JSONValue] | None = None,
-            *,
-            session_id: str,
-            job_id: str | None = None,
-            confidence: float | None = None,
-            claims: Sequence[JSONValue] | None = None,
-        ) -> dict[str, JSONValue]:
-            raise RuntimeError("jev down")
-
-        @override
-        async def assess_final_claim(
-            self,
-            text: str,
-            claim_type: str,
-            evidence: Mapping[str, JSONValue] | Sequence[JSONValue] | None = None,
-            *,
-            session_id: str,
-            job_id: str | None = None,
-            confidence: float | None = None,
-        ) -> dict[str, JSONValue]:
-            raise RuntimeError("jev down")
-
-    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "The filing discusses exposure."})
-    inventory: dict[str, JSONValue] = {
-        "text": "The filing may suggest exposure.",
-        "claim_type": "inference",
-        "evidence_ids": ["ev-1"],
-    }
-    down_r = kw._assess_final_response(
-        {"id": "r2", "sessionId": sid, "text": inventory["text"], "claims": [inventory], "evidence": []}, jev=_Boom()
-    )
-    assert down_r["support"] is None and down_r["support_answer"] is None and down_r["evidence_state"] == "insufficient"
-    assert down_r["error"] == "jev down"
-    down_c = kw._assess_final_claim(
-        {
-            "id": "c2",
-            "sessionId": sid,
-            "claim": inventory,
-            "evidence": [],
-        },
-        jev=_Boom(),
-    )
-    assert down_c["support"] is None and down_c["evidence_state"] == "insufficient"
-    assert down_c["error"] == "jev down"
-
-
-def test_assess_final_ops_shape_and_alias(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import app.research.kernel_worker as kw
-    import tests.research_source_seam as seam
-
-    # The worker verifies every claim against the session ledger before JEV sees it.
-    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-1": "WSJ reported X.", "ev-2": "If Y then Z."})
-    client = _final_client(tmp_path, 0.8, "sufficient_support")
-    resp = kw._assess_final_response(
-        {
-            "id": "r3",
-            "op": "assess_final_response",
-            "text": "WSJ reported X. If Y then Z.",
-            "claims": [
-                {
-                    "text": "WSJ reported X.",
-                    "claim_type": "attributed_report",
-                    "evidence_ids": ["ev-1"],
-                },
-                {
-                    "text": "If Y then Z.",
-                    "claim_type": "conditional_risk",
-                    "evidence_ids": ["ev-2"],
-                    "confidence": 0.6,
-                },
-            ],
-            "evidence": [
-                {"id": "ev-1", "content": "WSJ: X."},
-                {"id": "ev-2", "content": "Y risk."},
-                {"id": "x"},
-            ],
-            "sessionId": sid,
-            "confidence": 0.75,
-        },
-        jev=client,
-    )
-    assert resp["id"] == "r3" and resp["support_answer"] == "yes" and "error" not in resp
-    assert client.decide_types[0][0] == "final_response_assessment"
-    claim = kw._assess_final_claim(
-        {
-            "id": "c3",
-            "op": "assess_final_claim",
-            "claim": {
-                "text": "WSJ reported X.",
-                "claim_type": "attributed_report",
-                "evidence_ids": ["ev-1"],
-            },
-            "evidence": [{"id": "ev-1", "content": "WSJ: X."}],
-            "session_id": sid,
-        },
-        jev=client,
-    )
-    assert claim["id"] == "c3" and claim["support_answer"] == "yes" and "error" not in claim
 
 
 def _noop_persist(**kwargs: object) -> None:
@@ -2387,127 +1642,6 @@ def test_decide_rejects_unserializable_request(tmp_path: Path, monkeypatch: pyte
         asyncio.run(client.decide({"bad": object()}, {"q": {"type": "noul"}}, decision_type="t", session_id="s"))
 
     assert seen == []
-
-
-def _choice_transport(
-    picks: Mapping[str, str],
-    probabilities: Mapping[str, Mapping[str, float]] | None = None,
-) -> Callable[[object, Mapping[str, JSONValue]], dict[str, JSONValue]]:
-    """Stub answer envelope: pick the named label per question, with optional explicit probabilities."""
-
-    def _run(_state: object, questions: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
-        answers: dict[str, JSONValue] = {}
-        for qid, question in questions.items():
-            criteria = question.get("criteria") if isinstance(question, dict) else None
-            labels: list[str] = sorted(criteria) if isinstance(criteria, dict) else []
-            chosen = picks[qid]
-            assert chosen in labels, (qid, chosen)
-            given: Mapping[str, float] | None = probabilities.get(qid) if probabilities else None
-            rest = 0.1 / max(len(labels) - 1, 1)
-            probs: dict[str, JSONValue] = {}
-            for label in labels:
-                probs[label] = given[label] if given is not None else (0.9 if label == chosen else rest)
-            answers[qid] = {"type": "choice", "choice": chosen, "probabilities": probs, "confidence": 0.9}
-        return {"answers": answers}
-
-    return _run
-
-
-def _stub_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transport: Callable[..., object]) -> JevClient:
-    client = JevClient(transport=transport, data_root=tmp_path)
-    monkeypatch.setattr(client, "_persist", _noop_persist)
-    return client
-
-
-@pytest.mark.parametrize(
-    ("pick", "action"),
-    [("alpha", "invoke"), (REASON_SENTINEL, "reason"), (RESOLVED_SENTINEL, "resolved")],
-)
-def test_adjudicate_maps_sidecar_choice_to_tool_decision(
-    pick: str, action: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Adjudication over the whole registry returns invoke, reason, or resolved for the winner."""
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
-    registry: list[dict[str, JSONValue]] = [{"name": "alpha"}]
-    client = _stub_client(tmp_path, monkeypatch, _choice_transport({"tool_selection": pick}))
-
-    out = asyncio.run(client.adjudicate({"analyses": []}, node, session_id="s", registry=registry))
-
-    assert out.action == action
-    assert out.tool_name == ("alpha" if action == "invoke" else None)
-    assert out.tool_names == (("alpha",) if action == "invoke" else ())
-    assert out.confidence == 0.9
-
-
-def test_adjudicate_fans_out_close_runner_ups(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Runner-ups above the parallel floor and inside the window join the fan-out, capped at three."""
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
-    registry: list[dict[str, JSONValue]] = [
-        {"name": "alpha"},
-        {"name": "beta"},
-        {"name": "gamma"},
-        {"name": "delta"},
-    ]
-    scores = {
-        "tool_selection": {
-            "alpha": 0.60,
-            "beta": 0.55,
-            "gamma": 0.50,
-            "delta": 0.20,
-            REASON_SENTINEL: 0.05,
-            RESOLVED_SENTINEL: 0.05,
-        }
-    }
-    client = _stub_client(tmp_path, monkeypatch, _choice_transport({"tool_selection": "alpha"}, scores))
-
-    out = asyncio.run(client.adjudicate({"analyses": []}, node, session_id="s", registry=registry))
-
-    assert out.action == "invoke" and out.tool_name == "alpha"
-    assert out.tool_names[0] == "alpha"
-    assert out.tool_names == ("alpha", "beta", "gamma")
-
-
-def test_select_tool_rejects_sidecar_decision_defects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A sidecar decision that is not a choice, not in the registry, or not numeric fails the selection."""
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
-    registry: list[dict[str, JSONValue]] = [{"name": "alpha"}]
-    cases: list[tuple[JSONValue, type[Exception], str]] = [
-        ({"kind": "noul", "probability": 0.5}, TypeError, "malformed tool_selection decision"),
-        ({"kind": "choice", "choice": "alpha"}, TypeError, "malformed tool_selection decision"),
-        ({"kind": "choice", "choice": "outside", "probabilities": {"outside": 0.9}}, ValueError, "not in registry"),
-        (
-            {"kind": "choice", "choice": "alpha", "probabilities": {"alpha": "x"}, "confidence": 0.9},
-            TypeError,
-            "malformed tool_selection probabilities",
-        ),
-    ]
-
-    for decision, error, match in cases:
-        client = _sidecar_answering(tmp_path, monkeypatch, {"raw": {}, "decisions": {"tool_selection": decision}})
-        with pytest.raises(error, match=match):
-            asyncio.run(client.select_tool("obj", node, registry, session_id="s"))
-
-
-@pytest.mark.parametrize(
-    ("decision", "match"),
-    [
-        # A non-mapping decision fails the sidecar response typing before the kind check,
-        # so that defect names the response, not the selection (app/decision_client.py:1173).
-        (None, "malformed sidecar response"),
-        ({}, "malformed tool_selection decision"),
-        ({"choice": []}, "malformed tool_selection decision"),
-        ({"kind": "choice", "choice": []}, "malformed tool_selection decision"),
-    ],
-)
-def test_select_tool_rejects_missing_sidecar_decision(
-    decision: JSONValue, match: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A missing or shapeless tool_selection decision never becomes a ToolDecision."""
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
-    client = _sidecar_answering(tmp_path, monkeypatch, {"raw": {}, "decisions": {"tool_selection": decision}})
-
-    with pytest.raises(TypeError, match=match):
-        asyncio.run(client.select_tool("obj", node, [{"name": "alpha"}], session_id="s"))
 
 
 # --- decision answer parsing boundaries ---------------------------------------------------------
@@ -3142,46 +2276,6 @@ def test_persist_swallows_a_failing_model_call(tmp_path: Path, monkeypatch: pyte
 # --- prompt phases and logging projections ------------------------------------------------------
 
 
-def test_node_dict_reads_dataclasses_to_dict_and_attributes() -> None:
-    """Node projections come from a mapping, a to_dict method, dataclass fields, or plain attributes."""
-    from dataclasses import dataclass
-
-    from app.decision_client import _node_dict
-
-    @dataclass
-    class _Node:
-        node_id: str
-        question: str
-
-    class _ToDict:
-        def to_dict(self) -> object:
-            return {"id": "n2", "question": "why?"}
-
-    class _NotAMapping:
-        def to_dict(self) -> object:
-            return "nope"
-
-    class _Attrs:
-        node_id = "n3"
-        question = "how?"
-        depends_on = ("a", "b")
-
-    assert _node_dict({"node_id": "n1", "question": "q?", "unlisted": 1}) == {"node_id": "n1", "question": "q?"}
-    assert _node_dict(_Node(node_id="n4", question="q4?")) == {"node_id": "n4", "question": "q4?"}
-    assert _node_dict(_ToDict()) == {"id": "n2", "question": "why?"}
-    assert _node_dict(_NotAMapping()) == {}
-    assert _node_dict(_Attrs()) == {"node_id": "n3", "question": "how?", "depends_on": ["a", "b"]}
-    assert _node_dict(object()) == {}
-
-
-class _HostileDict(dict[str, JSONValue]):
-    """Mapping whose lookups always fail, standing in for a corrupt decision payload."""
-
-    @override
-    def get(self, *args: object, **kwargs: object) -> JSONValue:
-        raise TypeError("boom")
-
-
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -3201,236 +2295,6 @@ def test_jev_usage_reads_only_wire_token_counts(
     from app.decision_client import _jev_usage
 
     assert _jev_usage(raw) == expected
-
-
-def test_logging_projections_never_raise_on_hostile_mappings() -> None:
-    """Usage and choice summaries are logging-only: a hostile mapping yields the fallback text."""
-    from app.decision_client import _choice_summary, _jev_usage
-
-    assert _jev_usage(_HostileDict()) == (None, None, None)
-    assert _choice_summary(_HostileDict()) == "winner=? conf=? top3=[] margin=?"
-
-
-def test_choice_summary_shapes_winner_top3_and_margin() -> None:
-    """The logging one-liner reports the winner, its confidence, the top three, and the margin."""
-    from app.decision_client import _choice_summary
-
-    assert _choice_summary(None) == "winner=- conf=- top3=[] margin=0.00"
-    assert _choice_summary(
-        {"choice": "a", "confidence": 0.5, "probabilities": {"a": 0.9, "b": 0.6, "c": 0.2, "d": 0.1}}
-    ) == ("winner=a conf=0.50 top3=[a:0.90,b:0.60,c:0.20] margin=0.30")
-    assert _choice_summary({"choice": "a", "confidence": 1.5, "probabilities": {"a": 2.0, "b": "x"}}) == (
-        "winner=a conf=1.50 top3=[] margin=0.00"
-    )
-    assert _choice_summary({"choice": "", "confidence": True, "probabilities": [1]}) == (
-        "winner=- conf=- top3=[] margin=0.00"
-    )
-
-
-def test_observation_lines_caps_at_five_recent_records() -> None:
-    """Only the last ten records are inspected and at most five observation lines come back."""
-    from app.decision_client import _observation_lines
-
-    assert _observation_lines(None) == []
-    assert _observation_lines({"a": 1}) == []
-    many: list[JSONValue] = [{"tool": f"t{i}", "outcome_summary": "s"} for i in range(12)]
-
-    assert _observation_lines(many) == [f"t{i}: s" for i in range(2, 7)]
-
-
-def test_tool_options_prompt_rejects_defective_input() -> None:
-    """An empty registry, a nameless node, and a duplicate or colliding entry are defects."""
-    from app.decision_client import _registry_options, _tool_options_prompt
-
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?"}
-    registry: list[dict[str, JSONValue]] = [{"name": "a"}]
-
-    with pytest.raises(ValueError, match="empty registry"):
-        _tool_options_prompt([], node, [], [])
-    bad_nodes: tuple[Mapping[str, JSONValue], ...] = ({}, {"node_id": "n1"}, {"question": "q?"}, {"id": ""})
-    for bad_node in bad_nodes:
-        with pytest.raises(ValueError, match="needs nodeId and question"):
-            _tool_options_prompt(registry, bad_node, [], [])
-    with pytest.raises(ValueError, match="needs a name"):
-        _tool_options_prompt([{}], node, [], [])
-    with pytest.raises(ValueError, match="tool_selection: registry entry needs a name"):
-        _registry_options(["junk"], {}, "tool_selection")
-    with pytest.raises(ValueError, match="duplicate tool a"):
-        _tool_options_prompt([{"name": "a"}, {"name": "a"}], node, [], [])
-    with pytest.raises(ValueError, match="collides with sentinel"):
-        _tool_options_prompt([{"name": REASON_SENTINEL}], node, [], [])
-
-
-def test_tool_options_prompt_renders_evidence_observations_and_why() -> None:
-    """The question text carries the node question, why-it-matters, evidence ids, and observations."""
-    from app.decision_client import _SENTINEL_DESCRIPTIONS, _tool_options_prompt
-
-    node: dict[str, JSONValue] = {"node_id": "n1", "question": "q?", "why_it_matters": " because "}
-    evidence: list[JSONValue] = [
-        {"evidence_id": "ev-1", "claim_text": "c"},
-        {"tool": "t", "tool_result_ref": "r", "outcome_summary": "  one   two  "},
-        {"tool": "u", "outcome_summary": "x", "error": "  boom  "},
-        {"evidence_id": "ev-2"},
-        {"id": "ev-3"},
-        "junk",
-        {"outcome_summary": "   "},
-    ]
-
-    options, prompt = _tool_options_prompt(
-        [{"name": "a"}], node, evidence, [{"tool": "b"}, "junk", {"tool": "c", "error": ""}]
-    )
-
-    assert options == {
-        "a": "a",
-        REASON_SENTINEL: _SENTINEL_DESCRIPTIONS[REASON_SENTINEL],
-        RESOLVED_SENTINEL: _SENTINEL_DESCRIPTIONS[RESOLVED_SENTINEL],
-    }
-    assert prompt.startswith("Which single tool runs next for research node n1? Question: [Today UTC ")
-    assert " Why it matters:  because " in prompt
-    assert " Evidence on hand: 7 item(s) [ev-1,r,ev-2,ev-3]." in prompt
-    assert " Observed t ref=r: one two." in prompt
-    assert " Observed u FAILED: boom." in prompt
-    assert "Prior attempt" not in prompt
-
-    _, number_prompt = _tool_options_prompt([{"name": "a"}], {"node_id": "n1", "question": 7}, [], [])
-    assert "Question: 7" in number_prompt and "Latest revenue" not in number_prompt
-
-
-def test_assess_final_response_states_declared_claim_types(tmp_path: Path) -> None:
-    """The whole-response question states the declared claim count and its sorted, unique types."""
-    client = _final_client(tmp_path, 0.9, "sufficient_support")
-
-    asyncio.run(
-        client.assess_final_response(
-            "WSJ reported X; if Y then Z.",
-            [],
-            session_id="s1",
-            claims=[
-                {"claim_type": "conditional_risk"},
-                {"claim_type": "attributed_report"},
-                {"claim_type": "attributed_report"},
-                "junk",
-            ],
-        )
-    )
-
-    support = client.decide_types[0][1]["support"]
-    assert isinstance(support, dict)
-    instructions = support["instructions"]
-    assert isinstance(instructions, str)
-    assert " Declared claims: 4 (types: attributed_report,conditional_risk)." in instructions
-    assert "Cited evidence: 0 item(s)." in instructions
-
-
-def test_assess_final_response_requires_text_and_bounds_confidence(tmp_path: Path) -> None:
-    """A blank or non-text response is rejected; a confidence outside [0,1] is not carried."""
-    from app.decision_client import _checked_excerpt
-
-    client = _final_client(tmp_path, 0.9, "insufficient")
-
-    with pytest.raises(ValueError, match="assess_final_response: text required"):
-        asyncio.run(client.assess_final_response("  ", [], session_id="s1"))
-    for text in (7, None):
-        with pytest.raises(ValueError, match="assess_final_response: text required"):
-            _checked_excerpt(text, "assess_final_response")
-
-    out = asyncio.run(client.assess_final_response("Growth maybe.", None, session_id="s1", confidence=1.5))
-
-    assert out["confidence"] is None
-    support = client.decide_types[0][1]["support"]
-    assert isinstance(support, dict)
-    instructions = support["instructions"]
-    assert isinstance(instructions, str)
-    assert " Declared claims: 0." in instructions and "(types:" not in instructions
-
-
-def test_auto_registry_prefers_scheduler_manifests(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A non-empty scheduler registry is returned as-is; the degraded build never runs."""
-    import app.decision_client as dc
-
-    manifest: list[dict[str, JSONValue]] = [{"name": "alpha"}]
-
-    def _unused() -> list[dict[str, JSONValue]]:
-        raise AssertionError("fallback ran for a healthy scheduler registry")
-
-    monkeypatch.setattr("app.research.scheduler.build_registry", lambda: manifest)
-    monkeypatch.setattr(dc, "_fallback_registry", _unused)
-
-    assert dc._auto_registry() is manifest
-
-
-def test_auto_registry_falls_back_when_scheduler_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A scheduler that raises, or returns nothing, yields the degraded canonical registry."""
-    import app.decision_client as dc
-    from app.research.scheduler import build_registry
-
-    def _boom() -> list[dict[str, JSONValue]]:
-        raise AttributeError("build_registry is gone")
-
-    monkeypatch.setattr("app.research.scheduler.build_registry", _boom)
-    fallback = dc._auto_registry()
-
-    assert fallback and all(isinstance(entry.get("name"), str) for entry in fallback)
-    assert list(fallback[0]) == list(build_registry()[0])
-
-    monkeypatch.setattr("app.research.scheduler.build_registry", list)
-    assert [entry["name"] for entry in dc._auto_registry()] == [entry["name"] for entry in fallback]
-
-
-def test_fallback_registry_renders_discovery_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A known tool carries its discovery metadata and declared prerequisites; unknown names stay blank."""
-    import app.decision_client as dc
-    import app.tools
-    from app.research.scheduler import _HANDLE_PARAMS
-    from app.tools import TOOL_DISCOVERY_REGISTRY
-
-    known = next(iter(TOOL_DISCOVERY_REGISTRY))
-    handle = next(iter(sorted(_HANDLE_PARAMS)))
-    unknown = "zz_not_a_canonical_tool"
-
-    def _tools(*args: object, **kwargs: object) -> list[object]:
-        return [
-            "not-a-tool",
-            {},
-            {"function": "not-a-mapping"},
-            {"function": {"name": ""}},
-            {"function": {"name": 7}},
-            {"function": {"name": known, "parameters": {"required": [handle, 7]}}},
-            {"function": {"name": unknown, "description": "described", "parameters": "not-a-mapping"}},
-        ]
-
-    monkeypatch.setattr(app.tools, "tools_for_capabilities", _tools)
-    entries = dc._fallback_registry()
-    meta = TOOL_DISCOVERY_REGISTRY[known]
-
-    assert [entry["name"] for entry in entries] == [known, unknown]
-    assert entries[0]["purpose"] == meta.summary
-    assert entries[0]["useWhen"] == "; ".join(meta.choose_when)
-    assert entries[0]["avoidWhen"] == "; ".join(meta.reject_when)
-    assert entries[0]["conflicts"] == ", ".join(meta.conflicts_with)
-    assert entries[0]["nextTools"] == ", ".join(meta.related_tools)
-    assert entries[0]["evidence"] == meta.output_kind
-    assert entries[0]["prerequisites"] == f"needs {handle}"
-    assert entries[0]["parameters"] == {"required": [handle, 7]}
-    assert entries[1]["description"] == "described"
-    assert entries[1]["domain"] == "unknown"
-    assert entries[1]["purpose"] == "" and entries[1]["prerequisites"] == ""
-    assert entries[1]["nextTools"] == "" and entries[1]["keyInputs"] == "req()"
-    assert entries[1]["parameters"] == {}
-
-
-def test_fallback_registry_survives_missing_scheduler_constants(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without the scheduler handle and blind lists the degraded manifest stays conservative."""
-    import app.decision_client as dc
-
-    monkeypatch.delattr("app.research.scheduler._HANDLE_PARAMS")
-    monkeypatch.delattr("app.research.scheduler._PIT_BLIND_TOOLS")
-
-    assert dc._scheduler_metadata() == (frozenset(), frozenset())
-    entries = dc._fallback_registry()
-    assert entries
-    assert all(entry["pitSupport"] == "PIT-scoped" for entry in entries)
-    assert all(entry["prerequisites"] == "" for entry in entries)
 
 
 @pytest.mark.parametrize("choice", ["low", "medium", "high", "xhigh", "auto", "HIGH", "", "unknown"])
@@ -3480,3 +2344,144 @@ def test_select_answer_effort_uses_strict_choices(tmp_path: Path, monkeypatch: p
     assert "Explain the filing\nTicker: NVDA" in instructions
     assert "The supplied limits are shared across persona drafts, synthesis, and inventory repair." in instructions
     assert "A simple fact lookup or filing explanation normally needs low effort, not high or xhigh." in instructions
+
+
+def test_select_subjects_keeps_threshold_in_candidate_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One noul per candidate: kept at >= 0.50 and returned in candidate order, not answer order."""
+    seen: list[tuple[object, dict[str, JSONValue]]] = []
+    answers: dict[str, float] = {"ZZZ": 0.9, "AAA": 0.49, "MMM": 0.5}
+
+    def transport(state: object, questions: dict[str, JSONValue]) -> dict[str, JSONValue]:
+        seen.append((state, questions))
+        return {"answers": {ticker: {"type": "noul", "noul": p} for ticker, p in answers.items()}}
+
+    persisted: list[dict[str, object]] = []
+
+    def no_persist(**kwargs: object) -> None:
+        persisted.append(kwargs)
+
+    client = JevClient(transport=transport, data_root=tmp_path)
+    monkeypatch.setattr(client, "_persist", no_persist)
+    candidates = [
+        ("Google", "Alphabet Inc.", "ZZZ"),
+        ("Beta", "Beta Inc.", "AAA"),
+        ("Mmm", "Mmm Ltd", "MMM"),
+    ]
+
+    assert asyncio.run(client.select_subjects("Compare Google and Beta", candidates, session_id="s")) == [
+        "ZZZ",
+        "MMM",
+    ]
+    assert [(record["decision_type"], record["session_id"]) for record in persisted] == [("subjects", "s")]
+    state, questions = seen[0]
+    assert state == {
+        "prompt": "Compare Google and Beta",
+        "candidates": [["Google", "Alphabet Inc.", "ZZZ"], ["Beta", "Beta Inc.", "AAA"], ["Mmm", "Mmm Ltd", "MMM"]],
+    }
+    assert list(questions) == ["ZZZ", "AAA", "MMM"]
+    instructions = questions["ZZZ"]
+    assert isinstance(instructions, dict)
+    assert instructions["type"] == "noul"
+    text = instructions["instructions"]
+    assert isinstance(text, str)
+    assert text.startswith("Request: Compare Google and Beta Does this request ask about Alphabet Inc. (ticker ZZZ)?")
+    assert "The request names it as 'Google'." in text  # the SEC name does not contain the mention
+    beta = questions["AAA"]
+    assert isinstance(beta, dict)
+    beta_text = beta["instructions"]
+    assert isinstance(beta_text, str)
+    assert beta["type"] == "noul"
+    assert beta_text == (
+        "Request: Compare Google and Beta Does this request ask about Beta Inc. (ticker AAA)? "
+        "Answer yes when the request asks about that company, its stock, or its filings. "
+        "Answer no when the request is about a different company, or about no company."
+    )
+
+
+def test_select_subjects_without_candidates_skips_jev(tmp_path: Path) -> None:
+    """No candidate means no decision request at all."""
+
+    def transport(state: object, questions: object) -> dict[str, JSONValue]:
+        pytest.fail("JEV must not be called without candidates")
+
+    client = JevClient(transport=transport, data_root=tmp_path)
+    assert asyncio.run(client.select_subjects("What time is it?", [], session_id="s")) == []
+
+
+def test_select_subjects_collapses_duplicate_tickers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two labels of one company ask one question and keep the first label."""
+    seen: list[dict[str, JSONValue]] = []
+
+    def transport(state: object, questions: dict[str, JSONValue]) -> dict[str, JSONValue]:
+        seen.append(questions)
+        return {"answers": {ticker: {"type": "noul", "noul": 0.8} for ticker in questions}}
+
+    def no_persist(**kwargs: object) -> None:
+        return None
+
+    client = JevClient(transport=transport, data_root=tmp_path)
+    monkeypatch.setattr(client, "_persist", no_persist)
+    candidates = [("Google", "Alphabet Inc.", "GOOGL"), ("Alphabet", "Alphabet Inc.", "GOOGL")]
+
+    assert asyncio.run(client.select_subjects("Google vs Alphabet?", candidates, session_id="s")) == ["GOOGL"]
+    assert list(seen[0]) == ["GOOGL"]
+    question = seen[0]["GOOGL"]
+    assert isinstance(question, dict)
+    assert "Alphabet Inc. (ticker GOOGL)" in str(question["instructions"])
+
+
+@pytest.mark.parametrize(
+    ("probability", "in_scope"),
+    [(0.2, False), (0.49, False), (0.5, True), (0.9, True)],
+)
+def test_request_in_scope_reads_one_noul_at_half(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probability: float, in_scope: bool
+) -> None:
+    """The scope noul keeps 0.50 as its boundary."""
+    seen: list[tuple[object, dict[str, JSONValue]]] = []
+
+    def transport(state: object, questions: dict[str, JSONValue]) -> dict[str, JSONValue]:
+        seen.append((state, questions))
+        return {"answers": {"in_scope": {"type": "noul", "noul": probability}}}
+
+    persisted: list[dict[str, object]] = []
+
+    def no_persist(**kwargs: object) -> None:
+        persisted.append(kwargs)
+
+    client = JevClient(transport=transport, data_root=tmp_path)
+    monkeypatch.setattr(client, "_persist", no_persist)
+    prompt = "How do I bake sourdough bread at home?"
+    assert asyncio.run(client.request_in_scope(prompt, session_id="s")) is in_scope
+    assert [(record["decision_type"], record["session_id"]) for record in persisted] == [("request_scope", "s")]
+    state, questions = seen[0]
+    assert state == {"prompt": prompt}
+    assert list(questions) == ["in_scope"]
+    question = questions["in_scope"]
+    assert isinstance(question, dict) and question["type"] == "noul"
+    instructions = question["instructions"]
+    assert isinstance(instructions, str)
+    assert instructions == (
+        f"Request: {prompt} Is this request about markets, companies, securities, or investing? "
+        "Answer yes for a question about a company, a stock, a filing, a portfolio, a thesis, or a market, "
+        "and for a request to manage one of them. "
+        "Answer no for an unrelated topic, such as cooking, travel, or health."
+    )
+
+
+@pytest.mark.parametrize("answer", [{"type": "noul", "noul": None}, {"type": "noul", "noul": "high"}, {}])
+def test_request_in_scope_rejects_a_malformed_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: dict[str, JSONValue]
+) -> None:
+    """A malformed scope answer raises, so the worker keeps research instead of refusing it."""
+
+    def transport(state: object, questions: dict[str, JSONValue]) -> dict[str, JSONValue]:
+        return {"answers": {"in_scope": answer}}
+
+    def no_persist(**kwargs: object) -> None:
+        return None
+
+    client = JevClient(transport=transport, data_root=tmp_path)
+    monkeypatch.setattr(client, "_persist", no_persist)
+    with pytest.raises(ValueError, match="malformed_decision_answer"):
+        asyncio.run(client.request_in_scope("NVDA revenue?", session_id="s"))

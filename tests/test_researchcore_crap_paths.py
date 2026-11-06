@@ -130,6 +130,23 @@ def test_invalid_context_unknown_staged_session(tmp_path: Path, monkeypatch: pyt
     assert "Unknown research session" in str(out.get("error", ""))
 
 
+def test_explicit_unknown_session_id_cannot_bypass_the_stage_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A forged session_id argument is denied before any handler runs, even inside a real session."""
+    from app.research.repository import ResearchRepository
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, jid = _svc_sid(repo)
+    ctx = RuntimeToolSession(session_id="gw-forged-sid")
+    ctx.active_research_session_id = sid
+    ctx.active_research_job_id = jid
+    out = execute_agent_tool("research_finalize", {"session_id": "bogus"}, ctx)
+    assert out.get("error_type") == "invalid_research_context"
+    assert "Unknown research session 'bogus'" in str(out.get("error", ""))
+
+
 def test_invalid_context_dispatch_missing_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from app.research.repository import ResearchRepository
 
@@ -6814,10 +6831,10 @@ def test_zero_novelty_wave_stops_the_run(tmp_path: Path, monkeypatch: pytest.Mon
 def test_kernel_node_lifecycle_ready_gating_and_decision_roundtrip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Kernel slice: node lifecycle + depends_on gating + decision persist + ToolDecision shapes."""
+    """Kernel slice: node lifecycle, dependency gating, and decision persistence."""
     import sqlite3
 
-    from app.research.models import DecisionRecord, ResearchNode, ToolDecision
+    from app.research.models import DecisionRecord, ResearchNode
 
     monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
     monkeypatch.setenv("RUNS_DB_PATH", str(tmp_path / "runs.sqlite"))
@@ -6848,15 +6865,6 @@ def test_kernel_node_lifecycle_ready_gating_and_decision_roundtrip(
     assert len(back) == 1 and back[0].decision_id == decision.decision_id
     assert DecisionRecord.from_dict(decision.to_dict()).selected == ["x"]
     assert ResearchNode.from_dict(first.to_dict()).node_id == first.node_id
-    single = ToolDecision.from_dict({"action": "invoke", "tool_name": "a", "probabilities": {}})
-    assert single.tool_names == ("a",) and single.selected_tools == ("a",)
-    parallel = ToolDecision.from_dict(
-        {"action": "invoke", "tool_name": "a", "tool_names": ["a", "b"], "probabilities": {}}
-    )
-    assert parallel.selected_tools == ("a", "b")
-    assert ToolDecision.from_dict({"action": "resolved", "probabilities": {}}).selected_tools == ()
-    with pytest.raises(ValueError):
-        ToolDecision.from_dict({"action": "invoke", "probabilities": {}})
     with pytest.raises(svc.ResearchNotFound):
         svc.create_node("rs:missing", "q?", "why?", repo=repo)
     mirror = (
@@ -7134,7 +7142,14 @@ def test_materialize_sec_passage_rejects_archive_without_text(monkeypatch: pytes
 
 
 @pytest.mark.parametrize(
-    "domain,tool", [("FINRA", "get_short_interest"), ("WEB", "search_web"), ("SEC", "list_sec_filings")]
+    "domain,tool",
+    [
+        ("FINRA", "get_short_interest"),
+        ("WEB", "search_web"),
+        ("SEC", "list_sec_filings"),
+        ("ALT", "get_trend_evidence"),
+        ("MACRO", "get_macro_context"),
+    ],
 )
 def test_persist_tool_result_preserves_first_payload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, domain: str, tool: str
@@ -7160,7 +7175,12 @@ def test_persist_tool_result_preserves_first_payload(
         ("WEB", "list_sec_filings", "cannot ground WEB evidence"),
         ("SEC", "search_web", "cannot ground SEC replay"),
         ("SEC", "get_sec_document", "cannot ground SEC replay"),
+        ("SEC", "get_trend_evidence", "cannot ground SEC replay"),
+        ("ALT", "get_macro_context", "cannot ground ALT evidence"),
+        ("ALT", "list_sec_filings", "cannot ground ALT evidence"),
+        ("MACRO", "get_trend_evidence", "cannot ground MACRO evidence"),
         ("OTHER", "search_web", "persists no tool results"),
+        ("OTHER", "get_trend_evidence", "persists no tool results"),
     ],
 )
 def test_persist_tool_result_rejects_wrong_domain(

@@ -846,7 +846,7 @@ test("secure relative redirects preserve both wire formats, headers, and the ini
       expect(init.body).toBe(calls[0].init.body);
       const request = JSON.parse(String(init.body));
       if (format === "decisions") {
-        expect(request).toEqual({ model: DECISION_ENV.DECISION_MODEL, state: { s: 1 }, questions: Q });
+        expect(request).toEqual({ model: DECISION_ENV.DECISION_MODEL, state: JSON.stringify({ s: 1 }), questions: Q });
       } else {
         expect(Object.keys(request).sort()).toEqual(["messages", "model", "stream"]);
         expect(request.model).toBe(DECISION_ENV.DECISION_MODEL);
@@ -1262,7 +1262,7 @@ test("native Decisions format posts {model,state,questions} for typesafe/jev-1.1
     "Content-Type": "application/json",
   });
   // The reported HTTP 400 came from Chat Completions fields on the native endpoint.
-  expect(JSON.parse(String(calls[0].init.body))).toEqual({ model: "typesafe/jev-1.13", state: DOC_STATE, questions: DOC_Q });
+  expect(JSON.parse(String(calls[0].init.body))).toEqual({ model: "typesafe/jev-1.13", state: JSON.stringify(DOC_STATE), questions: DOC_Q });
   expect(res.raw).toEqual({
     answers: DOC_ANSWERS,
     model: "typesafe/jev-1.13-20260917",
@@ -1285,7 +1285,7 @@ test("DECISION_API_FORMAT alone selects the wire format, never the URL or model"
   setDecisionEnv({ DECISION_API_FORMAT: "decisions" });
   const nativeRes = (await decide(recordingFetch(nativeCalls, () => chat({ answers: GOOD })))) as DecideOk;
   expect(nativeCalls[0].url).toBe(DECISION_ENV.DECISION_API_URL);
-  expect(JSON.parse(String(nativeCalls[0].init.body))).toEqual({ model: "decision-test-model", state: { s: 1 }, questions: Q });
+  expect(JSON.parse(String(nativeCalls[0].init.body))).toEqual({ model: "decision-test-model", state: JSON.stringify({ s: 1 }), questions: Q });
   expect(nativeRes.raw).toEqual({ answers: GOOD, model: "decision-test-model" });
 });
 

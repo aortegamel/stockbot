@@ -764,10 +764,10 @@ describe("SourcePage", () => {
     expect(chat.textContent).toContain("Partial checked answer · research continues");
     const final: AgentEvent = { type: "answer_delta", text: "The final filing analysis [ev:cited]." };
     await act(async () => mounted?.render(<AgentConsole events={[evidence, partial, final]} reasoning={false} debug={false} />));
-    expect(chat.textContent).toContain("The final filing analysis");
-    expect(chat.textContent).not.toContain("Revenue rose.");
+    expect(chat.textContent).not.toContain("The final filing analysis");
+    expect(chat.textContent).toContain("Revenue rose.");
     await act(async () => mounted?.render(<AgentConsole events={[evidence, partial, final, { type: "failed", category: "provider_error", message: "private provider diagnostic" }]} reasoning={false} debug={false} />));
-    expect(chat.textContent).toContain("The final filing analysis");
+    expect(chat.textContent).toContain("Revenue rose.");
     expect(chat.textContent).not.toContain("research continues");
     expect(chat.textContent).not.toContain("private provider diagnostic");
     expect(chat.querySelector('a[aria-label^="Open source:"]')?.getAttribute("href")).toBe(TEXT.originalUrl);

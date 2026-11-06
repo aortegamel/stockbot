@@ -1,8 +1,11 @@
 """Trigger runs plus deterministic monitoring (monitor.tick)."""
 
+import json
 import re
 from collections.abc import Callable, Mapping, Sequence
+from http.client import IncompleteRead
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -18,6 +21,92 @@ T0 = "2026-01-01T00:00:00+00:00"
 T1 = "2026-01-02T00:00:00+00:00"
 T2 = "2026-01-03T00:00:00+00:00"
 T4 = "2026-01-05T00:00:00+00:00"
+
+
+@pytest.mark.parametrize("as_of", [None, T2])
+def test_default_kernel_posts_research_and_waits_for_done(monkeypatch: pytest.MonkeyPatch, as_of: str | None) -> None:
+    monkeypatch.delenv("STOCKBOT_AGENT_API_URL", raising=False)
+    monkeypatch.setenv("STOCKBOT_API_PORT", "3456")
+    monkeypatch.delenv("STOCKBOT_THESIS_RESEARCH_TIMEOUT_SECONDS", raising=False)
+    response = MagicMock()
+    response.status = 200
+    response.__enter__.return_value = response
+    response.__iter__.return_value = iter([b": keepalive\n", b'data: {"type":"status"}\n', b'data: {"type":"done"}\n'])
+    connection = MagicMock()
+    connection.getresponse.return_value = response
+    transport = MagicMock(return_value=connection)
+
+    runner_mod._default_run_kernel("Review NVDA", as_of=as_of, transport=transport)
+
+    transport.assert_called_once_with("127.0.0.1", 3456, timeout=300.0)
+    args, kwargs = connection.request.call_args
+    assert args == ("POST", "/api/agent")
+    assert json.loads(kwargs["body"]) == {
+        "prompt": "Review NVDA",
+        "mode": "research",
+        **({"asOf": as_of} if as_of else {}),
+    }
+    connection.close.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("status", "lines", "message"),
+    [
+        (200, [b'data: {"type":"failed","message":"proof rejected"}\n'], "proof rejected"),
+        (200, [b'data: {"type":"error","message":"model unavailable"}\n'], "model unavailable"),
+        (200, [b'data: {"type":"status"}\n'], "stream ended without done"),
+        (500, [], "HTTP 500"),
+        (404, [], "HTTP 404"),
+    ],
+)
+def test_default_kernel_rejects_failed_or_incomplete_research(
+    monkeypatch: pytest.MonkeyPatch, status: int, lines: list[bytes], message: str
+) -> None:
+    monkeypatch.setenv("STOCKBOT_AGENT_API_URL", "http://agent.example:4567/")
+    monkeypatch.setenv("STOCKBOT_THESIS_RESEARCH_TIMEOUT_SECONDS", "240")
+    response = MagicMock()
+    response.status = status
+    response.__enter__.return_value = response
+    response.__iter__.return_value = iter([*lines, b'data: {"type":"done"}\n'] if status != 200 else lines)
+    connection = MagicMock()
+    connection.getresponse.return_value = response
+    transport = MagicMock(return_value=connection)
+
+    with pytest.raises(RuntimeError, match=message):
+        runner_mod._default_run_kernel("Review NVDA", as_of=T2, transport=transport)
+
+    transport.assert_called_once_with("agent.example", 4567, timeout=240.0)
+    connection.close.assert_called_once()
+
+
+@pytest.mark.parametrize("failure", [TimeoutError("read timed out"), IncompleteRead(b"truncated")])
+def test_default_kernel_rejects_transport_failure(monkeypatch: pytest.MonkeyPatch, failure: Exception) -> None:
+    monkeypatch.setenv("STOCKBOT_THESIS_RESEARCH_TIMEOUT_SECONDS", "240")
+    connection = MagicMock()
+    connection.getresponse.side_effect = failure
+    with pytest.raises(RuntimeError, match="Research API failed"):
+        runner_mod._default_run_kernel("Review NVDA", as_of=None, transport=MagicMock(return_value=connection))
+    connection.close.assert_called_once()
+
+
+def test_default_kernel_enforces_total_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STOCKBOT_THESIS_RESEARCH_TIMEOUT_SECONDS", "240")
+    monkeypatch.setattr(runner_mod.time, "monotonic", MagicMock(side_effect=[0, 1, 241]))
+    timer = MagicMock()
+    timer_factory = MagicMock(return_value=timer)
+    monkeypatch.setattr(runner_mod, "Timer", timer_factory)
+    response = MagicMock()
+    response.status = 200
+    response.__enter__.return_value = response
+    response.__iter__.return_value = iter([b'data: {"type":"done"}\n'])
+    connection = MagicMock()
+    connection.getresponse.return_value = response
+    with pytest.raises(RuntimeError, match="timed out"):
+        runner_mod._default_run_kernel("Review NVDA", as_of=None, transport=MagicMock(return_value=connection))
+    timer_factory.assert_called_once_with(239, runner_mod._stop_research_stream, (connection.sock,))
+    timer.start.assert_called_once()
+    timer.cancel.assert_called_once()
+    connection.close.assert_called_once()
 
 
 class _Src:

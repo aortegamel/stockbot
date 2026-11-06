@@ -13,3 +13,6 @@ def _isolate_runs_db(tmp_path_factory: pytest.TempPathFactory) -> None:
     """Point RUNS_DB_PATH at a temp DB so offline tests never touch data/runs.sqlite."""
     os.environ["RUNS_DB_PATH"] = str(tmp_path_factory.mktemp("runs") / "runs.sqlite")
     os.environ["STOCKBOT_DATA_DIR"] = str(tmp_path_factory.mktemp("data"))
+    # app.config loads the repo .env; without these the reasoner would answer tool-step decisions live.
+    for key in ("OPENCODE_API_KEY", "OPENCODE_URL", "OPENCODE_MODEL"):
+        os.environ.pop(key, None)

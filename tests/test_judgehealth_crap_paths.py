@@ -2,7 +2,7 @@
 
 Covers decision paths (pure helpers only, no Pi/network/subprocess) for:
 scripts/verify_judge.py, scripts/verify_tool_health.py,
-scripts/verify_type_escape_hatches.py, scripts/verify_agent_scenarios.py,
+scripts/verify_type_escape_hatches.py,
 app/research/stage.py, app/services/evidence_resolution.py,
 app/tools.py::_thesis_refine (validation + no-op plan paths only).
 """
@@ -16,14 +16,12 @@ from pathlib import Path
 
 import pytest
 
-import scripts.verify_agent_scenarios as vas
 import scripts.verify_judge as vj
 import scripts.verify_tool_health as vth
 import scripts.verify_type_escape_hatches as vte
 from app.domain.market.identity import resolve_ticker_aliases
 from app.domain.market.securities import TickerAlias
 from app.policy import Capability, RequestContext
-from app.research.evals.scenarios import Scenario, ScenarioFamily
 from app.research.stage import check_stage_tool, stage_for_session
 
 # --- verify_judge: concurrency + as_of helpers ---
@@ -254,48 +252,6 @@ def test_type_escape_helpers(tmp_path: Path):
     assert vte.scan(tmp_path) == []
 
 
-_SCENARIO_BASE = Scenario(
-    name="s",
-    family=ScenarioFamily.FACTUAL,
-    question="q",
-    ticker="NVDA",
-    as_of=None,
-    expected_tools=(),
-    requires_evidence=True,
-    notes="n",
-)
-
-
-def _scenario() -> Scenario:
-    return _SCENARIO_BASE
-
-
-def test_agent_scenario_helpers():
-    assert vas._clean("  x  ") == "x"
-    assert vas._search_tool_matches("", {"a_tool", "browse_tools"}) == ["a_tool"]
-    assert vas._search_tool_matches("zz_nomatch", {"a_tool"}) == ["a_tool"]
-    assert vas._dispatch_search_tools({"query": "x"}, {"a_tool"})["matches"] != []
-    name, inner = vas._extract_call_tool_request({"name": "t", "arguments": {"a": 1}})
-    assert (name, inner) == ("t", {"a": 1})
-    assert vas._extract_call_tool_request({}) == ("", {})
-    assert vas.resolve_provider_model("p", "m", {"STOCKBOT_PROVIDER": "x", "STOCKBOT_MODEL": "y"}) == ("p", "m")
-    # Re-pinned: an unset provider/model is the flag-less default (the kernel default), not a failure.
-    assert vas.resolve_provider_model(None, None, {}) == ("", "")
-    assert vas._selected_names(argparse.Namespace(scenario="s")) == ["s"]
-    assert vas._scenario_map() != {}
-    assert vas._find_unknown(["a"], {"a": _scenario()}) == []
-    assert vas._failed_results([]) == []
-    failed, code = vas.summarize_results([])
-    assert (failed, code) == ([], 0)
-    assert vas._eval_one_scenario.__name__ == "_eval_one_scenario"
-    assert vas._cli_prereqs.__name__ == "_cli_prereqs"
-    assert vas._extract_evidence_ids({"evidence_ids": ["a", 5]}) == ("a",)
-    assert vas._answer_from_final({"answer": "hi"}) == "hi"
-    assert vas._answer_from_final({}) is None
-    assert vas._is_completed("completed", "answer", ("e",)) is True
-    assert vas._is_completed("running", "answer", ("e",)) is False
-
-
 # --- stage + evidence_resolution ---
 
 
@@ -419,51 +375,7 @@ def test_thesis_refine_validation(tmp_path: Path):
     assert noop2 is None
 
 
-# --- CrapScripts: _search_tool_names + _telemetry_count decision paths ---
-
-
-def test_search_tool_names_live_registry_shapes():
-    from app.research.agents.source_agent import SEC_TOOLS
-
-    expected = sorted(t for t in SEC_TOOLS if isinstance(t, str) and t not in vas._SEARCH_EXCLUDE)
-    frozen: object = SEC_TOOLS
-    as_set: object = set(SEC_TOOLS)
-    as_dict: object = {t: i for i, t in enumerate(SEC_TOOLS)}
-    as_list: object = list(SEC_TOOLS)
-    as_tuple: object = tuple(SEC_TOOLS)
-    as_iter: object = iter(SEC_TOOLS)
-    none_val: object = None
-    int_val: object = 42
-    assert vas._search_tool_names(frozen) == expected  # frozenset (live call path)
-    assert vas._search_tool_names(as_set) == expected  # set
-    assert vas._search_tool_names(as_dict) == expected  # dict
-    assert vas._search_tool_names(as_list) == expected  # list
-    assert vas._search_tool_names(as_tuple) == expected  # tuple
-    assert vas._search_tool_names(as_iter) == expected  # one-shot iterable
-    assert vas._search_tool_names(none_val) == []  # non-iterable
-    assert vas._search_tool_names(int_val) == []  # non-iterable
-    assert all(t not in vas._SEARCH_EXCLUDE for t in expected)
-
-
-def test_search_tool_names_filters_and_sorts():
-    tools: object = {"zzz_tool", "aaa_tool", "search_tools", "browse_tools", 42, None}
-    assert vas._search_tool_names(tools) == ["aaa_tool", "zzz_tool"]
-
-
-def test_search_dispatch_live_registry_hides_discovery():
-    from app.research.agents.source_agent import SEC_TOOLS
-
-    out = vas._dispatch_search_tools({"query": ""}, SEC_TOOLS)
-    matches = out["matches"]
-    assert isinstance(matches, list)
-    got = [str(m["name"]) for m in matches if isinstance(m, dict)]
-    assert got and all(t not in vas._SEARCH_EXCLUDE for t in got)
-    assert got == sorted(got)[:12]
-    out_q = vas._dispatch_search_tools({"query": "filing"}, SEC_TOOLS)
-    matches_q = out_q["matches"]
-    assert isinstance(matches_q, list)
-    names_q = [str(m["name"]) for m in matches_q if isinstance(m, dict)]
-    assert names_q and all("filing" in n for n in names_q)
+# --- CrapScripts: telemetry decision paths ---
 
 
 def test_telemetry_count_narrows_each_shape():

@@ -276,7 +276,7 @@ export async function invoke(name: string, args: Record<string, unknown>, sessio
 type ToolSchema = { name: string; description?: string; parameters?: unknown };
 let schemas: Promise<ToolSchema[]> | undefined;
 // Canonical bridge schemas for the named tools, fetched once. A missing name fails loudly.
-export async function describeTools(names: readonly string[]): Promise<ToolSchema[]> {
+export async function describeTools(names?: readonly string[]): Promise<ToolSchema[]> {
   schemas ??= bridge.call({ op: "describe" }).then((reply) => {
     if (!Array.isArray(reply.tools)) throw new Error("stockbot bridge describe returned no tools");
     return reply.tools.flatMap((t: unknown) => {
@@ -289,6 +289,7 @@ export async function describeTools(names: readonly string[]): Promise<ToolSchem
     throw err;
   });
   const all = await schemas;
+  if (names === undefined) return all;
   return names.map((name) => {
     const found = all.find((t) => t.name === name);
     if (!found) throw new Error(`stockbot bridge has no tool ${name}`);

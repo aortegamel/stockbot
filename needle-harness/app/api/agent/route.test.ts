@@ -5,11 +5,13 @@ import { join } from "node:path";
 import type { AgentEvent, Evidence } from "@/lib/agent/types";
 import { ANSWER_SECTIONS, type reason } from "@/lib/muse/client";
 // Capture the production validators before mock.module replaces the kernel.
-import { asksWatchlist, parseTicker, parseWatchlist } from "@/lib/agent/kernel";
+import { asksWatchlist, outOfScopeAnswer, parseTicker, parseWatchlist, runKernelAgent } from "@/lib/agent/kernel";
 const realParseTicker = parseTicker;
 const realParseWatchlist = parseWatchlist;
 const realAsksWatchlist = asksWatchlist;
+const realOutOfScopeAnswer = outOfScopeAnswer;
 const realAnswerSections = ANSWER_SECTIONS;
+const realRunKernelAgent = runKernelAgent;
 
 type Body = Record<string, unknown>;
 type Event = { type: string;[key: string]: unknown };
@@ -21,6 +23,10 @@ const invoked: unknown[][] = [];
 const ended: string[] = [];
 // JEV sections calls, kept apart from the UI-command and effort calls in kernelCalls.
 const sectionCalls: Body[] = [];
+// The research scope gate's JEV call, likewise apart from kernelCalls.
+const scopeCalls: Body[] = [];
+const scopeOpts: { signal?: AbortSignal; timeoutMs?: number }[] = [];
+let scopeReply: Body | Error = { in_scope: true };
 let sectionsReply: Body | Error = { sections: ["short_term", "risks"] };
 let reasonText = "Hello! How can I help?";
 let reasonDown = false;
@@ -30,6 +36,7 @@ let argsReply: Body | null = null;
 let effortReply: Body = { effort: "medium" };
 let runThrows: unknown = null;
 let researchEvents: AgentEvent[] = [];
+let runNativeResearch = false;
 let toolFailure: string | null = null;
 let toolThrows = false;
 let endThrows = false;
@@ -53,23 +60,35 @@ mock.module("@/lib/agent/kernel", () => ({
   parseTicker: realParseTicker,
   parseWatchlist: realParseWatchlist,
   asksWatchlist: realAsksWatchlist,
+  outOfScopeAnswer: realOutOfScopeAnswer,
   kernelRouter: {
-    call: async (body: Body, opts: unknown) => {
+    call: async (body: Body, opts: { signal?: AbortSignal; timeoutMs?: number }) => {
       if (body.op === "sections") {
         sectionCalls.push(body);
         if (sectionsReply instanceof Error) throw sectionsReply;
         return sectionsReply;
       }
+      if (body.op === "scope") {
+        scopeCalls.push(body);
+        scopeOpts.push(opts);
+        if (scopeReply instanceof Error) throw scopeReply;
+        return scopeReply;
+      }
       kernelCalls.push(body);
       kernelOpts.push(opts);
       if (argsDown) throw new Error("needle down");
       if (body.op === "effort") return effortReply;
+      if (body.op === "open_research") return { sessionId: "rs:cutoff", tools: [] };
       return argsReply ?? { tool: body.tool, arguments: { q: "x" } };
     },
   },
   runKernelAgent: async (...args: unknown[]) => {
     runCalls.push(args);
     if (runThrows !== null) throw runThrows;
+    if (runNativeResearch) {
+      const [prompt, emit, options] = args as Parameters<typeof runKernelAgent>;
+      return realRunKernelAgent(prompt, emit, { ...options, deps: { describeTools: async () => [], reason: async () => ({ prose: "", claims: [], usage: {} }) } });
+    }
     const emit = args[1] as (event: AgentEvent) => void;
     for (const event of researchEvents) emit(event);
   },
@@ -112,7 +131,9 @@ mock.module("@/lib/tools/stockbot", () => ({
 let directory: string;
 const savedEnv = { debug: process.env.STOCKBOT_DEBUG, model: process.env.OPENCODE_MODEL, data: process.env.STOCKBOT_DATA_DIR, effort: process.env.REASONING_EFFORT, maxOutputTokens: process.env.MUSE_MAX_OUTPUT_TOKENS, answerTokenBudget: process.env.MUSE_ANSWER_TOKEN_BUDGET };
 beforeEach(async () => {
-  reasonCalls.length = kernelCalls.length = kernelOpts.length = runCalls.length = invoked.length = ended.length = toolOutputs.length = sectionCalls.length = 0;
+  reasonCalls.length = kernelCalls.length = kernelOpts.length = runCalls.length = invoked.length = ended.length = toolOutputs.length = sectionCalls.length = scopeCalls.length = 0;
+  scopeOpts.length = 0;
+  scopeReply = { in_scope: true };
   sectionsReply = { sections: ["short_term", "risks"] };
   chatToolCalls = [];
   reasonText = "Hello! How can I help?";
@@ -122,6 +143,7 @@ beforeEach(async () => {
   effortReply = { effort: "medium" };
   runThrows = toolFailure = null;
   researchEvents = [];
+  runNativeResearch = false;
   sessionsCreated = 0;
   chartReceipt = { result_type: "chart_selection", ticker: "AAPL" };
   watchlistReceipt = { result_type: "watchlist_update", action: "add", ticker: "NVDA" };
@@ -295,12 +317,34 @@ describe("plain chat", () => {
 });
 
 describe("research mode", () => {
-  test("concrete effort calls the kernel once with the full trio and no route op", async () => {
+  test("the route carries asOf into the native open_research operation", async () => {
+    const asOf = "2026-01-03T00:00:00+00:00";
+    runNativeResearch = true;
+    await eventsFor("NVDA revenue?", { mode: "research", asOf });
+    expect(kernelCalls[0]).toMatchObject({ op: "open_research", asOf });
+  });
+  test("research carries the exact cutoff to the kernel and chat ignores it", async () => {
+    const asOf = "2026-01-03T00:00:00+00:00";
+    await eventsFor("NVDA revenue?", { mode: "research", asOf });
+    expect(runCalls[0]?.[2]).toMatchObject({ asOf });
+    await eventsFor("hello", { asOf });
+    expect(runCalls).toHaveLength(1);
+    expect(reasonCalls[0]).not.toHaveProperty("asOf");
+  });
+  test("malformed cutoffs fail before execution without repair", async () => {
+    for (const asOf of [null, 7, "", "yesterday", " 2026-01-03", "2026-02-30", "2026-01-03T24:00:00Z", "01/03/2026"]) {
+      const response = await post({ prompt: "NVDA revenue?", mode: "research", asOf });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: "asOf must be an ISO-8601 date or timestamp" });
+    }
+    expectNoExecution();
+  });
+  test("concrete effort calls the kernel once without legacy routing", async () => {
     const prompt = "What drove NVDA revenue?";
     await eventsFor(prompt, { mode: "research", ticker: "nvda" });
     expect(runCalls).toHaveLength(1);
     expect(runCalls[0]?.[0]).toBe(prompt);
-    expect(runCalls[0]?.[2]).toMatchObject({ personas: ["stockbot", "bearbot", "bullbot"], ticker: "NVDA", currentChartTicker: "NVDA", signal: expect.any(AbortSignal), deadlineAt: expect.any(Number) });
+    expect(runCalls[0]?.[2]).toMatchObject({ ticker: "NVDA", currentChartTicker: "NVDA", signal: expect.any(AbortSignal), deadlineAt: expect.any(Number) });
     expect(reasonCalls).toEqual([]);
     expect(kernelCalls).toEqual([]);
     expect(invoked).toEqual([]);
@@ -374,25 +418,36 @@ describe("research mode", () => {
     const events = await eventsFor("filing facts?", { mode: "research" });
     expect(events.at(-1)?.metrics).toMatchObject({ timings: { routeMs: expect.any(Number) } });
   });
-  test("invalid effort and worker errors fail without a kernel call", async () => {
+  test("invalid effort keeps research running without a selected effort", async () => {
     process.env.REASONING_EFFORT = "auto";
-    for (const reply of [{ effort: "auto" }, { effort: "HIGH" }, { effort: 2 }, {}, { effort: "high", error: "selector failed" }]) {
-      effortReply = reply;
-      const events = await eventsFor("filing facts?", { mode: "research" });
-      expect(events.map((event) => event.type)).toEqual(["failed", "error"]);
-      expect(events[0]).toMatchObject({ category: "model_error", code: "EFFORT_SELECTION_FAILED", stage: "effort" });
-      expect(events[1]).toMatchObject({ code: "EFFORT_SELECTION_FAILED", stage: "effort" });
-      expect(runCalls).toEqual([]);
+    const warn = spyOn(console, "warn").mockImplementation(() => { });
+    try {
+      for (const reply of [{ effort: "auto" }, { effort: "HIGH" }, { effort: 2 }, {}, { effort: "high", error: "selector failed" }]) {
+        effortReply = reply;
+        runCalls.length = 0;
+        const events = await eventsFor("filing facts?", { mode: "research" });
+        expect(events.map((event) => event.type)).not.toContain("failed");
+        expect(runCalls).toHaveLength(1);
+        expect(runCalls[0]?.[2]).not.toHaveProperty("reasoningEffort");
+      }
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("research effort default kept"));
+    } finally {
+      warn.mockRestore();
     }
   });
-  test("a selector transport error fails without a kernel call", async () => {
+  test("a selector transport error keeps research running", async () => {
     process.env.REASONING_EFFORT = "auto";
     argsDown = true;
-    expect(await eventsFor("filing facts?", { mode: "research" })).toEqual([
-      { type: "failed", category: "model_error", message: "needle down", code: "EFFORT_SELECTION_FAILED", stage: "effort" },
-      { type: "error", message: "needle down", code: "EFFORT_SELECTION_FAILED", stage: "effort" },
-    ]);
-    expect(runCalls).toEqual([]);
+    const warn = spyOn(console, "warn").mockImplementation(() => { });
+    try {
+      const events = await eventsFor("filing facts?", { mode: "research" });
+      expect(events.some((event) => event.type === "failed")).toBe(false);
+      expect(runCalls).toHaveLength(1);
+      expect(runCalls[0]?.[2]).not.toHaveProperty("reasoningEffort");
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("needle down"));
+    } finally {
+      warn.mockRestore();
+    }
   });
   test("chat never selects effort in auto mode", async () => {
     process.env.REASONING_EFFORT = "auto";
@@ -422,6 +477,78 @@ describe("research mode", () => {
       { type: "chart_update", ticker: "MSFT" },
     ]);
     expect(JSON.stringify(events)).not.toContain("/private/raw");
+  });
+});
+
+describe("research scope gate", () => {
+  const FIXED = "This request is outside the scope of stock research. I can only research markets, companies, securities, and investing, so this request is unsupported.";
+  test("an out-of-scope prompt answers with the fixed scope text and runs no research", async () => {
+    const prompt = "How do I bake sourdough bread at home?";
+    scopeReply = { in_scope: false, answer: FIXED };
+    const events = await eventsFor(prompt, { mode: "research" });
+    expect(scopeCalls).toEqual([{ op: "scope", prompt, deadlineAt: expect.any(Number) }]);
+    expect(runCalls).toEqual([]);
+    expect(kernelCalls).toEqual([]);
+    expect(invoked).toEqual([]);
+    expect(events.map((event) => event.type)).toEqual(["agent_start", "status", "answer_delta", "done"]);
+    expect(events[1]).toEqual({ type: "status", text: "Checking the request scope" });
+    expect(events[2]).toEqual({ type: "answer_delta", text: FIXED });
+    expect(events.at(-1)).toMatchObject({ status: "completed_with_limitations", limitations: ["Request outside the scope of stock research."] });
+  });
+  test("the scope call uses the request signal and its remaining deadline", async () => {
+    const clock = spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+    try {
+      const { POST } = await import("./route");
+      const req = new Request("http://localhost/api/agent", {
+        method: "POST", body: JSON.stringify({ prompt: "NVDA revenue?", mode: "research" }),
+        signal: new AbortController().signal,
+      });
+      await (await POST(req)).text();
+      expect(scopeCalls).toEqual([{ op: "scope", prompt: "NVDA revenue?", deadlineAt: 1_800_000_120_000 }]);
+      expect(scopeOpts).toEqual([{ signal: req.signal, timeoutMs: 120_000 }]);
+      expect(scopeOpts[0]?.signal).toBe(req.signal);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+  test("a non-string error does not override a valid refusal", async () => {
+    scopeReply = { error: { code: 1 }, in_scope: false, answer: FIXED };
+    const events = await eventsFor("How do I bake sourdough bread at home?", { mode: "research" });
+    expect(events).toContainEqual({ type: "answer_delta", text: FIXED });
+    expect(events.at(-1)).toMatchObject({ type: "done", status: "completed_with_limitations" });
+    expect(runCalls).toEqual([]);
+  });
+  test("an in-scope verdict researches after the gate", async () => {
+    await eventsFor("Create a thesis: NVDA beats earnings on AI datacenter demand.", { mode: "research" });
+    expect(scopeCalls).toHaveLength(1);
+    expect(runCalls).toHaveLength(1);
+  });
+  test("an out-of-scope verdict without a fixed answer keeps research", async () => {
+    scopeReply = { in_scope: false };
+    await eventsFor("How do I bake sourdough bread at home?", { mode: "research" });
+    expect(runCalls).toHaveLength(1);
+  });
+  test("a scope transport error keeps research", async () => {
+    scopeReply = new Error("jev down");
+    const warning = spyOn(console, "warn").mockImplementation(() => { });
+    try {
+      await eventsFor("NVDA revenue?", { mode: "research" });
+      expect(runCalls).toHaveLength(1);
+      expect(warning).toHaveBeenCalledWith("[web] [agent-api] research scope kept: jev down");
+    } finally {
+      warning.mockRestore();
+    }
+  });
+  test("a scope worker error reply keeps research", async () => {
+    scopeReply = { error: "scope gate failed: decision sidecar down" };
+    const warning = spyOn(console, "warn").mockImplementation(() => { });
+    try {
+      await eventsFor("NVDA revenue?", { mode: "research" });
+      expect(runCalls).toHaveLength(1);
+      expect(warning).toHaveBeenCalledWith("[web] [agent-api] research scope kept: scope gate failed: decision sidecar down");
+    } finally {
+      warning.mockRestore();
+    }
   });
 });
 

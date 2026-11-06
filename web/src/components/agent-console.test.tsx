@@ -71,7 +71,7 @@ describe("AgentConsole answer rendering", () => {
     expect(out).toContain("Partial checked answer · research continues");
   });
 
-  test("the latest checked snapshot persists after failure and final deltas replace it", () => {
+  test("the latest checked snapshot replaces draft text and persists after failure", () => {
     const events: AgentEvent[] = [
       { type: "reasoning_start", model: "stockbot" },
       { type: "answer_partial", text: "Earlier checked snapshot.", claims: [] },
@@ -93,8 +93,8 @@ describe("AgentConsole answer rendering", () => {
         expect(stopped).not.toContain("research continues");
       }
       const final = html([...events, { type: "answer_delta", text: "Final checked " }, { type: "answer_delta", text: "answer." }], true, debug);
-      expect(final).toContain("Final checked answer.");
-      expect(final).not.toContain("Latest checked snapshot.");
+      expect(final).not.toContain("Final checked answer.");
+      expect(final).toContain("Latest checked snapshot.");
       expect(final).not.toContain("Earlier checked snapshot.");
     }
   });

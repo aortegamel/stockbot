@@ -102,11 +102,11 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
   const links = sourceLinks(known);
   const finalAnswer = events.filter((e) => e.type === "answer_delta").map((e) => e.text).join("");
   const partial = events.findLast((e) => e.type === "answer_partial");
-  const answer = finalAnswer || partial?.text || "";
-  // The backend emits only checked answer text, so display it before the request ends.
+  const answer = partial?.text ?? finalAnswer;
+  // A checked snapshot replaces the streamed draft.
   const done = events.some((e) => e.type === "done" || e.type === "error" || e.type === "failed");
   const showSources = answer.length > 0 || done;
-  const claims = finalAnswer ? events.findLast((e) => e.type === "claims")?.claims ?? [] : partial?.claims ?? [];
+  const claims = partial?.claims ?? events.findLast((e) => e.type === "claims")?.claims ?? [];
   const parts = splitAnswer(answer, known, claims);
   const cited = parts.flatMap((part) => part.citation?.sources?.slice(0, 1) ?? []);
   const loaded = useLoadedSources(showSources ? [...cited, ...links.map((link) => link.reference)] : []);
