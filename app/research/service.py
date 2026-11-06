@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, localcontext
@@ -187,9 +187,12 @@ def _require_job(repo: ResearchRepository, job_id: str):
 def _emit(store: ResearchRepository, session_id: str, event_type: str, payload: dict[str, object]) -> None:
     """Append one journal event (best-effort; never breaks the mutation)."""
     try:
-        from .journal import append_event, hydrate
+        from .journal import append_event, hydrate, next_sequence
 
-        hydrate(session_id, store.list_events(session_id))
+        # Re-read the journal only when another writer advanced it; the hash chain and
+        # sequence come from the store either way, so the appended rows stay identical.
+        if store.last_event_sequence(session_id) != next_sequence(session_id) - 1:
+            hydrate(session_id, store.list_events(session_id))
         store.save_event(append_event(session_id, event_type, "service", "service", dict(payload)))
     except Exception:  # noqa: BLE001, S110 - intentional best-effort boundary, never aborts; intentional silent skip
         pass
@@ -453,7 +456,7 @@ def start_job(
     model: str | None = None,
     request_id: str | None = None,
 ) -> dict[str, JSONValue]:
-    """Create a queued job for the kernel scheduler to run, then mark it running. Returns the job.
+    """Create a queued job for the research tool runner, then mark it running. Returns the job.
 
     request_id dedups retries: a known id returns the winner without writing;
     the claim + session + job persist in one BEGIN IMMEDIATE batch.
@@ -605,11 +608,11 @@ def _evidence_identity(
 ) -> str:
     """Identify one observed fact for dedupe.
 
-    SEC and FINRA record refs use the replayed tool name and record values.
+    SEC, FINRA, alternative-data and macro record refs use the replayed tool name and record values.
     """
     tail: object = data.get("observation_type", claim[:80] if isinstance(claim, str) else "")
     kind = str(provenance.get("kind") or "")
-    if kind == "finra_record":
+    if kind in ("finra_record", "alt_record", "macro_record"):
         return "|".join(
             (
                 kind.removesuffix("_record"),
@@ -770,10 +773,10 @@ def _observed_provenance(
     """Kernel-materialized provenance for an observed fact, routed by the owning job's domain.
 
     SEC jobs reload a get_sec_document handle from the archive, else replay a
-    persisted SEC structured tool result. FINRA/WEB jobs replay a persisted
-    staged tool result the kernel stored at dispatch time; a citation naming
-    no persisted result fails ERR_RAW_SOURCE_REQUIRED, and one naming bytes
-    the persisted result does not reproduce fails ERR_PASSAGE_NOT_IN_SOURCE.
+    persisted SEC structured tool result. FINRA/WEB/ALT/MACRO jobs replay a
+    persisted staged tool result the kernel stored at dispatch time; a citation
+    naming no persisted result fails ERR_RAW_SOURCE_REQUIRED, and one naming
+    bytes the persisted result does not reproduce fails ERR_PASSAGE_NOT_IN_SOURCE.
     A bare row/URL with no persisted result is navigation at best, never
     evidence.
     """
@@ -782,6 +785,8 @@ def _observed_provenance(
         return _finra_provenance(data, job, store=store, session_id=session_id)
     if domain == "WEB":
         return _web_provenance(data, job, store=store, session_id=session_id)
+    if domain in ("ALT", "MACRO"):
+        return _alt_provenance(data, job, domain, store=store, session_id=session_id)
     if isinstance(data.get("tool_result_id"), str) and data.get("tool_result_id"):
         return _sec_record_provenance(data, job, store=store, session_id=session_id)
     return _sec_provenance(data, as_of=as_of)
@@ -841,13 +846,14 @@ _SEC_REPLAY_TOOLS: frozenset[str] = frozenset(
         "get_recent_ownership_filings",
         "get_material_events",
         "search_sec_filings",
+        "diff_risk_factors",
     }
 )
 """SEC structured tools whose persisted results can ground a sec_record (document reads excluded)."""
 
 
 def _tool_result_ref(data: Mapping[str, object], domain: str) -> str:
-    """Persisted tool_result_id a FINRA/WEB citation names; bare rows fail closed."""
+    """Persisted tool_result_id a structured citation names; bare rows fail closed."""
     for key in ("tool_result_id", "source_handle_id", "result_id"):
         value = data.get(key)
         if isinstance(value, str) and value.strip():
@@ -1000,6 +1006,9 @@ def _sec_record_texts(result: Mapping[str, object]) -> list[str]:
 _SEC_AVAILABILITY_KEYS = ("known_at", "accepted_at", "filed_at")
 """Filing availability fields of one SEC record, in ``app.sec.models.pit_of`` precedence."""
 
+_SEC_DIFF_FILING_KEYS = ("latest_filed", "prior_filed")
+"""Filing dates of one risk-factor diff: the later filing is when the change became observable."""
+
 
 def _sec_record_known_at(result: Mapping[str, object], locator: str) -> str | None:
     """Availability of the one cited SEC record, read from its persisted filing metadata; None when unknown.
@@ -1007,6 +1016,8 @@ def _sec_record_known_at(result: Mapping[str, object], locator: str) -> str | No
     Only the cited row's own known_at/accepted_at/filed_at count. A caller time,
     another row, an envelope timestamp, or a financial as-of/period date never
     stands in, so a historical session fails PIT_UNVERIFIED when it is missing.
+    A risk-factor diff cites its own two filing dates, so its availability is
+    the later of them.
     """
     from .evidence import cited_record
 
@@ -1015,7 +1026,12 @@ def _sec_record_known_at(result: Mapping[str, object], locator: str) -> str | No
         value = record.get(key) if record is not None else None
         if isinstance(value, str) and value.strip():
             return value.strip()
-    return None
+    stamps = [
+        text.strip()
+        for key in _SEC_DIFF_FILING_KEYS
+        if isinstance(text := (record.get(key) if record is not None else None), str) and text.strip()
+    ]
+    return max(stamps) if stamps else None
 
 
 def _source_candidate(value: object) -> str | None:
@@ -1134,6 +1150,97 @@ def _sec_record_provenance(
             "in the persisted SEC tool result)"
         )
     return _sec_replay_ref(data, result, tool_name, locator, ref_id)
+
+
+_ALT_LABELS: dict[str, str] = {"ALT": "alternative-data", "MACRO": "macro-statistics"}
+"""Human label of each non-SEC structured lane, used in citation error messages."""
+
+
+def _alt_record_locator(raw: object, label: str) -> str:
+    """The cited record bytes: complete canonical JSON (key order/spacing free), never a fragment."""
+    from .evidence import _record_text
+
+    if isinstance(raw, str) and raw.strip():
+        stripped = raw.strip()
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            pass
+        else:
+            if isinstance(parsed, Mapping):
+                return _record_text(parsed)
+            raise ValueError(
+                "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE (an "
+                f"{label} citation names one complete persisted record, not a fragment)"
+            )
+    raise ValueError(
+        "record_evidence: ERR_RAW_SOURCE_REQUIRED (an "
+        f"{label} citation names the complete persisted record JSON of the response you read)"
+    )
+
+
+def _alt_record_known_at(result: Mapping[str, object], locator: str) -> str | None:
+    """Availability of the one cited alternative-data/macro row; None when the row states none.
+
+    Only the cited row's own ``known_at`` counts: the retrieval time of the call
+    never stands in, so a row without a stamp fails PIT_UNVERIFIED.
+    """
+    from .evidence import cited_record
+
+    record = cited_record(result, locator)
+    value = record.get("known_at") if record is not None else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _alt_replay_ref(
+    result: Mapping[str, object], tool_name: str, locator: str, ref_id: str, domain: str
+) -> dict[str, JSONValue]:
+    """Build an alternative-data/macro citation from the persisted response fields only."""
+    from .evidence import alt_record_ref, macro_record_ref
+
+    payload = result.get("result")
+    payload = payload if isinstance(payload, Mapping) else result
+    source = payload.get("source")
+    builder = alt_record_ref if domain == "ALT" else macro_record_ref
+    return builder(
+        tool_name=tool_name,
+        record_identity=locator,
+        dataset=source.strip() if isinstance(source, str) and source.strip() else None,
+        known_at=_alt_record_known_at(result, locator),
+        tool_result_id=ref_id,
+    )
+
+
+def _alt_provenance(
+    data: Mapping[str, object],
+    job: Job | None,
+    domain: str,
+    *,
+    store: ResearchRepository | None = None,
+    session_id: str | None = None,
+) -> dict[str, JSONValue]:
+    """AltRecordRef/MacroRecordRef replayed against the persisted staged tool result."""
+    from .agents.source_agent import is_alt_tool, is_macro_tool
+
+    label = _ALT_LABELS[domain]
+    ref_id = _tool_result_ref(data, domain)
+    locator = _alt_record_locator(_first_text(data, (*_PASSAGE_KEYS, "record_identity")), label)
+    repo, result = _replay_result(store, ref_id, domain, session_id)
+    tool_name = str(result.get("tool_name") or "")
+    allowed = is_alt_tool if domain == "ALT" else is_macro_tool
+    if not allowed(tool_name):
+        raise ValueError(
+            f"record_evidence: ERR_PROVENANCE_MISMATCH (tool result {ref_id!r} is {tool_name!r}, not {label} records)"
+        )
+    _check_replay_lane(repo, result, ref_id, job)
+    from .evidence import cited_record
+
+    if cited_record(result, locator) is None:
+        raise ValueError(
+            "record_evidence: ERR_PASSAGE_NOT_IN_SOURCE (the cited record values do not appear "
+            f"in the persisted {label} tool result)"
+        )
+    return _alt_replay_ref(result, tool_name, locator, ref_id, domain)
 
 
 def _web_result_row(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str, str] | None:
@@ -1783,6 +1890,34 @@ def _existing_evidence_ledger(store: ResearchRepository, session_id: str) -> Evi
     return ledger
 
 
+def _admission_ledger(store: ResearchRepository, session_id: str, record: Evidence) -> EvidenceLedger:
+    """Prior ledger rows, read only when this row is checked against them.
+
+    ``ingest_evidence`` reads prior rows for two things only: the inputs a
+    calculation names, and the target of a supersede link. Every other row gets
+    an empty ledger, so a listing fan-out no longer re-decodes the whole session
+    per row; a duplicate evidence id still fails on the store's unique index.
+    """
+    from .evidence import EvidenceLedger
+
+    inputs = record.proof.get("inputProofIds")
+    if record.superseded_by is None and not (isinstance(inputs, list) and inputs):
+        return EvidenceLedger()
+    return _existing_evidence_ledger(store, session_id)
+
+
+def _admission_cutoff(found: ResearchSession) -> str | None:
+    """PIT cutoff evidence admission gates on: the cutoff the request itself names.
+
+    A request cutoff ('as of 2023-06-30') lives in temporal_scope while session
+    as_of stays NULL. Admission reads it so pit_violated/pit_unverified run and
+    fail closed on a post-cutoff or undated row.
+    """
+    from .models import request_cutoff
+
+    return request_cutoff(found.as_of, found.temporal_scope, found.created_at)
+
+
 def _persist_evidence_record(
     store: ResearchRepository,
     session_id: str,
@@ -1793,9 +1928,12 @@ def _persist_evidence_record(
     source: MaterializedEvidenceSource,
 ) -> dict[str, JSONValue]:
     """PIT-gate + archive the full exact bytes, round-trip any datapoint proof, then commit."""
-    ledger = _existing_evidence_ledger(store, session_id)
+    ledger = _admission_ledger(store, session_id, record)
     ingest_evidence(
-        ledger, record, as_of=found.as_of, on_reject=lambda event, payload: _emit(store, session_id, event, payload)
+        ledger,
+        record,
+        as_of=_admission_cutoff(found),
+        on_reject=lambda event, payload: _emit(store, session_id, event, payload),
     )
     _archive_materialized_source(session_id, record.evidence_id, record.retrieved_at, source)
     _require_admission_proof(store, session_id, record, found.as_of)
@@ -1861,7 +1999,9 @@ def _require_admission_proof(
     """A datapoint row must verify against the bytes just archived (or its recomputed inputs) before commit."""
     if not record.proof:
         return
-    verdict = _proof_verdict(_session_rows(store, session_id), record, record.value, as_of=as_of)
+    # Only a calculation re-reads the ledger; an observation verifies against its own archived bytes.
+    rows = _session_rows(store, session_id) if record.proof.get("kind") == "calculation" else {}
+    verdict = _proof_verdict(rows, record, record.value, as_of=as_of)
     if verdict.status != "verified":
         code = "ERR_CALCULATION_INVALID" if record.claim_kind == "calculation" else "ERR_DATAPOINT_UNVERIFIED"
         raise ValueError(f"record_evidence: {code} ({verdict.status}: {verdict.reason})")
@@ -1883,18 +2023,12 @@ def _persist_finra_web_record(
     result) first and must verify against them before the commit.
     Explicit operator repairs require an open session, but no running model job.
     """
-    from .evidence import EvidenceLedger
-
-    ledger = EvidenceLedger()
-    for existing in store.list_evidence(session_id):
-        try:
-            from .evidence import evidence_from_dict
-
-            ledger.append(evidence_from_dict(existing))
-        except Exception:  # noqa: BLE001, S112 - intentional best-effort boundary, never aborts
-            continue
+    ledger = _admission_ledger(store, session_id, record)
     ingest_evidence(
-        ledger, record, as_of=found.as_of, on_reject=lambda event, payload: _emit(store, session_id, event, payload)
+        ledger,
+        record,
+        as_of=_admission_cutoff(found),
+        on_reject=lambda event, payload: _emit(store, session_id, event, payload),
     )
     if proof_bytes is not None:
         from app.storage import raw_archive
@@ -1945,7 +2079,7 @@ def _persist_finra_web_record(
 
 def _check_tool_result_domain(job: Job, job_id: str, tool_name: str) -> None:
     """Admit only tools that can ground records in the job's source domain."""
-    from .agents.source_agent import is_finra_tool, is_sec_tool, is_web_tool
+    from .agents.source_agent import is_alt_tool, is_finra_tool, is_macro_tool, is_sec_tool, is_web_tool
 
     domain = (job.source_domain or "").upper()
     if domain == "FINRA":
@@ -1957,6 +2091,12 @@ def _check_tool_result_domain(job: Job, job_id: str, tool_name: str) -> None:
     elif domain == "SEC":
         allowed = is_sec_tool(tool_name) and tool_name in _SEC_REPLAY_TOOLS
         kind = "SEC replay"
+    elif domain == "ALT":
+        allowed = is_alt_tool(tool_name)
+        kind = "ALT evidence"
+    elif domain == "MACRO":
+        allowed = is_macro_tool(tool_name)
+        kind = "MACRO evidence"
     else:
         raise ValueError(f"persist_tool_result: job {job_id!r} domain {job.source_domain!r} persists no tool results")
     if not allowed:
@@ -4365,6 +4505,18 @@ def _metric_label(metric: str) -> str:
     return metric.rsplit(":", 1)[-1] if ":" in metric and " " not in metric.strip() else metric
 
 
+_METRIC_ALIASES: dict[str, tuple[str, ...]] = {
+    "accession_no": ("accession_no", "accession number", "accession"),
+    "filed_at": ("filed_at", "filed on", "filed", "filing date"),
+}
+"""Field names a claim states in ordinary English; every other metric reads as its own name."""
+
+
+def _metric_labels(metric: str) -> tuple[str, ...]:
+    """Every spelling of one metric label: its own name, or the plain-English names the source field has."""
+    return _METRIC_ALIASES.get(metric) or (_metric_label(metric),)
+
+
 def _states_unit(masked: str, unit: str) -> bool:
     """Every part of a unit ("USD/shares", "USD millions") is stated by word, singular/plural form, or symbol alias."""
     words = [word for word, _, _ in _words(masked)]
@@ -4411,7 +4563,7 @@ def _bound_value_spans(
     context = numeric_tokens(_point_text(point, ("entity", "period", "unit")))
     identity = {word for word, _, _ in _words(_point_text(point, ("metric", "entity", "period", "unit")))}
     identity |= _GLUE_WORDS | _REPORTING_WORDS | (_CHANGE_WORDS.keys() if _change_sign(point) is not None else set())
-    labels = _phrase_spans(masked, _metric_label(str(point["metric"])))
+    labels = [span for text in _metric_labels(str(point["metric"])) for span in _phrase_spans(masked, text)]
     bound: list[tuple[int, int]] = []
     for start, end in _value_spans(masked, numbers, str(point["value"])):
         for _, label_end in labels:
@@ -4512,6 +4664,32 @@ def _shared_value_defect(
     return None
 
 
+# Date and identifier fields a record declares. Their values are record facts, not
+# measurements: a claim may state them verbatim with no datapoint. Field names are a
+# closed list on purpose, so an amount, ratio, or count field never joins it, and a
+# date field only counts a real date ("period 3" stays a stray number).
+_RECORD_FIELD_RE = re.compile(
+    r"\b(?P<field>accession_no|accession|filer_cik|subject_cik|cik|dcn|filed_at|accepted_at|report_period|period)"
+    r"\s*[:\s]\s*(?P<value>[^\s,;]+)",
+    re.IGNORECASE,
+)
+_RECORD_ID_FIELDS = frozenset({"accession_no", "accession", "filer_cik", "subject_cik", "cik", "dcn"})
+_RECORD_DATE_VALUE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_ACCESSION_RE = re.compile(r"\b\d{10}-\d{2}-\d{6}\b")
+
+
+def _record_field_tokens(verified: Sequence[Evidence]) -> set[str]:
+    """Numbers each cited record states in a date or identifier field."""
+    tokens: set[str] = set()
+    for row in verified:
+        for match in _RECORD_FIELD_RE.finditer(row.content or ""):
+            field = match.group("field").casefold()
+            value = match.group("value")
+            if field in _RECORD_ID_FIELDS or _RECORD_DATE_VALUE_RE.match(value):
+                tokens |= numeric_tokens(value)
+    return tokens
+
+
 def _binding_sentence_bounds(masked: str, points: Sequence[Mapping[str, object]], *, strict: bool) -> list[int]:
     """Find sentence boundaries without treating an entity's trailing abbreviation period as a sentence end."""
     abbreviated = {
@@ -4525,13 +4703,21 @@ def _binding_sentence_bounds(masked: str, points: Sequence[Mapping[str, object]]
     return [0, *ends, len(masked)] if strict else [0, len(masked)]
 
 
-def _binding_defect(text: str, points: Sequence[Mapping[str, object]], claim_type: str) -> str | None:
+def _binding_defect(
+    text: str,
+    points: Sequence[Mapping[str, object]],
+    claim_type: str,
+    *,
+    record_fields: Collection[str] = frozenset(),
+) -> str | None:
     """Bind the claim wording to each referenced datapoint's metric/value/entity/period/unit; no stray number.
 
     Every referenced datapoint needs its metric label directly before its value,
     its entity and period, and its unit when the source states one. Every other
     number must be one of those identities; an ``unknown`` may also name a year,
     and an explicitly opened ``assumption`` states premise numbers of its own.
+    ``record_fields`` carries the numbers of the cited records' date and identifier
+    fields, so a claim may state those verbatim without a datapoint.
     Numeric-token overlap with a source never suffices.
     """
     masked = _masked(text)
@@ -4578,6 +4764,7 @@ def _binding_defect(text: str, points: Sequence[Mapping[str, object]], claim_typ
             norm
             for norm, start, end in numbers
             if norm not in context
+            and norm not in record_fields
             and not any(a <= start and end <= b for a, b in bound)
             and not (claim_type == "unknown" and _YEAR_RE.fullmatch(norm))
         }
@@ -4651,7 +4838,7 @@ def _wording_defect(text: str, points: Sequence[Mapping[str, object]]) -> str | 
     numbers = _numbers(masked)
     vocabulary = {
         word for point in points for word, _, _ in _words(_point_text(point, ("metric", "entity", "period", "unit")))
-    }
+    } | {word for point in points for text in _metric_labels(str(point["metric"])) for word, _, _ in _words(text)}
     extra: set[str] = set()
     unsupported: set[str] = set()
     for word, at, _ in _words(masked):
@@ -4705,7 +4892,11 @@ def _statement_defect(
 
 
 def _source_identity_defect(text: str, verified: Sequence[Evidence]) -> str | None:
-    """Require literal quotations and SEC accessions to match the cited ledger sources."""
+    """Require literal quotations and SEC accessions to match the cited ledger sources.
+
+    A filing row states its own accession, so the accession inside a cited record's
+    identity is that record's source identity too.
+    """
     sources = [
         value
         for row in verified
@@ -4721,7 +4912,10 @@ def _source_identity_defect(text: str, verified: Sequence[Evidence]) -> str | No
         if not any(quote in " ".join(source.split()) for source in sources):
             return f"ERR_QUOTATION_UNVERIFIED (quotation {quote[:120]!r} is absent from cited sources)"
     accessions = {str(row.provenance.get("accession_no")) for row in verified if row.provenance.get("accession_no")}
-    for accession in re.findall(r"\b\d{10}-\d{2}-\d{6}\b", text):
+    for row in verified:
+        identity = row.provenance.get("record_identity")
+        accessions |= set(_ACCESSION_RE.findall(identity)) if isinstance(identity, str) else set()
+    for accession in _ACCESSION_RE.findall(text):
         if accession not in accessions:
             return f"ERR_SOURCE_IDENTITY (accession {accession!r} does not identify a cited source)"
     return None
@@ -4763,7 +4957,8 @@ def _claim_proof_defect(
     3. Every ``datapoint_ids`` entry is the kernel descriptor of a cited verified row;
        observed vs calculated datapoints match the declared type.
     4. The wording binds each datapoint (metric before value, entity, period, unit)
-       and states no other number; a quantitative observed fact or calculation adds only
+       and states no other number, except a date or identifier the cited record
+       declares in its own field; a quantitative observed fact or calculation adds only
        connectives and controlled restatement words to its datapoint wording (``_wording_defect``).
     5. A qualitative observed fact equals a located statement unless JEV must judge its semantic support.
     """
@@ -4796,7 +4991,9 @@ def _claim_proof_defect(
     identity = _source_identity_defect(claim.text, verified)
     if identity is not None:
         return identity
-    defect = _kind_defect(claim, points) or _binding_defect(claim.text, points, claim.claim_type)
+    defect = _kind_defect(claim, points) or _binding_defect(
+        claim.text, points, claim.claim_type, record_fields=_record_field_tokens(verified)
+    )
     if defect is not None or claim.claim_type not in ("observed_fact", "calculation"):
         return defect
     if points:

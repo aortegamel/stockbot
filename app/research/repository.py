@@ -108,6 +108,14 @@ CREATE TABLE IF NOT EXISTS submissions (
 CREATE INDEX IF NOT EXISTS ix_submissions_job ON submissions(job_id);
 """
 
+_SCHEMA_VERSION = 1
+"""sqlite user_version of _SCHEMA plus the lazy migrations in _apply_schema.
+
+A connection applies them only to a database below this version, so opening a
+connection stops re-running the whole script and the evidence-table backfill.
+Bump this whenever _SCHEMA or _apply_schema changes.
+"""
+
 
 def get_research_db_path(data_root: Path | None = None) -> Path:
     """Resolve the research DB path: $RESEARCH_DB_PATH wins, else data_root/research.sqlite."""
@@ -474,6 +482,14 @@ class ResearchRepository:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self._path))
         conn.row_factory = sqlite3.Row
+        if conn.execute("PRAGMA user_version").fetchone()[0] < _SCHEMA_VERSION:
+            self._apply_schema(conn)
+            conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        return conn
+
+    @staticmethod
+    def _apply_schema(conn: sqlite3.Connection) -> None:
+        """Create the tables and heal pre-targeted DBs; runs once per database file."""
         conn.executescript(_SCHEMA)
         # ponytail: lazy ALTER for pre-targeted DBs; drop once all DBs migrate.
         for col in ("targeted_question", "targeted_domain", "ticker"):
@@ -511,7 +527,6 @@ class ResearchRepository:
         except sqlite3.Error:
             pass
         _migrate_evidence_identity(conn)
-        return conn
 
     # -- sessions ------------------------------------------------------
 
@@ -863,6 +878,15 @@ class ResearchRepository:
             except sqlite3.IntegrityError:
                 raise ValueError(f"<research.sqlite>: duplicate journal event {event.event_id!r}") from None
         return event
+
+    def last_event_sequence(self, session_id: str) -> int:
+        """Highest stored journal sequence (0 when the session has none); a cheap staleness check."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(sequence) AS seq FROM journal WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        raw = row["seq"] if row is not None else None
+        return int(raw) if raw is not None else 0
 
     def list_events(self, session_id: str) -> list[JournalEvent]:
         """Session events in sequence order; raises ValueError on a broken hash chain."""

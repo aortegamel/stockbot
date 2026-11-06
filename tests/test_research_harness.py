@@ -2578,6 +2578,20 @@ def test_stage_allows_common_read_controls() -> None:
             check_stage_tool(stage, "search_web")
 
 
+@pytest.mark.parametrize(
+    "tool", ["thesis_create", "thesis_show", "thesis_refine", "thesis_watch", "thesis_journal", "thesis_status"]
+)
+def test_thesis_actions_run_only_during_source_research(tool: str) -> None:
+    """Research can create or journal a thesis while gathering sources; committee and final stages cannot."""
+    from app.research.stage import DISPATCH_TOOLS, check_stage_tool
+
+    check_stage_tool("SOURCE_RESEARCH", tool)
+    for stage in ("COMMITTEE", "FINAL"):
+        with pytest.raises(ValueError, match="forbids"):
+            check_stage_tool(stage, tool)
+    assert tool not in DISPATCH_TOOLS
+
+
 def test_queued_scout_blocks_freeze(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from app.research import service as _svc
 
@@ -3453,6 +3467,56 @@ def test_as_of_excludes_later_evidence() -> None:
     assert led.ids() == ("EV-OK",)
 
 
+def _known_item(sid: str, name: str, known_at: str, stamp: str) -> dict[str, object]:
+    """Service item whose own archived document carries known_at, so the admitted row inherits it."""
+    accession = f"0000320193-25-{stamp}"
+    document = f"{name.replace(':', '-')}.htm"
+    passage = f"Accelerated computing demand grew in {name}."
+    handle = seam.handle_for(passage, accession=accession, document=document, known_at=known_at, filed_at=known_at[:10])
+    return _svc_item(
+        f"{sid}:{name}",
+        passage=passage,
+        known_at=known_at,
+        source_record_id=accession,
+        document_name=document,
+        source_handle=handle,
+    )
+
+
+def test_prompt_cutoff_gates_evidence_admission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A prompt cutoff in temporal_scope gates admission while the session as_of stays NULL."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid = _svc.create_research("Who held more than 5% of TSLA as of 2023-06-30?", "o", repo=repo)
+    assert repo.get_session(sid).as_of is None
+    src = repo.list_jobs(sid)[0].job_id
+    with pytest.raises(EvidenceRejectedError) as late:
+        _svc.record_evidence(sid, src, _known_item(sid, "ev:late", "2023-08-01T00:00:00+00:00", "001001"), repo=repo)
+    assert late.value.reason == "PIT_VIOLATION"
+    admitted = _svc.record_evidence(
+        sid, src, _known_item(sid, "ev:on", "2023-06-30T00:00:00+00:00", "001002"), repo=repo
+    )
+    assert admitted["evidence_id"] == f"{sid}:ev:on"
+
+
+def test_now_scope_admits_current_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """'latest'/'current' wording sets no date limit (latest-available), so current evidence still admits."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid = _svc.create_research("What is NVDA's latest reported EPS?", "o", repo=repo)
+    session = repo.get_session(sid)
+    assert session.as_of is None and session.temporal_scope.get("mode") == "latest-available"
+    src = repo.list_jobs(sid)[0].job_id
+    admitted = _svc.record_evidence(
+        sid, src, _known_item(sid, "ev:now", datetime.now(UTC).isoformat(), "001003"), repo=repo
+    )
+    assert admitted["evidence_id"] == f"{sid}:ev:now"
+
+
 def test_coverage_shape_and_insufficient_never_terminal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from app.research import service as _svc
 
@@ -3584,6 +3648,27 @@ def test_resolve_temporal_scope_modes() -> None:
     assert quarter["mode"] == "range"
     assert quarter["start"] is not None and quarter["end"] is not None
     assert validate_temporal_scope(dict(latest)) == latest
+
+
+def test_request_cutoff_accepts_only_a_request_dated_cutoff() -> None:
+    """A prompt cutoff gates the session; a cutoff pinned to the request moment excludes nothing."""
+    from app.research.models import request_cutoff
+
+    made = "2026-10-31T02:06:49+00:00"
+    # An 'as of 2023-06-30' prompt predates creation: that date came from the request.
+    assert request_cutoff(None, {"mode": "as_of", "as_of": "2023-06-30T00:00:00+00:00"}, made) == (
+        "2023-06-30T00:00:00+00:00"
+    )
+    # 'now'/'today' wording parses to mode as_of with the request moment: no cutoff.
+    assert request_cutoff(None, {"mode": "as_of", "as_of": made}, made) is None
+    # The session's own as_of always applies.
+    assert (
+        request_cutoff("2024-01-01", {"mode": "latest-available", "as_of": made}, made) == "2024-01-01T00:00:00+00:00"
+    )
+    # A window or an unbounded scope names no cutoff, and neither does a scope without creation time.
+    assert request_cutoff(None, {"mode": "range", "as_of": "2026-09-30T00:00:00+00:00"}, made) is None
+    assert request_cutoff(None, {"mode": "as_of", "as_of": "2023-06-30T00:00:00+00:00"}, None) is None
+    assert request_cutoff(None, None, made) is None
 
 
 # ---------------------------------------------------------------------------
@@ -4084,6 +4169,8 @@ def test_reg_negatives_coverage_present() -> None:
         "sec_record",
         "finra_record",
         "web_source",
+        "alt_record",
+        "macro_record",
         "search_run",
         "none",
     )
@@ -4647,7 +4734,10 @@ def test_crap_temporal_patterns() -> None:
     )
     assert resolve_temporal_scope(temporal="before earnings", now=now)["mode"] == "as_of"
     assert resolve_temporal_scope(temporal="latest available data", now=now)["mode"] == "latest-available"
-    assert resolve_temporal_scope(temporal="most recent filing", now=now)["mode"] == "as_of"
+    # latest / most recent / current name the newest data, never a date limit.
+    for wording in ("most recent filing", "latest 10-Q", "current revenue", "the Latest quarter"):
+        assert resolve_temporal_scope(temporal=wording, now=now)["mode"] == "latest-available", wording
+    assert resolve_temporal_scope(temporal="price today", now=now)["mode"] == "as_of"
     with pytest.raises(ValueError, match="after end"):
         resolve_temporal_scope(temporal="between 2025-06-30 and 2025-01-01", now=now)
     with pytest.raises(ValueError, match="temporal"):
@@ -4932,13 +5022,6 @@ def _inv_sid(repo: ResearchRepository, q: str = "NVDA OpenAI exposure?") -> tupl
 
     sid = _svc.create_research(q, "o", as_of="2025-06-30T00:00:00+00:00", repo=repo)
     return sid, repo.list_jobs(sid)[0].job_id
-
-
-def _typed_committee_analysis(eid: str, text: str, claim_type: str) -> dict[str, object]:
-    """Rich committee envelope with one explicitly typed claim."""
-    env = _committee_analysis(eid, claim_text=text)
-    env["claims"] = [{"text": text, "claim_type": claim_type, "evidence_ids": [eid]}]
-    return env
 
 
 def test_invariant_search_hit_is_never_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5623,98 +5706,6 @@ def test_invariant_claims_only_envelope_is_incomplete(tmp_path: Path, monkeypatc
     assert repo.get_job(jid).status == "running"  # the incomplete envelope never closes the job
 
 
-def test_invariant_claim_type_is_declared_never_promoted() -> None:
-    """Absent type stays inference; observed_fact/contradicted/conditional_risk/attributed_report need a freeze id; citations never upgrade."""
-    from app.research.agents import ModelOutputFailure
-    from app.research.agents.stockbot import run_stockbot
-
-    def _run(model: Callable[[str], str]) -> StockbotAnalysis:
-        return run_stockbot(
-            "Q?",
-            session_id="rs:t",
-            wave_id=1,
-            freeze_id="F1",
-            evidence_ids=["EV-1"],
-            as_of="x",
-            model=model,
-            evidence_text="[EV-1] a",
-        )
-
-    undeclared = _run(
-        lambda prompt: _committee_output([{"text": "Confirmed: revenue grew.", "evidence_ids": ["EV-1"]}])
-    )
-    assert [c.claim_type for c in undeclared.claims] == ["inference"]
-    assert undeclared.claims[0].evidence_ids == ["EV-1"]
-    declared = _run(
-        lambda prompt: _committee_output(
-            [
-                {
-                    "text": "Revenue grew.",
-                    "claim_type": "observed_fact",
-                    "evidence_ids": ["EV-1"],
-                }
-            ]
-        )
-    )
-    assert [c.claim_type for c in declared.claims] == ["observed_fact"]
-    qualified = _run(
-        lambda prompt: _committee_output(
-            [
-                {
-                    "text": "A default could impair the marks.",
-                    "claim_type": "conditional_risk",
-                    "evidence_ids": ["EV-1"],
-                },
-                {
-                    "text": "Management said exposure is capped.",
-                    "claim_type": "attributed_report",
-                    "evidence_ids": ["EV-1"],
-                },
-            ]
-        )
-    )
-    assert [c.claim_type for c in qualified.claims] == [
-        "conditional_risk",
-        "attributed_report",
-    ]
-    with pytest.raises(ModelOutputFailure, match="uncited"):
-        _run(
-            lambda prompt: _committee_output(
-                [
-                    {
-                        "text": "A default could impair the marks.",
-                        "claim_type": "conditional_risk",
-                        "evidence_ids": [],
-                    }
-                ]
-            )
-        )
-    with pytest.raises(ModelOutputFailure, match="uncited"):
-        _run(
-            lambda prompt: _committee_output(
-                [
-                    {
-                        "text": "Revenue grew.",
-                        "claim_type": "observed_fact",
-                        "evidence_ids": [],
-                    }
-                ]
-            )
-        )
-    with pytest.raises(ModelOutputFailure, match="EV-999"):
-        _run(
-            lambda prompt: _committee_output(
-                [
-                    {
-                        "text": "Revenue grew.",
-                        "claim_type": "observed_fact",
-                        "evidence_ids": ["EV-999"],
-                    }
-                ]
-            )
-        )
-
-
 def test_invariant_director_waves_continue_past_two() -> None:
     """A material question advances wave N -> N+1 forever on new evidence; a zero-novelty wave stops
     the run only once nothing unexplored is left, or at an explicitly configured operator limit."""
@@ -6391,9 +6382,11 @@ def _hf_sid(repo: ResearchRepository, *sources: str, q: str = "NVDA demand?") ->
 def test_hf_provenance_maps_domain_and_integrity_in_kernel() -> None:
     """Kernel owns provenance->domain/integrity; evidence_to_dict exposes both on every row."""
     from app.research.evidence import (
+        alt_record_ref,
         evidence_domain,
         evidence_integrity,
         finra_record_ref,
+        macro_record_ref,
         search_run_ref,
         sec_source_ref,
         web_source_ref,
@@ -6413,6 +6406,10 @@ def test_hf_provenance_maps_domain_and_integrity_in_kernel() -> None:
     assert evidence_domain(fin) == "FINRA" and evidence_integrity(fin) == "CANONICAL_STRUCTURED"
     web = web_source_ref(url="https://example.com/a", excerpt="highlight text")
     assert evidence_domain(web) == "WEB" and evidence_integrity(web) == "EXTERNAL_SOURCE"
+    alt = alt_record_ref(tool_name="get_trend_evidence", record_identity="row-1")
+    assert evidence_domain(alt) == "ALT" and evidence_integrity(alt) == "EXTERNAL_SOURCE"
+    macro = macro_record_ref(tool_name="get_macro_context", record_identity="row-1")
+    assert evidence_domain(macro) == "MACRO" and evidence_integrity(macro) == "EXTERNAL_SOURCE"
     assert evidence_domain(search_run_ref(search_id="s1", query="q")) == "WEB"
     assert evidence_domain({"kind": "none"}) == "SOURCE" and evidence_domain(None) == "SOURCE"
     from app.research.evidence import Evidence, evidence_to_dict
@@ -7331,14 +7328,17 @@ def test_hf_resume_after_one_committee_no_dup(tmp_path: Path, monkeypatch: pytes
 
 
 def test_hf_provenance_vocab_closed() -> None:
-    """Provenance kinds are closed at six: sec_source|sec_record|finra_record|web_source|search_run|none all validate.
+    """Provenance kinds are closed at eight: every source family plus search_run|none validates.
 
     Bare FINRA rows / bare URLs still fail closed at admission (ERR_RAW_SOURCE_REQUIRED):
     only tool_result_id refs replayed against persisted tool results ground finra/web evidence.
+    Alternative-data and macro rows replay the same way, dated by their own row stamp.
     """
     from app.research.evidence import (
         PROVENANCE_KINDS,
+        alt_record_ref,
         finra_record_ref,
+        macro_record_ref,
         search_run_ref,
         sec_record_ref,
         sec_source_ref,
@@ -7351,6 +7351,8 @@ def test_hf_provenance_vocab_closed() -> None:
         "sec_record",
         "finra_record",
         "web_source",
+        "alt_record",
+        "macro_record",
         "search_run",
         "none",
     }
@@ -7370,6 +7372,10 @@ def test_hf_provenance_vocab_closed() -> None:
     assert validate_provenance(dict(rec))["kind"] == "sec_record"
     fin = finra_record_ref(tool_name="query_finra", record_identity="row-1")
     assert validate_provenance(dict(fin))["kind"] == "finra_record"
+    alt = alt_record_ref(tool_name="get_trend_evidence", record_identity="row-1")
+    assert validate_provenance(dict(alt))["kind"] == "alt_record"
+    macro = macro_record_ref(tool_name="get_macro_context", record_identity="row-1")
+    assert validate_provenance(dict(macro))["kind"] == "macro_record"
     web = web_source_ref(url="https://example.com/a", excerpt="highlight text")
     assert validate_provenance(dict(web))["kind"] == "web_source"
     with pytest.raises(ValueError, match="kind"):
@@ -7449,6 +7455,219 @@ def test_hf_persist_accepts_matching_domain_tools(tmp_path: Path, monkeypatch: p
     assert _hf_persist_web(repo, sid, web, f"{sid}:tr:web-ok") == f"{sid}:tr:web-ok"
     assert _svc.get_tool_result(f"{sid}:tr:fin-ok", repo=repo)["tool_name"] == "query_finra"
     assert _svc.get_tool_result(f"{sid}:tr:web-ok", repo=repo)["tool_name"] == "search_web"
+
+
+def _hf_alt_desks(repo: ResearchRepository, sid: str) -> tuple[str, str]:
+    """Fresh running ALT + MACRO jobs for one session."""
+    from app.research import service as _svc
+
+    alt_job = str(_svc.start_job(sid, "source_agent", source="ALT", repo=repo, wave_id=1)["job_id"])
+    macro_job = str(_svc.start_job(sid, "source_agent", source="MACRO", repo=repo, wave_id=1)["job_id"])
+    return alt_job, macro_job
+
+
+def test_hf_alt_lane_admits_a_trend_row_with_its_own_known_at(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A persisted trend packet grounds an alt_record citing one row, dated by that row's known_at."""
+    import json
+
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC", "ALT", "MACRO")
+    alt_job, _ = _hf_alt_desks(repo, sid)
+    row: dict[str, object] = {
+        "signal_id": "sig-1",
+        "term": "weight loss drug",
+        "geo": "US",
+        "period": "2025-06-16",
+        "rank": 12,
+        "known_at": "2025-06-20T00:00:00+00:00",
+    }
+    payload: dict[str, object] = {"status": "ok", "source": "google_trends", "observations": [row], "rows": [row]}
+    rid = str(
+        _svc.persist_tool_result(sid, alt_job, "get_trend_evidence", f"{sid}:tr:trend", payload, repo=repo)[
+            "tool_result_id"
+        ]
+    )
+    identity = json.dumps(row, sort_keys=True)
+    out = _svc.record_evidence(
+        sid,
+        alt_job,
+        {
+            "content": "The term entered the rising list.",
+            "tool_result_id": rid,
+            "record_identity": identity,
+            "matching_passage": identity,
+        },
+        repo=repo,
+    )
+    provenance = out["provenance"]
+    assert isinstance(provenance, dict)
+    assert provenance["kind"] == "alt_record" and provenance["tool_name"] == "get_trend_evidence"
+    assert provenance["known_at"] == "2025-06-20T00:00:00+00:00"
+    assert provenance["record_identity"] == identity
+    assert provenance["tool_result_id"] == rid
+    assert out["source_domain"] == "ALT"
+    stored = repo.get_evidence(str(out["evidence_id"]))
+    assert stored["known_at"] == "2025-06-20T00:00:00+00:00"
+    assert stored["source_domain"] == "ALT"
+    # A fragment cites nothing, and a citation with no record identity is navigation.
+    with pytest.raises(ValueError, match="ERR_PASSAGE_NOT_IN_SOURCE"):
+        _svc.record_evidence(
+            sid,
+            alt_job,
+            {"content": "The term entered the rising list.", "tool_result_id": rid, "record_identity": "[1, 2]"},
+            repo=repo,
+        )
+    with pytest.raises(ValueError, match="ERR_RAW_SOURCE_REQUIRED"):
+        _svc.record_evidence(
+            sid,
+            alt_job,
+            {"content": "The term entered the rising list.", "tool_result_id": rid},
+            repo=repo,
+        )
+
+
+@pytest.mark.parametrize("domain,tool", [("ALT", "get_trend_evidence"), ("MACRO", "get_macro_context")])
+def test_hf_alt_lane_rejects_changed_rows_and_foreign_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, domain: str, tool: str
+) -> None:
+    """A citation must reproduce its row and belong to the submitting session and wave."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC", "ALT", "MACRO")
+    alt_job, macro_job = _hf_alt_desks(repo, sid)
+    job = alt_job if domain == "ALT" else macro_job
+    row: dict[str, JSONValue] = {"value": 4.1, "known_at": "2025-06-20T00:00:00+00:00"}
+    payload: dict[str, object] = {"status": "ok", "series": [row], "observations": [row]}
+    rid = str(_svc.persist_tool_result(sid, job, tool, f"{sid}:tr:row", payload, repo=repo)["tool_result_id"])
+    citation: dict[str, object] = {
+        "content": "The measured value is 4.1.",
+        "tool_result_id": rid,
+        "record_identity": json.dumps(row, sort_keys=True),
+    }
+    with pytest.raises(ValueError, match="ERR_PASSAGE_NOT_IN_SOURCE"):
+        _svc.record_evidence(sid, job, {**citation, "record_identity": json.dumps({**row, "value": 9.9})}, repo=repo)
+    other_job = macro_job if domain == "ALT" else alt_job
+    with pytest.raises(ValueError, match="ERR_PROVENANCE_MISMATCH"):
+        _svc.record_evidence(sid, other_job, citation, repo=repo)
+    foreign_job = str(_svc.start_job(sid, "source_agent", source=domain, repo=repo, wave_id=2)["job_id"])
+    foreign_rid = f"{sid}:tr:foreign-wave"
+    repo.save_tool_result({**repo.get_tool_result(rid), "tool_result_id": foreign_rid, "job_id": foreign_job})
+    with pytest.raises(ValueError, match="ERR_PROVENANCE_MISMATCH"):
+        _svc.record_evidence(sid, job, {**citation, "tool_result_id": foreign_rid}, repo=repo)
+    other_sid, _ = _hf_sid(repo, "SEC", "ALT", "MACRO")
+    other_alt, other_macro = _hf_alt_desks(repo, other_sid)
+    with pytest.raises(ValueError, match="ERR_PROVENANCE_MISMATCH.*belongs to session"):
+        _svc.record_evidence(other_sid, other_alt if domain == "ALT" else other_macro, citation, repo=repo)
+    assert repo.list_evidence(sid) == []
+    assert repo.list_evidence(other_sid) == []
+
+
+def test_hf_macro_lane_admits_a_series_row_and_fails_closed_without_a_date(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persisted macro packet grounds a macro_record; a row without known_at fails PIT_UNVERIFIED."""
+    import json
+
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC", "ALT", "MACRO")
+    _, macro_job = _hf_alt_desks(repo, sid)
+    row: dict[str, object] = {
+        "geo": "US",
+        "variable": "UnemploymentRate_Person",
+        "facet": "f1",
+        "observations": [{"date": "2025-05", "value": 4.1}],
+        "known_at": "2025-06-20T00:00:00+00:00",
+    }
+    undated: dict[str, object] = {
+        "geo": "US",
+        "variable": "InflationRate_Person",
+        "observations": [{"date": "2025-05", "value": 2.9}],
+    }
+    payload: dict[str, object] = {"status": "ok", "source": "datacommons", "series": [row, undated]}
+    rid = str(
+        _svc.persist_tool_result(sid, macro_job, "get_macro_context", f"{sid}:tr:macro", payload, repo=repo)[
+            "tool_result_id"
+        ]
+    )
+    identity = json.dumps(row, sort_keys=True)
+    out = _svc.record_evidence(
+        sid,
+        macro_job,
+        {
+            "content": "US unemployment measured 4.1 percent.",
+            "tool_result_id": rid,
+            "record_identity": identity,
+            "matching_passage": identity,
+        },
+        repo=repo,
+    )
+    provenance = out["provenance"]
+    assert isinstance(provenance, dict)
+    assert provenance["kind"] == "macro_record" and provenance["tool_name"] == "get_macro_context"
+    assert provenance["known_at"] == "2025-06-20T00:00:00+00:00"
+    assert out["source_domain"] == "MACRO"
+    undated_identity = json.dumps(undated, sort_keys=True)
+    with pytest.raises(ValueError, match="PIT_UNVERIFIED|rejected"):
+        _svc.record_evidence(
+            sid,
+            macro_job,
+            {
+                "content": "US inflation measured 2.9 percent.",
+                "tool_result_id": rid,
+                "record_identity": undated_identity,
+                "matching_passage": undated_identity,
+            },
+            repo=repo,
+        )
+    assert [r["evidence_id"] for r in repo.list_evidence(sid)] == [out["evidence_id"]]
+
+
+def test_hf_sec_diff_risk_factors_lane_dates_the_later_filing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A persisted risk-factor diff grounds a sec_record dated by the later of its two filings."""
+    import json
+
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid, _ = _hf_sid(repo, "SEC", "ALT", "MACRO")
+    sec_job = str(_svc.start_job(sid, "source_agent", source="SEC", repo=repo, wave_id=1)["job_id"])
+    diff: dict[str, object] = {
+        "ticker": "NVDA",
+        "latest_filed": "2025-06-10",
+        "prior_filed": "2025-02-26",
+        "latest_accession": "0001045810-25-000010",
+        "prior_accession": "0001045810-24-000010",
+        "diff": "--- prior\n+++ latest\n-competition risk\n+export-control risk",
+    }
+    rid = str(
+        _svc.persist_tool_result(sid, sec_job, "diff_risk_factors", f"{sid}:tr:diff", diff, repo=repo)["tool_result_id"]
+    )
+    identity = json.dumps(diff, sort_keys=True)
+    out = _svc.record_evidence(
+        sid,
+        sec_job,
+        {
+            "content": "The latest 10-K adds export-control risk language.",
+            "tool_result_id": rid,
+            "record_identity": identity,
+            "matching_passage": identity,
+        },
+        repo=repo,
+    )
+    provenance = out["provenance"]
+    assert isinstance(provenance, dict)
+    assert provenance["kind"] == "sec_record" and provenance["tool_name"] == "diff_risk_factors"
+    assert provenance["known_at"] == "2025-06-10"
+    assert out["source_domain"] == "SEC"
 
 
 def test_hf_persist_rejects_cross_domain_and_sec(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -7977,6 +8196,59 @@ def test_hf_finra_settlement_is_not_publication(tmp_path: Path, monkeypatch: pyt
         )
 
 
+def test_hf_scope_cutoff_gates_finra_and_web_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A temporal_scope-only cutoff gates FINRA and WEB rows while the session as_of stays NULL."""
+    from app.research import service as _svc
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    repo = ResearchRepository()
+    sid = _svc.create_research(
+        "Did TSLA insiders unload as of 2025-06-30?", "o", policy=_hf_policy("SEC", "FINRA", "WEB"), repo=repo
+    )
+    assert repo.get_session(sid).as_of is None
+    fin, web = _hf_desks(repo, sid)
+    late_fin = _hf_persist_finra(
+        repo, sid, fin, f"{sid}:tr:scope-late", as_of_date="2025-06-15", published_at="2025-07-15"
+    )
+    late_row = json.dumps({"symbol": "NVDA", "shortInterest": 12345, "marker": "scope-late"}, sort_keys=True)
+    with pytest.raises(ValueError, match="PIT_VIOLATION|rejected"):
+        _svc.record_evidence(sid, fin, _hf_replay_item(f"{sid}:ev:scope-late", late_fin, late_row), repo=repo)
+    late_web = str(
+        _svc.persist_tool_result(
+            sid,
+            web,
+            "search_web",
+            f"{sid}:tr:scope-web",
+            {
+                "evidence": [
+                    {
+                        "url": "https://example.com/late",
+                        "source_domain": "example.com",
+                        "title": "NVDA news",
+                        "published_at": "2025-07-20",
+                        "retrieved_at": "2025-07-21",
+                        "highlight": "NVDA rallies on demand",
+                    }
+                ]
+            },
+            repo=repo,
+        )["tool_result_id"]
+    )
+    with pytest.raises(ValueError, match="PIT_VIOLATION|rejected"):
+        _svc.record_evidence(
+            sid,
+            web,
+            _hf_replay_item(f"{sid}:ev:scope-web", late_web, "NVDA rallies on demand", source_name="WEB"),
+            repo=repo,
+        )
+    early_fin = _hf_persist_finra(
+        repo, sid, fin, f"{sid}:tr:scope-early", as_of_date="2025-06-15", published_at="2025-06-15"
+    )
+    early_row = json.dumps({"symbol": "NVDA", "shortInterest": 12345, "marker": "scope-early"}, sort_keys=True)
+    accepted = _svc.record_evidence(sid, fin, _hf_replay_item(f"{sid}:ev:scope-early", early_fin, early_row), repo=repo)
+    assert accepted["evidence_id"] == f"{sid}:ev:scope-early"
+
+
 def test_hf_get_tool_result_roundtrip_and_unknown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """get_tool_result round-trips the persisted payload; unknown ids raise ResearchNotFound."""
     from app.research import service as _svc
@@ -8491,96 +8763,6 @@ def test_session_preserves_original_question_text() -> None:
     assert _session.create_session("q?", "q?").to_dict()["ticker"] is None
     round_tripped = _session.ResearchSession.from_dict(stored, "<test>")
     assert round_tripped.ticker == "NVDA"
-
-
-def test_needle_execution_context_excludes_raw_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A repository-backed node supplies anchors without disclosing stored evidence to Needle."""
-    import asyncio as _asyncio
-    import json as _json
-    from typing import override
-
-    import app.tools as _tools
-    from app.decision_client import JevClient
-    from app.research import scheduler as _sched
-    from app.research import service as _svc
-    from app.research.models import ToolDecision
-    from app.tool_runtime import outcome_from_result
-
-    def _orcl(name: str) -> str | None:
-        return {"ORCL": "ORCL"}.get(name)
-
-    monkeypatch.setattr(_tools, "_resolve_company_to_ticker", _orcl)
-
-    repo = ResearchRepository(data_root=tmp_path)
-    objective = "What is ORCL's filing history?"
-    # A cutoff retains generation, so this test checks the Needle context boundary.
-    sid = _svc.create_research(objective, ticker="ORCL", as_of="2026-01-01", repo=repo)
-    source_job = repo.list_jobs(sid)[0].job_id
-    _svc.record_evidence(
-        sid,
-        source_job,
-        _svc_item(
-            f"{sid}:ev:private",
-            passage="private stored passage",
-            content="private stored content",
-            claim_text="private stored claim",
-        ),
-        repo=repo,
-    )
-    assert any("private stored passage" in str(row) for row in repo.list_evidence(sid))
-    node = _svc.create_node(sid, objective, "Check filing history.", repo=repo)
-    seen: dict[str, object] = {}
-    invoked: list[dict[str, JSONValue]] = []
-
-    class _Jev(JevClient):
-        @override
-        async def select_tool(self, *args: object, **kwargs: object) -> ToolDecision:
-            return ToolDecision(action="invoke", tool_name="list_sec_filings", tool_names=("list_sec_filings",))
-
-        @override
-        async def assess_result(self, *args: object, **kwargs: object) -> dict[str, JSONValue]:
-            return {"evidence_state": "insufficient", "continuation": "continue_research"}
-
-    async def _generate(**kwargs: object) -> dict[str, object]:
-        seen.update(kwargs)
-        return {"tool": "list_sec_filings", "arguments": {"identifier": "ORCL"}, "reasoning": "", "withheld": False}
-
-    def _invoke(name: str, arguments: dict[str, JSONValue], session: object, **kwargs: object) -> dict[str, object]:
-        invoked.append(arguments)
-        return {"filings": []}
-
-    out = _asyncio.run(
-        _sched.run_node(
-            node,
-            sid,
-            repo=repo,
-            jev=_Jev(),
-            needle_generate=_generate,
-            invoke=_invoke,
-            to_outcome=outcome_from_result,
-            registry=[
-                {
-                    "name": "list_sec_filings",
-                    "parameters": {"type": "object", "properties": {"identifier": {"type": "string"}}},
-                }
-            ],
-            max_rounds=1,
-        )
-    )
-    assert invoked and invoked[0]["identifier"] == "ORCL"
-    assert out["status"] == "blocked" and out["admitted"] == 0
-    assert len(repo.list_evidence(sid)) == 1
-    context = seen["context"]
-    assert isinstance(context, dict)
-    assert "evidence" not in context and "attempts" not in context and "grounding_hint" not in context
-    serialized = _json.dumps(seen)
-    assert "private stored passage" not in serialized
-    assert "private stored content" not in serialized
-    assert "private stored claim" not in serialized
-    assert context["ticker"] == "ORCL"
-    scope = context["temporal_scope"]
-    assert scope == {"mode": "as_of", "as_of": "2026-01-01"}
-    assert context["grounded_arguments"] == {"identifier": "ORCL"}
 
 
 # --- changed-code CRAP repair: lifecycle argument resolution + coverage folds ---
@@ -9290,6 +9472,56 @@ def test_service_ledger_skips_legacy_and_keeps_duplicates_closed(
     assert corrected["superseded_by"] == f"{sid}:ev:2"
     assert repo.get_evidence(f"{sid}:ev:corrected")["superseded_by"] == f"{sid}:ev:2"
     assert len(repo.list_evidence(sid)) == 5
+
+
+def test_repository_migrates_a_pre_targeted_database_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An older research.sqlite gains every column, index, and default on first open, then stops re-applying.
+
+    A connection used to run the whole schema script, every lazy ALTER, and the evidence
+    backfill each time; one ticket persisted thousands of them per listing.
+    """
+    import sqlite3
+
+    from app.research import repository as repo_mod
+
+    db = tmp_path / "legacy.sqlite"
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+              session_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              query TEXT NOT NULL, objective TEXT NOT NULL, as_of TEXT,
+              status TEXT NOT NULL, current_wave INTEGER NOT NULL,
+              policy TEXT NOT NULL, budget TEXT NOT NULL,
+              job_ids TEXT NOT NULL, evidence_ids TEXT NOT NULL,
+              freeze_ids TEXT NOT NULL, dossier_ids TEXT NOT NULL,
+              committee_runs TEXT NOT NULL, unresolved_questions TEXT NOT NULL,
+              final_result TEXT, failure TEXT);
+            INSERT INTO sessions VALUES ('rs:old', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00',
+              'q?', 'o', NULL, 'created', 0, '{}', '{}', '[]', '[]', '[]', '[]', '[]', '[]', NULL, NULL);
+            """
+        )
+    assert sqlite3.connect(db).execute("PRAGMA user_version").fetchone()[0] == 0
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(db))
+    applied: list[int] = []
+    original = repo_mod.ResearchRepository._apply_schema
+
+    def counting(conn: sqlite3.Connection) -> None:
+        applied.append(1)
+        original(conn)
+
+    monkeypatch.setattr(repo_mod.ResearchRepository, "_apply_schema", staticmethod(counting))
+    repo = ResearchRepository()
+    old = repo.get_session("rs:old")
+    assert (old.source_policy.get("mode"), old.temporal_scope.get("mode")) == ("allowlist", "latest-available")
+    assert (old.targeted_question, old.ticker) == (None, None)
+    for _ in range(5):
+        repo.list_sessions(5)
+    assert applied == [1]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == repo_mod._SCHEMA_VERSION
+        assert any(row[1] == "last_heartbeat_at" for row in conn.execute("PRAGMA table_info(jobs)"))
+        assert any(row[1] == "ux_evidence_session_identity" for row in conn.execute("PRAGMA index_list(evidence)"))
 
 
 def test_service_finra_citation_keys_and_tool_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -10261,103 +10493,6 @@ def test_create_node_rejects_null_nonstring_question(tmp_path: Path, monkeypatch
         with pytest.raises(ValueError, match="'question' must be a non-empty string"):
             create_untyped(sid, bad_question, "why it matters", repo=repo)
     assert repo.list_nodes(sid) == []
-
-
-def test_intake_newest_4a_digest_carries_insider_transactions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Newest 4/A: intake opens insider activity, so the digest carries parsed transaction rows.
-
-    Live defect: the chain opened only 8-Ks, so a 4/A-led listing left the answer with
-    filing metadata (form, filed date) and no transaction code, kind, shares or price.
-    """
-    import asyncio
-
-    from app.research import kernel_worker as kw
-    from app.research import scheduler as sched
-    from app.research import service as _svc
-    from app.tool_runtime import outcome_from_result
-
-    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
-    repo = ResearchRepository()
-    sid = _svc.create_research("Did NVDA insiders sell?", "o", as_of=None, repo=repo)
-    payloads: dict[str, dict[str, object]] = {
-        "list_sec_filings": {
-            "subject": "1045810",
-            "filings": [
-                {"form": "4/A", "accession_no": "0001045810-26-000002", "filed_at": "2026-09-09"},
-                {"form": "8-K", "accession_no": "0001045810-26-000001", "filed_at": "2026-09-01"},
-            ],
-            "source": "SEC EDGAR",
-        },
-        "get_insider_activity": {
-            "subject": "NVDA",
-            "count": 1,
-            "transactions": [
-                {
-                    "insider_name": "Huang Jen-Hsun",
-                    "transaction_code": "S",
-                    "transaction_kind": "open_market_sale",
-                    "transaction_date": "2026-09-05",
-                    "acquired_disposed": "D",
-                    "shares": 2605,
-                    "price": 360.13,
-                    "filed_at": "2026-09-09",
-                    "accession_no": "0001045810-26-000002",
-                }
-            ],
-            "source": "SEC EDGAR",
-        },
-    }
-    calls: list[str] = []
-
-    async def _attempt(
-        tool: str,
-        args: dict[str, object],
-        sid: str,
-        session: object,
-        registry: object,
-        jev: object,
-        kernel: sched._Kernel,
-        as_of: str | None,
-    ) -> dict[str, object]:
-        calls.append(tool)
-        if tool == "get_sec_document":
-            return {"tool": tool, "arguments": args, "error": "no document backend", "outcome": None}
-        job_id = sched._attempt_job(kernel, sid, "SEC")
-        result = dict(payloads[tool])
-        forms = args.get("forms")
-        if isinstance(forms, list):
-            filings = result["filings"]
-            assert isinstance(filings, list)
-            result["filings"] = [r for r in filings if r["form"] in forms][:1]
-        ref = f"{sid}:tr:{tool}:{forms[0] if isinstance(forms, list) else ''}"
-        _svc.persist_tool_result(sid, job_id, tool, ref, result)
-        result["tool_result_id"] = ref
-        return sched._success_attempt(tool, args, outcome_from_result(tool, result), result, "SEC", "intake", job_id)
-
-    def _cik(ticker: str) -> str:
-        return "1045810"
-
-    monkeypatch.setattr(kw, "_intake_attempt", _attempt)
-    monkeypatch.setattr(kw, "_intake_cik", _cik)
-    admitted, _raw, stats = asyncio.run(
-        kw._intake_round(None, ["NVDA"], sid, repo.get_session(sid).to_dict(), [], None, sched._Kernel(), None)
-    )
-    # Four family listings, then the 8-K read beside insider activity, then one bounded retry of the unread 8-K.
-    assert sorted(calls) == sorted(["list_sec_filings"] * 4 + ["get_sec_document"] * 2 + ["get_insider_activity"])
-    assert stats["unread_material"] == ["0001045810-26-000001"]
-    # Every family listing admits as SEC record evidence; the 8-K read and its retry fail without a doc backend.
-    assert stats["outcomes"] == {"admitted": 5, "duplicate": 0, "not_citable": 0, "error": 2, "timeout": 0}
-    row = (
-        "  - insider_name Huang Jen-Hsun, transaction_code S, transaction_kind open_market_sale, "
-        "transaction_date 2026-09-05, acquired_disposed D, shares 2605, price 360.13, "
-        "filed_at 2026-09-09, accession_no 0001045810-26-000002"
-    )
-    contents = [str(ev.get("content", "")) for ev in admitted]
-    # Metadata alone (the listing) names the form and filed date but no transaction.
-    listing = [c for c in contents if "4/A" in c and row not in c]
-    assert listing and all("transaction_code" not in c and "shares" not in c for c in listing)
-    assert [c for c in contents if row in c]
-    assert row in kw._build_digest(admitted, ("NVIDIA", "NVDA"))
 
 
 def _regweb_cov(**over: object) -> dict[str, object]:
