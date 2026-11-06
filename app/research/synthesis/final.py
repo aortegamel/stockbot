@@ -1093,14 +1093,6 @@ def _gate_list(items: Sequence[str], inventory: Sequence[str]) -> list[str]:
     return [kept for kept in (_gate_text(item, inventory) for item in items) if kept]
 
 
-def uncovered_sentences(text: str, claim_texts: Sequence[str]) -> list[str]:
-    """Sentences of assertive prose (an answer) that no claim text covers, in order."""
-    inventory = [plain for plain in (_plain(claim) for claim in claim_texts) if plain]
-    return [
-        s for line in text.splitlines() for s in _SENTENCE_END.split(line.strip()) if s and not _covered(s, inventory)
-    ]
-
-
 def gate_uncovered_prose(synth: FinalSynthesis) -> FinalSynthesis:
     """Exhaustive prose inventory: every sentence needs a claim row, else it is deleted in place.
 
@@ -1139,5 +1131,4 @@ __all__ = [
     "gate_uncovered_prose",
     "scoped_absence",
     "synthesize_final",
-    "uncovered_sentences",
 ]

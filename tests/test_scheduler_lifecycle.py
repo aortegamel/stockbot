@@ -324,6 +324,8 @@ def test_sec_listing_row_accession_and_filing_date_datapoints_the_gate_accepts(t
     for text, point_ids, defect in (
         ("Apple Inc. filed on 2025-10-31 with accession number 0000320193-25-000079", dates, None),
         ("Apple Inc. filed 10-K on 2025-10-31 with accession number 0000320193-25-000079", dates, None),
+        # "filing date" is the plain-English spelling of filed_at a model writes; without the alias this rejects.
+        ("Apple Inc. filing date 2025-10-31, accession number 0000320193-25-000079", dates, None),
         ("Apple Inc. filed on 2025-10-31 with accession number 0000320193-25-999999", dates, "ERR_SOURCE_IDENTITY"),
         ("Apple Inc. filed on 2026-05-01 with accession number 0000320193-25-000079", dates, "ERR_DATAPOINT"),
     ):
@@ -1703,3 +1705,61 @@ def test_listing_repair_drops_a_one_day_start_date() -> None:
         schema=sched._schema_for("list_sec_filings", sched.build_registry()),
     )
     assert filled == {"identifier": "AAPL", "end_date": "2024-01-01", "forms": ["10-K"]}
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        (
+            {"evidence": [{"url": " https://example.com/a ", "highlight": " Revenue\n grew. "}]},
+            ("https://example.com/a", "Revenue grew."),
+        ),
+        ({"evidence": [{"source": "Reuters", "highlight": "Revenue grew."}]}, (None, None)),
+        ({"evidence": [None, "bad", {"url": 3, "highlight": []}]}, (None, None)),
+        ({"evidence": "bad"}, (None, None)),
+        (
+            {"evidence": [{"url": " ", "highlight": "text"}, {"url": "https://example.com", "highlight": ""}]},
+            (None, None),
+        ),
+    ],
+)
+def test_web_locator_requires_citable_url_and_passage(
+    payload: dict[str, object], expected: tuple[str | None, str | None]
+) -> None:
+    assert tool_runner._web_locator(payload) == expected
+
+
+@pytest.mark.parametrize(
+    "schema,scope,objective,initial,expected",
+    [
+        (None, {}, "latest events", {}, {}),
+        ({"required": "since"}, {}, "latest events", {}, {}),
+        ({"required": []}, {}, "latest events", {}, {}),
+        ({"required": ["since"]}, {"start": "2025-01-01"}, "latest events", {}, {}),
+        ({"required": ["since"]}, {"end": "2025-06-01"}, "latest events", {}, {}),
+        ({"required": ["since"]}, {}, "events since 2025-01-01", {}, {}),
+        ({"required": ["since"]}, {}, "latest events", {}, {"since": "2025-05-31"}),
+        ({"required": ["since"]}, {}, "latest events", {"since": "2025-05-31"}, {"since": "2025-05-31"}),
+    ],
+)
+def test_seed_since_window_preserves_explicit_scope(
+    schema: dict[str, JSONValue] | None,
+    scope: dict[str, JSONValue],
+    objective: str,
+    initial: dict[str, JSONValue],
+    expected: dict[str, JSONValue],
+) -> None:
+    filled = dict(initial)
+    sched._seed_since_window(filled, "events", schema, objective, "", scope, "2025-06-30", "s", "n")
+    assert filled == expected
+
+
+def test_seed_since_window_uses_fixed_clock_for_invalid_cutoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import UTC, datetime
+
+    clock = mock.Mock(wraps=datetime)
+    clock.now.return_value = datetime(2025, 6, 30, tzinfo=UTC)
+    monkeypatch.setattr(sched, "datetime", clock)
+    filled: dict[str, JSONValue] = {}
+    sched._seed_since_window(filled, "events", {"required": ["since"]}, "events", "", None, "bad", "s", "n")
+    assert filled == {"since": "2025-05-31"}

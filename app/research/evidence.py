@@ -1251,35 +1251,41 @@ def _passage_row_candidates(passage: str) -> Iterator[dict[str, str]]:
                     (row.split(_ROW_CELL) for row in reversed(before.split("\n")) if _ROW_CELL in row), []
                 )
                 period = f"{groups[0].strip()} {cells[0].strip()}" if groups else ""
-            numeric = next(
-                (i for i, cell in enumerate(cells) if re.search(r"[0-9]", cell) and not re.search(r"[A-Za-z]", cell)),
-                None,
-            )
-            if numeric is not None and entity and period and unit:
-                metric = " ".join(cell.strip() for cell in cells[:numeric] if cell.strip() not in ("", "$"))
-                if metric:
-                    claimed = {
-                        "metric": metric,
-                        "value": cells[numeric],
-                        "entity": entity,
-                        "period": period,
-                        "unit": unit,
-                    }
-                    try:
-                        at = sum(len(cell) + len(_ROW_CELL) for cell in cells[:numeric])
-                        _, scope, column = _row_metric(line, at, claimed)
-                        aligned = _grouped_period(before, period, column)
-                        if aligned is not None:
-                            claimed["period"] = aligned
-                            for label in ("entity", "period", "unit"):
-                                spelling = _context_label(before, len(before), scope, claimed, label, column)
-                                if spelling is None:
-                                    raise ValueError(f"datapoint {label} is required")
-                                claimed[label] = spelling
-                            yield claimed
-                    except ValueError:
-                        pass  # Incomplete or misaligned labels cannot form a declaration.
+            if entity and period and unit:
+                claimed = _passage_row_declaration(line, before, entity, period, unit)
+                if claimed is not None:
+                    yield claimed
         before += line + "\n"
+
+
+def _passage_row_declaration(line: str, before: str, entity: str, period: str, unit: str) -> dict[str, str] | None:
+    """Bind one numeric row to its metric and the surrounding table declarations."""
+    cells = line.split(_ROW_CELL)
+    numeric = next(
+        (i for i, cell in enumerate(cells) if re.search(r"[0-9]", cell) and not re.search(r"[A-Za-z]", cell)),
+        None,
+    )
+    if numeric is None:
+        return None
+    metric = " ".join(cell.strip() for cell in cells[:numeric] if cell.strip() not in ("", "$"))
+    if not metric:
+        return None
+    claimed = {"metric": metric, "value": cells[numeric], "entity": entity, "period": period, "unit": unit}
+    try:
+        at = sum(len(cell) + len(_ROW_CELL) for cell in cells[:numeric])
+        _, scope, column = _row_metric(line, at, claimed)
+        aligned = _grouped_period(before, period, column)
+        if aligned is None:
+            return None
+        claimed["period"] = aligned
+        for label in ("entity", "period", "unit"):
+            spelling = _context_label(before, len(before), scope, claimed, label, column)
+            if spelling is None:
+                raise ValueError(f"datapoint {label} is required")
+            claimed[label] = spelling
+    except ValueError:
+        return None
+    return claimed
 
 
 def _prose_metric(

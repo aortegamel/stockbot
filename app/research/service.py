@@ -5557,35 +5557,6 @@ def resolve_node(session_id: str, node_id: str, *, repo: ResearchRepository | Pa
     return _transition_node(_repo(repo), session_id, node_id, "resolved", "node.resolved")
 
 
-def await_node_evidence(
-    session_id: str,
-    node_id: str,
-    dependencies: Sequence[str],
-    *,
-    repo: ResearchRepository | Path | str | None = None,
-) -> ResearchNode:
-    """Wait for admitted evidence questions through the existing dependency gate. Reject dependency cycles."""
-    store = _repo(repo)
-    node = _require_node(store, node_id)
-    if node.session_id != session_id:
-        raise ResearchNotFound(f"unknown node_id: {node_id!r}")
-    deps = tuple(dict.fromkeys((*node.depends_on, *dependencies)))
-    _require_deps_in_session(store, session_id, deps)
-    pending = list(deps)
-    seen: set[str] = set()
-    while pending:
-        dependency = pending.pop()
-        if dependency == node_id:
-            raise ValueError("await_node_evidence: dependency cycle")
-        if dependency not in seen:
-            seen.add(dependency)
-            pending.extend(_require_node(store, dependency).depends_on)
-    updated = replace(node, status="gathering", depends_on=deps)
-    store.save_node(updated)
-    _emit(store, session_id, "node.awaiting_evidence", {"node_id": node_id, "depends_on": list(deps)})
-    return updated
-
-
 def block_node(
     session_id: str, node_id: str, reason: str = "", *, repo: ResearchRepository | Path | str | None = None
 ) -> ResearchNode:

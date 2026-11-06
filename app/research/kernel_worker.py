@@ -763,16 +763,6 @@ def _arguments(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         return {"id": rid, "error": str(exc)[:500] or "needle arguments failed"}
 
 
-def _final_ids(item: object, key: str) -> list[str]:
-    """Non-empty string id list under key; [] when absent or malformed."""
-    if not isinstance(item, Mapping):
-        return []
-    raw = item.get(key)
-    if not isinstance(raw, list):
-        return []
-    return [eid for eid in raw if isinstance(eid, str) and eid.strip()]
-
-
 def _final_session(req: Mapping[str, JSONValue]) -> str | None:
     """Caller session id: sessionId (camelCase, matches run op) with session_id alias; None when absent."""
     for key in ("sessionId", "session_id"):

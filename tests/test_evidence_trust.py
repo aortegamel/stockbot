@@ -381,3 +381,104 @@ def test_context_label_requires_identity_but_allows_no_unit() -> None:
     claimed["period"] = "FY2026"
     with pytest.raises(ValueError, match="period 'FY2026' is not stated in the value's table row"):
         evidence._context_label("", 0, "", claimed, "period", (0, 2))
+
+
+@pytest.mark.parametrize("basis", ["raw", "rendered"])
+def test_qualitative_replay_accepts_archived_passage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, basis: str
+) -> None:
+    from dataclasses import replace
+
+    import tests.research_source_seam as seam
+    from app.research import service
+    from app.research.repository import ResearchRepository
+
+    passage = "NVIDIA supplies accelerated computing platforms."
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-prose": passage})
+    store = ResearchRepository()
+    row = evidence.evidence_from_dict(store.get_evidence("ev-prose"))
+    row = replace(row, provenance={**row.provenance, "basis": basis})
+    assert service._qualitative_replay_defect(store, sid, row, None) is None
+
+
+@pytest.mark.parametrize(
+    "mutation,expected",
+    [
+        ("passage", "SEC passage does not replay from archived source bytes"),
+        ("hash", "archived SEC source hash does not match"),
+        ("identity", "SEC passage lacks canonical window identity"),
+    ],
+)
+def test_qualitative_replay_rejects_fabricated_or_corrupt_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mutation: str, expected: str
+) -> None:
+    from dataclasses import replace
+
+    import tests.research_source_seam as seam
+    from app.research import service
+    from app.research.repository import ResearchRepository
+
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-prose": "NVIDIA supplies computing platforms."})
+    store = ResearchRepository()
+    row = evidence.evidence_from_dict(store.get_evidence("ev-prose"))
+    if mutation == "passage":
+        row = replace(row, provenance={**row.provenance, "passage": "Invented acquisition of a competitor."})
+    elif mutation == "hash":
+        row = replace(row, metadata={**row.metadata, "source_content_hash": "0" * 64})
+    else:
+        row = replace(
+            row,
+            provenance={
+                key: value
+                for key, value in row.provenance.items()
+                if key not in ("basis", "text_hash", "offset", "end")
+            },
+        )
+    assert service._qualitative_replay_defect(store, sid, row, None) == expected
+
+
+@pytest.mark.parametrize("domain,tool", [("SEC", "get_xbrl_facts"), ("FINRA", "query_finra"), ("WEB", "search_web")])
+def test_qualitative_replay_rebuilds_persisted_records(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, domain: str, tool: str
+) -> None:
+    from dataclasses import replace
+
+    from app.research import service
+    from app.research.repository import ResearchRepository
+
+    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path / "data"))
+    store = ResearchRepository()
+    sid = service.create_research(
+        "NVDA?",
+        policy={"research_sources": {"mode": "allowlist", "sources": ["SEC", "FINRA", "WEB"]}},
+        repo=store,
+    )
+    job = str(service.start_job(sid, source=domain, repo=store)["job_id"])
+    passage = "NVIDIA supplies computing platforms."
+    record = {"symbol": "NVDA", "description": passage}
+    url = "https://example.com/platforms"
+    payload = {"evidence": [{"url": url, "highlight": passage}]} if domain == "WEB" else {"records": [record]}
+    ref = service.persist_tool_result(sid, job, tool, "platforms", payload, repo=store)["tool_result_id"]
+    stored = service.record_evidence(
+        sid,
+        job,
+        {
+            "content": passage,
+            "source_name": domain,
+            "tool_result_id": ref,
+            "matching_passage": passage if domain == "WEB" else json.dumps(record),
+            **({"source_record_id": url} if domain == "WEB" else {}),
+        },
+        repo=store,
+    )
+    row = evidence.evidence_from_dict(stored)
+    assert service._qualitative_replay_defect(store, sid, row, None) is None
+    changed = replace(
+        row, provenance={**row.provenance, "published_at" if domain == "WEB" else "known_at": "2000-01-01"}
+    )
+    assert service._qualitative_replay_defect(store, sid, changed, None) == (
+        "qualitative provenance differs from its persisted source"
+    )
+    missing = replace(row, provenance={**row.provenance, "tool_result_id": "missing"})
+    assert service._qualitative_replay_defect(store, sid, missing, None) is not None

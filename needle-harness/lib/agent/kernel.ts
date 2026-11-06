@@ -589,9 +589,12 @@ function kernelEvidence(raw: unknown): Evidence[] {
     };
   });
 }
-async function admitNumbers(run: KernelRun, results: readonly NarrativeResult[]): Promise<void> {
-  const declarations = results.flatMap((result) => result.claims.flatMap((claim) =>
-    (claim.numbers ?? []).map((number) => ({ claim, number }))));
+type NumberDeclaration = { claim: FinalClaim; number: NonNullable<FinalClaim["numbers"]>[number] };
+type ClaimDatapoints = {
+  pointById: Map<string, Datapoint>;
+  rowsOf: Map<string, string[]>;
+};
+async function admitDeclaredNumbers(run: KernelRun, declarations: readonly NumberDeclaration[]): Promise<void> {
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(4, declarations.length) }, async () => {
     while (next < declarations.length) {
@@ -625,61 +628,67 @@ async function admitNumbers(run: KernelRun, results: readonly NarrativeResult[])
       }
     }
   }));
-  // A growth claim often also lists its inputs' dp: ids. An input whose value the sentence never states is not
-  // what the sentence claims, so it leaves the claim; a stated input value stays and must still bind. A dp: id no
-  // run row carries (a mistyped id) leaves too: every stated number still needs a bound datapoint at the gate.
-  // A real dp: id whose row the claim forgot to cite gains that row: the gate still proves the datapoint there.
-  const pointById = new Map(run.evidence.flatMap((row) => (row.datapoints ?? []).map((p) => [p.id, p] as const)));
-  const rowsOf = datapointRows(run.evidence);
-  for (const claim of results.flatMap((result) => result.claims)) {
-    const ids = claim.datapointIds ?? [];
-    const inputs = new Set(ids.flatMap((id) => pointById.get(id)?.inputs ?? []));
-    const stated = ids.filter((id) => pointById.has(id) && (!inputs.has(id) || claim.text.includes(pointById.get(id)?.value ?? id)));
-    // One stated number has one datapoint: when several cite it, keep the one whose metric the sentence
-    // names ("filed" for filed_at). Still ambiguous stays out, so the proof reads it as unbound.
-    const byValue = new Map<string, string[]>();
-    for (const id of stated) {
-      const value = pointById.get(id)?.value ?? "";
-      byValue.set(value, [...(byValue.get(value) ?? []), id]);
-    }
-    const kept = [...byValue.values()].flatMap((group) => {
-      if (group.length === 1) return group;
-      const named = group.filter((id) => {
-        const head = pointById.get(id)?.metric?.toLowerCase().split(/[^a-z0-9]+/).find((word) => word.length > 2);
-        return head === undefined || claim.text.toLowerCase().includes(head);
-      });
-      return named.length === 1 ? named : [];
+}
+function pruneClaimDatapoints(claim: FinalClaim, { pointById, rowsOf }: ClaimDatapoints): void {
+  const ids = claim.datapointIds ?? [];
+  const inputs = new Set(ids.flatMap((id) => pointById.get(id)?.inputs ?? []));
+  const stated = ids.filter((id) => pointById.has(id) && (!inputs.has(id) || claim.text.includes(pointById.get(id)?.value ?? id)));
+  // One stated number has one datapoint: when several cite it, keep the one whose metric the sentence
+  // names ("filed" for filed_at). Still ambiguous stays out, so the proof reads it as unbound.
+  const byValue = new Map<string, string[]>();
+  for (const id of stated) {
+    const value = pointById.get(id)?.value ?? "";
+    byValue.set(value, [...(byValue.get(value) ?? []), id]);
+  }
+  const kept = [...byValue.values()].flatMap((group) => {
+    if (group.length === 1) return group;
+    const named = group.filter((id) => {
+      const head = pointById.get(id)?.metric?.toLowerCase().split(/[^a-z0-9]+/).find((word) => word.length > 2);
+      return head === undefined || claim.text.toLowerCase().includes(head);
     });
-    if (kept.length !== ids.length) claim.datapointIds = kept;
-    for (const id of kept) {
-      const rows = rowsOf.get(id) ?? [];
-      const row = rows[0];
-      if (row !== undefined && !rows.some((r) => claim.evidenceIds.includes(r))) claim.evidenceIds.push(row);
+    return named.length === 1 ? named : [];
+  });
+  if (kept.length !== ids.length) claim.datapointIds = kept;
+  for (const id of kept) {
+    const rows = rowsOf.get(id) ?? [];
+    const row = rows[0];
+    if (row !== undefined && !rows.some((r) => claim.evidenceIds.includes(r))) claim.evidenceIds.push(row);
+  }
+}
+function bindUniqueDatapoints(claim: FinalClaim, evidence: readonly Evidence[], { pointById, rowsOf }: ClaimDatapoints): void {
+  const bound = new Set(claim.datapointIds ?? []);
+  const lower = claim.text.toLowerCase();
+  const candidates = new Map<string, string[]>();
+  for (const row of evidence) {
+    for (const point of row.datapoints ?? []) {
+      if (!point.value || !claim.text.includes(point.value)) continue;
+      if ([...bound].some((id) => pointById.get(id)?.value === point.value)) continue;
+      const head = point.metric?.toLowerCase().split(/[^a-z0-9]+/).find((word) => word.length > 2);
+      if (head && !lower.includes(head)) continue;
+      candidates.set(point.value, [...(candidates.get(point.value) ?? []), point.id]);
     }
-    // A claim that states a value the run proves proves it: the row carrying that datapoint binds even when
-    // the claim cited a neighbour row, because a filing sentence states a date and an accession that live on
-    // two rows. A value the claim already binds stays as it is; two datapoints still share a stated value only
-    // when neither label is named, and that stays unbound so the proof rejects it.
-    const bound = new Set(claim.datapointIds ?? []);
-    const lower = claim.text.toLowerCase();
-    const candidates = new Map<string, string[]>();
-    for (const row of run.evidence) {
-      for (const point of row.datapoints ?? []) {
-        if (!point.value || !claim.text.includes(point.value)) continue;
-        if ([...bound].some((id) => pointById.get(id)?.value === point.value)) continue;
-        const head = point.metric?.toLowerCase().split(/[^a-z0-9]+/).find((word) => word.length > 2);
-        if (head && !lower.includes(head)) continue;
-        candidates.set(point.value, [...(candidates.get(point.value) ?? []), point.id]);
-      }
-    }
-    for (const ids of candidates.values()) {
-      const only = ids.length === 1 ? ids[0] : undefined;
-      if (only === undefined) continue;
-      bound.add(only);
-      const row = rowsOf.get(only)?.[0];
-      if (row !== undefined && !claim.evidenceIds.includes(row)) claim.evidenceIds.push(row);
-    }
-    if (bound.size !== (claim.datapointIds ?? []).length) claim.datapointIds = [...bound];
+  }
+  for (const ids of candidates.values()) {
+    const only = ids.length === 1 ? ids[0] : undefined;
+    if (only === undefined) continue;
+    bound.add(only);
+    const row = rowsOf.get(only)?.[0];
+    if (row !== undefined && !claim.evidenceIds.includes(row)) claim.evidenceIds.push(row);
+  }
+  if (bound.size !== (claim.datapointIds ?? []).length) claim.datapointIds = [...bound];
+}
+
+async function admitNumbers(run: KernelRun, results: readonly NarrativeResult[]): Promise<void> {
+  const declarations = results.flatMap((result) => result.claims.flatMap((claim) =>
+    (claim.numbers ?? []).map((number) => ({ claim, number }))));
+  await admitDeclaredNumbers(run, declarations);
+  const points: ClaimDatapoints = {
+    pointById: new Map(run.evidence.flatMap((row) => (row.datapoints ?? []).map((point) => [point.id, point] as const))),
+    rowsOf: datapointRows(run.evidence),
+  };
+  for (const claim of results.flatMap((result) => result.claims)) {
+    pruneClaimDatapoints(claim, points);
+    bindUniqueDatapoints(claim, run.evidence, points);
   }
 }
 
@@ -703,106 +712,134 @@ export async function runKernelAgent(prompt: string, emit: (event: AgentEvent) =
   if (run.evidence.length) emit({ type: "evidence", evidence: run.evidence });
   let streamed = "";
   try {
-    const opened = await worker({ op: "open_research", prompt, ...(opts?.asOf !== undefined ? { asOf: opts.asOf } : {}), ...(opts?.watchlist?.length ? { watchlist: opts.watchlist } : { ticker: opts?.ticker ?? opts?.currentChartTicker }) });
-    if (opened.error || typeof opened.sessionId !== "string" || !opened.sessionId) throw new Error(opened.error ?? "Research returned no session id.");
-    run.sessionId = opened.sessionId;
-    if (!Array.isArray(opened.tools) || !opened.tools.every((name): name is string => typeof name === "string" && name.length > 0)) throw new Error("Research returned invalid tool names.");
-    const schemas = await (deps.describeTools ?? describeTools)();
-    const tools = opened.tools.map((name) => {
-      const schema = schemas.find((tool) => tool.name === name);
-      if (!schema) throw new Error(`Research has no schema for tool ${name}.`);
-      return schema;
-    });
-    const allowed = new Set(opened.tools);
-    const runTool = async (tool: string, args: Record<string, unknown>): Promise<string> => {
-      if (!allowed.has(tool)) return `error: ${tool} is not available in research`;
-      const arguments_ = tool === "get_sec_document" ? { ...args, limit: Math.min(typeof args.limit === "number" ? args.limit : RESEARCH_DOCUMENT_CHARS, RESEARCH_DOCUMENT_CHARS) } : args;
-      emit(statusEvent(toolStatus(tool)));
-      emit({ type: "tool_start", tool });
-      const at = performance.now();
-      run.callsCount++;
-      try {
-        const reply = await worker({ op: "research_tool", sessionId: run.sessionId, tool, arguments: arguments_ });
-        const rows = kernelEvidence(reply.evidence);
-        const incoming = rows.filter((row) => !run.evidence.some((existing) => existing.id === row.id));
-        run.evidence.push(...incoming);
-        if (incoming.length) emit({ type: "evidence", evidence: incoming, sessionId: run.sessionId });
-        if (!reply.ok) {
-          const message = reply.error ?? `${tool} returned no result.`;
-          run.failures.tool_error = (run.failures.tool_error ?? 0) + 1;
-          run.limitations.push(message);
-          emit({ type: "tool_failed", tool, category: "tool_error", preview: message.slice(0, 160) });
-          return `error: ${message}`;
-        }
-        emit({ type: "tool_result", tool, evidenceId: incoming[0]?.id, preview: String(reply.summary ?? "").slice(0, 160) });
-        return JSON.stringify({ summary: reply.summary, evidence: rows });
-      } catch (error) {
-        const message = errorText(error);
+    const { tools, runTool } = await openResearchSession(run, worker, prompt, deps, opts);
+    const result = await reasonResearch(run, prompt, deps, tools, runTool, (text) => { streamed += text; emit({ type: "answer_delta", text }); }, opts);
+    const { candidates, supported } = await proveResearchClaims(run, worker, result);
+    publishResearch(run, result, candidates, supported, streamed);
+  } catch (error) { endFailed(run, errorText(error)); }
+}
+
+type ResearchWorker = (body: Record<string, unknown>) => Promise<KernelResponse>;
+async function openResearchSession(run: KernelRun, worker: ResearchWorker, prompt: string, deps: RunKernelDeps, opts?: KernelRunOptions) {
+  const emit = run.emit;
+  const opened = await worker({ op: "open_research", prompt, ...(opts?.asOf !== undefined ? { asOf: opts.asOf } : {}), ...(opts?.watchlist?.length ? { watchlist: opts.watchlist } : { ticker: opts?.ticker ?? opts?.currentChartTicker }) });
+  if (opened.error || typeof opened.sessionId !== "string" || !opened.sessionId) throw new Error(opened.error ?? "Research returned no session id.");
+  run.sessionId = opened.sessionId;
+  if (!Array.isArray(opened.tools) || !opened.tools.every((name): name is string => typeof name === "string" && name.length > 0)) throw new Error("Research returned invalid tool names.");
+  const schemas = await (deps.describeTools ?? describeTools)();
+  const tools = opened.tools.map((name) => {
+    const schema = schemas.find((tool) => tool.name === name);
+    if (!schema) throw new Error(`Research has no schema for tool ${name}.`);
+    return schema;
+  });
+  const allowed = new Set(opened.tools);
+  const runTool = async (tool: string, args: Record<string, unknown>): Promise<string> => {
+    if (!allowed.has(tool)) return `error: ${tool} is not available in research`;
+    const arguments_ = tool === "get_sec_document" ? { ...args, limit: Math.min(typeof args.limit === "number" ? args.limit : RESEARCH_DOCUMENT_CHARS, RESEARCH_DOCUMENT_CHARS) } : args;
+    emit(statusEvent(toolStatus(tool)));
+    emit({ type: "tool_start", tool });
+    const at = performance.now();
+    run.callsCount++;
+    try {
+      const reply = await worker({ op: "research_tool", sessionId: run.sessionId, tool, arguments: arguments_ });
+      const rows = kernelEvidence(reply.evidence);
+      const incoming = rows.filter((row) => !run.evidence.some((existing) => existing.id === row.id));
+      run.evidence.push(...incoming);
+      if (incoming.length) emit({ type: "evidence", evidence: incoming, sessionId: run.sessionId });
+      if (!reply.ok) {
+        const message = reply.error ?? `${tool} returned no result.`;
+        run.failures.tool_error = (run.failures.tool_error ?? 0) + 1;
         run.limitations.push(message);
         emit({ type: "tool_failed", tool, category: "tool_error", preview: message.slice(0, 160) });
         return `error: ${message}`;
-      } finally { run.workerMs += performance.now() - at; }
-    };
-    const at = performance.now();
-    run.museCalls++;
-    emit({ type: "reasoning_start", model: process.env.OPENCODE_MODEL ?? "stockbot" });
-    let result: KernelReasonResult;
-    try {
-      result = await (deps.reason ?? reason)({
-        prompt, evidence: run.evidence, tools, runTool,
-        ticker: opts?.ticker ?? opts?.currentChartTicker, context: opts?.context,
-        reasoningEffort: opts?.reasoningEffort, signal: run.signal, deadlineAt: run.deadlineAt,
-        usage: run.usage, timings: run.timings,
-        onDelta: (text) => { streamed += text; emit({ type: "answer_delta", text }); },
-      });
-      run.usage = result.usage;
-    } finally { run.museMs += performance.now() - at; }
-    if (!result.prose.trim()) throw new Error("The model returned an empty answer.");
-    const priorIds = new Set(run.evidence.map((row) => row.id));
-    await admitNumbers(run, [result]);
-    const admitted = run.evidence.filter((row) => !priorIds.has(row.id));
-    if (admitted.length) emit({ type: "evidence", evidence: admitted, sessionId: run.sessionId });
-    const ids = new Set(run.evidence.map((row) => row.id));
-    const points = datapointRows(run.evidence);
-    const candidates = result.claims.map((claim) => ({ ...claim, text: alignClaimText(result.prose, claim.text) ?? claim.text }));
-    const rejected: { text: string; reason: string }[] = [];
-    const valid = candidates.filter((claim) => {
-      const defect = inventoryDefect(result.prose, [claim], ids, points);
-      if (defect !== undefined) rejected.push({ text: claim.text, reason: defect });
-      return defect === undefined;
+      }
+      emit({ type: "tool_result", tool, evidenceId: incoming[0]?.id, preview: String(reply.summary ?? "").slice(0, 160) });
+      return JSON.stringify({ summary: reply.summary, evidence: rows });
+    } catch (error) {
+      const message = errorText(error);
+      run.limitations.push(message);
+      emit({ type: "tool_failed", tool, category: "tool_error", preview: message.slice(0, 160) });
+      return `error: ${message}`;
+    } finally { run.workerMs += performance.now() - at; }
+  };
+  return { tools, runTool };
+}
+
+async function reasonResearch(
+  run: KernelRun, prompt: string, deps: RunKernelDeps,
+  tools: KernelReasonInput["tools"], runTool: KernelReasonInput["runTool"],
+  onDelta: NonNullable<KernelReasonInput["onDelta"]>, opts?: KernelRunOptions,
+): Promise<KernelReasonResult> {
+  const emit = run.emit;
+  const at = performance.now();
+  run.museCalls++;
+  emit({ type: "reasoning_start", model: process.env.OPENCODE_MODEL ?? "stockbot" });
+  let result: KernelReasonResult;
+  try {
+    result = await (deps.reason ?? reason)({
+      prompt, evidence: run.evidence, tools, runTool,
+      ticker: opts?.ticker ?? opts?.currentChartTicker, context: opts?.context,
+      reasoningEffort: opts?.reasoningEffort, signal: run.signal, deadlineAt: run.deadlineAt,
+      usage: run.usage, timings: run.timings,
+      onDelta,
     });
-    const supported: FinalClaim[] = [];
-    if (valid.length) {
-      const proof = await worker({ op: "prove_claims", sessionId: run.sessionId, claims: valid.map(toWireClaim), evidence: run.evidence.map(({ id, content, datapoints }) => ({ id, content, datapoints })) });
-      if (proof.error || !Array.isArray(proof.verdicts) || proof.verdicts.length !== valid.length) throw new Error(proof.error ?? "Proof returned invalid verdicts.");
-      proof.verdicts.forEach((raw: unknown, index: number) => {
-        if (!raw || typeof raw !== "object") throw new Error("Proof returned an invalid verdict.");
-        const verdict = raw as Record<string, unknown>;
-        const claim = valid[index]!;
-        if (verdict.error && (typeof verdict.error !== "string" || !verdict.error.startsWith("proof:"))) throw new Error(`Proof unavailable: ${String(verdict.error)}`);
-        if (verdict.claim_type !== claim.claimType || !["yes", "no"].includes(String(verdict.support_answer))) throw new Error("Proof returned an invalid verdict.");
-        if (verdict.support_answer === "yes" && !verdict.error) supported.push(claim);
-        else rejected.push({ text: claim.text, reason: String(verdict.error ?? verdict.evidence_state ?? "not supported") });
-      });
-    }
-    // The operator log names every rejection, so a dropped sentence is diagnosable after the run.
-    for (const r of rejected) console.error(`[ai] claim rejected: ${r.reason.slice(0, 200)} | ${r.text.slice(0, 160)}`);
-    const blocks = result.prose.split(/^(── (?:Bearbot|Bullbot|Stockbot) ──)\s*$/m);
-    let text = dropUncovered(blocks[0] ?? "", supported);
-    for (let index = 1; index < blocks.length; index += 2) {
-      const body = dropUncovered(blocks[index + 1] ?? "", supported);
-      if (body) text += `${text ? "\n\n" : ""}${blocks[index]}\n${body}`;
-    }
-    const kept = supported.filter((claim) => text.includes(claim.text));
-    if (!text || !kept.length) { endUndetermined(run); return; }
-    const points_ = run.evidence.flatMap((row) => row.datapoints ?? []);
-    const shown = readableNumbers(text, points_);
-    const claims = kept.map((claim) => ({ ...claim, text: readableNumbers(claim.text, points_) }));
-    emit({ type: "claims", claims });
-    const partial = kept.length !== candidates.length || text.trim() !== result.prose.trim() || run.limitations.length > 0;
-    if (partial) run.limitations.push("The proof check removed unsupported text.");
-    // The snapshot also applies numeric formatting without appending a second answer.
-    if (partial || streamed !== shown) emitPartial(run, shown, claims);
-    run.emit({ type: "done", metrics: metricsOf(run), status: partial ? "completed_with_limitations" : "completed", ...(partial ? { limitations: [...new Set(run.limitations)] } : {}) });
-  } catch (error) { endFailed(run, errorText(error)); }
+    run.usage = result.usage;
+  } finally { run.museMs += performance.now() - at; }
+  if (!result.prose.trim()) throw new Error("The model returned an empty answer.");
+  return result;
+}
+
+async function proveResearchClaims(run: KernelRun, worker: ResearchWorker, result: KernelReasonResult) {
+  const emit = run.emit;
+  const priorIds = new Set(run.evidence.map((row) => row.id));
+  await admitNumbers(run, [result]);
+  const admitted = run.evidence.filter((row) => !priorIds.has(row.id));
+  if (admitted.length) emit({ type: "evidence", evidence: admitted, sessionId: run.sessionId });
+  const ids = new Set(run.evidence.map((row) => row.id));
+  const points = datapointRows(run.evidence);
+  const candidates = result.claims.map((claim) => ({ ...claim, text: alignClaimText(result.prose, claim.text) ?? claim.text }));
+  const rejected: { text: string; reason: string }[] = [];
+  const valid = candidates.filter((claim) => {
+    const defect = inventoryDefect(result.prose, [claim], ids, points);
+    if (defect !== undefined) rejected.push({ text: claim.text, reason: defect });
+    return defect === undefined;
+  });
+  const supported: FinalClaim[] = [];
+  if (valid.length) {
+    const proof = await worker({ op: "prove_claims", sessionId: run.sessionId, claims: valid.map(toWireClaim), evidence: run.evidence.map(({ id, content, datapoints }) => ({ id, content, datapoints })) });
+    if (proof.error || !Array.isArray(proof.verdicts) || proof.verdicts.length !== valid.length) throw new Error(proof.error ?? "Proof returned invalid verdicts.");
+    proof.verdicts.forEach((raw: unknown, index: number) => {
+      if (!raw || typeof raw !== "object") throw new Error("Proof returned an invalid verdict.");
+      const verdict = raw as Record<string, unknown>;
+      const claim = valid[index]!;
+      if (verdict.error && (typeof verdict.error !== "string" || !verdict.error.startsWith("proof:"))) throw new Error(`Proof unavailable: ${String(verdict.error)}`);
+      if (verdict.claim_type !== claim.claimType || !["yes", "no"].includes(String(verdict.support_answer))) throw new Error("Proof returned an invalid verdict.");
+      if (verdict.support_answer === "yes" && !verdict.error) supported.push(claim);
+      else rejected.push({ text: claim.text, reason: String(verdict.error ?? verdict.evidence_state ?? "not supported") });
+    });
+  }
+  // The operator log names every rejection, so a dropped sentence is diagnosable after the run.
+  for (const r of rejected) console.error(`[ai] claim rejected: ${r.reason.slice(0, 200)} | ${r.text.slice(0, 160)}`);
+  return { candidates, supported };
+}
+
+function publishResearch(run: KernelRun, result: KernelReasonResult, candidates: FinalClaim[], supported: FinalClaim[], streamed: string): void {
+  const emit = run.emit;
+  const blocks = result.prose.split(/^(── (?:Bearbot|Bullbot|Stockbot) ──)\s*$/m);
+  let text = dropUncovered(blocks[0] ?? "", supported);
+  for (let index = 1; index < blocks.length; index += 2) {
+    const body = dropUncovered(blocks[index + 1] ?? "", supported);
+    if (body) text += `${text ? "\n\n" : ""}${blocks[index]}\n${body}`;
+  }
+  const kept = supported.filter((claim) => text.includes(claim.text));
+  if (!text || !kept.length) { endUndetermined(run); return; }
+  const points_ = run.evidence.flatMap((row) => row.datapoints ?? []);
+  const shown = readableNumbers(text, points_);
+  const claims = kept.map((claim) => ({ ...claim, text: readableNumbers(claim.text, points_) }));
+  emit({ type: "claims", claims });
+  const partial = kept.length !== candidates.length || text.trim() !== result.prose.trim() || run.limitations.length > 0;
+  if (partial) run.limitations.push("The proof check removed unsupported text.");
+  // The snapshot also applies numeric formatting without appending a second answer.
+  if (partial || streamed !== shown) emitPartial(run, shown, claims);
+  run.emit({ type: "done", metrics: metricsOf(run), status: partial ? "completed_with_limitations" : "completed", ...(partial ? { limitations: [...new Set(run.limitations)] } : {}) });
 }

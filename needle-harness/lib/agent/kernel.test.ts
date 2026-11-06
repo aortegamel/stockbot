@@ -527,6 +527,8 @@ async function research(options: {
   prose?: string;
   claims?: FinalClaim[];
   evidence?: Evidence;
+  seedEvidence?: Evidence[];
+  admission?: Record<string, unknown> | Error;
   proof?: unknown;
   toolError?: boolean;
   reasonError?: boolean;
@@ -540,6 +542,13 @@ async function research(options: {
     child.reply = (id) => {
       const body = JSON.parse(child.written.at(-1)!);
       bodies.push(body);
+      if (body.op === "admit_datapoint") {
+        if (options.admission instanceof Error) {
+          queueMicrotask(() => child.emitExit());
+          return "";
+        }
+        return JSON.stringify({ id, ...(options.admission ?? { error: "Admission unavailable." }) }) + "\n";
+      }
       const reply = body.op === "open_research" ? { sessionId: "rs:1", tools: ["search_web", "get_sec_document"] }
         : body.op === "research_tool" ? { ok: !options.toolError, summary: "[ev:1] Demand held. Costs rose.", evidence: [options.evidence ?? source], ...(options.toolError ? { error: "Source unavailable." } : {}) }
           : body.op === "prove_claims" ? options.proof ?? { verdicts: body.claims.map((claim: Record<string, unknown>) => ({ claim_type: claim.claim_type, support_answer: "yes", support: 1 })) }
@@ -550,7 +559,7 @@ async function research(options: {
     return child;
   };
   await runKernelAgent("Explain NVDA", (event) => events.push(event), {
-    ticker: "NVDA", asOf: options.asOf, deps: {
+    ticker: "NVDA", asOf: options.asOf, seedEvidence: options.seedEvidence, deps: {
       spawnFn, describeTools: async () => {
         if (options.schemaFailure === "unavailable") throw new Error("Schema bridge unavailable.");
         if (options.schemaFailure === "missing") return [{ name: "get_sec_document" }];
@@ -584,6 +593,10 @@ describe("native research and deterministic proof", () => {
     expect(calls).toHaveLength(1);
     expect(events.find((event) => event.type === "evidence")).toMatchObject({ evidence: [source], sessionId: "rs:1" });
     expect(events.at(-1)).toMatchObject({ status: "completed", metrics: { needle: { calls: 0, totalMs: 0, escalations: 0 }, tools: { calls: 1 }, muse: { calls: 1, providerCalls: 2 } } });
+    expect(events.map((event) => event.type)).toEqual([
+      "agent_start", "status", "reasoning_start", "status", "tool_start", "evidence", "tool_result",
+      "answer_delta", "claims", "done",
+    ]);
     expect(bodies[2]).toMatchObject({ claims: [{ text: "Demand held.", claim_type: "observed_fact", evidence_ids: ["ev:1"] }, { text: "Costs rose.", claim_type: "observed_fact", evidence_ids: ["ev:1"] }] });
   });
   test("offered schemas exactly follow the worker's loop-safe names and order", async () => {
@@ -637,6 +650,73 @@ describe("native research and deterministic proof", () => {
     const { bodies } = await research({ evidence: filing, prose: claim.text, claims: [claim] });
     const proof = bodies.find((body) => body.op === "prove_claims");
     expect(proof?.claims).toMatchObject([{ datapoint_ids: ["dp:filed"] }]);
+  });
+  test("a failed declared number stays unproven", async () => {
+    for (const admission of [{ error: "Admission unavailable." }, {}, { evidence_id: "", datapoint: {} }, new Error("Admission transport failed.")]) {
+      const claim: FinalClaim = {
+        text: "Revenue grew 12%.", claimType: "calculation", evidenceIds: ["ev:1"],
+        numbers: [{ evidence_id: "ev:1", metric: "growth", value: "12%", entity: "NVDA", period: "Q3" }],
+      };
+      const { bodies, events } = await research({ prose: claim.text, claims: [claim], admission });
+      expect(bodies.map((body) => body.op)).toEqual(["open_research", "research_tool", "admit_datapoint"]);
+      expect(claim.datapointIds).toBeUndefined();
+      expect(events.findLast((event) => event.type === "answer_partial")).toMatchObject({ claims: [] });
+      expect(events.at(-1)).toMatchObject({ status: "completed_with_limitations" });
+    }
+  });
+  test("an admitted declaration adds its datapoint and evidence before proof", async () => {
+    const point: Datapoint = { id: "dp:growth", metric: "growth", value: "12%", entity: "NVDA", period: "Q3", statement: "Revenue growth 12%." };
+    for (const existing of [false, true]) {
+      const claim: FinalClaim = {
+        text: "Revenue growth 12%.", claimType: "calculation", evidenceIds: existing ? ["ev:1", "ev:admitted"] : ["ev:1"],
+        datapointIds: existing ? [point.id] : undefined,
+        numbers: [{ evidence_id: "ev:1", metric: "growth", value: "12%", entity: "NVDA", period: "Q3", unit: "%", formula: "growth@1", inputs: ["dp:previous"] }],
+      };
+      const { bodies, events } = await research({
+        prose: claim.text, claims: [claim], admission: { evidence_id: "ev:admitted", datapoint: point },
+        seedEvidence: existing ? [{ ...source, id: "ev:admitted", datapoints: [point] }] : [],
+      });
+      expect(bodies.map((body) => body.op)).toEqual(["open_research", "research_tool", "admit_datapoint", "prove_claims"]);
+      expect(bodies[2]).toMatchObject({ evidenceId: "ev:1", unit: "%", formula: "growth@1", inputs: ["dp:previous"] });
+      expect(bodies[3]?.claims).toMatchObject([{ evidence_ids: ["ev:1", "ev:admitted"], datapoint_ids: [point.id] }]);
+      expect(events.filter((event) => event.type === "evidence").flatMap((event) => event.evidence).filter((row) => row.id === "ev:admitted")).toHaveLength(1);
+      expect(events.at(-1)).toMatchObject({ status: "completed" });
+    }
+  });
+  test("a declaration without its cited source never reaches admission", async () => {
+    for (const evidence_id of ["ev:missing", "ev:uncited"]) {
+      const claim: FinalClaim = {
+        text: "Revenue growth 12%.", claimType: "calculation", evidenceIds: ["ev:1"],
+        numbers: [{ evidence_id, metric: "growth", value: "12%", entity: "NVDA", period: "Q3" }],
+      };
+      const { bodies, events } = await research({ prose: claim.text, claims: [claim], seedEvidence: [{ ...source, id: "ev:uncited" }] });
+      expect(bodies.map((body) => body.op)).toEqual(["open_research", "research_tool"]);
+      expect(events.at(-1)).toMatchObject({ status: "completed_with_limitations" });
+    }
+  });
+  test("an input datapoint whose value the sentence never states leaves the claim", async () => {
+    const growth: Datapoint = { id: "dp:growth", metric: "growth", value: "12%", entity: "NVDA", period: "Q3", statement: "Revenue growth 12%.", inputs: ["dp:previous"] };
+    const previous: Datapoint = { ...growth, id: "dp:previous", metric: "previous", value: "100", inputs: [] };
+    const claim: FinalClaim = { text: growth.statement, claimType: "calculation", evidenceIds: ["ev:1"], datapointIds: [growth.id, previous.id, "dp:missing"] };
+    const { bodies } = await research({ evidence: { ...source, datapoints: [growth, previous] }, prose: claim.text, claims: [claim] });
+    expect(bodies.find((body) => body.op === "prove_claims")?.claims).toMatchObject([{ datapoint_ids: [growth.id] }]);
+  });
+  test("two equally named datapoints with the same stated value stay unbound", async () => {
+    const point: Datapoint = { id: "dp:first", metric: "growth", value: "12%", entity: "NVDA", period: "Q3", statement: "Revenue growth 12%." };
+    for (const datapointIds of [undefined, ["dp:first", "dp:second"]]) {
+      const claim: FinalClaim = { text: point.statement, claimType: "calculation", evidenceIds: ["ev:1"], datapointIds };
+      const { bodies, events } = await research({ evidence: { ...source, datapoints: [point, { ...point, id: "dp:second" }] }, prose: claim.text, claims: [claim] });
+      expect(bodies.some((body) => body.op === "prove_claims")).toBe(false);
+      expect(events.findLast((event) => event.type === "answer_partial")).toMatchObject({ claims: [] });
+    }
+  });
+  test("a bound datapoint adds its row to evidence_ids", async () => {
+    const point: Datapoint = { id: "dp:growth", metric: "growth", value: "12%", entity: "NVDA", period: "Q3", statement: "Revenue growth 12%." };
+    for (const datapointIds of [undefined, [point.id]]) {
+      const claim: FinalClaim = { text: point.statement, claimType: "calculation", evidenceIds: ["ev:1"], datapointIds };
+      const { bodies } = await research({ seedEvidence: [{ ...source, id: "ev:point", datapoints: [point] }], prose: claim.text, claims: [claim] });
+      expect(bodies.find((body) => body.op === "prove_claims")?.claims).toMatchObject([{ evidence_ids: ["ev:1", "ev:point"], datapoint_ids: [point.id] }]);
+    }
   });
   test("proof rejection removes its sentence and replaces the streamed draft", async () => {
     const { events } = await research({

@@ -269,7 +269,7 @@ export async function POST(req: Request): Promise<Response> {
           return null;
         }
       };
-      const runResearch = async (): Promise<void> => {
+      const selectResearchEffort = async (): Promise<{ reasoningEffort: string | undefined } | undefined> => {
         let reasoningEffort: string | undefined;
         const configuredEffort = process.env.REASONING_EFFORT?.trim();
         const maxOutputTokens = process.env.MUSE_MAX_OUTPUT_TOKENS?.trim();
@@ -305,6 +305,9 @@ export async function POST(req: Request): Promise<Response> {
             timings.routeMs = performance.now() - startedAt;
           }
         }
+        return { reasoningEffort };
+      };
+      const answerOutsideResearchScope = async (): Promise<boolean> => {
         // Conversational scope gate: an out-of-scope request gets the runtime's fixed answer and
         // runs no tool. A gate outage keeps research.
         try {
@@ -316,11 +319,17 @@ export async function POST(req: Request): Promise<Response> {
             send(statusEvent("Checking the request scope"));
             send({ type: "answer_delta", text: outOfScope });
             send({ type: "done", metrics: zeroMetrics(requestAt, 0), status: "completed_with_limitations", limitations: ["Request outside the scope of stock research."] });
-            return;
+            return true;
           }
         } catch (err) {
           console.warn(`[web] [agent-api] research scope kept: ${err instanceof Error ? err.message : String(err)}`);
         }
+        return false;
+      };
+      const runResearch = async (): Promise<void> => {
+        const selected = await selectResearchEffort();
+        if (!selected || await answerOutsideResearchScope()) return;
+        const { reasoningEffort } = selected;
         await runKernelAgent(prompt, send, { signal: req.signal, deadlineAt, ...tickerField, ...(asOf !== undefined ? { asOf } : {}), ...(currentChartTicker ? { currentChartTicker } : {}), ...(watchlist ? { watchlist } : {}), ...contextField, ...(reasoningEffort ? { reasoningEffort } : {}) });
       };
       // A UI action is a receipt, never evidence. Only a validated canonical receipt emits its update event.

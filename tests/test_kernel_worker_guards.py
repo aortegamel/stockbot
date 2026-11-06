@@ -1978,3 +1978,79 @@ def test_open_research_advertises_exactly_the_tools_research_tool_accepts(
         assert name not in advertised
         denied = asyncio.run(tool_runner.run_tool(tool_runner.Kernel(), "rs:none", name, {}))
         assert denied["ok"] is False and "not a research tool" in str(denied["error"])
+
+
+@pytest.mark.parametrize(
+    "change,error",
+    [
+        ({"evidenceId": "missing"}, "missing"),
+        ({"value": "99.9"}, "99.9"),
+        ({"period": "FY2024"}, "period"),
+        ({"sessionId": None}, "sessionId and evidenceId required"),
+        ({"sessionId": "missing"}, "another session"),
+    ],
+)
+def test_admit_datapoint_rejection_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, change: dict[str, JSONValue], error: str
+) -> None:
+    import tests.research_source_seam as seam
+
+    sid = seam.proven_session(monkeypatch, tmp_path, {"ev-prose": "NVDA FY2025 Revenue was $46.7 billion."})
+    request: dict[str, JSONValue] = {
+        "id": "rejected",
+        "op": "admit_datapoint",
+        "sessionId": sid,
+        "evidenceId": "ev-prose",
+        "metric": "Revenue",
+        "value": "46.7",
+        "entity": "NVDA",
+        "period": "FY2025",
+        "unit": "billion",
+        **change,
+    }
+    result = kw._direct_op(request, None)
+    assert error in str(result.get("error")), result
+    assert "datapoint" not in result
+
+
+@pytest.mark.parametrize("kind", ["news", "filing", "insider", "alert"])
+def test_request_context_preserves_valid_feed_fields(kind: str) -> None:
+    context: dict[str, JSONValue] = {
+        "kind": kind,
+        "title": "A headline",
+        "source": "SEC",
+        "at": "",
+        "url": "https://example.com/news",
+        "sym": "NVDA",
+    }
+    assert kw._request_context({"context": context}) == context
+    minimal: dict[str, JSONValue] = {"kind": kind, "title": "A headline", "source": "SEC", "at": "now"}
+    assert kw._request_context({"context": minimal}) == minimal
+    assert kw._request_context({}) is None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"extra": True},
+        {"kind": "other"},
+        {"title": ""},
+        {"title": "a" * 301},
+        {"source": None},
+        {"url": "file:///tmp/private"},
+        {"url": "a" * 2001},
+        {"at": None},
+        {"at": "a" * 41},
+        {"sym": ""},
+    ],
+)
+def test_request_context_rejects_malformed_feed_fields(change: dict[str, JSONValue]) -> None:
+    context: dict[str, JSONValue] = {"kind": "news", "title": "Headline", "source": "SEC", "at": "now", **change}
+    with pytest.raises(ValueError):
+        kw._request_context({"context": context})
+
+
+@pytest.mark.parametrize("context", [[], "news", 42])
+def test_request_context_rejects_nonobjects(context: JSONValue) -> None:
+    with pytest.raises(ValueError, match="must be a feed item"):
+        kw._request_context({"context": context})
