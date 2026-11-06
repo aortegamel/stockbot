@@ -18,6 +18,17 @@ def test_sec_tool_maps_sec() -> None:
     assert source_domain_for_tool("get_sec_document") == "SEC"
 
 
+def test_every_alt_and_macro_tool_maps_its_lane() -> None:
+    """Alternative-data and macro tools own their lane, so their results persist and admit."""
+    from app.research.agents.source_agent import ALT_TOOLS, MACRO_TOOLS
+
+    assert ALT_TOOLS and MACRO_TOOLS
+    for tool in ALT_TOOLS:
+        assert source_domain_for_tool(tool) == "ALT"
+    for tool in MACRO_TOOLS:
+        assert source_domain_for_tool(tool) == "MACRO"
+
+
 def test_unknown_maps_other_not_sec() -> None:
     assert source_domain_for_tool("not_a_tool") == "OTHER"
     assert source_domain_for_tool("draft_thesis") == "OTHER"

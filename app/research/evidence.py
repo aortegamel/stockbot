@@ -28,6 +28,7 @@ __all__ = [
     "EvidenceRecord",
     "EvidenceRejectedError",
     "ProofVerdict",
+    "alt_record_ref",
     "assumption_proof",
     "calculation_datapoint",
     "calculation_proof",
@@ -44,6 +45,7 @@ __all__ = [
     "evidence_to_dict",
     "finra_record_ref",
     "ingest_evidence",
+    "macro_record_ref",
     "normalize_accession",
     "observation_proof",
     "search_run_ref",
@@ -90,16 +92,28 @@ Missing or ambiguous identity is ``unverified``; a value, hash, or byte
 disagreement is ``conflicted``. Only ``verified`` may publish.
 """
 
-PROVENANCE_KINDS = ("sec_source", "sec_record", "finra_record", "web_source", "search_run", "none")
+PROVENANCE_KINDS = (
+    "sec_source",
+    "sec_record",
+    "finra_record",
+    "web_source",
+    "alt_record",
+    "macro_record",
+    "search_run",
+    "none",
+)
 """Closed provenance vocabulary: a reloaded SEC passage, a persisted SEC tool
-result, a persisted FINRA tool result, a persisted web-search result, the
-executed search, or nothing recorded."""
+result, a persisted FINRA tool result, a persisted web-search result, a
+persisted alternative-data tool result, a persisted macro-statistics tool
+result, the executed search, or nothing recorded."""
 
 PROVENANCE_DOMAINS: dict[str, str] = {
     "sec_source": "SEC",
     "sec_record": "SEC",
     "finra_record": "FINRA",
     "web_source": "WEB",
+    "alt_record": "ALT",
+    "macro_record": "MACRO",
     "search_run": "WEB",
     "none": "SOURCE",
 }
@@ -110,6 +124,8 @@ PROVENANCE_INTEGRITY: dict[str, str] = {
     "sec_record": "CANONICAL_STRUCTURED",
     "finra_record": "CANONICAL_STRUCTURED",
     "web_source": "EXTERNAL_SOURCE",
+    "alt_record": "EXTERNAL_SOURCE",
+    "macro_record": "EXTERNAL_SOURCE",
     "search_run": "EXTERNAL_SOURCE",
     "none": "EXTERNAL_SOURCE",
 }
@@ -117,7 +133,7 @@ PROVENANCE_INTEGRITY: dict[str, str] = {
 
 
 def evidence_domain(provenance: Mapping[str, object] | None) -> str:
-    """Source domain for one provenance mapping (SEC|FINRA|WEB|SOURCE; unknown kinds stay SOURCE)."""
+    """Source domain for one provenance mapping (SEC|FINRA|WEB|ALT|MACRO|SOURCE; unknown kinds stay SOURCE)."""
     kind = provenance.get("kind") if isinstance(provenance, Mapping) else None
     return PROVENANCE_DOMAINS.get(kind, "SOURCE") if isinstance(kind, str) else "SOURCE"
 
@@ -221,8 +237,10 @@ def sec_source_ref(
     }
 
 
-def sec_record_ref(
+def _tool_record_ref(
     *,
+    kind: str,
+    label: str,
     tool_name: object,
     record_identity: object,
     dataset: object = None,
@@ -230,12 +248,12 @@ def sec_record_ref(
     known_at: object = None,
     tool_result_id: object = None,
 ) -> dict[str, JSONValue]:
-    """SecRecordRef: one persisted SEC structured-tool result an observed fact is read off."""
+    """One persisted structured-tool result an observed fact is read off (shared record-ref shape)."""
     tool = tool_name.strip() if isinstance(tool_name, str) else ""
     identity = record_identity.strip() if isinstance(record_identity, str) else ""
     if not tool or not identity:
-        raise ValueError("sec_record_ref: tool_name and record_identity must be non-empty strings")
-    ref: dict[str, JSONValue] = {"kind": "sec_record", "tool_name": tool, "record_identity": identity}
+        raise ValueError(f"{label}: tool_name and record_identity must be non-empty strings")
+    ref: dict[str, JSONValue] = {"kind": kind, "tool_name": tool, "record_identity": identity}
     for key, value in (
         ("dataset", dataset),
         ("source_uri", source_uri),
@@ -246,6 +264,28 @@ def sec_record_ref(
         if text is not None:
             ref[key] = text
     return ref
+
+
+def sec_record_ref(
+    *,
+    tool_name: object,
+    record_identity: object,
+    dataset: object = None,
+    source_uri: object = None,
+    known_at: object = None,
+    tool_result_id: object = None,
+) -> dict[str, JSONValue]:
+    """SecRecordRef: one persisted SEC structured-tool result an observed fact is read off."""
+    return _tool_record_ref(
+        kind="sec_record",
+        label="sec_record_ref",
+        tool_name=tool_name,
+        record_identity=record_identity,
+        dataset=dataset,
+        source_uri=source_uri,
+        known_at=known_at,
+        tool_result_id=tool_result_id,
+    )
 
 
 def _ref_texts(document_name: object, passage: object) -> tuple[str, str]:
@@ -297,21 +337,70 @@ def finra_record_ref(
     persisted result and stores its bytes; a model-authored row never qualifies.
     ``tool_result_id`` is the persisted kernel tool result this ref replays (None for legacy rows).
     """
-    tool = tool_name.strip() if isinstance(tool_name, str) else ""
-    identity = record_identity.strip() if isinstance(record_identity, str) else ""
-    if not tool or not identity:
-        raise ValueError("finra_record_ref: tool_name and record_identity must be non-empty strings")
-    ref: dict[str, JSONValue] = {"kind": "finra_record", "tool_name": tool, "record_identity": identity}
-    for key, value in (
-        ("dataset", dataset),
-        ("source_uri", source_uri),
-        ("known_at", known_at),
-        ("tool_result_id", tool_result_id),
-    ):
-        text = _provenance_opt({key: value}, key)
-        if text is not None:
-            ref[key] = text
-    return ref
+    return _tool_record_ref(
+        kind="finra_record",
+        label="finra_record_ref",
+        tool_name=tool_name,
+        record_identity=record_identity,
+        dataset=dataset,
+        source_uri=source_uri,
+        known_at=known_at,
+        tool_result_id=tool_result_id,
+    )
+
+
+def alt_record_ref(
+    *,
+    tool_name: object,
+    record_identity: object,
+    dataset: object = None,
+    source_uri: object = None,
+    known_at: object = None,
+    tool_result_id: object = None,
+) -> dict[str, JSONValue]:
+    """AltRecordRef: one persisted alternative-data tool result an observed fact is read off.
+
+    ``record_identity`` is the candidate row it names and ``known_at`` that row's
+    own availability stamp. A row that states no stamp keeps ``known_at`` absent,
+    so a bounded session fails PIT_UNVERIFIED instead of inventing a date.
+    """
+    return _tool_record_ref(
+        kind="alt_record",
+        label="alt_record_ref",
+        tool_name=tool_name,
+        record_identity=record_identity,
+        dataset=dataset,
+        source_uri=source_uri,
+        known_at=known_at,
+        tool_result_id=tool_result_id,
+    )
+
+
+def macro_record_ref(
+    *,
+    tool_name: object,
+    record_identity: object,
+    dataset: object = None,
+    source_uri: object = None,
+    known_at: object = None,
+    tool_result_id: object = None,
+) -> dict[str, JSONValue]:
+    """MacroRecordRef: one persisted macro-statistics tool result an observed fact is read off.
+
+    ``record_identity`` is the cited series entry and ``known_at`` the stamp that
+    entry states. An entry without a stamp keeps ``known_at`` absent, so a
+    bounded session fails PIT_UNVERIFIED instead of borrowing the retrieval time.
+    """
+    return _tool_record_ref(
+        kind="macro_record",
+        label="macro_record_ref",
+        tool_name=tool_name,
+        record_identity=record_identity,
+        dataset=dataset,
+        source_uri=source_uri,
+        known_at=known_at,
+        tool_result_id=tool_result_id,
+    )
 
 
 def web_source_ref(
@@ -409,6 +498,16 @@ def validate_provenance(value: object, where: str = "<evidence>: 'provenance'") 
         )
     if kind == "sec_record":
         return sec_record_ref(
+            tool_name=_provenance_str(value, "tool_name", where),
+            record_identity=_provenance_str(value, "record_identity", where),
+            dataset=value.get("dataset"),
+            source_uri=value.get("source_uri"),
+            known_at=value.get("known_at"),
+            tool_result_id=value.get("tool_result_id"),
+        )
+    if kind in ("alt_record", "macro_record"):
+        builder = alt_record_ref if kind == "alt_record" else macro_record_ref
+        return builder(
             tool_name=_provenance_str(value, "tool_name", where),
             record_identity=_provenance_str(value, "record_identity", where),
             dataset=value.get("dataset"),
@@ -540,6 +639,9 @@ _RECORD_LISTS = (
     "documents",
     "events",
     "line_items",
+    "observations",
+    "signals",
+    "series",
 )
 """Row lists of a persisted structured tool result (the same keys the replay gate cites)."""
 
@@ -559,7 +661,16 @@ _ENTITY_KEYS = (
     "cik",
     "company",
     "subject",
+    "filer_name",
+    "subject_name",
+    "company_name",
 )
+"""Entity fields a row states; the filing-row names are appended, so an existing identity key keeps its spelling."""
+_FILING_DATE_KEYS = ("filed_at", "report_period")
+"""Filing dates a row states; read after the fiscal period keys, so a stated fiscal period still wins.
+
+A filing row states when it was filed, not a fiscal period, so its filing date stands in for the period.
+"""
 _PERIOD_KEYS = (
     "period",
     "fiscal_period",
@@ -576,6 +687,7 @@ _PERIOD_KEYS = (
     "report_date",
     "period_of_report",
 )
+"""Fiscal period fields a row states; a row that states none reads a filing date instead (``_FILING_DATE_KEYS``)."""
 _UNIT_KEYS = ("unit", "units", "uom", "currency")
 _CONCEPT_KEYS = ("concept", "tag")
 _VALUE_KEYS = ("value", "val")
@@ -904,7 +1016,7 @@ def _record_datapoint(
         "period": _record_label(
             row,
             payload,
-            _PERIOD_KEYS,
+            (*_PERIOD_KEYS, *_FILING_DATE_KEYS),
             claimed["period"],
             "period",
             lambda source, _values, want: (
@@ -1109,6 +1221,65 @@ def _row_metric(line: str, at: int, claimed: Mapping[str, str | None]) -> tuple[
     if _norm_key(_unstated(header, identity)) != _norm_key(metric):
         raise ValueError(f"the source statement contains an unrelated metric or value: row {header.strip()!r}")
     return found.group(0), header, (column, len(numeric))
+
+
+def _passage_row_candidates(passage: str) -> Iterator[dict[str, str]]:
+    """Derive first-column declarations. The admission guard still proves each declaration."""
+    before = ""
+    entity = ""
+    unit = ""
+    period = ""
+    for line in passage.split("\n"):
+        if _ROW_CELL not in line:
+            registrant = re.fullmatch(
+                r"(.+?\b(?:Corporation|Inc\.?|Corp\.?|Company|Ltd\.?|Limited|PLC))"
+                r"(?:\s+and\s+Subsidiaries)?",
+                line.strip(),
+                re.IGNORECASE,
+            )
+            if registrant:
+                entity = registrant.group(1)
+            scale = _SCALE_HEADING.search(line)
+            if scale:
+                unit = scale.group(0).split()[-1]
+            elif re.search(r"\bper share\b", line, re.IGNORECASE):
+                unit = "per share"
+        else:
+            cells = line.split(_ROW_CELL)
+            if re.fullmatch(r"[A-Za-z]+\s+\d{1,2},\s*\d{4}", cells[0].strip()):
+                groups: list[str] = next(
+                    (row.split(_ROW_CELL) for row in reversed(before.split("\n")) if _ROW_CELL in row), []
+                )
+                period = f"{groups[0].strip()} {cells[0].strip()}" if groups else ""
+            numeric = next(
+                (i for i, cell in enumerate(cells) if re.search(r"[0-9]", cell) and not re.search(r"[A-Za-z]", cell)),
+                None,
+            )
+            if numeric is not None and entity and period and unit:
+                metric = " ".join(cell.strip() for cell in cells[:numeric] if cell.strip() not in ("", "$"))
+                if metric:
+                    claimed = {
+                        "metric": metric,
+                        "value": cells[numeric],
+                        "entity": entity,
+                        "period": period,
+                        "unit": unit,
+                    }
+                    try:
+                        at = sum(len(cell) + len(_ROW_CELL) for cell in cells[:numeric])
+                        _, scope, column = _row_metric(line, at, claimed)
+                        aligned = _grouped_period(before, period, column)
+                        if aligned is not None:
+                            claimed["period"] = aligned
+                            for label in ("entity", "period", "unit"):
+                                spelling = _context_label(before, len(before), scope, claimed, label, column)
+                                if spelling is None:
+                                    raise ValueError(f"datapoint {label} is required")
+                                claimed[label] = spelling
+                            yield claimed
+                    except ValueError:
+                        pass  # Incomplete or misaligned labels cannot form a declaration.
+        before += line + "\n"
 
 
 def _prose_metric(

@@ -111,14 +111,43 @@ def is_web_tool(name: str) -> bool:
     return name in WEB_TOOLS
 
 
+# Alternative-data desk allowlist: Google public-data discovery/trend reads.
+# A candidate is a discovery pointer with its own row timestamps, never a search-volume claim.
+ALT_TOOLS: frozenset[str] = frozenset(
+    {
+        "find_alternative_signals",
+        "get_trend_evidence",
+        "investigate_social_arbitrage_candidate",
+    }
+)
+
+
+def is_alt_tool(name: str) -> bool:
+    """Infra guard: the alternative-data trend/signal tools only."""
+    return name in ALT_TOOLS
+
+
+# Macro desk allowlist: Google public-data statistics (geography x variable series).
+MACRO_TOOLS: frozenset[str] = frozenset({"get_macro_context"})
+
+
+def is_macro_tool(name: str) -> bool:
+    """Infra guard: the macro statistics tool only."""
+    return name in MACRO_TOOLS
+
+
 def source_domain_for_tool(name: str) -> str:
-    """Job source_domain owning one canonical tool: WEB, FINRA, SEC, else OTHER."""
+    """Job source_domain owning one canonical tool: WEB, FINRA, SEC, ALT, MACRO, else OTHER."""
     if is_web_tool(name):
         return "WEB"
     if is_finra_tool(name):
         return "FINRA"
     if is_sec_tool(name):
         return "SEC"
+    if is_alt_tool(name):
+        return "ALT"
+    if is_macro_tool(name):
+        return "MACRO"
     return "OTHER"
 
 
