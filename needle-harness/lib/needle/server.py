@@ -559,6 +559,27 @@ def _generated_decision(tool, r, limit):
     return decision
 
 
+def _complete_bound(tool, schema, facts, text):
+    """One completion on a fresh agent bound to the selected tool."""
+    bound = _bound_agent(tool, schema, facts)
+    try:
+        return bound.complete(text, max_new_tokens=512)
+    finally:
+        bound.close()
+
+
+def _subject_request(tool, context):
+    """Tool intent plus the grounded ticker, e.g. 'get material events for AAPL'; None without a ticker."""
+    if not isinstance(context, dict):
+        return None
+    grounded = context.get("grounded_arguments")
+    ticker = grounded.get("ticker") if isinstance(grounded, dict) else None
+    ticker = ticker if isinstance(ticker, str) and ticker.strip() else context.get("ticker")
+    if not isinstance(ticker, str) or not ticker.strip():
+        return None
+    return f"{tool.replace('_', ' ')} for {ticker.strip()}"
+
+
 def _handle_generate(req):
     """Generate arguments for exactly one JEV-selected tool.
 
@@ -582,12 +603,14 @@ def _handle_generate(req):
     # Conflicting counts fail here, before the engine runs.
     limit = _requested_limit(objective, node, context, schema)
     text, expected = _generation_text(text, objective, context, schema, limit)
-    bound = _bound_agent(tool, schema, _arguments_facts(objective, node, context, schema, limit))
+    facts = _arguments_facts(objective, node, context, schema, limit)
     _init_ms = (_t.perf_counter() - _gen_t0) * 1000.0
-    try:
-        r = bound.complete(text, max_new_tokens=512)
-    finally:
-        bound.close()
+    r = _complete_bound(tool, schema, facts, text)
+    subject = _subject_request(tool, context)
+    if "tool call truncated" in str(r.get("error") or "") and subject is not None:
+        # A two-part request makes Needle emit a second call until the token budget runs out;
+        # one retry with only the tool intent and grounded subject removes that trigger.
+        r = _complete_bound(tool, schema, facts, _generation_text(subject, objective, context, schema, limit)[0])
     _gen_ms = (_t.perf_counter() - _gen_t0) * 1000.0
     sys.stderr.write(f"needle timing tool={tool} init_ms={_init_ms:.1f} generate_ms={_gen_ms:.1f}\n")
     sys.stderr.flush()

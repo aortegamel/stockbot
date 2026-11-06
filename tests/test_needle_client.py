@@ -788,6 +788,101 @@ def test_handle_withheld_same_name_returns_tool(monkeypatch: pytest.MonkeyPatch,
     assert out["arguments"] == {"q": "x"}
 
 
+_TRUNCATED: dict[str, object] = {
+    "type": "call",
+    "success": False,
+    "error": "tool call truncated: token budget exhausted",
+    "function_calls": [],
+    "suppressed_calls": [],
+}
+
+
+def _events_request(context: dict[str, object] | None) -> str:
+    return json.dumps(
+        {
+            "id": "t1",
+            "action": "arguments.generate",
+            "tool": "get_material_events",
+            "schema": {"type": "object", "properties": {"ticker": {"type": "string"}}},
+            "node": {"question": "What material events hit Apple recently, and what is the web saying about them?"},
+            "context": context,
+        }
+    )
+
+
+def test_truncated_generation_retries_once_with_the_grounded_subject(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A two-part question that exhausts the token budget retries once as tool intent plus ticker."""
+    srv = _load_server(monkeypatch, tmp_path)
+    prompts: list[str] = []
+    replies: list[dict[str, object]] = [
+        _TRUNCATED,
+        {
+            "type": "call",
+            "success": True,
+            "error": None,
+            "function_calls": [{"name": "get_material_events", "arguments": {"ticker": "AAPL"}}],
+            "suppressed_calls": [],
+        },
+    ]
+
+    class _B:
+        def complete(self, prompt: str, max_new_tokens: int = 0) -> dict[str, object]:
+            prompts.append(prompt)
+            return replies[len(prompts) - 1]
+
+        def close(self) -> None:
+            pass
+
+    def _bound(tool: str, schema: dict[str, object], facts: str) -> _B:
+        return _B()
+
+    monkeypatch.setattr(srv, "_bound_agent", _bound)
+    out = srv.handle(_events_request({"grounded_arguments": {"ticker": "AAPL"}}))
+    assert out["arguments"] == {"ticker": "AAPL"}
+    assert prompts[1] == "get material events for AAPL"
+    assert len(prompts) == 2
+
+
+@pytest.mark.parametrize("context", [None, {}, {"grounded_arguments": {"ticker": " "}}])
+def test_truncated_generation_without_a_subject_fails_without_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, context: dict[str, object] | None
+) -> None:
+    """No grounded ticker means no subject-only request: the truncation error reaches the caller once."""
+    srv = _load_server(monkeypatch, tmp_path)
+    calls: list[str] = []
+
+    class _B:
+        def complete(self, prompt: str, max_new_tokens: int = 0) -> dict[str, object]:
+            calls.append(prompt)
+            return _TRUNCATED
+
+        def close(self) -> None:
+            pass
+
+    def _bound(tool: str, schema: dict[str, object], facts: str) -> _B:
+        return _B()
+
+    monkeypatch.setattr(srv, "_bound_agent", _bound)
+    out = srv.handle(_events_request(context))
+    assert "token budget exhausted" in str(out["error"])
+    assert len(calls) == 1
+
+
+def test_truncated_retry_uses_the_context_ticker_when_no_argument_is_grounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The session subject ticker grounds the retry when the scheduler seeded no ticker argument."""
+    srv = _load_server(monkeypatch, tmp_path)
+    assert srv._subject_request("get_material_events", {"grounded_arguments": {}, "ticker": "MSFT"}) == (
+        "get material events for MSFT"
+    )
+    assert srv._subject_request(
+        "get_material_events", {"grounded_arguments": {"ticker": "AAPL"}, "ticker": "MSFT"}
+    ) == ("get material events for AAPL")
+
+
 def test_handle_rejects_engine_failure_ungrounded_and_missing_request(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1085,8 +1180,8 @@ _NO_COUNT = "TSLA 10-K filings since 2025-01-01 for CIK 0001318605, accession 00
         # Unknown numbers stay rejected.
         ("list_sec_filings", _TSLA, {"identifier": "TSLA", "limit": 37}, None, "not grounded"),
         ("find_sec_entities_bounded", _TESLA, {"query": "Tesla", "limit": 50}, None, "not grounded"),
-        # A "(default 20)" description is not a declared default.
-        ("find_sec_entities", _TESLA, {"query": "Tesla", "limit": 20}, None, "not grounded"),
+        # find_sec_entities declares its handler default (20), like the bounded variant.
+        ("find_sec_entities", _TESLA, {"query": "Tesla", "limit": 20}, None, "accepted"),
         # An explicit grounded limit is authoritative; the default never replaces it.
         ("list_sec_filings", _TSLA, {"identifier": "TSLA", "limit": 50}, {"limit": 10}, "not grounded"),
         ("list_sec_filings", _TSLA, {"identifier": "TSLA", "limit": 10}, {"limit": 10}, "accepted"),
