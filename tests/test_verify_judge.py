@@ -1,6 +1,8 @@
 """Synthetic-trace unit tests for scripts/verify_judge (no Pi, no network)."""
 
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Self
 
 import pytest
 
@@ -955,123 +957,321 @@ def test_load_evidence_reads_missing_table_as_nothing() -> None:
     conn.close()
 
 
-def _attempt_create_research() -> object:
-    """Session-creating stand-in for service.create_research bound to the attempt repo."""
-
-    def _create(
-        question: str,
-        objective: str | None = None,
-        *,
-        as_of: str | None = None,
-        policy: object = None,
-        repo: object = None,
-        ticker: str | None = None,
-    ) -> str:
-        from app.research import session as research_session
-        from app.research.repository import ResearchRepository
-
-        session = research_session.create_session(question, objective or question)
-        assert isinstance(repo, ResearchRepository)
-        repo.save_session(session)
-        return session.session_id
-
-    return _create
+# --------------------------------------------------------------------------
+# Live runner: POST /api/agent SSE fold, batch API process, attempt outcome
+# --------------------------------------------------------------------------
 
 
-async def _attempt_run_node(*args: object, **kwargs: object) -> None:
-    pass
+def _sse(*events: dict[str, object]) -> list[str]:
+    """SSE lines for the given events, as the route sends them."""
+    import json
+
+    return [f"data: {json.dumps(event)}" for event in events]
 
 
-class _AttemptJev:
-    def __init__(self, data_root: object = None) -> None:
-        self.data_root = data_root
+def test_fold_stream_terminal_answer_and_session() -> None:
+    from scripts import verify_judge as J
 
-    def close(self) -> None:
-        pass
+    outcome = J._fold_stream(
+        _sse(
+            {"type": "agent_start", "prompt": "p"},
+            {"type": "evidence", "sessionId": "sess-1", "evidence": [{"id": "e1"}]},
+            {"type": "answer_delta", "text": "NVDA EPS was $5.20."},
+            {"type": "done", "status": "completed", "metrics": {}},
+        )
+    )
+    assert outcome == {
+        "answer": "NVDA EPS was $5.20.",
+        "session_id": "sess-1",
+        "terminal": True,
+        "error": "",
+    }
 
 
-def test_run_kernel_attempt_stores_empty_terminal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import app.decision_client as decision
-    from app.research import scheduler, service
+def test_fold_stream_partial_is_fallback_and_limited_status_is_terminal() -> None:
+    from scripts import verify_judge as J
+
+    both = J._fold_stream(
+        _sse(
+            {"type": "answer_delta", "text": "full answer"},
+            {"type": "answer_partial", "text": "partial answer"},
+            {"type": "done", "status": "completed_with_limitations", "metrics": {}},
+        )
+    )
+    assert (both["answer"], both["terminal"]) == ("full answer", True)
+    partial_only = J._fold_stream(
+        _sse({"type": "answer_partial", "text": "only partial"}, {"type": "done", "status": "completed"})
+    )
+    assert (partial_only["answer"], partial_only["terminal"]) == ("only partial", True)
+
+
+def test_fold_stream_failure_and_cancel_are_not_terminal() -> None:
+    from scripts import verify_judge as J
+
+    failed = J._fold_stream(
+        _sse(
+            {"type": "failed", "category": "provider_error", "message": "needle down"},
+            {"type": "error", "message": "Stockbot could not verify part of that request."},
+            {"type": "done", "status": "failed", "metrics": {}},
+        )
+    )
+    assert failed["terminal"] is False
+    assert failed["error"] == "error: Stockbot could not verify part of that request."
+    cancelled = J._fold_stream(_sse({"type": "done", "status": "cancelled", "metrics": {}}))
+    assert cancelled["terminal"] is False and cancelled["error"] == ""
+
+
+class _FakeResponse:
+    """Minimal urlopen response: SSE byte lines over a context manager."""
+
+    def __init__(self, lines: list[bytes]) -> None:
+        self._lines = lines
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def __iter__(self) -> Iterator[bytes]:
+        return iter(self._lines)
+
+
+def test_run_kernel_attempt_posts_research_and_records_outcome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+    from types import SimpleNamespace
+
+    from scripts import verify_judge as J
+
+    seen: list[object] = []
+    body = _sse(
+        {"type": "evidence", "sessionId": "sess-9", "evidence": []},
+        {"type": "answer_delta", "text": "answer text"},
+        {"type": "done", "status": "completed", "metrics": {}},
+    )
+
+    def _urlopen(request: object, timeout: float) -> _FakeResponse:
+        seen.append(request)
+        return _FakeResponse([line.encode() for line in body])
+
+    def _batch_api(store_dir: Path) -> object:
+        return SimpleNamespace(base_url="http://127.0.0.1:9999")
+
+    monkeypatch.setattr(J.urllib.request, "urlopen", _urlopen)
+    monkeypatch.setattr(J, "_batch_api", _batch_api)
+
+    db_path = tmp_path / "attempt-2" / "runs.sqlite"
+    result = J._run_kernel_attempt("ask", db_path, tmp_path, tmp_path / "store")
+    assert result == (0, False, "answer text", "", True)
+    request = seen[0]
+    assert getattr(request, "full_url", "") == "http://127.0.0.1:9999/api/agent"
+    assert json.loads(bytes(getattr(request, "data", b"")).decode()) == {"prompt": "ask", "mode": "research"}
+    assert J._read_attempt_outcome(db_path) == ("sess-9", True)
+
+
+def test_run_kernel_attempt_marks_timeout_for_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from scripts import verify_judge as J
+
+    def _slow(base_url: str, prompt: str) -> object:
+        raise TimeoutError("slow attempt")
+
+    def _batch_api(store_dir: Path) -> object:
+        return SimpleNamespace(base_url="http://127.0.0.1:1")
+
+    monkeypatch.setattr(J, "_batch_api", _batch_api)
+    monkeypatch.setattr(J, "_post_research", _slow)
+    result = J._run_kernel_attempt("p", tmp_path / "attempt-1" / "runs.sqlite", tmp_path, tmp_path)
+    assert result == (1, True, "", "slow attempt", False)
+
+
+def test_kernel_calls_reads_governed_action_decisions_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RESEARCH_DB_PATH", raising=False)
+    from app.research import session as research_session
+    from app.research.models import DecisionRecord
     from app.research.repository import ResearchRepository
     from scripts import verify_judge as J
 
-    store_dir = tmp_path / "store"
-    repo = ResearchRepository(data_root=store_dir)
-    terminals: list[str] = []
+    repo = ResearchRepository(data_root=tmp_path / "store")
+    session = research_session.create_session("Create a thesis", "objective", session_id="s-decide")
+    repo.save_session(session)
+    sid = session.session_id
+    repo.save_evidence(
+        {
+            "evidence_id": "ev-1",
+            "session_id": sid,
+            "wave_id": 1,
+            "record_kind": "evidence",
+            "tool_name": "get_sec_filing",
+            "content": "NVDA 8-K filed 2026-08-01",
+        }
+    )
 
-    def _create_node(*args: object, **kwargs: object) -> object:
-        return object()
+    def _attempt(decision_id: str, tool: str, error: str | None = None, evidence_id: str | None = None) -> None:
+        repo.save_decision(
+            DecisionRecord(
+                decision_id=decision_id,
+                session_id=sid,
+                node_id=None,
+                job_id=None,
+                decision_type="node_attempt",
+                candidates={},
+                probabilities={},
+                selected={"tool": tool, "error": error, "evidence_id": evidence_id},
+            )
+        )
 
-    def _repo_for(store: object) -> ResearchRepository:
-        return repo
+    _attempt("d1", "thesis_create")
+    _attempt("d2", "get_sec_filing", evidence_id="ev-1")
+    _attempt("d3", "search_tools")
+    _attempt("d4", "thesis_refine", error="tool failed: denied")
+    _attempt("d5", "thesis_journal")
 
-    def _store_terminal(attempt_repo: ResearchRepository, session_id: str) -> None:
-        terminals.append(session_id)
-
-    monkeypatch.setattr(service, "create_research", _attempt_create_research())
-    monkeypatch.setattr(service, "create_node", _create_node)
-    monkeypatch.setattr(scheduler, "run_node", _attempt_run_node)
-    monkeypatch.setattr(decision, "JevClient", _AttemptJev)
-    monkeypatch.setattr(J, "_kernel_repo", _repo_for)
-    monkeypatch.setattr(J, "_store_empty_terminal", _store_terminal)
-
-    result = J._run_kernel_attempt("prompt?", tmp_path / "runs.sqlite", tmp_path, stockbot_store=store_dir)
-    assert result == (0, False, "", "", False)
-    assert store_dir.is_dir()
-    assert terminals == [J._latest_session_id(repo)]
+    calls, discovery = J._kernel_calls(repo, sid, {})
+    assert discovery == []
+    assert sorted(str(c["tool"]) for c in calls) == ["get_sec_filing", "thesis_create", "thesis_journal"]
+    by_tool = {str(c["tool"]): c for c in calls}
+    assert by_tool["thesis_create"]["output_kind"] == "governed_action"
+    assert by_tool["thesis_create"]["domain"] == "thesis"
+    assert by_tool["thesis_create"]["success"] is True
+    assert by_tool["get_sec_filing"]["tool_call_id"] == "ev-1"  # evidence row, not the decision
 
 
-def test_run_kernel_attempt_skips_empty_terminal_when_evidence_exists(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import app.decision_client as decision
-    from app.research import scheduler, service
-    from app.research.models import JSONValue
-    from app.research.repository import ResearchRepository
+class _FakeProc:
+    """Minimal Popen stand-in: fixed stdout lines and a recorded exit code."""
+
+    def __init__(self, lines: list[str]) -> None:
+        self.stdout = iter(lines)
+        self.pid = 4242
+        self.exit_code: int | None = None
+
+    def poll(self) -> int | None:
+        return self.exit_code
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+def test_start_api_reads_listen_port(tmp_path: Path) -> None:
     from scripts import verify_judge as J
 
-    store_dir = tmp_path / "store"
-    repo = ResearchRepository(data_root=store_dir)
-    terminals: list[str] = []
+    captured: list[tuple[list[str], str, object, bool]] = []
+    proc = _FakeProc(["api [env]: env loaded .env\n", "[web] bun api listening http://127.0.0.1:40451 (loopback)\n"])
 
-    def _create_node(*args: object, **kwargs: object) -> object:
-        return object()
+    def _spawn(command: list[str], **kwargs: object) -> _FakeProc:
+        captured.append((command, str(kwargs["cwd"]), kwargs["env"], kwargs["start_new_session"] is True))
+        return proc
 
-    def _one_evidence(session_id: str) -> list[dict[str, JSONValue]]:
-        return [{"evidence_id": "e1"}]
-
-    def _repo_for(store: object) -> ResearchRepository:
-        return repo
-
-    def _store_terminal(attempt_repo: ResearchRepository, session_id: str) -> None:
-        terminals.append(session_id)
-
-    monkeypatch.setattr(service, "create_research", _attempt_create_research())
-    monkeypatch.setattr(service, "create_node", _create_node)
-    monkeypatch.setattr(scheduler, "run_node", _attempt_run_node)
-    monkeypatch.setattr(decision, "JevClient", _AttemptJev)
-    monkeypatch.setattr(J, "_kernel_repo", _repo_for)
-    monkeypatch.setattr(J, "_store_empty_terminal", _store_terminal)
-    monkeypatch.setattr(repo, "list_evidence", _one_evidence)
-
-    result = J._run_kernel_attempt("prompt?", tmp_path / "runs.sqlite", tmp_path, stockbot_store=store_dir)
-    assert result == (0, False, "", "", False)
-    assert terminals == []
+    store = tmp_path / "batch" / "store"
+    api = J._start_api(store, spawn=_spawn)
+    assert (api.base_url, api.store_dir, api.proc) == ("http://127.0.0.1:40451", store, proc)
+    command, cwd, env, own_group = captured[0]
+    assert command[0].endswith("bun") and command[1] == "scripts/api.ts"
+    assert cwd.endswith("needle-harness")
+    assert isinstance(env, dict)
+    assert env["STOCKBOT_DATA_DIR"] == str(store)
+    assert env["RESEARCH_DB_PATH"] == str(store / "research.sqlite")
+    assert env["STOCKBOT_API_PORT"] == "0"
+    assert own_group is True
+    assert "bun api listening" in (tmp_path / "batch" / "api.log").read_text()
 
 
-def test_run_kernel_attempt_reports_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.research import service
-    from app.research.repository import ResearchRepository
+def test_start_api_raises_when_it_never_listens(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from scripts import verify_judge as J
 
-    def _boom(*args: object, **kwargs: object) -> str:
-        raise RuntimeError("no kernel")
+    stopped: list[object] = []
+    proc = _FakeProc(["boom: missing OPENCODE_MODEL\n"])
+    proc.exit_code = 1
 
-    def _repo_for(store: object) -> ResearchRepository:
-        return ResearchRepository(data_root=tmp_path / "unused")
+    def _spawn(command: list[str], **kwargs: object) -> _FakeProc:
+        return proc
 
-    monkeypatch.setattr(service, "create_research", _boom)
-    monkeypatch.setattr(J, "_kernel_repo", _repo_for)
-    # stockbot_store=None resolves against the working directory; nothing is written there.
-    assert J._run_kernel_attempt("p", tmp_path / "runs.sqlite", tmp_path) == (1, False, "", "no kernel", False)
+    def _stop(p: object) -> None:
+        stopped.append(p)
+
+    monkeypatch.setattr(J, "_API_READY_S", 5.0)
+    monkeypatch.setattr(J, "_stop_api", _stop)
+    with pytest.raises(RuntimeError, match="exited before listening"):
+        J._start_api(tmp_path / "store", spawn=_spawn)
+    assert stopped == [proc]
+
+
+def test_stop_api_kills_group_and_escalates(monkeypatch: pytest.MonkeyPatch) -> None:
+    import signal
+    import subprocess
+
+    from scripts import verify_judge as J
+
+    def _getpgid(pid: int) -> int:
+        return 777
+
+    sent: list[int] = []
+
+    def _killpg(pgid: int, sig: int) -> None:
+        sent.append(sig)
+
+    monkeypatch.setattr(J.os, "getpgid", _getpgid)
+    monkeypatch.setattr(J.os, "killpg", _killpg)
+    monkeypatch.setattr(J, "_API_STOP_S", 0.05)
+    monkeypatch.setattr(J, "_API_POLL_S", 0.01)
+
+    class _Stubborn:
+        pid = 123
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise subprocess.TimeoutExpired("api", timeout or 0.0)
+
+    J._stop_api(_Stubborn())
+    assert [sig for sig in sent if sig != 0] == [signal.SIGTERM, signal.SIGKILL]
+
+    # A group that disappears right after the signal needs no escalation.
+    sent.clear()
+
+    def _vanish(pgid: int, sig: int) -> None:
+        if sig == 0:
+            raise ProcessLookupError
+        sent.append(sig)
+
+    monkeypatch.setattr(J.os, "killpg", _vanish)
+    J._stop_api(_Stubborn())
+    assert sent == [signal.SIGTERM]
+
+    # A group that is already gone is not an error.
+    sent.clear()
+
+    def _gone(pgid: int, sig: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(J.os, "killpg", _gone)
+    J._stop_api(_Stubborn())
+    assert sent == []
+
+
+def test_batch_api_starts_one_process_per_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import verify_judge as J
+
+    monkeypatch.setattr(J, "_BATCH_API", None)
+    started: list[Path] = []
+    stopped: list[object] = []
+    proc = _FakeProc(["never read\n"])
+
+    def _start(store_dir: Path) -> object:
+        started.append(store_dir)
+        return J._BatchApi("http://127.0.0.1:1", store_dir, proc)
+
+    def _stop(p: object) -> None:
+        stopped.append(p)
+
+    monkeypatch.setattr(J, "_start_api", _start)
+    monkeypatch.setattr(J, "_stop_api", _stop)
+
+    api = J._batch_api(tmp_path)
+    assert J._batch_api(tmp_path) is api
+    assert started == [tmp_path]
+    with pytest.raises(RuntimeError, match="one judge batch runs one store"):
+        J._batch_api(tmp_path / "other")
+    J._stop_batch_api()
+    assert stopped == [proc]
+    J._stop_batch_api()
+    assert len(stopped) == 1

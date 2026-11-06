@@ -16,16 +16,14 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import ClassVar, override
+from typing import override
 
 import pytest
 
 import scripts.export_harness_viewer as exh_viewer
-import scripts.verify_agent_scenarios as vas
 import scripts.verify_judge as J
-from app.research.evals.scenarios import Scenario, ScenarioFamily
 from app.research.evals.traces import TraceHeader
-from app.research.models import Failure, Job, JSONValue, ResearchSession
+from app.research.models import DecisionRecord, Failure, Job, JSONValue, ResearchSession
 from app.research.repository import ResearchRepository
 from scripts import verify_tool_health as vth
 from scripts import verify_tool_registry as reg
@@ -316,24 +314,8 @@ def _traces_raise(session_id: str | None = None) -> list[object]:
     raise RuntimeError("no trace")
 
 
-def _ctx_ok(harness: tuple[object, ...]) -> tuple[object | None, str]:
-    return (object(), "")
-
-
-def _ctx_fail(harness: tuple[object, ...]) -> tuple[object | None, str]:
-    return (None, "tool context failed: x")
-
-
-def _pct_group(self: object, n: str) -> str:
-    return {"1": "870", "2": "+", "3": "75"}[n]
-
-
 def _write_disk_error(*a: object, **k: object) -> object:
     raise OSError("disk")
-
-
-def _no_fixture(tool: str, schemas: dict[str, dict[str, object]] | None = None) -> dict[str, object]:
-    raise LookupError("no fixture")
 
 
 def _trace_hdr() -> TraceHeader:
@@ -521,295 +503,6 @@ def test_export_output_path_preserves_default(monkeypatch: pytest.MonkeyPatch, t
     assert tracked.read_text(encoding="utf-8") == preview.read_text(encoding="utf-8")
 
 
-# ---- slice_agent_tests.py ----
-"""Scratch tests for scripts/verify_agent_scenarios.py pure + fallback paths."""
-
-
-class _NS:
-    pass
-
-
-def _ns(provider: object = None, model: object = None, scenario: object = None) -> argparse.Namespace:
-    return argparse.Namespace(provider=provider, model=model, scenario=scenario)
-
-
-def test_resolve_prefers_flags_and_strips_whitespace():
-    provider, model = vas.resolve_provider_model(
-        "  anthropic ", " claude ", {"STOCKBOT_PROVIDER": "x", "STOCKBOT_MODEL": "y"}
-    )
-    assert (provider, model) == ("anthropic", "claude")
-
-
-def test_resolve_falls_back_to_env():
-    provider, model = vas.resolve_provider_model(
-        None, None, {"STOCKBOT_PROVIDER": " anthropic", "STOCKBOT_MODEL": "claude "}
-    )
-    assert (provider, model) == ("anthropic", "claude")
-
-
-def test_resolve_defaults_to_pi_cli_when_unset():
-    """No flag and no env means Pi's own CLI default: resolved as ("", ""), never a hard failure."""
-    assert vas.resolve_provider_model(None, None, {}) == ("", "")
-    assert vas.resolve_provider_model("  ", "", {"STOCKBOT_PROVIDER": "", "STOCKBOT_MODEL": None}) == ("", "")
-
-
-def test_lookup_env_value_narrows_strings():
-    """Only real string values count as env configuration; anything else reads as unset."""
-    assert vas._lookup_env_value({"A": " v "}, "A") == " v "
-    assert vas._lookup_env_value({"A": 5}, "A") is None
-    assert vas._lookup_env_value({}, "A") is None
-
-    class _Lookup:
-        def get(self, key: str) -> object:
-            return "v" if key == "A" else None
-
-    class _NoGet:
-        get = 5
-
-    assert vas._lookup_env_value(_Lookup(), "A") == "v"
-    assert vas._lookup_env_value(_Lookup(), "B") is None
-    assert vas._lookup_env_value(object(), "A") is None
-    assert vas._lookup_env_value(_NoGet(), "A") is None
-
-
-def test_resolve_passes_explicit_flags_through():
-    """Explicit flags/env still override; a bad provider is validated at probe time, not here."""
-    assert vas.resolve_provider_model("unknown", "m", {}) == ("unknown", "m")
-    assert vas.resolve_provider_model("custom", None, {}) == ("custom", "")
-    assert vas.resolve_provider_model("anthropic", None, {}) == ("anthropic", "")
-
-
-def test_resolve_namespace_wrapper_strips():
-    ns = _ns("  anthropic ", " claude")
-    assert vas._resolve_provider_model(ns) == ("anthropic", "claude")
-
-
-def test_resolve_model_timeout_flag_env_default():
-    assert vas.resolve_model_timeout("120", {"STOCKBOT_MODEL_TIMEOUT": "60"}) == 120
-    assert vas.resolve_model_timeout(None, {"STOCKBOT_MODEL_TIMEOUT": " 60 "}) == 60
-    assert vas.resolve_model_timeout(None, {}) == vas.MODEL_TIMEOUT_DEFAULT_S
-    assert vas.resolve_model_timeout(None, {}) > 110
-
-
-def test_resolve_model_timeout_rejects_bad_values():
-    for bad in ("nope", "0", "-5"):
-        try:
-            vas.resolve_model_timeout(bad, {})
-        except RuntimeError as exc:
-            assert "invalid model timeout" in str(exc)
-        else:
-            raise AssertionError(f"expected RuntimeError for {bad!r}")
-
-
-def test_resolve_model_timeout_namespace_wrapper():
-    ns = argparse.Namespace(model_timeout="42")
-    assert vas._resolve_model_timeout(ns) == 42
-
-
-def test_parse_args_defaults():
-    args = vas.parse_args([])
-    assert args.prompt_version == "v1"
-    assert args.list is False and args.json is False
-    assert args.scenario is None and args.fixtures_dir is None
-    assert args.model_timeout is None
-
-
-def test_selected_names_excludes_fixture_only_regressions():
-    """The default live run never re-asks the two questions that only carry old broken-run fixtures."""
-    from app.research.evals.scenarios import get_scenario, list_scenarios
-
-    default_names = vas._selected_names(_ns())
-    assert len(default_names) == len(list_scenarios()) - 2
-    for name in (
-        "spacex-openai-bankruptcy-sec-only-live-run",
-        "gs-openai-sec-only-live-run",
-    ):
-        assert name not in default_names
-        assert get_scenario(name).fixture_only is True
-        assert name in vas._scenario_map()
-        assert vas._selected_names(_ns(scenario=name)) == [name]
-
-
-def test_summarize_pass_fail_counts():
-    from app.research.evals.evaluators import EvalMetrics, ScenarioResult
-
-    def _sr(passed: bool) -> ScenarioResult:
-        return ScenarioResult(
-            scenario_name="s",
-            passed=passed,
-            violations=(),
-            metrics=EvalMetrics(
-                success=passed,
-                wall_clock_ms=1.0,
-                job_count=1,
-                tool_call_count=1,
-                discovery_calls=0,
-                failed_count=0,
-                recovered_count=0,
-                evidence_count=0,
-                evidence_coverage=0.0,
-                input_tokens=0,
-                output_tokens=0,
-                estimated_cost=0.0,
-                pit_provenance_violations=0,
-                disagreement=False,
-                completeness=1.0,
-            ),
-        )
-
-    failed, code = vas.summarize_results([_sr(True), _sr(True)])
-    assert failed == [] and code == 0
-    failed, code = vas.summarize_results([_sr(True), _sr(False)])
-    assert len(failed) == 1 and code == 1
-
-
-def test_call_tool_policy_denied():
-    out = vas._dispatch_call_tool({"name": "portfolio_read", "arguments": {}}, "p", "m")
-    err = out.get("error")
-    assert isinstance(err, str) and err.startswith("POLICY_DENIED")
-
-
-def _harness_none() -> tuple[object, str]:
-    return (None, "tool harness unavailable: gone")
-
-
-def test_call_tool_harness_unavailable(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(vas, "_load_tool_harness", _harness_none)
-    out = vas._dispatch_call_tool({"name": "get_sec_filing", "arguments": {}}, "p", "m")
-    err = out.get("error")
-    assert isinstance(err, str) and "harness unavailable" in err
-
-
-def test_call_tool_exec_error_and_content(monkeypatch: pytest.MonkeyPatch):
-    def boom(*a: object, **k: object) -> object:
-        raise ValueError("bad")
-
-    def ok(*a: object, **k: object) -> object:
-        return {"ok": True}
-
-    def num(*a: object, **k: object) -> object:
-        return 42
-
-    def _harness_boom() -> tuple[object, str]:
-        return ((boom, None, None), "")
-
-    monkeypatch.setattr(vas, "_load_tool_harness", _harness_boom)
-    monkeypatch.setattr(vas, "_build_tool_context", _ctx_ok)
-    out = vas._dispatch_call_tool({"name": "get_sec_filing", "arguments": {}}, "p", "m")
-    assert out == {"error": "ValueError: bad"}
-
-    def _harness_ok() -> tuple[object, str]:
-        return ((ok, None, None), "")
-
-    monkeypatch.setattr(vas, "_load_tool_harness", _harness_ok)
-    out = vas._dispatch_call_tool({"name": "get_sec_filing", "arguments": {}}, "p", "m")
-    assert out == {"ok": True}
-
-    def _harness_num() -> tuple[object, str]:
-        return ((num, None, None), "")
-
-    monkeypatch.setattr(vas, "_load_tool_harness", _harness_num)
-    out = vas._dispatch_call_tool({"name": "get_sec_filing", "arguments": {}}, "p", "m")
-    assert out == {"content": "42"}
-
-
-def test_tool_context_failure(monkeypatch: pytest.MonkeyPatch):
-    def _harness_triple() -> tuple[object, str]:
-        return (("exec", "Cap", "Ctx"), "")
-
-    monkeypatch.setattr(vas, "_load_tool_harness", _harness_triple)
-    monkeypatch.setattr(vas, "_build_tool_context", _ctx_fail)
-    out = vas._dispatch_call_tool({"name": "get_sec_filing", "arguments": {}}, "p", "m")
-    err = out.get("error")
-    assert isinstance(err, str) and "tool context failed" in err
-
-
-def test_setup_restore_env_roundtrip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    import os
-
-    monkeypatch.delenv("RESEARCH_DB_PATH", raising=False)
-    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    old = vas.setup_env(str(tmp_path))
-    assert os.environ["RESEARCH_DB_PATH"].endswith("research.sqlite")
-    vas.restore_env(old)
-    assert "RESEARCH_DB_PATH" not in os.environ
-
-
-def test_extract_answer_paths():
-    assert vas._answer_from_final({"answer": "A"}) == "A"
-    assert vas._answer_from_final({}) is None
-    assert vas._extract_answer({"answer": "A"}, {}) == "A"
-
-    class A:
-        claims: ClassVar[object] = [1]
-        answer = ""
-        base_case = "B"
-
-    assert vas._extract_answer({}, {"stock": A()}) == "B"
-    assert vas._extract_answer({}, {}) == ""
-
-
-def test_extract_evidence_and_completed():
-    assert vas._extract_evidence_ids({"evidence_ids": ["a", 1, "b"]}) == ("a", "b")
-    assert vas._extract_evidence_ids({}) == ()
-    assert vas._extract_evidence_ids({"evidence_ids": "x"}) == ()
-    assert vas._is_completed("completed", "ans", ("e",)) is True
-    assert vas._is_completed("failed", "ans", ("e",)) is False
-    assert vas._is_completed("completed", "  ", ("e",)) is False
-    assert vas._is_completed("completed", "ans", ()) is False
-
-
-def test_build_success_counts_recovery():
-    jobs = [
-        Job(
-            job_id="j1",
-            session_id="s",
-            wave_id=1,
-            parent_job_id=None,
-            job_type="research",
-            owner="agent",
-            status="failed",
-        ),
-        Job(
-            job_id="j2",
-            session_id="s",
-            wave_id=1,
-            parent_job_id=None,
-            job_type="research",
-            owner="agent",
-            status="completed",
-        ),
-    ]
-    sc = _g2_scenario(name="n", as_of="2024-01-01", requires_evidence=True)
-    out = vas._build_success_input(sc, "ans", ["t"], jobs, "completed", ("e",), 1.0)
-    assert out.failed_count == 1 and out.recovered_count == 1 and out.budget_used == 1
-    out2 = vas._build_success_input(sc, "", ["t"], jobs, "failed", (), 1.0)
-    assert out2.recovered_count == 0
-
-
-def test_build_success_failure_bucket_statuses():
-    """Only failed/cancelled/timed_out count as failures; successful jobs never do."""
-    sc = _g2_scenario(name="n", as_of="2024-01-01", requires_evidence=True)
-
-    def _job(job_id: str, status: str) -> Job:
-        return Job(
-            job_id=job_id,
-            session_id="s",
-            wave_id=1,
-            parent_job_id=None,
-            job_type="research",
-            owner="agent",
-            status=status,
-        )
-
-    for status in ("failed", "cancelled", "timed_out"):
-        assert vas._job_failed(_job("j", status)) is True
-        assert vas._build_success_input(sc, "ans", ["t"], [_job("j", status)], "failed", (), 1.0).failed_count == 1
-    for status in ("completed", "running", "queued"):
-        assert vas._job_failed(_job("j", status)) is False
-        assert vas._build_success_input(sc, "ans", ["t"], [_job("j", status)], "completed", (), 1.0).failed_count == 0
-
-
 # ---- slice_judge_tests.py ----
 """Scratch coverage for scripts/verify_judge refactor: error/fallback branches + numeric boundaries."""
 
@@ -978,6 +671,46 @@ def test_expand_scaled_none_and_negative_exp():
     assert J._small_positive_decimal("2000000") is None
 
 
+def test_claim_close_bands_only_the_answer():
+    """The claim may round; the evidence value is data and carries no band."""
+    scaled = J._num_norm("5.4 million")
+    assert scaled == "5400000"
+    assert J._claim_close(scaled, "5357897") is True  # 42,103 away, inside the claim's +/-50000
+    assert J._claim_close(scaled, "5300000") is False  # 100,000 away
+    assert J._claim_close("4600000", "5000000") is False  # coarse evidence never excuses the answer
+    assert J._claim_close("5000000", "4960000") is True  # 0.8%, inside the answer's own band
+    assert J._claim_close("5000000", "4600000") is False  # 8%: the band is capped at 1% of the value
+
+
+def test_claim_band_is_not_symmetric():
+    assert J._claim_close("5400000", "5357897") is True
+    assert J._claim_close("5357897", "5400000") is False  # evidence side states no rounding
+
+
+def test_num_close_keeps_half_percent_rule():
+    assert J._num_close("1450000", "1460000") is False  # 0.68% apart
+    assert J._num_close("1450000", "1455000") is True  # 0.34% apart
+    assert J._num_close("5400000", "5357897") is False  # 0.79% apart, no band on evidence values
+
+
+def test_stated_tolerance_reads_the_operand_only():
+    assert J._stated_tolerance("5400000") == Decimal(50000)
+    assert J._stated_tolerance("1450000") == Decimal(5000)
+    assert J._stated_tolerance("5000000") == Decimal(50000)  # 10^6 digit, capped at 1% of the value
+    assert J._stated_tolerance("5400001") == 0  # no trailing zeros, no rounding band
+    assert J._stated_tolerance("5357897") == 0
+    assert J._stated_tolerance("5400000.0") == 0  # decimals keep the exact rules
+
+
+def test_unsubstantiated_values_accepts_scaled_restatement():
+    """The answer's own rounding is excused; a coarse evidence value is not."""
+    answer = "The previous short position changed by 5.4 million shares."
+    assert J._unsubstantiated_values(answer, "What changed?", ["change previous number 5357897"]) == []
+    exact_evidence = "change previous number 5000000"
+    assert J._unsubstantiated_values("The change was 4.6 million.", "What changed?", [exact_evidence]) == ["4600000"]
+    assert J._unsubstantiated_values("The count was 5 million.", "How many?", ["exact count 4960000"]) == []
+
+
 # --- derived math boundaries ---
 def test_within_two_pct_zero():
     assert J._within_two_pct(Decimal(0), Decimal(0)) is True
@@ -996,14 +729,6 @@ def test_equation_hit_bad_operands_and_zero_div():
     assert m3 is None  # bad rhs never matches: same None outcome as bad operands
 
 
-class _FakeMatch:
-    def __init__(self, groups: dict[str, str]) -> None:
-        self._g = groups
-
-    def group(self, name: str) -> str:
-        return self._g[name]
-
-
 def test_subtraction_bad_numbers():
     match = re.search(r"(?P<x>bogus) - \((?P<terms>1\+2)\) = (?P<r>3)", "bogus - (1+2) = 3")
     assert match is not None
@@ -1019,13 +744,6 @@ def test_pct_change_bases_none():
     match = J._PCT_CHANGE_RE.search("870 (+75%)")
     assert match is not None
     assert J._pct_change_bases(match, Decimal(870), Decimal(75), {"junk"}) is None
-
-
-class _FakeChangeMatch:
-    def group(self, n: int | str) -> str:
-        if isinstance(n, int):
-            return {1: "870", 2: "+", 3: "75"}[n]
-        return {"1": "870", "2": "+", "3": "75"}[n]
 
 
 def test_pct_pair_hits_bad_high():
@@ -1204,7 +922,6 @@ def test_build_trace_bad_path_and_empty_db(tmp_path: Path, monkeypatch: pytest.M
     repo = ResearchRepository(data_root=store)
     sess = _research_session.create_session("What is NVDA EPS?", "objective")
     repo.save_session(sess)
-    J._walk_to_completed(repo, sess.session_id)
     repo.save_evidence(
         {
             "evidence_id": "ev1",
@@ -1235,7 +952,7 @@ def test_build_trace_bad_path_and_empty_db(tmp_path: Path, monkeypatch: pytest.M
             "result": {"pe": 30},
         }
     )
-    t = J.build_trace(store, sc, "NVDA EPS is $5.20.")
+    t = J.build_trace(store, sc, "NVDA EPS is $5.20.", session_id=sess.session_id, terminal=True)
     assert t["terminal"] is True and t["final_answer"] == "NVDA EPS is $5.20."
     assert any(c["tool"] == "get_fundamentals" for c in t["research_calls"])
     assert any(c.get("tool_call_id") == "ev1" and c.get("known_at") == "2026-08-01" for c in t["research_calls"])
@@ -1270,8 +987,8 @@ def test_run_attempts_seeded_error_and_read_run_id(tmp_path: Path, monkeypatch: 
     out = J._seeded_prompt(sc, tmp_path, "prompt")
     assert isinstance(out[0], str)  # real seeder may succeed or fail; shape stable
     assert J._read_run_id(tmp_path / "nope.db") is None
-    assert J._read_session_id(tmp_path / "nope-store") is None
-    ok, reason = J._evaluate_live(_scenario(id="x", evaluator="nope"), "a", tmp_path)
+    assert J._read_attempt_outcome(tmp_path / "nope.db") == ("", False)
+    ok, reason = J._evaluate_live(_scenario(id="x", evaluator="nope"), "a", tmp_path, "", False)
     assert not ok and "unknown evaluator" in reason
 
 
@@ -1301,12 +1018,6 @@ class _BoomFuture(concurrent.futures.Future[dict[str, object]]):
     @override
     def result(self, timeout: float | None = None) -> dict[str, object]:
         raise RuntimeError("boom")
-
-
-def _unused_gate_checks():
-    # family verdict branches
-    assert J._gate_verdict([{"id": "pit_filing", "ok": False}]) == 1
-    assert J._gate_verdict([{"id": "nvda_eps", "ok": True}]) == 0
 
 
 def test_gate_verdict_branches():
@@ -1344,7 +1055,7 @@ def test_research_gates_none_branches():
 """Scratch CRAP-gap tests for RestGap slice (fakes only, no live model/network).
 
 Covers the remaining score>10 functions in:
-  scripts/verify_agent_scenarios.py, scripts/verify_judge.py,
+  scripts/verify_judge.py,
   scripts/sandbox_doctor.py, scripts/export_harness_viewer.py
 plus read-only-base coverage (no source edits) for:
   scripts/verify_tool_health.py, scripts/verify_tool_registry.py,
@@ -1357,40 +1068,6 @@ from scripts.verify_type_escape_hatches import (
     _flag_namespaced_decorator,
     _TypeBindings,
 )
-
-
-def _g2_scenario(**kw: object) -> Scenario:
-    name = kw.get("name", "t1")
-    assert isinstance(name, str)
-    family = kw.get("family", ScenarioFamily.FACTUAL)
-    assert isinstance(family, ScenarioFamily)
-    question = kw.get("question", "What drove NVDA?")
-    assert isinstance(question, str)
-    ticker = kw.get("ticker", "NVDA")
-    assert ticker is None or isinstance(ticker, str)
-    as_of = kw.get("as_of", None)
-    assert as_of is None or isinstance(as_of, str)
-    expected_tools = kw.get("expected_tools", ())
-    assert isinstance(expected_tools, tuple)
-    requires_evidence = kw.get("requires_evidence", True)
-    assert isinstance(requires_evidence, bool)
-    notes = kw.get("notes", "n")
-    assert isinstance(notes, str)
-    assert not [
-        k
-        for k in kw
-        if k not in ("name", "family", "question", "ticker", "as_of", "expected_tools", "requires_evidence", "notes")
-    ]
-    return Scenario(
-        name=name,
-        family=family,
-        question=question,
-        ticker=ticker,
-        as_of=as_of,
-        expected_tools=expected_tools,
-        requires_evidence=requires_evidence,
-        notes=notes,
-    )
 
 
 def _g2_ns(**kw: object) -> argparse.Namespace:
@@ -1410,341 +1087,6 @@ def _g2_ns(**kw: object) -> argparse.Namespace:
     return argparse.Namespace(**base)
 
 
-# ---- verify_agent_scenarios._pi_model_callable._call (cc6, needs >=52%) ----
-
-
-def _pi_run_fail(*a: object, **k: object) -> object:
-    return SimpleNamespace(returncode=1, stdout="", stderr="boom")
-
-
-def _pi_run_blank(*a: object, **k: object) -> object:
-    return SimpleNamespace(returncode=0, stdout="  \n", stderr="")
-
-
-def _evts_get_sec(trace_id: str) -> list[object]:
-    return [_evt("tool.completed", "get_sec_document")]
-
-
-def _evts_empty(trace_id: str) -> list[object]:
-    return []
-
-
-def _check_out_abc(*a: object, **k: object) -> str:
-    return "abc123\n"
-
-
-def _list_7() -> int:
-    return 7
-
-
-def _prep_pm(args: argparse.Namespace) -> tuple[str, str, int]:
-    return ("p", "m", 300)
-
-
-def _scenario_a() -> dict[str, Scenario]:
-    return {"a": _g2_scenario()}
-
-
-def _print_none_a(*a: object) -> None:
-    return None
-
-
-def _build_empty(*a: object) -> dict[str, object]:
-    return {}
-
-
-def _dispatch_d(*a: object) -> object:
-    return "d"
-
-
-def _model_mc(*a: object) -> object:
-    return "mc"
-
-
-def _run_live_sess(**k: object) -> dict[str, object]:
-    return {"session_id": "s"}
-
-
-def _eval_in(scenario: object, out: dict[str, object], wall: float, cap: int = 0) -> object:
-    return "IN"
-
-
-# ---- verify_agent_scenarios._trace_tool_names (cc5, needs >=42%) ----
-
-
-def _evt(kind: str, tool: object = "unset"):
-    return SimpleNamespace(event_type=kind, payload={} if tool == "unset" else {"tool": tool})
-
-
-def test_trace_tool_names_filters():
-    evts = [
-        _evt("tool.completed", "get_sec_document"),
-        _evt("other", "ignored"),
-        _evt("tool.completed", ""),
-        _evt("tool.completed"),
-        _evt("tool.completed", 5),
-        _evt("tool.completed", "list_sec_filings"),
-    ]
-
-    def _evts_passthrough(trace_id: str) -> list[object]:
-        return list(evts)
-
-    assert vas._trace_tool_names("t", _evts_passthrough) == [
-        "get_sec_document",
-        "list_sec_filings",
-    ]
-    assert vas._trace_tool_names("t", _evts_empty) == []
-
-
-from app.research.evals.evaluators import EvalMetrics, ScenarioResult
-
-
-def _sr(passed: bool) -> ScenarioResult:
-    return ScenarioResult(
-        scenario_name="s",
-        passed=passed,
-        violations=(),
-        metrics=EvalMetrics(
-            success=passed,
-            wall_clock_ms=1.0,
-            job_count=1,
-            tool_call_count=1,
-            discovery_calls=0,
-            failed_count=0,
-            recovered_count=0,
-            evidence_count=0,
-            evidence_coverage=0.0,
-            input_tokens=0,
-            output_tokens=0,
-            estimated_cost=0.0,
-            pit_provenance_violations=0,
-            disagreement=False,
-            completeness=1.0,
-        ),
-    )
-
-
-def test_suite_info_records_flagless_default(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
-    """A flag-less live run still tallies and records its git sha: there is no model flag to gate on."""
-    monkeypatch.setattr(vas.subprocess, "check_output", _check_out_abc)
-    summary: dict[str, object] = {}
-    vas._maybe_print_suite_info([_sr(True), _sr(False)], "", "", summary)
-    out = capsys.readouterr().out
-    assert "1/2 passed" in out and "kernel default" in out and "abc123" in out
-    assert summary["git_sha"] == "abc123"
-
-
-def test_suite_info_ok(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
-    monkeypatch.setattr(vas.subprocess, "check_output", _check_out_abc)
-    summary: dict[str, object] = {}
-    results = [_sr(True), _sr(False)]
-    vas._maybe_print_suite_info(results, "p", "m", summary)
-    out = capsys.readouterr().out
-    assert "1/2 passed" in out and "abc123" in out
-    assert summary["git_sha"] == "abc123"
-
-
-def test_suite_info_git_fails(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
-    def _boom(*a: object, **k: object) -> object:
-        raise OSError("no git")
-
-    monkeypatch.setattr(vas.subprocess, "check_output", _boom)
-    summary: dict[str, object] = {}
-    vas._maybe_print_suite_info([_sr(True)], "p", "m", summary)
-    assert summary["git_sha"] == "unknown"
-    assert "unknown" in capsys.readouterr().out
-
-
-def test_failed_results_selects_unpassed_only():
-    results = [_sr(True), _sr(False)]
-    assert vas._failed_results(results) == [results[1]]
-    assert vas._failed_results([]) == []
-
-
-def test_print_results_lines(capsys: pytest.CaptureFixture[str]):
-    vas._print_results([_sr(True), _sr(False)], "p", "m")
-    out = capsys.readouterr().out.splitlines()
-    assert out[0].startswith("PASS s (live via kernel p/m)")
-    assert out[1].startswith("FAIL s (live via kernel p/m):")
-    vas._print_results([_sr(True)], "", "")
-    assert "live via kernel kernel default" in capsys.readouterr().out
-
-
-def test_build_summary_records_default_label():
-    summary = vas._build_summary("", "", "v1", [_sr(True)])
-    assert summary["provider"] == "kernel default" and summary["model"] == "kernel default"
-    assert summary["prompt_version"] == "v1"
-    assert summary["scenarios"] == [{"scenario": "s", "passed": True, "violations": []}]
-    assert vas._build_summary("p", "m", "v1", [])["model"] == "m"
-
-
-# ---- verify_agent_scenarios._run_cli (cc4, needs >=28%) ----
-
-
-def test_agent_run_cli_list(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(vas, "_list_scenarios", _list_7)
-    assert vas._run_cli(_g2_ns(list=True)) == 7
-
-
-def test_agent_run_cli_skip(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
-    def _boom(args: argparse.Namespace) -> object:
-        raise RuntimeError("no model")
-
-    monkeypatch.setattr(vas, "_prepare_provider_model", _boom)
-    assert vas._run_cli(_g2_ns()) == 2
-    assert "SKIP live scenarios" in capsys.readouterr().err
-
-
-def test_agent_run_cli_unknown(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
-    monkeypatch.setattr(vas, "_prepare_provider_model", _prep_pm)
-    monkeypatch.setattr(vas, "_scenario_map", _scenario_a)
-    assert vas._run_cli(_g2_ns(scenario="zzz")) == 2
-    assert "unknown scenario" in capsys.readouterr().err
-
-
-def test_agent_run_cli_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
-    monkeypatch.setattr(vas, "_prepare_provider_model", _prep_pm)
-    monkeypatch.setattr(vas, "_scenario_map", _scenario_a)
-    r1 = SimpleNamespace(scenario_name="a", passed=True, violations=())
-    r2 = SimpleNamespace(scenario_name="a", passed=False, violations=("v1",))
-
-    def _run_two(*a: object) -> list[object]:
-        return [r1, r2]
-
-    monkeypatch.setattr(vas, "_run_all_scenarios", _run_two)
-    monkeypatch.setattr(vas, "_print_results", _print_none_a)
-    monkeypatch.setattr(vas, "_build_summary", _build_empty)
-    monkeypatch.setattr(vas, "_maybe_print_suite_info", _print_none_a)
-    monkeypatch.setattr(vas, "_maybe_print_json", _print_none_a)
-
-    def _summarize_r2(results: list[object]) -> tuple[list[object], int]:
-        return ([r2], 1)
-
-    monkeypatch.setattr(vas, "summarize_results", _summarize_r2)
-    assert vas._run_cli(_g2_ns(scenario="a", model="m")) == 1
-
-
-def _cli_tuple(
-    args: argparse.Namespace,
-) -> tuple[str, str, int, list[str], dict[str, Scenario]]:
-    """Prereqs as the success tuple; the int branch is the skip exit code."""
-    got = vas._cli_prereqs(args)
-    assert not isinstance(got, int)
-    return got
-
-
-# ---- verify_agent_scenarios._run_live_scenario (cc4, needs >=28%) ----
-
-
-def _omp_sid_ok(*a: object, **k: object) -> str:
-    return "s"
-
-
-# ---- verify_agent_scenarios.evaluate_and_record (cc4, needs >=28%) ----
-
-
-class _FakeRepo:
-    def __init__(self, sess: ResearchSession, jobs: list[Job]) -> None:
-        self._sess, self._jobs = sess, jobs
-
-    def get_session(self, sid: str) -> ResearchSession:
-        return self._sess
-
-    def list_jobs(self, sid: str) -> list[Job]:
-        return self._jobs
-
-    def list_evidence(self, sid: str) -> list[dict[str, object]]:
-        return []
-
-    def list_events(self, sid: str) -> list[object]:
-        return []
-
-
-def _eval_patient(monkeypatch: pytest.MonkeyPatch, traces: list[TraceHeader], sess: ResearchSession):
-    import app.research.evals.traces as traces_mod
-    import app.research.repository as repo_mod
-
-    jobs = [
-        Job(
-            job_id="j1",
-            session_id="s",
-            wave_id=1,
-            parent_job_id=None,
-            job_type="research",
-            owner="agent",
-            status="failed",
-        ),
-        Job(
-            job_id="j2",
-            session_id="s",
-            wave_id=1,
-            parent_job_id=None,
-            job_type="research",
-            owner="agent",
-            status="completed",
-        ),
-    ]
-
-    def _repo_fake(*a: object, **k: object) -> object:
-        return _FakeRepo(sess, jobs)
-
-    def _traces_list(session_id: str | None = None) -> list[TraceHeader]:
-        return traces
-
-    monkeypatch.setattr(repo_mod, "ResearchRepository", _repo_fake)
-    monkeypatch.setattr(traces_mod, "list_traces", _traces_list)
-    monkeypatch.setattr(
-        traces_mod,
-        "get_trace_events",
-        _evts_get_sec,
-    )
-
-
-def _eval_sess(answer: str, status: str) -> ResearchSession:
-    return ResearchSession(
-        session_id="s",
-        created_at=datetime(2026, 1, 2, tzinfo=UTC),
-        updated_at=datetime(2026, 1, 2, tzinfo=UTC),
-        query="q",
-        objective="o",
-        status=status,
-        final_result={"answer": answer},
-    )
-
-
-def test_evaluate_and_record_with_trace(monkeypatch: pytest.MonkeyPatch):
-    _eval_patient(
-        monkeypatch,
-        [
-            TraceHeader(
-                trace_id="t",
-                session_id="s",
-                wave_id=1,
-                provider="p",
-                model="m",
-                prompt_version="v1",
-                harness_version="h",
-                git_sha="g",
-                started_at="t",
-                completed_at=None,
-                duration_ms=None,
-                conclusion=None,
-                status="done",
-            )
-        ],
-        _eval_sess("A", "completed"),
-    )
-    out = vas.evaluate_and_record(_g2_scenario(), {"session_id": "s", "evidence_ids": ["e1", 5]}, 5.0)
-    assert out.answer_text == "A" and out.tool_calls == ("get_sec_document",)
-    assert out.evidence_ids == ("e1",) and out.recovered_count == 1
-
-
-def test_evaluate_and_record_no_trace(monkeypatch: pytest.MonkeyPatch):
-    _eval_patient(monkeypatch, [], _eval_sess("", "running"))
-    out = vas.evaluate_and_record(_g2_scenario(), {"session_id": "s"}, 5.0)
-    assert out.tool_calls == () and out.recovered_count == 0
-
-
 # ---- verify_judge._run_attempts (cc5, needs >=42%) ----
 
 
@@ -1756,19 +1098,11 @@ def _fake_dirs(root: Path):
     return _dirs
 
 
-def _research_a() -> list[str]:
-    return ["a"]
-
-
-def _research_thesis() -> list[str]:
-    return ["thesis_create"]
-
-
 def _seed_ctx(scenario: J.Scenario, store: Path, prompt: str) -> tuple[str, dict[str, object] | None]:
     return (prompt + " ctx", None)
 
 
-def _eval_good(scenario: J.Scenario, answer: str, db: object) -> tuple[bool, str]:
+def _eval_good(scenario: J.Scenario, answer: str, db: Path, session_id: str, terminal: bool) -> tuple[bool, str]:
     return (True, "good")
 
 
@@ -1836,8 +1170,8 @@ def _rep_true_s(sets: dict[str, set[str]]) -> bool:
     return True
 
 
-def _session_s1(store_dir: Path) -> str | None:
-    return "s1"
+def _outcome_s1(db_path: Path) -> tuple[str, bool]:
+    return "s1", True
 
 
 def _sessions_2(db: Path) -> list[str]:
@@ -1945,7 +1279,7 @@ def test_judge_run_scenario_live_ok(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         return (tmp_path / "db", False, " ans ", "", 0)
 
     monkeypatch.setattr(J, "_run_attempts", _attempts_ok_tmp)
-    monkeypatch.setattr(J, "_read_session_id", _session_s1)
+    monkeypatch.setattr(J, "_read_attempt_outcome", _outcome_s1)
 
     def _persist_a_tmp(*a: object) -> Path | None:
         return tmp_path / "a.md"
@@ -1972,7 +1306,9 @@ def test_judge_run_scenario_live_attempt_error(monkeypatch: pytest.MonkeyPatch, 
 
     monkeypatch.setattr(J, "persist_answer", _persist_a_tmp)
 
-    def _eval_bad(scenario: J.Scenario, answer: str, store_dir: Path) -> tuple[bool, str]:
+    def _eval_bad(
+        scenario: J.Scenario, answer: str, store_dir: Path, session_id: str, terminal: bool
+    ) -> tuple[bool, str]:
         return (False, "bad reason")
 
     monkeypatch.setattr(J, "_evaluate_live", _eval_bad)
@@ -2081,10 +1417,6 @@ def test_judge_main_live_gate(monkeypatch: pytest.MonkeyPatch):
 
 
 # ---- sandbox_doctor.check_policy (cc4, needs >=28%) ----
-
-
-def _proc(code: int = 0, out: str = "", err: str = ""):
-    return SimpleNamespace(returncode=code, stdout=out, stderr=err)
 
 
 # ---- export_harness_viewer.main (cc3, needs >=12%) ----
@@ -2238,135 +1570,6 @@ def test_escape_namespaced_decorator_branches():
     assert c.hits == []
 
 
-def test_build_success_does_not_invent_a_budget_cap():
-    """Unlimited live research must not trip budget-violation on depth alone."""
-    from app.research.evals.evaluators import evaluate
-
-    sc = _g2_scenario(name="n", as_of="2024-01-01", requires_evidence=True)
-    deep = vas._build_success_input(sc, "ans", ["get_sec_document"] * 100, [], "completed", ("e",), 1.0)
-    assert deep.budget_used == 100 and deep.budget_cap == 0
-    assert "budget-violation" not in evaluate(deep).violations
-    # A cap the run was actually given still trips the rule.
-    capped = vas._build_success_input(
-        sc, "ans", ["get_sec_document"] * 100, [], "completed", ("e",), 1.0, tool_call_cap=60
-    )
-    assert "budget-violation" in evaluate(capped).violations
-
-
-def test_live_trace_fields_reach_the_evaluator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A live verdict must see the run's real trace: branch coverage, opened docs, ledger kinds."""
-    from app.research.director import DirectorBudgets
-    from app.research.evals.scenarios import get_scenario
-    from app.research.repository import ResearchRepository
-    from app.research.runner import _LiveRun
-
-    monkeypatch.setenv("RESEARCH_DB_PATH", str(tmp_path / "r.sqlite"))
-    repo = ResearchRepository()
-    run = _LiveRun(
-        repo, "q?", "o", "2026-08-10", "NVDA", [], lambda name, args: {}, lambda prompt: "[]", DirectorBudgets()
-    )
-    sid = run._create_session("q?", "2026-08-10", None)
-    for eid, kind in (("ev:1", "evidence"), ("ev:2", "discovery")):
-        repo.save_evidence({"evidence_id": eid, "session_id": sid, "wave_id": 1, "record_kind": kind})
-    scenario = get_scenario("msft-openai-bankruptcy-sec-only")
-    # Only ids the run advertises for citation count as raw: the trace gate compares
-    # them against the same advertised set, so a wider ledger read would fail it falsely.
-    trace = vas._live_trace(scenario, repo, sid, repo.list_jobs(sid), ("ev:1", "ev:2"))
-    assert trace["requires_trace"] is True
-    assert trace["raw_evidence_ids"] == ("ev:1",) and trace["navigation_evidence_ids"] == ("ev:2",)
-    assert vas._live_trace(scenario, repo, sid, [], ("ev:2",))["raw_evidence_ids"] == ()
-    built = vas._build_success_input(
-        scenario, "answer", ["get_sec_document"], repo.list_jobs(sid), "researching", ("ev:1",), 1.0, 0, trace
-    )
-    assert built.raw_evidence_ids == ("ev:1",) and built.requires_trace is True
-    # The branch gate reads the run's real branch coverage, not just the answer prose.
-    telemetry_branches = vas._build_success_input(
-        scenario, "answer", [], [], "researching", ("ev:1",), 1.0, 0, {**trace, "branches_covered": ["orcl"]}
-    )
-    assert telemetry_branches.branches_covered == ("orcl",)
-
-
-def test_live_builder_carries_existing_trace_fields_without_invention() -> None:
-    """Every supported trace field reaches EvalInput unchanged; mistyped trace stays empty."""
-    sc = _g2_scenario(name="msft-openai-bankruptcy-sec-only", as_of="2026-08-10", requires_evidence=True)
-    trace = {
-        "requires_trace": True,
-        "trace_present": True,
-        "filings_opened": ["0000789019-26-000057"],
-        "documents_opened": ["0000789019-26-000057|msft.htm"],
-        "passages_opened": ["0000789019-26-000057|msft.htm|p18"],
-        "raw_evidence_ids": ["EV-1"],
-        "navigation_evidence_ids": ["sec-search:1"],
-        "claims": [
-            {"text": "MSFT 10-K discloses the marks", "claim_type": "observed_fact", "rendered_as": "observed_fact"}
-        ],
-        "claims_by_type": {"observed_fact": 1, "inference": True},
-        "trace_searches": ["sec-search:1"],
-        "material_channels": ["azure"],
-        "branches_covered": ["coreweave"],
-        "waves": ["rs:x:1:freeze"],
-        "roles_completed": ["stockbot", "bullbot", "bearbot"],
-        "limitations": ["SEC-only policy."],
-        "coverage_complete": False,
-        "universal_absence_claims": ["SpaceX has no relationship with OpenAI"],
-        "committee_freeze_ids": ["rs:x:1:freeze"] * 3,
-    }
-    built = vas._build_success_input(sc, "answer", ["get_sec_document"], [], "researching", ("EV-1",), 1.0, 0, trace)
-    assert built.passages_opened == ("0000789019-26-000057|msft.htm|p18",)
-    assert built.claims == (("MSFT 10-K discloses the marks", "observed_fact", "observed_fact"),)
-    assert built.claims_by_type == {"observed_fact": 1}
-    assert built.trace_searches == ("sec-search:1",)
-    assert built.material_channels == ("azure",) and built.branches_covered == ("coreweave",)
-    assert built.limitations == ("SEC-only policy.",) and built.coverage_complete is False
-    assert built.universal_absence_claims == ("SpaceX has no relationship with OpenAI",)
-    fixture_trace = {**trace, "searches": ["sec-search:1"]}
-    fixture_trace.pop("trace_searches")
-    assert vas._build_success_input(
-        sc, "answer", [], [], "researching", ("EV-1",), 1.0, 0, fixture_trace
-    ).trace_searches == ("sec-search:1",)
-    bad = vas._build_success_input(
-        sc,
-        "answer",
-        [],
-        [],
-        "researching",
-        ("EV-1",),
-        1.0,
-        0,
-        {"claims": "junk", "claims_by_type": [], "coverage_complete": "yes", "trace_present": True},
-    )
-    assert bad.claims == () and bad.claims_by_type == {} and bad.coverage_complete is True
-
-
-def test_row_provenance_narrows_raw_rows():
-    """Only an evidence row with a real accession is provenance for an opened filing."""
-    assert vas._row_provenance("not-a-row") is None
-    assert vas._row_provenance({"record_kind": "discovery", "metadata": {"accession_no": "1"}}) is None
-    assert vas._row_provenance({"record_kind": "evidence", "metadata": "junk"}) is None
-    assert vas._row_provenance({"record_kind": "evidence", "metadata": {"accession_no": ""}}) is None
-    assert vas._row_provenance({"record_kind": "evidence", "metadata": {"accession_no": 7}}) is None
-    assert vas._row_provenance(
-        {"record_kind": "evidence", "metadata": {"accession_no": "1", "document_name": "d.htm"}}
-    ) == ("1", "d.htm")
-
-
-def test_ledger_documents_keeps_row_order_without_duplicates():
-    """Opened filings/documents are read off the raw rows, deduped in first-seen order."""
-    repo = FakeRepo(
-        evidence=[
-            {"record_kind": "evidence", "metadata": {"accession_no": "0001", "document_name": "10-q.htm"}},
-            {"record_kind": "evidence", "metadata": {"accession_no": "0001", "document_name": "10-q.htm"}},
-            {"record_kind": "evidence", "metadata": {"accession_no": "0001", "document_name": "8-k.htm"}},
-            {"record_kind": "evidence", "metadata": {"accession_no": "0003"}},
-            {"record_kind": "discovery", "metadata": {"accession_no": "0002", "document_name": "nav.htm"}},
-            {"record_kind": "evidence", "metadata": {"document_name": "no-accession.htm"}},
-        ]
-    )
-    filings, documents = vas._ledger_documents(repo, "s")
-    assert filings == ("0001", "0003")
-    assert documents == ("0001|10-q.htm", "0001|8-k.htm")
-
-
 def test_kernel_calls_tool_and_discovery_branches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """_kernel_calls pins provenance, default, discovery, and dedup branches."""
     monkeypatch.delenv("RESEARCH_DB_PATH", raising=False)
@@ -2487,7 +1690,7 @@ def test_kernel_calls_tool_and_discovery_branches(tmp_path: Path, monkeypatch: p
     calls, discovery = J._kernel_calls(repo, sid, ev_known)
     by_id = {(c.get("tool_call_id") or ""): c for c in calls}
     assert set(by_id) == {"ev-prov-sec", "ev-default", "ev-toolkey", "ev-prov-none", "ev-plain", "tr-new"}
-    assert by_id["ev-prov-sec"]["tool"] == "get_fundamentals" and by_id["ev-prov-sec"]["domain"] == "SEC"
+    assert by_id["ev-prov-sec"]["tool"] == "get_fundamentals" and by_id["ev-prov-sec"]["domain"] == "fundamentals"
     assert by_id["ev-prov-sec"]["known_at"] == "2026-08-02"
     assert by_id["ev-default"]["tool"] == "evidence"
     assert by_id["ev-toolkey"]["domain"] == "fundamentals"
@@ -2568,27 +1771,78 @@ def test_kernel_evidence_text_and_known_at_branches(tmp_path: Path, monkeypatch:
     assert "ev-nodate" not in known
 
 
-def test_kernel_final_answer_branches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """_kernel_final_answer pins missing, non-dict, non-string, and valid branches."""
+def test_evidence_text_includes_cited_provenance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The record an answer cites (provenance.record_identity) is judged as evidence."""
     monkeypatch.delenv("RESEARCH_DB_PATH", raising=False)
-    from dataclasses import replace
-
     from app.research import session as _research_session
 
-    repo = ResearchRepository(data_root=tmp_path / "kernel_final_store")
-    sess = _research_session.create_session("q?", "o", session_id="s-kernel-final")
+    repo = ResearchRepository(data_root=tmp_path / "cited_store")
+    sess = _research_session.create_session("q?", "o", session_id="s-cited")
     repo.save_session(sess)
-    assert J._kernel_final_answer(repo, "missing") == ""
-    repo.save_session(replace(sess, final_result={"answer": "done"}))
-    assert J._kernel_final_answer(repo, sess.session_id) == "done"
-    repo.save_session(replace(sess, final_result={"answer": 7}))
-    assert J._kernel_final_answer(repo, sess.session_id) == ""
+    sid = sess.session_id
+    repo.save_evidence(
+        {
+            "evidence_id": "ev-cited",
+            "session_id": sid,
+            "wave_id": 1,
+            "record_kind": "evidence",
+            "tool_name": "get_transaction_status",
+            "content": "content: source: SEC EDGAR subject: MSFT count: 1 - event_id :merger:0001193125-24-118081",
+            "provenance": {
+                "kind": "sec_record",
+                "tool_name": "get_transaction_status",
+                "record_identity": '{"competing_offer": false, "filer_name": "MICROSOFT CORP", "status": "terminated"}',
+            },
+        }
+    )
+    texts, _known = J._kernel_evidence(repo, sid)
+    cited = texts["ev-cited"]
+    assert "terminated" in cited and "MICROSOFT CORP" in cited
+    answer = "The deal status is terminated, with no competing offer. The filer is MICROSOFT CORP."
+    assert J._grounded_in_evidence(answer, [cited], "What is the status of Microsoft's deal?") is True
 
-    def _nondict_session(_sid: str) -> SimpleNamespace:
-        return SimpleNamespace(final_result=["not-a-dict"])
 
-    monkeypatch.setattr(repo, "get_session", _nondict_session)
-    assert J._kernel_final_answer(repo, sess.session_id) == ""
+def test_decision_calls_skip_disabled_outcome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 'status: disabled' attempt is a failed call; an empty-but-ok result stays a success."""
+    monkeypatch.delenv("RESEARCH_DB_PATH", raising=False)
+    from app.research import session as _research_session
+
+    repo = ResearchRepository(data_root=tmp_path / "decision_store")
+    sess = _research_session.create_session("q?", "o", session_id="s-decisions")
+    repo.save_session(sess)
+    sid = sess.session_id
+    outcomes = (
+        ("d-disabled", "content: source: trends status: disabled reason: google data disabled"),
+        ("d-empty", ""),
+        ("d-done", "content: source: SEC EDGAR\nmeta: row_count: 1, status: completed"),
+    )
+    for decision_id, summary in outcomes:
+        repo.save_decision(
+            DecisionRecord(
+                decision_id=decision_id,
+                session_id=sid,
+                node_id=None,
+                job_id=None,
+                decision_type="node_attempt",
+                candidates={},
+                probabilities={},
+                selected={"tool": "get_trend_evidence", "error": None, "outcome_summary": summary},
+            )
+        )
+    calls = J._decision_calls(repo, sid, {})
+    assert len(calls) == 2  # the disabled attempt is dropped
+    assert {call["tool"] for call in calls} == {"get_trend_evidence"}
+
+
+def test_evidence_call_domain_uses_lowercase_family() -> None:
+    """Unregistered evidence rows carry the lowercase provenance family; registry domain wins."""
+    assert J._evidence_call_domain({"provenance": {"kind": "sec_source"}}, "evidence") == "sec"
+    assert J._evidence_call_domain({"provenance": {"kind": "finra_record"}}, "evidence") == "finra"
+    assert J._evidence_call_domain({"provenance": {"kind": "web_source"}}, "evidence") == "web"
+    assert J._evidence_call_domain({"provenance": {"kind": "none"}}, "evidence") == ""
+    assert J._evidence_call_domain({"provenance": {"kind": "sec_source"}}, "get_fundamentals") == "fundamentals"
+    doc_row = {"evidence_id": "ev-doc", "provenance": {"kind": "sec_source"}}
+    assert J._evidence_research_call(doc_row, "evidence", {})["domain"] == "sec"
 
 
 # ---- slice_hedgefund_live_tests.py ----
@@ -2931,140 +2185,6 @@ def test_missing_env_lists_credentials_then_missing_opt_in(monkeypatch: pytest.M
     assert hl._missing_env() == ["EXA_ENABLED=1"]
 
 
-def test_hedgefund_parse_args_defaults() -> None:
-    args = hl.parse_args([])
-    assert args.scenario == hl.GOLDEN_SCENARIO
-    assert args.prompt_version == "v1"
-    assert args.json is False
-    assert args.model is None and args.provider is None and args.model_timeout is None
-
-
-def test_hedgefund_main_requires_opt_in(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    monkeypatch.delenv("HEDGEFUND_LIVE", raising=False)
-    assert hl.main([]) == 2
-    assert "HEDGEFUND_LIVE=1" in capsys.readouterr().err
-
-
-def test_hedgefund_main_reports_missing_credentials(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setenv("HEDGEFUND_LIVE", "1")
-    for name in (*hl.REQUIRED_ENV, "EXA_ENABLED"):
-        monkeypatch.delenv(name, raising=False)
-    assert hl.main([]) == 2
-    assert "missing SEC_EDGAR_IDENTITY, FINRA_CLIENT_ID, FINRA_CLIENT_SECRET, EXA_API_KEY, EXA_ENABLED=1" in (
-        capsys.readouterr().err
-    )
-
-
-def _live_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HEDGEFUND_LIVE", "1")
-    monkeypatch.setenv("EXA_ENABLED", "1")
-    for name in hl.REQUIRED_ENV:
-        monkeypatch.setenv(name, "live-test")
-
-
-def _live_provider_model(provider: str | None, model: str | None, env: object = None) -> tuple[str, str]:
-    return ("anthropic", "claude")
-
-
-def _live_model_timeout(raw: str | None, env: object = None) -> int:
-    return 42
-
-
-def _golden_scenario_map() -> dict[str, object]:
-    return {hl.GOLDEN_SCENARIO: "scenario"}
-
-
-def _empty_scenario_map() -> dict[str, object]:
-    return {}
-
-
-def _no_violations(name: str) -> list[str]:
-    return []
-
-
-def _one_violation(name: str) -> list[str]:
-    return ["golden-no-session-persisted"]
-
-
-def _stub_live_verdict(
-    monkeypatch: pytest.MonkeyPatch, passed: bool, violations: tuple[str, ...]
-) -> list[tuple[object, ...]]:
-    import scripts.verify_agent_scenarios as live_mod
-
-    calls: list[tuple[object, ...]] = []
-    monkeypatch.setattr(live_mod, "resolve_provider_model", _live_provider_model)
-    monkeypatch.setattr(live_mod, "resolve_model_timeout", _live_model_timeout)
-    monkeypatch.setattr(live_mod, "_scenario_map", _golden_scenario_map)
-
-    def _eval(
-        scenario_name: str, by_name: object, provider: str, model: str, prompt_version: str, timeout_s: int
-    ) -> object:
-        calls.append((scenario_name, by_name, provider, model, prompt_version, timeout_s))
-        return SimpleNamespace(scenario_name=scenario_name, passed=passed, violations=violations)
-
-    monkeypatch.setattr(live_mod, "_eval_one_scenario", _eval)
-    return calls
-
-
-def test_hedgefund_main_records_pass_and_prints_json(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    import scripts.export_harness_viewer as viewer_mod
-
-    _live_env(monkeypatch)
-    calls = _stub_live_verdict(monkeypatch, True, ())
-    monkeypatch.setattr(hl, "_live_structural", _no_violations)
-    exported: list[object] = []
-
-    def _export(argv: list[str] | None = None) -> int:
-        exported.append(argv)
-        return 0
-
-    monkeypatch.setattr(viewer_mod, "main", _export)
-
-    assert hl.main(["--json", "--prompt-version", "v2"]) == 0
-    out = capsys.readouterr().out
-    assert out.startswith(f"PASS {hl.GOLDEN_SCENARIO} (live golden via real SEC/FINRA/Exa)")
-    assert json.loads(out[out.index("{") :]) == {"scenario": hl.GOLDEN_SCENARIO, "passed": True, "violations": []}
-    assert calls == [(hl.GOLDEN_SCENARIO, {hl.GOLDEN_SCENARIO: "scenario"}, "anthropic", "claude", "v2", 42)]
-    assert exported == [[]]
-
-
-def test_hedgefund_main_reports_failures_and_survives_export_error(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    import scripts.export_harness_viewer as viewer_mod
-
-    _live_env(monkeypatch)
-    _stub_live_verdict(monkeypatch, False, ("bad-answer",))
-    monkeypatch.setattr(hl, "_live_structural", _one_violation)
-
-    def _boom(argv: list[str] | None = None) -> int:
-        raise RuntimeError("no viewer")
-
-    monkeypatch.setattr(viewer_mod, "main", _boom)
-    assert hl.main([]) == 1
-    captured = capsys.readouterr()
-    assert captured.out.startswith(f"FAIL {hl.GOLDEN_SCENARIO}")
-    assert "violations: bad-answer, golden-no-session-persisted" in captured.err
-    assert "viewer export failed: no viewer" in captured.err
-
-
-def test_hedgefund_main_rejects_unknown_scenario(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    import scripts.verify_agent_scenarios as live_mod
-
-    _live_env(monkeypatch)
-    monkeypatch.setattr(live_mod, "resolve_provider_model", _live_provider_model)
-    monkeypatch.setattr(live_mod, "resolve_model_timeout", _live_model_timeout)
-    monkeypatch.setattr(live_mod, "_scenario_map", _empty_scenario_map)
-    assert hl.main(["--scenario", "nope"]) == 2
-    assert "unknown scenario: 'nope'" in capsys.readouterr().err
-
-
 def test_live_structural_skips_other_scenarios(monkeypatch: pytest.MonkeyPatch) -> None:
     def _unreachable(*args: object, **kwargs: object) -> object:
         raise AssertionError("repository must not be built for another scenario")
@@ -3197,88 +2317,6 @@ def test_collect_final_falls_back_to_legacy_keys_and_drops_mistyped_fields() -> 
     assert out["sources"] == [] and out["coverage"] == {} and out["allowedSources"] == []
     assert out["bullCase"] == "None" and out["bearCase"] == ""
     assert out["freezeId"] == "" and out["asOf"] == ""
-
-
-# ---- slice_agent_kernel_scenario_tests.py ----
-"""scripts/verify_agent_scenarios._run_kernel_scenario: production kernel path, fakes only."""
-
-
-def test_run_kernel_scenario_records_kernel_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    import os
-
-    from app.research import scheduler, service
-
-    sc = _g2_scenario(name="kernel-live", question="What drove NVDA?", notes="nvda notes")
-    calls: list[tuple[object, ...]] = []
-    eval_calls: list[tuple[Scenario, dict[str, object], float, int]] = []
-    closed: list[str] = []
-    node = SimpleNamespace(session_id="", question="", why_it_matters="")
-
-    def _create_research(
-        question: str,
-        objective: str | None = None,
-        *,
-        as_of: str | None = None,
-        policy: object = None,
-        repo: object = None,
-        ticker: str | None = None,
-    ) -> str:
-        calls.append(("research", question, objective, as_of, repo, ticker))
-        return "sid-1"
-
-    def _create_node(
-        session_id: str, question: str, why_it_matters: str, depends_on: object = None, *, repo: object = None
-    ) -> SimpleNamespace:
-        calls.append(("node", session_id, question, why_it_matters, depends_on, repo))
-        node.session_id = session_id
-        node.question = question
-        node.why_it_matters = why_it_matters
-        return node
-
-    async def _run_node(*args: object, **kwargs: object) -> None:
-        calls.append(("run", *args, kwargs))
-
-    sentinel = vas._crash_eval_input(sc, 1.0)
-
-    def _record_eval(scenario: Scenario, out: dict[str, object], wall_ms: float, tool_call_cap: int = 0) -> object:
-        eval_calls.append((scenario, out, wall_ms, tool_call_cap))
-        return sentinel
-
-    monkeypatch.setattr(service, "create_research", _create_research)
-    monkeypatch.setattr(service, "create_node", _create_node)
-    monkeypatch.setattr(scheduler, "run_node", _run_node)
-    monkeypatch.setattr(vas, "_close_bootstrap_jobs", closed.append)
-    monkeypatch.setattr(vas, "evaluate_and_record", _record_eval)
-    before_db = os.environ.get("RESEARCH_DB_PATH")
-
-    assert vas._run_kernel_scenario(sc, "p", "m", "v1", 300) is sentinel
-    assert closed == ["sid-1"]
-    assert os.environ.get("RESEARCH_DB_PATH") == before_db
-    assert calls[0] == ("research", "What drove NVDA?", "nvda notes", None, None, None)
-    assert calls[1][:4] == ("node", "sid-1", "What drove NVDA?", "Route question.")
-    assert calls[2][0] == "run" and calls[2][1] is node
-    [(eval_scenario, out, wall_ms, cap)] = eval_calls
-    assert eval_scenario is sc
-    assert out == {"session_id": "sid-1", "evidence_ids": []}
-    # 0 = unlimited: kernel research has no static tool-call cap.
-    assert cap == 0 and wall_ms >= 0.0
-
-
-def test_run_kernel_scenario_reports_crash(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    from app.research import service
-
-    sc = _g2_scenario(name="kernel-crash", requires_evidence=False)
-
-    def _boom(*args: object, **kwargs: object) -> str:
-        raise RuntimeError("no kernel")
-
-    monkeypatch.setattr(service, "create_research", _boom)
-    result = vas._run_kernel_scenario(sc, "p", "m", "v1", 300)
-    assert result.scenario_name == "kernel-crash"
-    assert result.scenario_crashed is True
-    assert result.failed_count == 1 and result.answer_text == ""
-    assert result.requires_evidence is False
-    assert "CRASH RuntimeError: no kernel" in capsys.readouterr().err
 
 
 # ---- scripts/verify_e2e.py: SSE fold + limits (canned bytes, no network) ----

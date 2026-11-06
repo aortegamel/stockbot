@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
-"""Opt-in live golden scenario: real SEC + FINRA + Exa only (never CI).
-
-Runs one golden question through the production kernel path and exports the
-read-only web projection. Requires reachable credentials (same prerequisites
-as scripts/verify_agent_scenarios.py):
-
-This script performs real network calls and is NEVER run by CI. Invoke only:
-  HEDGEFUND_LIVE=1 venv/bin/python scripts/verify_hedgefund_live.py [--scenario NAME] [--json]
-Without HEDGEFUND_LIVE=1 it exits 2 with an explicit opt-in message.
-"""
+"""Offline golden-session structure and live evaluation credential checks."""
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
@@ -292,71 +282,3 @@ def _live_structural(scenario_name: str) -> list[str]:
     _ok, failures, summary = golden_structure(sid)
     print(f"golden structure: {json.dumps(summary, sort_keys=True)}")
     return [f"golden-{failure}" for failure in failures]
-
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", default=GOLDEN_SCENARIO, help="live golden scenario name")
-    parser.add_argument("--model", default=None, help="model ID recorded (or STOCKBOT_MODEL)")
-    parser.add_argument("--provider", default=None, help="provider recorded (or STOCKBOT_PROVIDER)")
-    parser.add_argument("--model-timeout", default=None, help="per-call model timeout seconds")
-    parser.add_argument("--prompt-version", default="v1", help="prompt version stamp")
-    parser.add_argument("--json", action="store_true", help="print machine-readable summary")
-    return parser.parse_args(argv)
-
-
-def _live_skip_reason() -> str | None:
-    """Keep the opt-in check ahead of the credential check."""
-    if (os.getenv("HEDGEFUND_LIVE") or "").strip() != "1":
-        return "SKIP hedgefund live golden: set HEDGEFUND_LIVE=1 to opt in (never CI)."
-    missing = _missing_env()
-    if missing:
-        return f"SKIP hedgefund live golden: missing {', '.join(missing)}."
-    return None
-
-
-def _export_viewer() -> None:
-    """Refresh the web projection; export never changes the verdict."""
-    try:
-        import scripts.export_harness_viewer as viewer
-
-        viewer.main([])
-    except Exception as exc:  # noqa: BLE001 - export is best-effort after the verdict
-        print(f"viewer export failed: {exc}", file=sys.stderr)
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    skip = _live_skip_reason()
-    if skip:
-        print(skip, file=sys.stderr)
-        return 2
-    import scripts.verify_agent_scenarios as live
-
-    provider, model = live.resolve_provider_model(args.provider, args.model, os.environ)
-    timeout_s = live.resolve_model_timeout(args.model_timeout, os.environ)
-    by_name = live._scenario_map()
-    if args.scenario not in by_name:
-        print(f"unknown scenario: {args.scenario!r}", file=sys.stderr)
-        return 2
-    result = live._eval_one_scenario(args.scenario, by_name, provider, model, args.prompt_version, timeout_s)
-    structural = _live_structural(args.scenario)
-    violations = [*result.violations, *structural]
-    passed = result.passed and not structural
-    print(f"{'PASS' if passed else 'FAIL'} {result.scenario_name} (live golden via real SEC/FINRA/Exa)")
-    if violations:
-        print(f"violations: {', '.join(violations)}", file=sys.stderr)
-    _export_viewer()
-    if args.json:
-        print(
-            json.dumps(
-                {"scenario": result.scenario_name, "passed": passed, "violations": violations},
-                indent=2,
-                sort_keys=True,
-            )
-        )
-    return 0 if passed else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

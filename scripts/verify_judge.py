@@ -24,12 +24,13 @@ answer-side only and is not proof of end-to-end injection resistance
 (future work). injection_in_evidence is answer-side-only until a seeded fixture exists.
 
 Auditable answer artifact: agent_runs stores only final_answer_hash, so the
-live runner captures the terminal answer from the kernel attempt, persists a
-REDACTED copy as <attempt_dir>/<run_id>.answer.md, and evaluates that text
-(grounding/limitation/fabrication checks need text, not a hash). Evidence
-table rendered_text covers tool output; the answer file covers the response.
+live runner captures the terminal answer from POST /api/agent (research mode),
+persists a REDACTED copy as <attempt_dir>/<run_id>.answer.md, and evaluates
+that text (grounding/limitation/fabrication checks need text, not a hash).
+Evidence table rendered_text covers tool output; the answer file covers the
+response.
 
-The live runner passes scenario["prompt"] VERBATIM to Pi: no appended
+The live runner passes scenario["prompt"] VERBATIM to the agent: no appended
 "first call search_tools then browse then call_tool exactly once"
 instructions. stdlib + first-party app imports only.
 Ontology-coupling standard: require what evidence answers the question;
@@ -40,14 +41,20 @@ never treat one blessed output_kind combination as the only route.
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
 import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
+import threading
+import urllib.error
+import urllib.request
 from decimal import Decimal, InvalidOperation
-from signal import SIG_DFL, SIGPIPE
+from signal import SIG_DFL, SIGKILL, SIGPIPE, SIGTERM
 from signal import signal as _handle_signal
 
 
@@ -65,10 +72,11 @@ def restore_default_sigpipe() -> None:
 
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NotRequired, TypedDict
+from typing import NotRequired, Protocol, TypedDict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -322,7 +330,9 @@ SCENARIOS: list[Scenario] = [
         "prompt": "Is Microsoft overvalued? Compare its valuation multiples against reported fundamentals.",
         "requires_research": True,
         "acceptable_domains": ["valuation", "fundamentals"],
-        "required_evidence_kinds": ["derived_snapshot", "metric_snapshot"],
+        "required_evidence_kinds": ["derived_snapshot"],
+        # "Reported fundamentals" names no metric: a reported statement answers it as well as a metric snapshot.
+        "required_evidence_any": [["metric_snapshot"], ["statement"]],
         "forbidden_tools": [],
         "max_external_calls": 16,
         "as_of": "2026-09-01",
@@ -986,7 +996,7 @@ def _overlap_for_text(
 ) -> tuple[int, int, set[str], set[str], bool]:
     """Per-text overlap counts plus close-number flag."""
     e_nums, e_tick, e_longs, e_med = _substantive_tokens(e_text)
-    close = any(_num_close(a, e) for a in a_nums for e in e_nums)
+    close = any(_claim_close(a, e) for a in a_nums for e in e_nums)
     return (
         len(a_nums & e_nums),
         len(a_tick & e_tick),
@@ -1140,9 +1150,29 @@ def _num_norm(value: str) -> str:
     return scaled if scaled is not None else _trim_decimal_zeros(norm)
 
 
+def _stated_tolerance(norm: str) -> Decimal:
+    """Half a unit in the last stated digit of an integer ending in >= 3 zeros.
+
+    5400000 states its 10^5 digit, so it asserts +/-50000; 1450000 states its
+    10^4 digit, so it asserts +/-5000. An integer without trailing zeros
+    states its units digit and carries no rounding band. Stateless: the answer
+    and the evidence value each declare their own precision.
+    """
+    if "." in norm or not norm.isdigit():
+        return Decimal(0)
+    trailing = len(norm) - len(norm.rstrip("0"))
+    if trailing < 3:
+        return Decimal(0)
+    # Capped at 1% of the value: "5 million" may round 4,960,000 but never 4,600,000.
+    return min(Decimal("0.5") * Decimal(10) ** trailing, Decimal(norm) / 100)
+
+
 def _num_close(a: str, b: str) -> bool:
     """Numerically close: 0.5% relative tolerance, or absolute half-ULP of
-    the stated precision (0.72 covers 0.7247; integers cover ±0.5)."""
+    the stated precision (0.72 covers 0.7247; integers cover ±0.5).
+
+    Symmetric: use _claim_close when one operand is the answer's claim.
+    """
     from decimal import Decimal, InvalidOperation
 
     try:
@@ -1158,6 +1188,26 @@ def _num_close(a: str, b: str) -> bool:
         half_ulp = Decimal("0.5") / (Decimal(10) ** places)
         return abs(da - db) <= half_ulp
     return abs(da - db) <= Decimal("0.5")
+
+
+def _claim_close(claimed: str, evidence: str) -> bool:
+    """Answer value against evidence value: the claim may round, the data may not.
+
+    The rounding band belongs to the value the answer states, so '5.4 million'
+    (5400000 +/- 50000) covers evidence 5357897, while an exact evidence
+    5000000 never excuses an answer of 4600000.
+    """
+    if _num_close(claimed, evidence):
+        return True
+    band = _stated_tolerance(claimed)
+    if not band:
+        return False
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        return abs(Decimal(claimed) - Decimal(evidence)) <= band
+    except InvalidOperation:
+        return False
 
 
 _SCALE_STEPS = (1000, 1000000, 1000000000, 1000000000000)
@@ -1207,7 +1257,7 @@ def _answer_dollar_values(answer: str) -> set[str]:
 
 
 def _pool_close(o: str, pool: set[str]) -> bool:
-    return o in pool or any(_num_close(o, p) for p in pool)
+    return o in pool or any(_claim_close(o, p) for p in pool)
 
 
 def _operand_resolved(o: str, pool: set[str], backed: set[str]) -> bool:
@@ -1227,7 +1277,7 @@ def _scaled_peer(norm: str, backed: set[str]) -> bool:
     d = _small_positive_decimal(norm)
     if d is None:
         return False
-    return any(_num_close(f"{d * m}", b) for m in _SCALE_STEPS for b in backed)
+    return any(_claim_close(f"{d * m}", b) for m in _SCALE_STEPS for b in backed)
 
 
 def _scaled_digits_match(d: Decimal, pool: set[str]) -> bool:
@@ -1576,7 +1626,7 @@ def _prompt_value_pool(prompt: str, args_texts: list[str] | None) -> set[str]:
 
 
 def _scaled_backed(s: str, pool: set[str]) -> bool:
-    return s in pool or any(_num_close(s, o) for o in pool)
+    return s in pool or any(_claim_close(s, o) for o in pool)
 
 
 def _backed_scaled_values(answer: str, pool: set[str]) -> set[str]:
@@ -1640,7 +1690,7 @@ def _value_current_date(norm: str, ctx: _ValueContext) -> bool:
 
 
 def _value_pool_close(norm: str, ctx: _ValueContext) -> bool:
-    return any(_num_close(norm, other) for other in ctx.pool)
+    return any(_claim_close(norm, other) for other in ctx.pool)
 
 
 def _value_numeric_backed(norm: str, ctx: _ValueContext) -> bool:
@@ -1664,7 +1714,7 @@ def _value_derived_backed(norm: str, ctx: _ValueContext) -> bool:
 
 
 def _ratio_in_pool(ratio: str, ctx: _ValueContext) -> bool:
-    return any("." in q and _num_close(ratio, q) for q in ctx.pool)
+    return any("." in q and _claim_close(ratio, q) for q in ctx.pool)
 
 
 def _value_ratio_backed(norm: str, ctx: _ValueContext, pct_norms: set[str]) -> bool:
@@ -2532,15 +2582,6 @@ def _evidence_kinds_of(calls: list[ResearchCall]) -> list[str]:
     return sorted({c.get("output_kind", "") for c in calls if c.get("success") and c.get("output_kind")})
 
 
-def _session_terminal(repo: ResearchRepository, session_id: str) -> bool:
-    """Terminal flag from the attempt session status."""
-    try:
-        sess = repo.get_session(session_id)
-    except KeyError:
-        return False
-    return sess.status == "completed"
-
-
 def _known_at_of(record: object) -> str:
     """Knowability date from one kernel evidence record."""
     items: list[object] = [record]
@@ -2560,14 +2601,30 @@ def _known_at_of(record: object) -> str:
     return _evidence_known_at(text)
 
 
+_EVIDENCE_BODY_KEYS = ("content", "claim_text", "matching_passage", "record_identity")
+_EVIDENCE_CITED_KEYS = ("record_identity", "excerpt")
+
+
+def _stripped_text(value: object) -> str:
+    """Stripped string field, else ''."""
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _evidence_text_of(record: object) -> str:
-    """Model-visible text for one kernel evidence record."""
-    if isinstance(record, dict):
-        for key in ("content", "claim_text", "matching_passage", "record_identity"):
-            value = record.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return json.dumps(record, sort_keys=True, default=str)
+    """Model-visible text for one kernel evidence record: the row body plus the cited provenance fields.
+
+    provenance.record_identity (SEC/FINRA rows) and provenance.excerpt (web
+    rows) name the exact record the answer cites, so judging only the
+    rendered body grades the answer on text the citation did not show.
+    """
+    if not isinstance(record, dict):
+        return json.dumps(record, sort_keys=True, default=str)
+    body = next((t for t in map(_stripped_text, (record.get(k) for k in _EVIDENCE_BODY_KEYS)) if t), "")
+    provenance = record.get("provenance")
+    parts = [body] if body else []
+    if isinstance(provenance, dict):
+        parts += [t for t in map(_stripped_text, (provenance.get(k) for k in _EVIDENCE_CITED_KEYS)) if t]
+    return "\n".join(parts) if parts else json.dumps(record, sort_keys=True, default=str)
 
 
 def _evidence_call_tool(record: Mapping[str, object]) -> str:
@@ -2581,16 +2638,20 @@ def _evidence_call_tool(record: Mapping[str, object]) -> str:
 
 
 def _evidence_call_domain(record: Mapping[str, object], tool: str) -> str:
-    """Domain for one evidence call: provenance evidence_domain, else registry field."""
-    domain = ""
-    provenance = record.get("provenance")
-    if isinstance(provenance, dict):
-        from app.research.evidence import evidence_domain
+    """Ontology domain of the tool that produced the row; provenance family (sec/finra/web) only for unregistered tools.
 
-        domain = evidence_domain(provenance)
-    if not domain or domain == "SOURCE":
-        domain = _registry_field(_registry_meta(tool), "domain")
-    return domain
+    Provenance names the source family, not the research domain: get_fundamentals rows are
+    SEC records yet answer the 'fundamentals' domain the scenarios accept. Scenarios spell
+    domains lowercase, so an unregistered row's family is lowercased to match.
+    """
+    domain = _registry_field(_registry_meta(tool), "domain")
+    provenance = record.get("provenance")
+    if domain or not isinstance(provenance, dict):
+        return domain
+    from app.research.evidence import evidence_domain
+
+    family = evidence_domain(provenance)
+    return "" if family == "SOURCE" else family.lower()
 
 
 def _evidence_research_call(record: Mapping[str, object], tool: str, ev_known: dict[str, list[str]]) -> ResearchCall:
@@ -2652,19 +2713,78 @@ def _has_evidence_call(calls: list[ResearchCall], tool: str) -> bool:
     return any(call.get("tool") == tool and call.get("tool_call_id") for call in calls)
 
 
+_DISABLED_STATUS_RE = re.compile(r"\bstatus:\s*disabled\b")
+
+
+def _attempt_disabled(selected: Mapping[str, object]) -> bool:
+    """True when the attempt outcome summary reports a disabled data source.
+
+    An empty-but-ok result stays a success; only an explicit
+    'status: disabled' payload (for example get_trend_evidence without a
+    BigQuery project) means the call returned no evidence.
+    """
+    summary = selected.get("outcome_summary")
+    return isinstance(summary, str) and bool(_DISABLED_STATUS_RE.search(summary))
+
+
+def _decision_call(selected: Mapping[str, object], ev_known: dict[str, list[str]]) -> ResearchCall | None:
+    """ResearchCall for one successful node_attempt decision; None to skip.
+
+    Governed actions (thesis_create, journal, watch) return a receipt, not an
+    evidence row, so the attempt decision is the only record of that call.
+    """
+    tool = str(selected.get("tool") or "")
+    if not tool or tool in DISCOVERY_TOOLS or selected.get("error") is not None or _attempt_disabled(selected):
+        return None
+    meta = _registry_meta(tool)
+    domain, output_kind = _research_call_fields(tool, meta)
+    rid = str(selected.get("evidence_id") or selected.get("tool_result_ref") or "")
+    return {
+        "tool": tool,
+        "success": True,
+        "domain": domain,
+        "source": _call_source("", meta),
+        "known_at": max(ev_known.get(rid, []), default=""),
+        "limitations": [],
+        "output_kind": output_kind,
+        "tool_call_id": rid,
+    }
+
+
+def _decision_calls(repo: ResearchRepository, session_id: str, ev_known: dict[str, list[str]]) -> list[ResearchCall]:
+    """Research calls from the session's successful node_attempt decisions."""
+    calls: list[ResearchCall] = []
+    for decision in repo.list_decisions(session_id):
+        if decision.decision_type != "node_attempt" or not isinstance(decision.selected, dict):
+            continue
+        call = _decision_call(decision.selected, ev_known)
+        if call is not None:
+            calls.append(call)
+    return calls
+
+
 def _kernel_calls(
     repo: ResearchRepository, session_id: str, ev_known: dict[str, list[str]]
 ) -> tuple[list[ResearchCall], list[str]]:
-    """Research calls plus discovery texts from attempt evidence/tool results."""
+    """Research calls plus discovery texts from attempt evidence, tool results, and decisions."""
     calls, discovery_texts = _evidence_calls(repo, session_id, ev_known)
+    for candidates in (_tool_result_rows(repo, session_id, ev_known), _decision_calls(repo, session_id, ev_known)):
+        for call in candidates:
+            if not _has_evidence_call(calls, str(call["tool"])):
+                calls.append(call)
+    return calls, discovery_texts
+
+
+def _tool_result_rows(repo: ResearchRepository, session_id: str, ev_known: dict[str, list[str]]) -> list[ResearchCall]:
+    """Research calls from the session's tool-result rows."""
+    calls: list[ResearchCall] = []
     for row in repo.list_tool_results(session_id):
         if not isinstance(row, dict):
             continue
         call = _tool_result_call(row, ev_known)
-        if call is None or _has_evidence_call(calls, str(call["tool"])):
-            continue
-        calls.append(call)
-    return calls, discovery_texts
+        if call is not None:
+            calls.append(call)
+    return calls
 
 
 def _record_known_at(ev_known: dict[str, list[str]], key: str, record: object) -> None:
@@ -2734,11 +2854,11 @@ def _kernel_telemetry(repo: ResearchRepository, session_id: str) -> Telemetry:
     return tel
 
 
-def _kernel_trace(repo: ResearchRepository, trace: Trace, session_id: str) -> Trace:
+def _kernel_trace(repo: ResearchRepository, trace: Trace, session_id: str, terminal: bool) -> Trace:
     """Fill research/evidence/security sections from the attempt research DB."""
     ev_texts, ev_known = _kernel_evidence(repo, session_id)
     calls, discovery_texts = _kernel_calls(repo, session_id, ev_known)
-    trace["terminal"] = _session_terminal(repo, session_id)
+    trace["terminal"] = terminal
     trace["telemetry"] = _kernel_telemetry(repo, session_id)
     trace["research_calls"] = calls
     trace["evidence_kinds"] = _evidence_kinds_of(calls)
@@ -2750,71 +2870,20 @@ def _kernel_trace(repo: ResearchRepository, trace: Trace, session_id: str) -> Tr
     return trace
 
 
-def _walk_to_completed(repo: ResearchRepository, session_id: str) -> None:
-    """Walk the session forward to COMPLETED along legal edges; never invents a jump."""
-    from app.research import session as _session
-    from app.research.models import SessionStatus
+def build_trace(
+    store_dir: Path, scenario: Scenario, answer_text: str = "", *, session_id: str = "", terminal: bool = False
+) -> Trace:
+    """Build the evaluator trace for one kernel session in the attempt store.
 
-    order = (
-        SessionStatus.PLANNING,
-        SessionStatus.RESEARCHING,
-        SessionStatus.FREEZING,
-        SessionStatus.ANALYZING,
-        SessionStatus.SYNTHESIZING,
-        SessionStatus.COMPLETED,
-    )
-    for _ in range(8):
-        progressed = False
-        for target in order:
-            cur = repo.get_session(session_id)
-            if cur.status in ("failed", "completed", "cancelled"):
-                return
-            if cur.status == target.value:
-                continue
-            try:
-                repo.save_session(_session.transition_session(cur, target))
-                progressed = True
-                break
-            except ValueError:
-                continue
-        if not progressed:
-            return
-
-
-def _store_empty_terminal(repo: ResearchRepository, session_id: str) -> None:
-    """Persist a durable COMPLETED no-evidence result with limitations text."""
-    from dataclasses import replace
-
-    from app.research.models import utcnow, validate_json_mapping
-
-    empty = validate_json_mapping(
-        {
-            "answer": (
-                "No PIT-eligible evidence was found; the question cannot be answered "
-                "from the allowed sources within the session scope. Limitations: "
-                "searched-source scope, as_of-filtered corpus."
-            ),
-            "freeze_id": "",
-            "claims": [],
-        },
-        "<verify_judge>: 'final_result'",
-    )
-    cur = repo.get_session(session_id)
-    cur = replace(cur, final_result=empty, updated_at=utcnow())
-    repo.save_session(cur)
-    _walk_to_completed(repo, session_id)
-
-
-def build_trace(store_dir: Path, scenario: Scenario, answer_text: str = "") -> Trace:
-    """Build the evaluator trace from the attempt research DB.
-
-    final_answer comes ONLY from the caller-supplied terminal answer text
-    (kernel attempt output), persisted redacted via persist_answer. Terminal
-    state, research calls, evidence texts, and tool results all read the same
-    attempt research DB the producer wrote — never agent_runs in runs.sqlite.
+    final_answer comes ONLY from the caller-supplied answer text (the SSE
+    answer), persisted redacted via persist_answer. Terminal state comes ONLY
+    from the run outcome (the done event): the Python session never reaches
+    completed on the kernel path, so its status cannot stand in for it.
+    Research calls, evidence texts, and tool results all read the same
+    research DB the API's kernel worker wrote — never agent_runs in runs.sqlite.
     """
     trace: Trace = {
-        "terminal": False,
+        "terminal": terminal,
         "research_calls": [],
         "capability_violations": [],
         "private_transmissions": [],
@@ -2831,17 +2900,11 @@ def build_trace(store_dir: Path, scenario: Scenario, answer_text: str = "") -> T
         "evidence_kinds": [],
         "evidence_texts": {},
     }
-    try:
-        repo = ResearchRepository(data_root=store_dir)
-        session_id = _latest_session_id(repo)
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
-        return trace
-    if session_id is None:
-        return trace
-    try:
-        return _kernel_trace(repo, trace, session_id)
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
-        return trace
+    if not session_id:
+        return trace  # no evidence event, so no kernel session to read
+    # Explicit path, not data_root: an exported RESEARCH_DB_PATH must not redirect this read.
+    # A read error propagates: the worker reports it as the FAIL reason, never as an empty session.
+    return _kernel_trace(ResearchRepository(store_dir / "research.sqlite"), trace, session_id, terminal)
 
 
 # --------------------------------------------------------------------------
@@ -2898,14 +2961,14 @@ def _batch_id() -> str:
 
 
 # Scenarios that operate on an existing owned thesis: a fresh empty
-# STOCKBOT_DATA_DIR per attempt would leave their prompts unsatisfiable, so
-# the runner seeds one thesis into the attempt store and appends its ID as
-# run context (the stored scenario prompt itself stays verbatim).
+# batch store would leave their prompts unsatisfiable, so the runner seeds
+# one thesis into the batch store and appends its ID as run context (the
+# stored scenario prompt itself stays verbatim).
 SEEDED_THESIS_SCENARIOS = frozenset({"thesis_contradict", "watch_vs_journal"})
 
 
 def _seed_thesis(store_dir: Path) -> str:
-    """Create one owned thesis in the attempt store; returns its ID."""
+    """Create one owned thesis in the batch store; returns its ID."""
     from app.policy import Capability, RequestContext
     from app.tools import execute_tool
 
@@ -2918,82 +2981,324 @@ def _seed_thesis(store_dir: Path) -> str:
     return str(out["thesis_id"])
 
 
+def _batch_store(batch_root: Path) -> Path:
+    """One research store per eval batch: the API's kernel worker, thesis seeds, and trace reads share it."""
+    return batch_root / "store"
+
+
 def _attempt_dirs(batch_root: Path, tool: str, attempt: int, retry: int = 0) -> tuple[Path, Path]:
-    """Per-attempt recorder DB and Stockbot store; keeps attempts mutually isolated."""
+    """Per-attempt recorder DB plus the store every attempt of the batch shares."""
     if retry:
         attempt_dir = batch_root / tool / f"attempt-{attempt}-retry-{retry}"
     else:
         attempt_dir = batch_root / tool / f"attempt-{attempt}"
-    return attempt_dir / "runs.sqlite", attempt_dir / "store"
+    return attempt_dir / "runs.sqlite", _batch_store(batch_root)
 
 
-def _kernel_repo(store_dir: Path) -> ResearchRepository:
-    """Research repository rooted at the per-attempt store."""
-    return ResearchRepository(data_root=store_dir)
+def _write_attempt_outcome(db_path: Path, session_id: str, terminal: bool) -> None:
+    """Record the attempt's kernel session and run outcome beside its recorder DB."""
+    dest = db_path.parent / "outcome.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps({"session_id": session_id, "terminal": terminal}))
 
 
-def _close_attempt_jobs(repo: ResearchRepository, sid: str) -> None:
-    """Cancel queued/running jobs so the attempt leaves no open work."""
-    from app.research import service
-
-    for job in repo.list_jobs(sid):
-        if job.status in ("queued", "running"):
-            service.cancel_job(job.job_id, repo=repo)
-
-
-def _kernel_final_answer(repo: ResearchRepository, sid: str) -> str:
-    """Terminal answer from the attempt session final_result; '' when absent."""
+def _read_attempt_outcome(db_path: Path) -> tuple[str, bool]:
+    """(kernel session id, terminal) written by the attempt; ("", False) when absent."""
     try:
-        final = repo.get_session(sid).final_result or {}
-    except KeyError:
-        return ""
-    answer = final.get("answer") if isinstance(final, dict) else None
-    return answer if isinstance(answer, str) else ""
+        data = json.loads((db_path.parent / "outcome.json").read_text())
+    except OSError, ValueError:
+        return "", False
+    if not isinstance(data, dict):
+        return "", False
+    session_id = data.get("session_id")
+    return (session_id if isinstance(session_id, str) else ""), data.get("terminal") is True
 
 
-def _attempt_invoke(
-    data_root: Path,
-) -> object:
-    """Tool invoke bound to the per-attempt store (thesis + research reads stay isolated)."""
-    from functools import partial
+# --------------------------------------------------------------------------
+# Bun API process (one per batch; the kernel worker is spawn-once)
+# --------------------------------------------------------------------------
 
-    from app.tool_runtime import execute_agent_tool
+_API_READY_S = 180.0  # kernel worker prewarm wall (120s) plus the Python import
+_API_STOP_S = 10.0
+_API_POLL_S = 0.05
+_API_LISTEN_RE = re.compile(r"bun api listening http://127\.0\.0\.1:(\d+)")
+_ATTEMPT_WALL_S = 520.0  # verify_e2e's per-case wall: two 180s server walls plus persona time
+# A done event with either status published an answer, so the run finished.
+# The kernel's status "failed" and "cancelled" are not terminal.
+_TERMINAL_STATUSES = frozenset({"completed", "completed_with_limitations"})
 
-    return partial(execute_agent_tool, data_root=data_root)
+
+@dataclass(frozen=True)
+class _BatchApi:
+    """Started Bun API: its base URL, the store it writes, and the process to stop."""
+
+    base_url: str
+    store_dir: Path
+    proc: _ApiProcess
+
+
+class _Stoppable(Protocol):
+    """Process surface the stop path uses: the pid and a bounded wait."""
+
+    @property
+    def pid(self) -> int: ...
+
+    def wait(self, timeout: float | None = None) -> int: ...
+
+
+class _ApiProcess(_Stoppable, Protocol):
+    """Process surface the API host uses: exit poll plus the stdout line stream."""
+
+    @property
+    def stdout(self) -> Iterable[str] | None: ...
+
+    def poll(self) -> int | None: ...
+
+
+class _ApiStartup:
+    """Ready signal and resolved port from the API stdout pump."""
+
+    def __init__(self) -> None:
+        self.ready = threading.Event()
+        self.port: int | None = None
+
+
+def _api_env(store_dir: Path) -> dict[str, str]:
+    """Child env: the kernel worker and its research DB live in the batch store.
+
+    Both names are set on purpose: $RESEARCH_DB_PATH wins over the data root for
+    the research DB, and the data root also holds the thesis store the seeds write.
+    """
+    env = dict(os.environ)
+    env["STOCKBOT_DATA_DIR"] = str(store_dir)
+    env["RESEARCH_DB_PATH"] = str(store_dir / "research.sqlite")
+    env["STOCKBOT_API_PORT"] = "0"  # ephemeral; the listen log line carries the real port
+    return env
+
+
+def _api_launch() -> tuple[list[str], Path]:
+    """(command, cwd) for the Bun API host; `bun` resolves from PATH."""
+    return [shutil.which("bun") or "bun", "scripts/api.ts"], Path(__file__).resolve().parent.parent / "needle-harness"
+
+
+def _pump_api(proc: _ApiProcess, log_path: Path, startup: _ApiStartup) -> None:
+    """Copy API stdout to the batch log and capture the listen line (keeps the pipe drained)."""
+    with log_path.open("a", encoding="utf-8") as log:
+        for line in proc.stdout or ():
+            log.write(line)
+            log.flush()
+            match = _API_LISTEN_RE.search(line)
+            if match and startup.port is None:
+                startup.port = int(match.group(1))
+                startup.ready.set()
+    startup.ready.set()
+
+
+def _api_ready(startup: _ApiStartup, proc: _ApiProcess, log_path: Path) -> int:
+    """Listening port once the API is ready; raises when it exits or never listens."""
+    if not startup.ready.wait(_API_READY_S):
+        raise RuntimeError(f"Bun API did not listen within {_API_READY_S:.0f}s; log: {log_path}")
+    if startup.port is None:
+        raise RuntimeError(f"Bun API exited before listening (exit {proc.poll()}); log: {log_path}")
+    return startup.port
+
+
+def _start_api(store_dir: Path, spawn: Callable[..., _ApiProcess] = subprocess.Popen) -> _BatchApi:
+    """Start the Bun API on the batch store; its stdout lands in <batch>/api.log."""
+    store_dir.mkdir(parents=True, exist_ok=True)
+    log_path = store_dir.parent / "api.log"
+    command, cwd = _api_launch()
+    proc = spawn(
+        command,
+        cwd=str(cwd),
+        env=_api_env(store_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        start_new_session=True,  # own process group: the stop below reaches the kernel child too
+    )
+    startup = _ApiStartup()
+    threading.Thread(target=_pump_api, args=(proc, log_path, startup), name="judge-api-log", daemon=True).start()
+    try:
+        port = _api_ready(startup, proc, log_path)
+    except Exception:
+        _stop_api(proc)
+        raise
+    print(f"Bun API http://127.0.0.1:{port} store={store_dir}", file=sys.stderr)
+    return _BatchApi(f"http://127.0.0.1:{port}", store_dir, proc)
+
+
+def _group_gone(pgid: int, wait_s: float) -> bool:
+    """True once no process remains in the group (a group has no wait(); poll it)."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            os.killpg(pgid, 0)  # signal 0 only probes for members
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_API_POLL_S)
+
+
+def _stop_api(proc: _Stoppable) -> None:
+    """Stop the API process tree (kernel child included); SIGKILL after the grace wall."""
+    for sig in (SIGTERM, SIGKILL):
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, sig)
+        except ProcessLookupError, PermissionError:
+            return
+        try:
+            proc.wait(timeout=_API_STOP_S)
+        except subprocess.TimeoutExpired:
+            pass
+        if _group_gone(pgid, _API_STOP_S):
+            return
+
+
+_API_LOCK = threading.Lock()
+_BATCH_API: _BatchApi | None = None
+
+
+def _batch_api(store_dir: Path) -> _BatchApi:
+    """The batch's API process, started on first use and shared by every scenario."""
+    global _BATCH_API
+    with _API_LOCK:
+        if _BATCH_API is None:
+            _BATCH_API = _start_api(store_dir)
+            atexit.register(_stop_batch_api)
+        elif _BATCH_API.store_dir != store_dir:
+            raise RuntimeError(f"one judge batch runs one store: {_BATCH_API.store_dir} != {store_dir}")
+        return _BATCH_API
+
+
+def _stop_batch_api() -> None:
+    """Stop the batch's API process tree; idempotent (the CLI also runs it at exit)."""
+    global _BATCH_API
+    with _API_LOCK:
+        api, _BATCH_API = _BATCH_API, None
+    if api is not None:
+        _stop_api(api.proc)
+
+
+# --------------------------------------------------------------------------
+# POST /api/agent (research mode) and SSE fold
+# --------------------------------------------------------------------------
+
+
+class _StreamOutcome(TypedDict):
+    answer: str
+    session_id: str
+    terminal: bool
+    error: str
+
+
+def _stream_event(raw: str) -> dict[str, object] | None:
+    """One SSE data line as an event object; None for other lines and malformed JSON."""
+    if not raw.startswith("data:"):
+        return None
+    try:
+        event = json.loads(raw[5:])
+    except ValueError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def _event_session(event: Mapping[str, object]) -> str:
+    """Kernel session id: the evidence event carries it, debug progress relays it."""
+    session_id = event.get("sessionId")
+    if isinstance(session_id, str) and session_id:
+        return session_id
+    detail = event.get("detail")
+    if isinstance(detail, dict):
+        relayed = detail.get("session_id")
+        if isinstance(relayed, str):
+            return relayed
+    return ""
+
+
+def _stream_error(event: Mapping[str, object]) -> str:
+    """Error text from one failed/error event."""
+    kind = str(event.get("type") or "error")
+    message = event.get("message")
+    return f"{kind}: {message}" if isinstance(message, str) and message else kind
+
+
+def _fold_stream(lines: Iterable[str]) -> _StreamOutcome:
+    """Fold SSE lines into the attempt outcome: answer, session, terminal, error.
+
+    A delta carries the whole answer text, so the last one wins. answer_partial
+    is the same whole text on the limited path, which emits no delta, so it is
+    only the fallback. Only a done event finishes the run. Its status decides
+    terminal: the Python session never reaches completed on the kernel path,
+    so the session status cannot stand in for the run outcome.
+    """
+    out: _StreamOutcome = {"answer": "", "session_id": "", "terminal": False, "error": ""}
+    partial = ""
+    for raw in lines:
+        event = _stream_event(raw)
+        if event is None:
+            continue
+        kind = event.get("type")
+        out["session_id"] = _event_session(event) or out["session_id"]
+        if kind == "answer_delta":
+            text = event.get("text")
+            out["answer"] = text if isinstance(text, str) else ""
+        elif kind == "answer_partial":
+            text = event.get("text")
+            partial = text if isinstance(text, str) else ""
+        elif kind in ("failed", "error"):
+            out["error"] = _stream_error(event)
+        elif kind == "done":
+            out["terminal"] = str(event.get("status") or "") in _TERMINAL_STATUSES
+    return {**out, "answer": out["answer"] or partial}
+
+
+def _timed_lines(resp: Iterable[bytes], deadline: float) -> Iterator[str]:
+    """Decoded SSE lines; fails past the attempt wall so one stream cannot hang the batch."""
+    for raw in resp:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"attempt exceeded {_ATTEMPT_WALL_S:.0f}s")
+        yield raw.decode("utf-8", "replace")
+
+
+def _post_research(base_url: str, prompt: str) -> _StreamOutcome:
+    """One research request through POST /api/agent, folded into an attempt outcome.
+
+    Raises TimeoutError past the attempt wall; OSError/ValueError on transport failure.
+    """
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/api/agent",
+        data=json.dumps({"prompt": prompt, "mode": "research"}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    deadline = time.monotonic() + _ATTEMPT_WALL_S
+    with urllib.request.urlopen(request, timeout=_ATTEMPT_WALL_S) as resp:
+        return _fold_stream(_timed_lines(resp, deadline))
 
 
 def _run_kernel_attempt(
     prompt: str, db_path: Path, cwd: Path, stockbot_store: Path | None = None
 ) -> tuple[int, bool, str, str, bool]:
-    """Run one scenario attempt through create_research + node + run_node."""
-    import asyncio
-
-    from app.decision_client import JevClient
-    from app.research import scheduler, service
-
-    _ = (db_path, cwd)  # recorder DB path rides alongside; research state lives in the attempt store
+    """Run one scenario attempt through the production POST /api/agent (research mode)."""
+    _ = cwd  # the API launches from needle-harness; the judge cwd is never used
     store_dir = Path(stockbot_store).resolve() if stockbot_store is not None else Path.cwd()
-    store_dir.mkdir(parents=True, exist_ok=True)
-    repo = _kernel_repo(store_dir)
     try:
-        sid = service.create_research(prompt, prompt, as_of=None, repo=repo)
-        node = service.create_node(sid, prompt, "Route question.", repo=repo)
-        try:
-            jev = JevClient(data_root=store_dir)
-            try:
-                asyncio.run(
-                    scheduler.run_node(node, session_id=sid, repo=repo, jev=jev, invoke=_attempt_invoke(store_dir))
-                )
-            finally:
-                jev.close()
-        finally:
-            _close_attempt_jobs(repo, sid)
-        if not repo.list_evidence(sid):
-            _store_empty_terminal(repo, sid)
-        answer = _kernel_final_answer(repo, sid)
-        return 0, False, answer, "", bool(answer.strip())
-    except Exception as exc:  # noqa: BLE001 - the verdict reports the crash, never hides it
-        return 1, False, "", str(exc), False
+        outcome = _post_research(_batch_api(store_dir).base_url, prompt)
+    except TimeoutError as exc:
+        return 1, True, "", str(exc), False  # the retry in _run_attempts keys off timed_out
+    except (OSError, ValueError) as exc:
+        return 1, False, "", f"transport: {exc}", False
+    try:
+        _write_attempt_outcome(db_path, outcome["session_id"], outcome["terminal"])
+    except OSError as exc:
+        return 1, False, outcome["answer"], f"outcome write failed: {exc}", outcome["terminal"]
+    return 0, False, outcome["answer"], outcome["error"], outcome["terminal"]
 
 
 def _seeded_prompt(scenario: Scenario, store_dir: Path, prompt: str) -> tuple[str, dict[str, object] | None]:
@@ -3044,33 +3349,18 @@ def _run_attempts(
             if err is not None:
                 err["db"] = str(db_path)
                 return db_path, False, "", "", err
-        exit_code, timed_out, out_text, err_text, _saw_complete = run_attempt(attempt_prompt, db_path, cwd, store_dir)
+        exit_code, timed_out, out_text, err_text, _terminal = run_attempt(attempt_prompt, db_path, cwd, store_dir)
         code = exit_code
         if not timed_out:
             break
     return db_path, timed_out, out_text, err_text, code
 
 
-def _latest_session_id(repo: ResearchRepository) -> str | None:
-    """Newest session id from the attempt store, None when empty."""
-    sessions = repo.list_sessions(limit=1)
-    if not sessions:
-        return None
-    session_id = sessions[0].get("session_id") if isinstance(sessions[0], dict) else None
-    return session_id if isinstance(session_id, str) and session_id else None
-
-
-def _read_session_id(store_dir: Path) -> str | None:
-    """Latest session id from the attempt store, None on any storage error."""
-    try:
-        return _latest_session_id(ResearchRepository(data_root=store_dir))
-    except Exception:  # noqa: BLE001 - intentional best-effort boundary, never aborts
-        return None
-
-
-def _evaluate_live(scenario: Scenario, answer_text: str, store_dir: Path) -> tuple[bool, str]:
-    """Evaluate the persisted terminal answer from the attempt research DB."""
-    trace = build_trace(store_dir, scenario, answer_text)
+def _evaluate_live(
+    scenario: Scenario, answer_text: str, store_dir: Path, session_id: str, terminal: bool
+) -> tuple[bool, str]:
+    """Evaluate the attempt answer and run outcome against the shared research store."""
+    trace = build_trace(store_dir, scenario, answer_text, session_id=session_id, terminal=terminal)
     evaluator = EVALUATORS.get(scenario["evaluator"])
     if evaluator is None:
         return False, f"unknown evaluator: {scenario['evaluator']}"
@@ -3103,13 +3393,8 @@ def _live_result_dict(
     return result
 
 
-def _store_dir_of(db_path: Path) -> Path:
-    """Attempt store directory beside the recorder DB."""
-    return db_path.parent / "store"
-
-
 def run_scenario_live(scenario: Scenario, batch_root: Path, cwd: Path, index: int) -> dict[str, object]:
-    """Run one scenario through the kernel scheduler and evaluate the trace.
+    """Run one scenario through POST /api/agent and evaluate the trace.
 
     The stored prompt goes verbatim, except seeded-thesis scenarios append
     the pre-seeded thesis ID as run context (see SEEDED_THESIS_SCENARIOS).
@@ -3122,10 +3407,10 @@ def run_scenario_live(scenario: Scenario, batch_root: Path, cwd: Path, index: in
         code["duration_s"] = time.monotonic() - start
         return code
     answer_text = (out_text or "").strip()
-    store_dir = _store_dir_of(db_path)
-    session_id = _read_session_id(store_dir)
-    answer_file = persist_answer(db_path, session_id, scenario["id"], answer_text)
-    ok, reason = _evaluate_live(scenario, answer_text, store_dir)
+    store_dir = _batch_store(batch_root)
+    session_id, terminal = _read_attempt_outcome(db_path)
+    answer_file = persist_answer(db_path, session_id or None, scenario["id"], answer_text)
+    ok, reason = _evaluate_live(scenario, answer_text, store_dir, session_id, terminal)
     summary = f"{reason} (attempt error: {err_text[:500]})" if err_text.strip() and not ok else reason
     print(f"{'PASS' if ok else 'FAIL'} {scenario['id']}: {summary}", file=sys.stderr)
     return _live_result_dict(scenario, ok, reason, code, timed_out, db_path, answer_file, start, err_text)
@@ -3447,7 +3732,10 @@ def _main_live(args: argparse.Namespace) -> int:
     if wanted is None:
         return 2
     root = Path("data/verify") / _batch_id() / "agent"
-    results = _run_selection(wanted, root, Path.cwd())
+    try:
+        results = _run_selection(wanted, root, Path.cwd())
+    finally:
+        _stop_batch_api()  # Ctrl-C and crashes stop the API tree too
     _report_results(results, root)
     return _single_verdict(args, results)
 
