@@ -7,11 +7,13 @@ the network or cache.db.
 import json
 import re
 import sys
+import time
 import types
 from collections.abc import Iterator
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from itertools import pairwise
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Self
 
 import pytest
@@ -23,6 +25,14 @@ from api import market_providers as mp
 from api.main import app
 from app import cache as real_cache
 from app.sec.models import Filing, InsiderTransaction
+from app.storage import market
+
+
+@pytest.fixture(autouse=True)
+def isolated_market(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("BROKER_ENABLED", "false")
+    monkeypatch.setattr(mp.time, "time", lambda: 1700000100.0)
 
 
 class FakeCache:
@@ -197,12 +207,13 @@ def test_candles_throttle_uses_negative_cache(fake_cache: FakeCache, monkeypatch
     monkeypatch.setattr(mp, "_http_bytes", boom)
     first = mp.get_candles("NVDA")
     assert calls["n"] == 1
-    assert "error" in first
+    assert first == {"sym": "NVDA", "error": "candles unavailable for NVDA: Yahoo throttled (429)"}
     second = mp.get_candles("nvda")
     assert calls["n"] == 1
-    assert second.get("sym") == "NVDA"
-    assert "error" in second
-    assert "neg:candles:NVDA:6mo:1d" in fake_cache.store
+    assert second == first
+    assert fake_cache.store == {
+        "neg:candles:NVDA:6mo:1d": {"error": "candles unavailable for NVDA: Yahoo throttled (429)"}
+    }
 
 
 def test_rss_bad_xml_yields_empty() -> None:
@@ -298,21 +309,20 @@ def test_news_merge_sorts_dedups_filters_topics(fake_cache: FakeCache, monkeypat
     first = items[0]
     assert isinstance(first, dict) and first["source"] == "Yahoo Finance"
     mp.get_news("NVDA")
-    assert "news:NVDA" in fake_cache.store
+    state = market.refresh_state("news", "NVDA")
+    assert state is not None and state["last_ok_at"] == 1700000100.0
 
 
 def test_news_warm_cache_slices_without_mutation_or_fetch(
     fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     items = [
-        {"title": "Second headline", "published": "2026-10-02"},
-        {"title": "First headline", "published": "2026-10-01"},
-        {"title": "Fourth headline", "published": "2026-10-04"},
-        {"title": "Third headline", "published": "2026-10-03"},
+        {"title": f"Headline {i}", "url": f"https://example.com/{i}", "source": "RSS", "published_at": i}
+        for i in range(4)
     ]
-    cached = {"sym": "NVDA", "items": items, "source": "cached news"}
-    fake_cache.set("news:NVDA", cached)
-    before = json.dumps(cached)
+    market.save_news("NVDA", items, now=1700000100.0)
+    market.mark_ok("news", "NVDA", now=1700000100.0)
+    before = market.read_news("NVDA", 10)
     calls: list[str] = []
 
     def fake_http(url: str, **kwargs: object) -> bytes:
@@ -323,10 +333,11 @@ def test_news_warm_cache_slices_without_mutation_or_fetch(
     monkeypatch.setenv("STOCKBOT_NEWSQUANT", "0")
     for limit in (2, 1, 4, 8, 0):
         out = mp.get_news(" nvda ", limit=limit)
-        assert out == {"sym": "NVDA", "items": items[:limit], "source": "cached news"}
-        assert out["items"] is not items
-        assert fake_cache.store["news:NVDA"] is cached
-        assert json.dumps(cached) == before
+        result_items = out["items"]
+        assert isinstance(result_items, list)
+        assert [item["title"] for item in result_items] == [item["title"] for item in reversed(items)][:limit]
+        assert out["stale"] is False
+        assert market.read_news("NVDA", 10) == before
     assert calls == []
 
 
@@ -356,9 +367,13 @@ def test_news_cold_limit_stays_cached_for_larger_request(
     assert len(calls) == 5
     before = json.dumps(cold)
     for limit in (1, 4):
-        assert mp.get_news("NVDA", limit=limit) == dict(cold, items=items[:limit])
+        out = mp.get_news("NVDA", limit=limit)
+        result_items = out["items"]
+        assert isinstance(result_items, list)
+        assert [item["title"] for item in result_items] == ["Newest", "Second newest", "Second oldest", "Oldest"][
+            :limit
+        ]
         assert len(calls) == 5
-        assert fake_cache.store["news:NVDA"] is cold
         assert json.dumps(cold) == before
 
 
@@ -414,7 +429,7 @@ def test_filings_atom_parses_entries(
     assert isinstance(first, dict) and "published" not in first
     assert isinstance(second, dict) and len(str(second["summary"])) == 300
     assert "market_universe" in fake_cache.store
-    assert "filings:v2:1341439" in fake_cache.store
+    assert market.read_filings(1341439, 40) == items
     atom_url = urls[-1]
     assert "CIK=0001341439" in atom_url and "type=&" in atom_url
     assert "owner=include" in atom_url and "count=40" in atom_url
@@ -484,14 +499,19 @@ def test_filings_fund_resolves_trust_cik_via_edgartools_registry(
 
 def test_filings_warm_cache_slices_and_preserves_alias(fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch) -> None:
     items = [
-        {"title": "Second filing", "filed": "2026-10-02", "updated": "2026-10-01T18:00:00-04:00"},
-        {"title": "First filing", "filed": "2026-10-01", "updated": "2026-10-01T09:00:00-04:00"},
-        {"title": "Fourth filing", "filed": "2026-10-04", "updated": "2026-10-04T09:00:00-04:00"},
-        {"title": "Third filing", "filed": "2026-10-03", "updated": "2026-10-03T09:00:00-04:00"},
+        {
+            "title": f"Filing {i}",
+            "link": f"https://sec.gov/{i}",
+            "filed": f"2026-10-0{i + 1}",
+            "updated": "",
+            "summary": "",
+        }
+        for i in range(4)
     ]
-    cached = {"sym": "GOOG", "cik": 1652044, "items": items, "source": "cached filings"}
-    fake_cache.set("filings:v2:1652044", cached)
-    before = json.dumps(cached)
+    market.save_filings("GOOGL", 1652044, items)
+    market.save_cik("GOOGL", 1652044)
+    market.mark_ok("filings", "GOOGL", now=1700000100.0)
+    before = market.read_filings(1652044, 10)
     calls: list[str] = []
 
     def fake_http(url: str, **kwargs: object) -> bytes:
@@ -506,10 +526,10 @@ def test_filings_warm_cache_slices_and_preserves_alias(fake_cache: FakeCache, mo
     monkeypatch.setattr(mp, "cik_for_ticker", fake_cik)
     for limit in (2, 1, 4, 8, 0):
         out = mp.get_filings(" googl ", limit=limit)
-        assert out == dict(cached, sym="GOOGL", items=items[:limit])
-        assert out["items"] is not items
-        assert fake_cache.store["filings:v2:1652044"] is cached
-        assert json.dumps(cached) == before
+        assert out["sym"] == "GOOGL"
+        assert out["items"] == before[:limit]
+        assert out["stale"] is False
+        assert market.read_filings(1652044, 10) == before
     assert calls == []
 
 
@@ -542,14 +562,11 @@ def test_filings_small_first_request_does_not_truncate_larger(
     small_items = small["items"]
     assert isinstance(small_items, list)
     assert [item["title"] for item in small_items] == ["10-Q", "8-K"]
-    cached = fake_cache.store["filings:v2:1652044"]
-    assert isinstance(cached, dict)
-    full = cached["items"]
-    assert isinstance(full, list) and [item["title"] for item in full] == ["10-Q", "8-K", "10-K"]
-    before = json.dumps(cached)
+    full = market.read_filings(1652044, 40)
+    assert [item["title"] for item in full] == ["10-Q", "8-K", "10-K"]
     for limit in (1, 4, 40):
-        assert mp.get_filings("GOOGL", limit=limit) == dict(cached, sym="GOOGL", items=full[:limit])
-        assert json.dumps(cached) == before
+        out = mp.get_filings("GOOG", limit=limit)
+        assert out == dict(small, items=full[:limit])
     assert len(calls) == 1
     assert fake_cache.store["filings:1652044"] is pre_v2
 
@@ -573,31 +590,17 @@ def test_filings_entry_without_filing_date_is_error_not_guess(
     assert "filings:v2:1652044" not in fake_cache.store
 
 
-@pytest.mark.parametrize("payload", [{}, {"items": None}, {"items": {}}, {"items": "cached"}])
-def test_warm_cache_without_list_items_preserves_payload(
-    fake_cache: FakeCache, monkeypatch: pytest.MonkeyPatch, payload: dict[str, object]
-) -> None:
-    cached = dict(payload, sym="GOOG", error="cached error")
-    fake_cache.set("news:GOOG", cached)
-    fake_cache.set("filings:v2:1652044", cached)
+@pytest.mark.parametrize("kind", ["news", "filings"])
+def test_empty_successful_store_does_not_fetch(monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+    market.mark_ok(kind, "GOOG", now=1700000100.0)
 
-    def fake_cik(ticker: str) -> int:
-        assert ticker == "GOOGL"
-        return 1652044
+    def fail(*args: object, **kwargs: object) -> bytes:
+        pytest.fail("An empty successful collection must not fetch again")
 
-    monkeypatch.setattr(mp, "cik_for_ticker", fake_cik)
-    calls: list[str] = []
-
-    def fake_http(url: str, **kwargs: object) -> bytes:
-        calls.append(url)
-        raise AssertionError("warm providers must not fetch")
-
-    monkeypatch.setattr(mp, "_http_bytes", fake_http)
-    before = json.dumps(cached)
-    assert mp.get_news("GOOG", limit=1) == cached
-    assert mp.get_filings("GOOGL", limit=1) == dict(cached, sym="GOOGL")
-    assert json.dumps(cached) == before
-    assert calls == []
+    monkeypatch.setattr(mp, "_http_bytes", fail)
+    result = mp.get_news("GOOG") if kind == "news" else mp.get_filings("GOOG")
+    assert result["items"] == []
+    assert result["stale"] is False
 
 
 def test_filings_no_cik_returns_error(
@@ -1100,7 +1103,7 @@ def test_candles_malformed_chart_returns_provider_error(
         return json.dumps(payload).encode()
 
     monkeypatch.setattr(mp, "_http_bytes", fake_http)
-    assert mp.get_candles(" nvda ") == {"error": f"candles unavailable for NVDA: {detail}"}
+    assert mp.get_candles(" nvda ") == {"sym": "NVDA", "error": f"candles unavailable for NVDA: {detail}"}
     assert fake_cache.store == {}
 
 
@@ -1133,16 +1136,18 @@ def test_candles_public_preserves_timestamps_and_sparse_columns(
         return json.dumps(payload).encode()
 
     monkeypatch.setattr(mp, "_http_bytes", fake_http)
-    assert mp.get_candles(" nvda ", range_="1mo", interval="1h") == {
+    assert mp.get_candles(" nvda ", range_="max", interval="1h") == {
         "sym": "NVDA",
-        "range": "1mo",
+        "range": "max",
         "interval": "1h",
-        "price": 7,
+        "price": 8,
         "delayed": True,
         "candles": [
-            {"t": 3000, "open": None, "high": 8, "low": 8, "close": 8, "vol": 0},
             {"t": 2000, "open": 6, "high": 6, "low": 6, "close": 6, "vol": 0},
+            {"t": 3000, "open": None, "high": 8, "low": 8, "close": 8, "vol": 0},
         ],
+        "as_of": mp._iso(1700000100.0),
+        "stale": False,
     }
 
 
@@ -1158,13 +1163,14 @@ def test_prop_candles_public_retains_present_close_order(closes: list[float | No
     def fake_http(url: str, **kwargs: object) -> bytes:
         return json.dumps(_payload(closes)).encode()
 
-    with pytest.MonkeyPatch.context() as patch:
+    with pytest.MonkeyPatch.context() as patch, TemporaryDirectory() as root:
+        patch.setenv("STOCKBOT_DATA_DIR", root)
         patch.setattr(mp, "cache", FakeCache())
         patch.setattr(mp, "_http_bytes", fake_http)
         out = mp.get_candles("NVDA")
     expected = [value for value in closes if value is not None]
     if not expected:
-        assert out == {"error": "candles unavailable for NVDA: all bars empty"}
+        assert out == {"sym": "NVDA", "error": "candles unavailable for NVDA: all bars empty"}
         return
     rows = out["candles"]
     assert isinstance(rows, list)
@@ -1188,10 +1194,13 @@ def test_news_missing_links_dedup_by_title_preserves_first_source(
             {
                 "title": "NVDA headline",
                 "link": "",
-                "published": "Tue, 06 Oct 2026 10:00:00 GMT",
+                "published": "2026-10-06T10:00:00+00:00",
                 "source": "Google News",
+                "summary_path": None,
             }
         ],
+        "as_of": mp._iso(1700000100.0),
+        "stale": False,
     }
 
 
@@ -1216,6 +1225,8 @@ def test_filings_missing_optional_fields_preserves_official_date(
         "sym": "NVDA",
         "cik": 1341439,
         "items": [{"title": "", "link": "", "filed": "2026-10-03", "updated": "", "summary": ""}],
+        "as_of": mp._iso(1700000100.0),
+        "stale": False,
     }
 
 
@@ -2211,7 +2222,7 @@ def test_regweb_news_feed_rows_are_headline_only_never_article_body(
     assert isinstance(items, list) and len(items) == 1
     first = items[0]
     assert isinstance(first, dict) and first.get("link") == "https://n.example/nvda"
-    assert set(first) == {"title", "link", "published", "source"}
+    assert set(first) == {"title", "link", "published", "source", "summary_path"}
     assert "body" not in first and "content" not in first and "excerpt" not in first
 
 
@@ -2263,3 +2274,692 @@ def test_reg4_threshold_uses_latest_record_and_incomplete_stays_visible(
     short = TestClient(app).get("/api/widget-data?type=short-volume&sym=NVDA").json()
     assert short["rows"] == [] and "incomplete" in str(short["error"]).lower()
     assert len(calls) == 4
+
+
+@pytest.mark.parametrize("age,stale", [(0, False), (900, True)])
+def test_stored_candles_never_fetch(monkeypatch: pytest.MonkeyPatch, age: int, stale: bool) -> None:
+    now = 1700000100.0
+    rows = mp._bar_rows(mp._parse_candles("NVDA", _payload([10.0, 11.0]), "1d", "1d"))
+    market.save_bars("NVDA", "1d", rows)
+    market.save_quote("NVDA", 12.0, now)
+    market.mark_ok("candles", "NVDA", "1d", now=now - age, covered_from=0)
+
+    def fail(*args: object, **kwargs: object) -> bytes:
+        pytest.fail("Stored coverage must not fetch")
+
+    monkeypatch.setattr(mp, "_http_bytes", fail)
+    out = mp.get_candles("NVDA", now=now)
+    assert out["candles"] == rows
+    assert out["price"] == 12.0
+    assert out["stale"] is stale
+    assert out["as_of"] == mp._iso(now - age)
+
+
+def test_cold_candles_fetch_once_and_widen_coverage(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    now = 1700000100.0
+
+    def fetch(url: str, **kwargs: object) -> bytes:
+        calls.append(url)
+        return json.dumps(_payload([10.0])).encode()
+
+    monkeypatch.setattr(mp, "_http_bytes", fetch)
+    for range_ in ("1d", "1d", "1y", "1y"):
+        assert mp.get_candles("NVDA", range_, now=now)["stale"] is False
+    assert calls == [
+        f"{mp.YAHOO_QUERY_BASE}/v8/finance/chart/NVDA?range=1d&interval=1d",
+        f"{mp.YAHOO_QUERY_BASE}/v8/finance/chart/NVDA?range=1y&interval=1d",
+    ]
+    state = market.refresh_state("candles", "NVDA", "1d")
+    assert state is not None and state["covered_from"] == mp._range_start("1y", now)
+    assert market.read_bars("NVDA", "1d", None)
+
+
+def test_failed_backfill_preserves_saved_candles_and_success_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1700000100.0
+    rows = mp._bar_rows(mp._parse_candles("NVDA", _payload([10.0]), "1d", "1d"))
+    market.save_bars("NVDA", "1d", rows)
+    market.mark_ok("candles", "NVDA", "1d", now=now - 100, covered_from=now - 86400)
+
+    def fail(*args: object, **kwargs: object) -> bytes:
+        raise ConnectionError("offline")
+
+    monkeypatch.setattr(mp, "_http_bytes", fail)
+    result = mp.get_candles("NVDA", "1y", now=now)
+    assert result["candles"] == rows
+    assert result["stale"] is True
+    assert "offline" in str(result["error"])
+    state = market.refresh_state("candles", "NVDA", "1d")
+    assert state is not None and state["last_ok_at"] == now - 100
+
+
+@pytest.mark.parametrize("kind,ttl", [("quote", 300), ("news", 900), ("filings", 3600)])
+def test_stored_provider_freshness_never_fetches(monkeypatch: pytest.MonkeyPatch, kind: str, ttl: int) -> None:
+    now = 1700000100.0
+    market.save_quote("NVDA", 10.0, now)
+    market.save_news("NVDA", [{"title": "News", "url": "https://example.com", "published_at": now}], now=now)
+    market.save_filings(
+        "NVDA",
+        1045810,
+        [{"title": "10-Q", "link": "https://sec.gov", "filed": "2023-11-14", "updated": "", "summary": ""}],
+    )
+    market.mark_ok(kind, "NVDA", now=now)
+    market.save_cik("NVDA", 1045810)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        pytest.fail("A stored read must not fetch")
+
+    monkeypatch.setattr(mp, f"refresh_{kind}", fail)
+    getter = getattr(mp, f"get_{kind}")
+    assert getter("NVDA", now=now)["stale"] is False
+    stale = getter("NVDA", now=now + ttl)
+    assert stale["stale"] is True
+    assert stale["as_of"] == mp._iso(now)
+
+
+def test_quote_cold_fetch_stores_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import analyst_client
+
+    calls: list[str] = []
+
+    def fetch(ticker: str) -> dict[str, object]:
+        calls.append(ticker)
+        return {"price": 10.0, "retrieved_at": mp._iso(1700000000)}
+
+    monkeypatch.setattr(analyst_client, "get_quote_price", fetch)
+    for _ in range(2):
+        assert mp.get_quote("NVDA", now=1700000100) == {
+            "sym": "NVDA",
+            "price": 10.0,
+            "retrieved_at": mp._iso(1700000000),
+            "as_of": mp._iso(1700000100),
+            "stale": False,
+            "source": "yahoo",
+        }
+    assert calls == ["NVDA"]
+    assert market.latest_quote("NVDA") == (10.0, 1700000000)
+
+
+def test_quote_returns_the_most_recently_confirmed_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Latest wins regardless of source; an unchanged price still counts as confirmed by its poll."""
+    from app import tools
+
+    def no_provider(*args: object, **kwargs: object) -> object:
+        pytest.fail("a read with saved quotes must not call a provider")
+
+    def connected(now: float) -> bool:
+        return True
+
+    monkeypatch.setattr(mp, "_broker_connected", connected)
+    monkeypatch.setattr(tools, "get_equity_quote_prices", no_provider)
+    t = 1700000000.0
+    market.save_quote("NVDA", 10.0, t)
+    market.mark_ok("quote", "NVDA", now=t)
+    market.save_quote("NVDA", 12.5, t + 5, source="robinhood")
+    market.mark_ok("broker_quote", "NVDA", now=t + 5)
+    newer_broker = mp.get_quote("NVDA", now=t + 6)
+    assert (newer_broker["price"], newer_broker["source"], newer_broker["stale"]) == (12.5, "robinhood", False)
+    # Yahoo confirms the same 10.0 later: no new row, but the confirmation makes it latest.
+    assert market.save_quote("NVDA", 10.0, t + 30) is False
+    market.mark_ok("quote", "NVDA", now=t + 30)
+    newer_yahoo = mp.get_quote("NVDA", now=t + 31)
+    assert (newer_yahoo["price"], newer_yahoo["source"], newer_yahoo["as_of"]) == (10.0, "yahoo", mp._iso(t + 30))
+    assert newer_yahoo["retrieved_at"] == mp._iso(t)
+    # Stale after two missed polling intervals of the chosen source.
+    assert mp.get_quote("NVDA", now=t + 30 + 2 * mp.YAHOO_QUOTE_INTERVAL)["stale"] is True
+    assert mp.get_quote("NVDA", now=t + 30 + 2 * mp.YAHOO_QUOTE_INTERVAL - 1)["stale"] is False
+
+
+@pytest.mark.parametrize("price", [None, True, "12.5"])
+def test_refresh_quote_rejects_a_missing_or_non_numeric_price(monkeypatch: pytest.MonkeyPatch, price: object) -> None:
+    from app import analyst_client
+
+    def fetch(ticker: str) -> dict[str, object]:
+        return {"price": price, "retrieved_at": None}
+
+    monkeypatch.setattr(analyst_client, "get_quote_price", fetch)
+    with pytest.raises(TypeError, match="^no price$"):
+        mp.refresh_quote("NVDA", now=1700000000)
+    state = market.refresh_state("quote", "NVDA")
+    assert state is not None
+    assert state["last_error"] == "quote unavailable: no price"
+    assert market.latest_quote("NVDA") is None
+
+
+def test_equal_confirmation_prefers_the_broker_quote() -> None:
+    t = 1700000000.0
+    market.save_quote("NVDA", 10.0, t)
+    market.mark_ok("quote", "NVDA", now=t)
+    market.save_quote("NVDA", 12.5, t, source="robinhood")
+    market.mark_ok("broker_quote", "NVDA", now=t)
+    assert mp._best_quote("NVDA") == (12.5, t, "robinhood")
+
+
+def test_cold_read_checks_the_broker_with_the_read_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import analyst_client
+
+    seen: list[float] = []
+
+    def connected(now: float) -> bool:
+        seen.append(now)
+        return False
+
+    def fetch(ticker: str) -> dict[str, object]:
+        return {"price": 10.0, "retrieved_at": None}
+
+    monkeypatch.setattr(mp, "_broker_connected", connected)
+    monkeypatch.setattr(analyst_client, "get_quote_price", fetch)
+    assert mp.get_quote("NVDA", now=1700000000)["source"] == "yahoo"
+    assert seen == [1700000000]
+    assert market.latest_quote("NVDA") == (10.0, 1700000000)
+
+
+def test_cold_read_falls_back_to_yahoo_when_robinhood_has_no_quote(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Indexes and futures (^TNX, CL=F) have no Robinhood quote; Yahoo fills them in."""
+    from app import analyst_client, tools
+
+    now = 1700000000.0
+    calls: list[str] = []
+
+    def connected(now: float) -> bool:
+        return True
+
+    def broker(tickers: list[str]) -> dict[str, float]:
+        calls.append("robinhood")
+        return {}
+
+    def yahoo(ticker: str) -> dict[str, object]:
+        calls.append("yahoo")
+        return {"price": 4.25, "retrieved_at": None}
+
+    monkeypatch.setattr(mp, "_broker_connected", connected)
+    monkeypatch.setattr(tools, "get_equity_quote_prices", broker)
+    monkeypatch.setattr(analyst_client, "get_quote_price", yahoo)
+    result = mp.get_quote("^tnx", now=now)
+    assert (result["price"], result["source"], result["stale"]) == (4.25, "yahoo", False)
+    assert calls == ["robinhood", "yahoo"]
+
+
+def test_cold_read_tries_each_source_once_per_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    """5-second UI polls of an unquotable symbol never hammer a provider."""
+    from app import analyst_client, tools
+
+    calls: list[str] = []
+
+    def connected(now: float) -> bool:
+        return True
+
+    def broker(tickers: list[str]) -> dict[str, float]:
+        calls.append("robinhood")
+        return {}
+
+    def yahoo(ticker: str) -> dict[str, object]:
+        calls.append("yahoo")
+        return {"price": None, "retrieved_at": None}
+
+    monkeypatch.setattr(mp, "_broker_connected", connected)
+    monkeypatch.setattr(tools, "get_equity_quote_prices", broker)
+    monkeypatch.setattr(analyst_client, "get_quote_price", yahoo)
+    t = 1700000000.0
+    first = mp.get_quote("BOGUS", now=t)
+    assert (first["price"], first["source"], first["stale"]) == (None, "robinhood", True)
+    assert first["error"] == "broker quote unavailable: no price"
+    assert calls == ["robinhood", "yahoo"]
+    for offset in range(1, mp.BROKER_QUOTE_INTERVAL):
+        mp.get_quote("BOGUS", now=t + offset)
+    assert calls == ["robinhood", "yahoo"]
+    # Robinhood retries after its 5 s interval; Yahoo waits for its own 60 s.
+    mp.get_quote("BOGUS", now=t + mp.BROKER_QUOTE_INTERVAL)
+    assert calls == ["robinhood", "yahoo", "robinhood"]
+    mp.get_quote("BOGUS", now=t + mp.YAHOO_QUOTE_INTERVAL)
+    assert calls == ["robinhood", "yahoo", "robinhood", "robinhood", "yahoo"]
+
+
+def test_cold_read_without_broker_never_calls_robinhood(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import analyst_client, tools
+
+    def disconnected(now: float) -> bool:
+        return False
+
+    def broker(tickers: list[str]) -> dict[str, float]:
+        pytest.fail("Robinhood must not be called without a connected broker")
+
+    def yahoo(ticker: str) -> dict[str, object]:
+        return {"price": 7.0, "retrieved_at": None}
+
+    monkeypatch.setattr(mp, "_broker_connected", disconnected)
+    monkeypatch.setattr(tools, "get_equity_quote_prices", broker)
+    monkeypatch.setattr(analyst_client, "get_quote_price", yahoo)
+    assert mp.get_quote("NVDA", now=1700000000)["price"] == 7.0
+
+
+def test_candles_price_uses_the_latest_quote_from_any_source() -> None:
+    t = 1700000000.0
+    market.save_quote("NVDA", 10.0, t)
+    market.save_quote("NVDA", 12.5, t + 5, source="robinhood")
+    market.save_bars("NVDA", "1d", [{"t": t, "open": 1, "high": 1, "low": 1, "close": 9.0, "vol": 1}])
+    market.mark_ok("candles", "NVDA", "1d", now=t, covered_from=0)
+    assert mp.get_candles("NVDA", "1mo", "1d", now=t + 6)["price"] == 12.5
+
+
+@pytest.mark.parametrize("kind", ["quote", "news", "filings"])
+def test_refresh_failure_preserves_success_and_data(monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+    now = 1700000100.0
+    market.save_quote("NVDA", 10.0, now)
+    market.save_news("NVDA", [{"title": "Saved news", "url": "https://example.com"}], now=now)
+    market.save_cik("NVDA", 1045810)
+    market.save_filings(
+        "NVDA",
+        1045810,
+        [{"title": "10-Q", "link": "https://sec.gov", "filed": "2023-11-14", "updated": "", "summary": ""}],
+    )
+    market.mark_ok(kind, "NVDA", now=now)
+
+    def fail(*args: object, **kwargs: object) -> bytes:
+        raise ConnectionError("offline")
+
+    monkeypatch.setattr(mp, "_http_bytes", fail)
+    from app import analyst_client
+
+    monkeypatch.setattr(analyst_client, "get_quote_price", fail)
+    with pytest.raises((ConnectionError, RuntimeError)):
+        getattr(mp, f"refresh_{kind}")("NVDA", now=now + 1)
+    result = getattr(mp, f"get_{kind}")("NVDA", now=now + 1)
+    assert result["stale"] is True
+    assert "offline" in str(result["error"]) or "all news feeds failed" in str(result["error"])
+    assert result["as_of"] == mp._iso(now)
+    if kind == "quote":
+        assert result["price"] == 10.0
+    else:
+        assert result["items"]
+
+
+def test_empty_filings_preserve_cik_for_offline_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolve(ticker: str) -> int:
+        return 1045810
+
+    monkeypatch.setattr(mp, "cik_for_ticker", resolve)
+
+    def fetch(*args: object, **kwargs: object) -> bytes:
+        return _atom([])
+
+    monkeypatch.setattr(mp, "_http_bytes", fetch)
+    first = mp.get_filings("NVDA", now=1700000100)
+    assert first["cik"] == 1045810 and first["items"] == []
+
+    def fail(*args: object, **kwargs: object) -> int:
+        pytest.fail("A stored CIK must not need resolution")
+
+    monkeypatch.setattr(mp, "cik_for_ticker", fail)
+    mp.refresh_filings("NVDA", now=1700000200)
+    assert mp.get_filings("NVDA", now=1700000200)["cik"] == 1045810
+
+
+@pytest.mark.parametrize("range_", ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"])
+def test_range_start_is_not_first_available_bar(range_: str) -> None:
+    now = 1700000100.0
+    start = mp._range_start(range_, now)
+    assert 0 <= start <= now
+    if range_ == "max":
+        assert start == 0
+    elif range_ == "ytd":
+        assert mp._iso(start) == "2023-01-01T00:00:00+00:00"
+
+
+def test_month_range_clamps_day_at_leap_year_boundary() -> None:
+    now = mp._epoch("2024-03-31T12:00:00Z")
+    assert mp._iso(mp._range_start("1mo", now)) == "2024-02-29T12:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    "sym,range_,expected",
+    [("   ", "1d", {"error": "empty symbol"}), ("nvda", "invalid", {"error": "unsupported range: invalid"})],
+)
+def test_candles_invalid_request_does_not_fetch(
+    monkeypatch: pytest.MonkeyPatch, sym: str, range_: str, expected: dict[str, object]
+) -> None:
+    def fail(*args: object, **kwargs: object) -> None:
+        pytest.fail("Invalid requests must not fetch")
+
+    monkeypatch.setattr(mp, "refresh_candles", fail)
+    assert mp.get_candles(sym, range_) == expected
+    assert market.refresh_state("candles", "NVDA", "1d") is None
+
+
+def test_cold_candles_failure_records_error_without_bars(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*args: object, **kwargs: object) -> bytes:
+        raise ConnectionError("offline")
+
+    monkeypatch.setattr(mp, "_http_bytes", fail)
+    assert mp.get_candles(" nvda ", "5d", "1h", now=1700000100) == {
+        "sym": "NVDA",
+        "error": "candles unavailable for NVDA: offline",
+    }
+    state = market.refresh_state("candles", "NVDA", "1h")
+    assert state is not None
+    assert state["last_ok_at"] is None
+    assert state["last_error_at"] == 1700000100
+    assert market.read_bars("NVDA", "1h", None) == []
+
+
+def test_stored_coverage_without_matching_bars_has_no_price(monkeypatch: pytest.MonkeyPatch) -> None:
+    market.mark_ok("candles", "NVDA", "1d", now=1700000100, covered_from=0)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        pytest.fail("Stored coverage must not fetch")
+
+    monkeypatch.setattr(mp, "refresh_candles", fail)
+    result = mp.get_candles("NVDA", "1d", now=1700000100)
+    assert result["candles"] == []
+    assert result["price"] is None
+    assert result["stale"] is False
+
+
+def test_cold_broker_read_fetches_once_then_reads_the_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import tools
+
+    now = 1700000100.0
+    calls: list[list[str]] = []
+
+    def prices(tickers: list[str]) -> dict[str, float]:
+        calls.append(tickers)
+        return {"NVDA": 12.5}
+
+    def connected(now: float) -> bool:
+        return True
+
+    monkeypatch.setattr(mp, "_broker_connected", connected)
+    monkeypatch.setattr(tools, "get_equity_quote_prices", prices)
+    for _ in range(2):
+        assert mp.get_quote(" nvda ", now=now) == {
+            "sym": "NVDA",
+            "price": 12.5,
+            "retrieved_at": mp._iso(now),
+            "as_of": mp._iso(now),
+            "stale": False,
+            "source": "robinhood",
+        }
+    assert calls == [["NVDA"]]
+    assert market.latest_quote("NVDA") is None
+
+
+def test_empty_quote_does_not_check_broker(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*args: object, **kwargs: object) -> None:
+        pytest.fail("An empty symbol must not check the broker")
+
+    monkeypatch.setattr(mp, "_broker_connected", fail)
+    assert mp.get_quote(" ") == {"sym": "", "price": None, "retrieved_at": None}
+
+
+def test_refresh_broker_quotes_batches_and_marks_each_symbol(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import tools
+
+    now = 1700000100.0
+    calls: list[list[str]] = []
+
+    def prices(tickers: list[str]) -> dict[str, float]:
+        calls.append(tickers)
+        return {"NVDA": 12.5}
+
+    monkeypatch.setattr(tools, "get_equity_quote_prices", prices)
+    mp.refresh_broker_quotes([" nvda ", "AAPL", "NVDA", " "], now=now)
+    assert calls == [["NVDA", "AAPL"]]
+    assert market.latest_quote("NVDA", "robinhood") == (12.5, now)
+    ok = market.refresh_state("broker_quote", "NVDA")
+    assert ok is not None and ok["last_ok_at"] == now
+    missing = market.refresh_state("broker_quote", "AAPL")
+    assert missing is not None
+    assert missing["last_ok_at"] is None
+    assert (missing["last_error"], missing["last_error_at"]) == ("broker quote unavailable: no price", now)
+    assert market.latest_quote("NVDA") is None
+
+
+def test_refresh_broker_quotes_failure_marks_every_symbol_and_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import tools
+
+    now = 1700000100.0
+
+    def prices(tickers: list[str]) -> dict[str, float]:
+        raise RuntimeError("RATE_LIMITED")
+
+    monkeypatch.setattr(tools, "get_equity_quote_prices", prices)
+    with pytest.raises(RuntimeError, match="RATE_LIMITED"):
+        mp.refresh_broker_quotes(["NVDA", "AAPL"], now=now)
+    for symbol in ("NVDA", "AAPL"):
+        state = market.refresh_state("broker_quote", symbol)
+        assert state is not None
+        assert state["last_ok_at"] is None
+        # The error timestamp drives the retry interval; None would retry on every tick.
+        assert (state["last_error"], state["last_error_at"]) == ("broker quote unavailable: RATE_LIMITED", now)
+        assert market.latest_quote(symbol, "robinhood") is None
+
+
+def test_refresh_options_snapshots_both_chains(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import tools
+
+    now = 1700000100.0
+    seen: list[str] = []
+
+    def chain(ticker: str, option_type: str, limit: object = 20) -> dict[str, object]:
+        seen.append(f"{ticker}:{option_type}:{limit}")
+        return {"contracts": [option_type]}
+
+    monkeypatch.setattr(tools, "get_option_chain", chain)
+    mp.refresh_options("nvda", now=now)
+    assert seen == ["NVDA:call:30", "NVDA:put:30"]
+    assert market.read_snapshots("rh_options", "NVDA", 1) == [
+        ("2023-11-14", {"call": {"contracts": ["call"]}, "put": {"contracts": ["put"]}})
+    ]
+    state = market.refresh_state("rh_options", "NVDA")
+    assert state is not None and state["last_ok_at"] == now
+
+
+def test_refresh_options_dates_the_snapshot_in_utc(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import tools
+
+    # 2023-11-14T20:00Z is already 2023-11-15 in UTC+9; the stored day must stay the UTC date.
+    now = datetime(2023, 11, 14, 20, 0, tzinfo=UTC).timestamp()
+
+    def chain(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"contracts": []}
+
+    monkeypatch.setattr(tools, "get_option_chain", chain)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("TZ", "JST-9")
+        time.tzset()
+        try:
+            mp.refresh_options("NVDA", now=now)
+        finally:
+            patch.undo()
+            time.tzset()
+    assert [day for day, _ in market.read_snapshots("rh_options", "NVDA", 1)] == ["2023-11-14"]
+
+
+def test_refresh_options_failure_records_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import tools
+
+    now = 1700000100.0
+
+    def chain(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"error": "broker offline"}
+
+    monkeypatch.setattr(tools, "get_option_chain", chain)
+    with pytest.raises(RuntimeError, match="broker offline"):
+        mp.refresh_options("NVDA", now=now)
+    state = market.refresh_state("rh_options", "NVDA")
+    assert state is not None
+    assert state["last_ok_at"] is None
+    assert state["last_error_at"] == now
+    assert state["last_error"] == "options unavailable: broker offline"
+    assert market.read_snapshots("rh_options", "NVDA", 1) == []
+
+
+@pytest.mark.parametrize("saved", [False, True])
+def test_cold_quote_failure_preserves_available_history(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, saved: bool
+) -> None:
+    from app import analyst_client
+
+    now = 1700000100.0
+    if saved:
+        market.save_quote("NVDA", 10, now - 1)
+
+    def fail(ticker: str) -> dict[str, object]:
+        assert ticker == "NVDA"
+        raise ConnectionError("offline")
+
+    monkeypatch.setattr(analyst_client, "get_quote_price", fail)
+    expected: dict[str, object] = {
+        "sym": "NVDA",
+        "price": 10 if saved else None,
+        "retrieved_at": mp._iso(now - 1) if saved else None,
+        "source": "yahoo",
+        "as_of": None,
+        "stale": True,
+    }
+    if not saved:
+        expected["error"] = "quote unavailable: offline"
+    assert mp.get_quote(" nvda ", now=now) == expected
+    # A saved quote is served without a provider call; only an empty store fetches.
+    logged = "quote failed for NVDA: offline" in [record.getMessage() for record in caplog.records]
+    assert logged is not saved
+
+
+@pytest.mark.parametrize(
+    "ok,failed,now,stale,error",
+    [
+        (None, None, 1000, True, False),
+        (100, None, 399, False, False),
+        (100, None, 400, True, False),
+        (100, 99, 100, False, False),
+        (100, 100, 100, True, True),
+        (100, 101, 101, True, True),
+        (None, 100, 100, True, True),
+    ],
+)
+def test_freshness_compares_error_success_and_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+    ok: int | None,
+    failed: int | None,
+    now: int,
+    stale: bool,
+    error: bool,
+) -> None:
+    def state(kind: str, ticker: str, params: str) -> dict[str, object]:
+        assert (kind, ticker, params) == ("candles", "NVDA", "1h")
+        return {"last_ok_at": ok, "last_error_at": failed, "last_error": "offline"}
+
+    monkeypatch.setattr(market, "refresh_state", state)
+    expected: dict[str, object] = {"as_of": mp._iso(ok) if ok is not None else None, "stale": stale}
+    if error:
+        expected["error"] = "offline"
+    assert mp._freshness("candles", "NVDA", 300, now, "1h") == expected
+
+
+@pytest.mark.parametrize(
+    "range_,expected",
+    [
+        ("1d", "2024-03-30T12:34:56+00:00"),
+        ("5d", "2024-03-26T12:34:56+00:00"),
+        ("1mo", "2024-02-29T12:34:56+00:00"),
+        ("3mo", "2023-12-31T12:34:56+00:00"),
+        ("6mo", "2023-09-30T12:34:56+00:00"),
+        ("1y", "2023-03-31T12:34:56+00:00"),
+        ("2y", "2022-03-31T12:34:56+00:00"),
+        ("5y", "2019-03-31T12:34:56+00:00"),
+        ("10y", "2014-03-31T12:34:56+00:00"),
+        ("ytd", "2024-01-01T00:00:00+00:00"),
+        ("max", "1970-01-01T00:00:00+00:00"),
+    ],
+)
+def test_range_start_preserves_calendar_and_clock(range_: str, expected: str) -> None:
+    now = mp._epoch("2024-03-31T12:34:56Z")
+    assert datetime.fromtimestamp(mp._range_start(range_, now), UTC).isoformat() == expected
+
+
+def test_ytd_start_drops_subseconds() -> None:
+    now = mp._epoch("2024-06-01T12:00:00Z") + 0.5
+    assert datetime.fromtimestamp(mp._range_start("ytd", now), UTC).isoformat() == "2024-01-01T00:00:00+00:00"
+
+
+def test_candles_return_only_bars_inside_requested_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1700000100.0
+    market.save_bars(
+        "NVDA",
+        "1d",
+        [
+            {"t": now - 3 * 86400, "open": 1, "high": 1, "low": 1, "close": 1, "vol": 1},
+            {"t": now - 60, "open": 2, "high": 2, "low": 2, "close": 2, "vol": 2},
+        ],
+    )
+    market.mark_ok("candles", "NVDA", "1d", now=now, covered_from=0)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        pytest.fail("Stored coverage must not fetch")
+
+    monkeypatch.setattr(mp, "refresh_candles", fail)
+    result = mp.get_candles("NVDA", "1d", "1d", now=now)
+    assert result["candles"] == [{"t": now - 60, "open": 2, "high": 2, "low": 2, "close": 2, "vol": 2}]
+    assert result["price"] == 2
+
+
+def test_explicit_now_drives_freshness_not_wall_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1700000100.0
+    market.save_quote("NVDA", 10.0, now)
+    market.mark_ok("quote", "NVDA", now=now)
+    market.mark_ok("candles", "NVDA", "1d", now=now, covered_from=0)
+    monkeypatch.setattr(mp.time, "time", lambda: now + 30 * 86400)
+    assert mp.get_candles("NVDA", "1d", "1d", now=now)["stale"] is False
+    quote = mp.get_quote("NVDA", now=now)
+    assert quote["stale"] is False
+    assert quote["as_of"] == mp._iso(now)
+
+
+def test_default_now_uses_wall_clock() -> None:
+    market.save_quote("NVDA", 10.0, 1700000100)
+    market.mark_ok("quote", "NVDA", now=1700000100)
+    assert mp.get_quote("NVDA") == {
+        "sym": "NVDA",
+        "price": 10.0,
+        "retrieved_at": mp._iso(1700000100),
+        "source": "yahoo",
+        "as_of": mp._iso(1700000100),
+        "stale": False,
+    }
+
+
+@pytest.mark.parametrize("covered", [None, 1700000100 - 86400, 1700000100 - 86400 + 1])
+def test_candle_backfill_respects_exact_coverage_boundary(monkeypatch: pytest.MonkeyPatch, covered: int | None) -> None:
+    now = 1700000100.0
+    market.mark_ok("candles", "NVDA", "1h", now=now - 1, covered_from=covered)
+    calls: list[str] = []
+
+    def fetch(url: str, **kwargs: object) -> bytes:
+        calls.append(url)
+        return json.dumps(_payload([10.0])).encode()
+
+    monkeypatch.setattr(mp, "_http_bytes", fetch)
+    result = mp.get_candles("NVDA", "1d", "1h", now=now)
+    assert len(calls) == (0 if covered == now - 86400 else 1)
+    assert result["stale"] is False
+    assert result["interval"] == "1h"
+
+
+def test_refresh_candles_normalizes_symbol_and_saves_requested_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def fetch(url: str, **kwargs: object) -> bytes:
+        calls.append(url)
+        return json.dumps(_payload([10.0])).encode()
+
+    monkeypatch.setattr(mp, "_http_bytes", fetch)
+    mp.refresh_candles(" nvda ", "1h", "5d", now=1700000100)
+    assert calls == [f"{mp.YAHOO_QUERY_BASE}/v8/finance/chart/NVDA?range=5d&interval=1h"]
+    assert market.read_bars("NVDA", "1h", None) == [
+        {"t": 1700000000, "open": 10, "high": 10, "low": 10, "close": 10, "vol": 10},
+    ]
+    assert market.read_bars("NVDA", "1d", None) == []
+    state = market.refresh_state("candles", "NVDA", "1h")
+    assert state is not None
+    assert state["last_ok_at"] == 1700000100
+    assert state["covered_from"] == 1700000100 - 5 * 86400

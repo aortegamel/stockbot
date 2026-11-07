@@ -1,10 +1,11 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { fetchFeed, type FeedItem } from "../lib/market-data";
 import { toastAlert } from "../components/toasts";
 import { routeHash } from "../lib/route";
 import { safeSourceUrl } from "../../../needle-harness/lib/agent/types";
 import { ago } from "../lib/time";
 import type { ShellState } from "../layout/Shell";
+import { MarketRefreshContext } from "../components/home-panels";
 
 const POLL_MS = 60_000;
 // ponytail: cap the first page at 200 rows. Add virtualization if this limit grows.
@@ -36,6 +37,7 @@ const FeedRow = memo(function FeedRow({ item, now, onAsk }: { item: FeedItem; no
 });
 
 export default function Feed({ selected, watchlist, setInput, setAskContext, openDrawer }: Props) {
+  const refresh = useContext(MarketRefreshContext);
   // null: the first page is loading.
   const [items, setItems] = useState<FeedItem[] | null>(null);
   // Polled items that arrived while the list was scrolled away from the top.
@@ -102,7 +104,7 @@ export default function Feed({ selected, watchlist, setInput, setAskContext, ope
       clearInterval(id);
       document.removeEventListener("visibilitychange", visible);
     };
-  }, [symsKey, retry]);
+  }, [symsKey, retry, refresh]);
 
   // The item rides as a chip beside an empty input; the server rejects an unsafe url or a title over 300 chars, so both drop here.
   const ask = useCallback((item: FeedItem) => {

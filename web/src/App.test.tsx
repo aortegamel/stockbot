@@ -5,6 +5,7 @@ import { act } from "react";
 import type { ReactNode } from "react";
 import type { Root } from "react-dom/client";
 import App from "./App";
+import { QUOTE_POLL_MS } from "./lib/market-data";
 import type { Metrics } from "../../needle-harness/lib/agent/types";
 
 // react-dom reads canUseDOM once at module load, so it must load after the jsdom globals
@@ -51,6 +52,8 @@ function serve(extra: Handler = () => undefined): { urls: string[]; bodies: stri
     const handled = extra(url, init);
     if (handled !== undefined) return Promise.resolve(handled);
     if (url.includes("/api/health")) return Promise.resolve(json({ debug: false }));
+    if (url === "/api/market/watchlist") return Promise.resolve(json({ symbols: WATCHLIST }));
+    if (url === "/api/market/status") return Promise.resolve(json({ running: false, last_cycle_at: null, oldest_as_of: null }));
     if (url.includes("/api/quote")) return Promise.resolve(json({ sym: "X", price: 100 }));
     if (url.includes("/api/watchlist")) {
       const symbols = new URL(url, dom.window.location.href).searchParams.get("symbols")?.split(",") ?? [];
@@ -626,10 +629,10 @@ describe("App agent send", () => {
       expect(text(root)).not.toContain("stream stalled");
       expect(signal?.aborted).toBe(true);
       expect(findButton(root, "Send")).not.toBeNull();
-      // The strip keeps refreshing on its own minute interval.
+      // The strip keeps refreshing on the quote poll interval.
       const quotesBefore = urls.filter((url) => url.includes("/api/quote")).length;
       await act(async () => {
-        jest.advanceTimersByTime(60_000);
+        jest.advanceTimersByTime(QUOTE_POLL_MS);
       });
       await settle();
       expect(urls.filter((url) => url.includes("/api/quote")).length).toBeGreaterThan(quotesBefore);
@@ -1000,5 +1003,90 @@ describe("App command bar", () => {
     await click(find<HTMLButtonElement>(root, '[aria-label="Open agent drawer"]'));
     expect(dom.window.localStorage.getItem("stockbot.drawer")).toBe("open");
     expect(root.querySelector('[aria-label="Agent drawer"]')).toBeNull();
+  });
+});
+
+describe("persistent market data", () => {
+  test("loads the saved watchlist and persists receipts without a watchlist panel", async () => {
+    const live = liveStream();
+    let symbols = ["AAPL"];
+    const writes: string[][] = [];
+    serve((url, init) => {
+      if (url === "/api/market/watchlist") {
+        if (init?.method === "PUT") {
+          symbols = JSON.parse(String(init.body)).symbols;
+          writes.push(symbols);
+        }
+        return json({ symbols });
+      }
+      if (url === "/api/agent") return new Response(live.stream);
+      if (url.startsWith("/api/feed")) return json({ items: [], errors: [] });
+      return undefined;
+    });
+    const root = await mount(<App />);
+    await until(() => text(root).includes("AAPL100DELAYED"));
+    expect(root.querySelector('[aria-label="MSFT sources"]')).toBeNull();
+    expect(writes).toEqual([]);
+    await click(findLink(root, "Feed")!);
+    await until(() => root.querySelector('[data-widget-type="watchlist"]') === null);
+    await type(find<HTMLInputElement>(root, AGENT_PROMPT), "Update my watchlist");
+    await click(button(root, "Send"));
+    await act(async () => {
+      for (const event of [
+        { type: "watchlist_update", action: "add", ticker: "AMD" },
+        { type: "watchlist_update", action: "remove", ticker: "AAPL" },
+        { type: "watchlist_update", action: "add", ticker: ["MSFT"] },
+        { type: "watchlist_update", action: "add", ticker: "SEC" },
+        { type: "done", metrics: metrics() },
+      ]) live.send(`data: ${JSON.stringify(event)}\n\n`);
+      live.close();
+    });
+    await until(() => writes.length === 2);
+    expect(writes).toEqual([["AAPL", "AMD"], ["AMD"]]);
+    expect(symbols).toEqual(["AMD"]);
+    expect(root.querySelector("footer")?.lastElementChild?.textContent).toBe("NVDA");
+    await click(findLink(root, "Workspaces: Research")!);
+    await until(() => text(root).includes("AMD100DELAYED"));
+    expect(root.querySelector('[aria-label="NVDA sources"]')).not.toBeNull();
+    expect(root.querySelector('[aria-label="AAPL sources"]')).toBeNull();
+  });
+
+  test("shows local freshness, polls a queued refresh, and reloads stored panels after collection", async () => {
+    jest.useFakeTimers();
+    const asOf = 1793350000;
+    let status = { running: false, last_cycle_at: asOf, oldest_as_of: asOf };
+    let refreshes = 0;
+    const { urls } = serve((url, init) => {
+      if (url === "/api/market/status") return json(status);
+      if (url === "/api/market/refresh") {
+        expect(init?.method).toBe("POST");
+        refreshes++;
+        return new Response(null, { status: 202 });
+      }
+      return undefined;
+    });
+    const root = await mount(<App />, false);
+    await settle();
+    await act(async () => { jest.advanceTimersByTime(0); });
+    await until(() => text(root).includes("NVDA100DELAYEDSEC none"));
+    const local = new Date(asOf * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+    expect(root.querySelector("header")?.textContent).toContain(`as of ${local}`);
+    const before = urls.filter((url) => url.startsWith("/api/news?")).length;
+    await click(button(root, "Refresh"));
+    expect(refreshes).toBe(1);
+    expect(button(root, "Refreshing…").disabled).toBe(true);
+    await act(async () => { jest.advanceTimersByTime(3_000); });
+    await settle();
+    expect(button(root, "Refreshing…").disabled).toBe(true);
+    status = { ...status, running: true };
+    await act(async () => { jest.advanceTimersByTime(3_000); });
+    await settle();
+    status = { running: false, last_cycle_at: asOf + 6, oldest_as_of: asOf + 6 };
+    await act(async () => { jest.advanceTimersByTime(3_000); });
+    await settle();
+    expect(button(root, "Refresh").disabled).toBe(false);
+    expect(urls.filter((url) => url.startsWith("/api/news?")).length).toBe(before + 1);
+    await unmount();
+    jest.useRealTimers();
   });
 });

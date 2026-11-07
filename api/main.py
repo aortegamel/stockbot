@@ -23,13 +23,32 @@ Routes:
 """
 
 import os
+import re
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, StrictStr
+
+from app.services import collector
+from app.storage import market
 
 from . import market_providers as providers
 from . import portfolio_routes, scans, theses_routes, workspaces
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    enabled = os.getenv("STOCKBOT_COLLECTOR") != "0"
+    if enabled:
+        collector.start()
+    try:
+        yield
+    finally:
+        if enabled:
+            collector.stop()
+
+
+app = FastAPI(lifespan=lifespan)
 app.include_router(theses_routes.router)
 app.include_router(portfolio_routes.router)
 app.include_router(scans.router)
@@ -41,6 +60,35 @@ def _syms(raw: str) -> list[str]:
         return providers.parse_syms(raw)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+class MarketWatchlist(BaseModel):
+    symbols: list[StrictStr] = Field(max_length=50)
+
+
+@app.get("/api/market/watchlist")
+def market_watchlist():
+    return {"symbols": market.get_watchlist()}
+
+
+@app.put("/api/market/watchlist")
+def save_market_watchlist(body: MarketWatchlist):
+    symbols = [symbol.strip().upper() for symbol in body.symbols]
+    if any(not re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=/-]{0,19}", symbol) for symbol in symbols):
+        raise HTTPException(400, "invalid ticker symbol")
+    saved = market.set_watchlist(symbols)
+    return {"symbols": saved}
+
+
+@app.post("/api/market/refresh", status_code=202)
+def refresh_market():
+    collector.request_refresh()
+    return {"status": "queued"}
+
+
+@app.get("/api/market/status")
+def market_status():
+    return collector.status()
 
 
 @app.get("/")

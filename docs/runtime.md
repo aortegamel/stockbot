@@ -1,10 +1,22 @@
 # Stockbot runtime: native research tools and ledger proof
 
 Launch: `bun run stockbot` runs `bun needle-harness/scripts/needle.ts`.
-The launcher refreshes tool schemas through `scripts/tool_bridge.py describe`.
-It starts the Bun API host, FastAPI, and Vite.
-Vite sends agent, watchlist, health, and research requests to Bun.
-It sends the existing market requests to FastAPI.
+The launcher refreshes the tool catalog through `scripts/tool_bridge.py describe`.
+It starts three services: the Bun API host (`needle-harness/scripts/api.ts`), FastAPI (`api.main:app`), and Vite.
+The Bun host dispatches `POST /api/agent`, `GET /api/watchlist`, `GET /api/health`, and `GET /api/research/*`.
+Vite proxies those paths to the Bun host.
+It sends the existing `/api/*` and `/api/market/*` market paths to FastAPI.
+
+`GET /api/market/watchlist` loads the saved list.
+`PUT /api/market/watchlist` saves `{symbols}`.
+The selected ticker stays visible without entering the saved list.
+The shell persists validated watchlist receipts even when no watchlist panel exists.
+`GET /api/market/status` supplies `running`, `last_cycle_at`, and `oldest_as_of` in epoch seconds.
+The header shows the oldest timestamp in local time as `as of HH:MM`.
+Its Refresh button sends `POST /api/market/refresh` and polls status every three seconds.
+When collection completes, panels read the stored data again.
+Quotes, candles, news, and filings retain their data when `stale` is true.
+Their `as_of` fields contain ISO timestamps.
 
 Research requests use `runKernelAgent` in `needle-harness/lib/agent/kernel.ts`.
 The kernel calls `app/research/kernel_worker.py` through its shared worker.
@@ -226,6 +238,44 @@ The shared worker timeout still bounds argument generation.
 
 
 The terminal Harness tab renders `HarnessSessionViewer` with the selected session id. It reads the existing session plus snapshot research APIs only. A missing or failed snapshot stays unavailable for that session, never another session. Static `HarnessViewer` with a projection prop remains for untracked preview files; export previews write only the `--out` path.
+
+## Market data store and collector
+
+`data/market.sqlite` (`app/storage/market.py`) keeps market history for local reuse. The file uses WAL mode, so the collector writes while readers read.
+
+| Table | Contents | Retention |
+|---|---|---|
+| `watchlist` | One saved watchlist per install. The first run seeds it from `DEFAULT_WATCHLIST`. | Kept |
+| `bars`, `quotes`, `filings`, `ciks` | Candles per interval, quotes tagged by source, SEC Atom filings, ticker→CIK | Kept (Robinhood quotes: 30 days) |
+| `snapshots` | One JSON payload per kind, symbol, and UTC day: estimates, FINRA, US Google Trends, `rh_options` | Kept (`rh_options`: 30 days) |
+| `news` | Headlines, article text, summary state | 30 days |
+| `refresh_log` | Last success, last error, covered range per kind, symbol, and params | Kept |
+| `budget` | Exa dollar spend per month | Kept |
+
+The collector (`app/services/collector.py`) runs as one daemon thread in the FastAPI lifespan. `STOCKBOT_COLLECTOR=0` disables it. The thread wakes every 60 seconds and runs each job whose interval has passed. Jobs run one at a time:
+
+- quote: 5 minutes. Candles and news: 15 minutes. Filings: 1 hour.
+- Analyst estimates, SEC companyfacts, FINRA short interest and Reg SHO, Exa news, US Trends: daily.
+- Article text and news summaries: small batches every cycle. Retention: daily.
+
+A failed job records `last_error` and runs again after its interval. A failed job does not change `last_ok_at`.
+
+Reads (`api/market_providers.py`) return stored data with `as_of` and `stale`. A stale read does not fetch. A read fetches live only when the store has no data, or when a candle range starts before `covered_from`. The header Refresh button (`POST /api/market/refresh`) runs every job once. `status.running` is true only while a requested refresh is queued or running.
+
+Quotes run in two collector threads, one per source, separate from the 60-second cycle, so a slow Yahoo sweep never delays the 5-second broker poll. They cover the watchlist plus every symbol the UI has read a quote for (`market.quote_symbols()`), such as the index tape and searched tickers. Neither provider publishes a rate limit, so the intervals sit below observed ceilings:
+
+| Source | Interval | Calls | Evidence |
+|---|---|---|---|
+| Robinhood (broker connected) | 5 s | one batched `get_equity_quotes` call for all tracked symbols | about 4 calls/s sustained, throttling near 8/s, as measured by kevin1chun/robinhood-for-agents |
+| Yahoo `quoteSummary` | 60 s | one call per symbol, bypassing `valuation`'s 5-minute price cache | about 2,000 requests/hour per IP is the commonly reported ceiling |
+
+A quote row is saved only when its price differs from the newest saved price of the same source. `refresh_log` records every successful poll. `GET /api/quote` returns the price from whichever source was confirmed most recently, with `source` set to `robinhood` or `yahoo`. A read is `stale` when that source missed two of its intervals or its last poll failed. Reads call a provider only when no quote is saved yet: Robinhood first when connected, then Yahoo for symbols Robinhood does not quote, such as indexes and futures. Each source is tried at most once per its interval, so repeated reads of an unquotable symbol never hammer a provider. The UI polls quotes every 5 seconds (`QUOTE_POLL_MS`). Option chains are saved once a day under `rh_options` while the broker is connected. Robinhood quotes and `rh_options` snapshots are deleted after 30 days. Without a broker, no code calls Robinhood.
+
+Exa: every caller reserves an upper-bound cost in `budget` before the request. The client then replaces the reservation with `costDollars.total`. The monthly cap is `EXA_MONTHLY_LIMIT` (default $9) for all callers. The collector also has its own cap, `EXA_COLLECTOR_MONTHLY_LIMIT` (default $3). Set a matching key budget in the Exa dashboard. Only that budget stops spending from other machines.
+
+News summaries (`app/services/news_summary.py`): the OpenCode reasoner reads each new story. The prompt is `STORY_SYSTEM_PROMPT` in `app/reasoner_client.py`, and the reply is checked JSON. A relevant story with high or medium impact becomes `data/news/YYYY-MM-DD/<TICKER>-<slug>-<hash8>.md`. The collector requests each article body at most once. A story gets two summary attempts.
+
+Retention deletes these items when they are older than 30 days: `news` rows, `data/news/` day folders, `data/briefing/*.json`, and `data/raw/viewer/capture` entries. Retention refuses symlinked roots.
 
 ## Numeric datapoints
 

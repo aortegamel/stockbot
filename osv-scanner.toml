@@ -6,14 +6,6 @@
 # both past every listed fix). The gate therefore checks exactly what this repo
 # pins: requirements.txt direct pins + the full bun.lock tree.
 #
-# Every entry below stays until its fix is picked up; ignoreUntil forces a re-check.
-
-[[IgnoredVulns]]
-# GHSA-g3hv-75wg-m249: minimatch ReDoS via crafted glob patterns (CVSS 6.9, fixed 11.0.1).
-# Reached only through @stryker-mutator/core (dev), which declares "minimatch": "~10.2.4";
-# the latest release (10.1.1) still pins that range, so no compatible fixed version exists.
-# Stryker globs repository paths at mutation-test time on this machine: no untrusted glob
-# pattern reaches it, and nothing from this dependency ships in the app or the API server.
-id = "GHSA-g3hv-75wg-m249"
-ignoreUntil = 2027-02-01
-reason = "dev-only transitive of @stryker-mutator/core (pins ~10.2.4; no compatible fixed release); mutation runner globs local paths, not shipped"
+# No suppressions are active. The former GHSA-g3hv-75wg-m249 entry (minimatch
+# ReDoS through @stryker-mutator/core) is gone because `package.json` now
+# overrides minimatch to 11.0.4, past the 11.0.1 fix.

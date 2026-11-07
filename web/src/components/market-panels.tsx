@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
-import { fetchFilings, fetchNews, fetchQuote, fetchWatchlistSources, type SourceRow } from "../lib/market-data";
+import { useContext, useEffect, useState } from "react";
+import { QUOTE_POLL_MS, fetchFilings, fetchNews, fetchQuote, fetchWatchlistSources, type SourceRow } from "../lib/market-data";
 
 import { AgentConsole } from "./agent-console";
 import type { WidgetOutcomes } from "./action-cards";
 import { AskContextChip } from "./agent-event";
-import { useLoad } from "./home-panels";
+import { MarketRefreshContext, useLoad } from "./home-panels";
 import type { AgentEvent, AskContext } from "../../../needle-harness/lib/agent/types";
 import type { JournalPage, ResearchSnapshot } from "../lib/research-client";
 import { sessionTitle } from "../lib/session-title";
@@ -25,13 +25,9 @@ const h: React.CSSProperties = {
 const muted = "var(--muted, #93A0B8)";
 const down = "var(--down, #EF5350)";
 
-const WATCH_DEFAULTS = ["NVDA", "AAPL", "MSFT", "TSLA", "SPY", "QQQ", "AMZN", "META", "GOOG"];
-
-// The actual UI watchlist: the selected symbol is always present even when it
-// isn't in the defaults (any-ticker search). The agent receives this same list.
-export function watchlistFor(selected: string): string[] {
-  const extra = selected && !WATCH_DEFAULTS.includes(selected) ? [selected] : [];
-  return [...extra, ...WATCH_DEFAULTS];
+// The selected symbol stays visible without changing the saved watchlist.
+export function watchlistFor(selected: string, symbols: string[]): string[] {
+  return selected && !symbols.includes(selected) ? [selected, ...symbols] : symbols;
 }
 
 const SOURCE_LABEL: Record<SourceRow["source"], string> = {
@@ -49,7 +45,8 @@ function sourceText(row: SourceRow): string {
 // Watchlist: real delayed quotes from /api/quote, plus one page-load fan-out of
 // SEC filings and the three FINRA datasets per symbol. Every source shows its own status.
 export function WatchlistPanel({ selected, onSelect, symbols }: { selected: string; onSelect: (s: string) => void; symbols?: string[] }) {
-  const syms = symbols ?? watchlistFor(selected);
+  const syms = watchlistFor(selected, symbols ?? []);
+  const refresh = useContext(MarketRefreshContext);
   const symKey = syms.join(",");
   const [prices, setPrices] = useState<Record<string, number | null>>({});
   const [sources, setSources] = useState<SourceRow[]>([]);
@@ -69,7 +66,7 @@ export function WatchlistPanel({ selected, onSelect, symbols }: { selected: stri
       clearTimeout(id);
       ctrl.abort();
     };
-  }, [symKey, sourceAttempt]);
+  }, [symKey, sourceAttempt, refresh]);
   useEffect(() => {
     const current = symKey.split(",");
     let alive = true;
@@ -89,13 +86,13 @@ export function WatchlistPanel({ selected, onSelect, symbols }: { selected: stri
       if (alive) setPrices(next);
     }
     void load();
-    const id = setInterval(() => void load(), 60_000);
+    const id = setInterval(() => void load(), QUOTE_POLL_MS);
     return () => {
       alive = false;
       ctrl.abort();
       clearInterval(id);
     };
-  }, [symKey]);
+  }, [symKey, refresh]);
   return (
     <div style={{ ...panel, height: "100%", overflowY: "auto" }}>
       <div style={h}>WATCHLIST · DELAYED</div>

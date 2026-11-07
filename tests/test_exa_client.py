@@ -6,6 +6,7 @@ per-test via env vars.
 """
 
 import json
+import sqlite3
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -14,6 +15,7 @@ import requests
 
 from app import exa_client, tools
 from app.policy import Capability, RequestContext
+from app.storage import market
 
 EXA_FIXTURES = Path(__file__).parent / "fixtures" / "exa"
 
@@ -88,6 +90,13 @@ def _patch_session(monkeypatch: pytest.MonkeyPatch, session: FakeSession) -> Fak
 @pytest.fixture
 def enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     _enable_exa(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def isolated_budget(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("EXA_MONTHLY_LIMIT", "9")
+    monkeypatch.setenv("EXA_COLLECTOR_MONTHLY_LIMIT", "3")
 
 
 def test_disabled_when_env_off(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -328,3 +337,227 @@ def test_payload_privacy(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None
     blob = json.dumps(payload).lower()
     for identifier in ("account", "portfolio", "123456789"):
         assert identifier not in blob
+
+
+def test_budget_refuses_without_http(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXA_MONTHLY_LIMIT", "0.001")
+    session = _patch_session(monkeypatch, FakeSession())
+    assert "budget" in str(exa_client.search("AMD")["error"])
+    assert not session.posts
+
+
+def test_collector_budget_is_separate(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXA_COLLECTOR_MONTHLY_LIMIT", "0")
+    session = _patch_session(monkeypatch, FakeSession(_response({"results": []})))
+    assert "budget" in str(exa_client.search("AMD", caller="collector")["error"])
+    assert "error" not in exa_client.search("AMD")
+    assert len(session.posts) == 1
+
+
+def test_budget_reconciles_and_contents_share_it(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    period = exa_client.datetime.now(exa_client.UTC).strftime("%Y-%m")
+    session = _patch_session(monkeypatch, FakeSession(_response({"results": [], "costDollars": {"total": 0.002}})))
+    assert "error" not in exa_client.search("AMD", caller="collector")
+    assert market.spent("exa", period) == pytest.approx(0.002)
+    assert market.spent("exa:collector", period) == pytest.approx(0.002)
+    assert "error" not in exa_client.contents(["https://example.com"], caller="collector")
+    assert market.spent("exa", period) == pytest.approx(0.004)
+    assert market.spent("exa:collector", period) == pytest.approx(0.004)
+    assert session.posts[-1][0].endswith("/contents")
+    assert session.posts[-1][1]["json"] == {
+        "urls": ["https://example.com"],
+        "text": {"maxCharacters": exa_client.EXA_SEARCH_TEXT_MAX_CHARS},
+    }
+
+
+def test_budget_refunds_failed_request(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    session = MagicMock()
+    session.post.side_effect = requests.ConnectionError("offline")
+    monkeypatch.setattr(exa_client, "_ensure_session", lambda: session)
+    assert "error" in exa_client.search("AMD", caller="collector")
+    period = exa_client.datetime.now(exa_client.UTC).strftime("%Y-%m")
+    assert market.spent("exa", period) == 0
+    assert market.spent("exa:collector", period) == 0
+
+
+@pytest.mark.parametrize("cost", [None, {}, {"total": None}, {"total": -1}, {"total": True}, {"total": float("nan")}])
+def test_invalid_cost_keeps_reservation(enabled: None, monkeypatch: pytest.MonkeyPatch, cost: object) -> None:
+    _patch_session(monkeypatch, FakeSession(_response({"results": [], "costDollars": cost})))
+    exa_client.search("AMD", limit=1)
+    period = exa_client.datetime.now(exa_client.UTC).strftime("%Y-%m")
+    assert market.spent("exa", period) == pytest.approx(0.009)
+
+
+@pytest.mark.parametrize("limit", ["-1", "nan", "inf", "-inf"])
+@pytest.mark.parametrize("caller", ["agent", "collector"])
+def test_invalid_caps_refuse_before_http(
+    enabled: None, monkeypatch: pytest.MonkeyPatch, limit: str, caller: str
+) -> None:
+    monkeypatch.setenv("EXA_MONTHLY_LIMIT" if caller == "agent" else "EXA_COLLECTOR_MONTHLY_LIMIT", limit)
+    session = _patch_session(monkeypatch, FakeSession())
+    assert exa_client.contents(["https://example.com"], caller=caller) == {
+        "error": "Exa monthly budget limits must be finite nonnegative dollars",
+        "source": "exa",
+    }
+    assert not session.posts
+
+
+@pytest.mark.parametrize("urls", [[], ["ftp://example.com"], ["https:///missing"], [1], "https://example.com"])
+def test_contents_rejects_invalid_urls(enabled: None, monkeypatch: pytest.MonkeyPatch, urls: object) -> None:
+    session = _patch_session(monkeypatch, FakeSession())
+    assert exa_client.contents(urls, caller="collector") == {
+        "error": "Exa contents requires nonempty HTTP(S) URLs",
+        "source": "exa",
+    }
+    assert not session.posts
+
+
+def test_contents_disabled_makes_no_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXA_ENABLED", "false")
+    session = _patch_session(monkeypatch, FakeSession())
+    assert exa_client.contents(["https://example.com"], caller="collector") == {
+        "error": "Exa contents unavailable",
+        "source": "exa",
+    }
+    assert not session.posts
+
+
+@pytest.mark.parametrize(
+    "payload,status,error",
+    [({}, 200, "Exa contents returned an invalid response"), ({}, 503, "Exa search failed: HTTP 503")],
+)
+def test_contents_reports_bad_response(
+    enabled: None, monkeypatch: pytest.MonkeyPatch, payload: object, status: int, error: str
+) -> None:
+    _patch_session(monkeypatch, FakeSession(_response(payload, status)))
+    assert _err(exa_client.contents(["https://example.com"], caller="agent")) == error
+
+
+def test_contents_reports_unavailable_budget(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXA_MONTHLY_LIMIT", "not dollars")
+    session = _patch_session(monkeypatch, FakeSession())
+    assert "Exa budget unavailable:" in _err(exa_client.contents(["https://example.com"], caller="collector"))
+    assert not session.posts
+
+
+def test_contents_budget_refusal_makes_no_request(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXA_COLLECTOR_MONTHLY_LIMIT", "0")
+    session = _patch_session(monkeypatch, FakeSession())
+    assert exa_client.contents(["https://example.com"], caller="collector") == {
+        "error": "Exa monthly budget exhausted",
+        "source": "exa",
+    }
+    assert not session.posts
+
+
+def test_reservation_precedes_http(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    period = exa_client.datetime.now(exa_client.UTC).strftime("%Y-%m")
+
+    def request(payload: object, endpoint: str) -> object:
+        assert payload == {"urls": ["https://example.com"], "text": {"maxCharacters": 12_000}}
+        assert endpoint == "contents"
+        assert market.spent("exa", period) == pytest.approx(0.001)
+        assert market.spent("exa:collector", period) == pytest.approx(0.001)
+        return _response({"results": [], "costDollars": {"total": 0}})
+
+    monkeypatch.setattr(exa_client, "_request", request)
+    assert exa_client.contents(["https://example.com"], caller="collector") == {
+        "source": "exa",
+        "evidence": [],
+        "omitted_count": 0,
+        "row_count": 0,
+    }
+    assert market.spent("exa", period) == 0
+    assert market.spent("exa:collector", period) == 0
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        None,
+        [],
+        {"costDollars": []},
+        {"costDollars": {"total": "0.002"}},
+        {"costDollars": {"total": float("inf")}},
+        {"costDollars": {"total": False}},
+    ],
+)
+def test_contents_keeps_estimate_without_numeric_cost(
+    enabled: None, monkeypatch: pytest.MonkeyPatch, body: object
+) -> None:
+    _patch_session(monkeypatch, FakeSession(_response(body, 503)))
+    assert "HTTP 503" in _err(exa_client.contents(["https://example.com"], caller="collector"))
+    period = exa_client.datetime.now(exa_client.UTC).strftime("%Y-%m")
+    assert market.spent("exa", period) == pytest.approx(0.001)
+    assert market.spent("exa:collector", period) == pytest.approx(0.001)
+
+
+def test_contents_refunds_no_response(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    session = MagicMock()
+    session.post.side_effect = requests.Timeout()
+    monkeypatch.setattr(exa_client, "_ensure_session", lambda: session)
+    assert exa_client.contents(["https://example.com"], caller="collector") == {
+        "error": "Exa contents timed out",
+        "source": "exa",
+    }
+    period = exa_client.datetime.now(exa_client.UTC).strftime("%Y-%m")
+    assert market.spent("exa", period) == 0
+    assert market.spent("exa:collector", period) == 0
+
+
+def test_contents_estimate_scales_with_url_count(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_session(monkeypatch, FakeSession(_response({"results": []})))
+    urls = ["https://a.example", "https://b.example"]
+    assert "error" not in exa_client.contents(urls, caller="agent")
+    period = exa_client.datetime.now(exa_client.UTC).strftime("%Y-%m")
+    assert market.spent("exa", period) == pytest.approx(0.002)
+
+
+def test_search_reports_unavailable_budget(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*args: object, **kwargs: object) -> bool:
+        raise sqlite3.Error("database is locked")
+
+    monkeypatch.setattr(market, "reserve", fail)
+    session = _patch_session(monkeypatch, FakeSession())
+    assert _err(exa_client.search("AMD")) == "Exa budget unavailable: database is locked"
+    assert not session.posts
+
+
+def test_default_caps_apply_without_env(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("EXA_MONTHLY_LIMIT")
+    monkeypatch.delenv("EXA_COLLECTOR_MONTHLY_LIMIT")
+    _patch_session(monkeypatch, FakeSession(_response({"results": []})))
+    assert "error" not in exa_client.contents(["https://example.com"], caller="collector")
+    period = exa_client.datetime.now(exa_client.UTC).strftime("%Y-%m")
+    assert market.spent("exa", period) == pytest.approx(exa_client.EXA_TEXT_PAGE_COST)
+    assert market.spent("exa:collector", period) == pytest.approx(exa_client.EXA_TEXT_PAGE_COST)
+
+
+def test_contents_normalizes_article_text(enabled: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_session(
+        monkeypatch,
+        FakeSession(
+            _response(
+                {
+                    "results": [
+                        None,
+                        {
+                            "url": "https://example.com/story",
+                            "title": "Story",
+                            "text": "Article",
+                            "publishedDate": "2026-10-30",
+                        },
+                    ]
+                }
+            )
+        ),
+    )
+    result = exa_client.contents(["https://example.com/story"], caller="agent")
+    assert result["source"] == "exa"
+    assert result["row_count"] == 1
+    assert result["omitted_count"] == 1
+    article = _as_dict(_as_seq(result["evidence"])[0])
+    assert article["url"] == "https://example.com/story"
+    assert article["source_content"] == "Article"
+    assert article["source_domain"] == "example.com"
+    assert isinstance(article["retrieved_at"], str) and article["retrieved_at"].endswith("+00:00")

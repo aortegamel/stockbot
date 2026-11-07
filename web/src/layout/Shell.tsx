@@ -1,13 +1,14 @@
-import { useCallback, useEffect, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
+import { useCallback, useContext, useEffect, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
 import { AIPanel, watchlistFor } from "../components/market-panels";
 import type { WidgetOutcomes } from "../components/action-cards";
 import { HealthDot } from "../components/health-dot";
-import { fetchQuote } from "../lib/market-data";
+import { QUOTE_POLL_MS, fetchMarketStatus, fetchMarketWatchlist, fetchQuote, refreshMarket, saveMarketWatchlist, type MarketStatus } from "../lib/market-data";
 import { parseRoute, routeHash, TICKER_RE, useHashRoute, type Route } from "../lib/route";
 import type { AgentEvent, AskContext } from "../../../needle-harness/lib/agent/types";
 import { fetchJournal, fetchSnapshot, listSessions, type JournalPage, type ResearchSnapshot } from "../lib/research-client";
 import CommandBar from "./CommandBar";
 import { DEFAULT_WORKSPACE_ID, type WorkspaceDraft } from "../pages/Workspace";
+import { MarketRefreshContext } from "../components/home-panels";
 
 // The existing watchdog stops once buffered persona reasoning starts.
 const STALL_TIMEOUT_MS = 120_000;
@@ -34,6 +35,7 @@ export type ShellState = {
   selected: string;
   pick: (sym: string) => void;
   watchlist: string[];
+  watchlistLoading?: boolean;
   onWatchlist: (symbols: string[]) => void;
   events: AgentEvent[];
   input: string;
@@ -63,6 +65,7 @@ export type ShellState = {
 };
 
 function Strip() {
+  const refresh = useContext(MarketRefreshContext);
   const [prices, setPrices] = useState<Record<string, number | null>>({});
   useEffect(() => {
     let alive = true;
@@ -82,13 +85,13 @@ function Strip() {
       if (alive) setPrices(next);
     }
     void load();
-    const id = setInterval(() => void load(), 60_000);
+    const id = setInterval(() => void load(), QUOTE_POLL_MS);
     return () => {
       alive = false;
       ctrl.abort();
       clearInterval(id);
     };
-  }, []);
+  }, [refresh]);
   const items = [...STRIP_DEFAULTS, ...STRIP_DEFAULTS];
   return (
     <div className="ticker-track">
@@ -139,6 +142,75 @@ async function receiveAgentResponse(response: Response, push: (event: AgentEvent
   }
 }
 
+function MarketControls({ error, setError, onCollected }: {
+  error: string;
+  setError: (error: string) => void;
+  onCollected: () => void;
+}) {
+  const [marketStatus, setMarketStatus] = useState<MarketStatus | null>(null);
+  const [refreshPending, setRefreshPending] = useState(false);
+  const refreshRequested = useRef(false);
+  const collected = useRef(onCollected);
+  collected.current = onCollected;
+
+  useEffect(() => {
+    const ctrl = new AbortController();
+    let previous: MarketStatus | null = null;
+    async function poll() {
+      try {
+        const status = await fetchMarketStatus(ctrl.signal);
+        if (ctrl.signal.aborted) return;
+        // Only requested refreshes set running. Routine cycles do not reload panels.
+        if (!status.running && previous?.running === true) {
+          refreshRequested.current = false;
+          setRefreshPending(false);
+          collected.current();
+        }
+        previous = status;
+        setMarketStatus(status);
+      } catch {
+        if (!ctrl.signal.aborted) setError("Market status unavailable.");
+      }
+    }
+    void poll();
+    const id = setInterval(() => void poll(), 3_000);
+    return () => { ctrl.abort(); clearInterval(id); };
+  }, [setError]);
+
+  async function requestMarketRefresh() {
+    if (refreshRequested.current || marketStatus?.running) return;
+    refreshRequested.current = true;
+    setRefreshPending(true);
+    setError("");
+    try {
+      await refreshMarket();
+    } catch {
+      refreshRequested.current = false;
+      setRefreshPending(false);
+      setError("Market refresh failed. Please retry.");
+    }
+  }
+  const running = refreshPending || marketStatus?.running;
+  return <>
+    <span className="num" aria-live="polite">
+      as of {marketStatus?.oldest_as_of == null ? "--:--" : new Date(marketStatus.oldest_as_of * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })}
+    </span>
+    <button type="button" className="pill" disabled={running} onClick={() => void requestMarketRefresh()}>
+      {running ? "Refreshing…" : "Refresh"}
+    </button>
+    {error && <span role="status">{error}</span>}
+  </>;
+}
+
+function applyWatchlistReceipt(event: AgentEvent, symbols: string[], onWatchlist: (symbols: string[]) => void) {
+  if (event.type !== "watchlist_update") return;
+  const { action, ticker } = event;
+  if ((action === "add" || action === "remove") && typeof ticker === "string" && TICKER_RE.test(ticker) && !TICKER_ORG[ticker]) {
+    onWatchlist(action === "remove" ? symbols.filter((symbol) => symbol !== ticker)
+      : symbols.includes(ticker) ? symbols : [...symbols, ticker]);
+  }
+}
+
 export default function Shell({ children }: { children: (route: Route, state: ShellState) => ReactNode }) {
   const [hashRoute, navigate] = useHashRoute();
   // The last workspace ticker. A workspace hash wins; other pages keep the last pick.
@@ -146,8 +218,40 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
   const route: Route = hashRoute ?? { page: "workspace", sym: lastSym };
   const selected = route.page === "workspace" ? route.sym : lastSym;
   if (selected !== lastSym) setLastSym(selected);
-  const [watchlist, setWatchlist] = useState(() => watchlistFor("NVDA"));
-  const onWatchlist = useCallback((symbols: string[]) => setWatchlist(symbols), []);
+  const [savedWatchlist, setWatchlist] = useState<string[]>([]);
+  const [watchlistLoading, setWatchlistLoading] = useState(true);
+  const watchlistRef = useRef(savedWatchlist);
+  const watchlistWrites = useRef(Promise.resolve());
+  const [marketError, setMarketError] = useState("");
+  const onWatchlist = useCallback((symbols: string[]) => {
+    watchlistRef.current = symbols;
+    setWatchlist(symbols);
+    setWatchlistLoading(false);
+    setMarketError("");
+    watchlistWrites.current = watchlistWrites.current.then(async () => {
+      const saved = await saveMarketWatchlist(symbols);
+      if (watchlistRef.current === symbols) {
+        watchlistRef.current = saved.symbols;
+        setWatchlist(saved.symbols);
+      }
+    }).catch(() => setMarketError("Watchlist save failed. Please retry your edit."));
+  }, []);
+  const watchlist = watchlistFor(selected, savedWatchlist);
+  const [marketRefresh, setMarketRefresh] = useState(0);
+
+  useEffect(() => {
+    const ctrl = new AbortController();
+    const initial = watchlistRef.current;
+    fetchMarketWatchlist(ctrl.signal).then((data) => {
+      if (!ctrl.signal.aborted && watchlistRef.current === initial) {
+        watchlistRef.current = data.symbols;
+        setWatchlist(data.symbols);
+        setWatchlistLoading(false);
+      }
+    }).catch(() => !ctrl.signal.aborted && setMarketError("Watchlist unavailable. Reload to retry."));
+    return () => ctrl.abort();
+  }, []);
+
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [widgetOutcomes, setWidgetOutcomes] = useState<WidgetOutcomes>(new Map());
   const onWidgetOutcomes = useCallback((outcomes: WidgetOutcomes) => setWidgetOutcomes((previous) => new Map([...previous, ...outcomes])), []);
@@ -336,6 +440,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
         if (!TICKER_RE.test(ticker) || TICKER_ORG[ticker]) return;
         pick(ticker);
       }
+      applyWatchlistReceipt(event, watchlistRef.current, onWatchlist);
       if (event.type === "done" || event.type === "error" || event.type === "failed") terminal = true;
       if (event.type === "reasoning_start") {
         reasoningStarted = true;
@@ -377,7 +482,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
   // The chat stays mounted for a windowed Agent. The drawer toggle gates only the docked aside.
   const chat = <AIPanel events={events} input={input} setInput={setInput} research={research} setResearch={setResearch} context={askContext} onClearContext={() => setAskContext(null)} onSend={() => void onSend()} sym={selected} busy={busy} debug={debug} widgetOutcomes={widgetOutcomes} />;
   const state: ShellState = {
-    selected, pick, watchlist, onWatchlist, events, input, setInput, research, setResearch, setAskContext, onSend: () => void onSend(),
+    selected, pick, watchlist, watchlistLoading, onWatchlist, events, input, setInput, research, setResearch, setAskContext, onSend: () => void onSend(),
     busy, debug, sessions, sessionId, setSessionId, snapshot, journal, seq, openDrawer: () => setDrawer(true), ask, onWidgetOutcomes, chat,
     workspace, setWorkspace,
   };
@@ -422,6 +527,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
             onAsk={ask}
           />
           <span className="nav">
+            <MarketControls error={marketError} setError={setMarketError} onCollected={() => setMarketRefresh((n) => n + 1)} />
             <HealthDot />
             <button
               type="button"
@@ -439,22 +545,24 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
         </span>
       </header>
 
-      <div className="shell-body">
-        {children(route, state)}
-        {drawer && !windowedAgent && <aside className="glass ws-cell drawer" aria-label="Agent drawer">{chat}</aside>}
-      </div>
+      <MarketRefreshContext.Provider value={marketRefresh}>
+        <div className="shell-body">
+          {children(route, state)}
+          {drawer && !windowedAgent && <aside className="glass ws-cell drawer" aria-label="Agent drawer">{chat}</aside>}
+        </div>
 
-      <footer className="app-footer">
-        <span className="strip ticker-strip">
-          <Strip />
-        </span>
-        <details className="footer-disclaimer">
-          <summary>Disclaimers</summary>
-          <p>Stockbot is for research and informational purposes only. It is not investment, legal, tax, or financial advice. Verify source data and make your own decisions.</p>
-        </details>
-        <span>delayed feed · Yahoo OHLCV + SEC EDGAR + multi-source news · research snapshot + journal</span>
-        <span>{selected}</span>
-      </footer>
+        <footer className="app-footer">
+          <span className="strip ticker-strip">
+            <Strip />
+          </span>
+          <details className="footer-disclaimer">
+            <summary>Disclaimers</summary>
+            <p>Stockbot is for research and informational purposes only. It is not investment, legal, tax, or financial advice. Verify source data and make your own decisions.</p>
+          </details>
+          <span>delayed feed · Yahoo OHLCV + SEC EDGAR + multi-source news · research snapshot + journal</span>
+          <span>{selected}</span>
+        </footer>
+      </MarketRefreshContext.Provider>
     </main>
   );
 }
