@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { AgentEvent, Evidence, FinalClaim, SourceReference } from "../../../needle-harness/lib/agent/types";
+import type { AgentEvent, ChatTurn, Evidence, FinalClaim, SourceReference } from "../../../needle-harness/lib/agent/types";
 import { fetchSourceDocument } from "../lib/research-client";
 import { routeHash } from "../lib/route";
 import { originalLink, sourceLabel, type OriginalLink } from "../lib/source-viewer";
@@ -97,7 +97,8 @@ function sourceLinks(known: Map<string, Evidence>): { reference: SourceReference
 // Citations open resolved originals. Source cards keep the audit page under a separate provenance action.
 // onRetry reruns the request behind these events; without it failures offer no Try again.
 // widgetOutcomes: what the workspace did with each widget receipt, for the toast text.
-export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes }: { events: AgentEvent[]; reasoning: boolean; debug: boolean; onRetry?: () => void; widgetOutcomes?: WidgetOutcomes }) {
+// history: earlier messages of the stored chat, above the live turn in the same scroll column.
+export function AgentConsole({ events, history = [], reasoning, debug, onRetry, widgetOutcomes }: { events: AgentEvent[]; history?: ChatTurn[]; reasoning: boolean; debug: boolean; onRetry?: () => void; widgetOutcomes?: WidgetOutcomes }) {
   const known = evidenceById(events);
   const links = sourceLinks(known);
   const finalAnswer = events.filter((e) => e.type === "answer_delta").map((e) => e.text).join("");
@@ -112,25 +113,26 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
   const loaded = useLoadedSources(showSources ? [...cited, ...links.map((link) => link.reference)] : []);
   const labelOf = (reference: SourceReference, evidence: Evidence, index: number): string =>
     loaded.get(reference.id)?.label || evidence.title || reference.title || `${evidence.source.toUpperCase() || "Source"} ${index}`;
-  if (events.length === 0) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // Stays pinned to the newest text until the reader scrolls up.
+  const followTail = useRef(true);
+  useEffect(() => {
+    const box = scrollRef.current;
+    if (box && followTail.current) box.scrollTop = box.scrollHeight;
+  }, [history.length, events.length, answer]);
+  if (events.length === 0 && history.length === 0) {
     return (
-      <div className="flex-1 space-y-3 overflow-y-auto p-3 text-sm">
+      <div className="flex-1 space-y-2 overflow-y-auto p-3 text-sm">
         <div className="text-zinc-100">Stockbot — local-first investment research</div>
         <div className="text-xs text-zinc-500">
-          Hedge-fund-style research infrastructure for individual investors — research and data foundation, not automated trading or portfolio management. I read
-          primary sources and show my evidence; deterministic calculations, not model arithmetic.
+          Ask about a stock, a filing, or the news. I read primary sources and show the evidence under each answer.
         </div>
         <div className="space-y-1 text-xs text-zinc-500">
-          <div>· SEC EDGAR — resolve a company to its CIK, search and list filings (10-K/10-Q/8-K), read bounded document windows, diff risk factors across periods.</div>
-          <div>· Fundamentals — EPS, dividends, balance-sheet items, full statements, XBRL facts, obligations and valuation multiples.</div>
-          <div>· Ownership &amp; insiders — beneficial stakes, holder changes, Forms 3/4/5 trades, Form 144 planned sales, offerings and dilution.</div>
-          <div>· FINRA — short interest and leaderboards, Reg SHO volume, threshold securities, dataset queries.</div>
-          <div>· Market context — analyst consensus, S&amp;P 500 weight, macro rates and inflation. No live quotes or option chains in this harness.</div>
-          <div>· Web + time — Exa web highlights as research leads only (canonical SEC/FINRA wins on facts); current time for point-in-time queries.</div>
-          <div>· Deep research — multi-question sessions with evidence, point-in-time known_at/as_of, raw archiving and provenance.</div>
-          <div>· Full Stockbot optionally reads Robinhood portfolio, quotes, and options when BROKER_ENABLED — disabled here. Research only, not investment advice.</div>
+          <div>· “What moved NVDA today?”</div>
+          <div>· “NVDA risk factors?”</div>
+          <div>· “AAPL insider sales last quarter?”</div>
         </div>
-        <div className="text-xs text-zinc-600">Try: “What time is it?” · “NVDA risk factors?” · “AAPL insider sales last quarter?”</div>
+        <div className="text-xs text-zinc-600">Research only, not investment advice.</div>
       </div>
     );
   }
@@ -145,7 +147,21 @@ export function AgentConsole({ events, reasoning, debug, onRetry, widgetOutcomes
   const tail = visible.filter((e) => e.type === "done" || e.type === "error" || e.type === "failed");
   const streaming = reasoning && tail.length === 0;
   return (
-    <div className="flex-1 space-y-2 overflow-y-auto p-3 text-sm">
+    <div
+      ref={scrollRef}
+      className="flex-1 space-y-2 overflow-y-auto p-3 text-sm"
+      onScroll={() => {
+        const box = scrollRef.current;
+        if (box) followTail.current = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+      }}
+    >
+      {history.length > 0 && (
+        <div aria-label="Earlier conversation" className="space-y-2">
+          {history.map((turn, i) => (
+            <div key={i} className={turn.role === "user" ? "text-zinc-100" : "whitespace-pre-wrap text-zinc-100"}>{turn.role === "user" ? `> ${turn.content}` : turn.content}</div>
+          ))}
+        </div>
+      )}
       {head.map((e, i) => (
         <AgentEventView key={i} event={e} />
       ))}

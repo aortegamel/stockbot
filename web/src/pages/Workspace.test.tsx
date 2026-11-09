@@ -275,6 +275,23 @@ describe("Named workspace", () => {
     expect(server.saved().widgets[0].geometry).toEqual({ ...geometry, height: 370 });
   });
 
+  test("scales a saved layout that is wider than the window on load", async () => {
+    // A 1024 px window has a 1160 x 760 budget, so a 2800 px wide layout scales by 1160/2800.
+    serve([{ ...widget("news"), geometry: { x: 0, y: 0, width: 2800, height: 600 } }]);
+    await render(<Page />);
+    const frame = find('[aria-label="Move or resize News · NVDA"]').closest(".react-draggable") as HTMLElement;
+    expect(frame.style.width).toBe("1160px");
+    expect(frame.style.height).toBe("248px");
+  });
+
+  test("keeps a saved layout that already fits the window", async () => {
+    serve([widget("news")]);
+    await render(<Page />);
+    const frame = find('[aria-label="Move or resize News · NVDA"]').closest(".react-draggable") as HTMLElement;
+    expect(frame.style.width).toBe("560px");
+    expect(frame.style.height).toBe("360px");
+  });
+
   test("keeps window geometry inside its minimum bounds", async () => {
     const server = serve([{ ...widget("news"), geometry: { x: 0, y: 0, width: 280, height: 180 } }]);
     await render(<Page />);

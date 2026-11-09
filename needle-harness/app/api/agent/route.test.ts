@@ -3,6 +3,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentEvent, Evidence } from "@/lib/agent/types";
+import { closeChatDb, readChat } from "@/lib/chat";
 import { ANSWER_SECTIONS, type reason } from "@/lib/muse/client";
 // Capture the production validators before mock.module replaces the kernel.
 import { asksWatchlist, outOfScopeAnswer, parseTicker, parseWatchlist, runKernelAgent } from "@/lib/agent/kernel";
@@ -149,6 +150,7 @@ beforeEach(async () => {
   watchlistReceipt = { result_type: "watchlist_update", action: "add", ticker: "NVDA" };
   widgetReceipt = { result_type: "widget_selection", widget_type: "short-volume", ticker: "AAPL" };
   directory = await mkdtemp(join(tmpdir(), "agent-events-"));
+  closeChatDb();
   process.env.STOCKBOT_DATA_DIR = directory;
   process.env.STOCKBOT_DEBUG = "1";
   process.env.OPENCODE_MODEL = "test-model";
@@ -162,6 +164,7 @@ afterEach(async () => {
     else process.env[name] = value;
   }
   await rm(directory, { recursive: true, force: true });
+  closeChatDb();
 });
 
 // Dynamic imports ensure route.ts binds the mocks instead of the real kernel and client.
@@ -612,6 +615,72 @@ describe("request validation", () => {
     }
     for (const call of reasonCalls) expect(call).not.toHaveProperty("context");
     for (const call of runCalls) expect(call[2]).not.toHaveProperty("context");
+  });
+  test("the first send stores the chat and returns its id", async () => {
+    const response = await post({ prompt: "What did NVDA file?" });
+    const chatId = response.headers.get("X-Chat-Id");
+    expect(chatId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    await response.text();
+    const stored = readChat(chatId!);
+    expect(stored?.title).toBe("What did NVDA file?");
+    expect(stored?.messages).toEqual([
+      { role: "user", content: "What did NVDA file?" },
+      { role: "assistant", content: reasonText },
+    ]);
+    expect(reasonCalls[0]).not.toHaveProperty("history");
+  });
+  test("a later send on the same chat carries the stored turns as conversation in order", async () => {
+    const first = await post({ prompt: "What did NVDA file?" });
+    const chatId = first.headers.get("X-Chat-Id")!;
+    await first.text();
+    await eventsFor("And the price?", { chatId });
+    expect(reasonCalls[1]).toMatchObject({
+      prompt: "And the price?",
+      history: [{ role: "user", content: "What did NVDA file?" }, { role: "assistant", content: reasonText }],
+    });
+    // Research runs its own loop, so stored turns sit outside it.
+    const before = runCalls.length;
+    await eventsFor("And the price?", { chatId, mode: "research" });
+    expect(runCalls.length).toBe(before + 1);
+    expect(runCalls.at(-1)?.[2]).not.toHaveProperty("history");
+    expect(readChat(chatId)?.messages.filter((message) => message.role === "user")).toHaveLength(3);
+  });
+  test("an unknown chat id rejects instead of opening a new conversation", async () => {
+    const response = await post({ prompt: "hello", chatId: "00000000-0000-4000-8000-000000000000" });
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: "chat not found" });
+    expectNoExecution();
+  });
+  test("a chat id of the wrong shape rejects before execution", async () => {
+    for (const chatId of ["hello", 7, {}, "", "00000000-0000-4000-8000"] as unknown[]) {
+      const response = await post({ prompt: "hello", chatId });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: "chatId must be a chat id from this installation" });
+    }
+    expectNoExecution();
+  });
+  test("a failed run stores the question alone", async () => {
+    reasonDown = true;
+    const response = await post({ prompt: "hello" });
+    const chatId = response.headers.get("X-Chat-Id")!;
+    await response.text();
+    expect(readChat(chatId)?.messages).toEqual([{ role: "user", content: "hello" }]);
+  });
+  test("a store failure still answers the request", async () => {
+    const blocked = join(directory, "blocked-db");
+    await writeFile(blocked, "");
+    const previous = process.env.STOCKBOT_DATA_DIR;
+    process.env.STOCKBOT_DATA_DIR = blocked;
+    closeChatDb();
+    try {
+      const response = await post({ prompt: "hello" });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("X-Chat-Id")).toBeNull();
+      expect(await response.text()).toContain("answer_delta");
+    } finally {
+      closeChatDb();
+      process.env.STOCKBOT_DATA_DIR = previous;
+    }
   });
   test("invalid tickers drop without changing the prompt", async () => {
     for (const ticker of ["SEC", "nvda!", "TOOLONGTICKER12", 7]) {

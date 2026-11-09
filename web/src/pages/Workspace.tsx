@@ -40,7 +40,8 @@ function windowOf(type: string, ticker: string, index: number): WorkspaceWidget 
   };
 }
 
-// The default tiles the browser window once, at creation. Saved layouts keep their saved pixels.
+// The default tiles the browser window once, at creation. A saved layout scales on load when it
+// overflows the window (fitToWindow); until the user saves, the stored pixels stay unchanged.
 // 58 px: workspace padding, viewport border, and the 40 px desktop margin in WidgetGrid. 258 px: shell and toolbar chrome plus that margin.
 function defaultWorkspace(ticker: string): WorkspaceDoc {
   const g = 8;
@@ -115,9 +116,33 @@ function applyReceipts(widgets: WorkspaceWidget[], events: AgentEvent[]): { widg
   }
   return { widgets: next, outcomes, changed: next.length !== widgets.length };
 }
+// A layout saved on a wider window is scaled once on load, so no column sits off-screen.
+// WidgetGrid renders the desktop at max(1200 x 800, the viewport, extents + 40), so the budget
+// subtracts that 40 px margin. The saved file keeps its pixels until the user saves it again.
+function fitToWindow(doc: WorkspaceDoc): WorkspaceDoc {
+  const w = Math.max(1160, window.innerWidth - 98);
+  const h = Math.max(760, window.innerHeight - 298);
+  const right = Math.max(0, ...doc.widgets.map((widget) => widget.geometry.x + widget.geometry.width));
+  const bottom = Math.max(0, ...doc.widgets.map((widget) => widget.geometry.y + widget.geometry.height));
+  const scale = Math.min(1, w / Math.max(right, 1), h / Math.max(bottom, 1));
+  // Flooring keeps the scaled extents inside the budget, so a reload never scales again.
+  if (scale > 0.999) return doc;
+  return {
+    ...doc,
+    widgets: doc.widgets.map((widget) => ({
+      ...widget,
+      geometry: {
+        x: Math.floor(widget.geometry.x * scale),
+        y: Math.floor(widget.geometry.y * scale),
+        width: Math.max(280, Math.floor(widget.geometry.width * scale)),
+        height: Math.max(180, Math.floor(widget.geometry.height * scale)),
+      },
+    })),
+  };
+}
 function initialDraft(workspaces: WorkspaceDoc[], selected: string): WorkspaceDraft {
-  const docs = workspaces.some((doc) => doc.id === DEFAULT_WORKSPACE_ID)
-    ? workspaces : [defaultWorkspace(selected), ...workspaces];
+  const docs = (workspaces.some((doc) => doc.id === DEFAULT_WORKSPACE_ID)
+    ? workspaces : [defaultWorkspace(selected), ...workspaces]).map(fitToWindow);
   let activeId = DEFAULT_WORKSPACE_ID;
   try {
     const saved = window.localStorage.getItem(ACTIVE_KEY);

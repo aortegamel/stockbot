@@ -4,8 +4,9 @@ import type { WidgetOutcomes } from "../components/action-cards";
 import { HealthDot } from "../components/health-dot";
 import { QUOTE_POLL_MS, fetchMarketStatus, fetchMarketWatchlist, fetchQuote, refreshMarket, saveMarketWatchlist, type MarketStatus } from "../lib/market-data";
 import { parseRoute, routeHash, TICKER_RE, useHashRoute, type Route } from "../lib/route";
-import type { AgentEvent, AskContext } from "../../../needle-harness/lib/agent/types";
+import type { AgentEvent, AskContext, ChatTurn } from "../../../needle-harness/lib/agent/types";
 import { fetchJournal, fetchSnapshot, listSessions, type JournalPage, type ResearchSnapshot } from "../lib/research-client";
+import { deleteChat, fetchChat, listChats, type ChatSummary } from "../lib/chat-client";
 import CommandBar from "./CommandBar";
 import { DEFAULT_WORKSPACE_ID, type WorkspaceDraft } from "../pages/Workspace";
 import { MarketRefreshContext } from "../components/home-panels";
@@ -211,6 +212,16 @@ function applyWatchlistReceipt(event: AgentEvent, symbols: string[], onWatchlist
   }
 }
 
+// The finished console turn becomes one user message plus one answer message.
+// A checked snapshot replaces the streamed draft, as the console shows it.
+function committedTurn(events: AgentEvent[]): ChatTurn[] {
+  const started = events.findLast((event) => event.type === "agent_start");
+  if (!started) return [];
+  const partial = events.findLast((event) => event.type === "answer_partial");
+  const answer = (partial?.text ?? events.filter((event) => event.type === "answer_delta").map((event) => event.text).join("")).trim();
+  return answer ? [{ role: "user", content: started.prompt }, { role: "assistant", content: answer }] : [];
+}
+
 export default function Shell({ children }: { children: (route: Route, state: ShellState) => ReactNode }) {
   const [hashRoute, navigate] = useHashRoute();
   // The last workspace ticker. A workspace hash wins; other pages keep the last pick.
@@ -263,6 +274,13 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
   const [journal, setJournal] = useState<JournalPage | null>(null);
   const [seq, setSeq] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
+  // Earlier messages of this chat, oldest first. The route caps the count and each length.
+  const [turns, setTurns] = useState<ChatTurn[]>([]);
+  // The stored conversation of this panel; null until the first send creates it.
+  const [chatId, setChatId] = useState<string | null>(null);
+  const [chats, setChats] = useState<ChatSummary[]>([]);
+  // A reset bumps the epoch, so a late event or turn from an aborted request cannot land in the new chat.
+  const chatEpoch = useRef(0);
   const [input, setInput] = useState("");
   const [research, setResearch] = useState(false);
   const [askContext, setAskContext] = useState<AskContext | null>(null);
@@ -296,6 +314,12 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
   }, []);
 
   useEffect(() => () => abortRef.current?.abort(), []);
+  // Stored conversations of this installation, for the history list.
+  useEffect(() => {
+    const ctrl = new AbortController();
+    listChats(ctrl.signal).then(setChats).catch(() => !ctrl.signal.aborted && setChats([]));
+    return () => ctrl.abort();
+  }, []);
   // Backend sessions for the state panel.
   useEffect(() => {
     let alive = true;
@@ -416,12 +440,15 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
     if (!q || busy || abortRef.current) return;
     const prompt = q;
     setBusy(true);
+    // The finished turn moves into the transcript so the console holds only the live turn.
+    setTurns([...turns, ...committedTurn(events)]);
     setEvents([{ type: "agent_start", prompt, ...(context ? { context } : {}) }]);
     setWidgetOutcomes(new Map());
     setInput("");
     setAskContext(null);
     const ctrl = new AbortController();
     abortRef.current = ctrl;
+    const epoch = chatEpoch.current;
     let terminal = false;
     let stalled = false;
     let reasoningStarted = false;
@@ -435,6 +462,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
       }, STALL_TIMEOUT_MS);
     };
     const push = (event: AgentEvent) => {
+      if (chatEpoch.current !== epoch) return;
       if (event.type === "chart_update") {
         const ticker = typeof event.ticker === "string" ? event.ticker.trim().toUpperCase() : "";
         if (!TICKER_RE.test(ticker) || TICKER_ORG[ticker]) return;
@@ -454,9 +482,14 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
         method: "POST",
         headers: { "Content-Type": "application/json" },
         // Watchlist rides as separate context; the prompt stays verbatim and the server decides scope.
-        body: JSON.stringify({ prompt, ticker: selected, currentChartTicker: selected, ...(watchlist.length ? { watchlist } : {}), ...(context ? { context } : {}), ...(researchMode ? { mode: "research" } : {}) }),
+        body: JSON.stringify({ prompt, ticker: selected, currentChartTicker: selected, ...(watchlist.length ? { watchlist } : {}), ...(context ? { context } : {}), ...(chatId ? { chatId } : {}), ...(researchMode ? { mode: "research" } : {}) }),
         signal: ctrl.signal,
       });
+      // The server creates the chat on the first send and returns its id for later turns.
+      const stored = response.headers.get("X-Chat-Id");
+      if (stored && chatEpoch.current === epoch) setChatId(stored);
+      // A chat deleted in another tab ends the conversation here: the next send opens a fresh chat.
+      else if (response.status === 404 && chatEpoch.current === epoch) setChatId(null);
       await receiveAgentResponse(response, push, arm);
       if (!terminal) push({ type: "error", message: "stream ended without a terminal event" });
     } catch (error) {
@@ -470,9 +503,54 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
       }
     } finally {
       clearTimeout(timer);
-      abortRef.current = null;
-      setBusy(false);
+      // A reset owns the new chat: it owns the controller and the busy flag.
+      if (chatEpoch.current === epoch) {
+        abortRef.current = null;
+        setBusy(false);
+        void listChats().then(setChats).catch(() => undefined);
+      }
     }
+  }
+
+  // New chat: stop the live request and drop the conversation. Late events of the old chat are ignored.
+  function newChat() {
+    chatEpoch.current += 1;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setChatId(null);
+    setEvents([]);
+    setTurns([]);
+    setWidgetOutcomes(new Map());
+    setAskContext(null);
+    setInput("");
+    setBusy(false);
+  }
+
+  // Reopen a stored conversation: the server messages become the transcript of a fresh panel.
+  async function openChat(id: string) {
+    if (busy) return;
+    try {
+      const stored = await fetchChat(id);
+      setChatId(stored.chatId);
+      setTurns(stored.messages);
+      setEvents([]);
+      setWidgetOutcomes(new Map());
+      setAskContext(null);
+    } catch {
+      // A chat deleted in another tab stays closed; the next list load shows the truth.
+      setChatId(null);
+      setTurns([]);
+    }
+  }
+
+  // The user owns deletion: remove the stored conversation, then reload the list.
+  function removeChat(id: string) {
+    void deleteChat(id)
+      .then(async () => {
+        if (id === chatId) newChat();
+        setChats(await listChats());
+      })
+      .catch(() => undefined);
   }
 
   const ask = (text: string) => {
@@ -480,7 +558,7 @@ export default function Shell({ children }: { children: (route: Route, state: Sh
     void onSend(text);
   };
   // The chat stays mounted for a windowed Agent. The drawer toggle gates only the docked aside.
-  const chat = <AIPanel events={events} input={input} setInput={setInput} research={research} setResearch={setResearch} context={askContext} onClearContext={() => setAskContext(null)} onSend={() => void onSend()} sym={selected} busy={busy} debug={debug} widgetOutcomes={widgetOutcomes} />;
+  const chat = <AIPanel events={events} turns={turns} onNewChat={newChat} chats={chats} activeChat={chatId} onOpenChat={(id) => void openChat(id)} onDeleteChat={removeChat} input={input} setInput={setInput} research={research} setResearch={setResearch} context={askContext} onClearContext={() => setAskContext(null)} onSend={() => void onSend()} sym={selected} busy={busy} debug={debug} widgetOutcomes={widgetOutcomes} />;
   const state: ShellState = {
     selected, pick, watchlist, watchlistLoading, onWatchlist, events, input, setInput, research, setResearch, setAskContext, onSend: () => void onSend(),
     busy, debug, sessions, sessionId, setSessionId, snapshot, journal, seq, openDrawer: () => setDrawer(true), ask, onWidgetOutcomes, chat,

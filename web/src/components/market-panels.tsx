@@ -5,7 +5,8 @@ import { AgentConsole } from "./agent-console";
 import type { WidgetOutcomes } from "./action-cards";
 import { AskContextChip } from "./agent-event";
 import { MarketRefreshContext, useLoad } from "./home-panels";
-import type { AgentEvent, AskContext } from "../../../needle-harness/lib/agent/types";
+import type { AgentEvent, AskContext, ChatTurn } from "../../../needle-harness/lib/agent/types";
+import type { ChatSummary } from "../lib/chat-client";
 import type { JournalPage, ResearchSnapshot } from "../lib/research-client";
 import { sessionTitle } from "../lib/session-title";
 import { ago } from "../lib/time";
@@ -225,6 +226,12 @@ export function NewsPanel({ sym }: { sym: string }) {
 
 export function AIPanel({
   events,
+  turns = [],
+  onNewChat,
+  chats = [],
+  activeChat,
+  onOpenChat,
+  onDeleteChat,
   input,
   setInput,
   research,
@@ -238,6 +245,14 @@ export function AIPanel({
   widgetOutcomes,
 }: {
   events: AgentEvent[];
+  // Stored messages of the open chat, oldest first. The console shows only the live turn.
+  turns?: ChatTurn[];
+  onNewChat?: () => void;
+  // Stored conversations of this installation, newest first, with the open one marked.
+  chats?: ChatSummary[];
+  activeChat?: string | null;
+  onOpenChat?: (chatId: string) => void;
+  onDeleteChat?: (chatId: string) => void;
   input: string;
   setInput: (v: string) => void;
   research: boolean;
@@ -251,12 +266,43 @@ export function AIPanel({
   debug: boolean;
   widgetOutcomes?: WidgetOutcomes;
 }) {
+  const empty = turns.length === 0 && events.length === 0;
   return (
     <div style={{ ...panel, padding: 0, display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
       {/* Mixed case on purpose: the ticker context reads "viewing NVDA", not "VIEWING". */}
-      <div className="card-head" style={{ textTransform: "none" }}>AGENT · viewing {sym}{debug ? " · DEBUG" : ""}</div>
+      <div className="card-head" style={{ textTransform: "none", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+        <span>AGENT · viewing {sym}{debug ? " · DEBUG" : ""}</span>
+        {onNewChat && <button type="button" className="pill" aria-label="New chat" disabled={empty} onClick={onNewChat}>New chat</button>}
+      </div>
+      {onOpenChat && chats.length > 0 && (
+        <details style={{ padding: "0 12px 8px" }}>
+          <summary style={{ cursor: "pointer", fontSize: "var(--fs-label)", color: muted }}>History · {chats.length}</summary>
+          <div aria-label="Stored chats" style={{ maxHeight: 160, overflowY: "auto", marginTop: 4 }}>
+            {chats.map((chat) => (
+              <div key={chat.chatId} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <button
+                  type="button"
+                  onClick={() => onOpenChat(chat.chatId)}
+                  aria-current={chat.chatId === activeChat ? "true" : undefined}
+                  title={chat.title}
+                  style={{
+                    flex: 1, minWidth: 0, textAlign: "left", padding: "2px 4px", background: "transparent", cursor: "pointer",
+                    color: chat.chatId === activeChat ? "var(--accent, #2962FF)" : "var(--text, #D5DBE5)",
+                    border: "1px solid transparent", borderRadius: 4, fontSize: "var(--fs-label)", ...clip,
+                  }}
+                >
+                  {chat.title}
+                </button>
+                {onDeleteChat && (
+                  <button type="button" className="ghost" aria-label={`Delete chat ${chat.title}`} title="Delete this chat" onClick={() => onDeleteChat(chat.chatId)}>×</button>
+                )}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
       {/* Backend debug mode must not expose diagnostic events in chat. */}
-      <AgentConsole events={events} reasoning={events.some((event) => event.type === "reasoning_start")} debug={false} widgetOutcomes={widgetOutcomes} />
+      <AgentConsole events={events} history={turns} reasoning={events.some((event) => event.type === "reasoning_start")} debug={false} widgetOutcomes={widgetOutcomes} />
       {context && <div style={{ padding: "0 12px 6px" }}><AskContextChip context={context} onRemove={onClearContext} /></div>}
       <form onSubmit={(event) => { event.preventDefault(); onSend(); }} style={{ display: "flex", gap: 6, padding: "0 12px 12px" }}>
         <input

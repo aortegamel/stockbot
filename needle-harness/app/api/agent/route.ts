@@ -3,6 +3,7 @@ import { appendFile, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { ANSWER_SECTIONS, reason } from "@/lib/muse/client";
 import { asksWatchlist, kernelRouter, outOfScopeAnswer, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent } from "@/lib/agent/kernel";
+import { appendMessage, createChat, hasChat, readChat } from "@/lib/chat";
 import { describeTools, endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
 import { ASK_CONTEXT_KINDS, safeSourceUrl, sourceReferences, statusEvent, toolStatus, WIDGET_TYPES, type AgentEvent, type AskContext, type Evidence, type Timings, type ToolResult } from "@/lib/agent/types";
 
@@ -28,17 +29,24 @@ function parseAskContext(v: unknown): AskContext | null | undefined {
   return { kind: kind as AskContext["kind"], title, source, at, ...(url !== undefined ? { url } : {}), ...(ticker !== undefined ? { sym: ticker } : {}) };
 }
 // Default chat is one plain model call. mode "research" runs the native research loop.
-type AgentRequest = { prompt: string; ticker: unknown; currentChartTicker: unknown; parsedWatchlist: string[] | undefined; context: AskContext | undefined; research: boolean; asOf: string | undefined };
+// chatId names the stored conversation; null starts a new one.
+type AgentRequest = { prompt: string; ticker: unknown; currentChartTicker: unknown; parsedWatchlist: string[] | undefined; context: AskContext | undefined; chatId: string | null; research: boolean; asOf: string | undefined };
+// The store bounds what reaches the model: the last messages, each cut to a readable size.
+const HISTORY_MESSAGES = 20;
+const HISTORY_CHARS = 4000;
+// A chat id comes from this installation's store, so only its own uuid shape is accepted.
+const CHAT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 async function readAgentRequest(req: Request): Promise<Response | AgentRequest> {
   let prompt: unknown;
   let ticker: unknown;
   let currentChartTicker: unknown;
   let watchlistRaw: unknown;
   let contextRaw: unknown;
+  let chatRaw: unknown;
   let mode: unknown;
   let asOf: unknown;
   try {
-    ({ prompt, ticker, currentChartTicker, watchlist: watchlistRaw, context: contextRaw, mode, asOf } = await req.json());
+    ({ prompt, ticker, currentChartTicker, watchlist: watchlistRaw, context: contextRaw, chatId: chatRaw, mode, asOf } = await req.json());
   } catch {
     console.error("[web] [agent-api] invalid JSON");
     return Response.json({ error: "invalid JSON" }, { status: 400 });
@@ -69,7 +77,12 @@ async function readAgentRequest(req: Request): Promise<Response | AgentRequest> 
     console.error("[web] [agent-api] invalid context");
     return Response.json({ error: "context must be a feed item: kind news|filing|insider|alert, title and source (1-300 chars), at (max 40 chars), optional http(s) url and ticker sym" }, { status: 400 });
   }
-  return { prompt, ticker, currentChartTicker, parsedWatchlist, context, research: mode === "research", asOf };
+  // The chat id names stored history: a wrong shape fails loudly, an absent id starts a new chat.
+  if (chatRaw !== undefined && chatRaw !== null && (typeof chatRaw !== "string" || !CHAT_ID_RE.test(chatRaw))) {
+    console.error("[web] [agent-api] invalid chatId");
+    return Response.json({ error: "chatId must be a chat id from this installation" }, { status: 400 });
+  }
+  return { prompt, ticker, currentChartTicker, parsedWatchlist, context, chatId: typeof chatRaw === "string" ? chatRaw : null, research: mode === "research", asOf };
 }
 
 function publicEvent(e: AgentEvent): AgentEvent | null {
@@ -101,10 +114,14 @@ function publicEvent(e: AgentEvent): AgentEvent | null {
 }
 
 // Every done carries the request-owned timings: the route round and the first answer text.
-function streamSender(req: Request, controller: ReadableStreamDefaultController<Uint8Array>, requestAt: number, timings: Timings): { send: (e: AgentEvent) => void; flush: () => Promise<void> } {
+// answer() returns the text the user saw, for the stored conversation.
+function streamSender(req: Request, controller: ReadableStreamDefaultController<Uint8Array>, requestAt: number, timings: Timings): { send: (e: AgentEvent) => void; flush: () => Promise<void>; answer: () => string } {
   const enc = new TextEncoder();
   const debug = ["1", "true", "yes"].includes((process.env.STOCKBOT_DEBUG ?? "").trim().toLowerCase());
   let terminalSent = false;
+  // A checked snapshot replaces the streamed draft, as the console renders it.
+  let partial: string | undefined;
+  let deltas = "";
   const directory = resolve(ROOT, process.env.STOCKBOT_DATA_DIR ?? "data", "logs/agent-events");
   const logPath = join(directory, `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}.jsonl`);
   let logFailed = false;
@@ -116,6 +133,8 @@ function streamSender(req: Request, controller: ReadableStreamDefaultController<
   const send = (e: AgentEvent): void => {
     if (req.signal.aborted) return;
     if (e.type === "answer_partial" || e.type === "answer_delta") timings.firstTextMs ??= performance.now() - requestAt;
+    if (e.type === "answer_partial") partial = e.text;
+    if (e.type === "answer_delta") deltas += e.text;
     if (e.type === "done") e = { ...e, metrics: { ...e.metrics, timings: { ...e.metrics.timings, ...timings } } };
     // Record the full event before production filtering, in emission order.
     if (!logFailed) {
@@ -141,7 +160,7 @@ function streamSender(req: Request, controller: ReadableStreamDefaultController<
       // The client disconnected. Later sends do not affect the closed stream.
     }
   };
-  return { send, flush: () => pending };
+  return { send, flush: () => pending, answer: () => (partial ?? deltas).trim() };
 }
 
 const SSE_HEADERS = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" };
@@ -176,7 +195,25 @@ export async function POST(req: Request): Promise<Response> {
   const requestAt = performance.now();
   const input = await readAgentRequest(req);
   if (input instanceof Response) return input;
-  const { prompt, ticker, currentChartTicker: chartInput, parsedWatchlist, context, research, asOf } = input;
+  const { prompt, ticker, currentChartTicker: chartInput, parsedWatchlist, context, chatId: requestedChat, research, asOf } = input;
+  // The stored conversation. A store failure degrades to one unpersisted turn instead of blocking the answer.
+  let chatId: string | null = null;
+  let history: { role: "user" | "assistant"; content: string }[] = [];
+  try {
+    // An unknown chat id is a stale client, never a new conversation.
+    if (requestedChat !== null && !hasChat(requestedChat)) {
+      console.error("[web] [agent-api] chat not found");
+      return Response.json({ error: "chat not found" }, { status: 404 });
+    }
+    // The user message is stored before any model work, so a failed answer never loses the question.
+    chatId = requestedChat ?? createChat(prompt);
+    appendMessage(chatId, "user", prompt);
+    // History is every stored message before this one, bounded for the model.
+    const stored = readChat(chatId)?.messages ?? [];
+    history = stored.slice(0, -1).slice(-HISTORY_MESSAGES).map((message) => ({ role: message.role, content: message.content.slice(0, HISTORY_CHARS) }));
+  } catch (err) {
+    console.error(`[web] [agent-api] chat store unavailable: ${err instanceof Error ? err.message : String(err)}`);
+  }
   // The feed item rides beside the verbatim prompt as labeled untrusted data. The prompt itself never changes.
   const contextField = context ? { context } : {};
   // Only a prompt that names the watchlist uses its symbols instead of the selected ticker.
@@ -189,7 +226,9 @@ export async function POST(req: Request): Promise<Response> {
   const stream = new ReadableStream({
     async start(controller) {
       const timings: Timings = {};
-      const { send, flush } = streamSender(req, controller, requestAt, timings);
+      const { send, flush, answer } = streamSender(req, controller, requestAt, timings);
+      // A failed run stores no answer text.
+      let failed = false;
       const zeroMetrics = (t0: number, calls: number) => ({ totalMs: performance.now() - t0, needle: { calls, totalMs: 0, escalations: 0 }, tools: { calls, totalMs: 0 }, muse: { calls: 0, totalMs: 0 }, evidence: { count: 0, characters: 0 }, failures: {} });
       // One plain answer with read-only research tools: no evidence gates, no inventory.
       const answerPlain = async (): Promise<void> => {
@@ -245,7 +284,7 @@ export async function POST(req: Request): Promise<Response> {
             ] : []),
             pickSections(),
           ]);
-          const r = await reason({ prompt, evidence: prefetched.flatMap((row) => (row.ok ? [row.evidence] : [])), direct: true, plain: true, reasoningEffort: "low", tools: schemas, runTool: runChatTool, sections, ...(currentChartTicker && !watchlist ? { ticker: currentChartTicker } : {}), ...contextField, signal: req.signal, deadlineAt });
+          const r = await reason({ prompt, evidence: prefetched.flatMap((row) => (row.ok ? [row.evidence] : [])), direct: true, plain: true, reasoningEffort: "low", tools: schemas, runTool: runChatTool, sections, ...(history.length ? { history } : {}), ...(currentChartTicker && !watchlist ? { ticker: currentChartTicker } : {}), ...contextField, signal: req.signal, deadlineAt });
           const prose = plainText(r.prose);
           if (!prose) throw new Error("The model returned an empty answer.");
           if (used.length) send({ type: "evidence", evidence: used });
@@ -397,14 +436,25 @@ export async function POST(req: Request): Promise<Response> {
           }
         }
       } catch (err) {
+        failed = true;
         console.error(`[web] [agent-api] ${research ? "runKernelAgent" : "chat"} error: ${err instanceof Error ? err.message : String(err)}`);
         if (req.signal.aborted) send({ type: "cancelled", message: "The request was cancelled." });
         else send({ type: "error", message: err instanceof Error ? err.message : String(err), code: "KERNEL_FAILED", stage: research ? "research" : "chat" });
       }
       await flush();
+      // Only a completed answer is stored: a cancelled or failed run keeps the question alone.
+      const text = req.signal.aborted || failed ? "" : answer();
+      if (text && chatId) {
+        try {
+          appendMessage(chatId, "assistant", text);
+        } catch (err) {
+          console.error(`[web] [agent-api] chat store failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
       controller.close();
       console.log("[web] [agent-api] stream close");
     },
   });
-  return new Response(stream, { headers: SSE_HEADERS });
+  // No header when the store is unavailable: the client then keeps its chat unpersisted.
+  return new Response(stream, { headers: { ...SSE_HEADERS, ...(chatId ? { "X-Chat-Id": chatId } : {}) } });
 }

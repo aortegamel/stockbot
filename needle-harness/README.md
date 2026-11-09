@@ -104,6 +104,20 @@ Needle generates `type` and `ticker`. The canonical tool validates both fields, 
 The route emits `{type:"widget_update", ticker, widgetType}` only after canonical success and only when the receipt ticker equals `currentChartTicker`. Kernel worker progress relays this event only for a canonical ticker and a known widget type.
 The receipt supplies no factual evidence. A failure answers as text without research, and a post-tool assessment cannot chain into `add_widget`.
 
+### Stored conversations
+
+Chat keeps its messages in `data/chat.sqlite`. `STOCKBOT_DATA_DIR` moves that file.
+The tables are `chats` and `chat_messages`. One installation is one account, so no owner column exists.
+The first send creates a chat and names it with the prompt.
+The API returns the chat id in the `X-Chat-Id` response header.
+A later send names that id, and the API reads the earlier messages from the store.
+The provider reads the last 20 messages, and each message is cut to 4000 characters.
+A failed or cancelled run stores the question alone.
+`GET /api/chat` lists the chats. `GET /api/chat?id=` returns one chat. `DELETE /api/chat?id=` deletes one chat.
+The chat panel lists the stored chats, and it deletes a chat when the user clicks the delete control.
+A store failure still answers the request, and the response then has no chat id.
+Deep research keeps its own sessions, so stored chat messages do not change a research run.
+
 ### Provider generation
 
 The reasoner generates prose and its claim inventory in one provider call.

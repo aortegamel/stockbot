@@ -73,6 +73,27 @@ describe("bun api host", () => {
     expect(res.status).toBe(405);
   });
 
+  test("chat answers GET and DELETE, and every other method is 405", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "chat-dispatch-"));
+    const saved = process.env.STOCKBOT_DATA_DIR;
+    process.env.STOCKBOT_DATA_DIR = dir;
+    try {
+      const list = await dispatch(new Request("http://localhost/api/chat"));
+      expect(list.status).toBe(200);
+      expect(await list.json()).toEqual({ chats: [] });
+      expect((await dispatch(new Request("http://localhost/api/chat/"))).status).toBe(200);
+      const missing = await dispatch(new Request("http://localhost/api/chat?id=00000000-0000-4000-8000-000000000000", { method: "DELETE" }));
+      expect(missing.status).toBe(404);
+      for (const method of ["POST", "PUT", "PATCH"]) {
+        expect((await dispatch(new Request("http://localhost/api/chat", { method }))).status).toBe(405);
+      }
+    } finally {
+      if (saved === undefined) delete process.env.STOCKBOT_DATA_DIR;
+      else process.env.STOCKBOT_DATA_DIR = saved;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("health reports the actual API listener port, not Vite PORT", async () => {
     const prevApi = process.env.STOCKBOT_API_PORT;
     const prevPort = process.env.PORT;

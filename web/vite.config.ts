@@ -8,6 +8,7 @@ const market = `http://127.0.0.1:${process.env.STOCKBOT_MARKET_PORT ?? "8000"}`;
 const to = (target: string) => ({ target, changeOrigin: true });
 const proxy = {
   "/api/agent": to(api),
+  "/api/chat": to(api),
   "/api/watchlist": to(api),
   "/api/research": to(api),
   "/api/health": to(api),

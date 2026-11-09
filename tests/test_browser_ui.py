@@ -226,6 +226,7 @@ def local_ui(tmp_path_factory: pytest.TempPathFactory) -> Iterator[UI]:
                     "oldest_as_of": 1793350000,
                 },
                 "/api/research/sessions": {"sessions": []},
+                "/api/chat": {"chats": []},
                 "/api/workspaces": {"workspaces": list(workspaces.values())},
                 "/api/search": {
                     "query": query.get("q", [""])[0],
@@ -703,14 +704,16 @@ def assert_prompt_reachable(browser: webdriver.Chrome) -> None:
     assert visible(browser, browser.find_element(*SEND)), "The Send button is clipped or outside the viewport."
 
 
-def wheel_until(browser: webdriver.Chrome, origin: tuple[int, int], reached: Callable[[], object]) -> None:
-    """Send native wheel input at one viewport point until `reached()` is true."""
+def wheel_until(
+    browser: webdriver.Chrome, origin: tuple[int, int], reached: Callable[[], object], step: int = 240
+) -> None:
+    """Send native wheel input at one viewport point until `reached()` is true. A negative step scrolls up."""
     for _ in range(40):
         try:
             WebDriverWait(browser, 1, poll_frequency=0.05).until(lambda _: reached())
             return
         except TimeoutException:
-            ActionChains(browser).scroll_from_origin(ScrollOrigin.from_viewport(*origin), 0, 240).perform()
+            ActionChains(browser).scroll_from_origin(ScrollOrigin.from_viewport(*origin), 0, step).perform()
     pytest.fail("The target stayed out of reach after 40 wheel steps.")
 
 
@@ -755,7 +758,7 @@ def test_agent_transcript_scrolls_inside_panel(
 
     # Empty introduction: the prompt is reachable and the last intro line is reachable by wheel alone.
     assert_prompt_reachable(browser)
-    intro_end = browser.find_element(By.XPATH, "//div[starts-with(normalize-space(), 'Try:')]")
+    intro_end = browser.find_element(By.XPATH, "//div[starts-with(normalize-space(), 'Research only')]")
     wheel_until(browser, transcript_point(browser), lambda: visible(browser, intro_end))
     assert_prompt_reachable(browser)
 
@@ -772,8 +775,11 @@ def test_agent_transcript_scrolls_inside_panel(
     assert_prompt_reachable(browser)
     sources = browser.find_element(By.XPATH, "//div[@aria-label='Captured sources']//a[text()='View provenance']")
     assert "ev:fixture" not in sources.text
-    assert not visible(browser, sources), "The long answer must overflow the transcript for this check."
-    wheel_until(browser, transcript_point(browser), lambda: visible(browser, sources))
+    # The transcript follows the newest text, so the finished answer keeps its source list in view.
+    assert visible(browser, sources), "A finished answer must keep its newest content in view."
+    # It still scrolls inside the panel: the first line returns on wheel-up and the prompt never moves.
+    first = browser.find_element(By.XPATH, "//div[starts-with(normalize-space(), '> Show the long answer')]")
+    wheel_until(browser, transcript_point(browser), lambda: visible(browser, first), -240)
     assert_prompt_reachable(browser)
 
     # Provenance opens in its own tab. Its content scrolls until the final line.

@@ -6,6 +6,7 @@ import type { Server } from "bun";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { POST as agentPOST } from "@/app/api/agent/route";
+import { DELETE as chatDELETE, GET as chatGET } from "@/app/api/chat/route";
 import { GET as healthGET } from "@/app/api/health/route";
 import { GET as researchGET } from "@/app/api/research/[...path]/route";
 import { GET as watchlistGET } from "@/app/api/watchlist/route";
@@ -41,6 +42,11 @@ export async function dispatch(req: Request): Promise<Response> {
     case "/api/watchlist":
     case "/api/watchlist/":
       return dispatchMethod(req, "GET", watchlistGET);
+    case "/api/chat":
+    case "/api/chat/":
+      if (req.method === "GET") return chatGET(req);
+      if (req.method === "DELETE") return chatDELETE(req);
+      return Response.json({ error: "method not allowed" }, { status: 405 });
     case "/api/health":
     case "/api/health/":
       return dispatchMethod(req, "GET", healthGET);

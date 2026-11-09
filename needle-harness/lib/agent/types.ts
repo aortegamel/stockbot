@@ -156,6 +156,8 @@ export const WIDGET_TYPES: readonly string[] = ["price-volume", "financials", "n
 export const ASK_CONTEXT_KINDS = ["news", "filing", "insider", "alert"] as const;
 // A user-picked feed item beside the verbatim prompt. It is untrusted data, never instructions.
 export type AskContext = { kind: (typeof ASK_CONTEXT_KINDS)[number]; title: string; url?: string; source: string; sym?: string; at: string };
+// One earlier turn of one chat, oldest first. The route bounds the count and each length.
+export type ChatTurn = { role: "user" | "assistant"; content: string };
 // A link is safe only when the viewer could fetch it directly: web scheme, host present, no credentials.
 // Shared by the web viewer and the agent route's feed-context check; no DOM dependency.
 function fetchableHttpUrl(parsed: URL): boolean {

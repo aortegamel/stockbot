@@ -64,6 +64,7 @@ function serve(extra: Handler = () => undefined): { urls: string[]; bodies: stri
     if (url.includes("/api/filings")) return Promise.resolve(json({ cik: 1, items: [] }));
     if (url.includes("/api/news")) return Promise.resolve(json({ sym: "X", items: [] }));
     if (url.includes("/api/research/sessions")) return Promise.resolve(json({ sessions: [] }));
+    if (url.startsWith("/api/chat")) return Promise.resolve(json({ chats: [] }));
     if (url.includes("/api/theses")) return Promise.resolve(json([]));
     if (url.includes("/api/portfolio")) return Promise.resolve(new Response(null, { status: 404 }));
     if (url === "/api/workspaces") return Promise.resolve(json({
@@ -470,6 +471,84 @@ describe("App agent send", () => {
     // The terminal event arrived, so the closed stream is not a failure.
     expect(text(root)).not.toContain("stream ended without a terminal event");
     expect(text(root)).not.toContain("broken json");
+  });
+
+  test("the panel reuses the stored chat id, shows the turn, and opens stored chats on demand", async () => {
+    const streams = [liveStream(), liveStream()];
+    const chats: { chatId: string; title: string; updatedAt: string }[] = [];
+    let calls = 0;
+    const { bodies } = serve((url, init) => {
+      if (url.includes("/api/agent")) {
+        // The server creates the chat and returns its id the way the route does.
+        if (!chats.length) chats.push({ chatId: "11111111-1111-4111-8111-111111111111", title: "What did NVDA file?", updatedAt: "2026-11-07T10:00:00Z" });
+        return new Response(streams[calls++].stream, { status: 200, headers: { "X-Chat-Id": chats[0].chatId } });
+      }
+      if (url === "/api/chat") return json({ chats });
+      if (url.startsWith("/api/chat?id=")) {
+        const chatId = decodeURIComponent(url.split("?id=")[1] ?? "");
+        if (init?.method === "DELETE") {
+          chats.splice(0, chats.length, ...chats.filter((chat) => chat.chatId !== chatId));
+          return json({ deleted: chatId });
+        }
+        return json({ ...chats[0], messages: [{ role: "user", content: "What did NVDA file?" }, { role: "assistant", content: "An 8-K on 2 September." }] });
+      }
+      return undefined;
+    });
+    const root = await mount(<App />);
+    const prompt = find<HTMLInputElement>(root, AGENT_PROMPT);
+    await type(prompt, "What did NVDA file?");
+    await click(button(root, "Send"));
+    await settle();
+    await act(async () => {
+      streams[0].send('data: {"type":"agent_start","prompt":"What did NVDA file?"}\n\ndata: {"type":"answer_delta","text":"An 8-K on 2 September."}\n\n');
+      streams[0].send(`data: {"type":"done","metrics":${JSON.stringify(metrics())}}\n\n`);
+      streams[0].close();
+    });
+    await until(() => findButton(root, "Send") !== null);
+    // The finished turn stays in the console until the next send moves it into the transcript.
+    expect(root.querySelector('[aria-label="Earlier conversation"]')).toBeNull();
+    // The first send opens a chat; the server returns its id.
+    expect(JSON.parse(bodies.filter((body) => body.includes('"prompt"')).at(-1) ?? "{}")).toEqual({
+      prompt: "What did NVDA file?", ticker: "NVDA", currentChartTicker: "NVDA", watchlist: WATCHLIST,
+    });
+    await until(() => root.querySelector('[aria-label="Stored chats"]') !== null);
+
+    await type(prompt, "And the price?");
+    await click(button(root, "Send"));
+    await settle();
+    // The second send names the stored chat; the server adds the earlier turns itself.
+    expect(JSON.parse(bodies.filter((body) => body.includes('"prompt"')).at(-1) ?? "{}")).toEqual({
+      prompt: "And the price?", ticker: "NVDA", currentChartTicker: "NVDA", watchlist: WATCHLIST,
+      chatId: "11111111-1111-4111-8111-111111111111",
+    });
+    expect(root.querySelector('[aria-label="Earlier conversation"]')?.textContent).toBe("> What did NVDA file?An 8-K on 2 September.");
+    // One chat column: the stored turns and the live turn share the console scroll box.
+    const column = root.querySelector('[aria-label="Earlier conversation"]')!.parentElement!;
+    expect(column.className).toContain("overflow-y-auto");
+    expect(column.textContent).toContain("An 8-K on 2 September.");
+
+    await act(async () => {
+      streams[1].send('data: {"type":"agent_start","prompt":"And the price?"}\n\ndata: {"type":"answer_delta","text":"It opened at 121."}\n\n');
+      streams[1].send(`data: {"type":"done","metrics":${JSON.stringify(metrics())}}\n\n`);
+      streams[1].close();
+    });
+    await until(() => text(root).includes("It opened at 121."));
+    await click(button(root, "New chat"));
+    await settle();
+    expect(root.querySelector('[aria-label="Earlier conversation"]')).toBeNull();
+    // The console returns to its intro, so the reset drops the whole conversation.
+    expect(text(root)).not.toContain("It opened at 121.");
+
+    // The stored chat reopens from the history list with its messages.
+    const openButton = root.querySelector<HTMLButtonElement>('[aria-label="Stored chats"] button[title]')!;
+    await click(openButton);
+    await until(() => root.querySelector('[aria-label="Earlier conversation"]') !== null);
+    expect(root.querySelector('[aria-label="Earlier conversation"]')?.textContent).toBe("> What did NVDA file?An 8-K on 2 September.");
+
+    // Deleting the open chat removes it from the list and clears the panel.
+    await click(root.querySelector<HTMLButtonElement>('[aria-label="Delete chat What did NVDA file?"]')!);
+    await until(() => root.querySelector('[aria-label="Stored chats"]') === null);
+    expect(root.querySelector('[aria-label="Earlier conversation"]')).toBeNull();
   });
 
   test.each(["AAPL", " brk.b ", "RDS-A"])("applies chart_update for %s and continues the answer", async (ticker) => {
