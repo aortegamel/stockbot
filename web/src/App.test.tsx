@@ -238,11 +238,12 @@ describe("App terminal shell", () => {
       return undefined;
     });
     const root = await mount(<App />, false);
-    await until(() => root.querySelector('[data-widget-type="markets"]') !== null);
+    await until(() => root.querySelector('[data-widget-type="agent"]') !== null);
     expect(findLink(root, "Home")).toBeNull();
     expect(findLink(root, "Workspaces: default")?.getAttribute("aria-current")).toBe("page");
+    // The left column lists the symbols, so the default carries no second watchlist panel.
     expect([...root.querySelectorAll(".ws-widget")].map((panel) => panel.getAttribute("data-widget-type")).sort()).toEqual([
-      "agent", "index-tape", "market-detail", "markets", "news", "portfolio", "price-volume", "watchlist",
+      "agent", "index-tape", "market-detail", "news", "portfolio", "price-volume", "watchlist",
     ]);
     const warning = new dom.window.Event("beforeunload", { cancelable: true });
     dom.window.dispatchEvent(warning);
@@ -258,10 +259,9 @@ describe("App terminal shell", () => {
     await type(palette, "Most shorted");
     await until(() => options(root).includes("Most shorted"));
     await press(palette, "Enter");
-    await until(() => root.querySelector('[data-widget-type="markets"]') !== null);
+    // A saved scan opens the default workspace. Its Markets panel is an optional widget now.
+    await until(() => findLink(root, "Workspaces: default")?.getAttribute("aria-current") === "page");
     expect(button(root, "Empty *")).not.toBeNull();
-    expect(root.querySelector('[data-widget-type="markets"]')).not.toBeNull();
-    expect(findLink(root, "Workspaces: default")?.getAttribute("aria-current")).toBe("page");
   });
   test("renders the watchlist, strip, and backend state on load", async () => {
     serve();

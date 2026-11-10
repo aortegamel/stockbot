@@ -42,12 +42,13 @@ function windowOf(type: string, ticker: string, index: number): WorkspaceWidget 
 
 // The default tiles the browser window once, at creation. A saved layout scales on load when it
 // overflows the window (fitToWindow); until the user saves, the stored pixels stay unchanged.
-// 58 px: workspace padding, viewport border, and the 40 px desktop margin in WidgetGrid. 258 px: shell and toolbar chrome plus that margin.
+// Both use the same budget, so a freshly generated default never needs that second scale.
+// 98 px: workspace padding, viewport border, and WidgetGrid's 40 px desktop margin plus its border.
 function defaultWorkspace(ticker: string): WorkspaceDoc {
   const g = 8;
-  // Proportions come from the user's saved 2502x1190 layout. 1240 px keeps every window at the server's 280 px minimum width.
-  const w = Math.max(1240, window.innerWidth - 58);
-  const h = Math.max(640, window.innerHeight - 258);
+  // Proportions come from the user's saved 2502x1190 layout. 1160 px keeps every window at the server's 280 px minimum width.
+  const w = Math.max(1160, window.innerWidth - 98);
+  const h = Math.max(760, window.innerHeight - 298);
   const right = Math.round(w * 0.3);
   const rightX = w - right;
   const left = Math.max(280, Math.round(w * 0.14));
@@ -56,21 +57,19 @@ function defaultWorkspace(ticker: string): WorkspaceDoc {
   const bottomY = top + g;
   const bottom = h - bottomY;
   const portfolio = Math.max(280, Math.round(w * 0.2));
-  const marketsX = portfolio + g;
-  const detail = Math.max(280, Math.round(w * 0.2));
-  const detailX = rightX - g - detail;
   const tape = 180;
   const news = Math.round((h - tape - g) * 0.4);
   const agentY = tape + g + news + g;
+  // The left column already lists the symbols, so no second watchlist sits under the chart.
+  // The chat takes that whole bottom band, and the company details move to the right column.
   const initial = [
     ["watchlist", 0, 0, left, top],
     ["price-volume", chartX, 0, rightX - g - chartX, top],
     ["portfolio", 0, bottomY, portfolio, bottom],
-    ["markets", marketsX, bottomY, detailX - g - marketsX, bottom],
-    ["market-detail", detailX, bottomY, detail, bottom],
+    ["agent", portfolio + g, bottomY, rightX - g - portfolio - g, bottom],
     ["index-tape", rightX, 0, right, tape],
     ["news", rightX, tape + g, right, news],
-    ["agent", rightX, agentY, right, h - agentY],
+    ["market-detail", rightX, agentY, right, h - agentY],
   ] as const;
   return {
     id: DEFAULT_WORKSPACE_ID, name: "default", updated_at: null,

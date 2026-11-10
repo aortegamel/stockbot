@@ -183,7 +183,8 @@ type RendererProps<T extends AgentEvent["type"]> = { event: Extract<AgentEvent, 
 type Renderers = { [T in AgentEvent["type"]]?: (props: RendererProps<T>) => React.ReactNode };
 
 function AgentStartRow({ event }: { event: Extract<AgentEvent, { type: "agent_start" }> }) {
-  return <div className="text-zinc-100">&gt; {event.prompt}{event.context && <AskContextChip context={event.context} />}</div>;
+  // The reader's own text: bold italic and larger than the answer, so the two never blur.
+  return <div className="text-[18px] font-semibold italic leading-snug text-zinc-100">&gt; {event.prompt}{event.context && <AskContextChip context={event.context} />}</div>;
 }
 
 function ReasoningRow() {

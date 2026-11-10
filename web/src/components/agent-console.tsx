@@ -156,9 +156,16 @@ export function AgentConsole({ events, history = [], reasoning, debug, onRetry, 
       }}
     >
       {history.length > 0 && (
-        <div aria-label="Earlier conversation" className="space-y-2">
+        <div aria-label="Earlier conversation" className="space-y-3">
           {history.map((turn, i) => (
-            <div key={i} className={turn.role === "user" ? "text-zinc-100" : "whitespace-pre-wrap text-zinc-100"}>{turn.role === "user" ? `> ${turn.content}` : turn.content}</div>
+            <div
+              key={i}
+              className={turn.role === "user"
+                ? "text-[18px] font-semibold italic leading-snug text-zinc-100"
+                : "whitespace-pre-wrap leading-relaxed text-zinc-100"}
+            >
+              {turn.role === "user" ? `> ${turn.content}` : turn.content}
+            </div>
           ))}
         </div>
       )}
@@ -170,7 +177,7 @@ export function AgentConsole({ events, history = [], reasoning, debug, onRetry, 
         : <div role="status" className="space-y-0.5 text-xs text-zinc-500">{statuses}</div>)}
       {streaming && !answer && <AgentEventView event={{ type: "reasoning_start", model: "stockbot" }} />}
       {!done && answer && <div role="status" className="pt-2 text-xs text-zinc-400">Partial checked answer · research continues</div>}
-      {answer && <div className="whitespace-pre-wrap pt-2 text-zinc-100">{parts.map((part, i) => {
+      {answer && <div className="whitespace-pre-wrap pt-2 leading-relaxed text-zinc-100">{parts.map((part, i) => {
         const citation = part.citation;
         const reference = citation?.sources?.[0];
         if (!citation || !reference) return <span key={i}>{part.text}</span>;

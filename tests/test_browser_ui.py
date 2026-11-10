@@ -993,7 +993,7 @@ def test_default_workspace_template_copies_current_windows(browser: webdriver.Ch
     browser.find_element(By.XPATH, "//*[@role='tab'][text()='default']").click()
     wait.until(EC.visibility_of_element_located((By.LINK_TEXT, "Workspaces: default")))
     assert not browser.find_elements(By.LINK_TEXT, "Home")
-    assert len(browser.find_elements(By.CSS_SELECTOR, ".ws-widget")) == 8
+    assert len(browser.find_elements(By.CSS_SELECTOR, ".ws-widget")) == 7
     assert not browser.find_elements(By.CSS_SELECTOR, '[aria-label="Agent drawer"]')
     title = browser.find_element(By.CSS_SELECTOR, '[data-widget-type="watchlist"] .ws-window-title')
     title.send_keys(Keys.ARROW_RIGHT)
@@ -1003,7 +1003,7 @@ def test_default_workspace_template_copies_current_windows(browser: webdriver.Ch
     browser.find_element(By.CSS_SELECTOR, 'input[type="checkbox"]').click()
     browser.find_element(By.XPATH, "//button[text()='Create workspace']").click()
     wait.until(EC.visibility_of_element_located((By.LINK_TEXT, "Workspaces: Default copy")))
-    assert len(browser.find_elements(By.CSS_SELECTOR, ".ws-widget")) == 7
+    assert len(browser.find_elements(By.CSS_SELECTOR, ".ws-widget")) == 6
     assert not browser.find_elements(By.CSS_SELECTOR, '[data-widget-type="index-tape"]')
     browser.find_element(By.XPATH, "//button[text()='Save']").click()
     wait.until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='Save']")))
@@ -1235,7 +1235,8 @@ def test_offline_alert_receipt_renders_card(browser: webdriver.Chrome, local_ui:
 
 def test_markets_rows_support_arrow_navigation(browser: webdriver.Chrome) -> None:
     wait = WebDriverWait(browser, 10)
-    browser.find_element(By.XPATH, "//*[@role='tab'][text()='default']").click()
+    # The watchlist column covers symbols, so the Markets table is an optional window now.
+    Select(browser.find_element(By.CSS_SELECTOR, 'select[aria-label="Add widget"]')).select_by_visible_text("Markets")
     first = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, ".home-table tbody tr[tabindex='0']")))
     assert "NVDA" in first.text
     ActionChains(browser).click(first).send_keys(Keys.ARROW_DOWN).perform()

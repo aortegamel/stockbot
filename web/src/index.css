@@ -149,8 +149,8 @@ input.pill{cursor:text}
 .shell-body{flex:1;min-height:0;display:flex;flex-direction:column;position:relative;z-index:1}
 .shell-body > :first-child{flex:1;min-height:0;min-width:0}
 .drawer{flex:0 0 40%;min-height:240px;margin:0 8px 8px}
-/* Chat text: answers (Tailwind text-sm) and the input row at 15px. */
-.drawer{--fs-body:15px;--text-sm:15px;--text-sm--line-height:1.4}
+/* Chat text: answers (Tailwind text-sm) and the input row read larger than a data panel. */
+.drawer{--fs-body:17px;--text-sm:17px;--text-sm--line-height:1.6}
 .drawer .input,.drawer .btn-primary{height:34px}
 
 /* Markets table: 28px rows, tabular numbers, sticky 11px headers. Tight padding fits a 1440px column. */
@@ -268,7 +268,7 @@ select.ws-tool{padding-right:16px;width:auto}
 .ws-widget-body :is(th,td){height:var(--h-row);padding:0 8px;font-size:var(--fs-body)}
 .ws-widget-body th{font-size:var(--fs-label);font-weight:500;color:var(--muted)}
 .ws-widget:has(iframe) .ws-widget-body{padding:0}
-.ws-widget[data-widget-type="agent"]{--fs-body:15px;--text-sm:15px;--text-sm--line-height:1.4}
+.ws-widget[data-widget-type="agent"]{--fs-body:17px;--text-sm:17px;--text-sm--line-height:1.6}
 .ws-widget[data-widget-type="agent"] .ws-widget-body{padding:0;display:flex;overflow:hidden}
 .ws-widget[data-widget-type="agent"] .ws-widget-body > *{flex:1;min-height:0;min-width:0}
 .ws-alerts{padding:var(--sp-3);font-size:var(--fs-body)}

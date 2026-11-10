@@ -376,7 +376,7 @@ describe("Named workspace", () => {
     server.control.failLoad = false;
     await click(button("Retry"));
     expect(find<HTMLInputElement>('[aria-label="Workspace name"]').value).toBe("default");
-    expect(container().querySelector('[data-widget-type="markets"]')).not.toBeNull();
+    expect(container().querySelector('[data-widget-type="agent"]')).not.toBeNull();
   });
 
   test("adds all formerly fixed panels as interchangeable windows", async () => {
