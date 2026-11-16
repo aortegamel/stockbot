@@ -8,6 +8,7 @@ and that as_of_date/data_freshness/environment are always surfaced.
 """
 
 from collections.abc import Iterator
+from datetime import date
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,10 +21,14 @@ from tests.test_finra import (
     FakeCache,
     _as_seq,
     _error,
+    _freeze_finra_today,
     _mock_get,
     _response,
     _token_response,
 )
+
+# The fixture rows carry 2026-08 dates. Freshness reads the real clock, so pin it near them.
+FINRA_FIXTURE_TODAY = date(2026, 8, 20)
 
 
 @pytest.fixture(autouse=True)
@@ -44,6 +49,11 @@ def fake_cache(monkeypatch: pytest.MonkeyPatch) -> FakeCache:
     fc = FakeCache()
     monkeypatch.setattr(finra_client, "cache", fc)
     return fc
+
+
+@pytest.fixture(autouse=True)
+def _frozen_finra_today(monkeypatch: pytest.MonkeyPatch) -> None:
+    _freeze_finra_today(monkeypatch, FINRA_FIXTURE_TODAY)
 
 
 @pytest.fixture
