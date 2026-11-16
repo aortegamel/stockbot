@@ -68,6 +68,12 @@ def _env_bool(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in ("1", "true", "yes")
 
 
+def jev_enabled() -> bool:
+    """False only when JEV_ENABLED is set to a non-truthy value. Unset or empty keeps JEV on."""
+    raw = (os.getenv("JEV_ENABLED") or "").strip()
+    return not raw or raw.lower() in ("1", "true", "yes")
+
+
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 

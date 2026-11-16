@@ -389,6 +389,18 @@ def test_startup_needle_failure_stays_live(monkeypatch: pytest.MonkeyPatch) -> N
     assert kw._startup() is jev
 
 
+def test_startup_skips_jev_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """JEV_ENABLED=false starts no decision sidecar; Needle still starts and the worker stays live."""
+    import sys
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("JEV_ENABLED", "false")
+    monkeypatch.setattr(kw, "_shared_jev", lambda: pytest.fail("JEV must not start"))
+    monkeypatch.setattr(kw, "_prewarm", lambda: None)
+    monkeypatch.setitem(sys.modules, "app.needle_client", SimpleNamespace(start=lambda: None, close=lambda: None))
+    assert kw._startup() is None
+
+
 @pytest.mark.parametrize("stage", ["repository", "list", "cancel"])
 def test_close_bootstrap_job_failure_logs(
     stage: str,

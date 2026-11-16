@@ -130,7 +130,7 @@ mock.module("@/lib/tools/stockbot", () => ({
 }));
 
 let directory: string;
-const savedEnv = { debug: process.env.STOCKBOT_DEBUG, model: process.env.OPENCODE_MODEL, data: process.env.STOCKBOT_DATA_DIR, effort: process.env.REASONING_EFFORT, maxOutputTokens: process.env.MUSE_MAX_OUTPUT_TOKENS, answerTokenBudget: process.env.MUSE_ANSWER_TOKEN_BUDGET };
+const savedEnv = { debug: process.env.STOCKBOT_DEBUG, model: process.env.OPENCODE_MODEL, data: process.env.STOCKBOT_DATA_DIR, effort: process.env.REASONING_EFFORT, maxOutputTokens: process.env.MUSE_MAX_OUTPUT_TOKENS, answerTokenBudget: process.env.MUSE_ANSWER_TOKEN_BUDGET, jev: process.env.JEV_ENABLED };
 beforeEach(async () => {
   reasonCalls.length = kernelCalls.length = kernelOpts.length = runCalls.length = invoked.length = ended.length = toolOutputs.length = sectionCalls.length = scopeCalls.length = 0;
   scopeOpts.length = 0;
@@ -155,11 +155,12 @@ beforeEach(async () => {
   process.env.STOCKBOT_DEBUG = "1";
   process.env.OPENCODE_MODEL = "test-model";
   process.env.REASONING_EFFORT = "medium";
+  delete process.env.JEV_ENABLED;
   delete process.env.MUSE_MAX_OUTPUT_TOKENS;
   delete process.env.MUSE_ANSWER_TOKEN_BUDGET;
 });
 afterEach(async () => {
-  for (const [name, value] of [["STOCKBOT_DEBUG", savedEnv.debug], ["OPENCODE_MODEL", savedEnv.model], ["STOCKBOT_DATA_DIR", savedEnv.data], ["REASONING_EFFORT", savedEnv.effort], ["MUSE_MAX_OUTPUT_TOKENS", savedEnv.maxOutputTokens], ["MUSE_ANSWER_TOKEN_BUDGET", savedEnv.answerTokenBudget]] as const) {
+  for (const [name, value] of [["STOCKBOT_DEBUG", savedEnv.debug], ["OPENCODE_MODEL", savedEnv.model], ["STOCKBOT_DATA_DIR", savedEnv.data], ["REASONING_EFFORT", savedEnv.effort], ["MUSE_MAX_OUTPUT_TOKENS", savedEnv.maxOutputTokens], ["MUSE_ANSWER_TOKEN_BUDGET", savedEnv.answerTokenBudget], ["JEV_ENABLED", savedEnv.jev]] as const) {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
   }
@@ -316,6 +317,22 @@ describe("plain chat", () => {
     controller.abort();
     const response = await POST(new Request("http://localhost/api/agent", { method: "POST", body: JSON.stringify({ prompt: "hello" }), signal: controller.signal }));
     expect(await response.text()).toBe("");
+  });
+});
+
+describe("JEV switch", () => {
+  test("JEV_ENABLED=false skips the section picker, the scope gate, and the effort selector", async () => {
+    process.env.JEV_ENABLED = "false";
+    await eventsFor("hello");
+    expect(sectionCalls).toEqual([]);
+    expect(kernelCalls).toEqual([]);
+    expect(reasonCalls[0]?.sections).toEqual(["short_term", "long_term", "analysts", "bull_case", "bear_case", "risks"]);
+    process.env.REASONING_EFFORT = "auto";
+    await eventsFor("filing facts?", { mode: "research" });
+    expect(kernelCalls).toEqual([]);
+    expect(scopeCalls).toEqual([]);
+    expect(runCalls).toHaveLength(1);
+    expect(runCalls[0]?.[2]).not.toHaveProperty("reasoningEffort");
   });
 });
 

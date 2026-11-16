@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { ANSWER_SECTIONS, reason } from "@/lib/muse/client";
 import { asksWatchlist, kernelRouter, outOfScopeAnswer, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent } from "@/lib/agent/kernel";
 import { appendMessage, createChat, hasChat, readChat } from "@/lib/chat";
+import { envFlag } from "@/lib/env";
 import { describeTools, endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
 import { ASK_CONTEXT_KINDS, safeSourceUrl, sourceReferences, statusEvent, toolStatus, WIDGET_TYPES, type AgentEvent, type AskContext, type Evidence, type Timings, type ToolResult } from "@/lib/agent/types";
 
@@ -14,6 +15,8 @@ function requiredEnv(name: string): string {
   if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
   return value;
 }
+// JEV_ENABLED=false skips every JEV decision; each call site then keeps its fail-open default.
+const jevOff = (): boolean => !envFlag("JEV_ENABLED", true);
 const ASK_CONTEXT_KEYS = ["kind", "title", "url", "source", "sym", "at"];
 // Feed-item context beside the verbatim prompt: undefined when absent, null when
 // malformed (callers reject; unknown keys reject too). The values stay untrusted data.
@@ -262,6 +265,7 @@ export async function POST(req: Request): Promise<Response> {
         const since = new Date(Date.now() - NEWS_DAYS * 86_400_000).toISOString().slice(0, 10);
         // JEV keeps the investor parts that fit this request. A failed or malformed pick keeps every part.
         const pickSections = async (): Promise<string[]> => {
+          if (jevOff()) return Object.keys(ANSWER_SECTIONS);
           try {
             const reply = await kernelRouter.call({ op: "sections", prompt, ...(newsTicker ? { ticker: newsTicker } : {}), ...contextField, deadlineAt }, { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) });
             if (reply.error) throw new Error(String(reply.error));
@@ -322,6 +326,7 @@ export async function POST(req: Request): Promise<Response> {
             return;
           }
         }
+        if (jevOff()) return { reasoningEffort: undefined };
         if (!configuredEffort || configuredEffort === "auto") {
           const startedAt = performance.now();
           try {
@@ -349,6 +354,7 @@ export async function POST(req: Request): Promise<Response> {
       const answerOutsideResearchScope = async (): Promise<boolean> => {
         // Conversational scope gate: an out-of-scope request gets the runtime's fixed answer and
         // runs no tool. A gate outage keeps research.
+        if (jevOff()) return false;
         try {
           const verdict = await kernelRouter.call({ op: "scope", prompt, deadlineAt }, { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) });
           if (typeof verdict.error === "string" && verdict.error) throw new Error(verdict.error);

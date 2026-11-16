@@ -118,8 +118,15 @@ def check_sec(env: Env) -> Result:
     return OK, name, "SEC_EDGAR_IDENTITY set"
 
 
+def jev_on(env: Env) -> bool:
+    """JEV is on unless JEV_ENABLED is set to a non-truthy value; unset keeps it on."""
+    return val(env, "JEV_ENABLED") == "" or on(env, "JEV_ENABLED")
+
+
 def check_decision(env: Env) -> Result:
     name = "JEV decision API (MVP)"
+    if not jev_on(env):
+        return SKIP, name, "JEV_ENABLED off"
     missing = [k for k in DECISION_KEYS if not val(env, k)]
     if missing:
         return FAIL, name, f"unset: {', '.join(missing)}. Fix: set them in .env (see docs/runtime.md)"

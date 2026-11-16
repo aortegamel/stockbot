@@ -346,6 +346,11 @@ Native research tools and final claim proof do not call JEV or the Reasoner for 
 The native model selects tools directly.
 The ledger decides final claim proof deterministically.
 
+`JEV_ENABLED` is the switch. `false` skips the scope gate, the chat part picker, and the effort selector.
+It also stops the kernel worker from starting the `decision/runtime.ts` sidecar.
+With JEV off, the scope gate admits every request, the part picker keeps every part, and the effort selector returns no effort.
+Unset or empty keeps JEV on. Truthy values are `1`, `true`, and `yes`.
+
 Set these values in the root `.env` to select the protocol, endpoint, key, and model. No code change is necessary.
 The code supplies no format, URL, or model default. A live call fails when a value is blank.
 A missing, blank, or unsupported `DECISION_API_FORMAT` fails before any HTTP request.

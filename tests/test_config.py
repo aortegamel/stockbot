@@ -68,6 +68,20 @@ def test_broker_enabled_defaults_false(monkeypatch: pytest.MonkeyPatch):
     assert config.broker_enabled() is False
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, True), ("", True), ("true", True), ("1", True), ("false", False), ("0", False), ("off", False)],
+)
+def test_jev_enabled_defaults_on_and_switches_off(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool
+) -> None:
+    if value is None:
+        monkeypatch.delenv("JEV_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("JEV_ENABLED", value)
+    assert config.jev_enabled() is expected
+
+
 def _root_and_foreign_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_env: str) -> None:
     """Point config at a fixture repo root and run from a foreign cwd with its own .env."""
     root = tmp_path / "repo"

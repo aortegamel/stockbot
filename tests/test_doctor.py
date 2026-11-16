@@ -41,6 +41,13 @@ def test_required_features_pass_with_full_env_and_fail_on_placeholders() -> None
     assert doctor.check_opencode({**FULL, "OPENCODE_URL": "https://x/v1"})[0] == doctor.FAIL
 
 
+def test_decision_skips_when_jev_is_disabled() -> None:
+    assert doctor.check_decision({"JEV_ENABLED": "false"})[0] == doctor.SKIP
+    assert doctor.check_decision({"JEV_ENABLED": "0"})[0] == doctor.SKIP
+    assert doctor.check_decision({"JEV_ENABLED": "true"})[0] == doctor.FAIL
+    assert doctor.check_decision({**FULL, "JEV_ENABLED": "true"})[0] == doctor.OK
+
+
 def test_optional_features_skip_when_off_and_fail_when_half_configured() -> None:
     assert doctor.check_exa({"EXA_ENABLED": "false"})[0] == doctor.SKIP
     assert doctor.check_exa({"EXA_ENABLED": "true", "EXA_API_KEY": "your_exa_api_key"})[0] == doctor.FAIL

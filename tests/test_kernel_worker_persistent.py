@@ -471,6 +471,8 @@ stub = os.environ["KW_TEST_STUB"]
 needle._server = lambda: Path(stub)
 needle._python = lambda: sys.executable
 kw._prewarm = lambda: None  # no registry or SEC network work
+# The stub providers cover both sidecars. A developer's JEV_ENABLED switch must not change that.
+os.environ["JEV_ENABLED"] = "true"
 
 
 def event(text):

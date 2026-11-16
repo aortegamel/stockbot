@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { fingerprintKey } from "@/lib/env";
+import { envFlag, fingerprintKey } from "@/lib/env";
 
 export async function GET(): Promise<Response> {
   const root =
@@ -17,11 +17,12 @@ export async function GET(): Promise<Response> {
   const on = (k: string): boolean => ["1", "true", "yes"].includes(env(k).toLowerCase());
   const all = (...keys: string[]): boolean => keys.every((k) => env(k) !== "");
   const venvPresent = existsSync(join(root, "venv/bin/python"));
+  const jevOn = envFlag("JEV_ENABLED", true);
   const deps: Record<string, { ok: boolean; required: boolean }> = {
     venv: { ok: venvPresent, required: true },
     needle: { ok: weightsPresent, required: true },
     sec: { ok: env("SEC_EDGAR_IDENTITY").includes("@"), required: true },
-    jev: { ok: all("DECISION_API_FORMAT", "DECISION_API_URL", "DECISION_API_KEY", "DECISION_MODEL"), required: true },
+    jev: { ok: !jevOn || all("DECISION_API_FORMAT", "DECISION_API_URL", "DECISION_API_KEY", "DECISION_MODEL"), required: jevOn },
     opencode: { ok: all("OPENCODE_API_KEY", "OPENCODE_URL", "OPENCODE_MODEL"), required: true },
   };
   if (on("EXA_ENABLED")) deps.exa = { ok: env("EXA_API_KEY") !== "", required: false };

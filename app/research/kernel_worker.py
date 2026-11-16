@@ -55,6 +55,7 @@ from typing import TYPE_CHECKING
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from app.child_spawn import defer_termination
+from app.config import jev_enabled
 from app.research.models import JSONValue, utcnow
 
 if TYPE_CHECKING:
@@ -131,12 +132,14 @@ def _prewarm() -> None:
     threading.Thread(target=_prewarm_caches, name="kernel-prewarm", daemon=True).start()
 
 
-def _startup() -> JevClient:
-    """Start shared JEV + Needle. Caller emits readiness only after this returns."""
+def _startup() -> JevClient | None:
+    """Start shared JEV unless disabled, then Needle. Caller emits readiness only after this returns."""
     global _SHUTDOWN_DONE
     _SHUTDOWN_DONE = False
-    jev = _shared_jev()
-    jev.start()
+    jev: JevClient | None = None
+    if jev_enabled():
+        jev = _shared_jev()
+        jev.start()
     try:
         needle_mod = importlib.import_module("app.needle_client")
         start_fn = needle_mod.start

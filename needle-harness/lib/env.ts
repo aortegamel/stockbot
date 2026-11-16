@@ -40,6 +40,12 @@ export function redactKey(key: string): string {
   return key.length <= 11 ? `${key.slice(0, 3)}…` : `${key.slice(0, 11)}…`;
 }
 
+// Env switch: truthy values are 1/true/yes. An unset or empty value keeps `fallback`.
+export function envFlag(name: string, fallback: boolean): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  return raw ? ["1", "true", "yes"].includes(raw) : fallback;
+}
+
 export type EnvOverride = { key: string; oldRedacted: string; newRedacted: string };
 
 // Explicit runtime overrides always win: PORT=3101 bun run stockbot must work.
