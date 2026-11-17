@@ -1,0 +1,5 @@
+# Optional Needle experiment. Install after the base setup:
+#   venv/bin/pip install -r requirements-needle.txt
+# Then set NEEDLE_ENABLED=true in .env and provide the needle3.cact weights file.
+# The default chat and research paths do not use this package.
+cactus-needle==3.0.1

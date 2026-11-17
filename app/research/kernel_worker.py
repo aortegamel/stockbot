@@ -55,7 +55,7 @@ from typing import TYPE_CHECKING
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from app.child_spawn import defer_termination
-from app.config import jev_enabled
+from app.config import jev_enabled, needle_enabled
 from app.research.models import JSONValue, utcnow
 
 if TYPE_CHECKING:
@@ -133,21 +133,22 @@ def _prewarm() -> None:
 
 
 def _startup() -> JevClient | None:
-    """Start shared JEV unless disabled, then Needle. Caller emits readiness only after this returns."""
+    """Start shared JEV and Needle only for their experiments. Caller emits readiness after this."""
     global _SHUTDOWN_DONE
     _SHUTDOWN_DONE = False
     jev: JevClient | None = None
     if jev_enabled():
         jev = _shared_jev()
         jev.start()
-    try:
-        needle_mod = importlib.import_module("app.needle_client")
-        start_fn = needle_mod.start
-        start_fn()
-    except Exception as exc:
-        # Needle failures do not stop the worker: only the chat arguments op grounds on it.
-        logger.exception("kernel-worker needle start failed")
-        print(f"[kernel-worker] needle start failed: {exc}", file=sys.stderr)
+    if needle_enabled():
+        try:
+            needle_mod = importlib.import_module("app.needle_client")
+            start_fn = needle_mod.start
+            start_fn()
+        except Exception as exc:
+            # Needle failures do not stop the worker: only the chat arguments op grounds on it.
+            logger.exception("kernel-worker needle start failed")
+            print(f"[kernel-worker] needle start failed: {exc}", file=sys.stderr)
     _prewarm()
     return jev
 
@@ -751,6 +752,9 @@ def _arguments(req: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
     if not isinstance(tool, str) or not tool:
         logger.warning("toolflow arguments_deny rid=%s reason=tool-required", rid)
         return {"id": rid, "error": "tool required"}
+    if not needle_enabled():
+        logger.info("toolflow arguments_deny rid=%s reason=needle-disabled", rid)
+        return {"id": rid, "error": "needle disabled"}
     try:
         sid_hint = _arguments_session_hint(req)
         sid_display = sid_hint or "-"

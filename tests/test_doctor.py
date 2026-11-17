@@ -31,21 +31,30 @@ def test_load_env_dotenv_wins_except_inherited_port(tmp_path: Path) -> None:
 
 
 def test_required_features_pass_with_full_env_and_fail_on_placeholders() -> None:
-    for check in (doctor.check_sec, doctor.check_decision, doctor.check_opencode):
+    for check in (doctor.check_sec, doctor.check_opencode):
         assert check(FULL)[0] == doctor.OK
+    jev = {**FULL, "JEV_ENABLED": "true"}
+    assert doctor.check_decision(jev)[0] == doctor.OK
     placeholder = {**FULL, "SEC_EDGAR_IDENTITY": "Your Name your.email@example.com"}
     assert doctor.check_sec(placeholder)[0] == doctor.FAIL
-    assert "DECISION_MODEL" in doctor.check_decision({**FULL, "DECISION_MODEL": " "})[2]
-    assert doctor.check_decision({**FULL, "DECISION_API_FORMAT": "auto"})[0] == doctor.FAIL
-    assert doctor.check_decision({**FULL, "DECISION_API_URL": "http://x/d"})[0] == doctor.FAIL
+    assert "DECISION_MODEL" in doctor.check_decision({**jev, "DECISION_MODEL": " "})[2]
+    assert doctor.check_decision({**jev, "DECISION_API_FORMAT": "auto"})[0] == doctor.FAIL
+    assert doctor.check_decision({**jev, "DECISION_API_URL": "http://x/d"})[0] == doctor.FAIL
     assert doctor.check_opencode({**FULL, "OPENCODE_URL": "https://x/v1"})[0] == doctor.FAIL
 
 
 def test_decision_skips_when_jev_is_disabled() -> None:
+    assert doctor.check_decision({})[0] == doctor.SKIP
     assert doctor.check_decision({"JEV_ENABLED": "false"})[0] == doctor.SKIP
     assert doctor.check_decision({"JEV_ENABLED": "0"})[0] == doctor.SKIP
     assert doctor.check_decision({"JEV_ENABLED": "true"})[0] == doctor.FAIL
     assert doctor.check_decision({**FULL, "JEV_ENABLED": "true"})[0] == doctor.OK
+
+
+def test_needle_skips_when_disabled() -> None:
+    assert doctor.check_needle({})[0] == doctor.SKIP
+    assert doctor.check_needle({"NEEDLE_ENABLED": "false"})[0] == doctor.SKIP
+    assert doctor.check_needle({"NEEDLE_ENABLED": "0"})[0] == doctor.SKIP
 
 
 def test_optional_features_skip_when_off_and_fail_when_half_configured() -> None:

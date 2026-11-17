@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentEvent, Evidence } from "@/lib/agent/types";
 import { closeChatDb, readChat } from "@/lib/chat";
-import { ANSWER_SECTIONS, type reason } from "@/lib/muse/client";
+import { ANSWER_SECTIONS, type complete, type reason } from "@/lib/muse/client";
 // Capture the production validators before mock.module replaces the kernel.
 import { asksWatchlist, outOfScopeAnswer, parseTicker, parseWatchlist, runKernelAgent } from "@/lib/agent/kernel";
 const realParseTicker = parseTicker;
@@ -17,6 +17,7 @@ const realRunKernelAgent = runKernelAgent;
 type Body = Record<string, unknown>;
 type Event = { type: string;[key: string]: unknown };
 const reasonCalls: Parameters<typeof reason>[0][] = [];
+const completeCalls: Parameters<typeof complete>[0][] = [];
 const kernelCalls: Body[] = [];
 const kernelOpts: unknown[] = [];
 const runCalls: unknown[][] = [];
@@ -31,6 +32,8 @@ let scopeReply: Body | Error = { in_scope: true };
 let sectionsReply: Body | Error = { sections: ["short_term", "risks"] };
 let reasonText = "Hello! How can I help?";
 let reasonDown = false;
+let completeText = "{}";
+let completeDown = false;
 let reasonUsage = {};
 let argsDown = false;
 let argsReply: Body | null = null;
@@ -102,6 +105,11 @@ mock.module("@/lib/muse/client", () => ({
     if (reasonDown) throw new Error("muse down");
     return { prose: reasonText, usage: reasonUsage };
   },
+  complete: async (opts: Parameters<typeof complete>[0]) => {
+    completeCalls.push(opts);
+    if (completeDown) throw new Error("complete down");
+    return completeText;
+  },
 }));
 mock.module("@/lib/tools/stockbot", () => ({
   invoke: async (name: string, args: unknown, sessionId: string, timeoutMs: number) => {
@@ -130,7 +138,7 @@ mock.module("@/lib/tools/stockbot", () => ({
 }));
 
 let directory: string;
-const savedEnv = { debug: process.env.STOCKBOT_DEBUG, model: process.env.OPENCODE_MODEL, data: process.env.STOCKBOT_DATA_DIR, effort: process.env.REASONING_EFFORT, maxOutputTokens: process.env.MUSE_MAX_OUTPUT_TOKENS, answerTokenBudget: process.env.MUSE_ANSWER_TOKEN_BUDGET, jev: process.env.JEV_ENABLED };
+const savedEnv = { debug: process.env.STOCKBOT_DEBUG, model: process.env.OPENCODE_MODEL, data: process.env.STOCKBOT_DATA_DIR, effort: process.env.REASONING_EFFORT, maxOutputTokens: process.env.MUSE_MAX_OUTPUT_TOKENS, answerTokenBudget: process.env.MUSE_ANSWER_TOKEN_BUDGET, jev: process.env.JEV_ENABLED, needle: process.env.NEEDLE_ENABLED };
 beforeEach(async () => {
   reasonCalls.length = kernelCalls.length = kernelOpts.length = runCalls.length = invoked.length = ended.length = toolOutputs.length = sectionCalls.length = scopeCalls.length = 0;
   scopeOpts.length = 0;
@@ -140,6 +148,9 @@ beforeEach(async () => {
   reasonText = "Hello! How can I help?";
   reasonDown = argsDown = toolThrows = endThrows = false;
   reasonUsage = {};
+  completeCalls.length = 0;
+  completeText = "{}";
+  completeDown = false;
   argsReply = null;
   effortReply = { effort: "medium" };
   runThrows = toolFailure = null;
@@ -155,12 +166,13 @@ beforeEach(async () => {
   process.env.STOCKBOT_DEBUG = "1";
   process.env.OPENCODE_MODEL = "test-model";
   process.env.REASONING_EFFORT = "medium";
-  delete process.env.JEV_ENABLED;
+  process.env.JEV_ENABLED = "true";
+  delete process.env.NEEDLE_ENABLED;
   delete process.env.MUSE_MAX_OUTPUT_TOKENS;
   delete process.env.MUSE_ANSWER_TOKEN_BUDGET;
 });
 afterEach(async () => {
-  for (const [name, value] of [["STOCKBOT_DEBUG", savedEnv.debug], ["OPENCODE_MODEL", savedEnv.model], ["STOCKBOT_DATA_DIR", savedEnv.data], ["REASONING_EFFORT", savedEnv.effort], ["MUSE_MAX_OUTPUT_TOKENS", savedEnv.maxOutputTokens], ["MUSE_ANSWER_TOKEN_BUDGET", savedEnv.answerTokenBudget], ["JEV_ENABLED", savedEnv.jev]] as const) {
+  for (const [name, value] of [["STOCKBOT_DEBUG", savedEnv.debug], ["OPENCODE_MODEL", savedEnv.model], ["STOCKBOT_DATA_DIR", savedEnv.data], ["REASONING_EFFORT", savedEnv.effort], ["MUSE_MAX_OUTPUT_TOKENS", savedEnv.maxOutputTokens], ["MUSE_ANSWER_TOKEN_BUDGET", savedEnv.answerTokenBudget], ["JEV_ENABLED", savedEnv.jev], ["NEEDLE_ENABLED", savedEnv.needle]] as const) {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
   }
@@ -330,6 +342,18 @@ describe("JEV switch", () => {
     process.env.REASONING_EFFORT = "auto";
     await eventsFor("filing facts?", { mode: "research" });
     expect(kernelCalls).toEqual([]);
+    expect(scopeCalls).toEqual([]);
+    expect(runCalls).toHaveLength(1);
+    expect(runCalls[0]?.[2]).not.toHaveProperty("reasoningEffort");
+  });
+  test("an unset JEV_ENABLED keeps every decision off", async () => {
+    delete process.env.JEV_ENABLED;
+    await eventsFor("hello");
+    expect(sectionCalls).toEqual([]);
+    expect(kernelCalls).toEqual([]);
+    expect(reasonCalls[0]?.sections).toEqual(["short_term", "long_term", "analysts", "bull_case", "bear_case", "risks"]);
+    process.env.REASONING_EFFORT = "auto";
+    await eventsFor("filing facts?", { mode: "research" });
     expect(scopeCalls).toEqual([]);
     expect(runCalls).toHaveLength(1);
     expect(runCalls[0]?.[2]).not.toHaveProperty("reasoningEffort");
@@ -712,11 +736,13 @@ describe("request validation", () => {
 });
 
 describe("deterministic UI commands", () => {
-  test("a watchlist command generates arguments and emits its validated update", async () => {
+  test("a watchlist command grounds its arguments on Needle when enabled", async () => {
+    process.env.NEEDLE_ENABLED = "true";
     argsReply = { tool: "update_watchlist", arguments: { action: "add", ticker: "NVDA" } };
     const prompt = "add NVDA to my watchlist";
     const events = await eventsFor(prompt);
     expect(kernelCalls).toEqual([{ op: "arguments", tool: "update_watchlist", objective: prompt }]);
+    expect(completeCalls).toEqual([]);
     expect(invoked[0]).toEqual(["update_watchlist", argsReply.arguments, "sess-test", expect.any(Number)]);
     expect(events).toContainEqual({ type: "watchlist_update", action: "add", ticker: "NVDA" });
     expect(events).toContainEqual({ type: "answer_delta", text: "Added NVDA to your watchlist." });
@@ -725,7 +751,35 @@ describe("deterministic UI commands", () => {
     expect(reasonCalls).toEqual([]);
     expect(runCalls).toEqual([]);
   });
+  test("a watchlist command uses one model call when Needle is off", async () => {
+    completeText = JSON.stringify({ action: "add", ticker: "NVDA" });
+    const prompt = "add NVDA to my watchlist";
+    const events = await eventsFor(prompt, { currentChartTicker: "AAPL" });
+    expect(kernelCalls).toEqual([]);
+    expect(completeCalls).toHaveLength(1);
+    expect(completeCalls[0]?.prompt).toContain("update_watchlist");
+    expect(completeCalls[0]?.prompt).toContain("CURRENT STOCK\nAAPL");
+    expect(invoked[0]).toEqual(["update_watchlist", { action: "add", ticker: "NVDA" }, "sess-test", expect.any(Number)]);
+    expect(events).toContainEqual({ type: "watchlist_update", action: "add", ticker: "NVDA" });
+    expect(events).toContainEqual({ type: "answer_delta", text: "Added NVDA to your watchlist." });
+  });
+  test("a failing Needle falls back to the model call", async () => {
+    process.env.NEEDLE_ENABLED = "true";
+    argsDown = true;
+    completeText = JSON.stringify({ action: "add", ticker: "NVDA" });
+    const events = await eventsFor("add NVDA to my watchlist");
+    expect(kernelCalls).toHaveLength(1);
+    expect(completeCalls).toHaveLength(1);
+    expect(events).toContainEqual({ type: "answer_delta", text: "Added NVDA to your watchlist." });
+  });
+  test("an invalid model answer fails visibly without a tool call", async () => {
+    completeText = "not json";
+    const events = await eventsFor("add NVDA to my watchlist");
+    expect(invoked).toEqual([]);
+    expect(events).toContainEqual({ type: "answer_delta", text: "Watchlist update failed: no valid stock and action." });
+  });
   test("a remove command emits the remove receipt", async () => {
+    completeText = JSON.stringify({ action: "remove", ticker: "NVDA" });
     watchlistReceipt = { result_type: "watchlist_update", action: "remove", ticker: "NVDA" };
     const events = await eventsFor("remove NVDA from my watchlist");
     expect(events).toContainEqual({ type: "watchlist_update", action: "remove", ticker: "NVDA" });
@@ -740,7 +794,8 @@ describe("deterministic UI commands", () => {
     expect(invoked).toEqual([]);
     expect(events).toContainEqual({ type: "answer_delta", text: reasonText });
   });
-  test("a widget command emits an update for the displayed stock", async () => {
+  test("a widget command grounds its arguments on Needle when enabled", async () => {
+    process.env.NEEDLE_ENABLED = "true";
     argsReply = { tool: "add_widget", arguments: { type: "short-volume", ticker: "aapl" } };
     const prompt = "add a short volume widget";
     const events = await eventsFor(prompt, { currentChartTicker: "AAPL" });
@@ -751,6 +806,14 @@ describe("deterministic UI commands", () => {
     expect(reasonCalls).toEqual([]);
     expect(runCalls).toEqual([]);
     expect(ended).toEqual(["sess-test"]);
+  });
+  test("a widget command uses one model call when Needle is off", async () => {
+    completeText = JSON.stringify({ type: "short-volume", ticker: "AAPL" });
+    const events = await eventsFor("add a short volume widget", { currentChartTicker: "AAPL" });
+    expect(kernelCalls).toEqual([]);
+    expect(completeCalls).toHaveLength(1);
+    expect(invoked[0]).toEqual(["add_widget", { type: "short-volume", ticker: "AAPL" }, "sess-test", expect.any(Number)]);
+    expect(events).toContainEqual({ type: "widget_update", ticker: "AAPL", widgetType: "short-volume" });
   });
   test("a widget ticker mismatch fails visibly without an update", async () => {
     widgetReceipt = { result_type: "widget_selection", widget_type: "short-volume", ticker: "MSFT" };
@@ -795,6 +858,8 @@ describe("deterministic UI commands", () => {
     expect(runCalls).toEqual([]);
   });
   test.each(["error", "tool", "null", "string", "throw"])("invalid %s arguments fail without invocation", async (failure) => {
+    process.env.NEEDLE_ENABLED = "true";
+    completeText = "not json";
     argsReply = { tool: "update_watchlist", arguments: { action: "add", ticker: "NVDA" } };
     if (failure === "error") argsReply.error = "args failed";
     if (failure === "tool") argsReply.tool = "add_widget";
@@ -816,6 +881,7 @@ describe("deterministic UI commands", () => {
     expect(events.at(-1)).toMatchObject({ type: "done", status: "completed" });
   });
   test("arguments and tool calls share the request deadline", async () => {
+    process.env.NEEDLE_ENABLED = "true";
     await eventsFor("add NVDA to my watchlist");
     expect(kernelOpts[0]).toMatchObject({ signal: expect.any(AbortSignal), timeoutMs: expect.any(Number) });
     const timeout = invoked[0]?.[3] as number;

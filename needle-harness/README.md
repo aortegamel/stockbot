@@ -1,11 +1,14 @@
 # Needle Harness
 
-Local routing (Cactus Needle 3), remote reasoning (Muse Spark via OpenCode Go API), Bun orchestration, Vite terminal UI.
+Remote reasoning through one OpenCode model, Bun orchestration, Vite web UI.
+The optional Needle experiment adds a small local model for chat command arguments.
 
 ## 1. Requirements
 
-- Bun 1.4.2, uv, and the repo-root `needle3.cact` weights
+- Bun 1.4.2 and uv
+- `OPENCODE_API_KEY`, `OPENCODE_URL`, and `OPENCODE_MODEL` in the repo-root `.env`
 - `SEC_EDGAR_IDENTITY="Name email@example.com"` in the repo-root `.env` for SEC tools
+- Optional Needle experiment: `NEEDLE_ENABLED=true`, the `cactus-needle` package, and the repo-root `needle3.cact` weights
 
 ## 2. Setup
 
@@ -46,14 +49,15 @@ See the root README "LAN access" section.
 
 ```
 prompt + current chart + exclusive ticker/watchlist scope
-  → JEV selects the original answer/research route, personas, and an optional chart focus
-  → EDGAR resolves only the selected stock label
-  → Needle generates set_chart_symbol arguments → canonical tool → chart_update
-  → original answer/research route → evidence → reasoner → answer + metrics
-Bun streams AgentEvents as SSE to the terminal UI.
+  → exact UI command? → tool arguments → canonical tool → receipt event
+  → otherwise → one OpenCode model call with curated read-only tools → answer + sources
+research mode (exclusive scope)
+  → open_research → native tool loop → evidence admission
+  → model writes the answer and its claims → deterministic claim proof
+Bun streams AgentEvents as SSE to the web UI.
 ```
 
-JEV alone selects the route and chart focus. Needle generates tool arguments. Bun orchestrates. Tools retrieve. The reasoner answers.
+Bun orchestrates. The model selects tools. Python tools retrieve and admit evidence. Code proves each claim. JEV and Needle are optional experiments; see the root README.
 
 ### Current stock and chart actions
 
@@ -62,47 +66,21 @@ The existing frontend `ticker` supplies the displayed stock unless the request s
 The API validates each stock symbol with the existing ticker validator.
 The user prompt remains verbatim.
 
-For a question with several stocks, JEV chooses the focus in the same call that selects the original route.
-The worker resolves only that chosen ticker or company label through EDGAR.
-It returns `chartTicker` only when the resolved focus differs from the current chart.
-It returns `chartError` when chart selection or resolution fails.
-Invalid chart metadata never authorizes a chart change or discards a valid original route.
-
-Before a direct answer, single-tool answer, or persona research run, the API executes any approved chart action.
-Needle generates arguments for the fixed `set_chart_symbol` tool using the selected focus.
-The API checks the generated ticker against that focus.
-The canonical tool must return a matching `chart_selection` receipt before the API emits `{type:"chart_update", ticker}`.
-The bridge carries that structured receipt in `result.meta.chart_selection`.
-The TypeScript adapter preserves it as untrusted `ToolResult.chartSelection` only for `set_chart_symbol`.
-The API checks that object, not the tool's formatted content. Existing metrics remain scoped to the original answer path.
-The pre-action shares the existing request deadline and existing worker/bridge cancellation behavior. It adds no retry or separate timeout policy.
+A chart command is one exact shape: `show AAPL`, `open the chart for $nvda`, or `switch to MSFT`.
+The route parses the ticker and calls `set_chart_symbol` directly. No model is involved.
+The canonical tool must return a matching `chart_selection` receipt before the route emits `{type:"chart_update", ticker}`.
+The bridge carries that receipt in `result.meta.chart_selection`, and the TypeScript adapter keeps it as untrusted `ToolResult.chartSelection` only for `set_chart_symbol`.
+The API checks that object, not the tool's formatted content.
+The action shares the request deadline and the existing worker and bridge cancellation.
 The chart receipt supplies no factual answer evidence or research seed evidence.
-The API adds no assessment call and never reroutes the question for this action.
-The API rejects `set_chart_symbol` as an original entry route or a post-tool answer transition.
+A failure answers as text and does not end the request.
 
-If the chart action fails, the API emits a warning as answer text and continues the original question.
-The reasoner keeps the prior chart context after failure.
-After success, direct, single-tool, persona, follow-up, and synthesis calls use the applied ticker as separate reasoner context.
-Watchlist calls omit that reasoner ticker and keep their exclusive watchlist research scope.
-The reasoner treats current-stock context as context, not evidence.
-
-A successful canonical research invocation emits the same event through validated worker progress.
-Production SSE retains `chart_update` while ordinary progress remains redacted.
-The API does not infer chart actions from tool previews or answer prose.
-
-Chat can select `update_watchlist` for a local add or remove request.
-Needle generates `action` and `ticker`. The canonical tool validates both fields.
-The bridge preserves its structured `watchlist_update` receipt.
-The route emits `{type:"watchlist_update", action, ticker}` only after canonical success.
-The receipt supplies no factual evidence. The route answers without research or an assessment call.
-`WatchlistChatPanel` applies each event once and keeps the list for the mounted terminal.
-It preserves the existing page-load source requests and their 15-second budget.
-The component requires App integration. The default `WatchlistPanel` behavior does not change.
-
-Chat can select `add_widget` to add one widget to the displayed stock's workspace.
-Needle generates `type` and `ticker`. The canonical tool validates both fields, and the bridge preserves its `widget_selection` receipt.
-The route emits `{type:"widget_update", ticker, widgetType}` only after canonical success and only when the receipt ticker equals `currentChartTicker`. Kernel worker progress relays this event only for a canonical ticker and a known widget type.
-The receipt supplies no factual evidence. A failure answers as text without research, and a post-tool assessment cannot chain into `add_widget`.
+A watchlist command (`add NVDA to my watchlist`) or a widget command (`add a short volume widget`) needs tool arguments.
+The route asks Needle for them when `NEEDLE_ENABLED=true`. Otherwise it asks the OpenCode model for one JSON object from the tool schema. A Needle failure also falls back to the model.
+The canonical tool validates the fields. The bridge preserves its `watchlist_update` or `widget_selection` receipt.
+The route emits the matching update event only after canonical success.
+The widget receipt ticker must equal `currentChartTicker`.
+The receipt supplies no factual evidence. A failure answers as text without research.
 
 ### Stored conversations
 
@@ -133,7 +111,7 @@ Numeric claims still require exact evidence IDs and datapoint IDs.
 Feed items and sibling drafts remain untrusted data, not evidence.
 Direct answers retain their separate rules for requests without evidence.
 
-Every persona uses the shared caller deadline when the caller supplies one.
+Every model call uses the shared caller deadline when the caller supplies one.
 Otherwise, one 120-second limit covers generation, the bounded retry, and protocol fallback.
 Abort and error paths retain observed token counts, provider POST counts, and generation time.
 Research timings report `narrativeMs`. They do not report an absent binder stage.

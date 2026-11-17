@@ -1,202 +1,203 @@
 # Stockbot
 
-Stockbot is a local-first AI investment research system designed to give individual investors hedge-fund-style research infrastructure. Today it is the research and data foundation for that direction, not an automated trading or consumer portfolio-management product.
+Stockbot is a local research workstation for individual investors. It collects filings, market data, and news, then answers questions with one AI model and a deterministic proof step.
 
-## Current capabilities
+Every number in a final answer must trace back to a stored source. Stockbot cannot place orders or move money.
 
-- SEC EDGAR research, filing extraction, and deterministic financial calculations
-- FINRA datasets, short-interest screens, and Regulation SHO analysis
-- Point-in-time `known_at` data handling, provenance, raw-data archiving, normalized Parquet datasets, and DuckDB analytics
-- Obligation and valuation analysis
-- A tool-using research agent backed by Pi
-- Analyst-consensus and market-data adapters
-- Optional Robinhood portfolio, quote, option, and saved-scanner **read** integration with portfolio analytics
-- Optional Exa-backed external web research (`search_web`): bounded current-evidence search with highlights; results are research evidence, not canonical financial records
+## What it does
 
-## Architecture principles
+- Reads SEC EDGAR filings and extracts financial facts.
+- Reads FINRA datasets for short interest and Regulation SHO.
+- Tracks market data for your watchlist.
+- Pulls analyst estimates and valuation metrics.
+- Answers questions about companies, filings, and market events.
+- Shows the source of each answer.
+- Optional: reads Robinhood portfolio data with no write access.
+- Optional: searches the web for current news.
 
-Stockbot keeps raw source data and normalized analytical data separate, preserves when data became knowable, and favors deterministic calculations over model arithmetic. The LLM selects bounded tools and explains evidence; it is not the primary database or calculator.
+## How an answer is built
 
-## Grounded hypothetical reasoning
+1. You ask a question in the web UI.
+2. The model selects tools from a fixed list. It does not run code.
+3. Each tool result is checked before it becomes evidence. The check covers the source, the filing bytes, the point in time, and the data shape.
+4. The model writes the answer and declares every claim.
+5. Code verifies each claim against the evidence. A claim without support is removed.
 
-Hypotheticals ("what if X does terrible?") are model-invented assumptions, each declared with an `assumptionId` — never cited as evidence.
-Every impact number must cite exact evidence ids in `evidenceRefs` plus a `numbers[]` entry `{value, evidenceId, quote}`.
-Each `numbers[]` quote reproduces the source bytes verbatim; live traces prove the run reasoned on exact bytes, not summaries.
-The model never multiplies: it states the formula in words ("exposure times haircut, divided by 100").
-Code attaches `computed_impact` (`exposure_pct x haircut_pct / 100`) to each kept analysis via
-`attach_scenario_impact` in `app/research/grounding.py` (fail-open: unparseable pairs ride unchanged).
-Unknown refs and non-verbatim quotes fail closed: the validator raises `ValueError` and the caller drops the analysis, never accepts it.
-Live traces (`cli.py inspect`) show the exact GROUNDED bytes the run reasoned on.
-`reason_adjudication` DecisionRecords persist `evidence_refs` + `numbers` + `assumptions` + `computed_impact` in `selected`, so inspect links each interpretation back to its source rows.
-Example: "If the OpenAI IPO does terrible, how does NVDA move?"
--> assumption `openai-ipo-terrible` (invented, labeled) carries the 30% haircut; it needs no evidence ref.
-NVDA's 12.5% OpenAI exposure is quoted verbatim from `ev-nvda-10k`; code computes `12.5 x 30% = 3.75`, the model does not.
+The model writes prose. Code does the arithmetic.
 
-## Quick start
+## Chat commands
 
-On a fresh machine:
+The chat also accepts a few exact commands:
 
-1. Install [uv](https://docs.astral.sh/uv/) and [Bun](https://bun.sh), then clone this repository.
-2. Run `bun run setup && bun install --cwd web && bun install --cwd needle-harness`.
-3. Run `cp .env.example .env`. Fill every key that `.env.example` labels `MVP-required`: SEC, JEV decisions, and OpenCode reasoner.
-4. Run `bun run doctor`. Apply the `Fix:` on each `✗` line. Repeat until the doctor exits 0.
-5. Run `bun run stockbot`. Open the Vite URL from the startup log, for example `http://localhost:3000`.
+- `add NVDA to my watchlist`
+- `remove NVDA from my watchlist`
+- `add a short volume widget`
+- `show AAPL`, or `open the chart for AAPL`
+
+Everything else goes to the model as a research question.
+
+## Experiments
+
+Two experiments are off by default. The default runtime needs neither.
+
+### JEV decisions (`JEV_ENABLED`)
+
+JEV adds three decisions around the model. It can reject a request that is outside stock research, pick the parts of a chat answer, and select a reasoning effort. It calls a separate decision endpoint.
+
+Set `JEV_ENABLED=true` and the four `DECISION_API_*` values to turn it on. When it is off, every request is in scope, every answer part is kept, and no reasoning effort is selected. See [docs/runtime.md](docs/runtime.md#jev-decision-api).
+
+### Needle argument grounding (`NEEDLE_ENABLED`)
+
+Needle is a small local model. It turns a chat command into tool arguments.
+
+To use it, install the optional package and provide the weights file:
+
+```bash
+venv/bin/pip install -r requirements-needle.txt
+```
+
+Put `needle3.cact` at the repository root, or set `NEEDLE_WEIGHTS` to its path. Git does not track the weights file.
+
+Set `NEEDLE_ENABLED=true` in `.env`. When Needle is off, the OpenCode model produces the same arguments from the tool schema. A Needle failure also falls back to the model.
 
 ## Requirements
 
-- uv (installs and manages Python 3.14)
-- An SEC EDGAR identity for SEC requests
-- A working Pi setup for model inference (Stockbot shells to `pi`)
-- Bun (task runner) — `package.json` scripts are zero-dependency wrappers around Python tooling; required for `bun run setup`, `bun run test`, `bun run verify`.
+- [uv](https://docs.astral.sh/uv/) manages Python 3.14.
+- An SEC EDGAR identity: your name and email.
+- An OpenCode Responses endpoint and model: `OPENCODE_API_KEY`, `OPENCODE_URL`, and `OPENCODE_MODEL`.
+- [Bun](https://bun.sh) runs the project scripts.
 
-## Local setup
+The default runtime does not need JEV, Needle, FINRA, Robinhood, or Exa.
 
-```bash
-cp .env.example .env
-# Fill only the credentials for integrations you intend to use.
-bun run setup
-```
+## Quick start
 
-`bun run setup` reads `.python-version` and creates the only Python environment at `venv/`.
-Stockbot, Needle, and all Python tools use this environment.
-The setup installs their shared dependencies from `requirements.txt`.
+1. Install uv and Bun, then clone the repository.
+2. Run `bun run setup && bun install --cwd web && bun install --cwd needle-harness`.
+3. Run `cp .env.example .env`. Fill `SEC_EDGAR_IDENTITY` and the three `OPENCODE_*` values.
+4. Run `bun run doctor`. Fix every `✗` line and repeat until the doctor exits 0.
+5. Run `bun run stockbot`. Open the URL from the startup log, for example `http://localhost:3000`.
 
-Offline tests do not need FINRA, Robinhood, or SEC credentials.
+## How it runs
 
-### Offline browser regression
+`bun run stockbot` starts three local services:
 
-The default Python suite runs Selenium against the actual Vite UI.
-The test uses local HTTP fixtures for every market and research request.
-It does not start the live API servers or call SEC, Yahoo, or broker services.
-At 1440x900 and 1280x720, it checks that the agent input and Send button stay visible.
-It also sends native wheel input to scroll the transcript and the captured source content.
+- the Vite web UI on `PORT`, default 3000,
+- the Bun API host,
+- the FastAPI market-data service.
 
-Install Chromium and a ChromeDriver version that matches the Chromium major version.
-The test searches `PATH` for `chromium`, `chromium-browser`, or `google-chrome`, plus `chromedriver`.
-Set `STOCKBOT_CHROMIUM_BINARY` and `STOCKBOT_CHROMEDRIVER` to use explicit executable paths.
-The test fails if either executable is missing.
-It never downloads a browser or driver through Selenium Manager.
+Only the web UI listens on your network. The other two bind to `127.0.0.1`, and the browser reaches them through the Vite proxy.
 
-```bash
-bun run setup
-bun install --cwd web
-chromium --version
-chromedriver --version
-bun run test:browser
-```
+`bun run dev` starts the same stack with hot reload.
 
-The repository pins [Selenium 4.51.0](https://pypi.org/project/selenium/4.51.0/).
-Its package metadata supports Python 3.10 or later, including the repository's Python 3.14.
-The test uses headless Chromium without a display server.
-`bun run test` and `bun run verify` include this regression through the default Python suite.
+The Bun kernel runs one native tool loop through `app/research/kernel_worker.py`. The model selects tools and supplies their arguments. The kernel admits evidence and proves each claim before it shows the answer. [docs/runtime.md](docs/runtime.md) describes the full sequence.
 
-The web component suite runs with `bun test --cwd web`.
-Its App tests await deferred watchlist results inside React `act` boundaries.
-Fake-timer tests unmount components before restoring the real timers.
-
-## Environment variables
-
-See [`.env.example`](.env.example) for the current list and whether each setting is required, optional, or testing-only. `SEC_EDGAR_IDENTITY` is required only for SEC features. FINRA and Robinhood are optional integrations.
-
-JEV decisions use one configured endpoint. Set `DECISION_API_FORMAT` to `chat_completions` for an OpenAI-compatible Chat Completions endpoint or to `decisions` for a native Decisions API endpoint, such as OpenRouter `/api/alpha/decisions`. Set `DECISION_API_URL`, `DECISION_API_KEY`, and `DECISION_MODEL` to select the endpoint, credential, and model. The code supplies no format, URL, or model default. See [docs/runtime.md](docs/runtime.md#jev-decision-api).
-
-Python and Bun startup both load only the repository root `.env`, regardless of the current directory.
-Root `.env` values replace inherited shell values.
-Inherited keys absent from `.env` stay in effect.
-An inherited `PORT` stays in effect, so `PORT=3101 bun run stockbot` works.
-
-## Running research
-
-```bash
-bun run stockbot   # production build: vite build, then vite preview
-bun run dev        # same launcher with STOCKBOT_WEB_MODE=dev: vite dev server with hot reload
-```
-
-`STOCKBOT_WEB_MODE` selects the web listener: `prod` (default) or `dev`.
-
-Pi owns model selection and the agent loop; Stockbot exposes its tools and
-security gates over the stdio bridge. `cli.py` remains for admin tasks only
-(`runs`, `inspect`, `refresh-data`, `log-server`, `robinhood-login`).
+`cli.py` remains for admin tasks only: `runs`, `inspect`, `refresh-data`, `log-server`, and `robinhood-login`.
 
 ### LAN access
 
-`bun run stockbot` serves the UI on every IPv4 interface (`0.0.0.0`) by default,
-so other devices on your network can open it. It starts three listeners:
+`bun run stockbot` serves the web UI on every IPv4 interface (`0.0.0.0`) by default, so other devices on your network can open it. It starts three listeners:
 
-- Vite UI on `PORT` (free-picked from 3000), bound to `0.0.0.0`.
-- Bun API on `STOCKBOT_API_PORT` (free-picked above the Vite port), always bound to `127.0.0.1`.
-- FastAPI market service on `STOCKBOT_MARKET_PORT` (free-picked above the API port), always bound to `127.0.0.1`.
+- Vite UI on `PORT`, free-picked from 3000, bound to `0.0.0.0`.
+- Bun API on `STOCKBOT_API_PORT`, free-picked above the Vite port, always bound to `127.0.0.1`.
+- FastAPI market service on `STOCKBOT_MARKET_PORT`, free-picked above the API port, always bound to `127.0.0.1`.
 
-The browser reaches the Bun API and the market service only through the Vite `/api/*` proxy.
-The startup log prints each selected port.
+The browser reaches the Bun API and the market service only through the Vite `/api/*` proxy. The startup log prints each selected port.
+
 `STOCKBOT_LAN=0 bun run stockbot` keeps the UI on loopback only.
 
-Open `http://<host LAN IP>:<PORT>/` from the other device.
-Find the host LAN IP with `ip -4 addr` on Linux.
+Open `http://<host LAN IP>:<PORT>/` from the other device. Find the host LAN IP with `ip -4 addr`.
+
 `0.0.0.0` is a bind address, not a client address. Do not put it in a browser.
 
-Optional token: set `STOCKBOT_LAN_TOKEN` to require it on `/api/*` (header
-`x-stockbot-token` or an HttpOnly cookie set once via `?token=…`).
-Without a token the LAN UI is open to anyone on your network: they can run the
-agent, spend model quota, and read theses. Use it only on a trusted network.
-Do not forward the port through a router or expose it to the internet.
+Optional token: set `STOCKBOT_LAN_TOKEN` to require it on `/api/*`, with the header `x-stockbot-token` or an HttpOnly cookie set once through `?token=…`.
 
-## Running tests
+Without a token, anyone on your network can run the agent, spend model quota, and read theses. Use it only on a trusted network. Do not forward the port through a router or expose it to the internet.
+
+## Environment variables
+
+See [`.env.example`](.env.example) for the full list. Each setting is labeled required, optional, or experiment-only.
+
+`SEC_EDGAR_IDENTITY` is required only for SEC features. FINRA, Robinhood, Exa, JEV, and Needle are optional.
+
+Python and Bun load only the repository-root `.env`, regardless of the current directory. A root `.env` value replaces an inherited shell value. An inherited key absent from `.env` stays in effect. An inherited `PORT` stays in effect, so `PORT=3101 bun run stockbot` works.
+
+## Tests
+
+The default suite runs offline. External services are faked.
+
 ```bash
-bun run test
-bun run typecheck
-bun run lint
-bun run test-collect
-# Fresh-environment verification (offline):
-bun run verify
-# Live end-to-end (manual, opt-in):
-bun run verify:e2e
+bun run test        # Python, decision, harness, and web suites
+bun run typecheck   # Python types
+bun run lint        # ruff plus TypeScript checks
+bun run verify      # fresh environment, offline
 ```
-The default suite is offline.
-FINRA and Robinhood smoke tests remain opt-in Bun scripts: `smoke-mock`, `smoke-prod`, and `smoke-robinhood`.
-`bun run verify:e2e` remains manual and opt-in.
-It does not run through `bun run verify` or CI.
+
+`bun run test:browser` runs the Selenium UI regression. It needs Chromium and a matching ChromeDriver on `PATH`. The default Python suite also runs it. Set `STOCKBOT_CHROMIUM_BINARY` and `STOCKBOT_CHROMEDRIVER` to use explicit executable paths.
+
+Live checks are opt-in: `verify:e2e` for the real agent loop, `smoke-prod` for FINRA, and `smoke-robinhood` for the broker. They do not run through `bun run verify` or CI.
 
 ## Optional Robinhood integration
 
-Set `BROKER_ENABLED=true` and complete the local OAuth login flow (`cli.py robinhood-login`) before using the integration. OAuth and MCP transport are pinned to `https://agent.robinhood.com/mcp/trading`; persisted tokens/client registration are bound to that HTTPS origin. Stockbot only permits explicitly allowlisted read operations and blocks unknown operations. It blocks order placement, order cancellation/replacement, option exercise, withdrawals, deposits, and transfers. It does not support trading or modifying saved scanners.
+Set `BROKER_ENABLED=true` and complete the local OAuth login with `cli.py robinhood-login`.
+
+OAuth and MCP transport are pinned to `https://agent.robinhood.com/mcp/trading`. Persisted tokens and client registration are bound to that HTTPS origin.
+
+Stockbot permits only explicitly allowlisted read operations. It blocks unknown operations, order placement, order cancellation or replacement, option exercise, withdrawals, deposits, and transfers. It does not support trading or changing saved scanners.
 
 ## Optional Exa integration
 
-Set `EXA_ENABLED=true` and `EXA_API_KEY` to enable external web research via
-the `search_web` tool. It returns bounded highlights for current qualitative
-evidence: news, announcements, competitive/industry developments,
-publications, specialist commentary, and counterevidence. Canonical
-SEC/FINRA/Robinhood/local-warehouse data remains authoritative — Exa never
-writes canonical datasets, and exact financial facts, portfolio state, and
-deterministic screens must come from the canonical tools. Searches appear in
-run traces (`cli.py inspect`) with their evidence.
+Set `EXA_ENABLED=true` and `EXA_API_KEY` to enable the `search_web` research tool. It returns bounded highlights for current qualitative evidence: news, announcements, competitive and industry developments, publications, specialist commentary, and counterevidence.
 
-## Data storage
+SEC, FINRA, Robinhood, and local data remain authoritative. Exa never writes canonical datasets. Exact financial facts, portfolio state, and deterministic screens come from the canonical tools.
 
-Runtime data is local and ignored by Git under `data/`. Stockbot archives raw source responses and stores normalized datasets as Parquet for DuckDB analytics. Robinhood OAuth state is intended to stay local at `~/.stockbot/robinhood/oauth.json` with restrictive permissions.
+## Stored data
 
-## Privacy and external services
+Runtime data stays on your machine under `data/`, which Git ignores:
 
-Stockbot runs locally, but selected functionality calls external APIs including SEC EDGAR, FINRA, Robinhood MCP, and market-data sources. When Pi runs inference, prompts and selected research/tool context—including applicable portfolio research context—are sent to the user's configured Pi model for inference. Raw Robinhood OAuth credentials remain local; Stockbot omits brokerage account identifiers from the model-facing portfolio payload.
+- `data/market.sqlite` keeps watchlists, quotes, filings, estimates, and news.
+- `data/research.sqlite` keeps research sessions, evidence, and decisions.
+- `data/chat.sqlite` keeps chat conversations.
+- `data/cache.db` keeps tool caches.
+- `data/logs/` keeps per-request JSONL traces.
 
-The analyst-consensus adapter uses Yahoo Finance's unofficial `quoteSummary` endpoint with a cookie/crumb workflow. It is isolated in `app/analyst_client.py`, is not required for startup, and fails gracefully; it is not a guaranteed supported API.
+Robinhood OAuth state stays at `~/.stockbot/robinhood/oauth.json` with restrictive permissions.
+
+## Hypothetical questions
+
+A hypothetical question, such as "what if OpenAI has a terrible IPO?", needs assumptions. Stockbot labels each assumption with an `assumptionId`. An assumption is never cited as evidence.
+
+Every impact number must cite evidence ids and a verbatim source quote. Code computes the impact from the cited numbers. The model states the formula in words and does not multiply.
+
+The validator fails closed. An unknown evidence id or a quote that does not match the source drops the analysis. An answer is never accepted with unverified numbers.
+
+`cli.py inspect` shows the stored record for one run.
+
+## Privacy
+
+Stockbot runs on your machine. Some features call external services:
+
+- SEC EDGAR, FINRA, Yahoo Finance, and news providers.
+- The OpenCode endpoint you configure. Prompts and the selected research context go to that endpoint.
+- Exa, when `EXA_ENABLED=true`.
+- Robinhood, when `BROKER_ENABLED=true`. Credentials stay local.
+
+Stockbot omits brokerage account identifiers from the portfolio data it sends to the model.
 
 ## Current limitations
 
-- No hosted, multi-user, or deployment environment
-- No brokerage trading, money movement, or scanner writes
-- Some research adapters depend on external source availability
-- Yahoo Finance consensus data is unofficial and best-effort
-- The broader thesis-monitoring and mandate product is not implemented
+- No hosted, multi-user, or deployment environment.
+- No brokerage trading, money movement, or scanner writes.
+- Some research adapters depend on external source availability.
+- Yahoo Finance consensus data is unofficial and best effort.
+- The broader thesis-monitoring and mandate product is not complete.
 
 ## Roadmap
 
-See [docs/architecture-roadmap.md](docs/architecture-roadmap.md). It describes intended architecture; some components are not implemented.
+See [docs/architecture-roadmap.md](docs/architecture-roadmap.md). It describes intended architecture. Some components are not implemented.
 
 ## Disclaimer
 
-Stockbot is for research and informational purposes only. It is not investment, legal, tax, or financial advice. Verify source data and make your own decisions.
+Stockbot is for research and information only. It is not investment, legal, tax, or financial advice. Verify source data and make your own decisions.
 
 ## License
 

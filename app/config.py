@@ -69,9 +69,13 @@ def _env_bool(name: str) -> bool:
 
 
 def jev_enabled() -> bool:
-    """False only when JEV_ENABLED is set to a non-truthy value. Unset or empty keeps JEV on."""
-    raw = (os.getenv("JEV_ENABLED") or "").strip()
-    return not raw or raw.lower() in ("1", "true", "yes")
+    """True only when JEV_ENABLED is truthy. Unset keeps JEV off; it is an experiment."""
+    return _env_bool("JEV_ENABLED")
+
+
+def needle_enabled() -> bool:
+    """True only when NEEDLE_ENABLED is truthy. Unset keeps Needle off; it is an experiment."""
+    return _env_bool("NEEDLE_ENABLED")
 
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"

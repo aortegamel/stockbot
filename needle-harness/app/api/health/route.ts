@@ -17,10 +17,11 @@ export async function GET(): Promise<Response> {
   const on = (k: string): boolean => ["1", "true", "yes"].includes(env(k).toLowerCase());
   const all = (...keys: string[]): boolean => keys.every((k) => env(k) !== "");
   const venvPresent = existsSync(join(root, "venv/bin/python"));
-  const jevOn = envFlag("JEV_ENABLED", true);
+  const jevOn = envFlag("JEV_ENABLED", false);
+  const needleOn = envFlag("NEEDLE_ENABLED", false);
   const deps: Record<string, { ok: boolean; required: boolean }> = {
     venv: { ok: venvPresent, required: true },
-    needle: { ok: weightsPresent, required: true },
+    needle: { ok: !needleOn || weightsPresent, required: needleOn },
     sec: { ok: env("SEC_EDGAR_IDENTITY").includes("@"), required: true },
     jev: { ok: !jevOn || all("DECISION_API_FORMAT", "DECISION_API_URL", "DECISION_API_KEY", "DECISION_MODEL"), required: jevOn },
     opencode: { ok: all("OPENCODE_API_KEY", "OPENCODE_URL", "OPENCODE_MODEL"), required: true },

@@ -3,7 +3,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { fingerprintKey, loadDotenvAuthoritative } from "../lib/env";
+import { envFlag, fingerprintKey, loadDotenvAuthoritative } from "../lib/env";
 import { pickFreePort } from "../lib/port";
 
 const HARNESS_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -284,13 +284,16 @@ if (import.meta.main) {
   }
   process.stdout.write(`needle [ai]: venv ok ${REPO_PYTHON}\n`);
 
-  const pinned = process.env.NEEDLE_WEIGHTS;
+  const needleOn = envFlag("NEEDLE_ENABLED", false);
+  const pinned = needleOn ? process.env.NEEDLE_WEIGHTS : undefined;
   const repoBlob = join(ROOT_DIR, "needle3.cact");
   if (pinned) {
     const resolved = isAbsolute(pinned) ? pinned : join(HARNESS_DIR, pinned);
     process.env.NEEDLE_WEIGHTS = resolved;
     childEnv.NEEDLE_WEIGHTS = resolved;
     process.stdout.write(`needle [ai]: weights ${resolved} (${existsSync(resolved) ? "exists" : "missing"})\n`);
+  } else if (!needleOn) {
+    process.stdout.write("needle [ai]: needle off\n");
   } else if (existsSync(repoBlob)) {
     process.stdout.write(`needle [ai]: weights ${repoBlob} (exists)\n`);
   } else {
@@ -306,8 +309,8 @@ if (import.meta.main) {
   }
 
   process.stdout.write("needle [kernel]: starting\n");
-  process.stdout.write("needle [jev]: starting\n");
-  process.stdout.write("needle [needle]: loading weights\n");
+  if (envFlag("JEV_ENABLED", false)) process.stdout.write("needle [jev]: starting\n");
+  if (needleOn) process.stdout.write("needle [needle]: loading weights\n");
   await runAssets(childEnv);
   if (gotSignal) process.exit(1);
   // ponytail: build runs before services start; overlap it with api/market startup if launch time matters.

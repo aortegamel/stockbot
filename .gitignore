@@ -78,5 +78,5 @@ web/public/pdfjs/
 .mutmut-cache
 *.tsbuildinfo
 
-# Needle weights blob (never ignore)
-!/needle3.cact
+# Needle weights blob (large binary: provide locally, never commit)
+/needle3.cact

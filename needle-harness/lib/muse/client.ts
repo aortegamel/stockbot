@@ -405,7 +405,7 @@ function reasonEndpoint(): { apiKey: string; model: string; base: string } {
   return { apiKey, model, base: responsesUrl.slice(0, -"/responses".length) };
 }
 
-function reasonSignal(opts: ReasonOptions): AbortSignal {
+function reasonSignal(opts: { signal?: AbortSignal; deadlineAt?: number }): AbortSignal {
   const left = opts.deadlineAt === undefined ? FETCH_TIMEOUT_MS : opts.deadlineAt - Date.now();
   if (left <= 0) throw new Error("muse deadline exceeded");
   const signal = AbortSignal.any([
@@ -615,4 +615,32 @@ export async function reason(opts: ReasonOptions): Promise<NarrativeResult & { u
     const output = usage.outputTokens === undefined ? undefined : usage.outputTokens - (outputBefore ?? 0);
     tally.outputTokens += output ?? (completed ? cap ?? 0 : 0);
   }
+}
+
+export type CompleteOptions = {
+  system: string;
+  prompt: string;
+  maxOutputTokens?: number;
+  signal?: AbortSignal;
+  deadlineAt?: number;
+};
+
+// One plain request/response call on the same endpoint. Returns trimmed text.
+export async function complete(opts: CompleteOptions): Promise<string> {
+  const { apiKey, model, base } = reasonEndpoint();
+  const stage: Stage = {
+    signal: reasonSignal(opts),
+    base,
+    apiKey,
+    session: crypto.randomUUID(),
+    model,
+    onDelta: () => { },
+    usage: {},
+  };
+  const input: StageInput = [
+    { role: "system", content: opts.system },
+    { role: "user", content: opts.prompt },
+  ];
+  const raw = await callStage(stage, input, opts.maxOutputTokens);
+  return raw.text.trim();
 }

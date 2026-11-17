@@ -119,12 +119,17 @@ def check_sec(env: Env) -> Result:
 
 
 def jev_on(env: Env) -> bool:
-    """JEV is on unless JEV_ENABLED is set to a non-truthy value; unset keeps it on."""
-    return val(env, "JEV_ENABLED") == "" or on(env, "JEV_ENABLED")
+    """JEV is an experiment: on only when JEV_ENABLED is truthy."""
+    return on(env, "JEV_ENABLED")
+
+
+def needle_on(env: Env) -> bool:
+    """Needle is an experiment: on only when NEEDLE_ENABLED is truthy."""
+    return on(env, "NEEDLE_ENABLED")
 
 
 def check_decision(env: Env) -> Result:
-    name = "JEV decision API (MVP)"
+    name = "JEV decision API (experiment)"
     if not jev_on(env):
         return SKIP, name, "JEV_ENABLED off"
     missing = [k for k in DECISION_KEYS if not val(env, k)]
@@ -186,16 +191,22 @@ def check_broker(env: Env) -> Result:
 
 
 def check_needle(env: Env) -> Result:
-    """Mirror needle-harness/lib/needle/server.py resolve_weights()."""
-    name = "Needle model"
+    """Mirror needle-harness/lib/needle/server.py resolve_weights(). Needle is an experiment."""
+    name = "Needle model (experiment)"
+    if not needle_on(env):
+        return SKIP, name, "NEEDLE_ENABLED off"
     pinned = val(env, "NEEDLE_WEIGHTS")
     path = HARNESS_DIR / pinned if pinned else REPO_ROOT / "needle3.cact"
     path = path.resolve()
     if path.is_file():
         return OK, name, f"weights {path}"
     if pinned:
-        return FAIL, name, f"NEEDLE_WEIGHTS={pinned} resolves to missing {path}. Fix: git checkout -- needle3.cact"
-    return WARN, name, "needle3.cact missing, launcher falls back to the HF cache. Fix: git checkout -- needle3.cact"
+        return FAIL, name, f"NEEDLE_WEIGHTS={pinned} resolves to missing {path}. Fix: place the weights file there."
+    return (
+        WARN,
+        name,
+        "needle3.cact missing, launcher falls back to the HF cache. Fix: place needle3.cact at the repo root.",
+    )
 
 
 def port_free(port: int) -> bool:

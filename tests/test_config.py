@@ -70,9 +70,9 @@ def test_broker_enabled_defaults_false(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [(None, True), ("", True), ("true", True), ("1", True), ("false", False), ("0", False), ("off", False)],
+    [(None, False), ("", False), ("true", True), ("1", True), ("false", False), ("0", False), ("off", False)],
 )
-def test_jev_enabled_defaults_on_and_switches_off(
+def test_jev_enabled_defaults_off_and_switches_on(
     monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool
 ) -> None:
     if value is None:
@@ -80,6 +80,20 @@ def test_jev_enabled_defaults_on_and_switches_off(
     else:
         monkeypatch.setenv("JEV_ENABLED", value)
     assert config.jev_enabled() is expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, False), ("", False), ("true", True), ("1", True), ("false", False), ("0", False), ("off", False)],
+)
+def test_needle_enabled_defaults_off_and_switches_on(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool
+) -> None:
+    if value is None:
+        monkeypatch.delenv("NEEDLE_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("NEEDLE_ENABLED", value)
+    assert config.needle_enabled() is expected
 
 
 def _root_and_foreign_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_env: str) -> None:

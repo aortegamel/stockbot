@@ -18,6 +18,21 @@ from app.research.models import JSONValue
 from app.research.repository import ResearchRepository
 
 
+@pytest.fixture(autouse=True)
+def _needle_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The arguments op is the experiment under test; startup tests override the switch."""
+    monkeypatch.setenv("NEEDLE_ENABLED", "true")
+
+
+def test_arguments_refuses_when_needle_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default path has no Needle: the op reports it and the caller uses the model."""
+    monkeypatch.delenv("NEEDLE_ENABLED", raising=False)
+    assert kw._arguments({"id": "off", "op": "arguments", "tool": "query_finra"}) == {
+        "id": "off",
+        "error": "needle disabled",
+    }
+
+
 def test_research_registry_excludes_portfolio_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     """The live research registry exposes no portfolio tool, even with the broker enabled."""
     from app.tools import PORTFOLIO_AUTHORIZED_TOOLS
@@ -361,6 +376,7 @@ def test_startup_jev_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None
         def start(self) -> None:
             raise RuntimeError("jev start down")
 
+    monkeypatch.setenv("JEV_ENABLED", "true")
     monkeypatch.setattr(kw, "_shared_jev", lambda: _BadJev())
     monkeypatch.setattr(kw, "_prewarm", lambda: None)
     with pytest.raises(RuntimeError, match="jev start down"):
@@ -375,6 +391,7 @@ def test_startup_needle_failure_stays_live(monkeypatch: pytest.MonkeyPatch) -> N
     def _noop_start(self: JevClient) -> None:
         return None
 
+    monkeypatch.setenv("JEV_ENABLED", "true")
     monkeypatch.setattr(kw, "_shared_jev", lambda: jev)
     monkeypatch.setattr(JevClient, "start", _noop_start)
     monkeypatch.setattr(kw, "_prewarm", lambda: None)

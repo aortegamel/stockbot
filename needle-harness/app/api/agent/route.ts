@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { ANSWER_SECTIONS, reason } from "@/lib/muse/client";
+import { ANSWER_SECTIONS, complete, reason } from "@/lib/muse/client";
 import { asksWatchlist, kernelRouter, outOfScopeAnswer, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent } from "@/lib/agent/kernel";
 import { appendMessage, createChat, hasChat, readChat } from "@/lib/chat";
 import { envFlag } from "@/lib/env";
@@ -15,8 +15,9 @@ function requiredEnv(name: string): string {
   if (!value) throw new Error(`opencode_unavailable: missing ${name}`);
   return value;
 }
-// JEV_ENABLED=false skips every JEV decision; each call site then keeps its fail-open default.
-const jevOff = (): boolean => !envFlag("JEV_ENABLED", true);
+// JEV and Needle are experiments: off unless their switch is truthy.
+// Each JEV call site keeps its fail-open default when the switch is off.
+const jevOff = (): boolean => !envFlag("JEV_ENABLED", false);
 const ASK_CONTEXT_KEYS = ["kind", "title", "url", "source", "sym", "at"];
 // Feed-item context beside the verbatim prompt: undefined when absent, null when
 // malformed (callers reject; unknown keys reject too). The values stay untrusted data.
@@ -193,6 +194,38 @@ function chartCommand(prompt: string): string | undefined {
   return parseTicker(raw.slice(raw.startsWith("$") ? 1 : 0));
 }
 
+// Model output for tool arguments: one JSON object, with optional code fences stripped.
+function parseJsonObject(text: string): Record<string, unknown> | null {
+  const body = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  try {
+    const parsed: unknown = JSON.parse(body);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+const ARGUMENT_SYSTEM =
+  "You turn one user request into JSON arguments for one tool." +
+  " Return one JSON object and nothing else. No Markdown, no code fences, no prose." +
+  " Use only the fields in the schema. Write ticker symbols in uppercase.";
+// One model call supplies UI-command arguments when Needle is off. The tool bridge validates them.
+async function modelArguments(tool: string, opts: { prompt: string; ticker?: string; signal?: AbortSignal; deadlineAt: number }): Promise<Record<string, unknown> | null> {
+  try {
+    const [schema] = await describeTools([tool]);
+    if (!schema) return null;
+    const text = await complete({
+      system: ARGUMENT_SYSTEM,
+      prompt: `TOOL\n${schema.name}\n${schema.description ?? ""}\n\nARGUMENTS SCHEMA\n${JSON.stringify(schema.parameters ?? {})}\n\nCURRENT STOCK\n${opts.ticker ?? "none"}\n\nUSER REQUEST\n${opts.prompt}`,
+      maxOutputTokens: 400,
+      signal: opts.signal,
+      deadlineAt: opts.deadlineAt,
+    });
+    return parseJsonObject(text);
+  } catch {
+    return null;
+  }
+}
+
 export async function POST(req: Request): Promise<Response> {
   const deadlineAt = Date.now() + REQUEST_WALL_MS;
   const requestAt = performance.now();
@@ -303,14 +336,18 @@ export async function POST(req: Request): Promise<Response> {
         }
       };
       const generateArguments = async (tool: string): Promise<Record<string, unknown> | null> => {
-        try {
-          const gen = await kernelRouter.call({ op: "arguments", tool, objective: prompt, ...tickerField }, { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) });
-          if (typeof gen.error === "string" && gen.error) return null;
-          if (gen.tool !== tool || typeof gen.arguments !== "object" || gen.arguments === null) return null;
-          return gen.arguments as Record<string, unknown>;
-        } catch {
-          return null;
+        if (envFlag("NEEDLE_ENABLED", false)) {
+          try {
+            const gen = await kernelRouter.call({ op: "arguments", tool, objective: prompt, ...tickerField }, { signal: req.signal, timeoutMs: Math.max(deadlineAt - Date.now(), 1) });
+            if (!(typeof gen.error === "string" && gen.error) && gen.tool === tool && typeof gen.arguments === "object" && gen.arguments !== null && !Array.isArray(gen.arguments)) {
+              return gen.arguments as Record<string, unknown>;
+            }
+          } catch {
+            // Fall through to the one model call.
+          }
         }
+        const stock = parsedTicker ?? currentChartTicker;
+        return modelArguments(tool, { prompt, ...(stock ? { ticker: stock } : {}), signal: req.signal, deadlineAt });
       };
       const selectResearchEffort = async (): Promise<{ reasoningEffort: string | undefined } | undefined> => {
         let reasoningEffort: string | undefined;

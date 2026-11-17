@@ -74,9 +74,9 @@ Default chat uses one plain model answer with curated read-only research tools.
 The model may call the six SEC EDGAR tools plus `search_web`, `get_current_time`, `get_material_events`, `get_financial_statements`, `get_analyst_estimates`, `get_valuation_metrics`, `get_insider_activity`, and `get_short_interest` through the bridge, for up to 8 rounds.
 Chat sends reasoning effort `low`. `REASONING_EFFORT` does not change chat.
 Before the model call, the route fetches four rows for the stock in view: 30 days of news with `search_web`, the 10 latest 8-K, 10-Q, and 10-K filings with `list_sec_filings`, `get_analyst_estimates`, and `get_valuation_metrics`. The feed-item ticker comes first, then the chart ticker.
-At the same time, the kernel worker `sections` op asks JEV which investor parts fit the request: short term, long term, what analysts say, bull case, bear case, and risks to watch.
-JEV answers one independent probability per part. A part at 0.50 or more stays. A failed or malformed JEV answer keeps every part.
-Every chat decision is stored in one shared research session, `rs:chat` ("default chat"). The worker creates it on first use, so the sessions list shows one chat row.
+JEV is off by default. When `JEV_ENABLED=true`, the kernel worker `sections` op asks JEV which investor parts fit the request: short term, long term, what analysts say, bull case, bear case, and risks to watch.
+JEV answers one independent probability per part. A part at 0.50 or more stays. A failed or malformed JEV answer keeps every part. With JEV off, the route keeps every part without a call.
+Every JEV chat decision is stored in one shared research session, `rs:chat` ("default chat"). The worker creates it on first use, so the sessions list shows one chat row.
 The user message carries the system-clock date, the fetched rows, and the kept parts. A failed fetch leaves its section out.
 The model writes the facts first, then each kept part under its label. It reports analyst targets and ratings as the analysts' view. It never says buy, sell, or hold, and it gives no price target of its own.
 A model `get_sec_document` read returns at most 6000 characters. The tool default is 12000.
@@ -84,13 +84,13 @@ The model writes plain text in ASD-STE100 style and writes no URLs.
 The route removes leftover Markdown emphasis, heading marks, and bullet marks.
 The route sends one `evidence` event with every successful tool row. The UI lists their captured sources below the answer as clickable links.
 A failed tool call returns an error to the model. It does not fail the chat.
-Default chat runs no research, evidence inventory, or final gates, and JEV picks only the investor parts. The answer text is not checked against the filings.
+Default chat runs no research, evidence inventory, or final gates. JEV, when enabled, picks only the investor parts. The answer text is not checked against the filings.
 The server handles three deterministic UI commands in `needle-harness/app/api/agent/route.ts`:
 
 - Watchlist commands contain `add` or `remove` plus a watchlist request.
-  Needle generates arguments for the fixed `update_watchlist` tool.
+  Needle generates arguments for the fixed `update_watchlist` tool when it is enabled. Otherwise the OpenCode model does.
 - Widget commands contain `add` followed by `widget` or `widgets` within the same sentence.
-  Needle generates arguments for the fixed `add_widget` tool.
+  Needle generates arguments for the fixed `add_widget` tool when it is enabled. Otherwise the OpenCode model does.
 - Chart commands match the whole prompt, such as `show AAPL` or `open the chart for $nvda`.
   The server calls the fixed `set_chart_symbol` tool.
 
@@ -227,14 +227,19 @@ Repeated admissions retain their evidence IDs.
 The native kernel adds each returned ID only once to its evidence list.
 Tool calls without admitted evidence remain uncitable observations.
 
-## Needle arguments
+## Chat command arguments
 
 The worker retains `arguments` for chat commands.
-It binds the selected tool's canonical description and parameter schema.
+Needle is off by default. With `NEEDLE_ENABLED=true`, the worker binds the selected tool's canonical description and parameter schema.
 The SDK receives temporal anchors, ticker context, and grounded argument values.
 It receives no research evidence, raw tool results, or attempt history.
 The worker rejects explicit engine failures, ungrounded fields, and mismatched tools.
 The shared worker timeout still bounds argument generation.
+
+With Needle off, or after a Needle failure, the route asks the OpenCode model for one JSON object from the same tool schema.
+The route strips optional code fences and rejects a non-object.
+The tool bridge validates the arguments before the tool runs.
+The same request deadline bounds both paths.
 
 
 The terminal Harness tab renders `HarnessSessionViewer` with the selected session id. It reads the existing session plus snapshot research APIs only. A missing or failed snapshot stays unavailable for that session, never another session. Static `HarnessViewer` with a projection prop remains for untracked preview files; export previews write only the `--out` path.
@@ -346,10 +351,10 @@ Native research tools and final claim proof do not call JEV or the Reasoner for 
 The native model selects tools directly.
 The ledger decides final claim proof deterministically.
 
-`JEV_ENABLED` is the switch. `false` skips the scope gate, the chat part picker, and the effort selector.
-It also stops the kernel worker from starting the `decision/runtime.ts` sidecar.
+`JEV_ENABLED` is the switch. JEV is off by default.
+`true` starts the scope gate, the chat part picker, the effort selector, and the `decision/runtime.ts` sidecar.
 With JEV off, the scope gate admits every request, the part picker keeps every part, and the effort selector returns no effort.
-Unset or empty keeps JEV on. Truthy values are `1`, `true`, and `yes`.
+Truthy values are `1`, `true`, and `yes`.
 
 Set these values in the root `.env` to select the protocol, endpoint, key, and model. No code change is necessary.
 The code supplies no format, URL, or model default. A live call fails when a value is blank.
