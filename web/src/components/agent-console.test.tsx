@@ -99,6 +99,17 @@ describe("AgentConsole answer rendering", () => {
     }
   });
 
+  test("blank lines separate answer paragraphs, and a single break stays inside one", () => {
+    const events: AgentEvent[] = [
+      { type: "reasoning_start", model: "stockbot" },
+      { type: "answer_partial", text: "Short term:\nDemand holds.\n\nLong term:\nMargins compress.", claims: [] },
+      { type: "done", metrics: metrics() },
+    ];
+    const doc = new JSDOM(html(events)).window.document;
+    const blocks = [...doc.querySelectorAll(".chat-answer > p")].map((p) => p.textContent);
+    expect(blocks).toEqual(["Short term:\nDemand holds.", "Long term:\nMargins compress."]);
+  });
+
   test("empty events render the intro", () => {
     const out = html([]);
     expect(out).toContain("Stockbot");

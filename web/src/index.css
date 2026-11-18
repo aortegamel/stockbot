@@ -150,8 +150,14 @@ input.pill{cursor:text}
 .shell-body > :first-child{flex:1;min-height:0;min-width:0}
 .drawer{flex:0 0 40%;min-height:240px;margin:0 8px 8px}
 /* Chat text: answers (Tailwind text-sm) and the input row read larger than a data panel. */
-.drawer{--fs-body:17px;--text-sm:17px;--text-sm--line-height:1.6}
+.drawer{--fs-body:19px;--text-sm:19px;--text-sm--line-height:1.6}
 .drawer .input,.drawer .btn-primary{height:34px}
+
+/* One block per answer paragraph. The block margin replaces the blank line the model writes, so a
+   paragraph break costs half a line instead of a full one, and single breaks stay hard breaks. */
+.chat-answer{white-space:pre-wrap;line-height:1.45}
+.chat-answer > p{margin:0}
+.chat-answer > p + p{margin-top:.75em}
 
 /* Markets table: 28px rows, tabular numbers, sticky 11px headers. Tight padding fits a 1440px column. */
 .home-table{width:100%;border-collapse:separate;border-spacing:0}
@@ -268,7 +274,7 @@ select.ws-tool{padding-right:16px;width:auto}
 .ws-widget-body :is(th,td){height:var(--h-row);padding:0 8px;font-size:var(--fs-body)}
 .ws-widget-body th{font-size:var(--fs-label);font-weight:500;color:var(--muted)}
 .ws-widget:has(iframe) .ws-widget-body{padding:0}
-.ws-widget[data-widget-type="agent"]{--fs-body:17px;--text-sm:17px;--text-sm--line-height:1.6}
+.ws-widget[data-widget-type="agent"]{--fs-body:19px;--text-sm:19px;--text-sm--line-height:1.6}
 .ws-widget[data-widget-type="agent"] .ws-widget-body{padding:0;display:flex;overflow:hidden}
 .ws-widget[data-widget-type="agent"] .ws-widget-body > *{flex:1;min-height:0;min-width:0}
 .ws-alerts{padding:var(--sp-3);font-size:var(--fs-body)}

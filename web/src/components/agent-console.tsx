@@ -53,6 +53,20 @@ function splitAnswer(answer: string, known: Map<string, Evidence>, claims: Final
   return parts;
 }
 
+// Blank lines separate paragraphs. Each paragraph renders as one block, so a block margin replaces
+// the empty line box, and a paragraph break costs half a line instead of a full one. A citation part
+// is one bracket marker, so it never carries a blank line and never splits.
+function answerBlocks(parts: AnswerPart[]): AnswerPart[][] {
+  const blocks: AnswerPart[][] = [[]];
+  for (const part of parts) {
+    part.text.split(/\n{2,}/).forEach((text, i) => {
+      if (i > 0) blocks.push([]);
+      blocks[blocks.length - 1].push({ ...part, text });
+    });
+  }
+  return blocks.filter((block) => block.some((part) => part.citation || part.text.trim() !== ""));
+}
+
 function evidenceById(events: AgentEvent[]): Map<string, Evidence> {
   // Each evidence event carries the full merged list, so the last one wins.
   const evidence = events.findLast((e) => e.type === "evidence")?.evidence ?? [];
@@ -161,10 +175,12 @@ export function AgentConsole({ events, history = [], reasoning, debug, onRetry, 
             <div
               key={i}
               className={turn.role === "user"
-                ? "text-[18px] font-semibold italic leading-snug text-zinc-100"
-                : "whitespace-pre-wrap leading-relaxed text-zinc-100"}
+                ? "text-[19px] font-semibold italic leading-snug text-zinc-100"
+                : "chat-answer text-zinc-100"}
             >
-              {turn.role === "user" ? `> ${turn.content}` : turn.content}
+              {turn.role === "user" ? `> ${turn.content}` : answerBlocks([{ text: turn.content }]).map((block, b) => (
+                <p key={b}>{block.map((part) => part.text).join("")}</p>
+              ))}
             </div>
           ))}
         </div>
@@ -177,18 +193,20 @@ export function AgentConsole({ events, history = [], reasoning, debug, onRetry, 
         : <div role="status" className="space-y-0.5 text-xs text-zinc-500">{statuses}</div>)}
       {streaming && !answer && <AgentEventView event={{ type: "reasoning_start", model: "stockbot" }} />}
       {!done && answer && <div role="status" className="pt-2 text-xs text-zinc-400">Partial checked answer · research continues</div>}
-      {answer && <div className="whitespace-pre-wrap pt-2 leading-relaxed text-zinc-100">{parts.map((part, i) => {
-        const citation = part.citation;
-        const reference = citation?.sources?.[0];
-        if (!citation || !reference) return <span key={i}>{part.text}</span>;
-        const label = labelOf(reference, citation, part.number ?? 0);
-        const link = loaded.get(reference.id)?.link;
-        if (!link) {
-          const status = loaded.has(reference.id) ? "Original source unavailable" : "Loading original source…";
-          return <span key={i} title={`${label} — ${status}`} aria-label={`${status}: ${label}`} className="rounded border border-zinc-700 px-1 text-zinc-400">{part.text}</span>;
-        }
-        return <a key={i} href={link.href} target="_blank" rel="noopener noreferrer" title={label} aria-label={`Open source: ${label}`} className="rounded border border-blue-800 px-1 text-blue-300 underline decoration-dotted hover:bg-blue-950">{part.text}</a>;
-      })}</div>}
+      {answer && <div className="chat-answer pt-2 text-zinc-100">{answerBlocks(parts).map((block, b) => (
+        <p key={b}>{block.map((part, i) => {
+          const citation = part.citation;
+          const reference = citation?.sources?.[0];
+          if (!citation || !reference) return <span key={i}>{part.text}</span>;
+          const label = labelOf(reference, citation, part.number ?? 0);
+          const link = loaded.get(reference.id)?.link;
+          if (!link) {
+            const status = loaded.has(reference.id) ? "Original source unavailable" : "Loading original source…";
+            return <span key={i} title={`${label} — ${status}`} aria-label={`${status}: ${label}`} className="rounded border border-zinc-700 px-1 text-zinc-400">{part.text}</span>;
+          }
+          return <a key={i} href={link.href} target="_blank" rel="noopener noreferrer" title={label} aria-label={`Open source: ${label}`} className="rounded border border-blue-800 px-1 text-blue-300 underline decoration-dotted hover:bg-blue-950">{part.text}</a>;
+        })}</p>
+      ))}</div>}
       <WorkRow events={events} debug={debug} />
       <ActionCards events={events} />
       {showSources && links.length > 0 && <div className="flex flex-wrap items-center gap-2 pt-2" role="group" aria-label="Captured sources">
