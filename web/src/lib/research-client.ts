@@ -37,7 +37,8 @@ export type SourceDocument = {
   capturedAt?: string;
   contentHash?: string;
   representation: "html" | "text" | "pdf";
-  // structured_record: the held SEC/FINRA data as JSON text, only when no official page exists (linkStatus "missing").
+  // structured_record: the held SEC/FINRA data as JSON text. It has no page of its own: linkStatus is "missing",
+  // or "stockbot_render" with the related official page (a captured filing list links the issuer's page).
   // calculation: Stockbot's formula text; it never has one original (linkStatus "missing"), its audit links each input.
   captureKind: "original" | "provider_extraction" | "structured_record" | "search_excerpt" | "calculation";
   content?: string;
@@ -311,12 +312,13 @@ function copySourceMetadata(source: object, document: SourceDocument): void {
 }
 
 // Each link status names exactly the links it carries. Links are safe web URLs; the plain original has no text fragment.
-// A structured record stands in only for a missing official page. A calculation never has one original.
+// A structured record may link only its related plain page. A calculation never has one original.
 function validateLinks(document: SourceDocument): void {
   const { linkStatus, originalUrl, highlightUrl } = document;
+  const linkedPlainly = document.captureKind !== "structured_record" || linkStatus === "stockbot_render";
   const shaped = linkStatus === "missing"
     ? originalUrl === undefined && highlightUrl === undefined
-    : originalUrl !== undefined && (linkStatus === "highlighted_original") === (highlightUrl !== undefined) && document.captureKind !== "structured_record" && document.captureKind !== "calculation";
+    : originalUrl !== undefined && (linkStatus === "highlighted_original") === (highlightUrl !== undefined) && document.captureKind !== "calculation" && linkedPlainly;
   const safe = [originalUrl, highlightUrl].every((url) => url === undefined || safeSourceUrl(url) !== undefined);
   if (!shaped || !safe || originalUrl?.includes(":~:") || (document.sourceConflict && linkStatus !== "missing")) throw new Error("The source links are invalid.");
 }

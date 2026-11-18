@@ -16,6 +16,14 @@ const CAPTURE_LABELS: Record<SourceDocument["captureKind"], string> = {
   calculation: "Stockbot calculation — no single original document",
 };
 
+// A linked structured record has a related official page, not its own.
+function captureLabel(source: Pick<SourceDocument, "captureKind" | "linkStatus">): string {
+  if (source.captureKind === "structured_record" && source.linkStatus !== "missing") {
+    return "Structured record — related official page";
+  }
+  return CAPTURE_LABELS[source.captureKind];
+}
+
 function useSourceDocument(id: string, retry: number): { source: SourceDocument | null; error: string | null } {
   const [source, setSource] = useState<SourceDocument | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -113,7 +121,7 @@ function SourceHeader({ source }: { source: SourceDocument }) {
   const original = source.sourceConflict ? null : originalLink(source);
   return (<>
     <h1 className="mt-1 text-base font-semibold">{sourceLabel(source) || source.title}</h1>
-    <p className="mt-1 text-amber-200">{CAPTURE_LABELS[source.captureKind]}</p>
+    <p className="mt-1 text-amber-200">{captureLabel(source)}</p>
     {original && <p className="mt-1"><a className="text-blue-300 underline" href={original.href} target="_blank" rel="noopener noreferrer">
       {original.highlighted ? `Open on ${original.host} (highlighted) ↗` : `Original on ${original.host} ↗`}
     </a></p>}

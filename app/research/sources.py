@@ -906,6 +906,38 @@ def _render_sec_document(
     return _official_url(url), _quote_fragment(document, basis, "") if html else None
 
 
+def _derived_record(record: Mapping[str, object]) -> bool:
+    """A derived SEC record cites no filing, so no official page can exist for it."""
+    payload = record.get("payload")
+    return record.get("kind") == "sec_record" and isinstance(payload, Mapping) and payload.get("derived") is True
+
+
+def _listing_record(record: Mapping[str, object]) -> bool:
+    """A captured filing list cites no single filing. The list itself is the cited record."""
+    row = record.get("row")
+    return (
+        record.get("kind") == "sec_record"
+        and record.get("tool") == "list_sec_filings"
+        and not (isinstance(row, Mapping) and row)
+    )
+
+
+def _structured_view(document: dict[str, object], record: Mapping[str, object]) -> None:
+    """Show the held record itself: the cited row, or the whole payload when none was cited."""
+    row, payload = record.get("row"), record.get("payload")
+    shown = row if isinstance(row, Mapping) and row else payload
+    content = _bounded(json.dumps(shown, sort_keys=True, ensure_ascii=False, indent=2, default=str))
+    document.update(
+        {
+            "representation": "text",
+            "captureKind": "structured_record",
+            "content": content,
+            "contentHash": raw_archive.content_hash(content.encode()),
+            "quote": "",
+        }
+    )
+
+
 def _render_record(
     document: dict[str, object], record: Mapping[str, object], root: Path, source_id: str
 ) -> tuple[str, str | None, tuple[str, str]]:
@@ -916,33 +948,31 @@ def _render_record(
     A published FINRA file that disagrees with the cited row or holds ambiguous lines also drops the
     public link. The held record renders, and ``sourceConflict`` reports the file conflict apart from
     the API proof verdict in ``audit``. Archive corruption and other errors still raise.
+
+    A derived record expects no page, so its absence is not an error. A filing list links the
+    issuer's official page but keeps its own rows: the page is related, not the cited record.
     """
     from app.finra_client import OfficialFileConflict
 
-    try:
-        official = _official_page(document, record, root)
-        missing = ("PUBLIC_PAGE_UNAVAILABLE", "resolver found no official page for the cited record")
-    except OSError as exc:
-        official, missing = None, ("SOURCE_UNAVAILABLE", f"official page fetch failed: {exc}")
-    except OfficialFileConflict as exc:
-        failure = failure_reason(exc)
-        official, missing = None, (failure, f"published file conflicts with the cited record: {exc}")
-        document["sourceConflict"] = {"failure": failure, "reason": str(exc)}
+    official: _Official | None = None
+    # An empty reason keeps an expected absence out of the ERROR log.
+    missing = ("PUBLIC_PAGE_UNAVAILABLE", "")
+    if not _derived_record(record):
+        try:
+            official = _official_page(document, record, root)
+            missing = ("PUBLIC_PAGE_UNAVAILABLE", "resolver found no official page for the cited record")
+        except OSError as exc:
+            official, missing = None, ("SOURCE_UNAVAILABLE", f"official page fetch failed: {exc}")
+        except OfficialFileConflict as exc:
+            failure = failure_reason(exc)
+            official, missing = None, (failure, f"published file conflicts with the cited record: {exc}")
+            document["sourceConflict"] = {"failure": failure, "reason": str(exc)}
     if official is None:
-        # No official page: the Stockbot view shows the cited row (the whole payload when none was cited).
-        row, payload = record.get("row"), record.get("payload")
-        shown = row if isinstance(row, Mapping) and row else payload
-        content = _bounded(json.dumps(shown, sort_keys=True, ensure_ascii=False, indent=2, default=str))
-        document.update(
-            {
-                "representation": "text",
-                "captureKind": "structured_record",
-                "content": content,
-                "contentHash": raw_archive.content_hash(content.encode()),
-                "quote": "",
-            }
-        )
+        _structured_view(document, record)
         return "", None, missing
+    if _listing_record(record):
+        _structured_view(document, record)
+        return official.url, None, missing
     document.update(
         {"url": official.url, "captureKind": "original", "contentHash": official.sha256, "quote": official.quote}
     )

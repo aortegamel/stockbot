@@ -54,6 +54,19 @@ describe("fetchSourceDocument", () => {
     expect(await fetchSourceDocument(id)).toStrictEqual(source);
   });
 
+  test("a structured record may link its related plain official page", async () => {
+    const page = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0000320193&owner=include&count=10";
+    const source = document({
+      captureKind: "structured_record",
+      content: '{\n  "filings": []\n}',
+      quote: "",
+      linkStatus: "stockbot_render",
+      originalUrl: page,
+    });
+    respond(source);
+    expect(await fetchSourceDocument(id)).toStrictEqual(source);
+  });
+
   test("rejects malformed source conflicts and conflicts with an available public link", async () => {
     for (const sourceConflict of [null, [], "conflict", {}, { failure: 1, reason: "mismatch" }, { failure: "SOURCE_MISMATCH", reason: null }]) {
       respond({ ...document(), sourceConflict });
@@ -186,7 +199,6 @@ describe("fetchSourceDocument", () => {
     for (const links of [
       { linkStatus: undefined },
       { linkStatus: "public_page" },
-      { linkStatus: "stockbot_render", originalUrl: page, captureKind: "structured_record" },
       { linkStatus: "highlighted_original", originalUrl: page, highlightUrl: highlight, captureKind: "structured_record" },
       { linkStatus: "missing", originalUrl: page },
       { linkStatus: "missing", highlightUrl: highlight },

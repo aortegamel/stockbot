@@ -762,6 +762,23 @@ def test_official_identity_gaps(tmp_path: Path, sec_www: _FakeSec) -> None:
     assert sec_www.calls == calls
 
 
+def test_official_filing_list_resolves_the_one_issuer_page(tmp_path: Path, sec_www: _FakeSec) -> None:
+    """A captured list cites no single accession. One shared issuer yields that issuer's page."""
+    rows = [{"form": "10-Q", "subject_cik": OFF_CIK}, {"form": "10-K", "filer_cik": OFF_CIK}]
+    page = _official(tmp_path, "list_sec_filings", {}, {"subject": "APPLE INC", "filings": rows})
+    assert (page["url"], page["quote"]) == (COMPANY_URL, "APPLE INC CIK#: 0000320193 (see all company filings)")
+    assert sec_www.calls == [COMPANY_URL]
+    # Two issuers in one list cite no one page, and no fetch happens.
+    mixed = {"filings": [{"subject_cik": OFF_CIK}, {"subject_cik": 1045810}]}
+    assert documents.resolve_sec_official("list_sec_filings", {}, mixed, root=tmp_path) is None
+    assert sec_www.calls == [COMPANY_URL]
+    # A row without an issuer does not make a second issuer, and an empty list has none.
+    sparse = {"filings": [{"subject_cik": OFF_CIK}, {"form": "4"}]}
+    assert documents.resolve_sec_official("list_sec_filings", {}, sparse, root=tmp_path) is not None
+    assert documents.resolve_sec_official("list_sec_filings", {}, {"filings": []}, root=tmp_path) is None
+    assert sec_www.calls == [COMPANY_URL]
+
+
 @pytest.mark.parametrize(
     ("changes", "anchor"),
     [

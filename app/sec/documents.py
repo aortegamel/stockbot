@@ -1564,6 +1564,16 @@ def _record_cik(record: Mapping[str, object], accession: str | None) -> int | No
     return None
 
 
+def _listing_cik(tool_name: str, payload: Mapping[str, object]) -> int | None:
+    """The one issuer a captured filing list shares. A list cites no single accession."""
+    rows = payload.get("filings")
+    if tool_name != "list_sec_filings" or not isinstance(rows, list):
+        return None
+    ciks = {_record_cik(row, None) for row in rows if isinstance(row, Mapping)}
+    ciks.discard(None)
+    return next(iter(ciks)) if len(ciks) == 1 else None
+
+
 def _company_page(cik: int, root: Path) -> dict[str, object]:
     url = f"{_SEC_WWW}/cgi-bin/browse-edgar?action=getcompany&CIK={cik:010d}&owner=include&count=10"
     payload = _official_bytes(url, root)
@@ -2145,6 +2155,11 @@ def resolve_sec_official(
     Hidden facts retain canonical evidence without a fabricated visible quote.
     """
     record = {**payload, **row}
+    if not any(record.get(key) for key in _CIK_KEYS):
+        # A captured filing list carries its issuer only inside its rows.
+        issuer = _listing_cik(tool_name, payload)
+        if issuer is not None:
+            record["subject_cik"] = issuer
     accession = _record_accession(row, payload)
     entity = {key: record.get(key) for key in ("issuer_cik", "subject_cik", "cik")}
     cik = _record_cik(entity if tool_name in _OWNERSHIP_TOOLS else record, accession)

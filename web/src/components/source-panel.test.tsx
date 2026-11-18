@@ -457,6 +457,27 @@ describe("SourcePage", () => {
     expect(root.querySelector('[role="alert"]')).toBeNull();
   });
 
+  test("a linked structured record keeps its rows and links the related SEC page", async () => {
+    const rows = JSON.stringify({ filings: [{ form: "10-Q", accession_no: "0000320193-26-000010" }] }, null, 2);
+    const page = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0000320193&owner=include&count=10";
+    const root = await open({
+      ...TEXT,
+      id: "evidence:panel:listing",
+      title: "list_sec_filings",
+      publisher: "SEC",
+      captureKind: "structured_record",
+      content: rows,
+      quote: "",
+      linkStatus: "stockbot_render",
+      originalUrl: page,
+    });
+    expect(root.textContent).toContain("Structured record — related official page");
+    expect(root.textContent).not.toContain("Structured record — no official page");
+    expect(root.querySelector('[aria-label="Captured source content"]')?.textContent).toBe(rows);
+    expect([official(root)?.textContent, official(root)?.getAttribute("href")]).toEqual(["Original on SEC.gov ↗", page]);
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+  });
+
   test("unsafe official links reject the document instead of rendering a link", async () => {
     for (const links of [
       { originalUrl: "javascript:alert(1)" },

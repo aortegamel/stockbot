@@ -1261,6 +1261,60 @@ def test_sec_fact_case_two_replays_exact_official_bytes(
     assert network.calls == [OFF_INDEX, OFF_PRIMARY]
 
 
+def test_captured_filing_list_keeps_rows_and_links_the_issuer_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A captured list cites no single filing: the JSON stays and the issuer page is the plain link."""
+    from app.sec import documents
+    from tests.test_sec_documents_archive import COMPANY_URL, OFF_CIK, _FakeSec
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    network = _FakeSec()
+    monkeypatch.setattr(documents, "_sec_get", network)
+    payload = {
+        "subject": "APPLE INC",
+        "filings": [{"form": "10-Q", "subject_cik": OFF_CIK}, {"form": "10-K", "filer_cik": OFF_CIK}],
+    }
+    with capture_scope() as captures:
+        capture_result("list_sec_filings", payload)
+    source_id = captures[0]["id"]
+    with caplog.at_level("ERROR", logger="app.research.sources"):
+        document = read_source_document(source_id, data_root=tmp_path)
+    assert (document["captureKind"], document["linkStatus"], document["quote"]) == (
+        "structured_record",
+        "stockbot_render",
+        "",
+    )
+    assert document["originalUrl"] == COMPANY_URL
+    assert "highlightUrl" not in document
+    assert json.loads(str(document["content"])) == payload
+    assert [r for r in caplog.records if r.levelname == "ERROR"] == []
+    assert network.calls == [COMPANY_URL]
+
+
+def test_captured_derived_record_expects_no_page_and_logs_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A derived record cites no filing. Its missing page is expected, not an error."""
+    from app.sec import documents
+    from tests.test_sec_documents_archive import _FakeSec
+
+    monkeypatch.setenv("STOCKBOT_DATA_DIR", str(tmp_path))
+    network = _FakeSec()
+    monkeypatch.setattr(documents, "_sec_get", network)
+    payload = {"derived": True, "ticker": "AAPL", "trailing_pe": {"value": 30.1, "derived": True}}
+    with capture_scope() as captures:
+        capture_result("get_valuation_metrics", payload)
+    source_id = captures[0]["id"]
+    with caplog.at_level("ERROR", logger="app.research.sources"):
+        document = read_source_document(source_id, data_root=tmp_path)
+    assert (document["captureKind"], document["linkStatus"]) == ("structured_record", "missing")
+    assert not {"originalUrl", "highlightUrl"} & set(document)
+    assert json.loads(str(document["content"])) == payload
+    assert caplog.records == []
+    assert network.calls == []
+
+
 @pytest.mark.parametrize("metadata", [False, True])
 def test_sec_metadata_index_does_not_become_a_financial_fact_citation(
     metadata: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
