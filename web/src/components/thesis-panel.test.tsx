@@ -90,7 +90,7 @@ describe("ThesisPanel", () => {
     await until(() => root.textContent?.includes("Filing reviewed") ?? false);
     expect(root.querySelector('[aria-label="claims"]')?.textContent).toContain("Data-center demand grows");
     expect(root.querySelector('[aria-label="watch rules"]')?.textContent).toContain("watch price_move (unsupported)");
-    expect(root.textContent).toContain("last tick 2026-10-19T12:00:00+00:00");
+    expect(root.textContent).toContain("last tick 2026-10-19 12:00");
 
     const before = requests.filter((r) => r === "GET /api/theses/thesis%3A1").length;
     await click(button(root, "Check now"));

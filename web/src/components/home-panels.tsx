@@ -4,6 +4,7 @@ import {
   type MarketRow, type MarketSort, type ScanDef, type Sparkline as SparkData,
 } from "../lib/market-data";
 import { routeHash } from "../lib/route";
+import { stamp } from "../lib/time";
 
 const INDEXES = ["SPY", "QQQ", "DIA", "IWM", "CL=F", "GC=F", "^TNX"];
 const SUMMARY_KEY = "stockbot.home.summary";
@@ -148,7 +149,7 @@ export function Briefing({ watchlist }: { watchlist: string[] }) {
                     <div className="home-item-title" title={it.title}>
                       <b>{it.sym}</b> <a href={it.link} target="_blank" rel="noreferrer">{it.title}</a>
                     </div>
-                    <div className="home-muted">{it.filing_form ?? it.kind} · {it.published ?? it.filed ?? ""}</div>
+                    <div className="home-muted">{it.filing_form ?? it.kind} · {stamp(it.published) || it.filed || ""}</div>
                   </li>
                 ))}
               </ul>
@@ -200,6 +201,13 @@ export function Scans({ active, onScan, onCreate }: { active: string; onScan: (s
     </section>
   );
 }
+
+// A per-source gap is a note, not a panel failure: the other rows stay usable.
+const POSITIONING_LABELS: Record<string, string> = {
+  short_interest: "short interest",
+  insider: "insider activity",
+  threshold: "threshold list",
+};
 
 export function Detail({ sym }: { sym: string }) {
   const spark = useLoad(sym, (s) => fetchSparklines([sym], "1d", s));
@@ -269,7 +277,11 @@ export function Detail({ sym }: { sym: string }) {
                         {bar("Insider sells 90d", (ins.sells / max) * 100, ins.sells.toLocaleString("en-US"), "down")}
                       </>
                     ) : null}
-                    {Object.keys(p.errors).length > 0 && <LoadError retry={pos.retry} />}
+                    {Object.keys(p.errors).length > 0 && (
+                      <p className="home-muted" role="status">
+                        Unavailable now: {Object.keys(p.errors).map((key) => POSITIONING_LABELS[key] ?? key.replaceAll("_", " ")).join(", ")}.
+                      </p>
+                    )}
                   </div>
                 );
               }}

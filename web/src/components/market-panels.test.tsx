@@ -262,7 +262,7 @@ describe("FinancialsPanel and NewsPanel", () => {
     const root = await mount(<NewsPanel sym="AAPL" />);
     await until(() => (root.textContent ?? "").includes("Headline 7"));
     expect(root.textContent).not.toContain("NEWS · AAPL");
-    expect(root.textContent).toContain("2026-10-14T12:34 · Example Wire");
+    expect(root.textContent).toContain("2026-10-14 12:34 · Example Wire");
     expect(root.textContent).not.toContain("12:34:56");
     expect(root.textContent).not.toContain("null · Example Wire");
     expect(root.textContent).not.toContain("Headline 8");

@@ -18,6 +18,8 @@ export type PortfolioView = {
   positions: Holding[];
 };
 
+import { stamp } from "../lib/time";
+
 const muted = "var(--muted, #93A0B8)";
 const down = "var(--down, #EF5350)";
 const up = "var(--up, #26A69A)";
@@ -56,7 +58,9 @@ export function PortfolioPanel({ onSelectTicker }: { onSelectTicker: (ticker: st
       .catch((e: unknown) => setError(`sync failed: ${e instanceof Error ? e.message : String(e)}`))
       .finally(() => setBusy(false));
   };
-  if (view === null || (view === undefined && !error)) return null;
+  if (view === undefined && !error) return <span className="skeleton" role="status" aria-label="Loading portfolio" aria-busy="true" />;
+  // A workspace widget keeps its frame. Say why the body is empty instead of leaving a blank card.
+  if (view === null) return <p style={{ fontSize: "var(--fs-body)", color: muted }}>Robinhood is not connected. Portfolio sync is optional.</p>;
   const cell: React.CSSProperties = { padding: "0 8px", height: 28, textAlign: "right" };
   const syncAppearance = busy ? { label: "Syncing…", cursor: "wait" } : { label: "Sync", cursor: "pointer" };
   return (
@@ -78,7 +82,7 @@ export function PortfolioPanel({ onSelectTicker }: { onSelectTicker: (ticker: st
       </div>
       <div style={{ padding: "8px 12px" }}>
         <div style={{ fontSize: "var(--fs-label)", color: muted, marginBottom: 8 }}>
-          {view?.synced_at ? `last sync ${view.synced_at}` : "never synced"}
+          {view?.synced_at ? `last sync ${stamp(view.synced_at)}` : "never synced"}
           {view?.total_value != null && ` · total ${money(view.total_value)}`}
         </div>
         {error && <div style={{ fontSize: "var(--fs-body)", color: down, marginBottom: 8 }}>{error}</div>}

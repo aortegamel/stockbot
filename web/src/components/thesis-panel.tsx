@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { stamp } from "../lib/time";
 
 type ThesisSummary = {
   thesis_id: string;
@@ -18,8 +19,8 @@ type ThesisDetail = ThesisSummary & {
   last_tick: string | null;
 };
 
-const POLL_MS = 60_000;
 // Same explicit-scope rule as the monitor's targets_for_thesis.
+const POLL_MS = 60_000;
 const TICKER = /^[A-Za-z]{1,5}$/;
 const muted = "var(--muted, #7A8599)";
 const down = "var(--down, #EF5350)";
@@ -127,7 +128,7 @@ export function ThesisPanel({ onSelectTicker }: { onSelectTicker: (ticker: strin
           {t.thesis_id === openId && shown && (
             <div style={{ ...small, padding: "6px 8px", color: "var(--text, #D5DBE5)" }}>
               <div style={{ color: muted }}>
-                {shown.assessment} · last tick {shown.last_tick ?? "never"}
+                {shown.assessment} · last tick {shown.last_tick ? stamp(shown.last_tick) : "never"}
               </div>
               <div style={{ display: "flex", gap: 6, margin: "6px 0" }}>
                 <button disabled={busy} onClick={() => act("check")}>
@@ -155,7 +156,7 @@ export function ThesisPanel({ onSelectTicker }: { onSelectTicker: (ticker: strin
                 {shown.journal.length === 0 && <div style={{ color: muted }}>no journal entries</div>}
                 {shown.journal.map((j) => (
                   <div key={j.entry_id} style={{ marginBottom: 4 }}>
-                    <span style={{ color: muted }}>{j.created_at.slice(0, 16)}</span> <b>{j.title}</b>
+                    <span style={{ color: muted }}>{stamp(j.created_at)}</span> <b>{j.title}</b>
                     <div style={{ whiteSpace: "pre-wrap" }}>{j.body.slice(0, 400)}</div>
                   </div>
                 ))}

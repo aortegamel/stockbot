@@ -207,19 +207,28 @@ function DoneRow({ event, debug }: { event: Extract<AgentEvent, { type: "done" }
   return (
     <div className="pt-2 text-xs text-zinc-500">
       <div role="status">{COMPLETION_LABELS[event.status ?? "completed"]}</div>
-      {(event.limitations?.length ?? 0) > 0 && <ul className="list-disc pl-4">{event.limitations?.map((limitation, i) => <li key={i}>{limitation}</li>)}</ul>}
-      <div>── metrics ──</div>
-      <div>
-        Needle calls: {m.needle.calls} · Tool calls: {m.tools.calls} · Stockbot calls: {m.muse.calls}
-        {m.muse.providerCalls !== undefined && <> · Provider calls: {m.muse.providerCalls}</>} · Evidence:{" "}
-        {m.evidence.count} · Evidence chars: {m.evidence.characters} · Stockbot input: {m.muse.inputTokens ?? "n/a"}{" "}
-        · Stockbot output: {m.muse.outputTokens ?? "n/a"}
-      </div>
-      <div>
-        Needle: {Math.round(m.needle.totalMs)}ms · Tools: {Math.round(m.tools.totalMs)}ms · Stockbot:{" "}
-        {Math.round(m.muse.totalMs)}ms · Total: {Math.round(m.totalMs)}ms
-      </div>
-      {timings.length > 0 && <div>Timings: {timings.join(" · ")}</div>}
+      {(event.limitations?.length ?? 0) > 0 && (
+        <details>
+          <summary className="cursor-pointer">Limitations · {event.limitations?.length}</summary>
+          <ul className="list-disc pl-4">{event.limitations?.map((limitation, i) => <li key={i}>{limitation}</li>)}</ul>
+        </details>
+      )}
+      {debug && (
+        <details className="pt-1">
+          <summary className="cursor-pointer">── metrics ──</summary>
+          <div>
+            Needle calls: {m.needle.calls} · Tool calls: {m.tools.calls} · Stockbot calls: {m.muse.calls}
+            {m.muse.providerCalls !== undefined && <> · Provider calls: {m.muse.providerCalls}</>} · Evidence:{" "}
+            {m.evidence.count} · Evidence chars: {m.evidence.characters} · Stockbot input: {m.muse.inputTokens ?? "n/a"}{" "}
+            · Stockbot output: {m.muse.outputTokens ?? "n/a"}
+          </div>
+          <div>
+            Needle: {Math.round(m.needle.totalMs)}ms · Tools: {Math.round(m.tools.totalMs)}ms · Stockbot:{" "}
+            {Math.round(m.muse.totalMs)}ms · Total: {Math.round(m.totalMs)}ms
+          </div>
+          {timings.length > 0 && <div>Timings: {timings.join(" · ")}</div>}
+        </details>
+      )}
     </div>
   );
 }

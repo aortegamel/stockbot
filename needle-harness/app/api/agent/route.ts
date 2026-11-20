@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { ANSWER_SECTIONS, complete, reason } from "@/lib/muse/client";
-import { asksWatchlist, kernelRouter, outOfScopeAnswer, parseTicker, parseWatchlist, REQUEST_WALL_MS, runKernelAgent } from "@/lib/agent/kernel";
+import { asksWatchlist, kernelRouter, outOfScopeAnswer, parseTicker, parseWatchlist, REQUEST_WALL_MS, RESEARCH_WALL_MS, runKernelAgent } from "@/lib/agent/kernel";
 import { appendMessage, createChat, hasChat, readChat } from "@/lib/chat";
 import { envFlag } from "@/lib/env";
 import { describeTools, endSession, invoke, newSessionId } from "@/lib/tools/stockbot";
@@ -227,11 +227,11 @@ async function modelArguments(tool: string, opts: { prompt: string; ticker?: str
 }
 
 export async function POST(req: Request): Promise<Response> {
-  const deadlineAt = Date.now() + REQUEST_WALL_MS;
   const requestAt = performance.now();
   const input = await readAgentRequest(req);
   if (input instanceof Response) return input;
   const { prompt, ticker, currentChartTicker: chartInput, parsedWatchlist, context, chatId: requestedChat, research, asOf } = input;
+  const deadlineAt = Date.now() + (research ? RESEARCH_WALL_MS : REQUEST_WALL_MS);
   // The stored conversation. A store failure degrades to one unpersisted turn instead of blocking the answer.
   let chatId: string | null = null;
   let history: { role: "user" | "assistant"; content: string }[] = [];

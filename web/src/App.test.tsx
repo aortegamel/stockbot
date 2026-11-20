@@ -466,7 +466,8 @@ describe("App agent send", () => {
     await until(() => findButton(root, "Send") !== null);
     expect(text(root)).not.toContain("├─");
     expect(text(root)).not.toContain("search_sec_filings");
-    expect(text(root)).toContain("── metrics ──");
+    expect(text(root)).toContain("Completed");
+    expect(text(root)).not.toContain("── metrics ──");
     expect(prompt.disabled).toBe(false);
     // The terminal event arrived, so the closed stream is not a failure.
     expect(text(root)).not.toContain("stream ended without a terminal event");

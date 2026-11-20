@@ -1293,3 +1293,22 @@ def test_screen_inputs_reports_non_sec_identity_and_survives_provider_failure(
     assert exclusions["not_classified_common_equity"] == 2
     assert exclusions["missing_shares_outstanding"] == 0
     assert result["unresolved"] == []
+
+
+def test_entity_screen_inputs_survives_http_provider_error() -> None:
+    """A 404 from the companyfacts provider reads as absent facts, never as a failed screen."""
+    import httpx2
+
+    from app.data_sources import SourceGateway
+
+    request = httpx2.Request("GET", "https://data.sec.gov/api/xbrl/companyfacts/CIK0000000001.json")
+
+    class Gateway(_FakeGateway):
+        @override
+        def company_facts(self, cik: int, as_of: str | None = None) -> dict[str, object]:
+            raise httpx2.HTTPStatusError(
+                "404 Not Found", request=request, response=httpx2.Response(404, request=request)
+            )
+
+    gateway: SourceGateway = Gateway(_Seeds())  # pyrefly: ignore[bad-assignment] - the double serves only company_facts
+    assert screens._entity_screen_inputs("sec:cik:1", "2026-08-30", gateway) == (None, [])

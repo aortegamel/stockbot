@@ -74,19 +74,30 @@ describe("AgentConsole source citations", () => {
     expect(out).not.toContain("ev:abc123&quot;,&quot;retrievedAt");
   });
 
-  test("last evidence event wins", () => {
-    const stale: AgentEvent = { type: "evidence", evidence: [evidence("ev:abc123", [SEC_SOURCE])] };
-    const current: AgentEvent = { type: "evidence", evidence: [evidence("ev:abc124", [SEC_SOURCE])] };
+  test("a citation resolves from any evidence event", () => {
+    const first: AgentEvent = { type: "evidence", evidence: [evidence("ev:abc123", [SEC_SOURCE])] };
+    const second: AgentEvent = { type: "evidence", evidence: [evidence("ev:abc124", [SEC_SOURCE])] };
     const events: AgentEvent[] = [
       { type: "agent_start", prompt: "risk?" },
-      stale,
-      current,
-      { type: "answer_delta", text: "Now [ev:abc124], stale [ev:abc123]." },
+      first,
+      second,
+      { type: "answer_delta", text: "Now [ev:abc124], earlier [ev:abc123]." },
       { type: "done", metrics: metrics() },
     ];
     const out = renderToStaticMarkup(<AgentConsole events={events} reasoning={true} debug={false} />);
-    expect(out.match(/aria-label="Loading original source…:/g)).toHaveLength(1);
-    expect(out).toContain(">[1]</span><span>, stale [ev:abc123].</span>");
+    expect(out.match(/aria-label="Loading original source…:/g)).toHaveLength(2);
+    expect(out).not.toContain("[ev:abc123]");
+    expect(out).not.toContain("[ev:abc124]");
+  });
+
+  test("saved chat evidence ids number in answer order", () => {
+    const out = renderToStaticMarkup(<AgentConsole events={[]} reasoning={false} debug={false} history={[
+      { role: "user", content: "revenue?" },
+      { role: "assistant", content: "Revenue rose [ev:abc123] and grew [ev:abc123]. Margin [ev:def456]." },
+    ]} />);
+    expect(out).toContain("Revenue rose [1] and grew [1]. Margin [2].");
+    expect(out).not.toContain("ev:abc123");
+    expect(out).not.toContain("ev:def456");
   });
 
   // A gated research answer: prose, then the claim inventory, then done.

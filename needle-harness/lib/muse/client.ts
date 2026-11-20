@@ -420,6 +420,10 @@ type StageInput = Record<string, unknown>[];
 type ChatTool = { name: string; description?: string; parameters?: unknown };
 // ponytail: fixed round cap; the last round forbids tools so the model must answer.
 const MAX_TOOL_ROUNDS = 8;
+// Reserve wall time for a final no-tools answer instead of spending it on more tool rounds.
+// A tool round can take a minute, so the reserve covers the round that starts near the boundary
+// plus the answer itself.
+const ANSWER_RESERVE_MS = 120_000;
 type FunctionCall = { type: "function_call"; call_id: string; name: string; arguments: string };
 function isFunctionCall(item: unknown): item is FunctionCall {
   const rec = objectRecord(item);
@@ -591,18 +595,26 @@ export async function reason(opts: ReasonOptions): Promise<NarrativeResult & { u
         forward(tail.slice(0, count));
         tail = tail.slice(count);
       };
-      const extra = tools.length ? { tools, ...(round >= MAX_TOOL_ROUNDS ? { tool_choice: "none" } : {}) } : {};
-      const raw = await callStage({ ...stage, onDelta: delta }, input, outputCap({ outputTokens: tally.outputTokens + (usage.outputTokens ?? 0) - (outputBefore ?? 0) }), extra);
+      const outOfTime = opts.deadlineAt !== undefined && opts.deadlineAt - Date.now() <= ANSWER_RESERVE_MS;
+      const last = round >= MAX_TOOL_ROUNDS || outOfTime;
+      // The final round sends no tool definitions at all. tool_choice:"none" alone is not enough:
+      // the provider can still emit a function call, and that call cannot run at the cap.
+      const extra = tools.length && !last ? { tools } : {};
+      const request = last && tools.length
+        ? [...input, { role: "user", content: "TOOL BUDGET EXHAUSTED. Write the final answer now from the evidence above. Do not call tools." }]
+        : input;
+      const raw = await callStage({ ...stage, onDelta: delta }, request, outputCap({ outputTokens: tally.outputTokens + (usage.outputTokens ?? 0) - (outputBefore ?? 0) }), extra);
       if (!inventory) forward(tail);
       const calls = (raw.output ?? []).filter(isFunctionCall);
       if (calls.length && !opts.plain && raw.text.trim()) console.warn(`[ai] pre-tool prose dropped: ${sent} chars`);
-      if (!calls.length) {
+      if (!calls.length || last) {
+        // A provider that still emits a call with no tools sent cannot run it; use the prose it wrote.
+        if (last && calls.length && !raw.text.trim()) throw new Error("The model called tools when tool use was disabled.");
         completed = true;
         if (opts.plain) return { prose: raw.text.trim(), claims: [], usage };
         const result = withInventory({ text: raw.text, usage });
         return opts.direct ? result : { ...result, timings };
       }
-      if (round >= MAX_TOOL_ROUNDS) throw new Error("The model called tools when tool use was disabled.");
       input.push(...(raw.output as StageInput));
       // Sequential: each call admits evidence into one session row, so two calls in flight would overwrite
       // each other's evidence ids. Order stays the model's call order.

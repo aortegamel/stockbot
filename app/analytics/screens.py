@@ -270,7 +270,7 @@ def _entity_screen_inputs(
         return "unknown", []
     try:
         facts: dict[str, object] = gateway.company_facts(cik, as_of=as_of)
-    except OSError, ValueError, RuntimeError:
+    except Exception:  # noqa: BLE001 - one CIK's provider failure must not abort the screen
         facts = {}
     securities = facts.get("securities") if isinstance(facts, dict) else None
     raw_facts = facts.get("financial_facts") if isinstance(facts, dict) else None

@@ -7,8 +7,10 @@ import type { AgentEvent, AskContext, Datapoint, Evidence, FailureCategory, Fina
 
 // ponytail: persistent worker bridge (spawn-once, ready-gated); spawn/exit/stderr handling mirrors lib/needle/client.ts.
 const WORKER_TIMEOUT_MS = 10 * 60 * 1000;
-// Every research operation shares the request deadline.
+// Every research operation shares the request deadline. Deep research gets a longer wall:
+// its evidence-heavy final call can take minutes on a slow provider.
 export const REQUEST_WALL_MS = 180_000;
+export const RESEARCH_WALL_MS = 300_000;
 const PREWARM_TIMEOUT_MS = 120_000;
 
 const ROOT =

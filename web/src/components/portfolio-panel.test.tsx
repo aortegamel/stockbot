@@ -51,7 +51,7 @@ const cached: PortfolioView = {
 };
 
 describe("PortfolioPanel", () => {
-  test("renders nothing when the portfolio API answers 404", async () => {
+  test("shows a disconnected state when the portfolio API answers 404", async () => {
     const asked: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       asked.push(String(input));
@@ -59,9 +59,9 @@ describe("PortfolioPanel", () => {
     }) as unknown as typeof fetch;
     const root = await mount(<PortfolioPanel onSelectTicker={() => { }} />);
     await until(() => asked.length === 1);
-    await act(() => new Promise<void>((resolve) => setTimeout(resolve, 10)));
+    await act(() => { const { promise, resolve } = Promise.withResolvers<void>(); setTimeout(resolve, 10); return promise; });
     expect(asked).toEqual(["/api/portfolio"]);
-    expect(root.innerHTML).toBe("");
+    expect(root.textContent).toContain("Robinhood is not connected. Portfolio sync is optional.");
   });
 
   test("shows cached holdings and last sync, and a position click selects the chart ticker", async () => {
@@ -69,7 +69,7 @@ describe("PortfolioPanel", () => {
     const picked: string[] = [];
     const root = await mount(<PortfolioPanel onSelectTicker={(t) => picked.push(t)} />);
     await until(() => (root.textContent ?? "").includes("WING"));
-    expect(root.textContent).toContain("last sync 2026-10-19T12:00:00+00:00");
+    expect(root.textContent).toContain("last sync 2026-10-19 12:00");
     expect(root.textContent).toContain("total 1268.40");
     const rows = root.querySelectorAll("tbody tr");
     expect(rows).toHaveLength(2);

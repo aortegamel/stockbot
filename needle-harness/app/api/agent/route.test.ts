@@ -61,6 +61,7 @@ const bridgeEvidence: Evidence = {
 
 mock.module("@/lib/agent/kernel", () => ({
   REQUEST_WALL_MS: 120_000,
+  RESEARCH_WALL_MS: 300_000,
   parseTicker: realParseTicker,
   parseWatchlist: realParseWatchlist,
   asksWatchlist: realAsksWatchlist,
@@ -548,8 +549,8 @@ describe("research scope gate", () => {
         signal: new AbortController().signal,
       });
       await (await POST(req)).text();
-      expect(scopeCalls).toEqual([{ op: "scope", prompt: "NVDA revenue?", deadlineAt: 1_800_000_120_000 }]);
-      expect(scopeOpts).toEqual([{ signal: req.signal, timeoutMs: 120_000 }]);
+      expect(scopeCalls).toEqual([{ op: "scope", prompt: "NVDA revenue?", deadlineAt: 1_800_000_300_000 }]);
+      expect(scopeOpts).toEqual([{ signal: req.signal, timeoutMs: 300_000 }]);
       expect(scopeOpts[0]?.signal).toBe(req.signal);
     } finally {
       clock.mockRestore();

@@ -67,10 +67,25 @@ function answerBlocks(parts: AnswerPart[]): AnswerPart[][] {
   return blocks.filter((block) => block.some((part) => part.citation || part.text.trim() !== ""));
 }
 
+// Saved chats keep raw evidence markers. Number them in answer order so the history is readable.
+function numberSavedCitations(text: string): string {
+  const numbers = new Map<string, number>();
+  return text.replace(/\[ev:[^\]]+\]/g, (marker) => {
+    const id = marker.slice(4, -1);
+    const next = numbers.get(id) ?? numbers.size + 1;
+    numbers.set(id, next);
+    return `[${next}]`;
+  });
+}
+
 function evidenceById(events: AgentEvent[]): Map<string, Evidence> {
-  // Each evidence event carries the full merged list, so the last one wins.
-  const evidence = events.findLast((e) => e.type === "evidence")?.evidence ?? [];
-  return new Map(evidence.map((entry) => [entry.id, entry]));
+  // The stream emits evidence per tool result, so merge every event; a repeated id keeps its latest row.
+  const known = new Map<string, Evidence>();
+  for (const event of events) {
+    if (event.type !== "evidence") continue;
+    for (const entry of event.evidence) known.set(entry.id, entry);
+  }
+  return known;
 }
 
 type LoadedSource = { label: string; link: OriginalLink | undefined };
@@ -178,7 +193,7 @@ export function AgentConsole({ events, history = [], reasoning, debug, onRetry, 
                 ? "text-[19px] font-semibold italic leading-snug text-zinc-100"
                 : "chat-answer text-zinc-100"}
             >
-              {turn.role === "user" ? `> ${turn.content}` : answerBlocks([{ text: turn.content }]).map((block, b) => (
+              {turn.role === "user" ? `> ${turn.content}` : answerBlocks([{ text: numberSavedCitations(turn.content) }]).map((block, b) => (
                 <p key={b}>{block.map((part) => part.text).join("")}</p>
               ))}
             </div>

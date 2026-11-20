@@ -846,7 +846,7 @@ describe("muse native reason loop (fake provider)", () => {
       expect(JSON.stringify(seen[1]?.body.input)).toContain("\"output\":\"error: bridge down\"");
     });
 
-    test("the last round forbids tools, so a model that keeps calling still answers", async () => {
+    test("the last round sends no tools, so a model that keeps calling still answers", async () => {
       respond = () => seen.length < 8 ? completed("", [listCall]) : sse("best effort");
       let runs = 0;
       const r = await reason({ prompt: "q", evidence: [], direct: true, plain: true, tools: [{ name: "list_sec_filings" }], runTool: async () => { runs += 1; return "row"; } });
@@ -854,7 +854,30 @@ describe("muse native reason loop (fake provider)", () => {
       expect(seen).toHaveLength(8);
       expect(runs).toBe(7);
       expect(seen[6]?.body.tool_choice).toBeUndefined();
-      expect(seen[7]?.body.tool_choice).toBe("none");
+      expect(seen[7]?.body.tools).toBeUndefined();
+      expect(seen[7]?.body.tool_choice).toBeUndefined();
+      expect(JSON.stringify(seen[7]?.body.input)).toContain("TOOL BUDGET EXHAUSTED");
+    });
+
+    test("a provider that emits a call on the final no-tools round keeps its prose", async () => {
+      respond = () => seen.length < 8 ? completed("", [listCall]) : completed("salvaged answer", [listCall]);
+      let runs = 0;
+      const r = await reason({ prompt: "q", evidence: [], direct: true, plain: true, tools: [{ name: "list_sec_filings" }], runTool: async () => { runs += 1; return "row"; } });
+      expect(r.prose).toBe("salvaged answer");
+      expect(seen).toHaveLength(8);
+      expect(runs).toBe(7);
+    });
+
+    test("a near deadline skips more tool rounds and answers", async () => {
+      respond = () => sse("time-boxed answer");
+      const r = await reason({
+        prompt: "q", evidence: [], direct: true, plain: true, tools: [{ name: "list_sec_filings" }],
+        runTool: async () => "row", deadlineAt: Date.now() + 5_000,
+      });
+      expect(r.prose).toBe("time-boxed answer");
+      expect(seen).toHaveLength(1);
+      expect(seen[0]?.body.tools).toBeUndefined();
+      expect(JSON.stringify(seen[0]?.body.input)).toContain("TOOL BUDGET EXHAUSTED");
     });
   });
 

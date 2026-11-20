@@ -9,7 +9,7 @@ import type { AgentEvent, AskContext, ChatTurn } from "../../../needle-harness/l
 import type { ChatSummary } from "../lib/chat-client";
 import type { JournalPage, ResearchSnapshot } from "../lib/research-client";
 import { sessionTitle } from "../lib/session-title";
-import { ago } from "../lib/time";
+import { ago, stamp } from "../lib/time";
 
 // Panels sit inside a glass card or tab, which already draws the surface and border.
 const panel: React.CSSProperties = {
@@ -204,7 +204,7 @@ export function NewsPanel({ sym }: { sym: string }) {
       {items.map((n, i) => (
         <div key={i} style={{ fontSize: "var(--fs-body)", marginBottom: 8, lineHeight: 1.4 }}>
           <span style={{ color: muted, fontSize: "var(--fs-label)" }}>
-            {(n.published || "").slice(0, 16)} · {n.source}
+            {stamp(n.published)} · {n.source}
           </span>
           <div>
             {n.link ? (
@@ -267,6 +267,7 @@ export function AIPanel({
   widgetOutcomes?: WidgetOutcomes;
 }) {
   const empty = turns.length === 0 && events.length === 0;
+  const [historyOpen, setHistoryOpen] = useState(false);
   return (
     <div style={{ ...panel, padding: 0, display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
       {/* Mixed case on purpose: the ticker context reads "viewing NVDA", not "VIEWING". */}
@@ -275,29 +276,32 @@ export function AIPanel({
         {onNewChat && <button type="button" className="pill" aria-label="New chat" disabled={empty} onClick={onNewChat}>New chat</button>}
       </div>
       {onOpenChat && chats.length > 0 && (
-        <details style={{ padding: "0 12px 8px" }}>
+        <details open={historyOpen} onToggle={(event) => setHistoryOpen(event.currentTarget.open)} style={{ padding: "0 12px 8px", flexShrink: 0 }}>
           <summary style={{ cursor: "pointer", fontSize: "var(--fs-label)", color: muted }}>History · {chats.length}</summary>
           <div aria-label="Stored chats" style={{ maxHeight: 160, overflowY: "auto", marginTop: 4 }}>
-            {chats.map((chat) => (
-              <div key={chat.chatId} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                <button
-                  type="button"
-                  onClick={() => onOpenChat(chat.chatId)}
-                  aria-current={chat.chatId === activeChat ? "true" : undefined}
-                  title={chat.title}
-                  style={{
-                    flex: 1, minWidth: 0, textAlign: "left", padding: "2px 4px", background: "transparent", cursor: "pointer",
-                    color: chat.chatId === activeChat ? "var(--accent, #2962FF)" : "var(--text, #D5DBE5)",
-                    border: "1px solid transparent", borderRadius: 4, fontSize: "var(--fs-label)", ...clip,
-                  }}
-                >
-                  {chat.title}
-                </button>
-                {onDeleteChat && (
-                  <button type="button" className="ghost" aria-label={`Delete chat ${chat.title}`} title="Delete this chat" onClick={() => onDeleteChat(chat.chatId)}>×</button>
-                )}
-              </div>
-            ))}
+            {chats.map((chat) => {
+              const title = sessionTitle(chat.title);
+              return (
+                <div key={chat.chatId} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                  <button
+                    type="button"
+                    onClick={() => { setHistoryOpen(false); onOpenChat(chat.chatId); }}
+                    aria-current={chat.chatId === activeChat ? "true" : undefined}
+                    title={title}
+                    style={{
+                      flex: 1, minWidth: 0, textAlign: "left", padding: "2px 4px", background: "transparent", cursor: "pointer",
+                      color: chat.chatId === activeChat ? "var(--accent, #2962FF)" : "var(--text, #D5DBE5)",
+                      border: "1px solid transparent", borderRadius: 4, fontSize: "var(--fs-label)", ...clip,
+                    }}
+                  >
+                    {title}
+                  </button>
+                  {onDeleteChat && (
+                    <button type="button" className="ghost" aria-label={`Delete chat ${title}`} title="Delete this chat" onClick={() => onDeleteChat(chat.chatId)}>×</button>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </details>
       )}

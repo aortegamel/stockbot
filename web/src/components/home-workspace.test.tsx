@@ -170,6 +170,22 @@ describe("Workspace market overview", () => {
     expect(dom.window.localStorage.getItem("stockbot.home.summary")).toBe("hidden");
   });
 
+  test("a partial positioning response is a note, not a failed panel", async () => {
+    serve({
+      "/api/positioning": (u) => ({
+        sym: u.searchParams.get("sym"), short_pct: null, short_as_of: null,
+        insider_net_90d: { buys: 4000, sells: 1000, net: 3000 }, threshold_listed: false, threshold_as_of: null,
+        errors: { short_interest: "provider still computing" },
+      }),
+    });
+    const root = await mount(state());
+    await until(() => text(root).includes("Insider buys 90d"));
+    const detail = root.querySelector('[aria-label="NVDA detail"]')!;
+    expect(text(detail)).toContain("Unavailable now: short interest.");
+    expect(text(detail)).not.toContain("provider still computing");
+    expect(detail.querySelector('[role="alert"]')).toBeNull();
+  });
+
   test("detail starts on the window ticker, not the first row", async () => {
     serve();
     const root = await mount(state(), "GME");

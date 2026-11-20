@@ -151,11 +151,14 @@ export default function Feed({ selected, watchlist, setInput, setAskContext, ope
             <button type="button" className="pill" onClick={() => setRetry((n) => n + 1)}>Retry</button>
           </p>
         ) : items === null ? (
-          <ul className="feed-list" aria-busy="true">
-            {[0, 1, 2, 3, 4].map((n) => (
-              <li key={n} className="feed-row feed-skeleton" aria-hidden />
-            ))}
-          </ul>
+          <>
+            <p className="feed-muted" role="status">Loading feed…</p>
+            <ul className="feed-list" aria-busy="true">
+              {[0, 1, 2, 3, 4].map((n) => (
+                <li key={n} className="feed-row feed-skeleton" aria-hidden />
+              ))}
+            </ul>
+          </>
         ) : visibleItems.length === 0 ? (
           <p className="feed-muted">No items for this filter — try Ask Stockbot: what's new with {selected}?</p>
         ) : (
